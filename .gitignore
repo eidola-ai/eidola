@@ -1,2 +1,9 @@
 /target
-/docker-output
+
+# Nix build outputs
+result
+result-*
+
+# direnv
+.direnv
+.envrc
