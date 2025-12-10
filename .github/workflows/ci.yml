@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-all-platforms:
+    name: Build all platforms
+    runs-on: macos-14  # Apple Silicon for native macOS + cross-compile to Linux
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          # Enable flakes and nix-command
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            # Allow building for other platforms
+            extra-platforms = x86_64-darwin aarch64-darwin
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
+        # This provides free GitHub-hosted binary caching
+        # Dramatically speeds up subsequent builds
+
+      - name: Show flake info
+        run: nix flake show
+
+      - name: Run all checks
+        run: nix flake check --all-systems --show-trace
+
+      - name: Build all packages
+        run: |
+          # Native macOS packages
+          nix build '.#server' -L
+          nix build '.#core' -L
+          nix build '.#server-oci' -L
+
+          # Cross-compiled Linux packages
+          nix build '.#server-x86_64-linux' -L
+          nix build '.#server-aarch64-linux' -L
+          nix build '.#server-oci-x86_64-linux' -L
+          nix build '.#server-oci-aarch64-linux' -L
+
+      - name: Verify build outputs
+        run: |
+          echo "=== Native macOS server ==="
+          file result/bin/eidolons-server || true
+
+          echo "=== Linux x86_64 server ==="
+          nix build '.#server-x86_64-linux' -o result-linux-x86
+          file result-linux-x86/bin/eidolons-server
+
+          echo "=== Linux aarch64 server ==="
+          nix build '.#server-aarch64-linux' -o result-linux-arm
+          file result-linux-arm/bin/eidolons-server
