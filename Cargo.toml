@@ -1,0 +1,25 @@
+[workspace]
+
+members = [
+    "core",
+    # "core/uniffi-bindgen",
+    # "core/uniffi-bindgen-swift",
+    "server",
+]
+resolver = "2"
+
+[workspace.dependencies]
+uniffi = "0.28.2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Mike Marcacci"]
+repository = "https://github.com/eidolons-ai/eidolons"
+publish = false
+
+[profile.release]
+# Incremental compilation is disabled to avoid non-determinism.
+incremental = false
+# Codegen units are set to 1 to avoid potential non-determinism. This may be unnecessary.
+codegen-units = 1
