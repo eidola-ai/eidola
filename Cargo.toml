@@ -21,5 +21,13 @@ publish = false
 [profile.release]
 # Incremental compilation is disabled to avoid non-determinism.
 incremental = false
-# Codegen units are set to 1 to avoid potential non-determinism. This may be unnecessary.
+# Codegen units are set to 1 to avoid potential non-determinism.
 codegen-units = 1
+# Enable link-time optimization for better determinism
+lto = true
+# Explicit optimization level
+opt-level = 3
+# Strip symbols for determinism
+strip = true
+# Explicit overflow check setting
+overflow-checks = false
