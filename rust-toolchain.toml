@@ -10,9 +10,9 @@
 channel = "1.91.1"
 targets = [
     # macOS
-    "aarch64-apple-darwin",
+    # "aarch64-apple-darwin",
 
-    # TODO: iOS
+    # iOS
     # "aarch64-apple-ios",
     # "aarch64-apple-ios-sim",
 
@@ -30,9 +30,9 @@ targets = [
     # TODO: WebAssembly
     # "wasm32-unknown-unknown",
 
-    # TODO: Linux
-
-    # TODO: Linux
+    # Linux
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
 
 ]
 components = ["clippy", "rustfmt"]

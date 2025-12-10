@@ -1,0 +1,22 @@
+# Exclude build artifacts
+target/
+
+# Exclude git
+.git/
+.gitignore
+
+# Exclude Docker files
+Dockerfile
+.dockerignore
+
+# Exclude any local scripts that aren't needed in container
+# (Keep build.sh in case it's useful for reference)
+
+# Exclude any local environment or editor files
+.env
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
