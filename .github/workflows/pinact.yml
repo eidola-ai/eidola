@@ -17,6 +17,6 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Suggest action pins
-        uses: suzuki-shunsuke/pinact-action@49cbd6acd0dbab6a6be2585d1dbdaa43b4410133 # v1.0.0
+        uses: suzuki-shunsuke/pinact-action@9d485f86d417fa2b51bef4bf7c55fbdefaef64da # v1.0.0
         with:
           skip_push: true
