@@ -17,6 +17,6 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Suggest action pins
-        uses: mike-marcacci/pinact-action@5c69d502ac7b8e09b2b16556155ebd4cbe1de663 # v1.0.0
+        uses: mike-marcacci/pinact-action@44ac031d5cb5a05ead2e02d6723962fa57781bc5 # v1.0.0
         with:
           skip_push: true
