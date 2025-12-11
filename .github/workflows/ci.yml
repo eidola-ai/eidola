@@ -2,18 +2,20 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
 
 jobs:
   build-all-platforms:
     name: Build all platforms
-    runs-on: macos-14  # Apple Silicon for native macOS + cross-compile to Linux
+    runs-on: macos-14 # Apple Silicon for native macOS + cross-compile to Linux
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout:v4.3.1
 
       - name: Install Nix
         uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
