@@ -27,9 +27,15 @@ jobs:
             extra-platforms = x86_64-darwin aarch64-darwin
 
       - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@v8
-        # This provides free GitHub-hosted binary caching
-        # Dramatically speeds up subsequent builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            /nix/store
+            /nix/var/nix
+            ~/.cache/nix
+          key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix') }}
+          restore-keys: |
+            nix-${{ runner.os }}-
 
       - name: Show flake info
         run: nix flake show
