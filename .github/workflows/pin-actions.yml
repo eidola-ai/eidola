@@ -18,6 +18,8 @@ jobs:
 
       - name: Pin GitHub Actions to SHAs
         uses: stacklok/frizbee-action@v0.0.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           actions: .github/workflows
           open_pr: true
