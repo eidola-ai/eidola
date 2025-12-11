@@ -2,8 +2,8 @@ name: Pin GitHub Actions
 
 on:
   schedule:
-    - cron: '0 0 * * 1'  # Weekly on Monday
-  workflow_dispatch:  # Manual trigger
+    - cron: "0 0 * * 1" # Weekly on Monday
+  workflow_dispatch: # Manual trigger
 
 permissions:
   contents: write
@@ -13,9 +13,12 @@ jobs:
   pin:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Pin GitHub Actions to SHAs
-        uses: stacklok/frizbee-action@v0.0.12
+        uses: stacklok/frizbee-action@v0.0.5
         with:
-          open_pr: true  # Automatically create PR with pinned actions
+          actions: .github/workflows
+          open_pr: true
+          fail_on_unpinned: true
