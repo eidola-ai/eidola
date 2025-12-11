@@ -2,16 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   pull_request:
-    branches: [main]
+    branches: [ main ]
 
 jobs:
   build-all-platforms:
     name: Build all platforms
-
-    # Apple Silicon for native macOS + cross-compile to Linux
-    runs-on: ghcr.io/cirruslabs/macos-tahoe-xcode:latest
+    runs-on: macos-14  # Apple Silicon for native macOS + cross-compile to Linux
 
     steps:
       - name: Checkout code
