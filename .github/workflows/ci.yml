@@ -33,7 +33,9 @@ jobs:
         run: nix flake show
 
       - name: Run all checks
-        run: nix flake check --all-systems --show-trace
+        run: nix flake check --show-trace
+        # Note: Only checks current system (aarch64-darwin)
+        # Cross-compiled packages are built explicitly below
 
       - name: Build all packages
         run: |
