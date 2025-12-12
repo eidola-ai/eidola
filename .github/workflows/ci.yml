@@ -12,6 +12,9 @@ jobs:
   build-all-platforms:
     name: Build all platforms
     runs-on: macos-14 # Apple Silicon for native macOS + cross-compile to Linux
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout code
@@ -71,3 +74,125 @@ jobs:
           echo "=== Linux aarch64 server ==="
           nix build '.#server-aarch64-linux' -o result-linux-arm
           file result-linux-arm/bin/eidolons-server
+
+          echo "=== OCI images ==="
+          nix build '.#server-oci-x86_64-linux' -o result-oci-x86
+          nix build '.#server-oci-aarch64-linux' -o result-oci-arm
+          ls -lh result-oci-*
+
+      - name: Upload macOS server binary
+        uses: actions/upload-artifact@ea165f2698648f7c85c88cc6da5285a5a9e47315 # v4.6.0
+        with:
+          name: eidolons-server-macos-aarch64
+          path: result/bin/eidolons-server
+          if-no-files-found: error
+
+      - name: Upload Linux x86_64 server binary
+        uses: actions/upload-artifact@ea165f2698648f7c85c88cc6da5285a5a9e47315 # v4.6.0
+        with:
+          name: eidolons-server-linux-x86_64
+          path: result-linux-x86/bin/eidolons-server
+          if-no-files-found: error
+
+      - name: Upload Linux aarch64 server binary
+        uses: actions/upload-artifact@ea165f2698648f7c85c88cc6da5285a5a9e47315 # v4.6.0
+        with:
+          name: eidolons-server-linux-aarch64
+          path: result-linux-arm/bin/eidolons-server
+          if-no-files-found: error
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@74b6eefbb7fb9ade0dfb63ca7db1bcaaf4c65a7f # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine image tags
+        id: tags
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          # Lowercase repository owner for GHCR
+          OWNER=$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')
+
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            TAG_PREFIX="pr-${PR_NUMBER}"
+          else
+            TAG_PREFIX="sha-$(echo ${COMMIT_SHA} | cut -c1-7)"
+            # Also tag as 'latest' for main branch
+            if [ "${GIT_REF}" = "refs/heads/main" ]; then
+              echo "is_main=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+          echo "owner=${OWNER}" >> $GITHUB_OUTPUT
+          echo "tag_prefix=${TAG_PREFIX}" >> $GITHUB_OUTPUT
+
+      - name: Push x86_64 image to GHCR
+        env:
+          OWNER: ${{ steps.tags.outputs.owner }}
+          TAG_PREFIX: ${{ steps.tags.outputs.tag_prefix }}
+          IS_MAIN: ${{ steps.tags.outputs.is_main }}
+        run: |
+          IMAGE="ghcr.io/${OWNER}/eidolons-server"
+
+          # Load the Nix-built image
+          docker load < result-oci-x86
+
+          # Tag and push
+          docker tag eidolons-server:latest "${IMAGE}:${TAG_PREFIX}-amd64"
+          docker push "${IMAGE}:${TAG_PREFIX}-amd64"
+
+          # Also tag as latest-amd64 if on main
+          if [ "${IS_MAIN}" = "true" ]; then
+            docker tag eidolons-server:latest "${IMAGE}:latest-amd64"
+            docker push "${IMAGE}:latest-amd64"
+          fi
+
+      - name: Push aarch64 image to GHCR
+        env:
+          OWNER: ${{ steps.tags.outputs.owner }}
+          TAG_PREFIX: ${{ steps.tags.outputs.tag_prefix }}
+          IS_MAIN: ${{ steps.tags.outputs.is_main }}
+        run: |
+          IMAGE="ghcr.io/${OWNER}/eidolons-server"
+
+          # Load the Nix-built image
+          docker load < result-oci-arm
+
+          # Tag and push
+          docker tag eidolons-server:latest "${IMAGE}:${TAG_PREFIX}-arm64"
+          docker push "${IMAGE}:${TAG_PREFIX}-arm64"
+
+          # Also tag as latest-arm64 if on main
+          if [ "${IS_MAIN}" = "true" ]; then
+            docker tag eidolons-server:latest "${IMAGE}:latest-arm64"
+            docker push "${IMAGE}:latest-arm64"
+          fi
+
+      - name: Create and push multi-arch manifest
+        env:
+          OWNER: ${{ steps.tags.outputs.owner }}
+          TAG_PREFIX: ${{ steps.tags.outputs.tag_prefix }}
+          IS_MAIN: ${{ steps.tags.outputs.is_main }}
+        run: |
+          IMAGE="ghcr.io/${OWNER}/eidolons-server"
+
+          # Create and push manifest for the specific tag (PR or commit SHA)
+          docker manifest create "${IMAGE}:${TAG_PREFIX}" \
+            "${IMAGE}:${TAG_PREFIX}-amd64" \
+            "${IMAGE}:${TAG_PREFIX}-arm64"
+          docker manifest push "${IMAGE}:${TAG_PREFIX}"
+
+          # Also create 'latest' manifest if on main
+          if [ "${IS_MAIN}" = "true" ]; then
+            docker manifest create "${IMAGE}:latest" \
+              "${IMAGE}:latest-amd64" \
+              "${IMAGE}:latest-arm64"
+            docker manifest push "${IMAGE}:latest"
+          fi
