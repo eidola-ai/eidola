@@ -12,6 +12,7 @@ jobs:
   build-all-platforms:
     name: Build all platforms
     runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write
@@ -27,16 +28,8 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Setup Nix cache
-        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
-        with:
-          path: |
-            /nix/store
-            /nix/var/nix
-            ~/.cache/nix
-          key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix') }}
-          restore-keys: |
-            nix-${{ runner.os }}-
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@fc6aaceb40b9845a02b91e059ec147e78d1b4e41 # v8
 
       - name: Show flake info
         run: nix flake show

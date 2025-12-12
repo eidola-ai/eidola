@@ -8,6 +8,10 @@
     fenix = {
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-analyzer-src = {
+        url = "github:rust-lang/rust-analyzer/release";
+        flake = false;
+      };
     };
 
     # Efficient Rust builds with incremental caching
@@ -25,7 +29,7 @@
         # Get the exact Rust toolchain specified in rust-toolchain.toml
         rustToolchain = fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
-          sha256 = "sha256-SDu4snEWjuZU475PERvu+iO50Mi39KVjqCeJeNvpguU=";
+          sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
         };
 
         # Create crane library with our Rust toolchain (function form for consistency)
@@ -76,14 +80,14 @@
           pkgsServerTarget = mkCrossSystem targetSystem "musl";
           craneLibServer = (crane.mkLib pkgsServerTarget).overrideToolchain (_: fenix.packages.${system}.fromToolchainFile {
             file = ./rust-toolchain.toml;
-            sha256 = "sha256-SDu4snEWjuZU475PERvu+iO50Mi39KVjqCeJeNvpguU=";
+            sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
           });
 
           # Core library uses gnu for compatibility with apps
           pkgsCoreTarget = mkCrossSystem targetSystem "gnu";
           craneLibCore = (crane.mkLib pkgsCoreTarget).overrideToolchain (_: fenix.packages.${system}.fromToolchainFile {
             file = ./rust-toolchain.toml;
-            sha256 = "sha256-SDu4snEWjuZU475PERvu+iO50Mi39KVjqCeJeNvpguU=";
+            sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
           });
 
           # Build server dependencies (musl)
