@@ -21,7 +21,7 @@ jobs:
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Install Nix
-        uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
+        uses: cachix/install-nix-action@4e002c8ec80594ecd40e759629461e26c8abed15 # v31.9.0
         with:
           # Enable flakes and nix-command
           extra_nix_config: |
@@ -81,28 +81,28 @@ jobs:
           ls -lh result-oci-*
 
       - name: Upload macOS server binary
-        uses: actions/upload-artifact@ea165f2698648f7c85c88cc6da5285a5a9e47315 # v4.6.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: eidolons-server-macos-aarch64
           path: result/bin/eidolons-server
           if-no-files-found: error
 
       - name: Upload Linux x86_64 server binary
-        uses: actions/upload-artifact@ea165f2698648f7c85c88cc6da5285a5a9e47315 # v4.6.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: eidolons-server-linux-x86_64
           path: result-linux-x86/bin/eidolons-server
           if-no-files-found: error
 
       - name: Upload Linux aarch64 server binary
-        uses: actions/upload-artifact@ea165f2698648f7c85c88cc6da5285a5a9e47315 # v4.6.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: eidolons-server-linux-aarch64
           path: result-linux-arm/bin/eidolons-server
           if-no-files-found: error
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@74b6eefbb7fb9ade0dfb63ca7db1bcaaf4c65a7f # v3.4.0
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
