@@ -42,8 +42,9 @@ jobs:
 
       - name: Run all checks
         run: nix flake check --show-trace
-        # Note: Only checks current system (aarch64-darwin)
-        # Cross-compiled packages are built explicitly below
+        # Note: Checks run on current system (aarch64-darwin) only
+        # This is sufficient as code quality checks are platform-independent
+        # Cross-compiled packages are built and verified below
 
       - name: Build all packages
         run: |

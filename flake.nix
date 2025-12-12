@@ -131,6 +131,11 @@
           inherit server core server-oci;
         };
 
+        # Build cargo dependencies once for checks (reused across fmt/clippy/test)
+        cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+          pname = "eidolons-deps";
+        });
+
         # Build for the current system
         nativePackages = mkPackagesForTarget system;
 
@@ -174,6 +179,25 @@
           # Verify builds work
           server-builds = nativePackages.server;
           core-builds = nativePackages.core;
+
+          # Verify code formatting
+          formatting = craneLib.cargoFmt {
+            inherit (commonArgs) src;
+            pname = "eidolons-fmt";
+          };
+
+          # Verify no Clippy warnings
+          clippy = craneLib.cargoClippy (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "eidolons-clippy";
+            cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+          });
+
+          # Run unit tests
+          tests = craneLib.cargoTest (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "eidolons-tests";
+          });
         };
       }
     );
