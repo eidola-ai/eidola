@@ -10,3 +10,14 @@ updates:
         update-types:
           - "minor"
           - "patch"
+
+  # Maintain dependencies for Rust/Cargo.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      "Cargo Dependencies (Minor/Patch)":
+        update-types:
+          - "minor"
+          - "patch"
