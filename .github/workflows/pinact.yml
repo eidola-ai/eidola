@@ -18,5 +18,7 @@ jobs:
 
       - name: Suggest action pins
         uses: mike-marcacci/pinact-action@7448dfedb8f98bf16d6e05a4ad07c1f922b5a3e6 # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           skip_push: true
