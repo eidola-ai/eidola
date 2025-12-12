@@ -1,0 +1,24 @@
+name: Suggest pinning GitHub Actions
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/*.yml"
+      - ".github/workflows/*.yaml"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  suggest-pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Suggest action pins
+        uses: mike-marcacci/pinact-action@a56127fea631bf6b44c7182ff09aedfd74ce476d # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          skip_push: true

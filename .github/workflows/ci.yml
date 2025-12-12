@@ -2,21 +2,23 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
 
 jobs:
   build-all-platforms:
     name: Build all platforms
-    runs-on: macos-14  # Apple Silicon for native macOS + cross-compile to Linux
+    runs-on: macos-14 # Apple Silicon for native macOS + cross-compile to Linux
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v27
+        uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
         with:
           # Enable flakes and nix-command
           extra_nix_config: |
@@ -25,7 +27,7 @@ jobs:
             extra-platforms = x86_64-darwin aarch64-darwin
 
       - name: Setup Nix cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             /nix/store

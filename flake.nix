@@ -161,6 +161,7 @@
             rustToolchain
             cargo-watch
             rust-analyzer
+            pinact  # Pin GitHub Actions to SHAs
           ];
 
           # Same environment variables as builds for consistency
