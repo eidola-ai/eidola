@@ -163,12 +163,12 @@ jobs:
 
             # Create multi-arch manifests pointing at the uploaded images
             crane index append -t "${IMAGE}:${TAG_PREFIX}" \
-              "${IMAGE}:${TAG_PREFIX}-amd64" \
-              "${IMAGE}:${TAG_PREFIX}-arm64"
+              -m "${IMAGE}:${TAG_PREFIX}-amd64" \
+              -m "${IMAGE}:${TAG_PREFIX}-arm64"
 
             if [ "${IS_MAIN}" = "true" ]; then
               crane index append -t "${IMAGE}:latest" \
-                "${IMAGE}:latest-amd64" \
-                "${IMAGE}:latest-arm64"
+                -m "${IMAGE}:latest-amd64" \
+                -m "${IMAGE}:latest-arm64"
             fi
           '
