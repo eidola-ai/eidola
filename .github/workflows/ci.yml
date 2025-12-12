@@ -143,10 +143,21 @@ jobs:
             # Authenticate once for GHCR
             crane auth login ghcr.io -u "$GITHUB_ACTOR" -p "$GITHUB_TOKEN"
 
+            # dockerTools outputs gzip-compressed archives; crane expects plain tar
+            unpack_archive() {
+              local gz="$1"
+              local out
+              out="$(mktemp /tmp/image-XXXX.tar)"
+              gzip -dc "$gz" > "$out"
+              echo "$out"
+            }
+
             push_arch() {
               local archive="$1"
               local tag="$2"
-              crane push "$archive" "${IMAGE}:${tag}"
+              local tar
+              tar="$(unpack_archive "$archive")"
+              crane push "$tar" "${IMAGE}:${tag}"
             }
 
             # Push architecture-specific images
