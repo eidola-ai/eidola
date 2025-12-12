@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Suggest action pins
-        uses: suzuki-shunsuke/pinact-action@9d485f86d417fa2b51bef4bf7c55fbdefaef64da
+        uses: mike-marcacci/pinact-action@ee38eb33de550d310250b759c84a396e6d48b086 # v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
