@@ -11,7 +11,7 @@ on:
 jobs:
   build-all-platforms:
     name: Build all platforms
-    runs-on: macos-14 # Apple Silicon for native macOS + cross-compile to Linux
+    runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
     permissions:
       contents: read
       packages: write
@@ -98,13 +98,6 @@ jobs:
           path: result-linux-arm/bin/eidolons-server
           if-no-files-found: error
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Determine image tags
         id: tags
         env:
@@ -130,66 +123,50 @@ jobs:
           echo "owner=${OWNER}" >> $GITHUB_OUTPUT
           echo "tag_prefix=${TAG_PREFIX}" >> $GITHUB_OUTPUT
 
-      - name: Push x86_64 image to GHCR
+      - name: Push images to GHCR (crane)
         env:
           OWNER: ${{ steps.tags.outputs.owner }}
           TAG_PREFIX: ${{ steps.tags.outputs.tag_prefix }}
           IS_MAIN: ${{ steps.tags.outputs.is_main }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
         run: |
+          set -euo pipefail
+
           IMAGE="ghcr.io/${OWNER}/eidolons-server"
+          export IMAGE
 
-          # Load the Nix-built image
-          docker load < result-oci-x86
+          # Use crane from the pinned flake (no Docker needed)
+          nix shell .#crane-cli --command bash -c '
+            set -euo pipefail
 
-          # Tag and push
-          docker tag eidolons-server:latest "${IMAGE}:${TAG_PREFIX}-amd64"
-          docker push "${IMAGE}:${TAG_PREFIX}-amd64"
+            # Authenticate once for GHCR
+            crane auth login ghcr.io -u "$GITHUB_ACTOR" -p "$GITHUB_TOKEN"
 
-          # Also tag as latest-amd64 if on main
-          if [ "${IS_MAIN}" = "true" ]; then
-            docker tag eidolons-server:latest "${IMAGE}:latest-amd64"
-            docker push "${IMAGE}:latest-amd64"
-          fi
+            push_arch() {
+              local archive="$1"
+              local tag="$2"
+              crane push "$archive" "${IMAGE}:${tag}"
+            }
 
-      - name: Push aarch64 image to GHCR
-        env:
-          OWNER: ${{ steps.tags.outputs.owner }}
-          TAG_PREFIX: ${{ steps.tags.outputs.tag_prefix }}
-          IS_MAIN: ${{ steps.tags.outputs.is_main }}
-        run: |
-          IMAGE="ghcr.io/${OWNER}/eidolons-server"
+            # Push architecture-specific images
+            push_arch result-oci-x86 "${TAG_PREFIX}-amd64"
+            push_arch result-oci-arm "${TAG_PREFIX}-arm64"
 
-          # Load the Nix-built image
-          docker load < result-oci-arm
+            # Optional "latest" tags for main
+            if [ "${IS_MAIN}" = "true" ]; then
+              push_arch result-oci-x86 "latest-amd64"
+              push_arch result-oci-arm "latest-arm64"
+            fi
 
-          # Tag and push
-          docker tag eidolons-server:latest "${IMAGE}:${TAG_PREFIX}-arm64"
-          docker push "${IMAGE}:${TAG_PREFIX}-arm64"
+            # Create multi-arch manifests pointing at the uploaded images
+            crane index append -t "${IMAGE}:${TAG_PREFIX}" \
+              "${IMAGE}:${TAG_PREFIX}-amd64" \
+              "${IMAGE}:${TAG_PREFIX}-arm64"
 
-          # Also tag as latest-arm64 if on main
-          if [ "${IS_MAIN}" = "true" ]; then
-            docker tag eidolons-server:latest "${IMAGE}:latest-arm64"
-            docker push "${IMAGE}:latest-arm64"
-          fi
-
-      - name: Create and push multi-arch manifest
-        env:
-          OWNER: ${{ steps.tags.outputs.owner }}
-          TAG_PREFIX: ${{ steps.tags.outputs.tag_prefix }}
-          IS_MAIN: ${{ steps.tags.outputs.is_main }}
-        run: |
-          IMAGE="ghcr.io/${OWNER}/eidolons-server"
-
-          # Create and push manifest for the specific tag (PR or commit SHA)
-          docker manifest create "${IMAGE}:${TAG_PREFIX}" \
-            "${IMAGE}:${TAG_PREFIX}-amd64" \
-            "${IMAGE}:${TAG_PREFIX}-arm64"
-          docker manifest push "${IMAGE}:${TAG_PREFIX}"
-
-          # Also create 'latest' manifest if on main
-          if [ "${IS_MAIN}" = "true" ]; then
-            docker manifest create "${IMAGE}:latest" \
-              "${IMAGE}:latest-amd64" \
-              "${IMAGE}:latest-arm64"
-            docker manifest push "${IMAGE}:latest"
-          fi
+            if [ "${IS_MAIN}" = "true" ]; then
+              crane index append -t "${IMAGE}:latest" \
+                "${IMAGE}:latest-amd64" \
+                "${IMAGE}:latest-arm64"
+            fi
+          '

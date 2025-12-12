@@ -152,6 +152,7 @@
           server = nativePackages.server;
           core = nativePackages.core;
           server-oci = nativePackages.server-oci;
+          crane-cli = pkgs.crane;
         } // (if pkgs.stdenv.isDarwin then {
           # On macOS, provide Linux cross-compiled packages
           server-x86_64-linux = linuxPackages.x86_64-linux.server;
