@@ -8,6 +8,10 @@
     fenix = {
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-analyzer-src = {
+        url = "github:rust-lang/rust-analyzer/release";
+        flake = false;
+      };
     };
 
     # Efficient Rust builds with incremental caching
@@ -25,7 +29,7 @@
         # Get the exact Rust toolchain specified in rust-toolchain.toml
         rustToolchain = fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
-          sha256 = "sha256-SDu4snEWjuZU475PERvu+iO50Mi39KVjqCeJeNvpguU=";
+          sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
         };
 
         # Create crane library with our Rust toolchain (function form for consistency)
@@ -76,14 +80,14 @@
           pkgsServerTarget = mkCrossSystem targetSystem "musl";
           craneLibServer = (crane.mkLib pkgsServerTarget).overrideToolchain (_: fenix.packages.${system}.fromToolchainFile {
             file = ./rust-toolchain.toml;
-            sha256 = "sha256-SDu4snEWjuZU475PERvu+iO50Mi39KVjqCeJeNvpguU=";
+            sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
           });
 
           # Core library uses gnu for compatibility with apps
           pkgsCoreTarget = mkCrossSystem targetSystem "gnu";
           craneLibCore = (crane.mkLib pkgsCoreTarget).overrideToolchain (_: fenix.packages.${system}.fromToolchainFile {
             file = ./rust-toolchain.toml;
-            sha256 = "sha256-SDu4snEWjuZU475PERvu+iO50Mi39KVjqCeJeNvpguU=";
+            sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
           });
 
           # Build server dependencies (musl)
@@ -131,6 +135,11 @@
           inherit server core server-oci;
         };
 
+        # Build cargo dependencies once for checks (reused across fmt/clippy/test)
+        cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+          pname = "eidolons-deps";
+        });
+
         # Build for the current system
         nativePackages = mkPackagesForTarget system;
 
@@ -147,6 +156,7 @@
           server = nativePackages.server;
           core = nativePackages.core;
           server-oci = nativePackages.server-oci;
+          crane-cli = pkgs.crane;
         } // (if pkgs.stdenv.isDarwin then {
           # On macOS, provide Linux cross-compiled packages
           server-x86_64-linux = linuxPackages.x86_64-linux.server;
@@ -174,6 +184,25 @@
           # Verify builds work
           server-builds = nativePackages.server;
           core-builds = nativePackages.core;
+
+          # Verify code formatting
+          formatting = craneLib.cargoFmt {
+            inherit (commonArgs) src;
+            pname = "eidolons-fmt";
+          };
+
+          # Verify no Clippy warnings
+          clippy = craneLib.cargoClippy (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "eidolons-clippy";
+            cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+          });
+
+          # Run unit tests
+          tests = craneLib.cargoTest (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "eidolons-tests";
+          });
         };
       }
     );

@@ -18,7 +18,7 @@ nix build '.#server-oci'              # Server OCI/Docker image
 nix build '.#server-x86_64-linux'
 nix build '.#server-aarch64-linux'
 
-# Run all checks
+# Run all checks (builds, formatting, clippy, tests)
 nix flake check
 ```
 
