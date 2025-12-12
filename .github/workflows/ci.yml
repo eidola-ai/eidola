@@ -134,8 +134,9 @@ jobs:
             # Authenticate once for GHCR
             crane auth login ghcr.io -u "$GITHUB_ACTOR" -p "$GITHUB_TOKEN"
 
-            tmpdir="$(mktemp -d)"
-            trap 'rm -rf "$tmpdir"' EXIT
+            # Use a local directory for intermediate files. The GitHub Actions runner
+            # is ephemeral, so explicit cleanup is not necessary.
+            mkdir -p ./oci-images
 
             # dockerTools outputs gzip-compressed archives; crane expects plain tar
             gunzip_archive() {
@@ -145,8 +146,8 @@ jobs:
             }
 
             # Decompress archives once
-            tar_x86="${tmpdir}/result-oci-x86.tar"
-            tar_arm="${tmpdir}/result-oci-arm.tar"
+            tar_x86="./oci-images/result-oci-x86.tar"
+            tar_arm="./oci-images/result-oci-arm.tar"
             gunzip_archive result-oci-x86 "$tar_x86"
             gunzip_archive result-oci-arm "$tar_arm"
 
