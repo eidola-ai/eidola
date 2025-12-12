@@ -141,31 +141,30 @@ jobs:
             # Authenticate once for GHCR
             crane auth login ghcr.io -u "$GITHUB_ACTOR" -p "$GITHUB_TOKEN"
 
+            tmpdir="$(mktemp -d)"
+            trap 'rm -rf "$tmpdir"' EXIT
+
             # dockerTools outputs gzip-compressed archives; crane expects plain tar
-            unpack_archive() {
+            gunzip_archive() {
               local gz="$1"
-              local out
-              out="$(mktemp /tmp/image-XXXX.tar)"
+              local out="$2"
               gzip -dc "$gz" > "$out"
-              echo "$out"
             }
 
-            push_arch() {
-              local archive="$1"
-              local tag="$2"
-              local tar
-              tar="$(unpack_archive "$archive")"
-              crane push "$tar" "${IMAGE}:${tag}"
-            }
+            # Decompress archives once
+            tar_x86="${tmpdir}/result-oci-x86.tar"
+            tar_arm="${tmpdir}/result-oci-arm.tar"
+            gunzip_archive result-oci-x86 "$tar_x86"
+            gunzip_archive result-oci-arm "$tar_arm"
 
             # Push architecture-specific images
-            push_arch result-oci-x86 "${TAG_PREFIX}-amd64"
-            push_arch result-oci-arm "${TAG_PREFIX}-arm64"
+            crane push "$tar_x86" "${IMAGE}:${TAG_PREFIX}-amd64"
+            crane push "$tar_arm" "${IMAGE}:${TAG_PREFIX}-arm64"
 
             # Optional "latest" tags for main
             if [ "${IS_MAIN}" = "true" ]; then
-              push_arch result-oci-x86 "latest-amd64"
-              push_arch result-oci-arm "latest-arm64"
+              crane push "$tar_x86" "${IMAGE}:latest-amd64"
+              crane push "$tar_arm" "${IMAGE}:latest-arm64"
             fi
 
             # Create multi-arch manifests pointing at the uploaded images
