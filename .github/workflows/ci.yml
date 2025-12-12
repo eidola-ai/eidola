@@ -52,39 +52,36 @@ jobs:
       - name: Build all packages
         run: |
           # Native macOS packages
-          nix build '.#server' -L
-          nix build '.#core' -L
-          nix build '.#server-oci' -L
+          nix build '.#server' -L -o result-macos
+          nix build '.#core' -L -o result-core
 
           # Cross-compiled Linux packages
-          nix build '.#server-x86_64-linux' -L
-          nix build '.#server-aarch64-linux' -L
-          nix build '.#server-oci-x86_64-linux' -L
-          nix build '.#server-oci-aarch64-linux' -L
+          nix build '.#server-x86_64-linux' -L -o result-linux-x86
+          nix build '.#server-aarch64-linux' -L -o result-linux-arm
+
+          # OCI images (Linux only)
+          nix build '.#server-oci-x86_64-linux' -L -o result-oci-x86
+          nix build '.#server-oci-aarch64-linux' -L -o result-oci-arm
 
       - name: Verify build outputs
         run: |
           echo "=== Native macOS server ==="
-          file result/bin/eidolons-server || true
+          file result-macos/bin/eidolons-server
 
           echo "=== Linux x86_64 server ==="
-          nix build '.#server-x86_64-linux' -o result-linux-x86
           file result-linux-x86/bin/eidolons-server
 
           echo "=== Linux aarch64 server ==="
-          nix build '.#server-aarch64-linux' -o result-linux-arm
           file result-linux-arm/bin/eidolons-server
 
           echo "=== OCI images ==="
-          nix build '.#server-oci-x86_64-linux' -o result-oci-x86
-          nix build '.#server-oci-aarch64-linux' -o result-oci-arm
           ls -lh result-oci-*
 
       - name: Upload macOS server binary
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: eidolons-server-macos-aarch64
-          path: result/bin/eidolons-server
+          path: result-macos/bin/eidolons-server
           if-no-files-found: error
 
       - name: Upload Linux x86_64 server binary
