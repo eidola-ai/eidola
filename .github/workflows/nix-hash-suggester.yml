@@ -1,0 +1,110 @@
+name: Nix Hash Suggester
+
+on:
+  workflow_run:
+    # This workflow runs when the workflow with the name "CI" completes.
+    workflows: ["CI"]
+    types:
+      - completed
+
+jobs:
+  suggest-fix:
+    # This job only runs for failed pull requests created by Dependabot.
+    if: >
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to post a review on the pull request.
+      pull-requests: write
+      # Required to check out the repository content.
+      contents: read
+
+    steps:
+      - name: Get PR Number from SHA
+        id: get-pr-number
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          PR_NUMBER=$(gh pr list --state open --search "$HEAD_SHA" --json number -q '.[0].number')
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "No open PR found for SHA $HEAD_SHA. Exiting."
+            exit 0 # Exit gracefully, not an error
+          fi
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Download and Parse Logs for New Hash
+        id: parse-logs
+        if: steps.get-pr-number.outputs.pr_number
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          # Get the ID of the 'Build all platforms' job from the failed workflow
+          JOB_ID=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" -q '.jobs[] | select(.name == "Build all platforms") | .id')
+          if [[ -z "$JOB_ID" ]]; then
+            echo "Could not find 'Build all platforms' job in the failed workflow."
+            exit 0
+          fi
+
+          # Download the logs for that job
+          gh api "repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job-logs.zip
+          unzip -o job-logs.zip
+
+          # Nix's hash mismatch error is very predictable. We search for the "got:" line.
+          # The log file from the 'Run all checks' step will contain the error.
+          NEW_HASH=$(grep -m 1 'got:' *.txt | awk '{print $2}')
+
+          if [[ -z "$NEW_HASH" ]]; then
+            echo "Failed to extract new hash from logs. CI probably failed for a different reason."
+            echo "is_hash_failure=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found new hash: $NEW_HASH"
+            echo "is_hash_failure=true" >> "$GITHUB_OUTPUT"
+            echo "new_hash=$NEW_HASH" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post Review Suggestion
+        if: steps.parse-logs.outputs.is_hash_failure == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.get-pr-number.outputs.pr_number }}
+          NEW_HASH: ${{ steps.parse-logs.outputs.new_hash }}
+        run: |
+          # Check out the code from the PR branch to find the line to comment on
+          gh pr checkout "$PR_NUMBER"
+
+          # Find the line content and number of the first sha256 to be replaced
+          LINE_TO_REPLACE=$(grep -m 1 'sha256 = "sha256' flake.nix)
+          LINE_NUMBER=$(grep -n -m 1 'sha256 = "sha256' flake.nix | cut -d':' -f1)
+
+          if [[ -z "$LINE_NUMBER" ]]; then
+            echo "Could not find the sha256 line in flake.nix"
+            exit 1
+          fi
+
+          # Capture the indentation of the original line to format the suggestion correctly
+          INDENTATION=$(echo "$LINE_TO_REPLACE" | awk -F'[^ ]' '{print $1}')
+
+          SUGGESTION_BODY="I believe this \`sha256\` needs to be updated. Here is the new one I found from the build logs:
+          \`\`\`suggestion
+          ${INDENTATION}sha256 = \"${NEW_HASH}\";
+          \`\`\`"
+
+          REVIEW_BODY="🤖 **Nix Hash Update Suggested**
+
+          The \`CI\` workflow failed due to a \`sha256\` mismatch. I have left a suggestion to update the first outdated hash I found in \`flake.nix\`.
+
+          **Note:** You may need to apply this new hash in other places in the file."
+
+          # Post a review on the PR with a line-specific suggestion
+          gh api --silent \
+            -X POST \
+            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+            -f event='COMMENT' \
+            -f body="$REVIEW_BODY" \
+            --field "comments[0][path]=flake.nix" \
+            --field "comments[0][line]=${LINE_NUMBER}" \
+            --field "comments[0][body]=${SUGGESTION_BODY}"

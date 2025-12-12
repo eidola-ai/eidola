@@ -7,7 +7,7 @@
 # We have drawn our list from https://github.com/mozilla/rust-android-gradle.
 
 [toolchain]
-channel = "1.91.1"
+channel = "1.92.0"
 targets = [
     # macOS
     "aarch64-apple-darwin",
