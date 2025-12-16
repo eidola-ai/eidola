@@ -12,7 +12,7 @@ jobs:
   build-all-platforms:
     name: Build all platforms
     runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
