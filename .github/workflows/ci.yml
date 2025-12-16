@@ -77,13 +77,10 @@ jobs:
 
       - name: Run Swift tests
         run: |
-          # Build macOS library for testing
-          nix develop -c cargo build --release --lib -p eidolons
-
-          # Create XCFramework for Swift Package Manager
+          # Create XCFramework from the Nix-built core library
           mkdir -p target/apple
           xcodebuild -create-xcframework \
-            -library target/release/libeidolons.dylib \
+            -library result-core/lib/libeidolons.dylib \
             -output target/apple/libeidolons-rs.xcframework
 
           # Run Swift tests

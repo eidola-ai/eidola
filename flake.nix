@@ -63,7 +63,9 @@
 
           # Deterministic build settings
           CARGO_BUILD_JOBS = "1";  # Single-threaded for reproducibility
+          CARGO_INCREMENTAL = "false"; # Disable incremental compilation
           SOURCE_DATE_EPOCH = "0"; # Fixed timestamp
+          ZERO_AR_DATE = "1"; # Reproducible ar/ranlib archives
 
           # Network isolation during build
           CARGO_NET_OFFLINE = "true";
@@ -163,7 +165,8 @@
         } else {};
 
         # Swift/Apple-specific packages (only on macOS)
-        applePackages = if pkgs.stdenv.isDarwin then {
+        # Note: rec is used so attributes can reference each other (e.g., swift-bindings uses uniffi-bindgen-swift)
+        applePackages = if pkgs.stdenv.isDarwin then rec {
           # Build uniffi-bindgen-swift tool
           uniffi-bindgen-swift = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
@@ -238,20 +241,27 @@
           };
 
           # Script to build full XCFramework with all iOS targets
-          # This uses system Xcode and is not fully deterministic
+          # This uses system Xcode and is not fully deterministic, but we apply
+          # reproducibility settings where possible.
           build-xcframework = pkgs.writeShellScriptBin "build-xcframework" ''
             set -euo pipefail
 
             echo "Building XCFramework for all Apple platforms..."
             echo "Note: This requires Xcode and uses system SDKs"
 
-            # Define architectures and their Rust targets
-            declare -A TARGETS=(
-              ["aarch64-apple-darwin"]="macOS (Apple Silicon)"
-              ["x86_64-apple-darwin"]="macOS (Intel)"
-              ["aarch64-apple-ios"]="iOS (Device)"
-              ["aarch64-apple-ios-sim"]="iOS Simulator (Apple Silicon)"
-              ["x86_64-apple-ios"]="iOS Simulator (Intel)"
+            # Reproducibility settings for builds outside Nix sandbox
+            export SOURCE_DATE_EPOCH=0
+            export ZERO_AR_DATE=1           # Reproducible ar/ranlib archives
+            export CARGO_INCREMENTAL=0      # Disable incremental compilation
+            export RUSTFLAGS="-C debuginfo=0 -C target-cpu=generic"
+
+            # Define architectures and their Rust targets (sorted for deterministic order)
+            TARGETS=(
+              "aarch64-apple-darwin"
+              "aarch64-apple-ios"
+              "aarch64-apple-ios-sim"
+              "x86_64-apple-darwin"
+              "x86_64-apple-ios"
             )
 
             # Build directory
@@ -259,9 +269,9 @@
             XCFRAMEWORK_DIR="target/apple"
             mkdir -p "$BUILD_DIR" "$XCFRAMEWORK_DIR"
 
-            # Build for each target
-            for target in "''${!TARGETS[@]}"; do
-              echo "Building for $target (''${TARGETS[$target]})..."
+            # Build for each target (in sorted order for reproducibility)
+            for target in "''${TARGETS[@]}"; do
+              echo "Building for $target..."
               cargo build --release --lib -p eidolons --target "$target"
             done
 
@@ -284,12 +294,12 @@
             echo "2. Run Swift Package Manager: cd core && swift build"
           '';
 
-          # Script to run Swift tests (builds XCFramework first)
+          # Script to run Swift tests
           swift-test = pkgs.writeShellScriptBin "swift-test" ''
             set -euo pipefail
 
-            echo "Building macOS library..."
-            cargo build --release --lib -p eidolons
+            echo "Building macOS library via Nix..."
+            nix build .#core -o result-core
 
             echo "Creating XCFramework for testing..."
             XCFRAMEWORK_DIR="target/apple"
@@ -297,8 +307,11 @@
             rm -rf "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
 
             xcodebuild -create-xcframework \
-              -library "target/release/libeidolons.dylib" \
+              -library result-core/lib/libeidolons.dylib \
               -output "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+
+            # Clean up build symlink
+            rm result-core
 
             echo "Running Swift tests..."
             cd core
@@ -309,45 +322,21 @@
           update-swift-bindings = pkgs.writeShellScriptBin "update-swift-bindings" ''
             set -euo pipefail
 
-            echo "Generating Swift bindings..."
+            echo "Building Swift bindings via Nix..."
+            nix build .#swift-bindings -o result-swift-bindings
 
-            # Build the core library and bindgen tool
-            echo "Building core library..."
-            cargo build --release --lib -p eidolons
-
-            echo "Building uniffi-bindgen-swift..."
-            cargo build --release -p uniffi-bindgen-swift
-
-            # Find the built dylib (will be in target/release)
-            DYLIB="target/release/libeidolons.dylib"
-
-            if [ ! -f "$DYLIB" ]; then
-              echo "Error: Could not find $DYLIB"
-              exit 1
-            fi
-
-            # Clean output directories
+            # Clean and update output directories
             SWIFT_DIR="core/swift/Sources/EidolonsCore"
             FFI_DIR="core/swift/Sources/EidolonsCoreFFI"
             rm -rf "$SWIFT_DIR" "$FFI_DIR"
             mkdir -p "$SWIFT_DIR" "$FFI_DIR"
 
-            # Generate bindings to temp directory
-            TEMP_OUT=$(mktemp -d)
-            echo "Generating Swift bindings..."
-            target/release/uniffi-bindgen-swift \
-              --swift-sources --headers --modulemap \
-              --metadata-no-deps \
-              "$DYLIB" \
-              "$TEMP_OUT" \
-              --module-name eidolonsFFI \
-              --modulemap-filename module.modulemap
+            # Copy generated bindings to source tree
+            cp result-swift-bindings/Sources/EidolonsCore/* "$SWIFT_DIR/"
+            cp result-swift-bindings/Sources/EidolonsCoreFFI/* "$FFI_DIR/"
 
-            # Move files to their proper locations
-            mv "$TEMP_OUT"/*.swift "$SWIFT_DIR/"
-            mv "$TEMP_OUT"/*.h "$FFI_DIR/"
-            mv "$TEMP_OUT"/module.modulemap "$FFI_DIR/"
-            rm -rf "$TEMP_OUT"
+            # Clean up build symlink
+            rm result-swift-bindings
 
             echo "Swift bindings updated successfully!"
             echo ""
