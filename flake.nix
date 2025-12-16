@@ -104,11 +104,13 @@
           # Build server dependencies (musl)
           serverArtifacts = craneLibServer.buildDepsOnly (commonArgs // {
             pname = "eidolons-server-deps";
+            cargoExtraArgs = "--package eidolons-server";
           });
 
           # Build core dependencies (gnu)
           coreArtifacts = craneLibCore.buildDepsOnly (commonArgs // {
             pname = "eidolons-core-deps";
+            cargoExtraArgs = "--package eidolons";
           });
 
           # Build the server binary with musl (static)
