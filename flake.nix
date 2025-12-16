@@ -26,10 +26,13 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
+        # SHA256 for rust-toolchain.toml (single source of truth)
+        rustToolchainSha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
+
         # Get the exact Rust toolchain specified in rust-toolchain.toml
         rustToolchain = fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
-          sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
+          sha256 = rustToolchainSha256;
         };
 
         # Create crane library with our Rust toolchain (function form for consistency)
@@ -42,7 +45,6 @@
             let
               baseName = builtins.baseNameOf path;
               pathStr = toString path;
-              rootPath = toString ./.;
             in
             # Include all Rust source files and Cargo files
             (craneLib.filterCargoSources path type)
@@ -89,14 +91,14 @@
           pkgsServerTarget = mkCrossSystem targetSystem "musl";
           craneLibServer = (crane.mkLib pkgsServerTarget).overrideToolchain (_: fenix.packages.${system}.fromToolchainFile {
             file = ./rust-toolchain.toml;
-            sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
+            sha256 = rustToolchainSha256;
           });
 
-          # Core library uses gnu for compatibility with apps
+          # Core library uses glibc for Linux (ignored on macOS where native toolchain is used)
           pkgsCoreTarget = mkCrossSystem targetSystem "gnu";
           craneLibCore = (crane.mkLib pkgsCoreTarget).overrideToolchain (_: fenix.packages.${system}.fromToolchainFile {
             file = ./rust-toolchain.toml;
-            sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
+            sha256 = rustToolchainSha256;
           });
 
           # Build server dependencies (musl)
@@ -167,7 +169,9 @@
             cargoExtraArgs = "--bin uniffi-bindgen-swift";
           });
 
-          # Build core library as cdylib for Swift (native macOS architecture)
+          # Build core library for Swift bindings generation (native macOS)
+          # Note: This is separate from nativePackages.core because it shares cargoArtifacts
+          # with the checks (clippy, tests, fmt), making CI builds more efficient.
           core-swift = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
             pname = "eidolons-swift";
@@ -278,32 +282,6 @@
             echo "2. Run Swift Package Manager: cd core && swift build"
           '';
 
-          # Build macOS-only XCFramework (for testing, deterministic)
-          xcframework-macos = pkgs.stdenv.mkDerivation {
-            name = "libeidolons-rs-xcframework-macos";
-
-            nativeBuildInputs = [ pkgs.darwin.xcode ];
-
-            # Use same deterministic settings
-            SOURCE_DATE_EPOCH = "0";
-
-            dontUnpack = true;
-
-            buildPhase = ''
-              mkdir -p $out
-
-              # Create XCFramework with just the macOS dylib
-              xcodebuild -create-xcframework \
-                -library "${applePackages.core-swift}/lib/libeidolons.dylib" \
-                -output "$out/libeidolons-rs.xcframework"
-            '';
-
-            installPhase = ''
-              echo "XCFramework created at: $out/libeidolons-rs.xcframework"
-              ls -la $out/
-            '';
-          };
-
           # Script to run Swift tests (builds XCFramework first)
           swift-test = pkgs.writeShellScriptBin "swift-test" ''
             set -euo pipefail
@@ -357,6 +335,7 @@
             echo "Generating Swift bindings..."
             target/release/uniffi-bindgen-swift \
               --swift-sources --headers --modulemap \
+              --metadata-no-deps \
               "$DYLIB" \
               "$TEMP_OUT" \
               --module-name eidolonsFFI \
@@ -400,7 +379,6 @@
             uniffi-bindgen-swift
             core-swift
             swift-bindings
-            xcframework-macos
             build-xcframework
             update-swift-bindings
             swift-test;
