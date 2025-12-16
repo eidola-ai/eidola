@@ -32,44 +32,36 @@ let package = Package(
   products: [
     .library(
       name: "EidolonsCore",
-      targets: [
-        "EidolonsCoreFFI"
-
-        // TODO: Wrap the FFI bindings in custom, idiomatic Swift.
-        // "Eidolons",
-      ]
+      targets: ["EidolonsCore"]
     )
   ],
   targets: [
-    // Target the built XCFramework.
+    // The built XCFramework containing the Rust library
     binaryTarget,
 
-    // Target the generated FFI bindings, which depend on the XCFramework.
+    // C module exposing the FFI types from the header
     .target(
-      name: "EidolonsCoreFFI",
+      name: "eidolonsFFI",
       dependencies: [.target(name: "EidolonsCoreRS")],
+      path: "swift/Sources/EidolonsCoreFFI",
+      publicHeadersPath: "."
+    ),
+
+    // Swift bindings that use the FFI types
+    .target(
+      name: "EidolonsCore",
+      dependencies: [
+        .target(name: "eidolonsFFI"),
+        .target(name: "EidolonsCoreRS"),
+      ],
       path: "swift/Sources/EidolonsCore"
     ),
 
-    // Tests for the FFI bindings
+    // Tests for the Swift bindings
     .testTarget(
-      name: "EidolonsCoreFFITests",
-      dependencies: ["EidolonsCoreFFI"],
+      name: "EidolonsCoreTests",
+      dependencies: ["EidolonsCore"],
       path: "swift/Tests/EidolonsCoreTests"
     ),
-
-    // TODO: Wrap the FFI bindings in custom, idiomatic Swift.
-    // .target(
-    //     name: "Eidolons",
-    //     dependencies: [.target(name: "EidolonsCoreFFI")],
-    //     path: "apple/Sources/Eidolons"
-    // ),
-
-    // TODO: Add tests for the Swift wrappers.
-    // .testTarget(
-    //     name: "EidolonsTests",
-    //     dependencies: ["Eidolons"],
-    //     path: "apple/Tests/EidolonsTests"
-    // ),
   ]
 )

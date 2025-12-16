@@ -48,8 +48,10 @@
             (craneLib.filterCargoSources path type)
             # Also include rust-toolchain.toml for fenix
             || (baseName == "rust-toolchain.toml")
-            # Include Swift bindings directory for checks
-            || (pkgs.lib.hasInfix "/core/swift" pathStr);
+            # Include Swift bindings and tests for checks
+            || (pkgs.lib.hasInfix "/core/swift" pathStr)
+            # Include Package.swift for Swift builds
+            || (baseName == "Package.swift");
         };
 
         # Common arguments for all Rust builds - ensures determinism
@@ -189,7 +191,9 @@
             dontUnpack = true;
 
             buildPhase = ''
+              # Create output directories
               mkdir -p $out/Sources/EidolonsCore
+              mkdir -p $out/Sources/EidolonsCoreFFI
 
               # uniffi-bindgen-swift needs access to the Cargo.toml to extract metadata
               # Copy the source tree to allow cargo metadata to work
@@ -199,23 +203,31 @@
               # Find the dylib - it will be in the lib output
               DYLIB="${applePackages.core-swift}/lib/libeidolons.dylib"
 
-              # Generate Swift bindings
-              # Note: Must specify what to generate (--swift-sources, --headers, --modulemap)
-              # Then: library_path out_dir [options]
-              # Use --metadata-no-deps to avoid network access during metadata extraction
+              # Generate Swift bindings to a temp directory first
+              TEMP_OUT=$(mktemp -d)
               uniffi-bindgen-swift \
                 --swift-sources --headers --modulemap \
                 --metadata-no-deps \
                 "$DYLIB" \
-                $out/Sources/EidolonsCore \
-                --module-name EidolonsCoreFFI \
+                "$TEMP_OUT" \
+                --module-name eidolonsFFI \
                 --modulemap-filename module.modulemap
+
+              # Move files to their proper locations:
+              # - Swift source goes to EidolonsCore
+              # - Header and modulemap go to EidolonsCoreFFI
+              mv "$TEMP_OUT"/*.swift $out/Sources/EidolonsCore/
+              mv "$TEMP_OUT"/*.h $out/Sources/EidolonsCoreFFI/
+              mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolonsCoreFFI/
             '';
 
             installPhase = ''
               # Output is already in $out from buildPhase
               echo "Generated Swift bindings:"
+              echo "EidolonsCore (Swift):"
               ls -la $out/Sources/EidolonsCore/
+              echo "EidolonsCoreFFI (C headers):"
+              ls -la $out/Sources/EidolonsCoreFFI/
             '';
           };
 
@@ -266,6 +278,53 @@
             echo "2. Run Swift Package Manager: cd core && swift build"
           '';
 
+          # Build macOS-only XCFramework (for testing, deterministic)
+          xcframework-macos = pkgs.stdenv.mkDerivation {
+            name = "libeidolons-rs-xcframework-macos";
+
+            nativeBuildInputs = [ pkgs.darwin.xcode ];
+
+            # Use same deterministic settings
+            SOURCE_DATE_EPOCH = "0";
+
+            dontUnpack = true;
+
+            buildPhase = ''
+              mkdir -p $out
+
+              # Create XCFramework with just the macOS dylib
+              xcodebuild -create-xcframework \
+                -library "${applePackages.core-swift}/lib/libeidolons.dylib" \
+                -output "$out/libeidolons-rs.xcframework"
+            '';
+
+            installPhase = ''
+              echo "XCFramework created at: $out/libeidolons-rs.xcframework"
+              ls -la $out/
+            '';
+          };
+
+          # Script to run Swift tests (builds XCFramework first)
+          swift-test = pkgs.writeShellScriptBin "swift-test" ''
+            set -euo pipefail
+
+            echo "Building macOS library..."
+            cargo build --release --lib -p eidolons
+
+            echo "Creating XCFramework for testing..."
+            XCFRAMEWORK_DIR="target/apple"
+            mkdir -p "$XCFRAMEWORK_DIR"
+            rm -rf "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+
+            xcodebuild -create-xcframework \
+              -library "target/release/libeidolons.dylib" \
+              -output "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+
+            echo "Running Swift tests..."
+            cd core
+            swift test
+          '';
+
           # Script to update Swift bindings in the source tree
           update-swift-bindings = pkgs.writeShellScriptBin "update-swift-bindings" ''
             set -euo pipefail
@@ -277,7 +336,7 @@
             cargo build --release --lib -p eidolons
 
             echo "Building uniffi-bindgen-swift..."
-            cargo build --release --bin uniffi-bindgen-swift
+            cargo build --release -p uniffi-bindgen-swift
 
             # Find the built dylib (will be in target/release)
             DYLIB="target/release/libeidolons.dylib"
@@ -287,24 +346,35 @@
               exit 1
             fi
 
-            # Clean output directory
-            OUTPUT_DIR="core/swift/Sources/EidolonsCore"
-            rm -rf "$OUTPUT_DIR"
-            mkdir -p "$OUTPUT_DIR"
+            # Clean output directories
+            SWIFT_DIR="core/swift/Sources/EidolonsCore"
+            FFI_DIR="core/swift/Sources/EidolonsCoreFFI"
+            rm -rf "$SWIFT_DIR" "$FFI_DIR"
+            mkdir -p "$SWIFT_DIR" "$FFI_DIR"
 
-            # Generate bindings
-            echo "Generating Swift bindings to $OUTPUT_DIR..."
+            # Generate bindings to temp directory
+            TEMP_OUT=$(mktemp -d)
+            echo "Generating Swift bindings..."
             target/release/uniffi-bindgen-swift \
               --swift-sources --headers --modulemap \
               "$DYLIB" \
-              "$OUTPUT_DIR" \
-              --module-name EidolonsCoreFFI \
+              "$TEMP_OUT" \
+              --module-name eidolonsFFI \
               --modulemap-filename module.modulemap
+
+            # Move files to their proper locations
+            mv "$TEMP_OUT"/*.swift "$SWIFT_DIR/"
+            mv "$TEMP_OUT"/*.h "$FFI_DIR/"
+            mv "$TEMP_OUT"/module.modulemap "$FFI_DIR/"
+            rm -rf "$TEMP_OUT"
 
             echo "Swift bindings updated successfully!"
             echo ""
-            echo "Generated files:"
-            ls -lh "$OUTPUT_DIR"
+            echo "Generated Swift files:"
+            ls -lh "$SWIFT_DIR"
+            echo ""
+            echo "Generated FFI headers:"
+            ls -lh "$FFI_DIR"
             echo ""
             echo "Don't forget to commit these changes!"
           '';
@@ -330,8 +400,10 @@
             uniffi-bindgen-swift
             core-swift
             swift-bindings
+            xcframework-macos
             build-xcframework
-            update-swift-bindings;
+            update-swift-bindings
+            swift-test;
         } else {});
 
         # Development shell with Rust toolchain and tools
@@ -345,6 +417,7 @@
             # Swift/Apple development tools
             applePackages.update-swift-bindings
             applePackages.build-xcframework
+            applePackages.swift-test
           ] else []);
 
           # Same environment variables as builds for consistency
@@ -352,9 +425,10 @@
           RUSTFLAGS = "-C debuginfo=0 -C target-cpu=generic";
 
           shellHook = if pkgs.stdenv.isDarwin then ''
-            echo "Swift bindings commands available:"
+            echo "Swift commands available:"
             echo "  update-swift-bindings  - Generate Swift bindings"
             echo "  build-xcframework      - Build XCFramework for all Apple platforms"
+            echo "  swift-test             - Run Swift tests"
           '' else "";
         };
 
@@ -389,24 +463,45 @@
           } ''
             echo "Checking if committed Swift bindings match generated ones..."
 
-            # Copy generated bindings to temp location
-            GENERATED="${applePackages.swift-bindings}/Sources/EidolonsCore"
-            COMMITTED="${src}/core/swift/Sources/EidolonsCore"
+            # Check Swift sources
+            GENERATED_SWIFT="${applePackages.swift-bindings}/Sources/EidolonsCore"
+            COMMITTED_SWIFT="${src}/core/swift/Sources/EidolonsCore"
 
-            # Check if committed bindings exist
-            if [ ! -d "$COMMITTED" ] || [ -z "$(ls -A "$COMMITTED" 2>/dev/null)" ]; then
+            if [ ! -d "$COMMITTED_SWIFT" ] || [ -z "$(ls -A "$COMMITTED_SWIFT" 2>/dev/null)" ]; then
               echo "ERROR: No committed Swift bindings found at core/swift/Sources/EidolonsCore/"
               echo "Run: nix run .#update-swift-bindings"
               echo "Then commit the generated files."
               exit 1
             fi
 
-            # Compare generated vs committed
-            if ! diff -r "$GENERATED" "$COMMITTED"; then
+            # Check FFI headers
+            GENERATED_FFI="${applePackages.swift-bindings}/Sources/EidolonsCoreFFI"
+            COMMITTED_FFI="${src}/core/swift/Sources/EidolonsCoreFFI"
+
+            if [ ! -d "$COMMITTED_FFI" ] || [ -z "$(ls -A "$COMMITTED_FFI" 2>/dev/null)" ]; then
+              echo "ERROR: No committed FFI headers found at core/swift/Sources/EidolonsCoreFFI/"
+              echo "Run: nix run .#update-swift-bindings"
+              echo "Then commit the generated files."
+              exit 1
+            fi
+
+            # Compare generated vs committed (Swift)
+            if ! diff -r "$GENERATED_SWIFT" "$COMMITTED_SWIFT"; then
               echo ""
               echo "ERROR: Committed Swift bindings don't match generated ones!"
               echo ""
-              echo "The Swift bindings in core/swift/Sources/EidolonsCore/ are out of date."
+              echo "To fix this:"
+              echo "  1. Run: nix run .#update-swift-bindings"
+              echo "  2. Review the changes"
+              echo "  3. Commit the updated bindings"
+              echo ""
+              exit 1
+            fi
+
+            # Compare generated vs committed (FFI headers)
+            if ! diff -r "$GENERATED_FFI" "$COMMITTED_FFI"; then
+              echo ""
+              echo "ERROR: Committed FFI headers don't match generated ones!"
               echo ""
               echo "To fix this:"
               echo "  1. Run: nix run .#update-swift-bindings"
