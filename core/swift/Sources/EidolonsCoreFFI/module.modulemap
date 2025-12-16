@@ -1,4 +1,4 @@
-module EidolonsCoreFFI {
+module eidolonsFFI {
     header "eidolonsFFI.h"
     export *
     use "Darwin"
