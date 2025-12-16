@@ -1,0 +1,5 @@
+# Mark generated Swift bindings as generated code
+# This collapses them in GitHub PR diffs and marks them in GitHub's UI
+core/swift/Sources/**/*.swift linguist-generated=true
+core/swift/Sources/**/*.h linguist-generated=true
+core/swift/Sources/**/*.modulemap linguist-generated=true
