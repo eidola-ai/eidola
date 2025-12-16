@@ -1,3 +1,6 @@
-pub fn hello_world() -> String {
-    "Hello, world!".to_string()
+uniffi::setup_scaffolding!();
+
+#[uniffi::export]
+pub fn hello(name: &str) -> String {
+    format!("Hello, {}!", name)
 }
