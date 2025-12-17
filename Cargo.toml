@@ -2,14 +2,14 @@
 
 members = [
     "core",
-    # "core/uniffi-bindgen",
-    # "core/uniffi-bindgen-swift",
+    "core/uniffi-bindgen",
+    "core/uniffi-bindgen-swift",
     "server",
 ]
 resolver = "2"
 
-# [workspace.dependencies]
-# uniffi = "0.28.2"
+[workspace.dependencies]
+uniffi = "0.30.0"
 
 [workspace.package]
 version = "0.1.0"

@@ -3,8 +3,8 @@ name = "eidolons"
 version = "0.1.0"
 edition = "2024"
 
-# [dependencies]
-# uniffi.workspace = true
+[dependencies]
+uniffi.workspace = true
 
 # [build-dependencies]
 

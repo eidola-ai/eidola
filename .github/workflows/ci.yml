@@ -12,7 +12,7 @@ jobs:
   build-all-platforms:
     name: Build all platforms
     runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
@@ -22,11 +22,7 @@ jobs:
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Install Nix
-        uses: cachix/install-nix-action@4e002c8ec80594ecd40e759629461e26c8abed15 # v31.9.0
-        with:
-          # Enable flakes and nix-command
-          extra_nix_config: |
-            experimental-features = nix-command flakes
+        uses: DeterminateSystems/nix-installer-action@ab6bcb2d5af0e904d04aea750e2089e9dc4cbfdd # v13
 
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v8
@@ -36,15 +32,20 @@ jobs:
 
       - name: Run all checks
         run: nix flake check --show-trace
+        # Checks include: formatting, clippy, Rust tests, Swift bindings verification
         # Note: Checks run on current system (aarch64-darwin) only
         # This is sufficient as code quality checks are platform-independent
         # Cross-compiled packages are built and verified below
+        # Swift tests run separately (XCTest requires system Xcode)
 
       - name: Build all packages
         run: |
           # Native macOS packages
           nix build '.#server' -L -o result-macos
           nix build '.#core' -L -o result-core
+
+          # Swift bindings (macOS only)
+          nix build '.#swift-bindings' -L -o result-swift-bindings
 
           # Cross-compiled Linux packages
           nix build '.#server-x86_64-linux' -L -o result-linux-x86
@@ -65,8 +66,24 @@ jobs:
           echo "=== Linux aarch64 server ==="
           file result-linux-arm/bin/eidolons-server
 
+          echo "=== Swift bindings ==="
+          ls -lh result-swift-bindings/Sources/EidolonsCore/
+          ls -lh result-swift-bindings/Sources/EidolonsCoreFFI/
+
           echo "=== OCI images ==="
           ls -lh result-oci-*
+
+      - name: Run Swift tests
+        run: |
+          # Build the XCFramework via Nix (reproducible, no Xcode needed)
+          nix build '.#xcframework' -L -o result-xcframework
+
+          # Set up XCFramework where Package.swift expects it
+          mkdir -p core/target/apple
+          cp -r result-xcframework core/target/apple/libeidolons-rs.xcframework
+
+          # Run Swift tests using system Swift (XCTest requires Xcode)
+          cd core && swift test
 
       - name: Upload macOS server binary
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
