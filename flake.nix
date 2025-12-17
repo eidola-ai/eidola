@@ -26,10 +26,13 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
+        # SHA256 for rust-toolchain.toml (single source of truth)
+        rustToolchainSha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
+
         # Get the exact Rust toolchain specified in rust-toolchain.toml
         rustToolchain = fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
-          sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
+          sha256 = rustToolchainSha256;
         };
 
         # Create crane library with our Rust toolchain (function form for consistency)
@@ -39,10 +42,18 @@
         src = pkgs.lib.cleanSourceWith {
           src = craneLib.path ./.;
           filter = path: type:
+            let
+              baseName = builtins.baseNameOf path;
+              pathStr = toString path;
+            in
             # Include all Rust source files and Cargo files
             (craneLib.filterCargoSources path type)
             # Also include rust-toolchain.toml for fenix
-            || (builtins.baseNameOf path == "rust-toolchain.toml");
+            || (baseName == "rust-toolchain.toml")
+            # Include Swift bindings and tests for checks
+            || (pkgs.lib.hasInfix "/core/swift" pathStr)
+            # Include Package.swift for Swift builds
+            || (baseName == "Package.swift");
         };
 
         # Common arguments for all Rust builds - ensures determinism
@@ -52,7 +63,9 @@
 
           # Deterministic build settings
           CARGO_BUILD_JOBS = "1";  # Single-threaded for reproducibility
+          CARGO_INCREMENTAL = "false"; # Disable incremental compilation
           SOURCE_DATE_EPOCH = "0"; # Fixed timestamp
+          ZERO_AR_DATE = "1"; # Reproducible ar/ranlib archives
 
           # Network isolation during build
           CARGO_NET_OFFLINE = "true";
@@ -80,24 +93,26 @@
           pkgsServerTarget = mkCrossSystem targetSystem "musl";
           craneLibServer = (crane.mkLib pkgsServerTarget).overrideToolchain (_: fenix.packages.${system}.fromToolchainFile {
             file = ./rust-toolchain.toml;
-            sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
+            sha256 = rustToolchainSha256;
           });
 
-          # Core library uses gnu for compatibility with apps
+          # Core library uses glibc for Linux (ignored on macOS where native toolchain is used)
           pkgsCoreTarget = mkCrossSystem targetSystem "gnu";
           craneLibCore = (crane.mkLib pkgsCoreTarget).overrideToolchain (_: fenix.packages.${system}.fromToolchainFile {
             file = ./rust-toolchain.toml;
-            sha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
+            sha256 = rustToolchainSha256;
           });
 
           # Build server dependencies (musl)
           serverArtifacts = craneLibServer.buildDepsOnly (commonArgs // {
             pname = "eidolons-server-deps";
+            cargoExtraArgs = "--package eidolons-server";
           });
 
           # Build core dependencies (gnu)
           coreArtifacts = craneLibCore.buildDepsOnly (commonArgs // {
             pname = "eidolons-core-deps";
+            cargoExtraArgs = "--package eidolons";
           });
 
           # Build the server binary with musl (static)
@@ -149,6 +164,309 @@
           aarch64-linux = mkPackagesForTarget "aarch64-linux";
         } else {};
 
+        # Swift/Apple-specific packages (only on macOS)
+        # Note: rec is used so attributes can reference each other (e.g., swift-bindings uses uniffi-bindgen-swift)
+        applePackages = if pkgs.stdenv.isDarwin then rec {
+          # Helper: Create a minimal single-architecture XCFramework without xcodebuild.
+          # This is sufficient for testing on the current macOS architecture.
+          mkXCFramework = { dylib, arch ? "arm64" }: pkgs.runCommand "xcframework" {
+            nativeBuildInputs = [ pkgs.darwin.cctools ];
+          } ''
+            mkdir -p "$out/macos-${arch}"
+
+            # Copy dylib and fix install_name to use @rpath
+            cp "${dylib}" "$out/macos-${arch}/libeidolons.dylib"
+            install_name_tool -id @rpath/libeidolons.dylib "$out/macos-${arch}/libeidolons.dylib"
+
+            # Create Info.plist describing the XCFramework contents
+            cat > "$out/Info.plist" << EOF
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>AvailableLibraries</key>
+              <array>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>macos-${arch}</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.dylib</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>${arch}</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>macos</string>
+                </dict>
+              </array>
+              <key>CFBundlePackageType</key>
+              <string>XFWK</string>
+              <key>XCFrameworkFormatVersion</key>
+              <string>1.0</string>
+            </dict>
+            </plist>
+            EOF
+          '';
+
+          # Pre-built XCFramework for the current architecture (used by checks and swift-test)
+          xcframework = mkXCFramework {
+            dylib = "${core-swift}/lib/libeidolons.dylib";
+          };
+
+          # Build uniffi-bindgen-swift tool
+          uniffi-bindgen-swift = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "uniffi-bindgen-swift";
+            cargoExtraArgs = "--bin uniffi-bindgen-swift";
+          });
+
+          # Build core library for Swift bindings generation (native macOS)
+          # Note: This is separate from nativePackages.core because it shares cargoArtifacts
+          # with the checks (clippy, tests, fmt), making CI builds more efficient.
+          core-swift = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "eidolons-swift";
+            cargoExtraArgs = "--lib -p eidolons";
+          });
+
+          # Generate Swift bindings from the core library
+          swift-bindings = pkgs.stdenv.mkDerivation {
+            name = "eidolons-swift-bindings";
+
+            # Need the built library, bindgen tool, and cargo for metadata extraction
+            nativeBuildInputs = [
+              applePackages.uniffi-bindgen-swift
+              rustToolchain  # Provides cargo for metadata extraction
+            ];
+
+            # Use same deterministic settings
+            SOURCE_DATE_EPOCH = "0";
+
+            # The generation happens in buildPhase
+            dontUnpack = true;
+
+            buildPhase = ''
+              # Create output directories
+              mkdir -p $out/Sources/EidolonsCore
+              mkdir -p $out/Sources/EidolonsCoreFFI
+
+              # uniffi-bindgen-swift needs access to the Cargo.toml to extract metadata
+              # Copy the source tree to allow cargo metadata to work
+              cp -r ${src}/* .
+              chmod -R +w .
+
+              # Find the dylib - it will be in the lib output
+              DYLIB="${applePackages.core-swift}/lib/libeidolons.dylib"
+
+              # Generate Swift bindings to a temp directory first
+              TEMP_OUT=$(mktemp -d)
+              uniffi-bindgen-swift \
+                --swift-sources --headers --modulemap \
+                --metadata-no-deps \
+                "$DYLIB" \
+                "$TEMP_OUT" \
+                --module-name eidolonsFFI \
+                --modulemap-filename module.modulemap
+
+              # Move files to their proper locations:
+              # - Swift source goes to EidolonsCore
+              # - Header and modulemap go to EidolonsCoreFFI
+              mv "$TEMP_OUT"/*.swift $out/Sources/EidolonsCore/
+              mv "$TEMP_OUT"/*.h $out/Sources/EidolonsCoreFFI/
+              mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolonsCoreFFI/
+            '';
+
+            installPhase = ''
+              # Output is already in $out from buildPhase
+              echo "Generated Swift bindings:"
+              echo "EidolonsCore (Swift):"
+              ls -la $out/Sources/EidolonsCore/
+              echo "EidolonsCoreFFI (C headers):"
+              ls -la $out/Sources/EidolonsCoreFFI/
+            '';
+          };
+
+          # Script to build full XCFramework with all Apple platforms (no Xcode required)
+          build-xcframework = pkgs.writeShellScriptBin "build-xcframework" ''
+            set -euo pipefail
+
+            echo "Building XCFramework for all Apple platforms..."
+
+            # Reproducibility settings
+            export SOURCE_DATE_EPOCH=0
+            export ZERO_AR_DATE=1
+            export CARGO_INCREMENTAL=0
+            export RUSTFLAGS="-C debuginfo=0 -C target-cpu=generic"
+
+            XCFRAMEWORK_DIR="core/target/apple/libeidolons-rs.xcframework"
+            rm -rf "$XCFRAMEWORK_DIR"
+            mkdir -p "$XCFRAMEWORK_DIR"
+
+            # Build and copy each target (cargo outputs to ./target, we copy to core/target/apple)
+            echo "Building aarch64-apple-darwin..."
+            cargo build --release --lib -p eidolons --target aarch64-apple-darwin
+            mkdir -p "$XCFRAMEWORK_DIR/macos-arm64"
+            cp target/aarch64-apple-darwin/release/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-arm64/"
+            install_name_tool -id @rpath/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-arm64/libeidolons.dylib"
+
+            echo "Building x86_64-apple-darwin..."
+            cargo build --release --lib -p eidolons --target x86_64-apple-darwin
+            mkdir -p "$XCFRAMEWORK_DIR/macos-x86_64"
+            cp target/x86_64-apple-darwin/release/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-x86_64/"
+            install_name_tool -id @rpath/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-x86_64/libeidolons.dylib"
+
+            echo "Building aarch64-apple-ios..."
+            cargo build --release --lib -p eidolons --target aarch64-apple-ios
+            mkdir -p "$XCFRAMEWORK_DIR/ios-arm64"
+            cp target/aarch64-apple-ios/release/libeidolons.a "$XCFRAMEWORK_DIR/ios-arm64/"
+
+            echo "Building aarch64-apple-ios-sim..."
+            cargo build --release --lib -p eidolons --target aarch64-apple-ios-sim
+            mkdir -p "$XCFRAMEWORK_DIR/ios-arm64-simulator"
+            cp target/aarch64-apple-ios-sim/release/libeidolons.a "$XCFRAMEWORK_DIR/ios-arm64-simulator/"
+
+            echo "Building x86_64-apple-ios..."
+            cargo build --release --lib -p eidolons --target x86_64-apple-ios
+            mkdir -p "$XCFRAMEWORK_DIR/ios-x86_64-simulator"
+            cp target/x86_64-apple-ios/release/libeidolons.a "$XCFRAMEWORK_DIR/ios-x86_64-simulator/"
+
+            # Create Info.plist
+            cat > "$XCFRAMEWORK_DIR/Info.plist" << 'PLIST'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>AvailableLibraries</key>
+              <array>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>macos-arm64</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.dylib</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>arm64</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>macos</string>
+                </dict>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>macos-x86_64</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.dylib</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>x86_64</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>macos</string>
+                </dict>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>ios-arm64</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>arm64</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>ios</string>
+                </dict>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>ios-arm64-simulator</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>arm64</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>ios</string>
+                  <key>SupportedPlatformVariant</key>
+                  <string>simulator</string>
+                </dict>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>ios-x86_64-simulator</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>x86_64</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>ios</string>
+                  <key>SupportedPlatformVariant</key>
+                  <string>simulator</string>
+                </dict>
+              </array>
+              <key>CFBundlePackageType</key>
+              <string>XFWK</string>
+              <key>XCFrameworkFormatVersion</key>
+              <string>1.0</string>
+            </dict>
+            </plist>
+            PLIST
+
+            echo ""
+            echo "XCFramework created at: $XCFRAMEWORK_DIR"
+            echo ""
+            echo "Contents:"
+            ls -la "$XCFRAMEWORK_DIR"
+            echo ""
+            echo "Next steps:"
+            echo "1. Swift bindings are at: core/swift/Sources/EidolonsCore/"
+            echo "2. Run Swift Package Manager: cd core && swift build"
+          '';
+
+          # Script to run Swift tests (uses Nix-built XCFramework, no Xcode required for lib)
+          swift-test = pkgs.writeShellScriptBin "swift-test" ''
+            set -euo pipefail
+
+            echo "Building XCFramework via Nix..."
+            nix build .#xcframework -o result-xcframework
+
+            echo "Setting up XCFramework for Swift PM..."
+            XCFRAMEWORK_DIR="core/target/apple"
+            mkdir -p "$XCFRAMEWORK_DIR"
+            rm -rf "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            cp -r result-xcframework "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            chmod -R +w "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+
+            # Clean up build symlink
+            rm result-xcframework
+
+            echo "Cleaning Swift PM cache (ensures fresh link against new XCFramework)..."
+            rm -rf core/.build
+
+            echo "Running Swift tests..."
+            cd core
+            swift test
+          '';
+
+          # Script to update Swift bindings in the source tree
+          update-swift-bindings = pkgs.writeShellScriptBin "update-swift-bindings" ''
+            set -euo pipefail
+
+            echo "Building Swift bindings via Nix..."
+            nix build .#swift-bindings -o result-swift-bindings
+
+            # Clean and update output directories
+            SWIFT_DIR="core/swift/Sources/EidolonsCore"
+            FFI_DIR="core/swift/Sources/EidolonsCoreFFI"
+            rm -rf "$SWIFT_DIR" "$FFI_DIR"
+            mkdir -p "$SWIFT_DIR" "$FFI_DIR"
+
+            # Copy generated bindings to source tree
+            cp result-swift-bindings/Sources/EidolonsCore/* "$SWIFT_DIR/"
+            cp result-swift-bindings/Sources/EidolonsCoreFFI/* "$FFI_DIR/"
+
+            # Clean up build symlink
+            rm result-swift-bindings
+
+            echo "Swift bindings updated successfully!"
+            echo ""
+            echo "Generated Swift files:"
+            ls -lh "$SWIFT_DIR"
+            echo ""
+            echo "Generated FFI headers:"
+            ls -lh "$FFI_DIR"
+            echo ""
+            echo "Don't forget to commit these changes!"
+          '';
+        } else {};
+
       in {
         # Default packages for current system
         packages = {
@@ -163,6 +481,16 @@
           server-aarch64-linux = linuxPackages.aarch64-linux.server;
           server-oci-x86_64-linux = linuxPackages.x86_64-linux.server-oci;
           server-oci-aarch64-linux = linuxPackages.aarch64-linux.server-oci;
+
+          # Swift/Apple packages
+          inherit (applePackages)
+            uniffi-bindgen-swift
+            core-swift
+            swift-bindings
+            xcframework
+            build-xcframework
+            update-swift-bindings
+            swift-test;
         } else {});
 
         # Development shell with Rust toolchain and tools
@@ -172,11 +500,24 @@
             cargo-watch
             rust-analyzer
             pinact  # Pin GitHub Actions to SHAs
-          ];
+          ] ++ (if pkgs.stdenv.isDarwin then [
+            # Swift/Apple development tools
+            applePackages.update-swift-bindings
+            applePackages.build-xcframework
+            applePackages.swift-test
+            pkgs.darwin.cctools  # Provides install_name_tool for XCFramework creation
+          ] else []);
 
           # Same environment variables as builds for consistency
           SOURCE_DATE_EPOCH = "0";
           RUSTFLAGS = "-C debuginfo=0 -C target-cpu=generic";
+
+          shellHook = if pkgs.stdenv.isDarwin then ''
+            echo "Swift commands available:"
+            echo "  update-swift-bindings  - Generate Swift bindings"
+            echo "  build-xcframework      - Build XCFramework for all Apple platforms"
+            echo "  swift-test             - Run Swift tests"
+          '' else "";
         };
 
         # Checks (run with `nix flake check`)
@@ -203,7 +544,70 @@
             inherit cargoArtifacts;
             pname = "eidolons-tests";
           });
-        };
+        } // (if pkgs.stdenv.isDarwin then {
+          # Note: Swift tests require XCTest which is only available via Xcode, not in
+          # open-source Swift. Tests run in CI using system Swift after setting up the
+          # Nix-built XCFramework. The xcframework package is reproducible; only the
+          # test execution uses system tools.
+
+          # Verify committed Swift bindings match generated ones
+          swift-bindings-current = pkgs.runCommand "check-swift-bindings" {
+            buildInputs = [ pkgs.diffutils ];
+          } ''
+            echo "Checking if committed Swift bindings match generated ones..."
+
+            # Check Swift sources
+            GENERATED_SWIFT="${applePackages.swift-bindings}/Sources/EidolonsCore"
+            COMMITTED_SWIFT="${src}/core/swift/Sources/EidolonsCore"
+
+            if [ ! -d "$COMMITTED_SWIFT" ] || [ -z "$(ls -A "$COMMITTED_SWIFT" 2>/dev/null)" ]; then
+              echo "ERROR: No committed Swift bindings found at core/swift/Sources/EidolonsCore/"
+              echo "Run: nix run .#update-swift-bindings"
+              echo "Then commit the generated files."
+              exit 1
+            fi
+
+            # Check FFI headers
+            GENERATED_FFI="${applePackages.swift-bindings}/Sources/EidolonsCoreFFI"
+            COMMITTED_FFI="${src}/core/swift/Sources/EidolonsCoreFFI"
+
+            if [ ! -d "$COMMITTED_FFI" ] || [ -z "$(ls -A "$COMMITTED_FFI" 2>/dev/null)" ]; then
+              echo "ERROR: No committed FFI headers found at core/swift/Sources/EidolonsCoreFFI/"
+              echo "Run: nix run .#update-swift-bindings"
+              echo "Then commit the generated files."
+              exit 1
+            fi
+
+            # Compare generated vs committed (Swift)
+            if ! diff -r "$GENERATED_SWIFT" "$COMMITTED_SWIFT"; then
+              echo ""
+              echo "ERROR: Committed Swift bindings don't match generated ones!"
+              echo ""
+              echo "To fix this:"
+              echo "  1. Run: nix run .#update-swift-bindings"
+              echo "  2. Review the changes"
+              echo "  3. Commit the updated bindings"
+              echo ""
+              exit 1
+            fi
+
+            # Compare generated vs committed (FFI headers)
+            if ! diff -r "$GENERATED_FFI" "$COMMITTED_FFI"; then
+              echo ""
+              echo "ERROR: Committed FFI headers don't match generated ones!"
+              echo ""
+              echo "To fix this:"
+              echo "  1. Run: nix run .#update-swift-bindings"
+              echo "  2. Review the changes"
+              echo "  3. Commit the updated bindings"
+              echo ""
+              exit 1
+            fi
+
+            echo "✓ Swift bindings are up to date"
+            touch $out
+          '';
+        } else {});
       }
     );
 }

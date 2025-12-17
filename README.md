@@ -26,3 +26,12 @@ nix flake check
 ```bash
 nix develop  # Provides Rust toolchain, cargo-watch, rust-analyzer
 ```
+
+**Swift bindings (macOS only):**
+```bash
+nix run '.#update-swift-bindings'  # Generate Swift bindings from Rust
+nix run '.#build-xcframework'      # Build XCFramework for iOS/macOS
+nix build '.#swift-bindings'       # Build bindings (deterministic)
+```
+
+Generated Swift bindings are committed to `core/swift/Sources/EidolonsCore/` and verified by CI to stay in sync with the Rust code.
