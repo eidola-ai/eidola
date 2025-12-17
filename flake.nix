@@ -169,14 +169,11 @@
         applePackages = if pkgs.stdenv.isDarwin then rec {
           # Helper: Create a minimal single-architecture XCFramework without xcodebuild.
           # This is sufficient for testing on the current macOS architecture.
-          mkXCFramework = { dylib, arch ? "arm64" }: pkgs.runCommand "xcframework" {
-            nativeBuildInputs = [ pkgs.darwin.cctools ];
-          } ''
+          mkXCFramework = { staticlib, arch ? "arm64" }: pkgs.runCommand "xcframework" {} ''
             mkdir -p "$out/macos-${arch}"
 
-            # Copy dylib and fix install_name to use @rpath
-            cp "${dylib}" "$out/macos-${arch}/libeidolons.dylib"
-            install_name_tool -id @rpath/libeidolons.dylib "$out/macos-${arch}/libeidolons.dylib"
+            # Copy static library
+            cp "${staticlib}" "$out/macos-${arch}/libeidolons.a"
 
             # Create Info.plist describing the XCFramework contents
             cat > "$out/Info.plist" << EOF
@@ -190,7 +187,7 @@
                   <key>LibraryIdentifier</key>
                   <string>macos-${arch}</string>
                   <key>LibraryPath</key>
-                  <string>libeidolons.dylib</string>
+                  <string>libeidolons.a</string>
                   <key>SupportedArchitectures</key>
                   <array><string>${arch}</string></array>
                   <key>SupportedPlatform</key>
@@ -208,7 +205,7 @@
 
           # Pre-built XCFramework for the current architecture (used by checks and swift-test)
           xcframework = mkXCFramework {
-            dylib = "${core-swift}/lib/libeidolons.dylib";
+            staticlib = "${core-swift}/lib/libeidolons.a";
           };
 
           # Build uniffi-bindgen-swift tool
@@ -300,35 +297,55 @@
             rm -rf "$XCFRAMEWORK_DIR"
             mkdir -p "$XCFRAMEWORK_DIR"
 
-            # Build and copy each target (cargo outputs to ./target, we copy to core/target/apple)
+            # XCFrameworks require consistent library types across all platforms.
+            # We use static libraries everywhere because:
+            # 1. iOS builds would require iOS SDK for dynamic library linking
+            # 2. Static libs are simpler - the final app links everything together
+            # 3. Nix can build static libs without escaping to system toolchains
+            CARGO_TOML="core/Cargo.toml"
+            sed -i.bak 's/crate-type = .*/crate-type = ["staticlib"]/' "$CARGO_TOML"
+
+            # Build all targets as static libraries
             echo "Building aarch64-apple-darwin..."
             cargo build --release --lib -p eidolons --target aarch64-apple-darwin
-            mkdir -p "$XCFRAMEWORK_DIR/macos-arm64"
-            cp target/aarch64-apple-darwin/release/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-arm64/"
-            install_name_tool -id @rpath/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-arm64/libeidolons.dylib"
 
             echo "Building x86_64-apple-darwin..."
             cargo build --release --lib -p eidolons --target x86_64-apple-darwin
-            mkdir -p "$XCFRAMEWORK_DIR/macos-x86_64"
-            cp target/x86_64-apple-darwin/release/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-x86_64/"
-            install_name_tool -id @rpath/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-x86_64/libeidolons.dylib"
 
             echo "Building aarch64-apple-ios..."
             cargo build --release --lib -p eidolons --target aarch64-apple-ios
-            mkdir -p "$XCFRAMEWORK_DIR/ios-arm64"
-            cp target/aarch64-apple-ios/release/libeidolons.a "$XCFRAMEWORK_DIR/ios-arm64/"
 
             echo "Building aarch64-apple-ios-sim..."
             cargo build --release --lib -p eidolons --target aarch64-apple-ios-sim
-            mkdir -p "$XCFRAMEWORK_DIR/ios-arm64-simulator"
-            cp target/aarch64-apple-ios-sim/release/libeidolons.a "$XCFRAMEWORK_DIR/ios-arm64-simulator/"
 
             echo "Building x86_64-apple-ios..."
             cargo build --release --lib -p eidolons --target x86_64-apple-ios
-            mkdir -p "$XCFRAMEWORK_DIR/ios-x86_64-simulator"
-            cp target/x86_64-apple-ios/release/libeidolons.a "$XCFRAMEWORK_DIR/ios-x86_64-simulator/"
 
-            # Create Info.plist
+            # Restore original Cargo.toml
+            mv "$CARGO_TOML.bak" "$CARGO_TOML"
+
+            # Create universal binaries with lipo (XCFramework requires combined architectures)
+            echo "Creating universal binaries..."
+
+            # macOS: combine arm64 + x86_64 into universal static lib
+            mkdir -p "$XCFRAMEWORK_DIR/macos-arm64_x86_64"
+            lipo -create \
+              target/aarch64-apple-darwin/release/libeidolons.a \
+              target/x86_64-apple-darwin/release/libeidolons.a \
+              -output "$XCFRAMEWORK_DIR/macos-arm64_x86_64/libeidolons.a"
+
+            # iOS device: single architecture (arm64 only)
+            mkdir -p "$XCFRAMEWORK_DIR/ios-arm64"
+            cp target/aarch64-apple-ios/release/libeidolons.a "$XCFRAMEWORK_DIR/ios-arm64/"
+
+            # iOS simulator: combine arm64 + x86_64 into universal static lib
+            mkdir -p "$XCFRAMEWORK_DIR/ios-arm64_x86_64-simulator"
+            lipo -create \
+              target/aarch64-apple-ios-sim/release/libeidolons.a \
+              target/x86_64-apple-ios/release/libeidolons.a \
+              -output "$XCFRAMEWORK_DIR/ios-arm64_x86_64-simulator/libeidolons.a"
+
+            # Create Info.plist (must match the universal binary directory structure)
             cat > "$XCFRAMEWORK_DIR/Info.plist" << 'PLIST'
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -338,21 +355,14 @@
               <array>
                 <dict>
                   <key>LibraryIdentifier</key>
-                  <string>macos-arm64</string>
+                  <string>macos-arm64_x86_64</string>
                   <key>LibraryPath</key>
-                  <string>libeidolons.dylib</string>
+                  <string>libeidolons.a</string>
                   <key>SupportedArchitectures</key>
-                  <array><string>arm64</string></array>
-                  <key>SupportedPlatform</key>
-                  <string>macos</string>
-                </dict>
-                <dict>
-                  <key>LibraryIdentifier</key>
-                  <string>macos-x86_64</string>
-                  <key>LibraryPath</key>
-                  <string>libeidolons.dylib</string>
-                  <key>SupportedArchitectures</key>
-                  <array><string>x86_64</string></array>
+                  <array>
+                    <string>arm64</string>
+                    <string>x86_64</string>
+                  </array>
                   <key>SupportedPlatform</key>
                   <string>macos</string>
                 </dict>
@@ -368,23 +378,14 @@
                 </dict>
                 <dict>
                   <key>LibraryIdentifier</key>
-                  <string>ios-arm64-simulator</string>
+                  <string>ios-arm64_x86_64-simulator</string>
                   <key>LibraryPath</key>
                   <string>libeidolons.a</string>
                   <key>SupportedArchitectures</key>
-                  <array><string>arm64</string></array>
-                  <key>SupportedPlatform</key>
-                  <string>ios</string>
-                  <key>SupportedPlatformVariant</key>
-                  <string>simulator</string>
-                </dict>
-                <dict>
-                  <key>LibraryIdentifier</key>
-                  <string>ios-x86_64-simulator</string>
-                  <key>LibraryPath</key>
-                  <string>libeidolons.a</string>
-                  <key>SupportedArchitectures</key>
-                  <array><string>x86_64</string></array>
+                  <array>
+                    <string>arm64</string>
+                    <string>x86_64</string>
+                  </array>
                   <key>SupportedPlatform</key>
                   <string>ios</string>
                   <key>SupportedPlatformVariant</key>
