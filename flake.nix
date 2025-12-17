@@ -167,6 +167,50 @@
         # Swift/Apple-specific packages (only on macOS)
         # Note: rec is used so attributes can reference each other (e.g., swift-bindings uses uniffi-bindgen-swift)
         applePackages = if pkgs.stdenv.isDarwin then rec {
+          # Helper: Create a minimal single-architecture XCFramework without xcodebuild.
+          # This is sufficient for testing on the current macOS architecture.
+          mkXCFramework = { dylib, arch ? "arm64" }: pkgs.runCommand "xcframework" {
+            nativeBuildInputs = [ pkgs.darwin.cctools ];
+          } ''
+            mkdir -p "$out/macos-${arch}"
+
+            # Copy dylib and fix install_name to use @rpath
+            cp "${dylib}" "$out/macos-${arch}/libeidolons.dylib"
+            install_name_tool -id @rpath/libeidolons.dylib "$out/macos-${arch}/libeidolons.dylib"
+
+            # Create Info.plist describing the XCFramework contents
+            cat > "$out/Info.plist" << EOF
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>AvailableLibraries</key>
+              <array>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>macos-${arch}</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.dylib</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>${arch}</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>macos</string>
+                </dict>
+              </array>
+              <key>CFBundlePackageType</key>
+              <string>XFWK</string>
+              <key>XCFrameworkFormatVersion</key>
+              <string>1.0</string>
+            </dict>
+            </plist>
+            EOF
+          '';
+
+          # Pre-built XCFramework for the current architecture (used by checks and swift-test)
+          xcframework = mkXCFramework {
+            dylib = "${core-swift}/lib/libeidolons.dylib";
+          };
+
           # Build uniffi-bindgen-swift tool
           uniffi-bindgen-swift = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
@@ -240,78 +284,151 @@
             '';
           };
 
-          # Script to build full XCFramework with all iOS targets
-          # This uses system Xcode and is not fully deterministic, but we apply
-          # reproducibility settings where possible.
+          # Script to build full XCFramework with all Apple platforms (no Xcode required)
           build-xcframework = pkgs.writeShellScriptBin "build-xcframework" ''
             set -euo pipefail
 
             echo "Building XCFramework for all Apple platforms..."
-            echo "Note: This requires Xcode and uses system SDKs"
 
-            # Reproducibility settings for builds outside Nix sandbox
+            # Reproducibility settings
             export SOURCE_DATE_EPOCH=0
-            export ZERO_AR_DATE=1           # Reproducible ar/ranlib archives
-            export CARGO_INCREMENTAL=0      # Disable incremental compilation
+            export ZERO_AR_DATE=1
+            export CARGO_INCREMENTAL=0
             export RUSTFLAGS="-C debuginfo=0 -C target-cpu=generic"
 
-            # Define architectures and their Rust targets (sorted for deterministic order)
-            TARGETS=(
-              "aarch64-apple-darwin"
-              "aarch64-apple-ios"
-              "aarch64-apple-ios-sim"
-              "x86_64-apple-darwin"
-              "x86_64-apple-ios"
-            )
+            XCFRAMEWORK_DIR="core/target/apple/libeidolons-rs.xcframework"
+            rm -rf "$XCFRAMEWORK_DIR"
+            mkdir -p "$XCFRAMEWORK_DIR"
 
-            # Build directory
-            BUILD_DIR="target/apple-libs"
-            XCFRAMEWORK_DIR="target/apple"
-            mkdir -p "$BUILD_DIR" "$XCFRAMEWORK_DIR"
+            # Build and copy each target (cargo outputs to ./target, we copy to core/target/apple)
+            echo "Building aarch64-apple-darwin..."
+            cargo build --release --lib -p eidolons --target aarch64-apple-darwin
+            mkdir -p "$XCFRAMEWORK_DIR/macos-arm64"
+            cp target/aarch64-apple-darwin/release/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-arm64/"
+            install_name_tool -id @rpath/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-arm64/libeidolons.dylib"
 
-            # Build for each target (in sorted order for reproducibility)
-            for target in "''${TARGETS[@]}"; do
-              echo "Building for $target..."
-              cargo build --release --lib -p eidolons --target "$target"
-            done
+            echo "Building x86_64-apple-darwin..."
+            cargo build --release --lib -p eidolons --target x86_64-apple-darwin
+            mkdir -p "$XCFRAMEWORK_DIR/macos-x86_64"
+            cp target/x86_64-apple-darwin/release/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-x86_64/"
+            install_name_tool -id @rpath/libeidolons.dylib "$XCFRAMEWORK_DIR/macos-x86_64/libeidolons.dylib"
 
-            # Create XCFramework
-            echo "Creating XCFramework..."
-            rm -rf "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            echo "Building aarch64-apple-ios..."
+            cargo build --release --lib -p eidolons --target aarch64-apple-ios
+            mkdir -p "$XCFRAMEWORK_DIR/ios-arm64"
+            cp target/aarch64-apple-ios/release/libeidolons.a "$XCFRAMEWORK_DIR/ios-arm64/"
 
-            xcodebuild -create-xcframework \
-              -library "target/aarch64-apple-darwin/release/libeidolons.dylib" \
-              -library "target/x86_64-apple-darwin/release/libeidolons.dylib" \
-              -library "target/aarch64-apple-ios/release/libeidolons.a" \
-              -library "target/aarch64-apple-ios-sim/release/libeidolons.a" \
-              -library "target/x86_64-apple-ios/release/libeidolons.a" \
-              -output "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            echo "Building aarch64-apple-ios-sim..."
+            cargo build --release --lib -p eidolons --target aarch64-apple-ios-sim
+            mkdir -p "$XCFRAMEWORK_DIR/ios-arm64-simulator"
+            cp target/aarch64-apple-ios-sim/release/libeidolons.a "$XCFRAMEWORK_DIR/ios-arm64-simulator/"
 
-            echo "XCFramework created at: $XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            echo "Building x86_64-apple-ios..."
+            cargo build --release --lib -p eidolons --target x86_64-apple-ios
+            mkdir -p "$XCFRAMEWORK_DIR/ios-x86_64-simulator"
+            cp target/x86_64-apple-ios/release/libeidolons.a "$XCFRAMEWORK_DIR/ios-x86_64-simulator/"
+
+            # Create Info.plist
+            cat > "$XCFRAMEWORK_DIR/Info.plist" << 'PLIST'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>AvailableLibraries</key>
+              <array>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>macos-arm64</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.dylib</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>arm64</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>macos</string>
+                </dict>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>macos-x86_64</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.dylib</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>x86_64</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>macos</string>
+                </dict>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>ios-arm64</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>arm64</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>ios</string>
+                </dict>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>ios-arm64-simulator</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>arm64</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>ios</string>
+                  <key>SupportedPlatformVariant</key>
+                  <string>simulator</string>
+                </dict>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>ios-x86_64-simulator</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>x86_64</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>ios</string>
+                  <key>SupportedPlatformVariant</key>
+                  <string>simulator</string>
+                </dict>
+              </array>
+              <key>CFBundlePackageType</key>
+              <string>XFWK</string>
+              <key>XCFrameworkFormatVersion</key>
+              <string>1.0</string>
+            </dict>
+            </plist>
+            PLIST
+
+            echo ""
+            echo "XCFramework created at: $XCFRAMEWORK_DIR"
+            echo ""
+            echo "Contents:"
+            ls -la "$XCFRAMEWORK_DIR"
             echo ""
             echo "Next steps:"
             echo "1. Swift bindings are at: core/swift/Sources/EidolonsCore/"
             echo "2. Run Swift Package Manager: cd core && swift build"
           '';
 
-          # Script to run Swift tests
+          # Script to run Swift tests (uses Nix-built XCFramework, no Xcode required for lib)
           swift-test = pkgs.writeShellScriptBin "swift-test" ''
             set -euo pipefail
 
-            echo "Building macOS library via Nix..."
-            nix build .#core -o result-core
+            echo "Building XCFramework via Nix..."
+            nix build .#xcframework -o result-xcframework
 
-            echo "Creating XCFramework for testing..."
-            XCFRAMEWORK_DIR="target/apple"
+            echo "Setting up XCFramework for Swift PM..."
+            XCFRAMEWORK_DIR="core/target/apple"
             mkdir -p "$XCFRAMEWORK_DIR"
             rm -rf "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
-
-            xcodebuild -create-xcframework \
-              -library result-core/lib/libeidolons.dylib \
-              -output "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            cp -r result-xcframework "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            chmod -R +w "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
 
             # Clean up build symlink
-            rm result-core
+            rm result-xcframework
+
+            echo "Cleaning Swift PM cache (ensures fresh link against new XCFramework)..."
+            rm -rf core/.build
 
             echo "Running Swift tests..."
             cd core
@@ -370,6 +487,7 @@
             uniffi-bindgen-swift
             core-swift
             swift-bindings
+            xcframework
             build-xcframework
             update-swift-bindings
             swift-test;
@@ -387,6 +505,7 @@
             applePackages.update-swift-bindings
             applePackages.build-xcframework
             applePackages.swift-test
+            pkgs.darwin.cctools  # Provides install_name_tool for XCFramework creation
           ] else []);
 
           # Same environment variables as builds for consistency
@@ -426,6 +545,11 @@
             pname = "eidolons-tests";
           });
         } // (if pkgs.stdenv.isDarwin then {
+          # Note: Swift tests require XCTest which is only available via Xcode, not in
+          # open-source Swift. Tests run in CI using system Swift after setting up the
+          # Nix-built XCFramework. The xcframework package is reproducible; only the
+          # test execution uses system tools.
+
           # Verify committed Swift bindings match generated ones
           swift-bindings-current = pkgs.runCommand "check-swift-bindings" {
             buildInputs = [ pkgs.diffutils ];

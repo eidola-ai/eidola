@@ -36,9 +36,11 @@ jobs:
 
       - name: Run all checks
         run: nix flake check --show-trace
+        # Checks include: formatting, clippy, Rust tests, Swift bindings verification
         # Note: Checks run on current system (aarch64-darwin) only
         # This is sufficient as code quality checks are platform-independent
         # Cross-compiled packages are built and verified below
+        # Swift tests run separately (XCTest requires system Xcode)
 
       - name: Build all packages
         run: |
@@ -77,13 +79,14 @@ jobs:
 
       - name: Run Swift tests
         run: |
-          # Create XCFramework from the Nix-built core library
-          mkdir -p target/apple
-          xcodebuild -create-xcframework \
-            -library result-core/lib/libeidolons.dylib \
-            -output target/apple/libeidolons-rs.xcframework
+          # Build the XCFramework via Nix (reproducible, no Xcode needed)
+          nix build '.#xcframework' -L -o result-xcframework
 
-          # Run Swift tests
+          # Set up XCFramework where Package.swift expects it
+          mkdir -p core/target/apple
+          cp -r result-xcframework core/target/apple/libeidolons-rs.xcframework
+
+          # Run Swift tests using system Swift (XCTest requires Xcode)
           cd core && swift test
 
       - name: Upload macOS server binary
@@ -105,15 +108,6 @@ jobs:
         with:
           name: eidolons-server-linux-aarch64
           path: result-linux-arm/bin/eidolons-server
-          if-no-files-found: error
-
-      - name: Upload Swift bindings
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: eidolons-swift-bindings
-          path: |
-            result-swift-bindings/Sources/EidolonsCore/
-            result-swift-bindings/Sources/EidolonsCoreFFI/
           if-no-files-found: error
 
       - name: Determine image tags

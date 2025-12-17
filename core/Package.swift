@@ -9,7 +9,7 @@ let useLocalFramework = true
 if useLocalFramework {
   binaryTarget = .binaryTarget(
     name: "EidolonsCoreRS",
-    path: "../target/apple/libeidolons-rs.xcframework"
+    path: "target/apple/libeidolons-rs.xcframework"
   )
 } else {
   let releaseTag = "0.1.0"

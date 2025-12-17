@@ -22,6 +22,7 @@ xcuserdata/
 # Swift Package Manager
 .build/
 .swiftpm/
+core/target/
 
 # macOS
 .DS_Store
