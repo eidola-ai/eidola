@@ -87,8 +87,9 @@
           RUSTFLAGS = "-C debuginfo=0 -C target-cpu=generic";
         };
 
-        # Build the server binary for a target system
-        mkServer =
+        # Target system configuration helper
+        # Provides pkgsCross mapping, Rust target triple, and crane setup for a target
+        mkTargetConfig =
           targetSystem:
           let
             isNative = targetSystem == system;
@@ -121,19 +122,29 @@
 
             # Cross-compilation needs CARGO_BUILD_TARGET set
             targetArgs = if isNative then { } else { CARGO_BUILD_TARGET = rustTarget; };
+          in
+          {
+            inherit isNative targetPkgs rustTarget craneLibTarget targetArgs;
+          };
 
-            serverArtifacts = craneLibTarget.buildDepsOnly (
+        # Build the server binary for a target system
+        mkServer =
+          targetSystem:
+          let
+            cfg = mkTargetConfig targetSystem;
+
+            serverArtifacts = cfg.craneLibTarget.buildDepsOnly (
               commonArgs
-              // targetArgs
+              // cfg.targetArgs
               // {
                 pname = "eidolons-server-deps-${targetSystem}";
                 cargoExtraArgs = "--package eidolons-server";
               }
             );
           in
-          craneLibTarget.buildPackage (
+          cfg.craneLibTarget.buildPackage (
             commonArgs
-            // targetArgs
+            // cfg.targetArgs
             // {
               cargoArtifacts = serverArtifacts;
               pname = "eidolons-server-${targetSystem}";
@@ -145,49 +156,20 @@
         mkCore =
           targetSystem:
           let
-            isNative = targetSystem == system;
+            cfg = mkTargetConfig targetSystem;
 
-            # Map system identifier to pkgsCross attribute name
-            crossPkgsAttr =
-              {
-                "aarch64-darwin" = "aarch64-darwin";
-                "x86_64-darwin" = "x86_64-darwin";
-                "aarch64-linux" = "aarch64-multiplatform-musl";
-                "x86_64-linux" = "musl64";
-              }
-              .${targetSystem} or (throw "Unknown target system: ${targetSystem}");
-
-            targetPkgs = if isNative then pkgs else pkgs.pkgsCross.${crossPkgsAttr};
-
-            # Map system identifier to Rust target triple
-            rustTarget =
-              {
-                "aarch64-darwin" = "aarch64-apple-darwin";
-                "x86_64-darwin" = "x86_64-apple-darwin";
-                "aarch64-linux" = "aarch64-unknown-linux-musl";
-                "x86_64-linux" = "x86_64-unknown-linux-musl";
-              }
-              .${targetSystem} or (throw "Unknown target system: ${targetSystem}");
-
-            craneLibTarget = (crane.mkLib targetPkgs).overrideToolchain (_: rustToolchain);
-
-            targetArgs = if isNative then { } else { CARGO_BUILD_TARGET = rustTarget; };
-
-            # Output path differs for native vs cross builds
-            targetDir = if isNative then "release" else "${rustTarget}/release";
-
-            coreArtifacts = craneLibTarget.buildDepsOnly (
+            coreArtifacts = cfg.craneLibTarget.buildDepsOnly (
               commonArgs
-              // targetArgs
+              // cfg.targetArgs
               // {
                 pname = "eidolons-core-deps-${targetSystem}";
                 cargoExtraArgs = "--package eidolons";
               }
             );
           in
-          craneLibTarget.buildPackage (
+          cfg.craneLibTarget.buildPackage (
             commonArgs
-            // targetArgs
+            // cfg.targetArgs
             // {
               cargoArtifacts = coreArtifacts;
               pname = "eidolons-core-${targetSystem}";
@@ -297,34 +279,25 @@
         packages = mkSystemPackages system // {
           # Swift binding generation (native only)
           core-swift-bindings = mkCoreSwiftBindings;
-          # cors-swift-xcframework = mkCoresSwiftXCFramework system; # depends on all cross-compiled apple targets
+          # TODO: xcframework depends on cross-compiled apple targets
 
-          # https://nix.dev/tutorials/cross-compilation.html#cross-compilation
-          # cross = builtins.listToAttrs (
-          #   map
-          #     (t: {
-          #       name = t;
-          #       value = mkSystemPackages pkgs.pkgsCross.${t};
-          #     })
-          #     [
-          #       # Linux targets
-          #       # "aarch64-linux"
-          #       # "x86_64-linux"
+          # Cross-compiled packages for other target systems
+          # Access via: nix build '.#cross.<target>.server'
+          cross = builtins.listToAttrs (
+            map
+              (targetSystem: {
+                name = targetSystem;
+                value = mkSystemPackages targetSystem;
+              })
+              [
+                # Linux targets (for containers/servers)
+                "aarch64-linux"
+                "x86_64-linux"
 
-          #       # Apple targets
-          #       # "aarch64-apple-darwin"
-          #       # "x86_64-apple-darwin"
-          #       # "aarch64-apple-ios"
-          #       # "aarch64-apple-ios-sim"
-          #       # "x86_64-apple-ios"
-          #       #
-          #       #
-          #       "aarch64-darwin"
-          #       "x86_64-darwin"
-          #       "iphone64"
-          #       "iphone64-simulator"
-          #     ]
-          # );
+                # Other macOS arch
+                "x86_64-darwin"
+              ]
+          );
         };
 
         # Development shell with Rust toolchain and tools
