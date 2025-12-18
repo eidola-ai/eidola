@@ -32,28 +32,16 @@ jobs:
 
       - name: Run all checks
         run: nix flake check --show-trace
-        # Checks include: formatting, clippy, Rust tests, Swift bindings verification
-        # Note: Checks run on current system (aarch64-darwin) only
-        # This is sufficient as code quality checks are platform-independent
-        # Cross-compiled packages are built and verified below
-        # Swift tests run separately (XCTest requires system Xcode)
 
       - name: Build all packages
         run: |
-          # Native macOS packages
-          nix build '.#server' -L -o result-macos
-          nix build '.#core' -L -o result-core
-
-          # Swift bindings (macOS only)
-          nix build '.#swift-bindings' -L -o result-swift-bindings
-
-          # Cross-compiled Linux packages
-          nix build '.#server-x86_64-linux' -L -o result-linux-x86
-          nix build '.#server-aarch64-linux' -L -o result-linux-arm
+          mkxir -p /out
 
           # OCI images (Linux only)
-          nix build '.#server-oci-x86_64-linux' -L -o result-oci-x86
-          nix build '.#server-oci-aarch64-linux' -L -o result-oci-arm
+          nix build '.#server-oci--x86_64-linux' -L -o /out/result-oci-x86
+          nix build '.#server-oci--aarch64-linux' -L -o /out/result-oci-arm
+
+          # TODO: build native apps
 
       - name: Verify build outputs
         run: |

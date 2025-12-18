@@ -1,19 +1,23 @@
-import XCTest
+import Testing
+
 @testable import EidolonsCore
 
-final class HelloTests: XCTestCase {
-    func testHelloReturnsGreeting() {
-        let result = hello(name: "World")
-        XCTAssertEqual(result, "Hello, World!")
-    }
+@Suite struct HelloTests {
+  @Test
+  func helloReturnsGreeting() {
+    let result = hello(name: "World")
+    #expect(result == "Hello, World!")
+  }
 
-    func testHelloWithEmptyName() {
-        let result = hello(name: "")
-        XCTAssertEqual(result, "Hello, !")
-    }
+  @Test
+  func helloWithEmptyName() {
+    let result = hello(name: "")
+    #expect(result == "Hello, !")
+  }
 
-    func testHelloWithSpecialCharacters() {
-        let result = hello(name: "Rust 🦀")
-        XCTAssertEqual(result, "Hello, Rust 🦀!")
-    }
+  @Test
+  func helloWithSpecialCharacters() {
+    let result = hello(name: "Rust 🦀")
+    #expect(result == "Hello, Rust 🦀!")
+  }
 }

@@ -1,4 +1,4 @@
-// swift-tools-version: 5.10
+// swift-tools-version: 6.2
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -26,14 +26,17 @@ let package = Package(
   name: "EidolonsCore",
   defaultLocalization: "en",
   platforms: [
-    .iOS(.v16),
-    .macOS(.v14),
+    .iOS(.v26),
+    .macOS(.v26),
   ],
   products: [
     .library(
       name: "EidolonsCore",
       targets: ["EidolonsCore"]
     )
+  ],
+  dependencies: [
+    .package(url: "https://github.com/swiftlang/swift-testing.git", from: "6.2.3")
   ],
   targets: [
     // The built XCFramework containing the Rust library
@@ -60,7 +63,10 @@ let package = Package(
     // Tests for the Swift bindings
     .testTarget(
       name: "EidolonsCoreTests",
-      dependencies: ["EidolonsCore"],
+      dependencies: [
+        "EidolonsCore",
+        .product(name: "Testing", package: "swift-testing"),
+      ],
       path: "swift/Tests/EidolonsCoreTests"
     ),
   ]
