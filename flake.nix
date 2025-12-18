@@ -141,9 +141,30 @@
             }
           );
 
+        # Build OCI (Docker) image containing the server
+        mkServerOCI =
+          targetSystem:
+          let
+            server = mkServer targetSystem;
+          in
+          pkgs.dockerTools.buildLayeredImage {
+            name = "eidolons-server";
+            tag = "latest";
+
+            contents = [ server ];
+
+            config = {
+              Cmd = [ "${server}/bin/eidolons-server" ];
+              Env = [ "SOURCE_DATE_EPOCH=0" ];
+            };
+
+            # Reproducible timestamp for deterministic builds
+            created = "1970-01-01T00:00:00Z";
+          };
+
         mkSystemPackages = targetSystem: {
           server = mkServer targetSystem;
-          # server-oci = mkServerOCI targetPkgs;
+          server-oci = mkServerOCI targetSystem;
           # core = mkCore targetPkgs;
         };
 
