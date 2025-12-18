@@ -95,32 +95,32 @@
 
             # Map system identifier to pkgsCross attribute name
             # Native builds use pkgs directly; cross builds need pkgsCross
-            crossPkgsAttr = {
-              "aarch64-darwin" = "aarch64-darwin";
-              "x86_64-darwin" = "x86_64-darwin";
-              "aarch64-linux" = "aarch64-multiplatform-musl"; # musl for static linking
-              "x86_64-linux" = "musl64"; # musl for static linking
-            }.${targetSystem} or (throw "Unknown target system: ${targetSystem}");
+            crossPkgsAttr =
+              {
+                "aarch64-darwin" = "aarch64-darwin";
+                "x86_64-darwin" = "x86_64-darwin";
+                "aarch64-linux" = "aarch64-multiplatform-musl"; # musl for static linking
+                "x86_64-linux" = "musl64"; # musl for static linking
+              }
+              .${targetSystem} or (throw "Unknown target system: ${targetSystem}");
 
             targetPkgs = if isNative then pkgs else pkgs.pkgsCross.${crossPkgsAttr};
 
             # Map system identifier to Rust target triple
-            rustTarget = {
-              "aarch64-darwin" = "aarch64-apple-darwin";
-              "x86_64-darwin" = "x86_64-apple-darwin";
-              "aarch64-linux" = "aarch64-unknown-linux-musl";
-              "x86_64-linux" = "x86_64-unknown-linux-musl";
-            }.${targetSystem} or (throw "Unknown target system: ${targetSystem}");
+            rustTarget =
+              {
+                "aarch64-darwin" = "aarch64-apple-darwin";
+                "x86_64-darwin" = "x86_64-apple-darwin";
+                "aarch64-linux" = "aarch64-unknown-linux-musl";
+                "x86_64-linux" = "x86_64-unknown-linux-musl";
+              }
+              .${targetSystem} or (throw "Unknown target system: ${targetSystem}");
 
             # Crane uses target pkgs (for linker/libc) but host toolchain (for cargo)
             craneLibTarget = (crane.mkLib targetPkgs).overrideToolchain (_: rustToolchain);
 
             # Cross-compilation needs CARGO_BUILD_TARGET set
-            targetArgs =
-              if isNative then
-                { }
-              else
-                { CARGO_BUILD_TARGET = rustTarget; };
+            targetArgs = if isNative then { } else { CARGO_BUILD_TARGET = rustTarget; };
 
             serverArtifacts = craneLibTarget.buildDepsOnly (
               commonArgs
@@ -138,6 +138,60 @@
               cargoArtifacts = serverArtifacts;
               pname = "eidolons-server-${targetSystem}";
               cargoExtraArgs = "--bin eidolons-server";
+            }
+          );
+
+        # Build the core library as a static lib for a target system
+        mkCore =
+          targetSystem:
+          let
+            isNative = targetSystem == system;
+
+            # Map system identifier to pkgsCross attribute name
+            crossPkgsAttr =
+              {
+                "aarch64-darwin" = "aarch64-darwin";
+                "x86_64-darwin" = "x86_64-darwin";
+                "aarch64-linux" = "aarch64-multiplatform-musl";
+                "x86_64-linux" = "musl64";
+              }
+              .${targetSystem} or (throw "Unknown target system: ${targetSystem}");
+
+            targetPkgs = if isNative then pkgs else pkgs.pkgsCross.${crossPkgsAttr};
+
+            # Map system identifier to Rust target triple
+            rustTarget =
+              {
+                "aarch64-darwin" = "aarch64-apple-darwin";
+                "x86_64-darwin" = "x86_64-apple-darwin";
+                "aarch64-linux" = "aarch64-unknown-linux-musl";
+                "x86_64-linux" = "x86_64-unknown-linux-musl";
+              }
+              .${targetSystem} or (throw "Unknown target system: ${targetSystem}");
+
+            craneLibTarget = (crane.mkLib targetPkgs).overrideToolchain (_: rustToolchain);
+
+            targetArgs = if isNative then { } else { CARGO_BUILD_TARGET = rustTarget; };
+
+            # Output path differs for native vs cross builds
+            targetDir = if isNative then "release" else "${rustTarget}/release";
+
+            coreArtifacts = craneLibTarget.buildDepsOnly (
+              commonArgs
+              // targetArgs
+              // {
+                pname = "eidolons-core-deps-${targetSystem}";
+                cargoExtraArgs = "--package eidolons";
+              }
+            );
+          in
+          craneLibTarget.buildPackage (
+            commonArgs
+            // targetArgs
+            // {
+              cargoArtifacts = coreArtifacts;
+              pname = "eidolons-core-${targetSystem}";
+              cargoExtraArgs = "--lib -p eidolons";
             }
           );
 
@@ -165,7 +219,7 @@
         mkSystemPackages = targetSystem: {
           server = mkServer targetSystem;
           server-oci = mkServerOCI targetSystem;
-          # core = mkCore targetPkgs;
+          core = mkCore targetSystem;
         };
 
       in
