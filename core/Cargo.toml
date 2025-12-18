@@ -10,4 +10,4 @@ uniffi.workspace = true
 uniffi = { workspace = true, features = ["build"] }
 
 [lib]
-crate-type = ["staticlib", "lib"]
+crate-type = ["cdylib", "staticlib", "lib"]

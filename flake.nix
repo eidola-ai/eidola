@@ -222,12 +222,81 @@
           core = mkCore targetSystem;
         };
 
+        # Build the uniffi-bindgen-swift tool (native only)
+        uniffiBindgenSwift = craneLib.buildPackage (
+          commonArgs
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly (
+              commonArgs
+              // {
+                pname = "uniffi-bindgen-swift-deps";
+                cargoExtraArgs = "--package uniffi-bindgen-swift";
+              }
+            );
+            pname = "uniffi-bindgen-swift";
+            cargoExtraArgs = "--bin uniffi-bindgen-swift";
+          }
+        );
+
+        # Generate Swift bindings from the core library
+        mkCoreSwiftBindings = pkgs.stdenv.mkDerivation {
+          name = "eidolons-swift-bindings";
+
+          nativeBuildInputs = [
+            uniffiBindgenSwift
+            rustToolchain # Provides cargo for metadata extraction
+          ];
+
+          # Use same deterministic settings
+          SOURCE_DATE_EPOCH = "0";
+
+          dontUnpack = true;
+
+          buildPhase = ''
+            # Create output directories
+            mkdir -p $out/Sources/EidolonsCore
+            mkdir -p $out/Sources/EidolonsCoreFFI
+
+            # uniffi-bindgen-swift needs access to Cargo.toml for metadata
+            cp -r ${src}/* .
+            chmod -R +w .
+
+            # Find the dylib
+            DYLIB="${mkCore system}/lib/libeidolons.dylib"
+
+            # Generate Swift bindings to a temp directory
+            TEMP_OUT=$(mktemp -d)
+            uniffi-bindgen-swift \
+              --swift-sources --headers --modulemap \
+              --metadata-no-deps \
+              "$DYLIB" \
+              "$TEMP_OUT" \
+              --module-name eidolonsFFI \
+              --modulemap-filename module.modulemap
+
+            # Move files to their proper locations:
+            # - Swift source goes to EidolonsCore
+            # - Header and modulemap go to EidolonsCoreFFI
+            mv "$TEMP_OUT"/*.swift $out/Sources/EidolonsCore/
+            mv "$TEMP_OUT"/*.h $out/Sources/EidolonsCoreFFI/
+            mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolonsCoreFFI/
+          '';
+
+          installPhase = ''
+            echo "Generated Swift bindings:"
+            echo "EidolonsCore (Swift):"
+            ls -la $out/Sources/EidolonsCore/
+            echo "EidolonsCoreFFI (C headers):"
+            ls -la $out/Sources/EidolonsCoreFFI/
+          '';
+        };
+
       in
       {
         # Default packages for current system
         packages = mkSystemPackages system // {
-          # Packages built using the native system.
-          # cors-swift-bindings = mkCoresSwiftBindings;
+          # Swift binding generation (native only)
+          core-swift-bindings = mkCoreSwiftBindings;
           # cors-swift-xcframework = mkCoresSwiftXCFramework system; # depends on all cross-compiled apple targets
 
           # https://nix.dev/tutorials/cross-compilation.html#cross-compilation
