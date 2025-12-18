@@ -38,61 +38,24 @@ jobs:
           mkxir -p /out
 
           # OCI images (Linux only)
-          nix build '.#server-oci--x86_64-linux' -L -o /out/result-oci-x86
-          nix build '.#server-oci--aarch64-linux' -L -o /out/result-oci-arm
+          nix build '.#server-oci--x86_64-linux' -L -o /out/server-oci--x86_64-linux
+          nix build '.#server-oci--aarch64-linux' -L -o /out/server-oci--aarch64-linux
 
           # TODO: build native apps
 
       - name: Verify build outputs
         run: |
-          echo "=== Native macOS server ==="
-          file result-macos/bin/eidolons-server
-
-          echo "=== Linux x86_64 server ==="
-          file result-linux-x86/bin/eidolons-server
-
-          echo "=== Linux aarch64 server ==="
-          file result-linux-arm/bin/eidolons-server
-
-          echo "=== Swift bindings ==="
-          ls -lh result-swift-bindings/Sources/EidolonsCore/
-          ls -lh result-swift-bindings/Sources/EidolonsCoreFFI/
-
-          echo "=== OCI images ==="
-          ls -lh result-oci-*
+          echo "=== Server OCI images ==="
+          ls -lh /out/result-oci-*
 
       - name: Run Swift tests
         run: |
-          # Build the XCFramework via Nix (reproducible, no Xcode needed)
-          nix build '.#xcframework' -L -o result-xcframework
+          # Build the XCFramework via Nix and update the local paths
+          nix run '.#update-core-swift-xcframework'
 
-          # Set up XCFramework where Package.swift expects it
-          mkdir -p core/target/apple
-          cp -r result-xcframework core/target/apple/libeidolons-rs.xcframework
-
-          # Run Swift tests using system Swift (XCTest requires Xcode)
-          cd core && swift test
-
-      - name: Upload macOS server binary
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: eidolons-server-macos-aarch64
-          path: result-macos/bin/eidolons-server
-          if-no-files-found: error
-
-      - name: Upload Linux x86_64 server binary
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: eidolons-server-linux-x86_64
-          path: result-linux-x86/bin/eidolons-server
-          if-no-files-found: error
-
-      - name: Upload Linux aarch64 server binary
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: eidolons-server-linux-aarch64
-          path: result-linux-arm/bin/eidolons-server
-          if-no-files-found: error
+          # Run Swift tests using system Swift
+          cd core
+          swift test
 
       - name: Determine image tags
         id: tags
@@ -141,7 +104,7 @@ jobs:
 
             # Use a local directory for intermediate files. The GitHub Actions runner
             # is ephemeral, so explicit cleanup is not necessary.
-            mkdir -p ./oci-images
+            mkdir -p /out/oci-images
 
             # dockerTools outputs gzip-compressed archives; crane expects plain tar
             gunzip_archive() {
@@ -151,10 +114,10 @@ jobs:
             }
 
             # Decompress archives once
-            tar_x86="./oci-images/result-oci-x86.tar"
-            tar_arm="./oci-images/result-oci-arm.tar"
-            gunzip_archive result-oci-x86 "$tar_x86"
-            gunzip_archive result-oci-arm "$tar_arm"
+            tar_x86="/out/oci-images/server-oci-x86_64-linux.tar"
+            tar_arm="/out/oci-images/server-oci-arm64-linux.tar"
+            gunzip_archive /out/server-oci-x86_64-linux.tar "$tar_x86"
+            gunzip_archive /out/server-oci-arm64-linux.tar "$tar_arm"
 
             # Push architecture-specific images
             crane push "$tar_x86" "${IMAGE}:${TAG_PREFIX}-amd64"
