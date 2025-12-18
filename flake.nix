@@ -329,28 +329,28 @@
           iosSimX86_64 = mkCore "x86_64-apple-ios" null "staticlib" false;
 
           buildPhase = ''
-            mkdir -p "$out/macos-arm64_x86_64"
-            mkdir -p "$out/ios-arm64"
-            mkdir -p "$out/ios-arm64_x86_64-simulator"
+            mkdir -p "$out/libeidolons-rs.xcframework/macos-arm64_x86_64"
+            mkdir -p "$out/libeidolons-rs.xcframework/ios-arm64"
+            mkdir -p "$out/libeidolons-rs.xcframework/ios-arm64_x86_64-simulator"
 
             # macOS: combine arm64 + x86_64 into universal binary
             lipo -create \
               "$macosArm64/lib/libeidolons.a" \
               "$macosX86_64/lib/libeidolons.a" \
-              -output "$out/macos-arm64_x86_64/libeidolons.a"
+              -output "$out/libeidolons-rs.xcframework/macos-arm64_x86_64/libeidolons.a"
 
             # iOS device: arm64 only
             cp "$iosArm64/lib/libeidolons.a" \
-              "$out/ios-arm64/libeidolons.a"
+              "$out/libeidolons-rs.xcframework/ios-arm64/libeidolons.a"
 
             # iOS simulator: combine arm64 + x86_64 into universal binary
             lipo -create \
               "$iosSimArm64/lib/libeidolons.a" \
               "$iosSimX86_64/lib/libeidolons.a" \
-              -output "$out/ios-arm64_x86_64-simulator/libeidolons.a"
+              -output "$out/libeidolons-rs.xcframework/ios-arm64_x86_64-simulator/libeidolons.a"
 
             # Create Info.plist for XCFramework
-            cat > "$out/Info.plist" << 'EOF'
+            cat > "$out/libeidolons-rs.xcframework/Info.plist" << 'EOF'
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
             <plist version="1.0">
@@ -410,7 +410,7 @@
             find "$out" -name "*.a" -exec ls -lh {} \;
             echo ""
             echo "Architecture info:"
-            for lib in "$out"/*/libeidolons.a; do
+            for lib in "$out"/libeidolons-rs.xcframework/*/libeidolons.a; do
               echo "$lib:"
               lipo -info "$lib"
             done
@@ -503,6 +503,7 @@
               pname = "eidolons-tests";
             }
           );
+
         };
       }
     );
