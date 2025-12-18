@@ -505,8 +505,146 @@
             }
           );
 
+          # Checks that committed bindings are up to date with the generated ones
+          bindings-current =
+            pkgs.runCommand "check-swift-bindings"
+              {
+                buildInputs = [ pkgs.diffutils ];
+              }
+              ''
+                echo "Checking if committed Swift bindings match generated ones..."
+
+                # Check Swift sources
+                GENERATED_SWIFT="${packages.core-swift-bindings}/Sources/EidolonsCore"
+                COMMITTED_SWIFT="${src}/core/swift/Sources/EidolonsCore"
+
+                if [ ! -d "$COMMITTED_SWIFT" ] || [ -z "$(ls -A "$COMMITTED_SWIFT" 2>/dev/null)" ]; then
+                  echo "ERROR: No committed Swift bindings found at core/swift/Sources/EidolonsCore/"
+                  echo "Run: nix run .#update-core-swift-bindings"
+                  echo "Then commit the generated files."
+                  exit 1
+                fi
+
+                # Check FFI headers
+                GENERATED_FFI="${packages.core-swift-bindings}/Sources/EidolonsCoreFFI"
+                COMMITTED_FFI="${src}/core/swift/Sources/EidolonsCoreFFI"
+
+                if [ ! -d "$COMMITTED_FFI" ] || [ -z "$(ls -A "$COMMITTED_FFI" 2>/dev/null)" ]; then
+                  echo "ERROR: No committed FFI headers found at core/swift/Sources/EidolonsCoreFFI/"
+                  echo "Run: nix run '.#update-core-swift-bindings'"
+                  echo "Then commit the generated files."
+                  exit 1
+                fi
+
+                # Compare generated vs committed (Swift)
+                if ! diff -r "$GENERATED_SWIFT" "$COMMITTED_SWIFT"; then
+                  echo ""
+                  echo "ERROR: Committed Swift bindings don't match generated ones!"
+                  echo ""
+                  echo "To fix this:"
+                  echo "  1. Run: nix run '.#update-core-swift-bindings'"
+                  echo "  2. Review the changes"
+                  echo "  3. Commit the updated bindings"
+                  echo ""
+                  exit 1
+                fi
+
+                # Compare generated vs committed (FFI headers)
+                if ! diff -r "$GENERATED_FFI" "$COMMITTED_FFI"; then
+                  echo ""
+                  echo "ERROR: Committed FFI headers don't match generated ones!"
+                  echo ""
+                  echo "To fix this:"
+                  echo "  1. Run: nix run '.#update-core-swift-bindings'"
+                  echo "  2. Review the changes"
+                  echo "  3. Commit the updated bindings"
+                  echo ""
+                  exit 1
+                fi
+
+                echo "✓ Swift bindings are up to date"
+                touch $out
+              '';
+
           # Ensure the primary artifacts are built
           build-server-oci = packages.server-oci;
+
+        };
+
+        apps = {
+          update-core-swift-bindings = {
+            type = "app";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "update-core-swift-bindings";
+                runtimeInputs = [
+                  pkgs.coreutils
+                  pkgs.git
+                ];
+
+                text = ''
+                  set -euo pipefail
+
+                  # Sanity check: must run from repo root (or adjust logic)
+                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                    echo "error: not in a git repository" >&2
+                    exit 1
+                  fi
+
+                  repo_root="$(git rev-parse --show-toplevel)"
+                  dest="$repo_root/core/swift/Sources"
+
+                  echo "Syncing Swift bindings from Nix store:"
+                  echo "  source: ${packages.core-swift-bindings}"
+                  echo "  dest:   $dest"
+
+                  mkdir -p "$dest"
+                  rm -rf "$dest"
+                  cp -R "${packages.core-swift-bindings}/Sources" "$dest"
+                  chmod -R +w "$dest"
+
+                  echo "Done. Review changes and commit:"
+                  echo "  git status"
+                '';
+              }
+            }/bin/update-core-swift-bindings";
+          };
+          update-core-swift-xcframework = {
+            type = "app";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "update-core-swift-xcframework";
+                runtimeInputs = [
+                  pkgs.coreutils
+                  pkgs.git
+                ];
+
+                text = ''
+                  set -euo pipefail
+
+                  # Sanity check: must run from repo root (or adjust logic)
+                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                    echo "error: not in a git repository" >&2
+                    exit 1
+                  fi
+
+                  repo_root="$(git rev-parse --show-toplevel)"
+                  dest="$repo_root/core/target/apple/libeidolons-rs.xcframework"
+
+                  echo "Copying core Swift XCframework from Nix store:"
+                  echo "  source: ${packages.core-swift-xcframework}"
+                  echo "  dest:   $dest"
+
+                  mkdir -p "$dest"
+                  rm -rf "$dest"
+                  cp -R "${packages.core-swift-xcframework}/libeidolons-rs.xcframework" "$dest"
+                  chmod -R +w "$dest"
+
+                  echo "Done."
+                '';
+              }
+            }/bin/update-core-swift-xcframework";
+          };
         };
       }
     );
