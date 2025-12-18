@@ -49,6 +49,16 @@
         # Create crane library with our Rust toolchain (function form for consistency)
         craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
 
+        # Map Nix system to Rust target triple for native builds
+        nativeRustTarget =
+          {
+            "aarch64-darwin" = "aarch64-apple-darwin";
+            "x86_64-darwin" = "x86_64-apple-darwin";
+            "aarch64-linux" = "aarch64-unknown-linux-musl";
+            "x86_64-linux" = "x86_64-unknown-linux-musl";
+          }
+          .${system};
+
         # Source filtering - only include files needed for Rust builds
         src = pkgs.lib.cleanSourceWith {
           src = craneLib.path ./.;
@@ -87,35 +97,17 @@
           RUSTFLAGS = "-C debuginfo=0 -C target-cpu=generic";
         };
 
-        # Target system configuration helper
-        # Provides pkgsCross mapping, Rust target triple, and crane setup for a target
+        # Target configuration helper
+        # Takes explicit Rust target and optional Nix cross-system (pkgsCross attr name).
+        # - rustTarget: Rust target triple (e.g., "aarch64-apple-darwin")
+        # - nixCrossSystem: pkgsCross attr name (e.g., "aarch64-multiplatform-musl"), or null for native pkgs
         mkTargetConfig =
-          targetSystem:
+          rustTarget: nixCrossSystem:
           let
-            isNative = targetSystem == system;
+            isNative = rustTarget == nativeRustTarget;
 
-            # Map system identifier to pkgsCross attribute name
-            # Native builds use pkgs directly; cross builds need pkgsCross
-            crossPkgsAttr =
-              {
-                "aarch64-darwin" = "aarch64-darwin";
-                "x86_64-darwin" = "x86_64-darwin";
-                "aarch64-linux" = "aarch64-multiplatform-musl"; # musl for static linking
-                "x86_64-linux" = "musl64"; # musl for static linking
-              }
-              .${targetSystem} or (throw "Unknown target system: ${targetSystem}");
-
-            targetPkgs = if isNative then pkgs else pkgs.pkgsCross.${crossPkgsAttr};
-
-            # Map system identifier to Rust target triple
-            rustTarget =
-              {
-                "aarch64-darwin" = "aarch64-apple-darwin";
-                "x86_64-darwin" = "x86_64-apple-darwin";
-                "aarch64-linux" = "aarch64-unknown-linux-musl";
-                "x86_64-linux" = "x86_64-unknown-linux-musl";
-              }
-              .${targetSystem} or (throw "Unknown target system: ${targetSystem}");
+            # Use pkgsCross if specified, otherwise native pkgs
+            targetPkgs = if nixCrossSystem == null then pkgs else pkgs.pkgsCross.${nixCrossSystem};
 
             # Crane uses target pkgs (for linker/libc) but host toolchain (for cargo)
             craneLibTarget = (crane.mkLib targetPkgs).overrideToolchain (_: rustToolchain);
@@ -124,20 +116,28 @@
             targetArgs = if isNative then { } else { CARGO_BUILD_TARGET = rustTarget; };
           in
           {
-            inherit isNative targetPkgs rustTarget craneLibTarget targetArgs;
+            inherit
+              isNative
+              targetPkgs
+              rustTarget
+              craneLibTarget
+              targetArgs
+              ;
           };
 
-        # Build the server binary for a target system
+        # Build the server binary
+        # - rustTarget: Rust target triple
+        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
         mkServer =
-          targetSystem:
+          rustTarget: nixCrossSystem:
           let
-            cfg = mkTargetConfig targetSystem;
+            cfg = mkTargetConfig rustTarget nixCrossSystem;
 
             serverArtifacts = cfg.craneLibTarget.buildDepsOnly (
               commonArgs
               // cfg.targetArgs
               // {
-                pname = "eidolons-server-deps-${targetSystem}";
+                pname = "eidolons-server-deps-${rustTarget}";
                 cargoExtraArgs = "--package eidolons-server";
               }
             );
@@ -147,23 +147,36 @@
             // cfg.targetArgs
             // {
               cargoArtifacts = serverArtifacts;
-              pname = "eidolons-server-${targetSystem}";
+              pname = "eidolons-server-${rustTarget}";
               cargoExtraArgs = "--bin eidolons-server";
             }
           );
 
-        # Build the core library as a static lib for a target system
+        # Build the core library
+        # - rustTarget: Rust target triple
+        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
+        # - crateType: "staticlib" (default) or "cdylib"
+        # - doCheck: whether to run tests (default true)
         mkCore =
-          targetSystem:
+          rustTarget: nixCrossSystem: crateType: doCheck:
           let
-            cfg = mkTargetConfig targetSystem;
+            cfg = mkTargetConfig rustTarget nixCrossSystem;
+            effectiveCrateType = if crateType == null then "staticlib" else crateType;
+            effectiveDoCheck = if doCheck == null then true else doCheck;
+
+            # Override crate-type to build only what's requested
+            preBuildHook = ''
+              sed -i 's/crate-type = .*/crate-type = ["${effectiveCrateType}"]/' core/Cargo.toml
+            '';
 
             coreArtifacts = cfg.craneLibTarget.buildDepsOnly (
               commonArgs
               // cfg.targetArgs
               // {
-                pname = "eidolons-core-deps-${targetSystem}";
+                pname = "eidolons-core-deps-${rustTarget}";
                 cargoExtraArgs = "--package eidolons";
+                preBuild = preBuildHook;
+                doCheck = effectiveDoCheck;
               }
             );
           in
@@ -172,16 +185,20 @@
             // cfg.targetArgs
             // {
               cargoArtifacts = coreArtifacts;
-              pname = "eidolons-core-${targetSystem}";
+              pname = "eidolons-core-${rustTarget}";
               cargoExtraArgs = "--lib -p eidolons";
+              preBuild = preBuildHook;
+              doCheck = effectiveDoCheck;
             }
           );
 
         # Build OCI (Docker) image containing the server
+        # - rustTarget: Rust target triple
+        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
         mkServerOCI =
-          targetSystem:
+          rustTarget: nixCrossSystem:
           let
-            server = mkServer targetSystem;
+            server = mkServer rustTarget nixCrossSystem;
           in
           pkgs.dockerTools.buildLayeredImage {
             name = "eidolons-server";
@@ -198,10 +215,13 @@
             created = "1970-01-01T00:00:00Z";
           };
 
-        mkSystemPackages = targetSystem: {
-          server = mkServer targetSystem;
-          server-oci = mkServerOCI targetSystem;
-          core = mkCore targetSystem;
+        # Build all packages for a target
+        # - rustTarget: Rust target triple
+        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
+        mkSystemPackages = rustTarget: nixCrossSystem: {
+          server = mkServer rustTarget nixCrossSystem;
+          server-oci = mkServerOCI rustTarget nixCrossSystem;
+          core = mkCore rustTarget nixCrossSystem null null; # staticlib, run tests
         };
 
         # Build the uniffi-bindgen-swift tool (native only)
@@ -243,8 +263,8 @@
             cp -r ${src}/* .
             chmod -R +w .
 
-            # Find the dylib
-            DYLIB="${mkCore system}/lib/libeidolons.dylib"
+            # Find the dylib (native build, cdylib for uniffi-bindgen-swift)
+            DYLIB="${mkCore nativeRustTarget null "cdylib" null}/lib/libeidolons.dylib"
 
             # Generate Swift bindings to a temp directory
             TEMP_OUT=$(mktemp -d)
@@ -273,32 +293,158 @@
           '';
         };
 
+        # Build XCFramework containing static libraries for all Apple platforms
+        mkCoreSwiftXCFramework = pkgs.stdenv.mkDerivation {
+          name = "eidolons-xcframework";
+
+          nativeBuildInputs = [ pkgs.darwin.cctools ]; # Provides lipo
+
+          # Use same deterministic settings
+          SOURCE_DATE_EPOCH = "0";
+          ZERO_AR_DATE = "1";
+
+          dontUnpack = true;
+
+          # Reference all the Apple target builds (all use native pkgs, Rust handles cross-compilation)
+          macosArm64 = mkCore "aarch64-apple-darwin" null "staticlib" null;
+          macosX86_64 = mkCore "x86_64-apple-darwin" null "staticlib" null;
+          iosArm64 = mkCore "aarch64-apple-ios" null "staticlib" false;
+          iosSimArm64 = mkCore "aarch64-apple-ios-sim" null "staticlib" false;
+          iosSimX86_64 = mkCore "x86_64-apple-ios" null "staticlib" false;
+
+          buildPhase = ''
+            mkdir -p "$out/macos-arm64_x86_64"
+            mkdir -p "$out/ios-arm64"
+            mkdir -p "$out/ios-arm64_x86_64-simulator"
+
+            # macOS: combine arm64 + x86_64 into universal binary
+            lipo -create \
+              "$macosArm64/lib/libeidolons.a" \
+              "$macosX86_64/lib/libeidolons.a" \
+              -output "$out/macos-arm64_x86_64/libeidolons.a"
+
+            # iOS device: arm64 only
+            cp "$iosArm64/lib/libeidolons.a" \
+              "$out/ios-arm64/libeidolons.a"
+
+            # iOS simulator: combine arm64 + x86_64 into universal binary
+            lipo -create \
+              "$iosSimArm64/lib/libeidolons.a" \
+              "$iosSimX86_64/lib/libeidolons.a" \
+              -output "$out/ios-arm64_x86_64-simulator/libeidolons.a"
+
+            # Create Info.plist for XCFramework
+            cat > "$out/Info.plist" << 'EOF'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>AvailableLibraries</key>
+              <array>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>macos-arm64_x86_64</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array>
+                    <string>arm64</string>
+                    <string>x86_64</string>
+                  </array>
+                  <key>SupportedPlatform</key>
+                  <string>macos</string>
+                </dict>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>ios-arm64</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array><string>arm64</string></array>
+                  <key>SupportedPlatform</key>
+                  <string>ios</string>
+                </dict>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>ios-arm64_x86_64-simulator</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array>
+                    <string>arm64</string>
+                    <string>x86_64</string>
+                  </array>
+                  <key>SupportedPlatform</key>
+                  <string>ios</string>
+                  <key>SupportedPlatformVariant</key>
+                  <string>simulator</string>
+                </dict>
+              </array>
+              <key>CFBundlePackageType</key>
+              <string>XFWK</string>
+              <key>XCFrameworkFormatVersion</key>
+              <string>1.0</string>
+            </dict>
+            </plist>
+            EOF
+          '';
+
+          installPhase = ''
+            echo "XCFramework contents:"
+            find "$out" -name "*.a" -exec ls -lh {} \;
+            echo ""
+            echo "Architecture info:"
+            for lib in "$out"/*/libeidolons.a; do
+              echo "$lib:"
+              lipo -info "$lib"
+            done
+          '';
+        };
+
+        # Cross-compilation targets: rustTarget -> nixCrossSystem (null = use native pkgs)
+        crossTargets = {
+          "aarch64-unknown-linux-musl" = "aarch64-multiplatform-musl";
+          "x86_64-unknown-linux-musl" = "musl64";
+          "aarch64-apple-darwin" = null; # Rust handles cross-compilation
+          "x86_64-apple-darwin" = null; # Rust handles cross-compilation
+        };
+
+        # Flatten cross-compiled packages: { "server--aarch64-unknown-linux-musl" = ...; ... }
+        crossPackages = builtins.listToAttrs (
+          builtins.concatMap (
+            rustTarget:
+            let
+              nixCrossSystem = crossTargets.${rustTarget};
+              targetPkgs = mkSystemPackages rustTarget nixCrossSystem;
+            in
+            [
+              {
+                name = "server--${rustTarget}";
+                value = targetPkgs.server;
+              }
+              {
+                name = "server-oci--${rustTarget}";
+                value = targetPkgs.server-oci;
+              }
+              {
+                name = "core--${rustTarget}";
+                value = targetPkgs.core;
+              }
+            ]
+          ) (builtins.attrNames crossTargets)
+        );
+
       in
       {
         # Default packages for current system
-        packages = mkSystemPackages system // {
-          # Swift binding generation (native only)
-          core-swift-bindings = mkCoreSwiftBindings;
-          # TODO: xcframework depends on cross-compiled apple targets
-
-          # Cross-compiled packages for other target systems
-          # Access via: nix build '.#cross.<target>.server'
-          cross = builtins.listToAttrs (
-            map
-              (targetSystem: {
-                name = targetSystem;
-                value = mkSystemPackages targetSystem;
-              })
-              [
-                # Linux targets (for containers/servers)
-                "aarch64-linux"
-                "x86_64-linux"
-
-                # Other macOS arch
-                "x86_64-darwin"
-              ]
-          );
-        };
+        packages =
+          mkSystemPackages nativeRustTarget null
+          // crossPackages
+          // {
+            # Swift binding generation (native only)
+            core-swift-bindings = mkCoreSwiftBindings;
+            core-swift-xcframework = mkCoreSwiftXCFramework;
+          };
 
         # Development shell with Rust toolchain and tools
         devShells.default = pkgs.mkShell {
