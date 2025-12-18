@@ -1,0 +1,729 @@
+{
+  description = "Eidolons";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+
+    # Rust toolchain manager that respects rust-toolchain.toml
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-analyzer-src = {
+        url = "github:rust-lang/rust-analyzer/release";
+        flake = false;
+      };
+    };
+
+    # Efficient Rust builds with incremental caching
+    crane.url = "github:ipetkov/crane";
+
+    # Utilities for multi-system support
+    flake-utils.url = "github:numtide/flake-utils";
+  };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+      fenix,
+      crane,
+      flake-utils,
+    }:
+    flake-utils.lib.eachSystem [ "x86_64-darwin" "aarch64-darwin" ] (
+      system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+
+        # SHA256 for rust-toolchain.toml (single source of truth)
+        rustToolchainSha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
+
+        # Get the exact Rust toolchain specified in rust-toolchain.toml
+        rustToolchain = fenix.packages.${system}.fromToolchainFile {
+          file = ./rust-toolchain.toml;
+          sha256 = rustToolchainSha256;
+        };
+
+        # Create crane library with our Rust toolchain (function form for consistency)
+        craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
+
+        # Source filtering - only include files needed for Rust builds
+        src = pkgs.lib.cleanSourceWith {
+          src = craneLib.path ./.;
+          filter =
+            path: type:
+            let
+              baseName = builtins.baseNameOf path;
+              pathStr = toString path;
+            in
+            # Include all Rust source files and Cargo files
+            (craneLib.filterCargoSources path type)
+            # Also include rust-toolchain.toml for fenix
+            || (baseName == "rust-toolchain.toml")
+            # Include Swift bindings and tests for checks
+            || (pkgs.lib.hasInfix "/core/swift" pathStr)
+            # Include Package.swift for Swift builds
+            || (baseName == "Package.swift");
+        };
+
+        # Common arguments for all Rust builds - ensures determinism
+        commonArgs = {
+          inherit src;
+          strictDeps = true;
+
+          # Deterministic build settings
+          CARGO_BUILD_JOBS = "1"; # Single-threaded for reproducibility
+          CARGO_INCREMENTAL = "false"; # Disable incremental compilation
+          SOURCE_DATE_EPOCH = "0"; # Fixed timestamp
+          ZERO_AR_DATE = "1"; # Reproducible ar/ranlib archives
+
+          # Network isolation during build
+          CARGO_NET_OFFLINE = "true";
+
+          # Rust flags for deterministic builds
+          # Note: Nix automatically handles path remapping via build sandbox
+          RUSTFLAGS = "-C debuginfo=0 -C target-cpu=generic";
+        };
+
+        # Helper to create cross-compilation pkgs with specific libc
+        mkCrossSystem =
+          targetSystem: libc:
+          if system == targetSystem then
+            pkgs
+          else
+            import nixpkgs {
+              inherit system;
+              crossSystem = {
+                config =
+                  if targetSystem == "x86_64-linux" then
+                    "x86_64-unknown-linux-${libc}"
+                  else if targetSystem == "aarch64-linux" then
+                    "aarch64-unknown-linux-${libc}"
+                  else
+                    throw "Unsupported target: ${targetSystem}";
+              };
+            };
+
+        # Build packages for a specific target
+        mkPackagesForTarget =
+          targetSystem:
+          let
+            # Server uses musl for static linking (containers)
+            pkgsServerTarget = mkCrossSystem targetSystem "musl";
+            craneLibServer = (crane.mkLib pkgsServerTarget).overrideToolchain (
+              _:
+              fenix.packages.${system}.fromToolchainFile {
+                file = ./rust-toolchain.toml;
+                sha256 = rustToolchainSha256;
+              }
+            );
+
+            # Core library uses glibc for Linux (ignored on macOS where native toolchain is used)
+            pkgsCoreTarget = mkCrossSystem targetSystem "gnu";
+            craneLibCore = (crane.mkLib pkgsCoreTarget).overrideToolchain (
+              _:
+              fenix.packages.${system}.fromToolchainFile {
+                file = ./rust-toolchain.toml;
+                sha256 = rustToolchainSha256;
+              }
+            );
+
+            # Build server dependencies (musl)
+            serverArtifacts = craneLibServer.buildDepsOnly (
+              commonArgs
+              // {
+                pname = "eidolons-server-deps";
+                cargoExtraArgs = "--package eidolons-server";
+              }
+            );
+
+            # Build core dependencies (gnu)
+            coreArtifacts = craneLibCore.buildDepsOnly (
+              commonArgs
+              // {
+                pname = "eidolons-core-deps";
+                cargoExtraArgs = "--package eidolons";
+              }
+            );
+
+            # Build the server binary with musl (static)
+            server = craneLibServer.buildPackage (
+              commonArgs
+              // {
+                cargoArtifacts = serverArtifacts;
+                pname = "eidolons-server";
+                cargoExtraArgs = "--bin eidolons-server";
+              }
+            );
+
+            # Build the core library with gnu (dynamic, app-compatible)
+            core = craneLibCore.buildPackage (
+              commonArgs
+              // {
+                cargoArtifacts = coreArtifacts;
+                pname = "eidolons-core";
+                cargoExtraArgs = "--lib -p eidolons";
+              }
+            );
+
+            # Build OCI (Docker) image containing the musl server
+            server-oci = pkgsServerTarget.dockerTools.buildLayeredImage {
+              name = "eidolons-server";
+              tag = "latest";
+
+              contents = [ server ];
+
+              config = {
+                Cmd = [ "${server}/bin/eidolons-server" ];
+                Env = [
+                  "SOURCE_DATE_EPOCH=0"
+                ];
+              };
+
+              # Reproducible timestamps
+              created = "1970-01-01T00:00:00Z";
+            };
+          in
+          {
+            inherit server core server-oci;
+          };
+
+        # Build cargo dependencies once for checks (reused across fmt/clippy/test)
+        cargoArtifacts = craneLib.buildDepsOnly (
+          commonArgs
+          // {
+            pname = "eidolons-deps";
+          }
+        );
+
+        # Build for the current system
+        nativePackages = mkPackagesForTarget system;
+
+        # Cross-compiled Linux packages (from macOS)
+        linuxPackages = {
+          x86_64-linux = mkPackagesForTarget "x86_64-linux";
+          aarch64-linux = mkPackagesForTarget "aarch64-linux";
+        };
+
+        # Swift/Apple-specific packages
+        applePackages = rec {
+          # Build a static library for a specific Apple target.
+          # Static libraries don't require the iOS SDK - only the Rust compiler and pre-built std.
+          buildAppleTarget =
+            target:
+            let
+              isIOS = builtins.match ".*-ios.*" target != null;
+            in
+            craneLib.buildPackage (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                pname = "eidolons-${target}";
+                cargoExtraArgs = "--lib -p eidolons";
+                CARGO_BUILD_TARGET = target;
+
+                # Skip tests for iOS targets - can't run iOS binaries on macOS
+                doCheck = !isIOS;
+
+                # Override crate type to staticlib for this build
+                preBuild = ''
+                  sed -i 's/crate-type = .*/crate-type = ["staticlib"]/' core/Cargo.toml
+                '';
+
+                # Only install the static library
+                installPhaseCommand = ''
+                  mkdir -p $out/lib
+                  cp target/${target}/release/libeidolons.a $out/lib/
+                '';
+              }
+            );
+
+          # Build static libraries for all Apple platforms
+          appleTargets = {
+            aarch64-apple-darwin = buildAppleTarget "aarch64-apple-darwin";
+            x86_64-apple-darwin = buildAppleTarget "x86_64-apple-darwin";
+            aarch64-apple-ios = buildAppleTarget "aarch64-apple-ios";
+            aarch64-apple-ios-sim = buildAppleTarget "aarch64-apple-ios-sim";
+            x86_64-apple-ios = buildAppleTarget "x86_64-apple-ios";
+          };
+
+          # Create universal (fat) binaries and assemble XCFramework
+          xcframework =
+            pkgs.runCommand "xcframework"
+              {
+                nativeBuildInputs = [ pkgs.darwin.cctools ];
+              }
+              ''
+                mkdir -p "$out/macos-arm64_x86_64"
+                mkdir -p "$out/ios-arm64"
+                mkdir -p "$out/ios-arm64_x86_64-simulator"
+
+                # macOS: combine arm64 + x86_64 into universal binary
+                lipo -create \
+                  ${appleTargets.aarch64-apple-darwin}/lib/libeidolons.a \
+                  ${appleTargets.x86_64-apple-darwin}/lib/libeidolons.a \
+                  -output "$out/macos-arm64_x86_64/libeidolons.a"
+
+                # iOS device: arm64 only
+                cp ${appleTargets.aarch64-apple-ios}/lib/libeidolons.a \
+                  "$out/ios-arm64/libeidolons.a"
+
+                # iOS simulator: combine arm64 + x86_64 into universal binary
+                lipo -create \
+                  ${appleTargets.aarch64-apple-ios-sim}/lib/libeidolons.a \
+                  ${appleTargets.x86_64-apple-ios}/lib/libeidolons.a \
+                  -output "$out/ios-arm64_x86_64-simulator/libeidolons.a"
+
+                # Create Info.plist
+                cat > "$out/Info.plist" << 'EOF'
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                <plist version="1.0">
+                <dict>
+                  <key>AvailableLibraries</key>
+                  <array>
+                    <dict>
+                      <key>LibraryIdentifier</key>
+                      <string>macos-arm64_x86_64</string>
+                      <key>LibraryPath</key>
+                      <string>libeidolons.a</string>
+                      <key>SupportedArchitectures</key>
+                      <array>
+                        <string>arm64</string>
+                        <string>x86_64</string>
+                      </array>
+                      <key>SupportedPlatform</key>
+                      <string>macos</string>
+                    </dict>
+                    <dict>
+                      <key>LibraryIdentifier</key>
+                      <string>ios-arm64</string>
+                      <key>LibraryPath</key>
+                      <string>libeidolons.a</string>
+                      <key>SupportedArchitectures</key>
+                      <array><string>arm64</string></array>
+                      <key>SupportedPlatform</key>
+                      <string>ios</string>
+                    </dict>
+                    <dict>
+                      <key>LibraryIdentifier</key>
+                      <string>ios-arm64_x86_64-simulator</string>
+                      <key>LibraryPath</key>
+                      <string>libeidolons.a</string>
+                      <key>SupportedArchitectures</key>
+                      <array>
+                        <string>arm64</string>
+                        <string>x86_64</string>
+                      </array>
+                      <key>SupportedPlatform</key>
+                      <string>ios</string>
+                      <key>SupportedPlatformVariant</key>
+                      <string>simulator</string>
+                    </dict>
+                  </array>
+                  <key>CFBundlePackageType</key>
+                  <string>XFWK</string>
+                  <key>XCFrameworkFormatVersion</key>
+                  <string>1.0</string>
+                </dict>
+                </plist>
+                EOF
+              '';
+
+          # Build uniffi-bindgen-swift tool
+          uniffi-bindgen-swift = craneLib.buildPackage (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              pname = "uniffi-bindgen-swift";
+              cargoExtraArgs = "--bin uniffi-bindgen-swift";
+            }
+          );
+
+          # Build core library for Swift bindings generation (native macOS)
+          # Note: This is separate from nativePackages.core because it shares cargoArtifacts
+          # with the checks (clippy, tests, fmt), making CI builds more efficient.
+          core-swift = craneLib.buildPackage (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              pname = "eidolons-swift";
+              cargoExtraArgs = "--lib -p eidolons";
+            }
+          );
+
+          # Generate Swift bindings from the core library
+          swift-bindings = pkgs.stdenv.mkDerivation {
+            name = "eidolons-swift-bindings";
+
+            # Need the built library, bindgen tool, and cargo for metadata extraction
+            nativeBuildInputs = [
+              applePackages.uniffi-bindgen-swift
+              rustToolchain # Provides cargo for metadata extraction
+            ];
+
+            # Use same deterministic settings
+            SOURCE_DATE_EPOCH = "0";
+
+            # The generation happens in buildPhase
+            dontUnpack = true;
+
+            buildPhase = ''
+              # Create output directories
+              mkdir -p $out/Sources/EidolonsCore
+              mkdir -p $out/Sources/EidolonsCoreFFI
+
+              # uniffi-bindgen-swift needs access to the Cargo.toml to extract metadata
+              # Copy the source tree to allow cargo metadata to work
+              cp -r ${src}/* .
+              chmod -R +w .
+
+              # Find the dylib - it will be in the lib output
+              DYLIB="${applePackages.core-swift}/lib/libeidolons.dylib"
+
+              # Generate Swift bindings to a temp directory first
+              TEMP_OUT=$(mktemp -d)
+              uniffi-bindgen-swift \
+                --swift-sources --headers --modulemap \
+                --metadata-no-deps \
+                "$DYLIB" \
+                "$TEMP_OUT" \
+                --module-name eidolonsFFI \
+                --modulemap-filename module.modulemap
+
+              # Move files to their proper locations:
+              # - Swift source goes to EidolonsCore
+              # - Header and modulemap go to EidolonsCoreFFI
+              mv "$TEMP_OUT"/*.swift $out/Sources/EidolonsCore/
+              mv "$TEMP_OUT"/*.h $out/Sources/EidolonsCoreFFI/
+              mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolonsCoreFFI/
+            '';
+
+            installPhase = ''
+              # Output is already in $out from buildPhase
+              echo "Generated Swift bindings:"
+              echo "EidolonsCore (Swift):"
+              ls -la $out/Sources/EidolonsCore/
+              echo "EidolonsCoreFFI (C headers):"
+              ls -la $out/Sources/EidolonsCoreFFI/
+            '';
+          };
+
+          # Script to run Swift tests (uses Nix-built XCFramework, no Xcode required for lib)
+          swift-test = pkgs.writeShellScriptBin "swift-test" ''
+            set -euo pipefail
+
+            echo "Building XCFramework via Nix..."
+            nix build .#xcframework -o result-xcframework
+
+            echo "Setting up XCFramework for Swift PM..."
+            XCFRAMEWORK_DIR="core/target/apple"
+            mkdir -p "$XCFRAMEWORK_DIR"
+            rm -rf "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            cp -r result-xcframework "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            chmod -R +w "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+
+            # Clean up build symlink
+            rm result-xcframework
+
+            echo "Cleaning Swift PM cache (ensures fresh link against new XCFramework)..."
+            rm -rf core/.build
+
+            echo "Running Swift tests..."
+            cd core
+            swift test
+          '';
+
+          # Script to update Swift bindings in the source tree
+          update-swift-bindings = pkgs.writeShellScriptBin "update-swift-bindings" ''
+            set -euo pipefail
+
+            echo "Building Swift bindings via Nix..."
+            nix build .#swift-bindings -o result-swift-bindings
+
+            # Clean and update output directories
+            SWIFT_DIR="core/swift/Sources/EidolonsCore"
+            FFI_DIR="core/swift/Sources/EidolonsCoreFFI"
+            rm -rf "$SWIFT_DIR" "$FFI_DIR"
+            mkdir -p "$SWIFT_DIR" "$FFI_DIR"
+
+            # Copy generated bindings to source tree
+            cp result-swift-bindings/Sources/EidolonsCore/* "$SWIFT_DIR/"
+            cp result-swift-bindings/Sources/EidolonsCoreFFI/* "$FFI_DIR/"
+
+            # Clean up build symlink
+            rm result-swift-bindings
+
+            echo "Swift bindings updated successfully!"
+            echo ""
+            echo "Generated Swift files:"
+            ls -lh "$SWIFT_DIR"
+            echo ""
+            echo "Generated FFI headers:"
+            ls -lh "$FFI_DIR"
+            echo ""
+            echo "Don't forget to commit these changes!"
+          '';
+
+          # Script to build unsigned macOS app for reproducibility verification
+          # This produces a deterministic build that can be compared against signed releases.
+          # See REPRODUCIBILITY.md for verification instructions.
+          build-app-unsigned = pkgs.writeShellScriptBin "build-app-unsigned" ''
+            set -euo pipefail
+
+            echo "Building unsigned Eidolons.app for reproducibility verification..."
+            echo ""
+
+            # Ensure XCFramework is built and in place
+            echo "Step 1: Building XCFramework via Nix..."
+            nix build .#xcframework -o result-xcframework
+
+            XCFRAMEWORK_DIR="core/target/apple"
+            mkdir -p "$XCFRAMEWORK_DIR"
+            rm -rf "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            cp -r result-xcframework "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            chmod -R +w "$XCFRAMEWORK_DIR/libeidolons-rs.xcframework"
+            rm result-xcframework
+
+            echo "Step 2: Building unsigned app with deterministic settings..."
+
+            # Deterministic build environment
+            export ZERO_AR_DATE=1
+            export SOURCE_DATE_EPOCH=0
+
+            # Output directory
+            OUTPUT_DIR="$(pwd)/apps/apple/.build/unsigned"
+            rm -rf "$OUTPUT_DIR"
+            mkdir -p "$OUTPUT_DIR"
+
+            # Use a fixed derived data path for reproducibility
+            DERIVED_DATA="$OUTPUT_DIR/DerivedData"
+
+            # Get the source root for path remapping
+            SRCROOT="$(pwd)/apps/apple/Eidolons"
+
+            # Build for macOS without code signing
+            # Note: We build only macOS here; iOS builds require additional setup
+            xcodebuild \
+              -project apps/apple/Eidolons/Eidolons.xcodeproj \
+              -scheme Eidolons \
+              -configuration Release \
+              -destination "generic/platform=macOS" \
+              -derivedDataPath "$DERIVED_DATA" \
+              CODE_SIGN_IDENTITY="" \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO \
+              AD_HOC_CODE_SIGNING_ALLOWED=NO \
+              OTHER_LDFLAGS="\$(inherited) -Wl,-oso_prefix,$SRCROOT/" \
+              OTHER_CFLAGS="\$(inherited) -fdebug-prefix-map=$SRCROOT/=." \
+              OTHER_SWIFT_FLAGS="\$(inherited) -debug-prefix-map $SRCROOT=." \
+              CURRENT_PROJECT_VERSION=1 \
+              MARKETING_VERSION=1.0 \
+              DEVELOPMENT_TEAM="" \
+              2>&1 | tee "$OUTPUT_DIR/build.log"
+
+            # Copy the built app to output
+            APP_PATH=$(find "$DERIVED_DATA" -name "Eidolons.app" -type d | head -1)
+            if [ -z "$APP_PATH" ]; then
+              echo "ERROR: Could not find built Eidolons.app"
+              exit 1
+            fi
+
+            cp -r "$APP_PATH" "$OUTPUT_DIR/"
+
+            # Generate build info for verification
+            cat > "$OUTPUT_DIR/BUILD-INFO.txt" << EOF
+            Build Information for Reproducibility Verification
+            ==================================================
+
+            Commit: $(git rev-parse HEAD)
+            Branch: $(git rev-parse --abbrev-ref HEAD)
+            Build Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+            Environment:
+              macOS: $(sw_vers -productVersion)
+              Xcode: $(xcodebuild -version | head -1)
+              SDK: $(xcrun --show-sdk-version)
+
+            Build Settings:
+              ZERO_AR_DATE=1
+              SOURCE_DATE_EPOCH=0
+              CODE_SIGNING_REQUIRED=NO
+
+            To verify this build, see REPRODUCIBILITY.md
+            EOF
+
+            # Generate checksums
+            echo ""
+            echo "Generating checksums..."
+            cd "$OUTPUT_DIR"
+
+            # Checksum of the main binary
+            shasum -a 256 Eidolons.app/Contents/MacOS/Eidolons > checksums.sha256
+            # Checksum of the entire app bundle (tar to normalize)
+            tar -cf - Eidolons.app | shasum -a 256 >> checksums.sha256
+
+            echo ""
+            echo "Build complete!"
+            echo ""
+            echo "Output: $OUTPUT_DIR/"
+            ls -la "$OUTPUT_DIR/"
+            echo ""
+            echo "Checksums:"
+            cat checksums.sha256
+            echo ""
+            echo "See BUILD-INFO.txt for environment details."
+          '';
+        };
+
+      in
+      {
+        packages = {
+          # Native macOS packages
+          server = nativePackages.server;
+          server-oci = nativePackages.server-oci;
+          core = nativePackages.core;
+
+          # Linux cross-compiled packages
+          server-x86_64-linux = linuxPackages.x86_64-linux.server;
+          server-aarch64-linux = linuxPackages.aarch64-linux.server;
+          server-oci-x86_64-linux = linuxPackages.x86_64-linux.server-oci;
+          server-oci-aarch64-linux = linuxPackages.aarch64-linux.server-oci;
+
+          # Swift/Apple packages
+          uniffi-bindgen-swift = applePackages.uniffi-bindgen-swift;
+          core-swift = applePackages.core-swift;
+          swift-bindings = applePackages.swift-bindings;
+          xcframework = applePackages.xcframework;
+          update-swift-bindings = applePackages.update-swift-bindings;
+          swift-test = applePackages.swift-test;
+          build-app-unsigned = applePackages.build-app-unsigned;
+        };
+
+        # Development shell with Rust toolchain and tools
+        devShells.default = pkgs.mkShell {
+          buildInputs = [
+            rustToolchain
+            pkgs.cargo-watch
+            pkgs.rust-analyzer
+            pkgs.pinact # Pin GitHub Actions to SHAs
+
+            # Swift/Apple development tools
+            applePackages.update-swift-bindings
+            applePackages.swift-test
+            applePackages.build-app-unsigned
+            pkgs.darwin.cctools # Provides lipo for universal binary creation
+          ];
+
+          # Same environment variables as builds for consistency
+          SOURCE_DATE_EPOCH = "0";
+          RUSTFLAGS = "-C debuginfo=0 -C target-cpu=generic";
+
+          shellHook = ''
+            echo "Swift commands available:"
+            echo "  update-swift-bindings  - Generate Swift bindings"
+            echo "  swift-test             - Run Swift tests"
+            echo "  build-app-unsigned     - Build unsigned app for reproducibility verification"
+            echo ""
+            echo "XCFramework is built automatically via: nix build .#xcframework"
+          '';
+        };
+
+        # Checks (run with `nix flake check`)
+        checks = {
+          # Verify builds work
+          server-builds = nativePackages.server;
+          core-builds = nativePackages.core;
+
+          # Verify code formatting
+          formatting = craneLib.cargoFmt {
+            inherit (commonArgs) src;
+            pname = "eidolons-fmt";
+          };
+
+          # Verify no Clippy warnings
+          clippy = craneLib.cargoClippy (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              pname = "eidolons-clippy";
+              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+            }
+          );
+
+          # Run unit tests
+          tests = craneLib.cargoTest (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              pname = "eidolons-tests";
+            }
+          );
+
+          # Verify committed Swift bindings match generated ones
+          # Note: Swift tests require XCTest which is only available via Xcode, not in
+          # open-source Swift. Tests run in CI using system Swift after setting up the
+          # Nix-built XCFramework. The xcframework package is reproducible; only the
+          # test execution uses system tools.
+          swift-bindings-current =
+            pkgs.runCommand "check-swift-bindings"
+              {
+                buildInputs = [ pkgs.diffutils ];
+              }
+              ''
+                echo "Checking if committed Swift bindings match generated ones..."
+
+                # Check Swift sources
+                GENERATED_SWIFT="${applePackages.swift-bindings}/Sources/EidolonsCore"
+                COMMITTED_SWIFT="${src}/core/swift/Sources/EidolonsCore"
+
+                if [ ! -d "$COMMITTED_SWIFT" ] || [ -z "$(ls -A "$COMMITTED_SWIFT" 2>/dev/null)" ]; then
+                  echo "ERROR: No committed Swift bindings found at core/swift/Sources/EidolonsCore/"
+                  echo "Run: nix run .#update-swift-bindings"
+                  echo "Then commit the generated files."
+                  exit 1
+                fi
+
+                # Check FFI headers
+                GENERATED_FFI="${applePackages.swift-bindings}/Sources/EidolonsCoreFFI"
+                COMMITTED_FFI="${src}/core/swift/Sources/EidolonsCoreFFI"
+
+                if [ ! -d "$COMMITTED_FFI" ] || [ -z "$(ls -A "$COMMITTED_FFI" 2>/dev/null)" ]; then
+                  echo "ERROR: No committed FFI headers found at core/swift/Sources/EidolonsCoreFFI/"
+                  echo "Run: nix run .#update-swift-bindings"
+                  echo "Then commit the generated files."
+                  exit 1
+                fi
+
+                # Compare generated vs committed (Swift)
+                if ! diff -r "$GENERATED_SWIFT" "$COMMITTED_SWIFT"; then
+                  echo ""
+                  echo "ERROR: Committed Swift bindings don't match generated ones!"
+                  echo ""
+                  echo "To fix this:"
+                  echo "  1. Run: nix run .#update-swift-bindings"
+                  echo "  2. Review the changes"
+                  echo "  3. Commit the updated bindings"
+                  echo ""
+                  exit 1
+                fi
+
+                # Compare generated vs committed (FFI headers)
+                if ! diff -r "$GENERATED_FFI" "$COMMITTED_FFI"; then
+                  echo ""
+                  echo "ERROR: Committed FFI headers don't match generated ones!"
+                  echo ""
+                  echo "To fix this:"
+                  echo "  1. Run: nix run .#update-swift-bindings"
+                  echo "  2. Review the changes"
+                  echo "  3. Commit the updated bindings"
+                  echo ""
+                  exit 1
+                fi
+
+                echo "✓ Swift bindings are up to date"
+                touch $out
+              '';
+        };
+      }
+    );
+}
