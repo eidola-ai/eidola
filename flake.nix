@@ -137,7 +137,7 @@
               commonArgs
               // cfg.targetArgs
               // {
-                pname = "eidolons-server-deps-${rustTarget}";
+                pname = "eidolons-server-deps--${rustTarget}";
                 cargoExtraArgs = "--package eidolons-server";
               }
             );
@@ -147,17 +147,17 @@
             // cfg.targetArgs
             // {
               cargoArtifacts = serverArtifacts;
-              pname = "eidolons-server-${rustTarget}";
+              pname = "eidolons-server--${rustTarget}";
               cargoExtraArgs = "--bin eidolons-server";
             }
           );
 
-        # Build the core library
+        # Build the core library dependencies and package
         # - rustTarget: Rust target triple
         # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
         # - crateType: "staticlib" (default) or "cdylib"
         # - doCheck: whether to run tests (default true)
-        mkCore =
+        mkCoreInternals =
           rustTarget: nixCrossSystem: crateType: doCheck:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
@@ -173,24 +173,40 @@
               commonArgs
               // cfg.targetArgs
               // {
-                pname = "eidolons-core-deps-${rustTarget}";
+                pname = "eidolons-core-deps--${rustTarget}";
                 cargoExtraArgs = "--package eidolons";
                 preBuild = preBuildHook;
                 doCheck = effectiveDoCheck;
               }
             );
+            corePackage = cfg.craneLibTarget.buildPackage (
+              commonArgs
+              // cfg.targetArgs
+              // {
+                cargoArtifacts = coreArtifacts;
+                pname = "eidolons-core--${rustTarget}";
+                cargoExtraArgs = "--lib -p eidolons";
+                preBuild = preBuildHook;
+                doCheck = effectiveDoCheck;
+              }
+            );
           in
-          cfg.craneLibTarget.buildPackage (
-            commonArgs
-            // cfg.targetArgs
-            // {
-              cargoArtifacts = coreArtifacts;
-              pname = "eidolons-core-${rustTarget}";
-              cargoExtraArgs = "--lib -p eidolons";
-              preBuild = preBuildHook;
-              doCheck = effectiveDoCheck;
-            }
-          );
+          {
+            coreArtifacts = coreArtifacts;
+            corePackage = corePackage;
+          };
+
+        # Build the core library
+        # - rustTarget: Rust target triple
+        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
+        # - crateType: "staticlib" (default) or "cdylib"
+        # - doCheck: whether to run tests (default true)
+        mkCore =
+          rustTarget: nixCrossSystem: crateType: doCheck:
+          let
+            mkCoreHelperResults = mkCoreInternals rustTarget nixCrossSystem crateType doCheck;
+          in
+          mkCoreHelperResults.corePackage;
 
         # Build OCI (Docker) image containing the server
         # - rustTarget: Rust target triple
@@ -468,6 +484,25 @@
             inherit (commonArgs) src;
             pname = "eidolons-fmt";
           };
+
+          # Verify no Clippy warnings
+          clippy = craneLib.cargoClippy (
+            commonArgs
+            // {
+              cargoArtifacts = (mkCoreInternals nativeRustTarget null null null).coreArtifacts;
+              pname = "eidolons-clippy";
+              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+            }
+          );
+
+          # Run unit tests
+          tests = craneLib.cargoTest (
+            commonArgs
+            // {
+              cargoArtifacts = (mkCoreInternals nativeRustTarget null null null).coreArtifacts;
+              pname = "eidolons-tests";
+            }
+          );
         };
       }
     );
