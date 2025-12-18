@@ -449,11 +449,8 @@
             ]
           ) (builtins.attrNames crossTargets)
         );
-
-      in
-      {
-        # Default packages for current system
         packages =
+          # Default packages for current system
           mkSystemPackages nativeRustTarget null
           // crossPackages
           // {
@@ -461,6 +458,10 @@
             core-swift-bindings = mkCoreSwiftBindings;
             core-swift-xcframework = mkCoreSwiftXCFramework;
           };
+
+      in
+      {
+        inherit packages;
 
         # Development shell with Rust toolchain and tools
         devShells.default = pkgs.mkShell {
@@ -504,6 +505,8 @@
             }
           );
 
+          # Ensure the primary artifacts are built
+          build-server-oci = packages.server-oci;
         };
       }
     );
