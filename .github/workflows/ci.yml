@@ -15,6 +15,7 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 15
     permissions:
+      id-token: write
       contents: read
       packages: write
 
@@ -39,8 +40,8 @@ jobs:
           mkdir -p $RUNNER_TEMP/out
 
           # OCI images (Linux only)
-          nix build '.#server-oci--x86_64-linux' -L -o $RUNNER_TEMP/out/server-oci--x86_64-linux
-          nix build '.#server-oci--aarch64-linux' -L -o $RUNNER_TEMP/out/server-oci--aarch64-linux
+          nix build '.#server-oci--x86_64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--x86_64-unknown-linux-musl
+          nix build '.#server-oci--aarch64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--aarch64-unknown-linux-musl
 
           # TODO: build native apps
 
@@ -115,9 +116,9 @@ jobs:
             }
 
             # Decompress archives once
-            tar_x86="$RUNNER_TEMP/out/oci-images/server-oci--x86_64-linux.tar"
+            tar_x86="$RUNNER_TEMP/out/oci-images/server-oci--x86_64-unknown-linux-musl.tar"
             tar_arm="$RUNNER_TEMP/out/oci-images/server-oci--arm64-linux.tar"
-            gunzip_archive $RUNNER_TEMP/out/server-oci--x86_64-linux.tar "$tar_x86"
+            gunzip_archive $RUNNER_TEMP/out/server-oci--x86_64-unknown-linux-musl.tar "$tar_x86"
             gunzip_archive $RUNNER_TEMP/out/server-oci--arm64-linux.tar "$tar_arm"
 
             # Push architecture-specific images
