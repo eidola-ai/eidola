@@ -62,6 +62,10 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Install the pure-Rust crypto provider for TLS (must be done before any TLS operations)
+    rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider())
+        .expect("failed to install rustls crypto provider");
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(

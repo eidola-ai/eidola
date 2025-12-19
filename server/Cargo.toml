@@ -15,8 +15,12 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
 
-# HTTP client for upstream requests
-reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json", "stream"] }
+# HTTP client for upstream requests (using rustls with pure-Rust crypto for cross-compilation)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream"] }
+
+# Pure Rust TLS crypto provider (no C/assembly dependencies)
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
