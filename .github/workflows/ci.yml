@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@ab6bcb2d5af0e904d04aea750e2089e9dc4cbfdd # v13
+        uses: DeterminateSystems/determinate-nix-action@9a921d81e9a16a9ad8423a63a7b31deb601139a6 # v3.14.0
 
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v8
@@ -40,8 +40,8 @@ jobs:
           mkdir -p $RUNNER_TEMP/out
 
           # OCI images (Linux only)
-          nix build '.#server-oci--x86_64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--x86_64-unknown-linux-musl
-          nix build '.#server-oci--aarch64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--aarch64-unknown-linux-musl
+          nix build '.#server-oci--x86_64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--x86_64-unknown-linux-musl.tar.gz
+          nix build '.#server-oci--aarch64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--aarch64-unknown-linux-musl.tar.gz
 
           # TODO: build native apps
 
@@ -118,8 +118,8 @@ jobs:
             # Decompress archives once
             tar_x86="$RUNNER_TEMP/out/oci-images/server-oci--x86_64-unknown-linux-musl.tar"
             tar_arm="$RUNNER_TEMP/out/oci-images/server-oci--arm64-linux.tar"
-            gunzip_archive $RUNNER_TEMP/out/server-oci--x86_64-unknown-linux-musl.tar "$tar_x86"
-            gunzip_archive $RUNNER_TEMP/out/server-oci--arm64-linux.tar "$tar_arm"
+            gunzip_archive $RUNNER_TEMP/out/server-oci--x86_64-unknown-linux-musl.tar.gz "$tar_x86"
+            gunzip_archive $RUNNER_TEMP/out/server-oci--arm64-linux.tar.gz "$tar_arm"
 
             # Push architecture-specific images
             crane push "$tar_x86" "${IMAGE}:${TAG_PREFIX}-amd64"
