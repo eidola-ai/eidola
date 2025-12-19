@@ -35,7 +35,7 @@ jobs:
 
       - name: Build all packages
         run: |
-          mkxir -p /out
+          mkdir -p /out
 
           # OCI images (Linux only)
           nix build '.#server-oci--x86_64-linux' -L -o /out/server-oci--x86_64-linux
@@ -46,7 +46,7 @@ jobs:
       - name: Verify build outputs
         run: |
           echo "=== Server OCI images ==="
-          ls -lh /out/result-oci-*
+          ls -lh /out/server-oci--*
 
       - name: Run Swift tests
         run: |
@@ -114,10 +114,10 @@ jobs:
             }
 
             # Decompress archives once
-            tar_x86="/out/oci-images/server-oci-x86_64-linux.tar"
-            tar_arm="/out/oci-images/server-oci-arm64-linux.tar"
-            gunzip_archive /out/server-oci-x86_64-linux.tar "$tar_x86"
-            gunzip_archive /out/server-oci-arm64-linux.tar "$tar_arm"
+            tar_x86="/out/oci-images/server-oci--x86_64-linux.tar"
+            tar_arm="/out/oci-images/server-oci--arm64-linux.tar"
+            gunzip_archive /out/server-oci--x86_64-linux.tar "$tar_x86"
+            gunzip_archive /out/server-oci--arm64-linux.tar "$tar_arm"
 
             # Push architecture-specific images
             crane push "$tar_x86" "${IMAGE}:${TAG_PREFIX}-amd64"
