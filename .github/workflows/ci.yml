@@ -11,9 +11,11 @@ on:
 jobs:
   build-all-platforms:
     name: Build all platforms
-    runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
+    # runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
+    runs-on: self-hosted
     timeout-minutes: 15
     permissions:
+      id-token: write
       contents: read
       packages: write
 
@@ -22,7 +24,7 @@ jobs:
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@c5a866b6ab867e88becbed4467b93592bce69f8a # v21
+        uses: DeterminateSystems/determinate-nix-action@9a921d81e9a16a9ad8423a63a7b31deb601139a6 # v3.14.0
 
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v8
@@ -32,79 +34,30 @@ jobs:
 
       - name: Run all checks
         run: nix flake check --show-trace
-        # Checks include: formatting, clippy, Rust tests, Swift bindings verification
-        # Note: Checks run on current system (aarch64-darwin) only
-        # This is sufficient as code quality checks are platform-independent
-        # Cross-compiled packages are built and verified below
-        # Swift tests run separately (XCTest requires system Xcode)
 
       - name: Build all packages
         run: |
-          # Native macOS packages
-          nix build '.#server' -L -o result-macos
-          nix build '.#core' -L -o result-core
-
-          # Swift bindings (macOS only)
-          nix build '.#swift-bindings' -L -o result-swift-bindings
-
-          # Cross-compiled Linux packages
-          nix build '.#server-x86_64-linux' -L -o result-linux-x86
-          nix build '.#server-aarch64-linux' -L -o result-linux-arm
+          mkdir -p $RUNNER_TEMP/out
 
           # OCI images (Linux only)
-          nix build '.#server-oci-x86_64-linux' -L -o result-oci-x86
-          nix build '.#server-oci-aarch64-linux' -L -o result-oci-arm
+          nix build '.#server-oci--x86_64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--x86_64-unknown-linux-musl.tar.gz
+          nix build '.#server-oci--aarch64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--aarch64-unknown-linux-musl.tar.gz
+
+          # TODO: build native apps
 
       - name: Verify build outputs
         run: |
-          echo "=== Native macOS server ==="
-          file result-macos/bin/eidolons-server
-
-          echo "=== Linux x86_64 server ==="
-          file result-linux-x86/bin/eidolons-server
-
-          echo "=== Linux aarch64 server ==="
-          file result-linux-arm/bin/eidolons-server
-
-          echo "=== Swift bindings ==="
-          ls -lh result-swift-bindings/Sources/EidolonsCore/
-          ls -lh result-swift-bindings/Sources/EidolonsCoreFFI/
-
-          echo "=== OCI images ==="
-          ls -lh result-oci-*
+          echo "=== Server OCI images ==="
+          ls -lh $RUNNER_TEMP/out/server-oci--*
 
       - name: Run Swift tests
         run: |
-          # Build the XCFramework via Nix (reproducible, no Xcode needed)
-          nix build '.#xcframework' -L -o result-xcframework
+          # Build the XCFramework via Nix and update the local paths
+          nix run '.#update-core-swift-xcframework'
 
-          # Set up XCFramework where Package.swift expects it
-          mkdir -p core/target/apple
-          cp -r result-xcframework core/target/apple/libeidolons-rs.xcframework
-
-          # Run Swift tests using system Swift (XCTest requires Xcode)
-          cd core && swift test
-
-      - name: Upload macOS server binary
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: eidolons-server-macos-aarch64
-          path: result-macos/bin/eidolons-server
-          if-no-files-found: error
-
-      - name: Upload Linux x86_64 server binary
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: eidolons-server-linux-x86_64
-          path: result-linux-x86/bin/eidolons-server
-          if-no-files-found: error
-
-      - name: Upload Linux aarch64 server binary
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: eidolons-server-linux-aarch64
-          path: result-linux-arm/bin/eidolons-server
-          if-no-files-found: error
+          # Run Swift tests using system Swift
+          cd core
+          swift test
 
       - name: Determine image tags
         id: tags
@@ -145,7 +98,7 @@ jobs:
           export IMAGE
 
           # Use crane from the pinned flake (no Docker needed)
-          nix shell .#crane-cli --command bash -c '
+          nix develop --command bash -c '
             set -euo pipefail
 
             # Authenticate once for GHCR
@@ -153,7 +106,7 @@ jobs:
 
             # Use a local directory for intermediate files. The GitHub Actions runner
             # is ephemeral, so explicit cleanup is not necessary.
-            mkdir -p ./oci-images
+            mkdir -p $RUNNER_TEMP/out/oci-images
 
             # dockerTools outputs gzip-compressed archives; crane expects plain tar
             gunzip_archive() {
@@ -163,10 +116,10 @@ jobs:
             }
 
             # Decompress archives once
-            tar_x86="./oci-images/result-oci-x86.tar"
-            tar_arm="./oci-images/result-oci-arm.tar"
-            gunzip_archive result-oci-x86 "$tar_x86"
-            gunzip_archive result-oci-arm "$tar_arm"
+            tar_x86="$RUNNER_TEMP/out/oci-images/server-oci--x86_64-unknown-linux-musl.tar"
+            tar_arm="$RUNNER_TEMP/out/oci-images/server-oci--aarch64-unknown-linux-musl.tar"
+            gunzip_archive $RUNNER_TEMP/out/server-oci--x86_64-unknown-linux-musl.tar.gz "$tar_x86"
+            gunzip_archive $RUNNER_TEMP/out/server-oci--aarch64-unknown-linux-musl.tar.gz "$tar_arm"
 
             # Push architecture-specific images
             crane push "$tar_x86" "${IMAGE}:${TAG_PREFIX}-amd64"
