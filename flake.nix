@@ -211,6 +211,13 @@
         # Build OCI (Docker) image containing the server
         # - rustTarget: Rust target triple
         # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
+        #
+        # Design decisions:
+        # - Distroless: No shell or package manager (minimal attack surface)
+        # - Static binary: musl-linked, self-contained (no libc dependency)
+        # - CA certs: Embedded via webpki-roots crate (no system certs needed)
+        # - Non-root: Runs as unprivileged user (UID 65534 = nobody)
+        # - Entrypoint: Server is the only thing this container does
         mkServerOCI =
           rustTarget: nixCrossSystem:
           let
@@ -223,8 +230,21 @@
             contents = [ server ];
 
             config = {
-              Cmd = [ "${server}/bin/eidolons-server" ];
-              Env = [ "SOURCE_DATE_EPOCH=0" ];
+              Entrypoint = [ "${server}/bin/eidolons-server" ];
+
+              # Bind to all interfaces (required for container networking)
+              # ANTHROPIC_API_KEY must be provided at runtime
+              Env = [
+                "BIND_ADDR=0.0.0.0:8080"
+              ];
+
+              # Run as unprivileged user (nobody)
+              User = "65534:65534";
+
+              # Document the exposed port
+              ExposedPorts = {
+                "8080/tcp" = { };
+              };
             };
 
             # Reproducible timestamp for deterministic builds

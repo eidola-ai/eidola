@@ -1,76 +1,89 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for AI coding agents working in this repository.
 
-## Project Overview
+## Project Structure
 
-Eidolons is a Rust library with Swift bindings for iOS/macOS apps, plus a server component. The primary focus is demonstrating deterministic, reproducible builds via Nix.
+```
+eidolons/
+├── server/           # OpenAI-compatible AI proxy server
+│   └── src/
+│       ├── main.rs       # HTTP server (hyper + tokio)
+│       ├── openai.rs     # OpenAI API types
+│       ├── anthropic.rs  # Anthropic API types
+│       ├── transform.rs  # Format conversion
+│       └── proxy.rs      # Upstream HTTP client
+├── core/             # Rust library with Swift bindings
+│   ├── src/lib.rs        # Exports via #[uniffi::export]
+│   ├── swift/            # Generated Swift bindings (committed)
+│   └── uniffi-bindgen-swift/  # Custom binding generator
+├── apps/apple/       # Xcode project for iOS/macOS
+└── flake.nix         # Nix build definitions
+```
 
-**Structure:**
-- `core/` - Rust library with uniffi-generated Swift bindings
-- `server/` - Rust server binary
-- `apps/apple/Eidolons/` - Xcode project for macOS/iOS app
+## Server Architecture
+
+The server is an OpenAI-compatible proxy that translates requests to upstream AI providers.
+
+**Current upstream:** Anthropic Claude (Messages API)
+
+**Key design decisions:**
+- Pure Rust TLS via `rustls-rustcrypto` (enables cross-compilation, no C dependencies)
+- Statically linked musl binaries for Linux deployment
+- Distroless OCI images (~9MB, runs as non-root)
+- Request-based (no sessions/caching)
+
+**API endpoints:**
+- `GET /health` - Health check
+- `POST /v1/chat/completions` - OpenAI-compatible chat completions (proxied to Anthropic)
+
+**Environment variables:**
+- `ANTHROPIC_API_KEY` (required) - Anthropic API key
+- `BIND_ADDR` (default: `127.0.0.1:8080`) - Address to bind
 
 ## Build Commands
 
-This project uses Nix for reproducible builds. All commands require Nix with flakes enabled.
+All builds use Nix for reproducibility. Run `nix develop` to enter dev shell.
 
 ```bash
-# Enter development shell (provides Rust toolchain, cargo-watch, rust-analyzer)
-nix develop
+# Development
+cargo build -p eidolons-server    # Quick local build
+cargo clippy -p eidolons-server   # Lint
+cargo fmt                         # Format
 
-# Run all checks (formatting, clippy, tests, binding sync verification)
-nix flake check
-
-# Build targets (native)
-nix build '.#server'                 # Server binary (native, e.g. macOS on macOS)
-nix build '.#server-oci'             # Server OCI/Docker image (native target)
-nix build '.#core'                   # Core static library (native)
-nix build '.#core-swift-xcframework' # XCFramework for Apple platforms
-
-# Cross-compile targets (append --<target> to package name)
-nix build '.#server--x86_64-unknown-linux-musl'   # Linux x86_64
+# Production builds (Nix)
+nix build '.#server'                              # Native binary
 nix build '.#server--aarch64-unknown-linux-musl'  # Linux ARM64
+nix build '.#server-oci--aarch64-unknown-linux-musl'  # Linux ARM64 container
 
-# Update Swift bindings after changing core Rust API
+# Checks
+nix flake check   # All checks (fmt, clippy, tests, binding sync)
+
+# Swift bindings (after changing core/ API)
 nix run '.#update-core-swift-bindings'
-nix run '.#update-core-swift-xcframework'
-
-# Swift tests
-cd core && swift test
 ```
 
-## Architecture
+## Cross-Compilation
 
-### Rust-Swift FFI Bridge
-
-The core library uses [uniffi](https://github.com/mozilla/uniffi-rs) v0.30.0 for FFI generation:
-
-1. **Rust code** in `core/src/lib.rs` exports functions via `#[uniffi::export]`
-2. **Custom binding generator** in `core/uniffi-bindgen-swift/` produces Swift code
-3. **Generated artifacts** (committed):
-   - `core/swift/Sources/EidolonsCore/` - Swift bindings
-   - `core/swift/Sources/EidolonsCoreFFI/` - C FFI header
-4. **XCFramework** built for: macOS (arm64+x86_64), iOS device, iOS simulator
-
-CI verifies committed bindings match generated output via `nix flake check`.
-
-### Cross-Compilation Targets
-
-Defined in `rust-toolchain.toml` (Rust 1.92.0):
-- Apple: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-apple-ios`, `aarch64-apple-ios-sim`, `x86_64-apple-ios`
+Targets defined in `rust-toolchain.toml`:
+- Apple: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-apple-ios`, `aarch64-apple-ios-sim`
 - Linux: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
 
-### Reproducibility
+**OCI images:** Use `server-oci--<linux-target>` for Docker. The native `server-oci` builds for macOS and won't run in Docker.
 
-All Rust/Nix builds are fully reproducible. See `REPRODUCIBILITY.md` for details on:
-- Deterministic build settings used in Nix
-- XCFramework and artifact verification
-- CI outputs (OCI images pushed to GHCR)
+## Key Files
 
-## Key Configuration Files
+| File | Purpose |
+|------|---------|
+| `flake.nix` | Nix build definitions, cross-compile targets, CI checks |
+| `rust-toolchain.toml` | Pinned Rust version (1.92.0) and targets |
+| `Cargo.toml` | Workspace config, release profile (LTO, single codegen unit) |
+| `server/Cargo.toml` | Server dependencies |
+| `core/Package.swift` | Swift Package Manager config |
 
-- `flake.nix` - Nix build definitions, cross-compile targets, CI checks
-- `rust-toolchain.toml` - Pinned Rust version and targets
-- `Cargo.toml` (workspace root) - Workspace members, optimized release profile
-- `core/Package.swift` - Swift Package Manager config with binary target support
+## Conventions
+
+- Pure Rust dependencies preferred (for cross-compilation)
+- No caching/state in server (request-based)
+- OpenAI API format as the canonical interface
+- Deterministic builds (no timestamps, fixed codegen)
