@@ -57,7 +57,7 @@ sha256sum result/lib/libeidolons.a
 Generated Swift code and FFI headers are deterministic:
 
 ```bash
-nix build '.#swift-bindings'
+nix build '.#core-swift-bindings'
 diff -r result/Sources/EidolonsCore core/swift/Sources/EidolonsCore
 ```
 
@@ -68,15 +68,15 @@ CI verifies committed bindings match generated ones via `nix flake check`.
 The universal XCFramework containing static libraries for all Apple platforms:
 
 ```bash
-nix build '.#xcframework'
+nix build '.#core-swift-xcframework'
 
 # Check hashes of all platform libraries
-sha256sum result/macos-arm64_x86_64/libeidolons.a
-sha256sum result/ios-arm64/libeidolons.a
-sha256sum result/ios-arm64_x86_64-simulator/libeidolons.a
+sha256sum result/libeidolons-rs.xcframework/macos-arm64_x86_64/libeidolons.a
+sha256sum result/libeidolons-rs.xcframework/ios-arm64/libeidolons.a
+sha256sum result/libeidolons-rs.xcframework/ios-arm64_x86_64-simulator/libeidolons.a
 
 # Check hash of the framework metadata
-sha256sum result/Info.plist
+sha256sum result/libeidolons-rs.xcframework/Info.plist
 ```
 
 The XCFramework contains:
@@ -87,67 +87,51 @@ The XCFramework contains:
 
 All libraries are built hermetically within Nix - no iOS SDK required for static library compilation.
 
-### 4. Unsigned macOS App (Deterministic with Caveats)
+### 4. Unsigned macOS App (Planned)
 
-The unsigned app is built with deterministic settings but depends on system Xcode:
+Unsigned app builds with deterministic settings are planned but not yet implemented.
+The build would use settings like `ZERO_AR_DATE`, `SOURCE_DATE_EPOCH`, and path remapping
+to maximize reproducibility while depending on system Xcode.
+
+## Verifying Builds
+
+### Rust/Nix Artifacts
+
+All Rust artifacts built through Nix are fully reproducible. Given the same git commit
+and `flake.lock`, you will get bit-identical outputs:
 
 ```bash
-# Via Nix (requires system Xcode)
-nix run '.#build-app-unsigned'
+# Clone and build
+git clone https://github.com/eidolons-ai/eidolons.git
+cd eidolons
 
-# Or directly
-build-app-unsigned  # if in nix develop shell
+# Verify core library
+nix build '.#core'
+sha256sum result/lib/libeidolons.a
+
+# Verify XCFramework
+nix build '.#core-swift-xcframework'
+sha256sum result/libeidolons-rs.xcframework/*/libeidolons.a
+
+# Verify server binaries
+nix build '.#server--x86_64-unknown-linux-musl'
+sha256sum result/bin/eidolons-server
 ```
-
-**Output:** `build/unsigned/Eidolons.app` with `BUILD-INFO.txt` and `checksums.sha256`
-
-## Verifying a Release
-
-### Prerequisites
-
-To reproduce our CI builds, you need:
-- macOS (version specified in release's `BUILD-INFO.txt`)
-- Xcode (version specified in release's `BUILD-INFO.txt`)
-- Nix with flakes enabled
-
-### Step-by-Step Verification
-
-1. **Clone at the release tag:**
-   ```bash
-   git clone https://github.com/anthropic/eidolons.git
-   cd eidolons
-   git checkout v1.0.0  # or specific release tag
-   ```
-
-2. **Build the unsigned app:**
-   ```bash
-   nix run .#build-app-unsigned
-   ```
-
-3. **Compare checksums:**
-   ```bash
-   # Compare against published checksums
-   diff build/unsigned/checksums.sha256 <(curl -sL https://github.com/.../checksums.sha256)
-   ```
-
-4. **Verify signed release matches unsigned build:**
-   ```bash
-   # Download signed release
-   curl -LO https://github.com/.../Eidolons-signed.app.zip
-   unzip Eidolons-signed.app.zip
-
-   # Strip signature for comparison
-   codesign --remove-signature Eidolons-signed.app/Contents/MacOS/Eidolons
-
-   # Compare binaries (excluding _CodeSignature and provisioning)
-   diff -r build/unsigned/Eidolons.app Eidolons-signed.app \
-     --exclude="_CodeSignature" \
-     --exclude="embedded.provisionprofile"
-   ```
 
 ## Build Settings for Determinism
 
-The unsigned app build uses these settings to maximize reproducibility:
+The Nix builds use these settings to maximize reproducibility (from `flake.nix`):
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `CARGO_BUILD_JOBS` | `1` | Single-threaded for reproducibility |
+| `CARGO_INCREMENTAL` | `false` | Disable incremental compilation |
+| `SOURCE_DATE_EPOCH` | `0` | Fixed timestamp |
+| `ZERO_AR_DATE` | `1` | Reproducible ar/ranlib archives |
+| `CARGO_NET_OFFLINE` | `true` | Network isolation during build |
+| `RUSTFLAGS` | `-C debuginfo=0 -C target-cpu=generic` | Deterministic codegen |
+
+For future unsigned Xcode app builds, these additional settings would be used:
 
 | Setting | Value | Purpose |
 |---------|-------|---------|
@@ -162,23 +146,28 @@ The unsigned app build uses these settings to maximize reproducibility:
 
 ## Known Limitations
 
-### Environment Dependencies
+### What's Fully Reproducible Now
 
-The unsigned app build depends on:
+- Rust core library and server binaries (via Nix)
+- Swift bindings generation
+- XCFramework creation
+- OCI container images
+
+### Future: Unsigned App Builds
+
+When unsigned Xcode app builds are implemented, they will depend on:
 - **macOS version** - Different SDK versions embed different metadata
 - **Xcode version** - Compiler/linker versions affect output
 - **Xcode Command Line Tools** - Must match Xcode version
-
-### What May Differ
 
 Even with deterministic settings, these may vary across environments:
 - `LC_BUILD_VERSION` SDK version in Mach-O headers
 - Linker version metadata (can be normalized with `vtool`)
 - Module cache paths (shouldn't affect final binary)
 
-### Not Currently Verified
+### Not Currently Implemented
 
-- iOS app builds (requires additional iOS SDK setup)
+- Unsigned macOS/iOS app builds
 - visionOS builds
 - App Store builds (require signing)
 
@@ -196,30 +185,29 @@ The workflow will be:
 
 ```
 Tart VM Image (versioned)
-  └── macOS 15.1
-      └── Xcode 16.1
+  └── macOS 26.x
+      └── Xcode 26.x
           └── Nix
-              └── build-app-unsigned
+              └── xcodebuild (unsigned)
                   └── Bit-identical .app
 ```
 
-Until then, we document exact versions in `BUILD-INFO.txt` for each release.
+## CI Outputs
 
-## CI Artifacts
+Every CI run on `main` produces OCI images pushed to GitHub Container Registry:
 
-Every CI run produces:
+| Image | Description |
+|-------|-------------|
+| `ghcr.io/eidolons-ai/eidolons-server:latest` | Multi-arch manifest (amd64 + arm64) |
+| `ghcr.io/eidolons-ai/eidolons-server:sha-<commit>` | Commit-specific multi-arch manifest |
+| `ghcr.io/eidolons-ai/eidolons-server:latest-amd64` | Linux x86_64 (musl, static) |
+| `ghcr.io/eidolons-ai/eidolons-server:latest-arm64` | Linux ARM64 (musl, static) |
 
-| Artifact | Description |
-|----------|-------------|
-| `eidolons-app-unsigned-macos` | Unsigned .app bundle with checksums |
-| `eidolons-server-macos-aarch64` | Native macOS server binary |
-| `eidolons-server-linux-x86_64` | Linux x86_64 server (musl, static) |
-| `eidolons-server-linux-aarch64` | Linux ARM64 server (musl, static) |
+Pull requests produce images tagged with `pr-<number>` instead of `latest`/`sha-*`.
 
-The unsigned app artifact includes:
-- `Eidolons.app/` - The unsigned application bundle
-- `BUILD-INFO.txt` - Build environment details
-- `checksums.sha256` - SHA256 of binary and bundle
+CI also runs:
+- `nix flake check` (formatting, clippy, tests, binding sync verification)
+- Swift tests via `swift test`
 
 ## References
 
