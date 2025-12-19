@@ -475,6 +475,9 @@
 
             # Pin GitHub Actions to SHAs
             pkgs.pinact
+
+            # Interact with OCI images
+            pkgs.crane
           ];
         };
 

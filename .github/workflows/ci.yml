@@ -96,7 +96,7 @@ jobs:
           export IMAGE
 
           # Use crane from the pinned flake (no Docker needed)
-          nix shell .#crane-cli --command bash -c '
+          nix develop --command bash -c '
             set -euo pipefail
 
             # Authenticate once for GHCR
