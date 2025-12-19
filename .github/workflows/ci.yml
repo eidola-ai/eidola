@@ -11,7 +11,8 @@ on:
 jobs:
   build-all-platforms:
     name: Build all platforms
-    runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
+    # runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
+    runs-on: self-hosted
     timeout-minutes: 15
     permissions:
       contents: read
@@ -35,18 +36,18 @@ jobs:
 
       - name: Build all packages
         run: |
-          mkdir -p /out
+          mkdir -p $RUNNER_TEMP/out
 
           # OCI images (Linux only)
-          nix build '.#server-oci--x86_64-linux' -L -o /out/server-oci--x86_64-linux
-          nix build '.#server-oci--aarch64-linux' -L -o /out/server-oci--aarch64-linux
+          nix build '.#server-oci--x86_64-linux' -L -o $RUNNER_TEMP/out/server-oci--x86_64-linux
+          nix build '.#server-oci--aarch64-linux' -L -o $RUNNER_TEMP/out/server-oci--aarch64-linux
 
           # TODO: build native apps
 
       - name: Verify build outputs
         run: |
           echo "=== Server OCI images ==="
-          ls -lh /out/server-oci--*
+          ls -lh $RUNNER_TEMP/out/server-oci--*
 
       - name: Run Swift tests
         run: |
@@ -104,7 +105,7 @@ jobs:
 
             # Use a local directory for intermediate files. The GitHub Actions runner
             # is ephemeral, so explicit cleanup is not necessary.
-            mkdir -p /out/oci-images
+            mkdir -p $RUNNER_TEMP/out/oci-images
 
             # dockerTools outputs gzip-compressed archives; crane expects plain tar
             gunzip_archive() {
@@ -114,10 +115,10 @@ jobs:
             }
 
             # Decompress archives once
-            tar_x86="/out/oci-images/server-oci--x86_64-linux.tar"
-            tar_arm="/out/oci-images/server-oci--arm64-linux.tar"
-            gunzip_archive /out/server-oci--x86_64-linux.tar "$tar_x86"
-            gunzip_archive /out/server-oci--arm64-linux.tar "$tar_arm"
+            tar_x86="$RUNNER_TEMP/out/oci-images/server-oci--x86_64-linux.tar"
+            tar_arm="$RUNNER_TEMP/out/oci-images/server-oci--arm64-linux.tar"
+            gunzip_archive $RUNNER_TEMP/out/server-oci--x86_64-linux.tar "$tar_x86"
+            gunzip_archive $RUNNER_TEMP/out/server-oci--arm64-linux.tar "$tar_arm"
 
             # Push architecture-specific images
             crane push "$tar_x86" "${IMAGE}:${TAG_PREFIX}-amd64"
