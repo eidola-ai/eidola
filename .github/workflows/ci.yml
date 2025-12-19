@@ -28,6 +28,10 @@ jobs:
 
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v8
+        with:
+          # Without a paid account, the action will perform an unnecessary check and issue a warning
+          # unless this is set to false
+          use-flakehub: false
 
       - name: Show flake info
         run: nix flake show
