@@ -298,6 +298,14 @@
             mv "$TEMP_OUT"/*.swift $out/Sources/EidolonsCore/
             mv "$TEMP_OUT"/*.h $out/Sources/EidolonsCoreFFI/
             mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolonsCoreFFI/
+
+            # Create stub C file for SPM (requires at least one compilable source per C target)
+            cat > $out/Sources/EidolonsCoreFFI/eidolonsFFI.c << 'STUB'
+// This file exists so Swift Package Manager has something to compile for the eidolonsFFI module.
+// The actual implementation is in the XCFramework (libeidolons.a).
+// This module just exposes the C header interface to Swift.
+#include "eidolonsFFI.h"
+STUB
           '';
 
           installPhase = ''
