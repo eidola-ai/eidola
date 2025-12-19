@@ -16,7 +16,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
 
 # HTTP client for upstream requests
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json", "stream"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
