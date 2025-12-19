@@ -32,6 +32,7 @@ jobs:
           # Without a paid account, the action will perform an unnecessary check and issue a warning
           # unless this is set to false
           use-flakehub: false
+          source-url: https://github.com/mike-marcacci/magic-nix-cache/releases/download/v0.0.1-skip-upstream-test/magic-nix-cache-closure-ARM64-macOS.xz
 
       - name: Show flake info
         run: nix flake show
