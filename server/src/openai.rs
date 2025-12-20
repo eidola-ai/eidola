@@ -5,9 +5,10 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// A chat completion request in OpenAI format.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ChatCompletionRequest {
     /// ID of the model to use.
     pub model: String,
@@ -41,7 +42,7 @@ pub struct ChatCompletionRequest {
 }
 
 /// Stop sequence can be a single string or array of strings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum StopSequence {
     Single(String),
@@ -58,7 +59,7 @@ impl StopSequence {
 }
 
 /// A message in the conversation.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct Message {
     /// The role of the message author.
     pub role: Role,
@@ -72,7 +73,7 @@ pub struct Message {
 }
 
 /// The role of a message author.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
@@ -81,7 +82,7 @@ pub enum Role {
 }
 
 /// Message content can be a simple string or array of content parts (for multimodal).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
@@ -105,7 +106,7 @@ impl MessageContent {
 }
 
 /// A content part within a multimodal message.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     /// Text content.
@@ -116,7 +117,7 @@ pub enum ContentPart {
 }
 
 /// An image URL reference.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct ImageUrl {
     /// The URL of the image, or a base64-encoded data URI.
     pub url: String,
@@ -127,7 +128,7 @@ pub struct ImageUrl {
 }
 
 /// A chat completion response.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ChatCompletionResponse {
     /// Unique identifier for the completion.
     pub id: String,
@@ -166,7 +167,7 @@ impl ChatCompletionResponse {
 }
 
 /// A completion choice.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Choice {
     /// The index of this choice.
     pub index: u32,
@@ -179,14 +180,14 @@ pub struct Choice {
 }
 
 /// An assistant message in a response.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AssistantMessage {
     pub role: Role,
     pub content: Option<String>,
 }
 
 /// The reason the model stopped generating.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
@@ -195,7 +196,7 @@ pub enum FinishReason {
 }
 
 /// Token usage statistics.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -203,7 +204,7 @@ pub struct Usage {
 }
 
 /// A streaming chat completion chunk.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ChatCompletionChunk {
     /// Unique identifier for the completion.
     pub id: String,
@@ -237,7 +238,7 @@ impl ChatCompletionChunk {
 }
 
 /// A choice delta in a streaming chunk.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ChunkChoice {
     /// The index of this choice.
     pub index: u32,
@@ -250,7 +251,7 @@ pub struct ChunkChoice {
 }
 
 /// A delta update in a streaming response.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
@@ -260,12 +261,12 @@ pub struct ChunkDelta {
 }
 
 /// An error response in OpenAI format.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ErrorDetail {
     pub message: String,
     #[serde(rename = "type")]

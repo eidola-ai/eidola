@@ -75,7 +75,9 @@
             # Include Swift bindings and tests for checks
             || (pkgs.lib.hasInfix "/core/swift" pathStr)
             # Include Package.swift for Swift builds
-            || (baseName == "Package.swift");
+            || (baseName == "Package.swift")
+            # Include OpenAPI spec for checks
+            || (baseName == "openapi.json");
         };
 
         # Common arguments for all Rust builds - ensures determinism
@@ -124,6 +126,33 @@
               targetArgs
               ;
           };
+
+        # Build the generate-openapi binary (native only, used for spec generation)
+        generateOpenapiBin = craneLib.buildPackage (
+          commonArgs
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly (
+              commonArgs
+              // {
+                pname = "generate-openapi-deps";
+                cargoExtraArgs = "--package eidolons-server";
+              }
+            );
+            pname = "generate-openapi";
+            cargoExtraArgs = "--bin generate-openapi";
+          }
+        );
+
+        # Generate OpenAPI specification from the server code
+        serverOpenApiSpec = pkgs.runCommand "eidolons-openapi-spec"
+          {
+            nativeBuildInputs = [ generateOpenapiBin ];
+            SOURCE_DATE_EPOCH = "0";
+          }
+          ''
+            mkdir -p $out
+            generate-openapi > $out/openapi.json
+          '';
 
         # Build the server binary
         # - rustTarget: Rust target triple
@@ -485,6 +514,9 @@ STUB
             # Swift binding generation (native only)
             core-swift-bindings = mkCoreSwiftBindings;
             core-swift-xcframework = mkCoreSwiftXCFramework;
+
+            # OpenAPI spec generation
+            server-openapi-spec = serverOpenApiSpec;
           };
 
       in
@@ -597,6 +629,41 @@ STUB
                 touch $out
               '';
 
+          # Checks that committed OpenAPI spec is up to date with the generated one
+          openapi-current =
+            pkgs.runCommand "check-openapi-spec"
+              {
+                buildInputs = [ pkgs.diffutils ];
+              }
+              ''
+                echo "Checking if committed OpenAPI spec matches generated one..."
+
+                GENERATED="${packages.server-openapi-spec}/openapi.json"
+                COMMITTED="${src}/server/openapi.json"
+
+                if [ ! -f "$COMMITTED" ]; then
+                  echo "ERROR: No committed OpenAPI spec found at server/openapi.json"
+                  echo "Run: nix run '.#update-server-openapi'"
+                  echo "Then commit the generated file."
+                  exit 1
+                fi
+
+                if ! diff "$GENERATED" "$COMMITTED"; then
+                  echo ""
+                  echo "ERROR: Committed OpenAPI spec doesn't match generated one!"
+                  echo ""
+                  echo "To fix this:"
+                  echo "  1. Run: nix run '.#update-server-openapi'"
+                  echo "  2. Review the changes"
+                  echo "  3. Commit the updated spec"
+                  echo ""
+                  exit 1
+                fi
+
+                echo "OpenAPI spec is up to date"
+                touch $out
+              '';
+
           # Ensure the primary artifacts are built
           build-server-oci = packages.server-oci;
 
@@ -675,6 +742,41 @@ STUB
                 '';
               }
             }/bin/update-core-swift-xcframework";
+          };
+          update-server-openapi = {
+            type = "app";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "update-server-openapi";
+                runtimeInputs = [
+                  pkgs.coreutils
+                  pkgs.git
+                ];
+
+                text = ''
+                  set -euo pipefail
+
+                  # Sanity check: must run from repo root (or adjust logic)
+                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                    echo "error: not in a git repository" >&2
+                    exit 1
+                  fi
+
+                  repo_root="$(git rev-parse --show-toplevel)"
+                  dest="$repo_root/server/openapi.json"
+
+                  echo "Copying OpenAPI spec from Nix store:"
+                  echo "  source: ${packages.server-openapi-spec}/openapi.json"
+                  echo "  dest:   $dest"
+
+                  cp "${packages.server-openapi-spec}/openapi.json" "$dest"
+                  chmod +w "$dest"
+
+                  echo "Done. Review changes and commit:"
+                  echo "  git status"
+                '';
+              }
+            }/bin/update-server-openapi";
           };
         };
       }
