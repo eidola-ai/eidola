@@ -19,7 +19,7 @@ nix build '.#server-oci--x86_64-unknown-linux-musl'   # x86_64
 
 # Load and run
 docker load < result
-docker run --rm -d -p 8080:8080 -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY eidolons-server:latest
+docker run --rm -d -p 8080:8080 -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" eidolons-server:latest
 
 # Test
 curl http://localhost:8080/health
