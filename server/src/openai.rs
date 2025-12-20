@@ -398,7 +398,9 @@ mod tests {
         match &request.messages[0].content {
             MessageContent::Parts(parts) => {
                 assert_eq!(parts.len(), 2);
-                assert!(matches!(&parts[0], ContentPart::Text { text } if text == "What's in this image?"));
+                assert!(
+                    matches!(&parts[0], ContentPart::Text { text } if text == "What's in this image?")
+                );
                 assert!(matches!(
                     &parts[1],
                     ContentPart::ImageUrl { image_url } if image_url.url == "https://example.com/img.png"

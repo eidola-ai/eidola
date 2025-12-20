@@ -380,7 +380,10 @@ mod tests {
         ]);
         let result = openai_to_anthropic(request).unwrap();
 
-        assert_eq!(result.system, Some("You are a helpful assistant.".to_string()));
+        assert_eq!(
+            result.system,
+            Some("You are a helpful assistant.".to_string())
+        );
         assert_eq!(result.messages.len(), 1); // System message not in messages
     }
 
@@ -626,7 +629,9 @@ mod tests {
         match &result.messages[0].content {
             anthropic::MessageContent::Blocks(blocks) => {
                 assert_eq!(blocks.len(), 2);
-                assert!(matches!(&blocks[0], anthropic::ContentBlock::Text { text } if text == "What's in this image?"));
+                assert!(
+                    matches!(&blocks[0], anthropic::ContentBlock::Text { text } if text == "What's in this image?")
+                );
                 assert!(matches!(&blocks[1], anthropic::ContentBlock::Image { .. }));
             }
             _ => panic!("expected Blocks variant"),
@@ -662,7 +667,10 @@ mod tests {
         assert_eq!(result.id, "msg_123");
         assert_eq!(result.model, "gpt-4o");
         assert_eq!(result.choices.len(), 1);
-        assert_eq!(result.choices[0].message.content, Some("Hello!".to_string()));
+        assert_eq!(
+            result.choices[0].message.content,
+            Some("Hello!".to_string())
+        );
         assert!(matches!(
             result.choices[0].finish_reason,
             Some(openai::FinishReason::Stop)

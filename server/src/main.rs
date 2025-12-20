@@ -38,10 +38,7 @@ use crate::transform::StreamTransformer;
         description = "OpenAI-compatible proxy API for AI providers",
         version = "0.1.0"
     ),
-    paths(
-        openapi_paths::health,
-        openapi_paths::chat_completions
-    ),
+    paths(openapi_paths::health, openapi_paths::chat_completions),
     components(schemas(
         ChatCompletionRequest,
         ChatCompletionResponse,
@@ -195,7 +192,9 @@ async fn handle_request(
 
         // OpenAPI specification
         (Method::GET, "/openapi.json") => {
-            let spec = ApiDoc::openapi().to_json().expect("OpenAPI spec serialization failed");
+            let spec = ApiDoc::openapi()
+                .to_json()
+                .expect("OpenAPI spec serialization failed");
             json_response(StatusCode::OK, &spec)
         }
 

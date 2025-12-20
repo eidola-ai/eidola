@@ -59,30 +59,31 @@
           }
           .${system};
 
-        # Source filtering - only include files needed for Rust builds
-        src = pkgs.lib.cleanSourceWith {
+        # Source filtering for Rust builds - excludes generated outputs
+        # (Swift bindings and OpenAPI spec are outputs, not inputs to Rust builds)
+        rustSrc = pkgs.lib.cleanSourceWith {
           src = craneLib.path ./.;
           filter =
             path: type:
             let
               baseName = builtins.baseNameOf path;
-              pathStr = toString path;
             in
-            # Include all Rust source files and Cargo files
+            # Include Rust source files and Cargo files
             (craneLib.filterCargoSources path type)
             # Also include rust-toolchain.toml for fenix
-            || (baseName == "rust-toolchain.toml")
-            # Include Swift bindings and tests for checks
-            || (pkgs.lib.hasInfix "/core/swift" pathStr)
-            # Include Package.swift for Swift builds
-            || (baseName == "Package.swift")
-            # Include OpenAPI spec for checks
-            || (baseName == "openapi.json");
+            || (baseName == "rust-toolchain.toml");
         };
 
+        # Full repo source for checks that compare committed vs generated files
+        repoSrc = craneLib.path ./.;
+
+        # Minimal source for dependency builds - only Cargo files
+        # This ensures .rs file changes don't invalidate the deps cache
+        cargoSrc = craneLib.cleanCargoSource (craneLib.path ./.);
+
         # Common arguments for all Rust builds - ensures determinism
+        # Note: src is NOT included here; add it per-derivation
         commonArgs = {
-          inherit src;
           strictDeps = true;
 
           # Deterministic build settings
@@ -127,32 +128,47 @@
               ;
           };
 
+        # Build workspace dependencies for a target (shared across all packages)
+        # Uses cargoSrc (Cargo files only) so .rs changes don't invalidate cache
+        mkWorkspaceDeps =
+          rustTarget: nixCrossSystem:
+          let
+            cfg = mkTargetConfig rustTarget nixCrossSystem;
+          in
+          cfg.craneLibTarget.buildDepsOnly (
+            commonArgs
+            // cfg.targetArgs
+            // {
+              src = cargoSrc;
+              pname = "eidolons-workspace-deps";
+            }
+          );
+
+        # Pre-built workspace deps for native target (shared by all native builds)
+        nativeWorkspaceDeps = mkWorkspaceDeps nativeRustTarget null;
+
         # Build the generate-openapi binary (native only, used for spec generation)
         generateOpenapiBin = craneLib.buildPackage (
           commonArgs
           // {
-            cargoArtifacts = craneLib.buildDepsOnly (
-              commonArgs
-              // {
-                pname = "generate-openapi-deps";
-                cargoExtraArgs = "--package eidolons-server";
-              }
-            );
+            src = rustSrc;
+            cargoArtifacts = nativeWorkspaceDeps;
             pname = "generate-openapi";
             cargoExtraArgs = "--bin generate-openapi";
           }
         );
 
         # Generate OpenAPI specification from the server code
-        serverOpenApiSpec = pkgs.runCommand "eidolons-openapi-spec"
-          {
-            nativeBuildInputs = [ generateOpenapiBin ];
-            SOURCE_DATE_EPOCH = "0";
-          }
-          ''
-            mkdir -p $out
-            generate-openapi > $out/openapi.json
-          '';
+        serverOpenApiSpec =
+          pkgs.runCommand "eidolons-openapi-spec"
+            {
+              nativeBuildInputs = [ generateOpenapiBin ];
+              SOURCE_DATE_EPOCH = "0";
+            }
+            ''
+              mkdir -p $out
+              generate-openapi > $out/openapi.json
+            '';
 
         # Build the server binary
         # - rustTarget: Rust target triple
@@ -161,21 +177,14 @@
           rustTarget: nixCrossSystem:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
-
-            serverArtifacts = cfg.craneLibTarget.buildDepsOnly (
-              commonArgs
-              // cfg.targetArgs
-              // {
-                pname = "eidolons-server-deps--${rustTarget}";
-                cargoExtraArgs = "--package eidolons-server";
-              }
-            );
+            workspaceDeps = mkWorkspaceDeps rustTarget nixCrossSystem;
           in
           cfg.craneLibTarget.buildPackage (
             commonArgs
             // cfg.targetArgs
             // {
-              cargoArtifacts = serverArtifacts;
+              src = rustSrc;
+              cargoArtifacts = workspaceDeps;
               pname = "eidolons-server--${rustTarget}";
               cargoExtraArgs = "--bin eidolons-server";
             }
@@ -190,29 +199,21 @@
           rustTarget: nixCrossSystem: crateType: doCheck:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
+            workspaceDeps = mkWorkspaceDeps rustTarget nixCrossSystem;
             effectiveCrateType = if crateType == null then "staticlib" else crateType;
             effectiveDoCheck = if doCheck == null then true else doCheck;
 
-            # Override crate-type to build only what's requested
+            # Override crate-type to build only what's requested (only needed for package, not deps)
             preBuildHook = ''
               sed -i 's/crate-type = .*/crate-type = ["${effectiveCrateType}"]/' core/Cargo.toml
             '';
 
-            coreArtifacts = cfg.craneLibTarget.buildDepsOnly (
-              commonArgs
-              // cfg.targetArgs
-              // {
-                pname = "eidolons-core-deps--${rustTarget}";
-                cargoExtraArgs = "--package eidolons";
-                preBuild = preBuildHook;
-                doCheck = effectiveDoCheck;
-              }
-            );
             corePackage = cfg.craneLibTarget.buildPackage (
               commonArgs
               // cfg.targetArgs
               // {
-                cargoArtifacts = coreArtifacts;
+                src = rustSrc;
+                cargoArtifacts = workspaceDeps;
                 pname = "eidolons-core--${rustTarget}";
                 cargoExtraArgs = "--lib -p eidolons";
                 preBuild = preBuildHook;
@@ -221,7 +222,7 @@
             );
           in
           {
-            coreArtifacts = coreArtifacts;
+            coreArtifacts = workspaceDeps; # For backwards compat with checks
             corePackage = corePackage;
           };
 
@@ -293,20 +294,15 @@
         uniffiBindgenSwift = craneLib.buildPackage (
           commonArgs
           // {
-            cargoArtifacts = craneLib.buildDepsOnly (
-              commonArgs
-              // {
-                pname = "uniffi-bindgen-swift-deps";
-                cargoExtraArgs = "--package uniffi-bindgen-swift";
-              }
-            );
+            src = rustSrc;
+            cargoArtifacts = nativeWorkspaceDeps;
             pname = "uniffi-bindgen-swift";
             cargoExtraArgs = "--bin uniffi-bindgen-swift";
           }
         );
 
         # Generate Swift bindings from the core library
-        mkCoreSwiftBindings = pkgs.stdenv.mkDerivation {
+        coreSwiftBindings = pkgs.stdenv.mkDerivation {
           name = "eidolons-swift-bindings";
 
           nativeBuildInputs = [
@@ -320,41 +316,41 @@
           dontUnpack = true;
 
           buildPhase = ''
-            # Create output directories
-            mkdir -p $out/Sources/EidolonsCore
-            mkdir -p $out/Sources/EidolonsCoreFFI
+                        # Create output directories
+                        mkdir -p $out/Sources/EidolonsCore
+                        mkdir -p $out/Sources/EidolonsCoreFFI
 
-            # uniffi-bindgen-swift needs access to Cargo.toml for metadata
-            cp -r ${src}/* .
-            chmod -R +w .
+                        # uniffi-bindgen-swift needs access to Cargo.toml for metadata
+                        cp -r ${rustSrc}/* .
+                        chmod -R +w .
 
-            # Find the dylib (native build, cdylib for uniffi-bindgen-swift)
-            DYLIB="${mkCore nativeRustTarget null "cdylib" null}/lib/libeidolons.dylib"
+                        # Find the dylib (native build, cdylib for uniffi-bindgen-swift)
+                        DYLIB="${mkCore nativeRustTarget null "cdylib" null}/lib/libeidolons.dylib"
 
-            # Generate Swift bindings to a temp directory
-            TEMP_OUT=$(mktemp -d)
-            uniffi-bindgen-swift \
-              --swift-sources --headers --modulemap \
-              --metadata-no-deps \
-              "$DYLIB" \
-              "$TEMP_OUT" \
-              --module-name eidolonsFFI \
-              --modulemap-filename module.modulemap
+                        # Generate Swift bindings to a temp directory
+                        TEMP_OUT=$(mktemp -d)
+                        uniffi-bindgen-swift \
+                            --swift-sources --headers --modulemap \
+                            --metadata-no-deps \
+                            "$DYLIB" \
+                            "$TEMP_OUT" \
+                            --module-name eidolonsFFI \
+                            --modulemap-filename module.modulemap
 
-            # Move files to their proper locations:
-            # - Swift source goes to EidolonsCore
-            # - Header and modulemap go to EidolonsCoreFFI
-            mv "$TEMP_OUT"/*.swift $out/Sources/EidolonsCore/
-            mv "$TEMP_OUT"/*.h $out/Sources/EidolonsCoreFFI/
-            mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolonsCoreFFI/
+                        # Move files to their proper locations:
+                        # - Swift source goes to EidolonsCore
+                        # - Header and modulemap go to EidolonsCoreFFI
+                        mv "$TEMP_OUT"/*.swift $out/Sources/EidolonsCore/
+                        mv "$TEMP_OUT"/*.h $out/Sources/EidolonsCoreFFI/
+                        mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolonsCoreFFI/
 
-            # Create stub C file for SPM (requires at least one compilable source per C target)
-            cat > $out/Sources/EidolonsCoreFFI/eidolonsFFI.c << 'STUB'
-// This file exists so Swift Package Manager has something to compile for the eidolonsFFI module.
-// The actual implementation is in the XCFramework (libeidolons.a).
-// This module just exposes the C header interface to Swift.
-#include "eidolonsFFI.h"
-STUB
+                        # Create stub C file for SPM (requires at least one compilable source per C target)
+                        cat > $out/Sources/EidolonsCoreFFI/eidolonsFFI.c << 'STUB'
+            // This file exists so Swift Package Manager has something to compile for the eidolonsFFI module.
+            // The actual implementation is in the XCFramework (libeidolons.a).
+            // This module just exposes the C header interface to Swift.
+            #include "eidolonsFFI.h"
+            STUB
           '';
 
           installPhase = ''
@@ -367,7 +363,7 @@ STUB
         };
 
         # Build XCFramework containing static libraries for all Apple platforms
-        mkCoreSwiftXCFramework = pkgs.stdenv.mkDerivation {
+        coreSwiftXCFramework = pkgs.stdenv.mkDerivation {
           name = "eidolons-xcframework";
 
           nativeBuildInputs = [ pkgs.darwin.cctools ]; # Provides lipo
@@ -512,8 +508,8 @@ STUB
           // crossPackages
           // {
             # Swift binding generation (native only)
-            core-swift-bindings = mkCoreSwiftBindings;
-            core-swift-xcframework = mkCoreSwiftXCFramework;
+            core-swift-bindings = coreSwiftBindings;
+            core-swift-xcframework = coreSwiftXCFramework;
 
             # OpenAPI spec generation
             server-openapi-spec = serverOpenApiSpec;
@@ -545,7 +541,7 @@ STUB
         checks = {
           # Verify code formatting
           formatting = craneLib.cargoFmt {
-            inherit (commonArgs) src;
+            src = rustSrc;
             pname = "eidolons-fmt";
           };
 
@@ -553,7 +549,8 @@ STUB
           clippy = craneLib.cargoClippy (
             commonArgs
             // {
-              cargoArtifacts = (mkCoreInternals nativeRustTarget null null null).coreArtifacts;
+              src = rustSrc;
+              cargoArtifacts = nativeWorkspaceDeps;
               pname = "eidolons-clippy";
               cargoClippyExtraArgs = "--all-targets -- --deny warnings";
             }
@@ -563,7 +560,8 @@ STUB
           tests = craneLib.cargoTest (
             commonArgs
             // {
-              cargoArtifacts = (mkCoreInternals nativeRustTarget null null null).coreArtifacts;
+              src = rustSrc;
+              cargoArtifacts = nativeWorkspaceDeps;
               pname = "eidolons-tests";
             }
           );
@@ -579,7 +577,7 @@ STUB
 
                 # Check Swift sources
                 GENERATED_SWIFT="${packages.core-swift-bindings}/Sources/EidolonsCore"
-                COMMITTED_SWIFT="${src}/core/swift/Sources/EidolonsCore"
+                COMMITTED_SWIFT="${repoSrc}/core/swift/Sources/EidolonsCore"
 
                 if [ ! -d "$COMMITTED_SWIFT" ] || [ -z "$(ls -A "$COMMITTED_SWIFT" 2>/dev/null)" ]; then
                   echo "ERROR: No committed Swift bindings found at core/swift/Sources/EidolonsCore/"
@@ -590,7 +588,7 @@ STUB
 
                 # Check FFI headers
                 GENERATED_FFI="${packages.core-swift-bindings}/Sources/EidolonsCoreFFI"
-                COMMITTED_FFI="${src}/core/swift/Sources/EidolonsCoreFFI"
+                COMMITTED_FFI="${repoSrc}/core/swift/Sources/EidolonsCoreFFI"
 
                 if [ ! -d "$COMMITTED_FFI" ] || [ -z "$(ls -A "$COMMITTED_FFI" 2>/dev/null)" ]; then
                   echo "ERROR: No committed FFI headers found at core/swift/Sources/EidolonsCoreFFI/"
@@ -639,7 +637,7 @@ STUB
                 echo "Checking if committed OpenAPI spec matches generated one..."
 
                 GENERATED="${packages.server-openapi-spec}/openapi.json"
-                COMMITTED="${src}/server/openapi.json"
+                COMMITTED="${repoSrc}/server/openapi.json"
 
                 if [ ! -f "$COMMITTED" ]; then
                   echo "ERROR: No committed OpenAPI spec found at server/openapi.json"
@@ -672,6 +670,7 @@ STUB
         apps = {
           update-core-swift-bindings = {
             type = "app";
+            meta.description = "Update committed Swift bindings from generated sources";
             program = "${
               pkgs.writeShellApplication {
                 name = "update-core-swift-bindings";
@@ -709,6 +708,7 @@ STUB
           };
           update-core-swift-xcframework = {
             type = "app";
+            meta.description = "Update XCFramework with compiled static libraries";
             program = "${
               pkgs.writeShellApplication {
                 name = "update-core-swift-xcframework";
@@ -745,6 +745,7 @@ STUB
           };
           update-server-openapi = {
             type = "app";
+            meta.description = "Update committed OpenAPI spec from generated sources";
             program = "${
               pkgs.writeShellApplication {
                 name = "update-server-openapi";

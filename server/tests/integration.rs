@@ -123,7 +123,10 @@ async fn smoke_test_anthropic_streaming() {
             StreamEvent::MessageDelta { delta, usage } => {
                 saw_message_delta = true;
                 println!("\nStream complete. Stop reason: {:?}", delta.stop_reason);
-                println!("Usage: {} input, {} output", usage.input_tokens, usage.output_tokens);
+                println!(
+                    "Usage: {} input, {} output",
+                    usage.input_tokens, usage.output_tokens
+                );
             }
             StreamEvent::Ping => {
                 // Expected keepalive
@@ -140,7 +143,10 @@ async fn smoke_test_anthropic_streaming() {
     }
 
     assert!(saw_message_start, "should have received message_start");
-    assert!(saw_content_delta, "should have received content_block_delta");
+    assert!(
+        saw_content_delta,
+        "should have received content_block_delta"
+    );
     assert!(saw_message_delta, "should have received message_delta");
     assert!(!collected_text.is_empty(), "should have collected text");
 

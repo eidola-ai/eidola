@@ -18,10 +18,7 @@ use utoipa::OpenApi;
         description = "OpenAI-compatible proxy API for AI providers",
         version = "0.1.0"
     ),
-    paths(
-        openapi_paths::health,
-        openapi_paths::chat_completions
-    ),
+    paths(openapi_paths::health, openapi_paths::chat_completions),
     components(schemas(
         ChatCompletionRequest,
         ChatCompletionResponse,

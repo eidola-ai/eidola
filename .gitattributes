@@ -3,3 +3,4 @@
 core/swift/Sources/EidolonsCore/*.swift linguist-generated=true
 core/swift/Sources/EidolonsCoreFFI/*.h linguist-generated=true
 core/swift/Sources/EidolonsCoreFFI/*.modulemap linguist-generated=true
+server/openapi.json linguist-generated=true
