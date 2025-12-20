@@ -1,0 +1,15 @@
+[package]
+name = "generate-openapi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "generate-openapi"
+path = "src/main.rs"
+
+[dependencies]
+eidolons-server = { path = ".." }
+utoipa = "5"

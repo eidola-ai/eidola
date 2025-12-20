@@ -87,10 +87,16 @@
           strictDeps = true;
 
           # Deterministic build settings
-          CARGO_BUILD_JOBS = "1"; # Single-threaded for reproducibility
           CARGO_INCREMENTAL = "false"; # Disable incremental compilation
           SOURCE_DATE_EPOCH = "0"; # Fixed timestamp
           ZERO_AR_DATE = "1"; # Reproducible ar/ranlib archives
+
+          # Single-threaded for reproducibility.
+          # Note: Setting this to 1 causes a major hit to compilation. It
+          # should have no impact on reproducibility *unless* a proc macro
+          # is not designed to function deterministically. If such a case
+          # emerges, this can be uncommented as a temporary workaround.
+          # CARGO_BUILD_JOBS = "1";
 
           # Network isolation during build
           CARGO_NET_OFFLINE = "true";
@@ -108,6 +114,7 @@
           rustTarget: nixCrossSystem:
           let
             isNative = rustTarget == nativeRustTarget;
+            isLinuxMusl = builtins.match ".*-linux-musl" rustTarget != null;
 
             # Use pkgsCross if specified, otherwise native pkgs
             targetPkgs = if nixCrossSystem == null then pkgs else pkgs.pkgsCross.${nixCrossSystem};
@@ -115,8 +122,23 @@
             # Crane uses target pkgs (for linker/libc) but host toolchain (for cargo)
             craneLibTarget = (crane.mkLib targetPkgs).overrideToolchain (_: rustToolchain);
 
-            # Cross-compilation needs CARGO_BUILD_TARGET set
-            targetArgs = if isNative then { } else { CARGO_BUILD_TARGET = rustTarget; };
+            # Cross-compilation needs CARGO_BUILD_TARGET set.
+            # For Linux musl targets without pkgsCross, use rust-lld (bundled with Rust)
+            # instead of system cc. If nixCrossSystem is set, pkgsCross provides a cross-linker.
+            targetArgs =
+              if isNative then
+                { }
+              else if isLinuxMusl && nixCrossSystem == null then
+                {
+                  CARGO_BUILD_TARGET = rustTarget;
+
+                  # The linker env var is dynamically generated from the target triple:
+                  # "aarch64-unknown-linux-musl" -> "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER"
+                  "CARGO_TARGET_${pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] rustTarget)}_LINKER" =
+                    "rust-lld";
+                }
+              else
+                { CARGO_BUILD_TARGET = rustTarget; };
           in
           {
             inherit
@@ -134,13 +156,26 @@
           rustTarget: nixCrossSystem:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
+            # Host-only tools that should never be cross-compiled
+            hostOnlyPackages = [
+              "generate-openapi"
+              "uniffi-bindgen"
+              "uniffi-bindgen-swift"
+            ];
+            # Exclude host-only packages when cross-compiling
+            excludeArgs =
+              if cfg.isNative then
+                ""
+              else
+                "--workspace " + builtins.concatStringsSep " " (map (p: "--exclude ${p}") hostOnlyPackages);
           in
           cfg.craneLibTarget.buildDepsOnly (
             commonArgs
             // cfg.targetArgs
             // {
               src = cargoSrc;
-              pname = "eidolons-workspace-deps";
+              pname = "eidolons-workspace-deps--${rustTarget}";
+              cargoExtraArgs = excludeArgs;
             }
           );
 
@@ -187,6 +222,8 @@
               cargoArtifacts = workspaceDeps;
               pname = "eidolons-server--${rustTarget}";
               cargoExtraArgs = "--bin eidolons-server";
+              # Skip tests when cross-compiling (can't run foreign binaries)
+              doCheck = cfg.isNative;
             }
           );
 
@@ -471,11 +508,17 @@
         };
 
         # Cross-compilation targets: rustTarget -> nixCrossSystem (null = use native pkgs)
+        # All targets use null (Rust handles cross-compilation) because the server
+        # has pure Rust dependencies with no C library requirements.
+        #
+        # If this changes, we can map rust targets to complete pkgsCross targets, like:
+        #   "aarch64-unknown-linux-musl" = "aarch64-multiplatform-musl";
+        #   "x86_64-unknown-linux-musl" = "musl64";
         crossTargets = {
-          "aarch64-unknown-linux-musl" = "aarch64-multiplatform-musl";
-          "x86_64-unknown-linux-musl" = "musl64";
-          "aarch64-apple-darwin" = null; # Rust handles cross-compilation
-          "x86_64-apple-darwin" = null; # Rust handles cross-compilation
+          "aarch64-unknown-linux-musl" = null;
+          "x86_64-unknown-linux-musl" = null;
+          "aarch64-apple-darwin" = null;
+          "x86_64-apple-darwin" = null;
         };
 
         # Flatten cross-compiled packages: { "server--aarch64-unknown-linux-musl" = ...; ... }

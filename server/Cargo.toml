@@ -10,10 +10,6 @@ publish.workspace = true
 name = "eidolons-server"
 path = "src/main.rs"
 
-[[bin]]
-name = "generate-openapi"
-path = "src/generate_openapi.rs"
-
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
