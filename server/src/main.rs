@@ -201,9 +201,6 @@ async fn handle_request(
         // OpenAI-compatible chat completions endpoint
         (Method::POST, "/v1/chat/completions") => handle_chat_completions(req, state).await,
 
-        // Also support without /v1 prefix for flexibility
-        (Method::POST, "/chat/completions") => handle_chat_completions(req, state).await,
-
         // 404 for everything else
         _ => {
             let error = ErrorResponse::new("not found", "invalid_request_error");
