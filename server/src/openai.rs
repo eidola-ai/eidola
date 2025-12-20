@@ -284,3 +284,236 @@ impl ErrorResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple_request() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "Hello!"}
+            ]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(request.model, "gpt-4o");
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].role, Role::User);
+        assert!(matches!(
+            &request.messages[0].content,
+            MessageContent::Text(t) if t == "Hello!"
+        ));
+        assert!(!request.stream);
+    }
+
+    #[test]
+    fn test_parse_request_with_all_options() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hi"}
+            ],
+            "max_tokens": 100,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "stream": true,
+            "stop": ["END"],
+            "user": "user-123"
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(request.max_tokens, Some(100));
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.top_p, Some(0.9));
+        assert!(request.stream);
+        assert!(matches!(&request.stop, Some(StopSequence::Multiple(v)) if v == &["END"]));
+        assert_eq!(request.user, Some("user-123".to_string()));
+    }
+
+    #[test]
+    fn test_parse_stop_single_string() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stop": "STOP"
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+
+        match request.stop.unwrap() {
+            StopSequence::Single(s) => assert_eq!(s, "STOP"),
+            _ => panic!("expected Single variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stop_array() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stop": ["END", "STOP", "DONE"]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+
+        match request.stop.unwrap() {
+            StopSequence::Multiple(v) => {
+                assert_eq!(v, vec!["END", "STOP", "DONE"]);
+            }
+            _ => panic!("expected Multiple variant"),
+        }
+    }
+
+    #[test]
+    fn test_stop_sequence_into_vec() {
+        let single = StopSequence::Single("STOP".to_string());
+        assert_eq!(single.into_vec(), vec!["STOP"]);
+
+        let multiple = StopSequence::Multiple(vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(multiple.into_vec(), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn test_parse_multimodal_message() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What's in this image?"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
+                ]
+            }]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+
+        match &request.messages[0].content {
+            MessageContent::Parts(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], ContentPart::Text { text } if text == "What's in this image?"));
+                assert!(matches!(
+                    &parts[1],
+                    ContentPart::ImageUrl { image_url } if image_url.url == "https://example.com/img.png"
+                ));
+            }
+            _ => panic!("expected Parts variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_image_with_detail() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/img.png", "detail": "high"}}
+                ]
+            }]
+        }"#;
+
+        let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+
+        match &request.messages[0].content {
+            MessageContent::Parts(parts) => match &parts[0] {
+                ContentPart::ImageUrl { image_url } => {
+                    assert_eq!(image_url.detail, Some("high".to_string()));
+                }
+                _ => panic!("expected ImageUrl"),
+            },
+            _ => panic!("expected Parts"),
+        }
+    }
+
+    #[test]
+    fn test_message_content_as_text() {
+        let text_content = MessageContent::Text("Hello".to_string());
+        assert_eq!(text_content.as_text(), Some("Hello"));
+
+        let parts_content = MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "First".to_string(),
+            },
+            ContentPart::Text {
+                text: "Second".to_string(),
+            },
+        ]);
+        assert_eq!(parts_content.as_text(), Some("First")); // Returns first text
+
+        let image_only = MessageContent::Parts(vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com".to_string(),
+                detail: None,
+            },
+        }]);
+        assert_eq!(image_only.as_text(), None);
+    }
+
+    #[test]
+    fn test_serialize_response() {
+        let response = ChatCompletionResponse {
+            id: "chatcmpl-123".to_string(),
+            object: "chat.completion",
+            created: 1234567890,
+            model: "gpt-4o".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: AssistantMessage {
+                    role: Role::Assistant,
+                    content: Some("Hello!".to_string()),
+                },
+                finish_reason: Some(FinishReason::Stop),
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            }),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"id\":\"chatcmpl-123\""));
+        assert!(json.contains("\"object\":\"chat.completion\""));
+        assert!(json.contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[test]
+    fn test_serialize_chunk() {
+        let chunk = ChatCompletionChunk {
+            id: "chatcmpl-123".to_string(),
+            object: "chat.completion.chunk",
+            created: 1234567890,
+            model: "gpt-4o".to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: Some(Role::Assistant),
+                    content: None,
+                },
+                finish_reason: None,
+            }],
+        };
+
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains("\"object\":\"chat.completion.chunk\""));
+        assert!(json.contains("\"role\":\"assistant\""));
+        // content should be omitted when None (skip_serializing_if)
+        assert!(!json.contains("\"content\":null"));
+    }
+
+    #[test]
+    fn test_serialize_error_response() {
+        let error = ErrorResponse::new("Something went wrong", "internal_error");
+
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(json.contains("\"message\":\"Something went wrong\""));
+        assert!(json.contains("\"type\":\"internal_error\""));
+    }
+}

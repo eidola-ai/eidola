@@ -306,3 +306,551 @@ impl std::fmt::Display for TransformError {
 }
 
 impl std::error::Error for TransformError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anthropic;
+    use crate::openai;
+
+    // ========================================================================
+    // Helper constructors for tests
+    // ========================================================================
+
+    fn user_message(text: &str) -> openai::Message {
+        openai::Message {
+            role: openai::Role::User,
+            content: openai::MessageContent::Text(text.to_string()),
+            name: None,
+        }
+    }
+
+    fn system_message(text: &str) -> openai::Message {
+        openai::Message {
+            role: openai::Role::System,
+            content: openai::MessageContent::Text(text.to_string()),
+            name: None,
+        }
+    }
+
+    fn assistant_message(text: &str) -> openai::Message {
+        openai::Message {
+            role: openai::Role::Assistant,
+            content: openai::MessageContent::Text(text.to_string()),
+            name: None,
+        }
+    }
+
+    fn simple_request(messages: Vec<openai::Message>) -> openai::ChatCompletionRequest {
+        openai::ChatCompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stream: false,
+            stop: None,
+            user: None,
+        }
+    }
+
+    // ========================================================================
+    // openai_to_anthropic tests
+    // ========================================================================
+
+    #[test]
+    fn test_simple_user_message() {
+        let request = simple_request(vec![user_message("Hello, world!")]);
+        let result = openai_to_anthropic(request).unwrap();
+
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].role, anthropic::Role::User);
+        assert!(matches!(
+            &result.messages[0].content,
+            anthropic::MessageContent::Text(t) if t == "Hello, world!"
+        ));
+        assert!(result.system.is_none());
+    }
+
+    #[test]
+    fn test_system_message_extraction() {
+        let request = simple_request(vec![
+            system_message("You are a helpful assistant."),
+            user_message("Hello!"),
+        ]);
+        let result = openai_to_anthropic(request).unwrap();
+
+        assert_eq!(result.system, Some("You are a helpful assistant.".to_string()));
+        assert_eq!(result.messages.len(), 1); // System message not in messages
+    }
+
+    #[test]
+    fn test_multiple_system_messages_concatenated() {
+        let request = simple_request(vec![
+            system_message("First instruction."),
+            system_message("Second instruction."),
+            user_message("Hello!"),
+        ]);
+        let result = openai_to_anthropic(request).unwrap();
+
+        assert_eq!(
+            result.system,
+            Some("First instruction.\n\nSecond instruction.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_conversation_history() {
+        let request = simple_request(vec![
+            system_message("Be concise."),
+            user_message("What is 2+2?"),
+            assistant_message("4"),
+            user_message("And 3+3?"),
+        ]);
+        let result = openai_to_anthropic(request).unwrap();
+
+        assert_eq!(result.messages.len(), 3);
+        assert_eq!(result.messages[0].role, anthropic::Role::User);
+        assert_eq!(result.messages[1].role, anthropic::Role::Assistant);
+        assert_eq!(result.messages[2].role, anthropic::Role::User);
+    }
+
+    #[test]
+    fn test_empty_messages_error() {
+        let request = simple_request(vec![]);
+        let result = openai_to_anthropic(request);
+
+        assert!(matches!(result, Err(TransformError::EmptyMessages)));
+    }
+
+    #[test]
+    fn test_only_system_message_error() {
+        let request = simple_request(vec![system_message("System only")]);
+        let result = openai_to_anthropic(request);
+
+        // System messages are extracted, leaving empty messages array
+        assert!(matches!(result, Err(TransformError::EmptyMessages)));
+    }
+
+    #[test]
+    fn test_default_max_tokens() {
+        let request = simple_request(vec![user_message("Hello")]);
+        let result = openai_to_anthropic(request).unwrap();
+
+        assert_eq!(result.max_tokens, DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn test_custom_max_tokens() {
+        let mut request = simple_request(vec![user_message("Hello")]);
+        request.max_tokens = Some(100);
+        let result = openai_to_anthropic(request).unwrap();
+
+        assert_eq!(result.max_tokens, 100);
+    }
+
+    #[test]
+    fn test_temperature_passthrough() {
+        let mut request = simple_request(vec![user_message("Hello")]);
+        request.temperature = Some(0.7);
+        let result = openai_to_anthropic(request).unwrap();
+
+        assert_eq!(result.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn test_stop_sequence_single() {
+        let mut request = simple_request(vec![user_message("Hello")]);
+        request.stop = Some(openai::StopSequence::Single("STOP".to_string()));
+        let result = openai_to_anthropic(request).unwrap();
+
+        assert_eq!(result.stop_sequences, Some(vec!["STOP".to_string()]));
+    }
+
+    #[test]
+    fn test_stop_sequence_multiple() {
+        let mut request = simple_request(vec![user_message("Hello")]);
+        request.stop = Some(openai::StopSequence::Multiple(vec![
+            "END".to_string(),
+            "STOP".to_string(),
+        ]));
+        let result = openai_to_anthropic(request).unwrap();
+
+        assert_eq!(
+            result.stop_sequences,
+            Some(vec!["END".to_string(), "STOP".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_user_id_mapping() {
+        let mut request = simple_request(vec![user_message("Hello")]);
+        request.user = Some("user-123".to_string());
+        let result = openai_to_anthropic(request).unwrap();
+
+        assert!(result.metadata.is_some());
+        assert_eq!(
+            result.metadata.unwrap().user_id,
+            Some("user-123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stream_flag() {
+        let mut request = simple_request(vec![user_message("Hello")]);
+        request.stream = true;
+        let result = openai_to_anthropic(request).unwrap();
+
+        assert_eq!(result.stream, Some(true));
+    }
+
+    // ========================================================================
+    // Model name mapping tests
+    // ========================================================================
+
+    #[test]
+    fn test_model_mapping_gpt4o() {
+        assert_eq!(map_model_name("gpt-4o"), "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn test_model_mapping_gpt4() {
+        assert_eq!(map_model_name("gpt-4"), "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn test_model_mapping_gpt4o_mini() {
+        assert_eq!(map_model_name("gpt-4o-mini"), "claude-3-5-haiku-20241022");
+    }
+
+    #[test]
+    fn test_model_mapping_gpt35_turbo() {
+        assert_eq!(map_model_name("gpt-3.5-turbo"), "claude-3-5-haiku-20241022");
+    }
+
+    #[test]
+    fn test_model_passthrough_claude() {
+        assert_eq!(
+            map_model_name("claude-3-opus-20240229"),
+            "claude-3-opus-20240229"
+        );
+    }
+
+    #[test]
+    fn test_model_passthrough_unknown() {
+        assert_eq!(map_model_name("some-other-model"), "some-other-model");
+    }
+
+    // ========================================================================
+    // Image URL parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_image_url_regular() {
+        let result = parse_image_url("https://example.com/image.png").unwrap();
+
+        assert!(matches!(
+            result,
+            anthropic::ImageSource::Url { url } if url == "https://example.com/image.png"
+        ));
+    }
+
+    #[test]
+    fn test_parse_image_url_data_uri() {
+        let result = parse_image_url("data:image/png;base64,iVBORw0KGgo=").unwrap();
+
+        match result {
+            anthropic::ImageSource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, "iVBORw0KGgo=");
+            }
+            _ => panic!("expected Base64 variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_image_url_data_uri_jpeg() {
+        let result = parse_image_url("data:image/jpeg;base64,/9j/4AAQ").unwrap();
+
+        match result {
+            anthropic::ImageSource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "image/jpeg");
+                assert_eq!(data, "/9j/4AAQ");
+            }
+            _ => panic!("expected Base64 variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_image_url_invalid_data_uri() {
+        // Missing base64 marker
+        let result = parse_image_url("data:image/png,notbase64");
+        assert!(matches!(result, Err(TransformError::InvalidImageUrl)));
+    }
+
+    // ========================================================================
+    // Multimodal content tests
+    // ========================================================================
+
+    #[test]
+    fn test_multimodal_text_and_image() {
+        let message = openai::Message {
+            role: openai::Role::User,
+            content: openai::MessageContent::Parts(vec![
+                openai::ContentPart::Text {
+                    text: "What's in this image?".to_string(),
+                },
+                openai::ContentPart::ImageUrl {
+                    image_url: openai::ImageUrl {
+                        url: "https://example.com/cat.jpg".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        };
+
+        let request = openai::ChatCompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![message],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stream: false,
+            stop: None,
+            user: None,
+        };
+
+        let result = openai_to_anthropic(request).unwrap();
+
+        match &result.messages[0].content {
+            anthropic::MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(matches!(&blocks[0], anthropic::ContentBlock::Text { text } if text == "What's in this image?"));
+                assert!(matches!(&blocks[1], anthropic::ContentBlock::Image { .. }));
+            }
+            _ => panic!("expected Blocks variant"),
+        }
+    }
+
+    // ========================================================================
+    // anthropic_to_openai response tests
+    // ========================================================================
+
+    #[test]
+    fn test_response_conversion() {
+        let anthropic_response = anthropic::MessagesResponse {
+            id: "msg_123".to_string(),
+            response_type: "message".to_string(),
+            role: anthropic::Role::Assistant,
+            content: vec![anthropic::ResponseContentBlock::Text {
+                text: "Hello!".to_string(),
+            }],
+            model: "claude-sonnet-4-20250514".to_string(),
+            stop_reason: Some(anthropic::StopReason::EndTurn),
+            stop_sequence: None,
+            usage: anthropic::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        let result = anthropic_to_openai(anthropic_response, "gpt-4o");
+
+        assert_eq!(result.id, "msg_123");
+        assert_eq!(result.model, "gpt-4o");
+        assert_eq!(result.choices.len(), 1);
+        assert_eq!(result.choices[0].message.content, Some("Hello!".to_string()));
+        assert!(matches!(
+            result.choices[0].finish_reason,
+            Some(openai::FinishReason::Stop)
+        ));
+
+        let usage = result.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn test_response_stop_reason_max_tokens() {
+        let anthropic_response = anthropic::MessagesResponse {
+            id: "msg_123".to_string(),
+            response_type: "message".to_string(),
+            role: anthropic::Role::Assistant,
+            content: vec![anthropic::ResponseContentBlock::Text {
+                text: "Truncated...".to_string(),
+            }],
+            model: "claude-sonnet-4-20250514".to_string(),
+            stop_reason: Some(anthropic::StopReason::MaxTokens),
+            stop_sequence: None,
+            usage: anthropic::Usage {
+                input_tokens: 10,
+                output_tokens: 100,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        let result = anthropic_to_openai(anthropic_response, "gpt-4o");
+
+        assert!(matches!(
+            result.choices[0].finish_reason,
+            Some(openai::FinishReason::Length)
+        ));
+    }
+
+    #[test]
+    fn test_response_multiple_content_blocks_concatenated() {
+        let anthropic_response = anthropic::MessagesResponse {
+            id: "msg_123".to_string(),
+            response_type: "message".to_string(),
+            role: anthropic::Role::Assistant,
+            content: vec![
+                anthropic::ResponseContentBlock::Text {
+                    text: "First ".to_string(),
+                },
+                anthropic::ResponseContentBlock::Text {
+                    text: "Second".to_string(),
+                },
+            ],
+            model: "claude-sonnet-4-20250514".to_string(),
+            stop_reason: Some(anthropic::StopReason::EndTurn),
+            stop_sequence: None,
+            usage: anthropic::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        let result = anthropic_to_openai(anthropic_response, "gpt-4o");
+
+        assert_eq!(
+            result.choices[0].message.content,
+            Some("First Second".to_string())
+        );
+    }
+
+    // ========================================================================
+    // StreamTransformer tests
+    // ========================================================================
+
+    #[test]
+    fn test_stream_transformer_message_start() {
+        let mut transformer = StreamTransformer::new("gpt-4o".to_string());
+
+        let event = anthropic::StreamEvent::MessageStart {
+            message: anthropic::MessageStartData {
+                id: "msg_123".to_string(),
+                message_type: "message".to_string(),
+                role: anthropic::Role::Assistant,
+                model: "claude-sonnet-4-20250514".to_string(),
+                usage: anthropic::Usage {
+                    input_tokens: 10,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            },
+        };
+
+        let chunk = transformer.transform(event).unwrap();
+
+        assert_eq!(chunk.id, "msg_123");
+        assert_eq!(chunk.model, "gpt-4o");
+        assert_eq!(chunk.choices[0].delta.role, Some(openai::Role::Assistant));
+        assert!(chunk.choices[0].delta.content.is_none());
+    }
+
+    #[test]
+    fn test_stream_transformer_content_delta() {
+        let mut transformer = StreamTransformer::new("gpt-4o".to_string());
+
+        // First, start the message to set the ID
+        transformer.transform(anthropic::StreamEvent::MessageStart {
+            message: anthropic::MessageStartData {
+                id: "msg_123".to_string(),
+                message_type: "message".to_string(),
+                role: anthropic::Role::Assistant,
+                model: "claude-sonnet-4-20250514".to_string(),
+                usage: anthropic::Usage {
+                    input_tokens: 10,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            },
+        });
+
+        let event = anthropic::StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: anthropic::ContentDelta::TextDelta {
+                text: "Hello".to_string(),
+            },
+        };
+
+        let chunk = transformer.transform(event).unwrap();
+
+        assert_eq!(chunk.choices[0].delta.content, Some("Hello".to_string()));
+        assert!(chunk.choices[0].delta.role.is_none());
+    }
+
+    #[test]
+    fn test_stream_transformer_ping_returns_none() {
+        let mut transformer = StreamTransformer::new("gpt-4o".to_string());
+        let result = transformer.transform(anthropic::StreamEvent::Ping);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_stream_transformer_message_stop_returns_none() {
+        let mut transformer = StreamTransformer::new("gpt-4o".to_string());
+        let result = transformer.transform(anthropic::StreamEvent::MessageStop);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_stream_transformer_message_delta_with_stop_reason() {
+        let mut transformer = StreamTransformer::new("gpt-4o".to_string());
+
+        // Start message first
+        transformer.transform(anthropic::StreamEvent::MessageStart {
+            message: anthropic::MessageStartData {
+                id: "msg_123".to_string(),
+                message_type: "message".to_string(),
+                role: anthropic::Role::Assistant,
+                model: "claude-sonnet-4-20250514".to_string(),
+                usage: anthropic::Usage {
+                    input_tokens: 10,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            },
+        });
+
+        let event = anthropic::StreamEvent::MessageDelta {
+            delta: anthropic::MessageDeltaData {
+                stop_reason: Some(anthropic::StopReason::EndTurn),
+                stop_sequence: None,
+            },
+            usage: anthropic::Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        };
+
+        let chunk = transformer.transform(event).unwrap();
+
+        assert!(matches!(
+            chunk.choices[0].finish_reason,
+            Some(openai::FinishReason::Stop)
+        ));
+    }
+}

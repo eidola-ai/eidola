@@ -3,10 +3,7 @@
 //! This server accepts requests in OpenAI Chat Completions API format and
 //! proxies them to configured upstream AI providers (currently Anthropic Claude).
 
-mod anthropic;
-mod openai;
-mod proxy;
-mod transform;
+use eidolons_server::{anthropic, openai, proxy, transform};
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
