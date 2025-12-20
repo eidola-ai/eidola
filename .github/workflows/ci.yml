@@ -11,8 +11,8 @@ on:
 jobs:
   build-all-platforms:
     name: Build all platforms
-    runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
-    # runs-on: self-hosted
+    # runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
+    runs-on: self-hosted
     timeout-minutes: 15
     permissions:
       id-token: write
@@ -38,7 +38,7 @@ jobs:
         run: nix flake show
 
       - name: Run all checks
-        run: nix flake check --show-trace --max-cores auto
+        run: nix flake check --show-trace --max-jobs auto
 
       - name: Build all packages
         run: |
