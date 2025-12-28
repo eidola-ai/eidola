@@ -1,43 +1,28 @@
-[package]
-name = "eidolons-server"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-repository.workspace = true
-publish.workspace = true
+[workspace]
 
-[[bin]]
-name = "eidolons-server"
-path = "src/main.rs"
+members = [
+    "server",
+    "generate-openapi",
+]
+resolver = "2"
 
-[dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Mike Marcacci"]
+repository = "https://github.com/eidolons-ai/eidolons"
+publish = false
 
-# HTTP server (minimal)
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
-http-body-util = "0.1"
-
-# HTTP client for upstream requests (using rustls with pure-Rust crypto for cross-compilation)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream"] }
-
-# Pure Rust TLS crypto provider (no C/assembly dependencies)
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-rustls-rustcrypto = "0.0.2-alpha"
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# OpenAPI documentation
-utoipa = "5"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Utilities
-futures-util = "0.3"
-bytes = "1"
-tokio-stream = "0.1"
+[profile.release]
+# Incremental compilation is disabled to avoid non-determinism.
+incremental = false
+# Codegen units are set to 1 to avoid potential non-determinism.
+codegen-units = 1
+# Enable link-time optimization for better determinism
+lto = true
+# Explicit optimization level
+opt-level = 3
+# Strip symbols for determinism
+strip = true
+# Explicit overflow check setting
+overflow-checks = false

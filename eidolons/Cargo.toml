@@ -4,8 +4,6 @@ members = [
     "core",
     "core/uniffi-bindgen",
     "core/uniffi-bindgen-swift",
-    "server",
-    "server/generate-openapi",
 ]
 resolver = "2"
 

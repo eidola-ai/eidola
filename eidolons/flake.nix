@@ -11,13 +11,6 @@
     fenix = {
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
-
-      # By default fenix uses rust-analyzer nightly. Uncommenting the bellow
-      # will use the latest stable version instead.
-      # inputs.rust-analyzer-src = {
-      #   url = "github:rust-lang/rust-analyzer/release";
-      #   flake = false;
-      # };
     };
 
     # Efficient Rust builds with incremental caching
@@ -59,27 +52,27 @@
           }
           .${system};
 
-        # Source filtering for Rust builds - excludes generated outputs
-        # (Swift bindings and OpenAPI spec are outputs, not inputs to Rust builds)
-        rustSrc = pkgs.lib.cleanSourceWith {
-          src = craneLib.path ./.;
-          filter =
-            path: type:
-            let
-              baseName = builtins.baseNameOf path;
-            in
-            # Include Rust source files and Cargo files
-            (craneLib.filterCargoSources path type)
-            # Also include rust-toolchain.toml for fenix
-            || (baseName == "rust-toolchain.toml");
-        };
-
         # Full repo source for checks that compare committed vs generated files
         repoSrc = craneLib.path ./.;
 
+        # Source filtering for Rust builds - excludes generated outputs
+        rustSrc = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            (craneLib.fileset.commonCargoSources ./.)
+            ./rust-toolchain.toml
+          ];
+        };
+
         # Minimal source for dependency builds - only Cargo files
         # This ensures .rs file changes don't invalidate the deps cache
-        cargoSrc = craneLib.cleanCargoSource (craneLib.path ./.);
+        rustDepsSrc = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            (craneLib.fileset.cargoTomlAndLock ./.)
+            ./rust-toolchain.toml
+          ];
+        };
 
         # Common arguments for all Rust builds - ensures determinism
         # Note: src is NOT included here; add it per-derivation
@@ -157,175 +150,18 @@
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
             # Host-only tools that should never be cross-compiled
-            hostOnlyPackages = [
-              "generate-openapi"
-              "uniffi-bindgen"
-              "uniffi-bindgen-swift"
-            ];
-            # Exclude host-only packages when cross-compiling
-            excludeArgs =
-              if cfg.isNative then
-                ""
-              else
-                "--workspace " + builtins.concatStringsSep " " (map (p: "--exclude ${p}") hostOnlyPackages);
           in
           cfg.craneLibTarget.buildDepsOnly (
             commonArgs
             // cfg.targetArgs
             // {
-              src = cargoSrc;
+              src = rustDepsSrc;
               pname = "eidolons-workspace-deps--${rustTarget}";
-              cargoExtraArgs = excludeArgs;
             }
           );
 
         # Pre-built workspace deps for native target (shared by all native builds)
         nativeWorkspaceDeps = mkWorkspaceDeps nativeRustTarget null;
-
-        # Build the generate-openapi binary (native only, used for spec generation)
-        generateOpenapiBin = craneLib.buildPackage (
-          commonArgs
-          // {
-            src = rustSrc;
-            cargoArtifacts = nativeWorkspaceDeps;
-            pname = "generate-openapi";
-            cargoExtraArgs = "--bin generate-openapi";
-          }
-        );
-
-        # Generate OpenAPI specification from the server code
-        serverOpenApiSpec =
-          pkgs.runCommand "eidolons-openapi-spec"
-            {
-              nativeBuildInputs = [ generateOpenapiBin ];
-              SOURCE_DATE_EPOCH = "0";
-            }
-            ''
-              mkdir -p $out
-              generate-openapi > $out/openapi.json
-            '';
-
-        # Build the server binary
-        # - rustTarget: Rust target triple
-        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
-        mkServer =
-          rustTarget: nixCrossSystem:
-          let
-            cfg = mkTargetConfig rustTarget nixCrossSystem;
-            workspaceDeps = mkWorkspaceDeps rustTarget nixCrossSystem;
-          in
-          cfg.craneLibTarget.buildPackage (
-            commonArgs
-            // cfg.targetArgs
-            // {
-              src = rustSrc;
-              cargoArtifacts = workspaceDeps;
-              pname = "eidolons-server--${rustTarget}";
-              cargoExtraArgs = "--bin eidolons-server";
-              # Skip tests when cross-compiling (can't run foreign binaries)
-              doCheck = cfg.isNative;
-            }
-          );
-
-        # Build the core library dependencies and package
-        # - rustTarget: Rust target triple
-        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
-        # - crateType: "staticlib" (default) or "cdylib"
-        # - doCheck: whether to run tests (default true)
-        mkCoreInternals =
-          rustTarget: nixCrossSystem: crateType: doCheck:
-          let
-            cfg = mkTargetConfig rustTarget nixCrossSystem;
-            workspaceDeps = mkWorkspaceDeps rustTarget nixCrossSystem;
-            effectiveCrateType = if crateType == null then "staticlib" else crateType;
-            effectiveDoCheck = if doCheck == null then true else doCheck;
-
-            # Override crate-type to build only what's requested (only needed for package, not deps)
-            preBuildHook = ''
-              sed -i 's/crate-type = .*/crate-type = ["${effectiveCrateType}"]/' core/Cargo.toml
-            '';
-
-            corePackage = cfg.craneLibTarget.buildPackage (
-              commonArgs
-              // cfg.targetArgs
-              // {
-                src = rustSrc;
-                cargoArtifacts = workspaceDeps;
-                pname = "eidolons-core--${rustTarget}";
-                cargoExtraArgs = "--lib -p eidolons";
-                preBuild = preBuildHook;
-                doCheck = effectiveDoCheck;
-              }
-            );
-          in
-          {
-            coreArtifacts = workspaceDeps; # For backwards compat with checks
-            corePackage = corePackage;
-          };
-
-        # Build the core library
-        # - rustTarget: Rust target triple
-        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
-        # - crateType: "staticlib" (default) or "cdylib"
-        # - doCheck: whether to run tests (default true)
-        mkCore =
-          rustTarget: nixCrossSystem: crateType: doCheck:
-          let
-            mkCoreHelperResults = mkCoreInternals rustTarget nixCrossSystem crateType doCheck;
-          in
-          mkCoreHelperResults.corePackage;
-
-        # Build OCI (Docker) image containing the server
-        # - rustTarget: Rust target triple
-        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
-        #
-        # Design decisions:
-        # - Distroless: No shell or package manager (minimal attack surface)
-        # - Static binary: musl-linked, self-contained (no libc dependency)
-        # - CA certs: Embedded via webpki-roots crate (no system certs needed)
-        # - Non-root: Runs as unprivileged user (UID 65534 = nobody)
-        # - Entrypoint: Server is the only thing this container does
-        mkServerOCI =
-          rustTarget: nixCrossSystem:
-          let
-            server = mkServer rustTarget nixCrossSystem;
-          in
-          pkgs.dockerTools.buildLayeredImage {
-            name = "eidolons-server";
-            tag = "latest";
-
-            contents = [ server ];
-
-            config = {
-              Entrypoint = [ "${server}/bin/eidolons-server" ];
-
-              # Bind to all interfaces (required for container networking)
-              # ANTHROPIC_API_KEY must be provided at runtime
-              Env = [
-                "BIND_ADDR=0.0.0.0:8080"
-              ];
-
-              # Run as unprivileged user (nobody)
-              User = "65534:65534";
-
-              # Document the exposed port
-              ExposedPorts = {
-                "8080/tcp" = { };
-              };
-            };
-
-            # Reproducible timestamp for deterministic builds
-            created = "1970-01-01T00:00:00Z";
-          };
-
-        # Build all packages for a target
-        # - rustTarget: Rust target triple
-        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
-        mkSystemPackages = rustTarget: nixCrossSystem: {
-          server = mkServer rustTarget nixCrossSystem;
-          server-oci = mkServerOCI rustTarget nixCrossSystem;
-          core = mkCore rustTarget nixCrossSystem null null; # staticlib, run tests
-        };
 
         # Build the uniffi-bindgen-swift tool (native only)
         uniffiBindgenSwift = craneLib.buildPackage (
@@ -362,7 +198,7 @@
                         chmod -R +w .
 
                         # Find the dylib (native build, cdylib for uniffi-bindgen-swift)
-                        DYLIB="${mkCore nativeRustTarget null "cdylib" null}/lib/libeidolons.dylib"
+                        DYLIB="${mkCore nativeRustTarget null "cdylib"}/lib/libeidolons.dylib"
 
                         # Generate Swift bindings to a temp directory
                         TEMP_OUT=$(mktemp -d)
@@ -412,11 +248,11 @@
           dontUnpack = true;
 
           # Reference all the Apple target builds (all use native pkgs, Rust handles cross-compilation)
-          macosArm64 = mkCore "aarch64-apple-darwin" null "staticlib" null;
-          macosX86_64 = mkCore "x86_64-apple-darwin" null "staticlib" null;
-          iosArm64 = mkCore "aarch64-apple-ios" null "staticlib" false;
-          iosSimArm64 = mkCore "aarch64-apple-ios-sim" null "staticlib" false;
-          iosSimX86_64 = mkCore "x86_64-apple-ios" null "staticlib" false;
+          macosArm64 = mkCore "aarch64-apple-darwin" null "staticlib";
+          macosX86_64 = mkCore "x86_64-apple-darwin" null "staticlib";
+          iosArm64 = mkCore "aarch64-apple-ios" null "staticlib";
+          iosSimArm64 = mkCore "aarch64-apple-ios-sim" null "staticlib";
+          iosSimX86_64 = mkCore "x86_64-apple-ios" null "staticlib";
 
           buildPhase = ''
             mkdir -p "$out/libeidolons-rs.xcframework/macos-arm64_x86_64"
@@ -507,6 +343,37 @@
           '';
         };
 
+        # Build the core library
+        # - rustTarget: Rust target triple
+        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
+        # - crateType: "staticlib" (default) or "cdylib
+        mkCore =
+          rustTarget: nixCrossSystem: crateType:
+          let
+            cfg = mkTargetConfig rustTarget nixCrossSystem;
+            effectiveCrateType = if crateType == null then "staticlib" else crateType;
+
+            # Override crate-type to build only what's requested (only needed for package, not deps)
+            preBuildHook = ''
+              sed -i 's/crate-type = .*/crate-type = ["${effectiveCrateType}"]/' core/Cargo.toml
+            '';
+
+          in
+          cfg.craneLibTarget.buildPackage (
+            commonArgs
+            // cfg.targetArgs
+            // {
+              src = rustSrc;
+              cargoArtifacts = mkWorkspaceDeps rustTarget nixCrossSystem;
+              pname = "eidolons-core--${rustTarget}";
+              cargoExtraArgs = "--lib --package eidolons";
+              preBuild = preBuildHook;
+
+              # Skip tests when cross-compiling (can't run foreign binaries)
+              doCheck = cfg.isNative;
+            }
+          );
+
         # Cross-compilation targets: rustTarget -> nixCrossSystem (null = use native pkgs)
         # All targets use null (Rust handles cross-compilation) because the server
         # has pure Rust dependencies with no C library requirements.
@@ -515,8 +382,8 @@
         #   "aarch64-unknown-linux-musl" = "aarch64-multiplatform-musl";
         #   "x86_64-unknown-linux-musl" = "musl64";
         crossTargets = {
-          "aarch64-unknown-linux-musl" = null;
-          "x86_64-unknown-linux-musl" = null;
+          "aarch64-unknown-linux-musl" = "aarch64-multiplatform-musl";
+          "x86_64-unknown-linux-musl" = "musl64";
           "aarch64-apple-darwin" = null;
           "x86_64-apple-darwin" = null;
         };
@@ -527,36 +394,23 @@
             rustTarget:
             let
               nixCrossSystem = crossTargets.${rustTarget};
-              targetPkgs = mkSystemPackages rustTarget nixCrossSystem;
             in
             [
               {
-                name = "server--${rustTarget}";
-                value = targetPkgs.server;
-              }
-              {
-                name = "server-oci--${rustTarget}";
-                value = targetPkgs.server-oci;
-              }
-              {
                 name = "core--${rustTarget}";
-                value = targetPkgs.core;
+                value = mkCore rustTarget nixCrossSystem null; # staticlib
               }
             ]
           ) (builtins.attrNames crossTargets)
         );
-        packages =
-          # Default packages for current system
-          mkSystemPackages nativeRustTarget null
-          // crossPackages
-          // {
-            # Swift binding generation (native only)
-            core-swift-bindings = coreSwiftBindings;
-            core-swift-xcframework = coreSwiftXCFramework;
+        packages = {
+          core = mkCore nativeRustTarget null null; # staticlib
 
-            # OpenAPI spec generation
-            server-openapi-spec = serverOpenApiSpec;
-          };
+          # Swift binding generation (native only)
+          core-swift-bindings = coreSwiftBindings;
+          core-swift-xcframework = coreSwiftXCFramework;
+        }
+        // crossPackages;
 
       in
       {
@@ -571,12 +425,6 @@
             # Additional rust tools
             pkgs.cargo-watch
             pkgs.rust-analyzer
-
-            # Pin GitHub Actions to SHAs
-            pkgs.pinact
-
-            # Interact with OCI images
-            pkgs.crane
           ];
         };
 
@@ -670,44 +518,6 @@
                 touch $out
               '';
 
-          # Checks that committed OpenAPI spec is up to date with the generated one
-          openapi-current =
-            pkgs.runCommand "check-openapi-spec"
-              {
-                buildInputs = [ pkgs.diffutils ];
-              }
-              ''
-                echo "Checking if committed OpenAPI spec matches generated one..."
-
-                GENERATED="${packages.server-openapi-spec}/openapi.json"
-                COMMITTED="${repoSrc}/server/openapi.json"
-
-                if [ ! -f "$COMMITTED" ]; then
-                  echo "ERROR: No committed OpenAPI spec found at server/openapi.json"
-                  echo "Run: nix run '.#update-server-openapi'"
-                  echo "Then commit the generated file."
-                  exit 1
-                fi
-
-                if ! diff "$GENERATED" "$COMMITTED"; then
-                  echo ""
-                  echo "ERROR: Committed OpenAPI spec doesn't match generated one!"
-                  echo ""
-                  echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-server-openapi'"
-                  echo "  2. Review the changes"
-                  echo "  3. Commit the updated spec"
-                  echo ""
-                  exit 1
-                fi
-
-                echo "OpenAPI spec is up to date"
-                touch $out
-              '';
-
-          # Ensure the primary artifacts are built
-          build-server-oci = packages.server-oci;
-
         };
 
         apps = {
@@ -785,42 +595,6 @@
                 '';
               }
             }/bin/update-core-swift-xcframework";
-          };
-          update-server-openapi = {
-            type = "app";
-            meta.description = "Update committed OpenAPI spec from generated sources";
-            program = "${
-              pkgs.writeShellApplication {
-                name = "update-server-openapi";
-                runtimeInputs = [
-                  pkgs.coreutils
-                  pkgs.git
-                ];
-
-                text = ''
-                  set -euo pipefail
-
-                  # Sanity check: must run from repo root (or adjust logic)
-                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
-                    echo "error: not in a git repository" >&2
-                    exit 1
-                  fi
-
-                  repo_root="$(git rev-parse --show-toplevel)"
-                  dest="$repo_root/server/openapi.json"
-
-                  echo "Copying OpenAPI spec from Nix store:"
-                  echo "  source: ${packages.server-openapi-spec}/openapi.json"
-                  echo "  dest:   $dest"
-
-                  cp "${packages.server-openapi-spec}/openapi.json" "$dest"
-                  chmod +w "$dest"
-
-                  echo "Done. Review changes and commit:"
-                  echo "  git status"
-                '';
-              }
-            }/bin/update-server-openapi";
           };
         };
       }
