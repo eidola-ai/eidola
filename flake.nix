@@ -1,5 +1,5 @@
 {
-  description = "Eidolons Server";
+  description = "Eidolons";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -24,6 +24,7 @@
       flake-utils,
       fenix,
       crane,
+      ...
     }:
     flake-utils.lib.eachSystem [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ] (
       system:
@@ -52,27 +53,149 @@
           }
           .${system};
 
+        # Parse workspace Cargo.toml to get member patterns
+        workspaceCargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+        memberPatterns = workspaceCargoToml.workspace.members or [ ];
+
+        # Expand member patterns (handles both explicit paths and globs like "crates/*")
+        expandMemberPattern =
+          pattern:
+          let
+            # Check if pattern ends with /*
+            globMatch = builtins.match "(.+)/\\*" pattern;
+          in
+          if globMatch != null then
+            # It's a glob pattern like "crates/*" - list the directory
+            let
+              baseDir = builtins.head globMatch;
+            in
+            map (name: "${baseDir}/${name}") (
+              builtins.attrNames (
+                pkgs.lib.filterAttrs (_: type: type == "directory") (builtins.readDir ./${baseDir})
+              )
+            )
+          else
+            # Explicit path
+            [ pattern ];
+
+        # Get all workspace member paths (e.g., ["crates/foo", "crates/bar"])
+        workspaceMemberPaths = builtins.concatMap expandMemberPattern memberPatterns;
+
+        # Map from crate name to its path
+        cratePaths = builtins.listToAttrs (
+          map (path: {
+            name = builtins.baseNameOf path;
+            value = path;
+          }) workspaceMemberPaths
+        );
+
+        # List of crate names
+        workspaceCrates = builtins.attrNames cratePaths;
+
+        # Parse a crate's Cargo.toml and extract workspace dependencies
+        # (dependencies with path = "../<crate>" pointing to sibling crates)
+        getWorkspaceDeps =
+          pname:
+          let
+            cratePath = cratePaths.${pname};
+            cargoToml = builtins.fromTOML (builtins.readFile ./${cratePath}/Cargo.toml);
+            deps = cargoToml.dependencies or { };
+            # Filter to only path dependencies that point to workspace crates
+            workspaceDeps = pkgs.lib.filterAttrs (
+              name: spec: builtins.isAttrs spec && spec ? path && builtins.elem name workspaceCrates
+            ) deps;
+          in
+          builtins.attrNames workspaceDeps;
+
+        # Recursively resolve all transitive workspace dependencies
+        getAllDeps =
+          pname:
+          let
+            directDeps = getWorkspaceDeps pname;
+            transitiveDeps = builtins.concatMap getAllDeps directDeps;
+          in
+          pkgs.lib.unique (directDeps ++ transitiveDeps);
+
+        # Build the full dependency graph (auto-discovered from Cargo.toml files)
+        packageDeps = builtins.listToAttrs (
+          map (pname: {
+            name = pname;
+            value = getAllDeps pname;
+          }) workspaceCrates
+        );
+
+        # Create filtered source that only includes specific crates
+        mkFilteredSrc =
+          crates:
+          let
+            crateSet = builtins.listToAttrs (
+              map (c: {
+                name = c;
+                value = true;
+              }) crates
+            );
+            # Find which crate (if any) a path belongs to
+            getCrateForPath =
+              relPath:
+              pkgs.lib.findFirst (
+                name:
+                let
+                  p = cratePaths.${name};
+                in
+                relPath == "/${p}" || pkgs.lib.hasPrefix "/${p}/" relPath
+              ) null workspaceCrates;
+            # Check if path is a parent directory of any workspace crate
+            isParentOfCrate =
+              relPath: pkgs.lib.any (path: pkgs.lib.hasPrefix "${relPath}/" "/${path}") workspaceMemberPaths;
+
+            # Filter source files
+            filteredSrc = pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter =
+                path: type:
+                let
+                  relPath = pkgs.lib.removePrefix (toString ./.) (toString path);
+                  # Which crate does this path belong to?
+                  matchingCrate = getCrateForPath relPath;
+                  # Is this an irrelevant crate? (in a crate dir but not in our set)
+                  isIrrelevantCrate = matchingCrate != null && !(crateSet ? ${matchingCrate});
+                in
+                # Exclude irrelevant crate directories entirely
+                if isIrrelevantCrate then
+                  false
+                # Keep root-level files (except Cargo.toml which we'll replace)
+                else if type == "regular" && builtins.match "/[^/]+" relPath != null then
+                  true
+                # Keep directories that are parents of crate paths
+                else if type == "directory" && isParentOfCrate relPath then
+                  true
+                # For everything else, use crane's filter (which handles .rs, Cargo.toml, etc.)
+                else
+                  craneLib.filterCargoSources path type;
+            };
+
+            # Generate a Cargo.toml with only the relevant members listed
+            filteredCargoTomlContent = (pkgs.formats.toml { }).generate "Cargo.toml" (
+              workspaceCargoToml
+              // {
+                workspace = workspaceCargoToml.workspace // {
+                  members = map (c: cratePaths.${c}) crates;
+                };
+              }
+            );
+          in
+          # Combine filtered source with the modified Cargo.toml
+          pkgs.runCommand "filtered-workspace-${builtins.concatStringsSep "-" crates}" { } ''
+            cp -r ${filteredSrc} $out
+            chmod -R u+w $out
+            cp ${filteredCargoTomlContent} $out/Cargo.toml
+          '';
+
         # Full repo source for checks that compare committed vs generated files
         repoSrc = craneLib.path ./.;
 
-        # Source filtering for Rust builds - excludes generated outputs
-        rustSrc = pkgs.lib.fileset.toSource {
-          root = ./.;
-          fileset = pkgs.lib.fileset.unions [
-            (craneLib.fileset.commonCargoSources ./.)
-            ./rust-toolchain.toml
-          ];
-        };
-
-        # Minimal source for dependency builds - only Cargo files
-        # This ensures .rs file changes don't invalidate the deps cache
-        rustDepsSrc = pkgs.lib.fileset.toSource {
-          root = ./.;
-          fileset = pkgs.lib.fileset.unions [
-            (craneLib.fileset.cargoTomlAndLock ./.)
-            ./rust-toolchain.toml
-          ];
-        };
+        # Full source for workspace-wide operations
+        fullSrc = craneLib.cleanCargoSource ./.;
 
         # Common arguments for all Rust builds - ensures determinism
         # Note: src is NOT included here; add it per-derivation
@@ -143,36 +266,59 @@
               ;
           };
 
-        # Build workspace dependencies for a target (shared across all packages)
-        # Uses cargoSrc (Cargo files only) so .rs changes don't invalidate cache
-        mkWorkspaceDeps =
-          rustTarget: nixCrossSystem:
+        # Build dependencies separately for caching (uses full workspace)
+        # This is used for workspace-wide operations like clippy and tests
+        cargoArtifacts = craneLib.buildDepsOnly (
+          commonArgs
+          // {
+            src = fullSrc;
+            pname = "workspace";
+          }
+        );
+
+        # Build per-package dependencies (only compiles deps that package needs)
+        mkPackageDeps =
+          pname: rustTarget: nixCrossSystem:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
-            # Host-only tools that should never be cross-compiled
+            deps = packageDeps.${pname} or [ ];
+            relevantCrates = [ pname ] ++ deps;
+            filteredSrc = mkFilteredSrc relevantCrates;
           in
           cfg.craneLibTarget.buildDepsOnly (
             commonArgs
             // cfg.targetArgs
             // {
-              src = rustDepsSrc;
-              pname = "eidolons-workspace-deps--${rustTarget}";
+              src = filteredSrc;
+              pname = "${pname}-deps";
+              # Only build deps for this specific package
+              cargoExtraArgs = "-p ${pname}";
             }
           );
 
-        # Pre-built workspace deps for native target (shared by all native builds)
-        nativeWorkspaceDeps = mkWorkspaceDeps nativeRustTarget null;
+        # Build individual packages with their own filtered deps
+        mkPackage =
+          pname: rustTarget: nixCrossSystem:
+          let
+            cfg = mkTargetConfig rustTarget nixCrossSystem;
+            deps = packageDeps.${pname} or [ ];
+            relevantCrates = [ pname ] ++ deps;
+            filteredSrc = mkFilteredSrc relevantCrates;
+            packageCargoArtifacts = mkPackageDeps pname rustTarget nixCrossSystem;
+          in
+          cfg.craneLibTarget.buildPackage (
+            commonArgs
+            // cfg.targetArgs
+            // {
+              src = filteredSrc;
+              cargoArtifacts = packageCargoArtifacts;
+              inherit pname;
+              cargoExtraArgs = "-p ${pname}";
+            }
+          );
 
         # Build the generate-openapi binary (native only, used for spec generation)
-        generateOpenapiBin = craneLib.buildPackage (
-          commonArgs
-          // {
-            src = rustSrc;
-            cargoArtifacts = nativeWorkspaceDeps;
-            pname = "generate-openapi";
-            cargoExtraArgs = "--bin generate-openapi";
-          }
-        );
+        generateOpenapiBin = mkPackage "generate-openapi" nativeRustTarget null;
 
         # Generate OpenAPI specification from the server code
         serverOpenApiSpec =
@@ -185,28 +331,6 @@
               mkdir -p $out
               generate-openapi > $out/openapi.json
             '';
-
-        # Build the server binary
-        # - rustTarget: Rust target triple
-        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
-        mkServer =
-          rustTarget: nixCrossSystem:
-          let
-            cfg = mkTargetConfig rustTarget nixCrossSystem;
-          in
-          cfg.craneLibTarget.buildPackage (
-            commonArgs
-            // cfg.targetArgs
-            // {
-              cargoArtifacts = mkWorkspaceDeps rustTarget nixCrossSystem;
-              src = rustSrc;
-              pname = "eidolons-server--${rustTarget}";
-              cargoExtraArgs = "--bin eidolons-server";
-
-              # Skip tests when cross-compiling (can't run foreign binaries)
-              doCheck = cfg.isNative;
-            }
-          );
 
         # Build OCI (Docker) image containing the server
         # - rustTarget: Rust target triple
@@ -221,7 +345,7 @@
         mkServerOCI =
           rustTarget: nixCrossSystem:
           let
-            server = mkServer rustTarget nixCrossSystem;
+            server = mkPackage "eidolons-server" rustTarget nixCrossSystem;
           in
           pkgs.dockerTools.buildLayeredImage {
             name = "eidolons-server";
@@ -250,48 +374,27 @@
             # Reproducible timestamp for deterministic builds
             created = "1970-01-01T00:00:00Z";
           };
-
-        # Cross-compilation targets: rustTarget -> nixCrossSystem (null = use native pkgs)
-        crossTargets = {
-          "aarch64-unknown-linux-musl" = "aarch64-multiplatform-musl";
-          "x86_64-unknown-linux-musl" = "musl64";
-          "aarch64-apple-darwin" = "aarch64-darwin";
-          "x86_64-apple-darwin" = "x86_64-darwin";
-        };
-
-        # Flatten cross-compiled packages: { "server--aarch64-unknown-linux-musl" = ...; ... }
-        crossPackages = builtins.listToAttrs (
-          builtins.concatMap (
-            rustTarget:
-            let
-              nixCrossSystem = crossTargets.${rustTarget};
-            in
-            [
-              {
-                name = "server--${rustTarget}";
-                value = mkServer rustTarget nixCrossSystem;
-              }
-              {
-                name = "server-oci--${rustTarget}";
-                value = mkServerOCI rustTarget nixCrossSystem;
-              }
-            ]
-          ) (builtins.attrNames crossTargets)
-        );
-        packages = {
-
-          server = mkServer nativeRustTarget null;
-          server-oci = mkServerOCI nativeRustTarget null;
-
-          # OpenAPI spec generation
-          server-openapi-spec = serverOpenApiSpec;
-        }
-        # Add cross-compiled targets
-        // crossPackages;
-
       in
       {
-        inherit packages;
+        packages = {
+          server = mkPackage "eidolons-server" nativeRustTarget null;
+          server-oci = mkServerOCI nativeRustTarget null;
+          server-openapi-spec = serverOpenApiSpec;
+
+          # Server binaries cross-compiled for specific targets
+          server--aarch64-unknown-linux-musl =
+            mkPackage "eidolons-server" "aarch64-unknown-linux-musl"
+              "aarch64-multiplatform-musl";
+          server--x86_64-unknown-linux-musl =
+            mkPackage "eidolons-server" "x86_64-unknown-linux-musl"
+              "musl64";
+          server--aarch64-apple-darwin = mkPackage "eidolons-server" "aarch64-apple-darwin" "aarch64-darwin";
+          server--x86_64-apple-darwin = mkPackage "eidolons-server" "x86_64-apple-darwin" "x86_64-darwin";
+
+          # Server OCI images cross-compiled for specific targets
+          server-oci--aarch64-unknown-linux-musl = mkServerOCI "aarch64-unknown-linux-musl" "aarch64-multiplatform-musl";
+          server-oci--x86_64-unknown-linux-musl = mkServerOCI "x86_64-unknown-linux-musl" "musl64";
+        };
 
         # Development shell with Rust toolchain and tools
         devShells.default = pkgs.mkShell {
@@ -305,6 +408,9 @@
 
             # Interact with OCI images
             pkgs.crane
+
+            # Pin GitHub actions
+            pkgs.pinact
           ];
         };
 
@@ -312,17 +418,17 @@
         checks = {
           # Verify code formatting
           formatting = craneLib.cargoFmt {
-            src = rustSrc;
-            pname = "eidolons-fmt";
+            src = fullSrc;
+            pname = "fmt";
           };
 
           # Verify no Clippy warnings
           clippy = craneLib.cargoClippy (
             commonArgs
             // {
-              src = rustSrc;
-              cargoArtifacts = nativeWorkspaceDeps;
-              pname = "eidolons-clippy";
+              src = fullSrc;
+              inherit cargoArtifacts;
+              pname = "clippy";
               cargoClippyExtraArgs = "--all-targets -- --deny warnings";
             }
           );
@@ -331,9 +437,9 @@
           tests = craneLib.cargoTest (
             commonArgs
             // {
-              src = rustSrc;
-              cargoArtifacts = nativeWorkspaceDeps;
-              pname = "eidolons-tests";
+              src = fullSrc;
+              inherit cargoArtifacts;
+              pname = "tests";
             }
           );
 
@@ -346,11 +452,11 @@
               ''
                 echo "Checking if committed OpenAPI spec matches generated one..."
 
-                GENERATED="${packages.server-openapi-spec}/openapi.json"
-                COMMITTED="${repoSrc}/server/openapi.json"
+                GENERATED="${self.packages.${system}.server-openapi-spec}/openapi.json"
+                COMMITTED="${repoSrc}/eidolons-server/openapi.json"
 
                 if [ ! -f "$COMMITTED" ]; then
-                  echo "ERROR: No committed OpenAPI spec found at server/openapi.json"
+                  echo "ERROR: No committed OpenAPI spec found at eidolons-server/openapi.json"
                   echo "Run: nix run '.#update-server-openapi'"
                   echo "Then commit the generated file."
                   exit 1
@@ -373,7 +479,7 @@
               '';
 
           # Ensure the primary artifacts are built
-          build-server-oci = packages.server-oci;
+          # build-server-oci = packages.server-oci;
 
         };
 
@@ -399,13 +505,13 @@
                   fi
 
                   repo_root="$(git rev-parse --show-toplevel)"
-                  dest="$repo_root/server/openapi.json"
+                  dest="$repo_root/eidolons-server/openapi.json"
 
                   echo "Copying OpenAPI spec from Nix store:"
-                  echo "  source: ${packages.server-openapi-spec}/openapi.json"
+                  echo "  source: ${self.packages.${system}.server-openapi-spec}/openapi.json"
                   echo "  dest:   $dest"
 
-                  cp "${packages.server-openapi-spec}/openapi.json" "$dest"
+                  cp "${self.packages.${system}.server-openapi-spec}/openapi.json" "$dest"
                   chmod +w "$dest"
 
                   echo "Done. Review changes and commit:"

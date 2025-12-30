@@ -11,5 +11,5 @@ name = "generate-openapi"
 path = "src/main.rs"
 
 [dependencies]
-eidolons-server = { path = "../server" }
+eidolons-server = { path = "../../eidolons-server" }
 utoipa = "5"
