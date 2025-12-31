@@ -231,6 +231,7 @@
           let
             isNative = rustTarget == nativeRustTarget;
             isLinuxMusl = builtins.match ".*-linux-musl" rustTarget != null;
+            isIOS = builtins.match ".*-apple-ios.*" rustTarget != null;
 
             # Use pkgsCross if specified, otherwise native pkgs
             targetPkgs = if nixCrossSystem == null then pkgs else pkgs.pkgsCross.${nixCrossSystem};
@@ -238,20 +239,30 @@
             # Crane uses target pkgs (for linker/libc) but host toolchain (for cargo)
             craneLibTarget = (crane.mkLib targetPkgs).overrideToolchain (_: rustToolchain);
 
+            # Linker env var name for this target (dynamically generated from target triple)
+            linkerEnvVar = "CARGO_TARGET_${
+              pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] rustTarget)
+            }_LINKER";
+
             # Cross-compilation needs CARGO_BUILD_TARGET set.
-            # For Linux musl targets without pkgsCross, use rust-lld (bundled with Rust)
-            # instead of system cc. If nixCrossSystem is set, pkgsCross provides a cross-linker.
+            # For Linux musl targets without pkgsCross, use rust-lld (bundled with Rust).
+            # For iOS targets, use system clang and Xcode SDK (requires sandbox=false).
             targetArgs =
               if isNative then
                 { }
               else if isLinuxMusl && nixCrossSystem == null then
                 {
                   CARGO_BUILD_TARGET = rustTarget;
-
-                  # The linker env var is dynamically generated from the target triple:
-                  # "aarch64-unknown-linux-musl" -> "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER"
-                  "CARGO_TARGET_${pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] rustTarget)}_LINKER" =
-                    "rust-lld";
+                  ${linkerEnvVar} = "rust-lld";
+                }
+              else if isIOS then
+                {
+                  CARGO_BUILD_TARGET = rustTarget;
+                  ${linkerEnvVar} = "/usr/bin/clang";
+                  preBuild = ''
+                    export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
+                  '';
+                  doCheck = false; # iOS binaries can't run on macOS
                 }
               else
                 { CARGO_BUILD_TARGET = rustTarget; };
@@ -310,17 +321,7 @@
             relevantCrates = [ pname ] ++ deps;
             filteredSrc = mkFilteredSrc relevantCrates;
             packageCargoArtifacts = mkPackageDeps pname rustTarget nixCrossSystem;
-          in
-          cfg.craneLibTarget.buildPackage (
-            commonArgs
-            // cfg.targetArgs
-            // {
-              src = filteredSrc;
-              cargoArtifacts = packageCargoArtifacts;
-              inherit pname;
-              cargoExtraArgs = "-p ${pname}";
-            }
-            // (
+            crateTypeSetup =
               if crateType == null then
                 { }
               else
@@ -328,8 +329,18 @@
                   preBuildHook = ''
                     sed -i 's/crate-type = .*/crate-type = ["${crateType}"]/' eidolons/Cargo.toml
                   '';
-                }
-            )
+                };
+          in
+          cfg.craneLibTarget.buildPackage (
+            commonArgs
+            // cfg.targetArgs
+            // crateTypeSetup
+            // {
+              src = filteredSrc;
+              cargoArtifacts = packageCargoArtifacts;
+              inherit pname;
+              cargoExtraArgs = "-p ${pname}";
+            }
           );
 
         # Build the generate-openapi binary (native only, used for spec generation)
@@ -473,6 +484,7 @@
         };
 
         # Build XCFramework containing static libraries for all Apple platforms
+        # Note: iOS targets require system Xcode SDK (sandbox=false in nix.conf).
         eidolonsSwiftXCFramework = pkgs.stdenv.mkDerivation {
           name = "eidolons-xcframework";
 
@@ -484,7 +496,7 @@
 
           dontUnpack = true;
 
-          # Reference all the Apple target builds (all use native pkgs, Rust handles cross-compilation)
+          # Reference all the Apple target builds
           macosArm64 = mkPackage {
             pname = "eidolons";
             rustTarget = "aarch64-apple-darwin";
@@ -517,80 +529,29 @@
           };
 
           buildPhase = ''
-            mkdir -p "$out/libeidolons-rs.xcframework/macos-arm64_x86_64"
-            mkdir -p "$out/libeidolons-rs.xcframework/ios-arm64"
-            mkdir -p "$out/libeidolons-rs.xcframework/ios-arm64_x86_64-simulator"
+            export PATH="$PATH:/usr/bin"
 
-            # macOS: combine arm64 + x86_64 into universal binary
+            # Create universal binaries for multi-arch slices
+            WORKDIR=$(mktemp -d)
+
+            # macOS: combine arm64 + x86_64
             lipo -create \
               "$macosArm64/lib/libeidolons.a" \
               "$macosX86_64/lib/libeidolons.a" \
-              -output "$out/libeidolons-rs.xcframework/macos-arm64_x86_64/libeidolons.a"
+              -output "$WORKDIR/libeidolons-macos.a"
 
-            # iOS device: arm64 only
-            cp "$iosArm64/lib/libeidolons.a" \
-              "$out/libeidolons-rs.xcframework/ios-arm64/libeidolons.a"
-
-            # iOS simulator: combine arm64 + x86_64 into universal binary
+            # iOS simulator: combine arm64 + x86_64
             lipo -create \
               "$iosSimArm64/lib/libeidolons.a" \
               "$iosSimX86_64/lib/libeidolons.a" \
-              -output "$out/libeidolons-rs.xcframework/ios-arm64_x86_64-simulator/libeidolons.a"
+              -output "$WORKDIR/libeidolons-ios-sim.a"
 
-            # Create Info.plist for XCFramework
-            cat > "$out/libeidolons-rs.xcframework/Info.plist" << 'EOF'
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-              <key>AvailableLibraries</key>
-              <array>
-                <dict>
-                  <key>LibraryIdentifier</key>
-                  <string>macos-arm64_x86_64</string>
-                  <key>LibraryPath</key>
-                  <string>libeidolons.a</string>
-                  <key>SupportedArchitectures</key>
-                  <array>
-                    <string>arm64</string>
-                    <string>x86_64</string>
-                  </array>
-                  <key>SupportedPlatform</key>
-                  <string>macos</string>
-                </dict>
-                <dict>
-                  <key>LibraryIdentifier</key>
-                  <string>ios-arm64</string>
-                  <key>LibraryPath</key>
-                  <string>libeidolons.a</string>
-                  <key>SupportedArchitectures</key>
-                  <array><string>arm64</string></array>
-                  <key>SupportedPlatform</key>
-                  <string>ios</string>
-                </dict>
-                <dict>
-                  <key>LibraryIdentifier</key>
-                  <string>ios-arm64_x86_64-simulator</string>
-                  <key>LibraryPath</key>
-                  <string>libeidolons.a</string>
-                  <key>SupportedArchitectures</key>
-                  <array>
-                    <string>arm64</string>
-                    <string>x86_64</string>
-                  </array>
-                  <key>SupportedPlatform</key>
-                  <string>ios</string>
-                  <key>SupportedPlatformVariant</key>
-                  <string>simulator</string>
-                </dict>
-              </array>
-              <key>CFBundlePackageType</key>
-              <string>XFWK</string>
-              <key>XCFrameworkFormatVersion</key>
-              <string>1.0</string>
-            </dict>
-            </plist>
-            EOF
+            # Use xcodebuild to create the XCFramework
+            xcodebuild -create-xcframework \
+              -library "$WORKDIR/libeidolons-macos.a" \
+              -library "$iosArm64/lib/libeidolons.a" \
+              -library "$WORKDIR/libeidolons-ios-sim.a" \
+              -output "$out/libeidolons-rs.xcframework"
           '';
 
           installPhase = ''
@@ -792,6 +753,7 @@
 
           # Ensure the primary artifacts are built
           builds-server-oci = self.packages.${system}.server-oci;
+          # Note: XCFramework requires sandbox=false for iOS builds (uses system Xcode SDK)
           builds-eidolons-swift-xcframework = self.packages.${system}.eidolons-swift-xcframework;
 
         };
