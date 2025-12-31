@@ -1,6 +1,7 @@
 [workspace]
 
 members = [
+    "eidolons",
     "eidolons-server",
     "tools/*",
 ]

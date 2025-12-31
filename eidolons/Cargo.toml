@@ -1,32 +1,13 @@
-[workspace]
-
-members = [
-    "core",
-    "core/uniffi-bindgen",
-    "core/uniffi-bindgen-swift",
-]
-resolver = "2"
-
-[workspace.dependencies]
-uniffi = "0.30.0"
-
-[workspace.package]
+[package]
+name = "eidolons"
 version = "0.1.0"
 edition = "2024"
-authors = ["Mike Marcacci"]
-repository = "https://github.com/eidolons-ai/eidolons"
-publish = false
 
-[profile.release]
-# Incremental compilation is disabled to avoid non-determinism.
-incremental = false
-# Codegen units are set to 1 to avoid potential non-determinism.
-codegen-units = 1
-# Enable link-time optimization for better determinism
-lto = true
-# Explicit optimization level
-opt-level = 3
-# Strip symbols for determinism
-strip = true
-# Explicit overflow check setting
-overflow-checks = false
+[dependencies]
+uniffi = "0.30.0"
+
+[build-dependencies]
+uniffi = { version = "0.30.0", features = ["build"] }
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
