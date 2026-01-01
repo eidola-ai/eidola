@@ -205,10 +205,6 @@
           # GNU tar needed for crane's reproducible archive creation (BSD tar lacks --sort)
           nativeBuildInputs = [ pkgs.gnutar ];
 
-          # On Darwin, use Nix's hermetic Apple SDK instead of relying on host Xcode.
-          # This ensures builds work regardless of host's xcode-select configuration.
-          buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.apple-sdk ];
-
           # Deterministic build settings
           CARGO_INCREMENTAL = "false"; # Disable incremental compilation
           SOURCE_DATE_EPOCH = "0"; # Fixed timestamp
