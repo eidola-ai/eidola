@@ -258,14 +258,17 @@
               else if isIOS then
                 {
                   CARGO_BUILD_TARGET = rustTarget;
-                  ${linkerEnvVar} = "/usr/bin/clang";
+                  ${linkerEnvVar} = "rust-lld";
                   preBuild = ''
                     export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
                   '';
                   doCheck = false; # iOS binaries can't run on macOS
                 }
               else
-                { CARGO_BUILD_TARGET = rustTarget; };
+                {
+                  CARGO_BUILD_TARGET = rustTarget;
+                  ${linkerEnvVar} = "rust-lld";
+                };
           in
           {
             inherit
