@@ -202,9 +202,6 @@
         commonArgs = {
           strictDeps = true;
 
-          # GNU tar needed for crane's reproducible archive creation (BSD tar lacks --sort)
-          nativeBuildInputs = [ pkgs.gnutar ];
-
           # Deterministic build settings
           CARGO_INCREMENTAL = "false"; # Disable incremental compilation
           SOURCE_DATE_EPOCH = "0"; # Fixed timestamp
@@ -242,15 +239,6 @@
             # Crane uses target pkgs (for linker/libc) but host toolchain (for cargo)
             craneLibTarget = (crane.mkLib targetPkgs).overrideToolchain (_: rustToolchain);
 
-            # Map iOS targets to their SDK names
-            iosSdkName =
-              if rustTarget == "aarch64-apple-ios" then
-                "iphoneos"
-              else if rustTarget == "aarch64-apple-ios-sim" || rustTarget == "x86_64-apple-ios" then
-                "iphonesimulator"
-              else
-                null;
-
             # Linker env var name for this target (dynamically generated from target triple)
             linkerEnvVar = "CARGO_TARGET_${
               pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] rustTarget)
@@ -272,10 +260,7 @@
                   CARGO_BUILD_TARGET = rustTarget;
                   ${linkerEnvVar} = "/usr/bin/clang";
                   preBuild = ''
-                    export PATH="${pkgs.gnutar}/bin:$PATH:/usr/bin"
                     export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
-                    export SDKROOT="$(/usr/bin/xcrun --sdk ${iosSdkName} --show-sdk-path)"
-                    echo "Using SDK: $SDKROOT"
                   '';
                   doCheck = false; # iOS binaries can't run on macOS
                 }
@@ -316,7 +301,7 @@
             // cfg.targetArgs
             // {
               src = filteredSrc;
-              inherit pname;
+              pname = "${pname}-deps";
               # Only build deps for this specific package
               cargoExtraArgs = "-p ${pname}";
             }
@@ -561,7 +546,7 @@
               "$iosSimX86_64/lib/libeidolons.a" \
               -output "$WORKDIR/libeidolons-ios-sim.a"
 
-            # Use xcodebuild to create the XCFramework (handles Info.plist automatically)
+            # Use xcodebuild to create the XCFramework
             xcodebuild -create-xcframework \
               -library "$WORKDIR/libeidolons-macos.a" \
               -library "$iosArm64/lib/libeidolons.a" \
