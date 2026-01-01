@@ -1,0 +1,545 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Eidolons API",
+    "description": "OpenAI-compatible proxy API for AI providers",
+    "contact": {
+      "name": "Mike Marcacci"
+    },
+    "license": {
+      "name": ""
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "openapi_paths"
+        ],
+        "summary": "Health check endpoint.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Server is healthy",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": {
+                  "status": "ok"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "tags": [
+          "openapi_paths"
+        ],
+        "summary": "Create a chat completion.",
+        "operationId": "chat_completions",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatCompletionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Chat completion response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatCompletionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream provider error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AssistantMessage": {
+        "type": "object",
+        "description": "An assistant message in a response.",
+        "required": [
+          "role"
+        ],
+        "properties": {
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          }
+        }
+      },
+      "ChatCompletionChunk": {
+        "type": "object",
+        "description": "A streaming chat completion chunk.",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices"
+        ],
+        "properties": {
+          "choices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChunkChoice"
+            },
+            "description": "List of completion choices (deltas)."
+          },
+          "created": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp of when the chunk was created.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for the completion."
+          },
+          "model": {
+            "type": "string",
+            "description": "The model used for completion."
+          },
+          "object": {
+            "type": "string",
+            "description": "The object type (always \"chat.completion.chunk\")."
+          }
+        }
+      },
+      "ChatCompletionRequest": {
+        "type": "object",
+        "description": "A chat completion request in OpenAI format.",
+        "required": [
+          "model",
+          "messages"
+        ],
+        "properties": {
+          "max_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The maximum number of tokens to generate.",
+            "minimum": 0
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            },
+            "description": "A list of messages comprising the conversation."
+          },
+          "model": {
+            "type": "string",
+            "description": "ID of the model to use."
+          },
+          "stop": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StopSequence",
+                "description": "Up to 4 sequences where the API will stop generating."
+              }
+            ]
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "Whether to stream partial responses."
+          },
+          "temperature": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Sampling temperature between 0 and 2."
+          },
+          "top_p": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Nucleus sampling parameter."
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A unique identifier for the end-user."
+          }
+        }
+      },
+      "ChatCompletionResponse": {
+        "type": "object",
+        "description": "A chat completion response.",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices"
+        ],
+        "properties": {
+          "choices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Choice"
+            },
+            "description": "List of completion choices."
+          },
+          "created": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp of when the completion was created.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for the completion."
+          },
+          "model": {
+            "type": "string",
+            "description": "The model used for completion."
+          },
+          "object": {
+            "type": "string",
+            "description": "The object type (always \"chat.completion\")."
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage",
+                "description": "Usage statistics for the request."
+              }
+            ]
+          }
+        }
+      },
+      "Choice": {
+        "type": "object",
+        "description": "A completion choice.",
+        "required": [
+          "index",
+          "message"
+        ],
+        "properties": {
+          "finish_reason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FinishReason",
+                "description": "The reason the model stopped generating."
+              }
+            ]
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The index of this choice.",
+            "minimum": 0
+          },
+          "message": {
+            "$ref": "#/components/schemas/AssistantMessage",
+            "description": "The generated message."
+          }
+        }
+      },
+      "ChunkChoice": {
+        "type": "object",
+        "description": "A choice delta in a streaming chunk.",
+        "required": [
+          "index",
+          "delta"
+        ],
+        "properties": {
+          "delta": {
+            "$ref": "#/components/schemas/ChunkDelta",
+            "description": "The delta (partial update) for this choice."
+          },
+          "finish_reason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FinishReason",
+                "description": "The reason the model stopped generating (only in final chunk)."
+              }
+            ]
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The index of this choice.",
+            "minimum": 0
+          }
+        }
+      },
+      "ChunkDelta": {
+        "type": "object",
+        "description": "A delta update in a streaming response.",
+        "properties": {
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Role"
+              }
+            ]
+          }
+        }
+      },
+      "ContentPart": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Text content.",
+            "required": [
+              "text",
+              "type"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Image content via URL.",
+            "required": [
+              "image_url",
+              "type"
+            ],
+            "properties": {
+              "image_url": {
+                "$ref": "#/components/schemas/ImageUrl"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "image_url"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A content part within a multimodal message."
+      },
+      "ErrorDetail": {
+        "type": "object",
+        "required": [
+          "message",
+          "type"
+        ],
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "description": "An error response in OpenAI format.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        }
+      },
+      "FinishReason": {
+        "type": "string",
+        "description": "The reason the model stopped generating.",
+        "enum": [
+          "stop",
+          "length",
+          "content_filter"
+        ]
+      },
+      "ImageUrl": {
+        "type": "object",
+        "description": "An image URL reference.",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional detail level for the image."
+          },
+          "url": {
+            "type": "string",
+            "description": "The URL of the image, or a base64-encoded data URI."
+          }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "description": "A message in the conversation.",
+        "required": [
+          "role",
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/MessageContent",
+            "description": "The content of the message."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional name for the participant."
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "The role of the message author."
+          }
+        }
+      },
+      "MessageContent": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContentPart"
+            }
+          }
+        ],
+        "description": "Message content can be a simple string or array of content parts (for multimodal)."
+      },
+      "Role": {
+        "type": "string",
+        "description": "The role of a message author.",
+        "enum": [
+          "system",
+          "user",
+          "assistant"
+        ]
+      },
+      "StopSequence": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Stop sequence can be a single string or array of strings."
+      },
+      "Usage": {
+        "type": "object",
+        "description": "Token usage statistics.",
+        "required": [
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens"
+        ],
+        "properties": {
+          "completion_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "prompt_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "total_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      }
+    }
+  }
+}

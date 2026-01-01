@@ -38,7 +38,7 @@ jobs:
         run: nix flake show
 
       - name: Run all checks
-        run: nix flake check --show-trace
+        run: nix flake check --show-trace --max-jobs auto
 
       - name: Build all packages
         run: |

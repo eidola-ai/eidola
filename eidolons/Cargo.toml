@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-uniffi.workspace = true
+uniffi = "0.30.0"
 
 [build-dependencies]
-uniffi = { workspace = true, features = ["build"] }
+uniffi = { version = "0.30.0", features = ["build"] }
 
 [lib]
 crate-type = ["cdylib", "staticlib", "lib"]

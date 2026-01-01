@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		272E2C482EF3512500E8F1B4 /* EidolonsCore in Frameworks */ = {isa = PBXBuildFile; productRef = 272E2C472EF3512500E8F1B4 /* EidolonsCore */; };
+		277225572F07113B000DF090 /* EidolonsCore in Frameworks */ = {isa = PBXBuildFile; productRef = 277225562F07113B000DF090 /* EidolonsCore */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -56,7 +56,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				272E2C482EF3512500E8F1B4 /* EidolonsCore in Frameworks */,
+				277225572F07113B000DF090 /* EidolonsCore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -117,7 +117,7 @@
 			);
 			name = Eidolons;
 			packageProductDependencies = (
-				272E2C472EF3512500E8F1B4 /* EidolonsCore */,
+				277225562F07113B000DF090 /* EidolonsCore */,
 			);
 			productName = Eidolons;
 			productReference = 272E2C1C2EF34D7200E8F1B4 /* Eidolons.app */;
@@ -202,7 +202,7 @@
 			mainGroup = 272E2C132EF34D7200E8F1B4;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				272E2C462EF3512500E8F1B4 /* XCLocalSwiftPackageReference "../../../core" */,
+				277225552F07113B000DF090 /* XCLocalSwiftPackageReference "../../../eidolons" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 272E2C1D2EF34D7200E8F1B4 /* Products */;
@@ -626,14 +626,14 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		272E2C462EF3512500E8F1B4 /* XCLocalSwiftPackageReference "../../../core" */ = {
+		277225552F07113B000DF090 /* XCLocalSwiftPackageReference "../../../eidolons" */ = {
 			isa = XCLocalSwiftPackageReference;
-			relativePath = ../../../core;
+			relativePath = ../../../eidolons;
 		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		272E2C472EF3512500E8F1B4 /* EidolonsCore */ = {
+		277225562F07113B000DF090 /* EidolonsCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = EidolonsCore;
 		};
