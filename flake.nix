@@ -483,8 +483,6 @@
           '';
         };
 
-        # Build XCFramework containing static libraries for all Apple platforms
-        # Note: iOS targets require system Xcode SDK (sandbox=false in nix.conf).
         eidolonsSwiftXCFramework = pkgs.stdenv.mkDerivation {
           name = "eidolons-xcframework";
 
@@ -496,7 +494,6 @@
 
           dontUnpack = true;
 
-          # Reference all the Apple target builds
           macosArm64 = mkPackage {
             pname = "eidolons";
             rustTarget = "aarch64-apple-darwin";
@@ -509,60 +506,56 @@
             nixCrossSystem = null;
             crateType = "staticlib";
           };
-          iosArm64 = mkPackage {
-            pname = "eidolons";
-            rustTarget = "aarch64-apple-ios";
-            nixCrossSystem = null;
-            crateType = "staticlib";
-          };
-          iosSimArm64 = mkPackage {
-            pname = "eidolons";
-            rustTarget = "aarch64-apple-ios-sim";
-            nixCrossSystem = null;
-            crateType = "staticlib";
-          };
-          iosSimX86_64 = mkPackage {
-            pname = "eidolons";
-            rustTarget = "x86_64-apple-ios";
-            nixCrossSystem = null;
-            crateType = "staticlib";
-          };
 
           buildPhase = ''
-            export PATH="$PATH:/usr/bin"
+            # Create XCFramework directory structure
+            XCFW="$out/libeidolons-rs.xcframework"
+            MACOS_DIR="$XCFW/macos-arm64_x86_64"
+            mkdir -p "$MACOS_DIR"
 
-            # Create universal binaries for multi-arch slices
-            WORKDIR=$(mktemp -d)
-
-            # macOS: combine arm64 + x86_64
+            # Create universal binary combining arm64 + x86_64
             lipo -create \
               "$macosArm64/lib/libeidolons.a" \
               "$macosX86_64/lib/libeidolons.a" \
-              -output "$WORKDIR/libeidolons-macos.a"
+              -output "$MACOS_DIR/libeidolons.a"
 
-            # iOS simulator: combine arm64 + x86_64
-            lipo -create \
-              "$iosSimArm64/lib/libeidolons.a" \
-              "$iosSimX86_64/lib/libeidolons.a" \
-              -output "$WORKDIR/libeidolons-ios-sim.a"
-
-            # Use xcodebuild to create the XCFramework
-            xcodebuild -create-xcframework \
-              -library "$WORKDIR/libeidolons-macos.a" \
-              -library "$iosArm64/lib/libeidolons.a" \
-              -library "$WORKDIR/libeidolons-ios-sim.a" \
-              -output "$out/libeidolons-rs.xcframework"
+            # Create Info.plist
+            cat > "$XCFW/Info.plist" << 'EOF'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>AvailableLibraries</key>
+              <array>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>macos-arm64_x86_64</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array>
+                    <string>arm64</string>
+                    <string>x86_64</string>
+                  </array>
+                  <key>SupportedPlatform</key>
+                  <string>macos</string>
+                </dict>
+              </array>
+              <key>CFBundlePackageType</key>
+              <string>XFWK</string>
+              <key>XCFrameworkFormatVersion</key>
+              <string>1.0</string>
+            </dict>
+            </plist>
+            EOF
           '';
 
           installPhase = ''
             echo "XCFramework contents:"
-            find "$out" -name "*.a" -exec ls -lh {} \;
+            find "$out" -type f -exec ls -lh {} \;
             echo ""
             echo "Architecture info:"
-            for lib in "$out"/libeidolons-rs.xcframework/*/libeidolons.a; do
-              echo "$lib:"
-              lipo -info "$lib"
-            done
+            lipo -info "$out/libeidolons-rs.xcframework/macos-arm64_x86_64/libeidolons.a"
           '';
         };
 
@@ -753,7 +746,6 @@
 
           # Ensure the primary artifacts are built
           builds-server-oci = self.packages.${system}.server-oci;
-          # Note: XCFramework requires sandbox=false for iOS builds (uses system Xcode SDK)
           builds-eidolons-swift-xcframework = self.packages.${system}.eidolons-swift-xcframework;
 
         };

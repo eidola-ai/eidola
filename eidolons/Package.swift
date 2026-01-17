@@ -30,8 +30,7 @@ let package = Package(
   name: "EidolonsCore",
   defaultLocalization: "en",
   platforms: [
-    .iOS(.v26),
-    .macOS(.v26),
+    .macOS(.v26)
   ],
   products: [
     .library(
