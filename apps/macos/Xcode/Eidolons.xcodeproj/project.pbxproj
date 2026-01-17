@@ -7,44 +7,36 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		277225572F07113B000DF090 /* EidolonsCore in Frameworks */ = {isa = PBXBuildFile; productRef = 277225562F07113B000DF090 /* EidolonsCore */; };
+		27D54D642F1AF6C700B53566 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27D54D622F1AF6C700B53566 /* main.swift */; };
+		27E92C022F1AFDBD00071830 /* EidolonsApp in Frameworks */ = {isa = PBXBuildFile; productRef = 27E92C012F1AFDBD00071830 /* EidolonsApp */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
-		272E2C2A2EF34D7300E8F1B4 /* PBXContainerItemProxy */ = {
+		274BFA562F1AEAD4008AFBDF /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
-			containerPortal = 272E2C142EF34D7200E8F1B4 /* Project object */;
+			containerPortal = 274BFA402F1AEAD4008AFBDF /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = 272E2C1B2EF34D7200E8F1B4;
+			remoteGlobalIDString = 274BFA472F1AEAD4008AFBDF;
 			remoteInfo = Eidolons;
 		};
-		272E2C342EF34D7300E8F1B4 /* PBXContainerItemProxy */ = {
+		274BFA602F1AEAD4008AFBDF /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
-			containerPortal = 272E2C142EF34D7200E8F1B4 /* Project object */;
+			containerPortal = 274BFA402F1AEAD4008AFBDF /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = 272E2C1B2EF34D7200E8F1B4;
+			remoteGlobalIDString = 274BFA472F1AEAD4008AFBDF;
 			remoteInfo = Eidolons;
 		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		272E2C1C2EF34D7200E8F1B4 /* Eidolons.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Eidolons.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		272E2C292EF34D7300E8F1B4 /* EidolonsTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EidolonsTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		272E2C332EF34D7300E8F1B4 /* EidolonsUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EidolonsUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		274BFA482F1AEAD4008AFBDF /* Eidolons.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Eidolons.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		274BFA552F1AEAD4008AFBDF /* EidolonsTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EidolonsTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		274BFA5F2F1AEAD4008AFBDF /* EidolonsUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EidolonsUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		27D54D622F1AF6C700B53566 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		272E2C1E2EF34D7200E8F1B4 /* Eidolons */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = Eidolons;
-			sourceTree = "<group>";
-		};
-		272E2C2C2EF34D7300E8F1B4 /* EidolonsTests */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = EidolonsTests;
-			sourceTree = "<group>";
-		};
-		272E2C362EF34D7300E8F1B4 /* EidolonsUITests */ = {
+		274BFA622F1AEAD4008AFBDF /* EidolonsUITests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = EidolonsUITests;
 			sourceTree = "<group>";
@@ -52,22 +44,22 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		272E2C192EF34D7200E8F1B4 /* Frameworks */ = {
+		274BFA452F1AEAD4008AFBDF /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				277225572F07113B000DF090 /* EidolonsCore in Frameworks */,
+				27E92C022F1AFDBD00071830 /* EidolonsApp in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		272E2C262EF34D7300E8F1B4 /* Frameworks */ = {
+		274BFA522F1AEAD4008AFBDF /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		272E2C302EF34D7300E8F1B4 /* Frameworks */ = {
+		274BFA5C2F1AEAD4008AFBDF /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -77,161 +69,171 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		272E2C132EF34D7200E8F1B4 = {
+		274BFA3F2F1AEAD4008AFBDF = {
 			isa = PBXGroup;
 			children = (
-				272E2C1E2EF34D7200E8F1B4 /* Eidolons */,
-				272E2C2C2EF34D7300E8F1B4 /* EidolonsTests */,
-				272E2C362EF34D7300E8F1B4 /* EidolonsUITests */,
-				272E2C1D2EF34D7200E8F1B4 /* Products */,
+				27D54D632F1AF6C700B53566 /* EidolonsEntrypoint */,
+				274BFA622F1AEAD4008AFBDF /* EidolonsUITests */,
+				27E92C002F1AFDBD00071830 /* Frameworks */,
+				274BFA492F1AEAD4008AFBDF /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		272E2C1D2EF34D7200E8F1B4 /* Products */ = {
+		274BFA492F1AEAD4008AFBDF /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				272E2C1C2EF34D7200E8F1B4 /* Eidolons.app */,
-				272E2C292EF34D7300E8F1B4 /* EidolonsTests.xctest */,
-				272E2C332EF34D7300E8F1B4 /* EidolonsUITests.xctest */,
+				274BFA482F1AEAD4008AFBDF /* Eidolons.app */,
+				274BFA552F1AEAD4008AFBDF /* EidolonsTests.xctest */,
+				274BFA5F2F1AEAD4008AFBDF /* EidolonsUITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		27D54D632F1AF6C700B53566 /* EidolonsEntrypoint */ = {
+			isa = PBXGroup;
+			children = (
+				27D54D622F1AF6C700B53566 /* main.swift */,
+			);
+			name = EidolonsEntrypoint;
+			path = ../Sources/EidolonsEntrypoint;
+			sourceTree = SOURCE_ROOT;
+		};
+		27E92C002F1AFDBD00071830 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		272E2C1B2EF34D7200E8F1B4 /* Eidolons */ = {
+		274BFA472F1AEAD4008AFBDF /* Eidolons */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 272E2C3D2EF34D7300E8F1B4 /* Build configuration list for PBXNativeTarget "Eidolons" */;
+			buildConfigurationList = 274BFA692F1AEAD4008AFBDF /* Build configuration list for PBXNativeTarget "Eidolons" */;
 			buildPhases = (
-				272E2C182EF34D7200E8F1B4 /* Sources */,
-				272E2C192EF34D7200E8F1B4 /* Frameworks */,
-				272E2C1A2EF34D7200E8F1B4 /* Resources */,
+				274BFA442F1AEAD4008AFBDF /* Sources */,
+				274BFA452F1AEAD4008AFBDF /* Frameworks */,
+				274BFA462F1AEAD4008AFBDF /* Resources */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-			);
-			fileSystemSynchronizedGroups = (
-				272E2C1E2EF34D7200E8F1B4 /* Eidolons */,
 			);
 			name = Eidolons;
 			packageProductDependencies = (
-				277225562F07113B000DF090 /* EidolonsCore */,
+				27E92C012F1AFDBD00071830 /* EidolonsApp */,
 			);
 			productName = Eidolons;
-			productReference = 272E2C1C2EF34D7200E8F1B4 /* Eidolons.app */;
+			productReference = 274BFA482F1AEAD4008AFBDF /* Eidolons.app */;
 			productType = "com.apple.product-type.application";
 		};
-		272E2C282EF34D7300E8F1B4 /* EidolonsTests */ = {
+		274BFA542F1AEAD4008AFBDF /* EidolonsTests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 272E2C402EF34D7300E8F1B4 /* Build configuration list for PBXNativeTarget "EidolonsTests" */;
+			buildConfigurationList = 274BFA6C2F1AEAD4008AFBDF /* Build configuration list for PBXNativeTarget "EidolonsTests" */;
 			buildPhases = (
-				272E2C252EF34D7300E8F1B4 /* Sources */,
-				272E2C262EF34D7300E8F1B4 /* Frameworks */,
-				272E2C272EF34D7300E8F1B4 /* Resources */,
+				274BFA512F1AEAD4008AFBDF /* Sources */,
+				274BFA522F1AEAD4008AFBDF /* Frameworks */,
+				274BFA532F1AEAD4008AFBDF /* Resources */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				272E2C2B2EF34D7300E8F1B4 /* PBXTargetDependency */,
-			);
-			fileSystemSynchronizedGroups = (
-				272E2C2C2EF34D7300E8F1B4 /* EidolonsTests */,
+				274BFA572F1AEAD4008AFBDF /* PBXTargetDependency */,
 			);
 			name = EidolonsTests;
 			packageProductDependencies = (
 			);
 			productName = EidolonsTests;
-			productReference = 272E2C292EF34D7300E8F1B4 /* EidolonsTests.xctest */;
+			productReference = 274BFA552F1AEAD4008AFBDF /* EidolonsTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
-		272E2C322EF34D7300E8F1B4 /* EidolonsUITests */ = {
+		274BFA5E2F1AEAD4008AFBDF /* EidolonsUITests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 272E2C432EF34D7300E8F1B4 /* Build configuration list for PBXNativeTarget "EidolonsUITests" */;
+			buildConfigurationList = 274BFA6F2F1AEAD4008AFBDF /* Build configuration list for PBXNativeTarget "EidolonsUITests" */;
 			buildPhases = (
-				272E2C2F2EF34D7300E8F1B4 /* Sources */,
-				272E2C302EF34D7300E8F1B4 /* Frameworks */,
-				272E2C312EF34D7300E8F1B4 /* Resources */,
+				274BFA5B2F1AEAD4008AFBDF /* Sources */,
+				274BFA5C2F1AEAD4008AFBDF /* Frameworks */,
+				274BFA5D2F1AEAD4008AFBDF /* Resources */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				272E2C352EF34D7300E8F1B4 /* PBXTargetDependency */,
+				274BFA612F1AEAD4008AFBDF /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
-				272E2C362EF34D7300E8F1B4 /* EidolonsUITests */,
+				274BFA622F1AEAD4008AFBDF /* EidolonsUITests */,
 			);
 			name = EidolonsUITests;
 			packageProductDependencies = (
 			);
 			productName = EidolonsUITests;
-			productReference = 272E2C332EF34D7300E8F1B4 /* EidolonsUITests.xctest */;
+			productReference = 274BFA5F2F1AEAD4008AFBDF /* EidolonsUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		272E2C142EF34D7200E8F1B4 /* Project object */ = {
+		274BFA402F1AEAD4008AFBDF /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 2620;
 				LastUpgradeCheck = 2620;
 				TargetAttributes = {
-					272E2C1B2EF34D7200E8F1B4 = {
+					274BFA472F1AEAD4008AFBDF = {
 						CreatedOnToolsVersion = 26.2;
 					};
-					272E2C282EF34D7300E8F1B4 = {
+					274BFA542F1AEAD4008AFBDF = {
 						CreatedOnToolsVersion = 26.2;
-						TestTargetID = 272E2C1B2EF34D7200E8F1B4;
+						TestTargetID = 274BFA472F1AEAD4008AFBDF;
 					};
-					272E2C322EF34D7300E8F1B4 = {
+					274BFA5E2F1AEAD4008AFBDF = {
 						CreatedOnToolsVersion = 26.2;
-						TestTargetID = 272E2C1B2EF34D7200E8F1B4;
+						TestTargetID = 274BFA472F1AEAD4008AFBDF;
 					};
 				};
 			};
-			buildConfigurationList = 272E2C172EF34D7200E8F1B4 /* Build configuration list for PBXProject "Eidolons" */;
+			buildConfigurationList = 274BFA432F1AEAD4008AFBDF /* Build configuration list for PBXProject "Eidolons" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
 				en,
 				Base,
 			);
-			mainGroup = 272E2C132EF34D7200E8F1B4;
+			mainGroup = 274BFA3F2F1AEAD4008AFBDF;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				277225552F07113B000DF090 /* XCLocalSwiftPackageReference "../../../eidolons" */,
+				27D54D652F1AF6EF00B53566 /* XCLocalSwiftPackageReference "../../macos" */,
 			);
 			preferredProjectObjectVersion = 77;
-			productRefGroup = 272E2C1D2EF34D7200E8F1B4 /* Products */;
+			productRefGroup = 274BFA492F1AEAD4008AFBDF /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				272E2C1B2EF34D7200E8F1B4 /* Eidolons */,
-				272E2C282EF34D7300E8F1B4 /* EidolonsTests */,
-				272E2C322EF34D7300E8F1B4 /* EidolonsUITests */,
+				274BFA472F1AEAD4008AFBDF /* Eidolons */,
+				274BFA542F1AEAD4008AFBDF /* EidolonsTests */,
+				274BFA5E2F1AEAD4008AFBDF /* EidolonsUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		272E2C1A2EF34D7200E8F1B4 /* Resources */ = {
+		274BFA462F1AEAD4008AFBDF /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		272E2C272EF34D7300E8F1B4 /* Resources */ = {
+		274BFA532F1AEAD4008AFBDF /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		272E2C312EF34D7300E8F1B4 /* Resources */ = {
+		274BFA5D2F1AEAD4008AFBDF /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -241,21 +243,22 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		272E2C182EF34D7200E8F1B4 /* Sources */ = {
+		274BFA442F1AEAD4008AFBDF /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				27D54D642F1AF6C700B53566 /* main.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		274BFA512F1AEAD4008AFBDF /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		272E2C252EF34D7300E8F1B4 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		272E2C2F2EF34D7300E8F1B4 /* Sources */ = {
+		274BFA5B2F1AEAD4008AFBDF /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -265,20 +268,20 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
-		272E2C2B2EF34D7300E8F1B4 /* PBXTargetDependency */ = {
+		274BFA572F1AEAD4008AFBDF /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = 272E2C1B2EF34D7200E8F1B4 /* Eidolons */;
-			targetProxy = 272E2C2A2EF34D7300E8F1B4 /* PBXContainerItemProxy */;
+			target = 274BFA472F1AEAD4008AFBDF /* Eidolons */;
+			targetProxy = 274BFA562F1AEAD4008AFBDF /* PBXContainerItemProxy */;
 		};
-		272E2C352EF34D7300E8F1B4 /* PBXTargetDependency */ = {
+		274BFA612F1AEAD4008AFBDF /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = 272E2C1B2EF34D7200E8F1B4 /* Eidolons */;
-			targetProxy = 272E2C342EF34D7300E8F1B4 /* PBXContainerItemProxy */;
+			target = 274BFA472F1AEAD4008AFBDF /* Eidolons */;
+			targetProxy = 274BFA602F1AEAD4008AFBDF /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		272E2C3B2EF34D7300E8F1B4 /* Debug */ = {
+		274BFA672F1AEAD4008AFBDF /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -332,15 +335,17 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
 			name = Debug;
 		};
-		272E2C3C2EF34D7300E8F1B4 /* Release */ = {
+		274BFA682F1AEAD4008AFBDF /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -388,101 +393,79 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
 				SWIFT_COMPILATION_MODE = wholemodule;
 			};
 			name = Release;
 		};
-		272E2C3E2EF34D7300E8F1B4 /* Debug */ = {
+		274BFA6A2F1AEAD4008AFBDF /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 7N2X49G865;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
-				GENERATE_INFOPLIST_FILE = YES;
-				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
-				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
-				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
-				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
-				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
-				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
-				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
-				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
-				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MACOSX_DEPLOYMENT_TARGET = 26.1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ../Support/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = tech.m6i.eidolons;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
-				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
-				XROS_DEPLOYMENT_TARGET = 26.2;
 			};
 			name = Debug;
 		};
-		272E2C3F2EF34D7300E8F1B4 /* Release */ = {
+		274BFA6B2F1AEAD4008AFBDF /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 7N2X49G865;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
-				GENERATE_INFOPLIST_FILE = YES;
-				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
-				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
-				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
-				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
-				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
-				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
-				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
-				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
-				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MACOSX_DEPLOYMENT_TARGET = 26.1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ../Support/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = tech.m6i.eidolons;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
-				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
-				XROS_DEPLOYMENT_TARGET = 26.2;
 			};
 			name = Release;
 		};
-		272E2C412EF34D7300E8F1B4 /* Debug */ = {
+		274BFA6D2F1AEAD4008AFBDF /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
@@ -490,25 +473,20 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 7N2X49G865;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MACOSX_DEPLOYMENT_TARGET = 26.1;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = tech.m6i.EidolonsTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Eidolons.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Eidolons";
-				XROS_DEPLOYMENT_TARGET = 26.2;
 			};
 			name = Debug;
 		};
-		272E2C422EF34D7300E8F1B4 /* Release */ = {
+		274BFA6E2F1AEAD4008AFBDF /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
@@ -516,109 +494,92 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 7N2X49G865;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MACOSX_DEPLOYMENT_TARGET = 26.1;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = tech.m6i.EidolonsTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Eidolons.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Eidolons";
-				XROS_DEPLOYMENT_TARGET = 26.2;
 			};
 			name = Release;
 		};
-		272E2C442EF34D7300E8F1B4 /* Debug */ = {
+		274BFA702F1AEAD4008AFBDF /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 7N2X49G865;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MACOSX_DEPLOYMENT_TARGET = 26.1;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = tech.m6i.EidolonsUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
 				TEST_TARGET_NAME = Eidolons;
-				XROS_DEPLOYMENT_TARGET = 26.2;
 			};
 			name = Debug;
 		};
-		272E2C452EF34D7300E8F1B4 /* Release */ = {
+		274BFA712F1AEAD4008AFBDF /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 7N2X49G865;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
-				MACOSX_DEPLOYMENT_TARGET = 26.1;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = tech.m6i.EidolonsUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
 				TEST_TARGET_NAME = Eidolons;
-				XROS_DEPLOYMENT_TARGET = 26.2;
 			};
 			name = Release;
 		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		272E2C172EF34D7200E8F1B4 /* Build configuration list for PBXProject "Eidolons" */ = {
+		274BFA432F1AEAD4008AFBDF /* Build configuration list for PBXProject "Eidolons" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				272E2C3B2EF34D7300E8F1B4 /* Debug */,
-				272E2C3C2EF34D7300E8F1B4 /* Release */,
+				274BFA672F1AEAD4008AFBDF /* Debug */,
+				274BFA682F1AEAD4008AFBDF /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		272E2C3D2EF34D7300E8F1B4 /* Build configuration list for PBXNativeTarget "Eidolons" */ = {
+		274BFA692F1AEAD4008AFBDF /* Build configuration list for PBXNativeTarget "Eidolons" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				272E2C3E2EF34D7300E8F1B4 /* Debug */,
-				272E2C3F2EF34D7300E8F1B4 /* Release */,
+				274BFA6A2F1AEAD4008AFBDF /* Debug */,
+				274BFA6B2F1AEAD4008AFBDF /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		272E2C402EF34D7300E8F1B4 /* Build configuration list for PBXNativeTarget "EidolonsTests" */ = {
+		274BFA6C2F1AEAD4008AFBDF /* Build configuration list for PBXNativeTarget "EidolonsTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				272E2C412EF34D7300E8F1B4 /* Debug */,
-				272E2C422EF34D7300E8F1B4 /* Release */,
+				274BFA6D2F1AEAD4008AFBDF /* Debug */,
+				274BFA6E2F1AEAD4008AFBDF /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		272E2C432EF34D7300E8F1B4 /* Build configuration list for PBXNativeTarget "EidolonsUITests" */ = {
+		274BFA6F2F1AEAD4008AFBDF /* Build configuration list for PBXNativeTarget "EidolonsUITests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				272E2C442EF34D7300E8F1B4 /* Debug */,
-				272E2C452EF34D7300E8F1B4 /* Release */,
+				274BFA702F1AEAD4008AFBDF /* Debug */,
+				274BFA712F1AEAD4008AFBDF /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
@@ -626,18 +587,19 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		277225552F07113B000DF090 /* XCLocalSwiftPackageReference "../../../eidolons" */ = {
+		27D54D652F1AF6EF00B53566 /* XCLocalSwiftPackageReference "../../macos" */ = {
 			isa = XCLocalSwiftPackageReference;
-			relativePath = ../../../eidolons;
+			relativePath = ../../macos;
 		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		277225562F07113B000DF090 /* EidolonsCore */ = {
+		27E92C012F1AFDBD00071830 /* EidolonsApp */ = {
 			isa = XCSwiftPackageProductDependency;
-			productName = EidolonsCore;
+			package = 27D54D652F1AF6EF00B53566 /* XCLocalSwiftPackageReference "../../macos" */;
+			productName = EidolonsApp;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
-	rootObject = 272E2C142EF34D7200E8F1B4 /* Project object */;
+	rootObject = 274BFA402F1AEAD4008AFBDF /* Project object */;
 }

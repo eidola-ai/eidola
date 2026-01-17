@@ -3,6 +3,10 @@
 
 import PackageDescription
 
+let swiftSettings: [SwiftSetting] = [
+  .enableUpcomingFeature("MemberImportVisibility")
+]
+
 let binaryTarget: Target
 let useLocalFramework = true
 
@@ -47,7 +51,8 @@ let package = Package(
       name: "eidolonsFFI",
       dependencies: [.target(name: "EidolonsCoreRS")],
       path: "swift/Sources/EidolonsCoreFFI",
-      publicHeadersPath: "."
+      publicHeadersPath: ".",
+      swiftSettings: swiftSettings
     ),
 
     // Swift bindings that use the FFI types
@@ -57,7 +62,8 @@ let package = Package(
         .target(name: "eidolonsFFI"),
         .target(name: "EidolonsCoreRS"),
       ],
-      path: "swift/Sources/EidolonsCore"
+      path: "swift/Sources/EidolonsCore",
+      swiftSettings: swiftSettings
     ),
 
     // Tests for the Swift bindings
@@ -67,7 +73,8 @@ let package = Package(
         "EidolonsCore",
         .product(name: "Testing", package: "swift-testing"),
       ],
-      path: "swift/Tests/EidolonsCoreTests"
+      path: "swift/Tests/EidolonsCoreTests",
+      swiftSettings: swiftSettings
     ),
   ]
 )
