@@ -6,18 +6,26 @@ Guidance for AI coding agents working in this repository.
 
 ```
 eidolons/
-├── server/           # OpenAI-compatible AI proxy server
+├── eidolons-server/  # OpenAI-compatible AI proxy server
 │   └── src/
 │       ├── main.rs       # HTTP server (hyper + tokio)
 │       ├── openai.rs     # OpenAI API types
 │       ├── anthropic.rs  # Anthropic API types
 │       ├── transform.rs  # Format conversion
 │       └── proxy.rs      # Upstream HTTP client
-├── core/             # Rust library with Swift bindings
+├── eidolons/         # Rust library with Swift bindings
 │   ├── src/lib.rs        # Exports via #[uniffi::export]
 │   ├── swift/            # Generated Swift bindings (committed)
+│   └── Package.swift     # Swift Package Manager config
+├── apps/macos/       # macOS app (SwiftPM + Xcode wrapper)
+│   ├── Sources/
+│   │   ├── Eidolons/         # EidolonsApp library (SwiftUI views)
+│   │   └── EidolonsEntrypoint/  # App entrypoint
+│   ├── Xcode/            # Xcode project wrapper
+│   ├── Support/          # Shared build files (Info.plist, scripts)
+│   └── Package.swift     # Swift Package Manager config
+├── tools/            # Build tooling
 │   └── uniffi-bindgen-swift/  # Custom binding generator
-├── apps/apple/       # Xcode project for iOS/macOS
 └── flake.nix         # Nix build definitions
 ```
 
@@ -59,7 +67,7 @@ nix build '.#server-oci--aarch64-unknown-linux-musl'  # Linux ARM64 container
 # Checks
 nix flake check   # All checks (fmt, clippy, tests, binding sync)
 
-# Swift bindings (after changing core/ API)
+# Swift bindings (after changing eidolons/ API)
 nix run '.#update-core-swift-bindings'
 ```
 
@@ -78,8 +86,11 @@ Targets defined in `rust-toolchain.toml`:
 | `flake.nix` | Nix build definitions, cross-compile targets, CI checks |
 | `rust-toolchain.toml` | Pinned Rust version (1.92.0) and targets |
 | `Cargo.toml` | Workspace config, release profile (LTO, single codegen unit) |
-| `server/Cargo.toml` | Server dependencies |
-| `core/Package.swift` | Swift Package Manager config |
+| `eidolons-server/Cargo.toml` | Server dependencies |
+| `eidolons/Package.swift` | Core library Swift Package config |
+| `apps/macos/Package.swift` | macOS app Swift Package config |
+| `apps/macos/Support/Info.plist` | Shared app Info.plist |
+| `apps/macos/Support/package-app.sh` | CLI build script for .app bundle |
 
 ## Conventions
 
