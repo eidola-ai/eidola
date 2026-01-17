@@ -733,6 +733,29 @@
                 touch $out
               '';
 
+          # Verify Swift formatting for all Swift files in the repo
+          swift-formatting =
+            pkgs.runCommand "check-swift-formatting"
+              {
+                nativeBuildInputs = [ pkgs.swift-format pkgs.findutils ];
+              }
+              ''
+                echo "Checking Swift formatting..."
+
+                # Find all Swift files, excluding:
+                # - eidolons/swift/Sources/EidolonsCore (auto-generated bindings)
+                # - Any .build directories (SwiftPM build artifacts)
+                # Note: .git is already excluded by crane's source filtering
+                find ${repoSrc} \
+                  -path '*/eidolons/swift/Sources/EidolonsCore' -prune -o \
+                  -path '*/.build' -prune -o \
+                  -name '*.swift' -print0 \
+                  | xargs -0 -r swift-format lint --strict
+
+                echo "✓ Swift files are properly formatted"
+                touch $out
+              '';
+
           # Ensure the primary artifacts are built
           builds-server-oci = self.packages.${system}.server-oci;
           builds-eidolons-swift-xcframework = self.packages.${system}.eidolons-swift-xcframework;
@@ -852,6 +875,43 @@
                 '';
               }
             }/bin/update-eidolons-swift-xcframework";
+          };
+
+          format-swift = {
+            type = "app";
+            meta.description = "Format all Swift files in the repo (excludes auto-generated bindings)";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "format-swift";
+                runtimeInputs = [
+                  pkgs.swift-format
+                  pkgs.git
+                ];
+
+                text = ''
+                  set -euo pipefail
+
+                  # Sanity check: must run from repo root (or adjust logic)
+                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                    echo "error: not in a git repository" >&2
+                    exit 1
+                  fi
+
+                  repo_root="$(git rev-parse --show-toplevel)"
+                  cd "$repo_root"
+
+                  echo "Formatting Swift files (excluding auto-generated bindings)..."
+
+                  # Use git ls-files to respect .gitignore, exclude auto-generated bindings
+                  git ls-files '*.swift' \
+                    | grep -v '^eidolons/swift/Sources/EidolonsCore/' \
+                    | xargs -r swift-format format --in-place
+
+                  echo "Done. Review changes and commit:"
+                  echo "  git status"
+                '';
+              }
+            }/bin/format-swift";
           };
         };
       }
