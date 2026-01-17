@@ -231,7 +231,6 @@
           let
             isNative = rustTarget == nativeRustTarget;
             isLinuxMusl = builtins.match ".*-linux-musl" rustTarget != null;
-            isIOS = builtins.match ".*-apple-ios.*" rustTarget != null;
 
             # Use pkgsCross if specified, otherwise native pkgs
             targetPkgs = if nixCrossSystem == null then pkgs else pkgs.pkgsCross.${nixCrossSystem};
@@ -246,7 +245,6 @@
 
             # Cross-compilation needs CARGO_BUILD_TARGET set.
             # For Linux musl targets without pkgsCross, use rust-lld (bundled with Rust).
-            # For iOS targets, use system clang and Xcode SDK (requires sandbox=false).
             targetArgs =
               if isNative then
                 { }
@@ -254,15 +252,6 @@
                 {
                   CARGO_BUILD_TARGET = rustTarget;
                   ${linkerEnvVar} = "rust-lld";
-                }
-              else if isIOS then
-                {
-                  CARGO_BUILD_TARGET = rustTarget;
-                  ${linkerEnvVar} = "/usr/bin/clang";
-                  preBuild = ''
-                    export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
-                  '';
-                  doCheck = false; # iOS binaries can't run on macOS
                 }
               else
                 { CARGO_BUILD_TARGET = rustTarget; };

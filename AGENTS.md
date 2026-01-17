@@ -74,7 +74,7 @@ nix run '.#update-core-swift-bindings'
 ## Cross-Compilation
 
 Targets defined in `rust-toolchain.toml`:
-- Apple: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-apple-ios`, `aarch64-apple-ios-sim`
+- macOS: `aarch64-apple-darwin`, `x86_64-apple-darwin`
 - Linux: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
 
 **OCI images:** Use `server-oci--<linux-target>` for Docker. The native `server-oci` builds for macOS and won't run in Docker.

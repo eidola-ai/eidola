@@ -46,7 +46,7 @@ This project uses Nix for reproducible builds. [Install Nix](https://nixos.org/d
 # Build targets
 nix build '.#server'                 # Server binary (native)
 nix build '.#server-oci'             # Server OCI image (native, for macOS won't run in Docker)
-nix build '.#core-swift-xcframework' # XCFramework for iOS/macOS apps
+nix build '.#eidolons-swift-xcframework' # XCFramework for macOS apps
 
 # Cross-compile Linux binaries
 nix build '.#server--aarch64-unknown-linux-musl' # Linux ARM64 binary
