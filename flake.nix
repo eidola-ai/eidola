@@ -610,10 +610,10 @@
 
         # Checks (run with `nix flake check`)
         checks = {
-          # Verify code formatting
-          formatting = craneLib.cargoFmt {
+          # Verify Rust code formatting
+          rust-formatting = craneLib.cargoFmt {
             src = fullSrc;
-            pname = "fmt";
+            pname = "rust-fmt";
           };
 
           # Verify no Clippy warnings
@@ -875,6 +875,39 @@
                 '';
               }
             }/bin/update-eidolons-swift-xcframework";
+          };
+
+          format-rust = {
+            type = "app";
+            meta.description = "Format all Rust files in the repo";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "format-rust";
+                runtimeInputs = [
+                  rustToolchain
+                  pkgs.git
+                ];
+
+                text = ''
+                  set -euo pipefail
+
+                  # Sanity check: must run from repo root (or adjust logic)
+                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                    echo "error: not in a git repository" >&2
+                    exit 1
+                  fi
+
+                  repo_root="$(git rev-parse --show-toplevel)"
+                  cd "$repo_root"
+
+                  echo "Formatting Rust files..."
+                  cargo fmt
+
+                  echo "Done. Review changes and commit:"
+                  echo "  git status"
+                '';
+              }
+            }/bin/format-rust";
           };
 
           format-swift = {
