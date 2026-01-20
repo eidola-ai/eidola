@@ -13,7 +13,7 @@ the constraints of Apple's toolchain:
 ├─────────────────────────────────────────────────────────────────────┤
 │  Rust core library (eidolons)                                       │
 │  Swift bindings generation (uniffi-bindgen-swift)                   │
-│  XCFramework creation (static libraries for all Apple platforms)    │
+│  XCFramework creation (static libraries for macOS)                  │
 │  Server binaries (Linux musl, macOS)                                │
 │  OCI container images                                               │
 └─────────────────────────────────────────────────────────────────────┘
@@ -22,7 +22,7 @@ the constraints of Apple's toolchain:
 ┌─────────────────────────────────────────────────────────────────────┐
 │              Deterministic (Same Xcode + macOS version)             │
 ├─────────────────────────────────────────────────────────────────────┤
-│  Unsigned macOS/iOS app (.app bundle)                               │
+│  Unsigned macOS app (.app bundle)                                   │
 │  Build uses ZERO_AR_DATE, SOURCE_DATE_EPOCH, path remapping         │
 └─────────────────────────────────────────────────────────────────────┘
                                    │
@@ -65,15 +65,13 @@ CI verifies committed bindings match generated ones via `nix flake check`.
 
 ### 3. XCFramework (Fully Reproducible)
 
-The universal XCFramework containing static libraries for all Apple platforms:
+The universal XCFramework containing the static library for macOS:
 
 ```bash
-nix build '.#core-swift-xcframework'
+nix build '.#eidolons-swift-xcframework'
 
-# Check hashes of all platform libraries
+# Check hash of the library
 sha256sum result/libeidolons-rs.xcframework/macos-arm64_x86_64/libeidolons.a
-sha256sum result/libeidolons-rs.xcframework/ios-arm64/libeidolons.a
-sha256sum result/libeidolons-rs.xcframework/ios-arm64_x86_64-simulator/libeidolons.a
 
 # Check hash of the framework metadata
 sha256sum result/libeidolons-rs.xcframework/Info.plist
@@ -81,11 +79,9 @@ sha256sum result/libeidolons-rs.xcframework/Info.plist
 
 The XCFramework contains:
 - `macos-arm64_x86_64/libeidolons.a` - Universal macOS (arm64 + x86_64)
-- `ios-arm64/libeidolons.a` - iOS device (arm64)
-- `ios-arm64_x86_64-simulator/libeidolons.a` - iOS simulator (arm64 + x86_64)
 - `Info.plist` - Framework metadata
 
-All libraries are built hermetically within Nix - no iOS SDK required for static library compilation.
+All libraries are built hermetically within Nix.
 
 ### 4. Unsigned macOS App (Planned)
 
@@ -167,8 +163,8 @@ Even with deterministic settings, these may vary across environments:
 
 ### Not Currently Implemented
 
-- Unsigned macOS/iOS app builds
-- visionOS builds
+- Unsigned macOS app builds
+- iOS/visionOS builds
 - App Store builds (require signing)
 
 ## Future: Bit-Identical Builds with Tart

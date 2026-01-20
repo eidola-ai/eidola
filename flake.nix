@@ -231,7 +231,6 @@
           let
             isNative = rustTarget == nativeRustTarget;
             isLinuxMusl = builtins.match ".*-linux-musl" rustTarget != null;
-            isIOS = builtins.match ".*-apple-ios.*" rustTarget != null;
 
             # Use pkgsCross if specified, otherwise native pkgs
             targetPkgs = if nixCrossSystem == null then pkgs else pkgs.pkgsCross.${nixCrossSystem};
@@ -246,7 +245,6 @@
 
             # Cross-compilation needs CARGO_BUILD_TARGET set.
             # For Linux musl targets without pkgsCross, use rust-lld (bundled with Rust).
-            # For iOS targets, use system clang and Xcode SDK (requires sandbox=false).
             targetArgs =
               if isNative then
                 { }
@@ -254,15 +252,6 @@
                 {
                   CARGO_BUILD_TARGET = rustTarget;
                   ${linkerEnvVar} = "rust-lld";
-                }
-              else if isIOS then
-                {
-                  CARGO_BUILD_TARGET = rustTarget;
-                  ${linkerEnvVar} = "/usr/bin/clang";
-                  preBuild = ''
-                    export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
-                  '';
-                  doCheck = false; # iOS binaries can't run on macOS
                 }
               else
                 { CARGO_BUILD_TARGET = rustTarget; };
@@ -483,8 +472,6 @@
           '';
         };
 
-        # Build XCFramework containing static libraries for all Apple platforms
-        # Note: iOS targets require system Xcode SDK (sandbox=false in nix.conf).
         eidolonsSwiftXCFramework = pkgs.stdenv.mkDerivation {
           name = "eidolons-xcframework";
 
@@ -496,7 +483,6 @@
 
           dontUnpack = true;
 
-          # Reference all the Apple target builds
           macosArm64 = mkPackage {
             pname = "eidolons";
             rustTarget = "aarch64-apple-darwin";
@@ -509,60 +495,56 @@
             nixCrossSystem = null;
             crateType = "staticlib";
           };
-          iosArm64 = mkPackage {
-            pname = "eidolons";
-            rustTarget = "aarch64-apple-ios";
-            nixCrossSystem = null;
-            crateType = "staticlib";
-          };
-          iosSimArm64 = mkPackage {
-            pname = "eidolons";
-            rustTarget = "aarch64-apple-ios-sim";
-            nixCrossSystem = null;
-            crateType = "staticlib";
-          };
-          iosSimX86_64 = mkPackage {
-            pname = "eidolons";
-            rustTarget = "x86_64-apple-ios";
-            nixCrossSystem = null;
-            crateType = "staticlib";
-          };
 
           buildPhase = ''
-            export PATH="$PATH:/usr/bin"
+            # Create XCFramework directory structure
+            XCFW="$out/libeidolons-rs.xcframework"
+            MACOS_DIR="$XCFW/macos-arm64_x86_64"
+            mkdir -p "$MACOS_DIR"
 
-            # Create universal binaries for multi-arch slices
-            WORKDIR=$(mktemp -d)
-
-            # macOS: combine arm64 + x86_64
+            # Create universal binary combining arm64 + x86_64
             lipo -create \
               "$macosArm64/lib/libeidolons.a" \
               "$macosX86_64/lib/libeidolons.a" \
-              -output "$WORKDIR/libeidolons-macos.a"
+              -output "$MACOS_DIR/libeidolons.a"
 
-            # iOS simulator: combine arm64 + x86_64
-            lipo -create \
-              "$iosSimArm64/lib/libeidolons.a" \
-              "$iosSimX86_64/lib/libeidolons.a" \
-              -output "$WORKDIR/libeidolons-ios-sim.a"
-
-            # Use xcodebuild to create the XCFramework
-            xcodebuild -create-xcframework \
-              -library "$WORKDIR/libeidolons-macos.a" \
-              -library "$iosArm64/lib/libeidolons.a" \
-              -library "$WORKDIR/libeidolons-ios-sim.a" \
-              -output "$out/libeidolons-rs.xcframework"
+            # Create Info.plist
+            cat > "$XCFW/Info.plist" << 'EOF'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>AvailableLibraries</key>
+              <array>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>macos-arm64_x86_64</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array>
+                    <string>arm64</string>
+                    <string>x86_64</string>
+                  </array>
+                  <key>SupportedPlatform</key>
+                  <string>macos</string>
+                </dict>
+              </array>
+              <key>CFBundlePackageType</key>
+              <string>XFWK</string>
+              <key>XCFrameworkFormatVersion</key>
+              <string>1.0</string>
+            </dict>
+            </plist>
+            EOF
           '';
 
           installPhase = ''
             echo "XCFramework contents:"
-            find "$out" -name "*.a" -exec ls -lh {} \;
+            find "$out" -type f -exec ls -lh {} \;
             echo ""
             echo "Architecture info:"
-            for lib in "$out"/libeidolons-rs.xcframework/*/libeidolons.a; do
-              echo "$lib:"
-              lipo -info "$lib"
-            done
+            lipo -info "$out/libeidolons-rs.xcframework/macos-arm64_x86_64/libeidolons.a"
           '';
         };
 
@@ -628,10 +610,10 @@
 
         # Checks (run with `nix flake check`)
         checks = {
-          # Verify code formatting
-          formatting = craneLib.cargoFmt {
+          # Verify Rust code formatting
+          rust-formatting = craneLib.cargoFmt {
             src = fullSrc;
-            pname = "fmt";
+            pname = "rust-fmt";
           };
 
           # Verify no Clippy warnings
@@ -751,9 +733,31 @@
                 touch $out
               '';
 
+          # Verify Swift formatting for all Swift files in the repo
+          swift-formatting =
+            pkgs.runCommand "check-swift-formatting"
+              {
+                nativeBuildInputs = [ pkgs.swift-format pkgs.findutils ];
+              }
+              ''
+                echo "Checking Swift formatting..."
+
+                # Find all Swift files, excluding:
+                # - eidolons/swift/Sources/EidolonsCore (auto-generated bindings)
+                # - Any .build directories (SwiftPM build artifacts)
+                # Note: .git is already excluded by crane's source filtering
+                find ${repoSrc} \
+                  -path '*/eidolons/swift/Sources/EidolonsCore' -prune -o \
+                  -path '*/.build' -prune -o \
+                  -name '*.swift' -print0 \
+                  | xargs -0 -r swift-format lint --strict
+
+                echo "✓ Swift files are properly formatted"
+                touch $out
+              '';
+
           # Ensure the primary artifacts are built
           builds-server-oci = self.packages.${system}.server-oci;
-          # Note: XCFramework requires sandbox=false for iOS builds (uses system Xcode SDK)
           builds-eidolons-swift-xcframework = self.packages.${system}.eidolons-swift-xcframework;
 
         };
@@ -871,6 +875,76 @@
                 '';
               }
             }/bin/update-eidolons-swift-xcframework";
+          };
+
+          format-rust = {
+            type = "app";
+            meta.description = "Format all Rust files in the repo";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "format-rust";
+                runtimeInputs = [
+                  rustToolchain
+                  pkgs.git
+                ];
+
+                text = ''
+                  set -euo pipefail
+
+                  # Sanity check: must run from repo root (or adjust logic)
+                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                    echo "error: not in a git repository" >&2
+                    exit 1
+                  fi
+
+                  repo_root="$(git rev-parse --show-toplevel)"
+                  cd "$repo_root"
+
+                  echo "Formatting Rust files..."
+                  cargo fmt
+
+                  echo "Done. Review changes and commit:"
+                  echo "  git status"
+                '';
+              }
+            }/bin/format-rust";
+          };
+
+          format-swift = {
+            type = "app";
+            meta.description = "Format all Swift files in the repo (excludes auto-generated bindings)";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "format-swift";
+                runtimeInputs = [
+                  pkgs.swift-format
+                  pkgs.git
+                ];
+
+                text = ''
+                  set -euo pipefail
+
+                  # Sanity check: must run from repo root (or adjust logic)
+                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                    echo "error: not in a git repository" >&2
+                    exit 1
+                  fi
+
+                  repo_root="$(git rev-parse --show-toplevel)"
+                  cd "$repo_root"
+
+                  echo "Formatting Swift files (excluding auto-generated bindings)..."
+
+                  # Use git ls-files to respect .gitignore, exclude auto-generated bindings
+                  git ls-files '*.swift' \
+                    | grep -v '^eidolons/swift/Sources/EidolonsCore/' \
+                    | xargs -r swift-format format --in-place
+
+                  echo "Done. Review changes and commit:"
+                  echo "  git status"
+                '';
+              }
+            }/bin/format-swift";
           };
         };
       }
