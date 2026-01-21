@@ -29,14 +29,18 @@ public final class Core {
   }
 
   private func processRequests(_ requestBytes: Data) {
-    var remaining = [UInt8](requestBytes)
-    while !remaining.isEmpty {
-      // Deserialize the next request
-      let deserializer = BincodeDeserializer(input: remaining)
-      guard let request = try? SharedTypes.Request.deserialize(deserializer: deserializer) else {
+    guard !requestBytes.isEmpty else { return }
+
+    let deserializer = BincodeDeserializer(input: [UInt8](requestBytes))
+
+    // The response is a bincode-serialized Vec<Request>, so read the length first
+    guard let count = try? deserializer.deserialize_len() else { return }
+
+    for _ in 0..<count {
+      guard let request = try? SharedTypes.Request.deserialize(deserializer: deserializer)
+      else {
         break
       }
-      remaining = Array(remaining.dropFirst(deserializer.get_buffer_offset()))
       handleEffect(request: request)
     }
   }
