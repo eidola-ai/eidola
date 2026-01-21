@@ -310,13 +310,14 @@
             relevantCrates = [ pname ] ++ deps;
             filteredSrc = mkFilteredSrc relevantCrates;
             packageCargoArtifacts = mkPackageDeps pname rustTarget nixCrossSystem;
+            cratePath = cratePaths.${pname};
             crateTypeSetup =
               if crateType == null then
                 { }
               else
                 {
                   preBuildHook = ''
-                    sed -i 's/crate-type = .*/crate-type = ["${crateType}"]/' eidolons/Cargo.toml
+                    sed -i 's/crate-type = .*/crate-type = ["${crateType}"]/' ${cratePath}/Cargo.toml
                   '';
                 };
           in
@@ -548,6 +549,193 @@
           '';
         };
 
+        # Build the shared-typegen tool (native only)
+        sharedTypegen = mkPackage {
+          pname = "shared-typegen";
+          rustTarget = nativeRustTarget;
+          nixCrossSystem = null;
+        };
+
+        # Generate Swift types from the shared core using Crux typegen
+        eidolonsSharedSwiftTypes = pkgs.stdenv.mkDerivation {
+          name = "eidolons-shared-swift-types";
+
+          nativeBuildInputs = [ sharedTypegen ];
+
+          SOURCE_DATE_EPOCH = "0";
+
+          dontUnpack = true;
+
+          buildPhase = ''
+            # Use NIX_BUILD_TOP as temp directory
+            TEMP_OUT="$NIX_BUILD_TOP/typegen-output"
+            mkdir -p "$TEMP_OUT"
+
+            # Run typegen - ignore errors about Package.swift, we'll create our own
+            export RUST_BACKTRACE=1
+            shared-typegen "$TEMP_OUT" 2>&1 || true
+
+            # Check if the Swift types were generated
+            if [ ! -f "$TEMP_OUT/SharedTypes/Sources/SharedTypes/SharedTypes.swift" ]; then
+              echo "Failed to generate Swift types"
+              find "$TEMP_OUT" -type f 2>/dev/null || true
+              exit 1
+            fi
+
+            # The typegen might fail trying to write Package.swift but we don't need it
+            # since we embed the types directly in our package
+            # Remove the generated Package.swift if it exists (we use our own)
+            rm -f "$TEMP_OUT/SharedTypes/Package.swift"
+
+            # Move to $out
+            mkdir -p $out
+            cp -r "$TEMP_OUT"/* $out/
+          '';
+
+          installPhase = ''
+            echo "Generated Swift types:"
+            find $out -type f -name "*.swift" | head -20
+          '';
+        };
+
+        # Generate Swift bindings from the shared core library (UniFFI)
+        eidolonsSharedSwiftBindings = pkgs.stdenv.mkDerivation {
+          name = "eidolons-shared-swift-bindings";
+
+          nativeBuildInputs = [
+            uniffiBindgenSwift
+            rustToolchain
+          ];
+
+          SOURCE_DATE_EPOCH = "0";
+
+          dontUnpack = true;
+
+          buildPhase = ''
+            # Create output directories
+            mkdir -p $out/Sources/EidolonsShared
+            mkdir -p $out/Sources/EidolonsSharedFFI
+
+            # uniffi-bindgen-swift needs access to Cargo.toml for metadata
+            cp -r ${mkFilteredSrc ([ "eidolons-shared" ] ++ packageDeps.eidolons-shared or [ ])}/* .
+            chmod -R +w .
+
+            # Find the dylib (native build, cdylib for uniffi-bindgen-swift)
+            DYLIB="${
+              mkPackage {
+                pname = "eidolons-shared";
+                rustTarget = nativeRustTarget;
+                nixCrossSystem = null;
+                crateType = "cdylib";
+              }
+            }/lib/libeidolons_shared.dylib"
+
+            # Generate Swift bindings to a temp directory
+            TEMP_OUT=$(mktemp -d)
+            uniffi-bindgen-swift \
+                --swift-sources --headers --modulemap \
+                --metadata-no-deps \
+                "$DYLIB" \
+                "$TEMP_OUT" \
+                --module-name eidolons_sharedFFI \
+                --modulemap-filename module.modulemap
+
+            # Move files to their proper locations
+            mv "$TEMP_OUT"/*.swift $out/Sources/EidolonsShared/
+            mv "$TEMP_OUT"/*.h $out/Sources/EidolonsSharedFFI/
+            mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolonsSharedFFI/
+
+            # Create stub C file for SPM
+            cat > $out/Sources/EidolonsSharedFFI/eidolons_sharedFFI.c << 'STUB'
+            // This file exists so Swift Package Manager has something to compile for the eidolons_sharedFFI module.
+            // The actual implementation is in the XCFramework (libeidolons_shared.a).
+            // This module just exposes the C header interface to Swift.
+            #include "eidolons_sharedFFI.h"
+            STUB
+          '';
+
+          installPhase = ''
+            echo "Generated Swift bindings:"
+            echo "EidolonsShared (Swift):"
+            ls -la $out/Sources/EidolonsShared/
+            echo "EidolonsSharedFFI (C headers):"
+            ls -la $out/Sources/EidolonsSharedFFI/
+          '';
+        };
+
+        # Build XCFramework for eidolons-shared
+        eidolonsSharedSwiftXCFramework = pkgs.stdenv.mkDerivation {
+          name = "eidolons-shared-xcframework";
+
+          nativeBuildInputs = [ pkgs.darwin.cctools ];
+
+          SOURCE_DATE_EPOCH = "0";
+          ZERO_AR_DATE = "1";
+
+          dontUnpack = true;
+
+          macosArm64 = mkPackage {
+            pname = "eidolons-shared";
+            rustTarget = "aarch64-apple-darwin";
+            nixCrossSystem = null;
+            crateType = "staticlib";
+          };
+          macosX86_64 = mkPackage {
+            pname = "eidolons-shared";
+            rustTarget = "x86_64-apple-darwin";
+            nixCrossSystem = null;
+            crateType = "staticlib";
+          };
+
+          buildPhase = ''
+            XCFW="$out/libeidolons_shared-rs.xcframework"
+            MACOS_DIR="$XCFW/macos-arm64_x86_64"
+            mkdir -p "$MACOS_DIR"
+
+            lipo -create \
+              "$macosArm64/lib/libeidolons_shared.a" \
+              "$macosX86_64/lib/libeidolons_shared.a" \
+              -output "$MACOS_DIR/libeidolons_shared.a"
+
+            cat > "$XCFW/Info.plist" << 'EOF'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>AvailableLibraries</key>
+              <array>
+                <dict>
+                  <key>LibraryIdentifier</key>
+                  <string>macos-arm64_x86_64</string>
+                  <key>LibraryPath</key>
+                  <string>libeidolons_shared.a</string>
+                  <key>SupportedArchitectures</key>
+                  <array>
+                    <string>arm64</string>
+                    <string>x86_64</string>
+                  </array>
+                  <key>SupportedPlatform</key>
+                  <string>macos</string>
+                </dict>
+              </array>
+              <key>CFBundlePackageType</key>
+              <string>XFWK</string>
+              <key>XCFrameworkFormatVersion</key>
+              <string>1.0</string>
+            </dict>
+            </plist>
+            EOF
+          '';
+
+          installPhase = ''
+            echo "XCFramework contents:"
+            find "$out" -type f -exec ls -lh {} \;
+            echo ""
+            echo "Architecture info:"
+            lipo -info "$out/libeidolons_shared-rs.xcframework/macos-arm64_x86_64/libeidolons_shared.a"
+          '';
+        };
+
       in
       {
         packages = {
@@ -588,6 +776,11 @@
           # Swift binding generation (native only)
           eidolons-swift-bindings = eidolonsSwiftBindings;
           eidolons-swift-xcframework = eidolonsSwiftXCFramework;
+
+          # Shared core Swift binding generation
+          eidolons-shared-swift-types = eidolonsSharedSwiftTypes;
+          eidolons-shared-swift-bindings = eidolonsSharedSwiftBindings;
+          eidolons-shared-swift-xcframework = eidolonsSharedSwiftXCFramework;
         };
 
         # Development shell with Rust toolchain and tools
@@ -744,10 +937,14 @@
 
                 # Find all Swift files, excluding:
                 # - eidolons/swift/Sources/EidolonsCore (auto-generated bindings)
+                # - apps/eidolons-shared/swift/Sources/EidolonsShared (auto-generated bindings)
+                # - apps/eidolons-shared/swift/generated (auto-generated Crux types)
                 # - Any .build directories (SwiftPM build artifacts)
                 # Note: .git is already excluded by crane's source filtering
                 find ${repoSrc} \
                   -path '*/eidolons/swift/Sources/EidolonsCore' -prune -o \
+                  -path '*/apps/eidolons-shared/swift/Sources/EidolonsShared' -prune -o \
+                  -path '*/apps/eidolons-shared/swift/generated' -prune -o \
                   -path '*/.build' -prune -o \
                   -name '*.swift' -print0 \
                   | xargs -0 -r swift-format lint --strict
@@ -877,6 +1074,93 @@
             }/bin/update-eidolons-swift-xcframework";
           };
 
+          update-eidolons-shared-swift-bindings = {
+            type = "app";
+            meta.description = "Update committed Swift bindings for shared core";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "update-eidolons-shared-swift-bindings";
+                runtimeInputs = [
+                  pkgs.coreutils
+                  pkgs.git
+                ];
+
+                text = ''
+                  set -euo pipefail
+
+                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                    echo "error: not in a git repository" >&2
+                    exit 1
+                  fi
+
+                  repo_root="$(git rev-parse --show-toplevel)"
+
+                  # Update UniFFI bindings
+                  dest="$repo_root/apps/eidolons-shared/swift/Sources"
+                  echo "Syncing Swift bindings from Nix store:"
+                  echo "  source: ${self.packages.${system}.eidolons-shared-swift-bindings}"
+                  echo "  dest:   $dest"
+
+                  mkdir -p "$dest"
+                  rm -rf "$dest"
+                  cp -R "${self.packages.${system}.eidolons-shared-swift-bindings}/Sources" "$dest"
+                  chmod -R +w "$dest"
+
+                  # Update Crux typegen types
+                  types_dest="$repo_root/apps/eidolons-shared/swift/generated"
+                  echo "Syncing Crux typegen Swift types:"
+                  echo "  source: ${self.packages.${system}.eidolons-shared-swift-types}"
+                  echo "  dest:   $types_dest"
+
+                  rm -rf "$types_dest"
+                  mkdir -p "$types_dest"
+                  cp -R "${self.packages.${system}.eidolons-shared-swift-types}/SharedTypes" "$types_dest/SharedTypes"
+                  chmod -R +w "$types_dest"
+
+                  echo "Done. Review changes and commit:"
+                  echo "  git status"
+                '';
+              }
+            }/bin/update-eidolons-shared-swift-bindings";
+          };
+
+          update-eidolons-shared-swift-xcframework = {
+            type = "app";
+            meta.description = "Update XCFramework for shared core";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "update-eidolons-shared-swift-xcframework";
+                runtimeInputs = [
+                  pkgs.coreutils
+                  pkgs.git
+                ];
+
+                text = ''
+                  set -euo pipefail
+
+                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+                    echo "error: not in a git repository" >&2
+                    exit 1
+                  fi
+
+                  repo_root="$(git rev-parse --show-toplevel)"
+                  dest="$repo_root/apps/eidolons-shared/target/apple/libeidolons_shared-rs.xcframework"
+
+                  echo "Copying shared core XCframework from Nix store:"
+                  echo "  source: ${self.packages.${system}.eidolons-shared-swift-xcframework}"
+                  echo "  dest:   $dest"
+
+                  mkdir -p "$dest"
+                  rm -rf "$dest"
+                  cp -R "${self.packages.${system}.eidolons-shared-swift-xcframework}/libeidolons_shared-rs.xcframework" "$dest"
+                  chmod -R +w "$dest"
+
+                  echo "Done."
+                '';
+              }
+            }/bin/update-eidolons-shared-swift-xcframework";
+          };
+
           format-rust = {
             type = "app";
             meta.description = "Format all Rust files in the repo";
@@ -938,6 +1222,8 @@
                   # Use git ls-files to respect .gitignore, exclude auto-generated bindings
                   git ls-files '*.swift' \
                     | grep -v '^eidolons/swift/Sources/EidolonsCore/' \
+                    | grep -v '^apps/eidolons-shared/swift/Sources/EidolonsShared/' \
+                    | grep -v '^apps/eidolons-shared/swift/generated/' \
                     | xargs -r swift-format format --in-place
 
                   echo "Done. Review changes and commit:"

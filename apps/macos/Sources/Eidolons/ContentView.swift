@@ -5,19 +5,23 @@
 //  Created by Mike Marcacci on 12/17/25.
 //
 
-import EidolonsCore
+import SharedTypes
 import SwiftUI
 
 struct ContentView: View {
-  let message: String = EidolonsCore.hello(name: "Apple")
+  @State private var core = Core()
+
   var body: some View {
     VStack {
       Image(systemName: "globe")
         .imageScale(.large)
         .foregroundStyle(.tint)
-      Text(message)
+      Text(core.viewModel.greeting.isEmpty ? "Loading..." : core.viewModel.greeting)
     }
     .padding()
+    .task {
+      core.update(event: .greet("Apple"))
+    }
   }
 }
 

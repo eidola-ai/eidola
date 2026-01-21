@@ -1,6 +1,21 @@
 # Mark generated Swift bindings as generated code
 # This collapses them in GitHub PR diffs and marks them in GitHub's UI
-core/swift/Sources/EidolonsCore/*.swift linguist-generated=true
-core/swift/Sources/EidolonsCoreFFI/*.h linguist-generated=true
-core/swift/Sources/EidolonsCoreFFI/*.modulemap linguist-generated=true
-server/openapi.json linguist-generated=true
+
+# Core library (eidolons/) Swift bindings
+eidolons/swift/Sources/EidolonsCore/*.swift linguist-generated=true
+eidolons/swift/Sources/EidolonsCoreFFI/*.h linguist-generated=true
+eidolons/swift/Sources/EidolonsCoreFFI/*.c linguist-generated=true
+eidolons/swift/Sources/EidolonsCoreFFI/*.modulemap linguist-generated=true
+
+# Shared core (eidolons-shared/) Swift bindings - UniFFI
+apps/eidolons-shared/swift/Sources/EidolonsShared/*.swift linguist-generated=true
+apps/eidolons-shared/swift/Sources/EidolonsSharedFFI/*.h linguist-generated=true
+apps/eidolons-shared/swift/Sources/EidolonsSharedFFI/*.c linguist-generated=true
+apps/eidolons-shared/swift/Sources/EidolonsSharedFFI/*.modulemap linguist-generated=true
+
+# Shared core (eidolons-shared/) Swift bindings - Crux TypeGen
+apps/eidolons-shared/swift/generated/SharedTypes/Sources/SharedTypes/*.swift linguist-generated=true
+apps/eidolons-shared/swift/generated/SharedTypes/Sources/Serde/*.swift linguist-generated=true
+
+# Server OpenAPI spec
+eidolons-server/openapi.json linguist-generated=true

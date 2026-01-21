@@ -4,6 +4,7 @@ members = [
     "eidolons",
     "eidolons-server",
     "tools/*",
+    "apps/eidolons-shared",
 ]
 resolver = "2"
 
