@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 
 @testable import EidolonsShared
@@ -10,7 +11,7 @@ import Testing
     let eventBytes = try! event.bincodeSerialize()
 
     // Process through the Crux core
-    let responseBytes = processEvent(data: eventBytes)
+    let responseBytes = processEvent(data: Data(eventBytes))
 
     // Should return serialized requests
     #expect(!responseBytes.isEmpty)
