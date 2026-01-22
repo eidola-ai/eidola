@@ -57,15 +57,20 @@ jobs:
 
       - name: Run Swift tests
         run: |
-          # Build the XCFramework via Nix and update the local paths
+          # Build the XCFrameworks via Nix and update the local paths
           nix run '.#update-eidolons-swift-xcframework'
+          nix run '.#update-eidolons-shared-swift-xcframework'
 
           # Run Swift tests for core library
           cd eidolons
           swift test
 
+          # Run Swift tests for shared core
+          cd ../apps/eidolons-shared
+          swift test
+
           # Run Swift tests for macOS app
-          cd ../apps/macos
+          cd ../macos
           swift test
 
       - name: Determine image tags
