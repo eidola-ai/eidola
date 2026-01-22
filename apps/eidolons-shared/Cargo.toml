@@ -15,6 +15,7 @@ typegen = ["crux_core/typegen"]
 
 [dependencies]
 crux_core = "0.16"
+eidolons-hello = { path = "../../crates/eidolons-hello" }
 serde = { version = "1.0", features = ["derive"] }
 uniffi = "0.30.0"
 

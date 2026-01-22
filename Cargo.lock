@@ -534,11 +534,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "eidolons"
+name = "eidolons-hello"
 version = "0.1.0"
-dependencies = [
- "uniffi",
-]
 
 [[package]]
 name = "eidolons-server"
@@ -566,6 +563,7 @@ name = "eidolons-shared"
 version = "0.1.0"
 dependencies = [
  "crux_core",
+ "eidolons-hello",
  "serde",
  "serde_json",
  "uniffi",
@@ -2607,13 +2605,6 @@ dependencies = [
  "uniffi_core",
  "uniffi_macros",
  "uniffi_pipeline",
-]
-
-[[package]]
-name = "uniffi-bindgen"
-version = "0.1.0"
-dependencies = [
- "uniffi",
 ]
 
 [[package]]

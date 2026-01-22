@@ -405,150 +405,6 @@
           nixCrossSystem = null;
         };
 
-        # Generate Swift bindings from the core library
-        eidolonsSwiftBindings = pkgs.stdenv.mkDerivation {
-          name = "eidolons-swift-bindings";
-
-          nativeBuildInputs = [
-            uniffiBindgenSwift
-            rustToolchain # Provides cargo for metadata extraction
-          ];
-
-          # Use same deterministic settings
-          SOURCE_DATE_EPOCH = "0";
-
-          dontUnpack = true;
-
-          buildPhase = ''
-                        # Create output directories
-                        mkdir -p $out/Sources/EidolonsCore
-                        mkdir -p $out/Sources/EidolonsCoreFFI
-
-                        # uniffi-bindgen-swift needs access to Cargo.toml for metadata
-                        cp -r ${mkFilteredSrc ([ "eidolons" ] ++ packageDeps.eidolons or [ ])}/* .
-                        chmod -R +w .
-
-                        # Find the dylib (native build, cdylib for uniffi-bindgen-swift)
-                        DYLIB="${
-                          mkPackage {
-                            pname = "eidolons";
-                            rustTarget = nativeRustTarget;
-                            nixCrossSystem = null;
-                            crateType = "cdylib";
-                          }
-                        }/lib/libeidolons.dylib"
-
-                        # Generate Swift bindings to a temp directory
-                        TEMP_OUT=$(mktemp -d)
-                        uniffi-bindgen-swift \
-                            --swift-sources --headers --modulemap \
-                            --metadata-no-deps \
-                            "$DYLIB" \
-                            "$TEMP_OUT" \
-                            --module-name eidolonsFFI \
-                            --modulemap-filename module.modulemap
-
-                        # Move files to their proper locations:
-                        # - Swift source goes to EidolonsCore
-                        # - Header and modulemap go to EidolonsCoreFFI
-                        mv "$TEMP_OUT"/*.swift $out/Sources/EidolonsCore/
-                        mv "$TEMP_OUT"/*.h $out/Sources/EidolonsCoreFFI/
-                        mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolonsCoreFFI/
-
-                        # Create stub C file for SPM (requires at least one compilable source per C target)
-                        cat > $out/Sources/EidolonsCoreFFI/eidolonsFFI.c << 'STUB'
-            // This file exists so Swift Package Manager has something to compile for the eidolonsFFI module.
-            // The actual implementation is in the XCFramework (libeidolons.a).
-            // This module just exposes the C header interface to Swift.
-            #include "eidolonsFFI.h"
-            STUB
-          '';
-
-          installPhase = ''
-            echo "Generated Swift bindings:"
-            echo "EidolonsCore (Swift):"
-            ls -la $out/Sources/EidolonsCore/
-            echo "EidolonsCoreFFI (C headers):"
-            ls -la $out/Sources/EidolonsCoreFFI/
-          '';
-        };
-
-        eidolonsSwiftXCFramework = pkgs.stdenv.mkDerivation {
-          name = "eidolons-xcframework";
-
-          nativeBuildInputs = [ pkgs.darwin.cctools ]; # Provides lipo
-
-          # Use same deterministic settings
-          SOURCE_DATE_EPOCH = "0";
-          ZERO_AR_DATE = "1";
-
-          dontUnpack = true;
-
-          macosArm64 = mkPackage {
-            pname = "eidolons";
-            rustTarget = "aarch64-apple-darwin";
-            nixCrossSystem = null;
-            crateType = "staticlib";
-          };
-          macosX86_64 = mkPackage {
-            pname = "eidolons";
-            rustTarget = "x86_64-apple-darwin";
-            nixCrossSystem = null;
-            crateType = "staticlib";
-          };
-
-          buildPhase = ''
-            # Create XCFramework directory structure
-            XCFW="$out/libeidolons-rs.xcframework"
-            MACOS_DIR="$XCFW/macos-arm64_x86_64"
-            mkdir -p "$MACOS_DIR"
-
-            # Create universal binary combining arm64 + x86_64
-            lipo -create \
-              "$macosArm64/lib/libeidolons.a" \
-              "$macosX86_64/lib/libeidolons.a" \
-              -output "$MACOS_DIR/libeidolons.a"
-
-            # Create Info.plist
-            cat > "$XCFW/Info.plist" << 'EOF'
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-              <key>AvailableLibraries</key>
-              <array>
-                <dict>
-                  <key>LibraryIdentifier</key>
-                  <string>macos-arm64_x86_64</string>
-                  <key>LibraryPath</key>
-                  <string>libeidolons.a</string>
-                  <key>SupportedArchitectures</key>
-                  <array>
-                    <string>arm64</string>
-                    <string>x86_64</string>
-                  </array>
-                  <key>SupportedPlatform</key>
-                  <string>macos</string>
-                </dict>
-              </array>
-              <key>CFBundlePackageType</key>
-              <string>XFWK</string>
-              <key>XCFrameworkFormatVersion</key>
-              <string>1.0</string>
-            </dict>
-            </plist>
-            EOF
-          '';
-
-          installPhase = ''
-            echo "XCFramework contents:"
-            find "$out" -type f -exec ls -lh {} \;
-            echo ""
-            echo "Architecture info:"
-            lipo -info "$out/libeidolons-rs.xcframework/macos-arm64_x86_64/libeidolons.a"
-          '';
-        };
-
         # Build the shared-typegen tool (native only)
         sharedTypegen = mkPackage {
           pname = "shared-typegen";
@@ -773,10 +629,6 @@
           server-oci--aarch64-unknown-linux-musl = mkServerOCI "aarch64-unknown-linux-musl" "aarch64-multiplatform-musl";
           server-oci--x86_64-unknown-linux-musl = mkServerOCI "x86_64-unknown-linux-musl" "musl64";
 
-          # Swift binding generation (native only)
-          eidolons-swift-bindings = eidolonsSwiftBindings;
-          eidolons-swift-xcframework = eidolonsSwiftXCFramework;
-
           # Shared core Swift binding generation
           eidolons-shared-swift-types = eidolonsSharedSwiftTypes;
           eidolons-shared-swift-bindings = eidolonsSharedSwiftBindings;
@@ -840,10 +692,10 @@
                 echo "Checking if committed OpenAPI spec matches generated one..."
 
                 GENERATED="${self.packages.${system}.server-openapi-spec}/openapi.json"
-                COMMITTED="${repoSrc}/eidolons-server/openapi.json"
+                COMMITTED="${repoSrc}/crates/eidolons-server/openapi.json"
 
                 if [ ! -f "$COMMITTED" ]; then
-                  echo "ERROR: No committed OpenAPI spec found at eidolons-server/openapi.json"
+                  echo "ERROR: No committed OpenAPI spec found at crates/eidolons-server/openapi.json"
                   echo "Run: nix run '.#update-server-openapi'"
                   echo "Then commit the generated file."
                   exit 1
@@ -865,67 +717,6 @@
                 touch $out
               '';
 
-          # Checks that committed bindings are up to date with the generated ones
-          bindings-current =
-            pkgs.runCommand "check-swift-bindings"
-              {
-                buildInputs = [ pkgs.diffutils ];
-              }
-              ''
-                echo "Checking if committed Swift bindings match generated ones..."
-
-                # Check Swift sources
-                GENERATED_SWIFT="${self.packages.${system}.eidolons-swift-bindings}/Sources/EidolonsCore"
-                COMMITTED_SWIFT="${repoSrc}/eidolons/swift/Sources/EidolonsCore"
-
-                if [ ! -d "$COMMITTED_SWIFT" ] || [ -z "$(ls -A "$COMMITTED_SWIFT" 2>/dev/null)" ]; then
-                  echo "ERROR: No committed Swift bindings found at eidolons/swift/Sources/EidolonsCore/"
-                  echo "Run: nix run .#update-eidolons-swift-bindings"
-                  echo "Then commit the generated files."
-                  exit 1
-                fi
-
-                # Check FFI headers
-                GENERATED_FFI="${self.packages.${system}.eidolons-swift-bindings}/Sources/EidolonsCoreFFI"
-                COMMITTED_FFI="${repoSrc}/eidolons/swift/Sources/EidolonsCoreFFI"
-
-                if [ ! -d "$COMMITTED_FFI" ] || [ -z "$(ls -A "$COMMITTED_FFI" 2>/dev/null)" ]; then
-                  echo "ERROR: No committed FFI headers found at eidolons/swift/Sources/EidolonsCoreFFI/"
-                  echo "Run: nix run '.#update-eidolons-swift-bindings'"
-                  echo "Then commit the generated files."
-                  exit 1
-                fi
-
-                # Compare generated vs committed (Swift)
-                if ! diff -r "$GENERATED_SWIFT" "$COMMITTED_SWIFT"; then
-                  echo ""
-                  echo "ERROR: Committed Swift bindings don't match generated ones!"
-                  echo ""
-                  echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-eidolons-swift-bindings'"
-                  echo "  2. Review the changes"
-                  echo "  3. Commit the updated bindings"
-                  echo ""
-                  exit 1
-                fi
-
-                # Compare generated vs committed (FFI headers)
-                if ! diff -r "$GENERATED_FFI" "$COMMITTED_FFI"; then
-                  echo ""
-                  echo "ERROR: Committed FFI headers don't match generated ones!"
-                  echo ""
-                  echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-eidolons-swift-bindings'"
-                  echo "  2. Review the changes"
-                  echo "  3. Commit the updated bindings"
-                  echo ""
-                  exit 1
-                fi
-
-                echo "✓ Swift bindings are up to date"
-                touch $out
-              '';
-
           # Verify Swift formatting for all Swift files in the repo
           swift-formatting =
             pkgs.runCommand "check-swift-formatting"
@@ -936,13 +727,11 @@
                 echo "Checking Swift formatting..."
 
                 # Find all Swift files, excluding:
-                # - eidolons/swift/Sources/EidolonsCore (auto-generated bindings)
                 # - apps/eidolons-shared/swift/Sources/EidolonsShared (auto-generated bindings)
                 # - apps/eidolons-shared/swift/generated (auto-generated Crux types)
                 # - Any .build directories (SwiftPM build artifacts)
                 # Note: .git is already excluded by crane's source filtering
                 find ${repoSrc} \
-                  -path '*/eidolons/swift/Sources/EidolonsCore' -prune -o \
                   -path '*/apps/eidolons-shared/swift/Sources/EidolonsShared' -prune -o \
                   -path '*/apps/eidolons-shared/swift/generated' -prune -o \
                   -path '*/.build' -prune -o \
@@ -955,7 +744,7 @@
 
           # Ensure the primary artifacts are built
           builds-server-oci = self.packages.${system}.server-oci;
-          builds-eidolons-swift-xcframework = self.packages.${system}.eidolons-swift-xcframework;
+          builds-eidolons-shared-swift-xcframework = self.packages.${system}.eidolons-shared-swift-xcframework;
 
         };
 
@@ -981,7 +770,7 @@
                   fi
 
                   repo_root="$(git rev-parse --show-toplevel)"
-                  dest="$repo_root/eidolons-server/openapi.json"
+                  dest="$repo_root/crates/eidolons-server/openapi.json"
 
                   echo "Copying OpenAPI spec from Nix store:"
                   echo "  source: ${self.packages.${system}.server-openapi-spec}/openapi.json"
@@ -995,83 +784,6 @@
                 '';
               }
             }/bin/update-server-openapi";
-          };
-
-          update-eidolons-swift-bindings = {
-            type = "app";
-            meta.description = "Update committed Swift bindings from generated sources";
-            program = "${
-              pkgs.writeShellApplication {
-                name = "update-eidolons-swift-bindings";
-                runtimeInputs = [
-                  pkgs.coreutils
-                  pkgs.git
-                ];
-
-                text = ''
-                  set -euo pipefail
-
-                  # Sanity check: must run from repo root (or adjust logic)
-                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
-                    echo "error: not in a git repository" >&2
-                    exit 1
-                  fi
-
-                  repo_root="$(git rev-parse --show-toplevel)"
-                  dest="$repo_root/eidolons/swift/Sources"
-
-                  echo "Syncing Swift bindings from Nix store:"
-                  echo "  source: ${self.packages.${system}.eidolons-swift-bindings}"
-                  echo "  dest:   $dest"
-
-                  mkdir -p "$dest"
-                  rm -rf "$dest"
-                  cp -R "${self.packages.${system}.eidolons-swift-bindings}/Sources" "$dest"
-                  chmod -R +w "$dest"
-
-                  echo "Done. Review changes and commit:"
-                  echo "  git status"
-                '';
-              }
-            }/bin/update-eidolons-swift-bindings";
-          };
-
-          update-eidolons-swift-xcframework = {
-            type = "app";
-            meta.description = "Update XCFramework with compiled static libraries";
-            program = "${
-              pkgs.writeShellApplication {
-                name = "update-eidolons-swift-xcframework";
-                runtimeInputs = [
-                  pkgs.coreutils
-                  pkgs.git
-                ];
-
-                text = ''
-                  set -euo pipefail
-
-                  # Sanity check: must run from repo root (or adjust logic)
-                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
-                    echo "error: not in a git repository" >&2
-                    exit 1
-                  fi
-
-                  repo_root="$(git rev-parse --show-toplevel)"
-                  dest="$repo_root/eidolons/target/apple/libeidolons-rs.xcframework"
-
-                  echo "Copying core Swift XCframework from Nix store:"
-                  echo "  source: ${self.packages.${system}.eidolons-swift-xcframework}"
-                  echo "  dest:   $dest"
-
-                  mkdir -p "$dest"
-                  rm -rf "$dest"
-                  cp -R "${self.packages.${system}.eidolons-swift-xcframework}/libeidolons-rs.xcframework" "$dest"
-                  chmod -R +w "$dest"
-
-                  echo "Done."
-                '';
-              }
-            }/bin/update-eidolons-swift-xcframework";
           };
 
           update-eidolons-shared-swift-bindings = {
@@ -1221,7 +933,6 @@
 
                   # Use git ls-files to respect .gitignore, exclude auto-generated bindings
                   git ls-files '*.swift' \
-                    | grep -v '^eidolons/swift/Sources/EidolonsCore/' \
                     | grep -v '^apps/eidolons-shared/swift/Sources/EidolonsShared/' \
                     | grep -v '^apps/eidolons-shared/swift/generated/' \
                     | xargs -r swift-format format --in-place

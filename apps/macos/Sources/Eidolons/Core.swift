@@ -5,7 +5,6 @@
 //  Shell bridge for Crux core - handles event/effect loop
 //
 
-import EidolonsCore
 import EidolonsShared
 import Foundation
 import Serde
@@ -52,10 +51,10 @@ public final class Core {
       let viewBytes = EidolonsShared.view()
       viewModel = try! SharedTypes.ViewModel.bincodeDeserialize(input: [UInt8](viewBytes))
 
-    case .eidolons(let eidolonsRequest):
-      // Eidolons capability: call the library and send response back
-      let greeting = EidolonsCore.hello(name: eidolonsRequest.name)
-      let response = SharedTypes.EidolonsResponse(greeting: greeting)
+    case .hello(let helloRequest):
+      // Hello capability: call the library and send response back
+      let greeting = EidolonsShared.hello(name: helloRequest.name)
+      let response = SharedTypes.HelloResponse(greeting: greeting)
       let responseBytes = try! response.bincodeSerialize()
       let moreRequestBytes = EidolonsShared.handleResponse(
         id: request.id, data: Data(responseBytes))

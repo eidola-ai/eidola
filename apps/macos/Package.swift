@@ -21,14 +21,12 @@ let package = Package(
   ],
   dependencies: [
     .package(url: "https://github.com/swiftlang/swift-testing.git", from: "6.2.3"),
-    .package(path: "../../eidolons"),
     .package(path: "../eidolons-shared"),
   ],
   targets: [
     .target(
       name: "EidolonsApp",
       dependencies: [
-        .product(name: "EidolonsCore", package: "eidolons"),
         .product(name: "EidolonsShared", package: "eidolons-shared"),
         .product(name: "SharedTypes", package: "eidolons-shared"),
         .product(name: "Serde", package: "eidolons-shared"),
