@@ -4,8 +4,9 @@ pub mod services;
 
 use std::sync::LazyLock;
 
-pub use app::{Effect, EidolonsApp, Event, Model, ViewModel};
+pub use app::{ChatMessage, Effect, EidolonsApp, Event, Model, Role, ViewModel};
 pub use capabilities::hello::{HelloRequest, HelloResponse};
+pub use capabilities::perception::{PerceptionRequest, PerceptionResponse};
 pub use crux_core::{Core, bridge::Bridge};
 pub use services::{PerceptionError, PerceptionService};
 

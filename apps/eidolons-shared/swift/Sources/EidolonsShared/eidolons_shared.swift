@@ -435,6 +435,30 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -488,6 +512,428 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
         let len = Int32(value.count)
         writeInt(&buf, len)
         writeBytes(&buf, value)
+    }
+}
+
+
+
+
+/**
+ * Service for text generation using ML models.
+ *
+ * This service wraps the perception crate's TextGenerationModel and exposes
+ * it via UniFFI for use in Swift/Kotlin shells.
+ *
+ * # Usage
+ *
+ * ```swift
+ * let service = PerceptionService()
+ * try await service.initialize()
+ * let response = try await service.chat(message: "Hello!")
+ * ```
+ */
+public protocol PerceptionServiceProtocol: AnyObject, Sendable {
+    
+    /**
+     * Generates a response for the given message.
+     *
+     * # Arguments
+     *
+     * * `message` - The input message/prompt
+     *
+     * # Returns
+     *
+     * The generated response string.
+     *
+     * # Errors
+     *
+     * Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
+     */
+    func chat(message: String) async throws  -> String
+    
+    /**
+     * Initializes the service by downloading and loading the model.
+     *
+     * This is an async operation that may take time depending on network
+     * speed and whether the model is already cached.
+     *
+     * # Errors
+     *
+     * Returns `PerceptionError::AlreadyInitialized` if called twice.
+     * Returns `PerceptionError::LoadFailed` if model download or loading fails.
+     */
+    func initialize() async throws 
+    
+    /**
+     * Returns whether the model is initialized and ready for inference.
+     */
+    func isReady() async  -> Bool
+    
+    /**
+     * Returns model configuration information if initialized.
+     *
+     * Returns a JSON string with model details, or an error if not initialized.
+     */
+    func modelInfo() async throws  -> String
+    
+}
+/**
+ * Service for text generation using ML models.
+ *
+ * This service wraps the perception crate's TextGenerationModel and exposes
+ * it via UniFFI for use in Swift/Kotlin shells.
+ *
+ * # Usage
+ *
+ * ```swift
+ * let service = PerceptionService()
+ * try await service.initialize()
+ * let response = try await service.chat(message: "Hello!")
+ * ```
+ */
+open class PerceptionService: PerceptionServiceProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_eidolons_shared_fn_clone_perceptionservice(self.handle, $0) }
+    }
+    /**
+     * Creates a new uninitialized perception service.
+     *
+     * This is a cheap operation that does not download any model weights.
+     * Call `initialize()` to download and load the model.
+     */
+public convenience init() {
+    let handle =
+        try! rustCall() {
+    uniffi_eidolons_shared_fn_constructor_perceptionservice_new($0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        try! rustCall { uniffi_eidolons_shared_fn_free_perceptionservice(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Generates a response for the given message.
+     *
+     * # Arguments
+     *
+     * * `message` - The input message/prompt
+     *
+     * # Returns
+     *
+     * The generated response string.
+     *
+     * # Errors
+     *
+     * Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
+     */
+open func chat(message: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_eidolons_shared_fn_method_perceptionservice_chat(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(message)
+                )
+            },
+            pollFunc: ffi_eidolons_shared_rust_future_poll_rust_buffer,
+            completeFunc: ffi_eidolons_shared_rust_future_complete_rust_buffer,
+            freeFunc: ffi_eidolons_shared_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypePerceptionError_lift
+        )
+}
+    
+    /**
+     * Initializes the service by downloading and loading the model.
+     *
+     * This is an async operation that may take time depending on network
+     * speed and whether the model is already cached.
+     *
+     * # Errors
+     *
+     * Returns `PerceptionError::AlreadyInitialized` if called twice.
+     * Returns `PerceptionError::LoadFailed` if model download or loading fails.
+     */
+open func initialize()async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_eidolons_shared_fn_method_perceptionservice_initialize(
+                    self.uniffiCloneHandle()
+                    
+                )
+            },
+            pollFunc: ffi_eidolons_shared_rust_future_poll_void,
+            completeFunc: ffi_eidolons_shared_rust_future_complete_void,
+            freeFunc: ffi_eidolons_shared_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypePerceptionError_lift
+        )
+}
+    
+    /**
+     * Returns whether the model is initialized and ready for inference.
+     */
+open func isReady()async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_eidolons_shared_fn_method_perceptionservice_is_ready(
+                    self.uniffiCloneHandle()
+                    
+                )
+            },
+            pollFunc: ffi_eidolons_shared_rust_future_poll_i8,
+            completeFunc: ffi_eidolons_shared_rust_future_complete_i8,
+            freeFunc: ffi_eidolons_shared_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Returns model configuration information if initialized.
+     *
+     * Returns a JSON string with model details, or an error if not initialized.
+     */
+open func modelInfo()async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_eidolons_shared_fn_method_perceptionservice_model_info(
+                    self.uniffiCloneHandle()
+                    
+                )
+            },
+            pollFunc: ffi_eidolons_shared_rust_future_poll_rust_buffer,
+            completeFunc: ffi_eidolons_shared_rust_future_complete_rust_buffer,
+            freeFunc: ffi_eidolons_shared_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypePerceptionError_lift
+        )
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePerceptionService: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = PerceptionService
+
+    public static func lift(_ handle: UInt64) throws -> PerceptionService {
+        return PerceptionService(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: PerceptionService) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PerceptionService {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: PerceptionService, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePerceptionService_lift(_ handle: UInt64) throws -> PerceptionService {
+    return try FfiConverterTypePerceptionService.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePerceptionService_lower(_ value: PerceptionService) -> UInt64 {
+    return FfiConverterTypePerceptionService.lower(value)
+}
+
+
+
+
+/**
+ * Error type for perception service operations.
+ */
+public enum PerceptionError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+
+    
+    
+    case NotInitialized
+    case LoadFailed(message: String
+    )
+    case AlreadyInitialized
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension PerceptionError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePerceptionError: FfiConverterRustBuffer {
+    typealias SwiftType = PerceptionError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PerceptionError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .NotInitialized
+        case 2: return .LoadFailed(
+            message: try FfiConverterString.read(from: &buf)
+            )
+        case 3: return .AlreadyInitialized
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PerceptionError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case .NotInitialized:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .LoadFailed(message):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case .AlreadyInitialized:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePerceptionError_lift(_ buf: RustBuffer) throws -> PerceptionError {
+    return try FfiConverterTypePerceptionError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePerceptionError_lower(_ value: PerceptionError) -> RustBuffer {
+    return FfiConverterTypePerceptionError.lower(value)
+}
+private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
+private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
+
+fileprivate let uniffiContinuationHandleMap = UniffiHandleMap<UnsafeContinuation<Int8, Never>>()
+
+fileprivate func uniffiRustCallAsync<F, T>(
+    rustFutureFunc: () -> UInt64,
+    pollFunc: (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
+    completeFunc: (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
+    freeFunc: (UInt64) -> (),
+    liftFunc: (F) throws -> T,
+    errorHandler: ((RustBuffer) throws -> Swift.Error)?
+) async throws -> T {
+    // Make sure to call the ensure init function since future creation doesn't have a
+    // RustCallStatus param, so doesn't use makeRustCall()
+    uniffiEnsureEidolonsSharedInitialized()
+    let rustFuture = rustFutureFunc()
+    defer {
+        freeFunc(rustFuture)
+    }
+    var pollResult: Int8;
+    repeat {
+        pollResult = await withUnsafeContinuation {
+            pollFunc(
+                rustFuture,
+                { handle, pollResult in
+                    uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult)
+                },
+                uniffiContinuationHandleMap.insert(obj: $0)
+            )
+        }
+    } while pollResult != UNIFFI_RUST_FUTURE_POLL_READY
+
+    return try liftFunc(makeRustCall(
+        { completeFunc(rustFuture, $0) },
+        errorHandler: errorHandler
+    ))
+}
+
+// Callback handlers for an async calls.  These are invoked by Rust when the future is ready.  They
+// lift the return value or error and resume the suspended function.
+fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: Int8) {
+    if let continuation = try? uniffiContinuationHandleMap.remove(handle: handle) {
+        continuation.resume(returning: pollResult)
+    } else {
+        print("uniffiFutureContinuationCallback invalid handle")
     }
 }
 /**
@@ -564,6 +1010,21 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_eidolons_shared_checksum_func_view() != 29235) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_chat() != 63550) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_initialize() != 5377) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_is_ready() != 2554) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_model_info() != 57901) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_eidolons_shared_checksum_constructor_perceptionservice_new() != 33440) {
         return InitializationResult.apiChecksumMismatch
     }
 

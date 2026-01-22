@@ -6,6 +6,25 @@ use crux_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::capabilities::hello::{HelloRequest, HelloResponse, hello};
+use crate::capabilities::perception::{PerceptionRequest, PerceptionResponse, ask};
+
+/// Role of a chat message sender
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Message from the user
+    User,
+    /// Message from the AI assistant
+    Assistant,
+}
+
+/// A single message in the conversation
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ChatMessage {
+    /// Who sent this message
+    pub role: Role,
+    /// The message content
+    pub content: String,
+}
 
 /// Events that can be sent from the shell to the core
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -15,18 +34,33 @@ pub enum Event {
     /// Response from the hello capability with the greeting
     #[serde(skip)]
     GreetingReceived(HelloResponse),
+    /// Submit a chat message to the AI
+    SubmitMessage(String),
+    /// Response from the perception capability
+    #[serde(skip)]
+    PerceptionResponse(PerceptionResponse),
 }
 
 /// The internal application model (private state)
 #[derive(Default)]
 pub struct Model {
+    /// The greeting from the hello capability
     greeting: Option<String>,
+    /// The conversation history
+    pub conversation: Vec<ChatMessage>,
+    /// Whether we're waiting for an AI response
+    pub is_processing: bool,
 }
 
 /// The view model exposed to the shell (public view state)
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq, Eq)]
 pub struct ViewModel {
+    /// The greeting message
     pub greeting: String,
+    /// The conversation history
+    pub conversation: Vec<ChatMessage>,
+    /// Whether we're waiting for an AI response
+    pub is_processing: bool,
 }
 
 /// Side effects the core can request from the shell
@@ -36,6 +70,8 @@ pub enum Effect {
     Render(RenderOperation),
     /// Request the hello capability
     Hello(HelloRequest),
+    /// Request the perception capability
+    Perception(PerceptionRequest),
 }
 
 /// The main Crux application
@@ -65,12 +101,35 @@ impl App for EidolonsApp {
                 model.greeting = Some(response.greeting);
                 render()
             }
+            Event::SubmitMessage(message) => {
+                // Add user message to conversation
+                model.conversation.push(ChatMessage {
+                    role: Role::User,
+                    content: message.clone(),
+                });
+                model.is_processing = true;
+
+                // Request AI response and render to show loading state
+                Command::all([render(), ask(message).then_send(Event::PerceptionResponse)])
+            }
+            Event::PerceptionResponse(response) => {
+                // Add assistant message to conversation
+                model.conversation.push(ChatMessage {
+                    role: Role::Assistant,
+                    content: response.response,
+                });
+                model.is_processing = false;
+
+                render()
+            }
         }
     }
 
     fn view(&self, model: &Self::Model) -> Self::ViewModel {
         ViewModel {
             greeting: model.greeting.clone().unwrap_or_default(),
+            conversation: model.conversation.clone(),
+            is_processing: model.is_processing,
         }
     }
 }
@@ -117,6 +176,7 @@ mod tests {
         let app = EidolonsApp;
         let model = Model {
             greeting: Some("Hello, Test!".to_string()),
+            ..Default::default()
         };
 
         let view = app.view(&model);
@@ -130,5 +190,88 @@ mod tests {
 
         let view = app.view(&model);
         assert_eq!(view.greeting, "");
+    }
+
+    #[test]
+    fn test_submit_message_adds_user_message_and_requests_perception() {
+        let app = AppTester::<EidolonsApp>::default();
+        let mut model = Model::default();
+
+        let cmd = app.update(Event::SubmitMessage("Hello AI".to_string()), &mut model);
+
+        // User message should be added
+        assert_eq!(model.conversation.len(), 1);
+        assert_eq!(model.conversation[0].role, Role::User);
+        assert_eq!(model.conversation[0].content, "Hello AI");
+
+        // Should be processing
+        assert!(model.is_processing);
+
+        // Should have Render and Perception effects
+        let effects: Vec<_> = cmd.into_effects().collect();
+        assert_eq!(effects.len(), 2);
+
+        let has_render = effects.iter().any(|e| matches!(e, Effect::Render(_)));
+        let has_perception = effects
+            .iter()
+            .any(|e| matches!(e, Effect::Perception(req) if req.operation.prompt == "Hello AI"));
+
+        assert!(has_render, "Should have Render effect");
+        assert!(has_perception, "Should have Perception effect");
+    }
+
+    #[test]
+    fn test_perception_response_adds_assistant_message() {
+        let app = AppTester::<EidolonsApp>::default();
+        let mut model = Model {
+            conversation: vec![ChatMessage {
+                role: Role::User,
+                content: "Hello AI".to_string(),
+            }],
+            is_processing: true,
+            ..Default::default()
+        };
+
+        let response = PerceptionResponse {
+            response: "Hello human!".to_string(),
+        };
+        let cmd = app.update(Event::PerceptionResponse(response), &mut model);
+
+        // Assistant message should be added
+        assert_eq!(model.conversation.len(), 2);
+        assert_eq!(model.conversation[1].role, Role::Assistant);
+        assert_eq!(model.conversation[1].content, "Hello human!");
+
+        // Should no longer be processing
+        assert!(!model.is_processing);
+
+        // Should trigger render
+        let effect = cmd.expect_one_effect();
+        assert!(matches!(effect, Effect::Render(_)));
+    }
+
+    #[test]
+    fn test_view_includes_conversation() {
+        let app = EidolonsApp;
+        let model = Model {
+            conversation: vec![
+                ChatMessage {
+                    role: Role::User,
+                    content: "Hi".to_string(),
+                },
+                ChatMessage {
+                    role: Role::Assistant,
+                    content: "Hello!".to_string(),
+                },
+            ],
+            is_processing: false,
+            ..Default::default()
+        };
+
+        let view = app.view(&model);
+        assert_eq!(view.conversation.len(), 2);
+        assert_eq!(view.conversation[0].role, Role::User);
+        assert_eq!(view.conversation[1].role, Role::Assistant);
+        assert!(!view.is_processing);
     }
 }
