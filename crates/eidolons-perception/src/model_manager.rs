@@ -3,6 +3,19 @@ use hf_hub::api::tokio::Api;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Once;
+
+/// Ensures the TLS crypto provider is installed exactly once.
+static CRYPTO_PROVIDER_INIT: Once = Once::new();
+
+/// Installs the pure-Rust crypto provider for TLS connections.
+/// This must be called before any TLS operations (e.g., HTTPS requests).
+fn ensure_crypto_provider() {
+    CRYPTO_PROVIDER_INIT.call_once(|| {
+        rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider())
+            .expect("failed to install rustls crypto provider");
+    });
+}
 
 /// Configuration loaded from a model's config.json file.
 #[derive(Debug, Clone, Deserialize)]
@@ -66,6 +79,9 @@ impl TextGenerationModel {
     ///
     /// * `repo_id` - The HuggingFace repository ID (e.g., "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     pub async fn load_from_repo(repo_id: &str) -> Result<Self> {
+        // Ensure TLS crypto provider is installed before making HTTPS requests
+        ensure_crypto_provider();
+
         let api = Api::new().context("Failed to create HuggingFace API client")?;
         let repo = api.model(repo_id.to_string());
 
@@ -159,12 +175,19 @@ impl TextGenerationModel {
 mod tests {
     use super::*;
 
+    /// This test requires network access and system configuration.
+    /// It is ignored by default because it:
+    /// - Requires network access to download from HuggingFace
+    /// - May panic in sandboxed environments (CI, Nix builds) where
+    ///   macOS system-configuration APIs are unavailable
+    ///
+    /// Run with: cargo test --ignored test_model_load
     #[tokio::test]
+    #[ignore]
     async fn test_model_load() {
-        // This test requires network access
-        let result = TextGenerationModel::load().await;
+        let load_result = TextGenerationModel::load().await;
 
-        match result {
+        match load_result {
             Ok(model) => {
                 // Verify the model is initialized
                 assert!(model.is_initialized());
@@ -189,18 +212,30 @@ mod tests {
                 println!("  Generate output: {}", response);
             }
             Err(e) => {
-                // Network errors are acceptable in CI/offline environments
-                eprintln!("Model load failed (may be expected in offline environment): {e}");
-                // Don't fail the test for network errors
-                if e.to_string().contains("network")
-                    || e.to_string().contains("connect")
-                    || e.to_string().contains("resolve")
-                {
-                    println!("Skipping test due to network unavailability");
-                    return;
-                }
-                panic!("Unexpected error loading model: {e}");
+                panic!("Model loading failed: {e}");
             }
         }
+    }
+
+    /// Test that model config deserialization works correctly.
+    #[test]
+    fn test_model_config_deserialization() {
+        let config_json = r#"{
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_size": 2048,
+            "num_attention_heads": 32,
+            "num_hidden_layers": 22,
+            "vocab_size": 32000,
+            "extra_field": "ignored"
+        }"#;
+
+        let config: ModelConfig = serde_json::from_str(config_json).unwrap();
+
+        assert_eq!(config.architectures, vec!["LlamaForCausalLM"]);
+        assert_eq!(config.hidden_size, 2048);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_hidden_layers, 22);
+        assert_eq!(config.vocab_size, 32000);
+        assert!(config.extra.contains_key("extra_field"));
     }
 }

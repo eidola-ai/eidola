@@ -13,7 +13,17 @@ burn-wgpu = { version = "0.20", features = ["metal"] }
 burn-ndarray = "0.20"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
-hf-hub = "0.4"
+
+# HuggingFace Hub - use tokio/reqwest backend without ureq (which hardcodes ring)
+hf-hub = { version = "0.4", default-features = false, features = ["tokio"] }
+
+# HTTP client with pure-Rust TLS (no ring/aws-lc-rs C dependencies for cross-compilation)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream"] }
+
+# Pure Rust TLS crypto provider
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

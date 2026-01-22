@@ -66,14 +66,29 @@ pub fn init_backend() -> Result<BackendManager> {
 
 /// Attempts to initialize the WGPU backend.
 fn try_init_wgpu() -> Result<()> {
-    // Attempt to get default device - this will fail if no GPU is available
-    let device = WgpuDevice::default();
+    use std::panic;
 
-    // Verify we can create a simple tensor on the device
-    use burn::tensor::Tensor;
-    let _tensor: Tensor<WgpuBackend, 1> = Tensor::from_floats([1.0, 2.0, 3.0], &device);
+    // WGPU may panic if no GPU adapter is available (e.g., in CI/sandbox environments).
+    // We catch the panic and convert it to an error for graceful fallback.
+    let result = panic::catch_unwind(|| {
+        // Attempt to get default device - this will fail if no GPU is available
+        let device = WgpuDevice::default();
 
-    Ok(())
+        // Verify we can create a simple tensor on the device
+        use burn::tensor::Tensor;
+        let _tensor: Tensor<WgpuBackend, 1> = Tensor::from_floats([1.0, 2.0, 3.0], &device);
+    });
+
+    result.map_err(|e| {
+        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = e.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic during WGPU initialization".to_string()
+        };
+        anyhow::anyhow!("WGPU initialization panicked: {}", msg)
+    })
 }
 
 /// Attempts to initialize the NdArray (CPU) backend.
