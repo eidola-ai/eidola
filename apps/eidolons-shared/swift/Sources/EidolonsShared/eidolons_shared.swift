@@ -505,6 +505,16 @@ public func handleResponse(id: UInt32, data: Data) -> Data  {
 })
 }
 /**
+ * Returns a greeting for the given name.
+ */
+public func hello(name: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_eidolons_shared_fn_func_hello(
+        FfiConverterString.lower(name),$0
+    )
+})
+}
+/**
  * Process an event from the shell
  *
  * Takes a bincode-serialized Event and returns bincode-serialized effects (requests).
@@ -545,6 +555,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_eidolons_shared_checksum_func_handle_response() != 54436) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_eidolons_shared_checksum_func_hello() != 49122) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_eidolons_shared_checksum_func_process_event() != 55793) {

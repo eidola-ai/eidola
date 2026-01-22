@@ -6,21 +6,20 @@ Guidance for AI coding agents working in this repository.
 
 ```
 eidolons/
-├── eidolons-server/  # OpenAI-compatible AI proxy server
-│   └── src/
-│       ├── main.rs       # HTTP server (hyper + tokio)
-│       ├── openai.rs     # OpenAI API types
-│       ├── anthropic.rs  # Anthropic API types
-│       ├── transform.rs  # Format conversion
-│       └── proxy.rs      # Upstream HTTP client
-├── eidolons/         # Rust library with Swift bindings
-│   ├── src/lib.rs        # Exports via #[uniffi::export]
-│   ├── swift/            # Generated Swift bindings (committed)
-│   └── Package.swift     # Swift Package Manager config
+├── crates/           # Rust crates
+│   ├── eidolons-server/  # OpenAI-compatible AI proxy server
+│   │   └── src/
+│   │       ├── main.rs       # HTTP server (hyper + tokio)
+│   │       ├── openai.rs     # OpenAI API types
+│   │       ├── anthropic.rs  # Anthropic API types
+│   │       ├── transform.rs  # Format conversion
+│   │       └── proxy.rs      # Upstream HTTP client
+│   └── eidolons-hello/   # Hello capability (example)
+│       └── src/lib.rs
 ├── apps/
-│   ├── eidolons-shared/  # Crux-based shared core
+│   ├── eidolons-shared/  # Crux-based shared core (exclusive FFI generator)
 │   │   ├── src/
-│   │   │   ├── lib.rs        # FFI bridge (processEvent, handleResponse, view)
+│   │   │   ├── lib.rs        # FFI bridge (processEvent, handleResponse, view, capabilities)
 │   │   │   ├── app.rs        # Crux App impl (Event, Model, ViewModel, Effect)
 │   │   │   └── capabilities/ # Crux capabilities (e.g., eidolons)
 │   │   ├── swift/            # Generated bindings (UniFFI + Crux types)
@@ -79,11 +78,13 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 │  - Model: private app state                             │
 │  - ViewModel: public view state                         │
 │  - Effect: side-effects for shell to handle             │
-│  - Capabilities: Render, Eidolons (calls eidolons lib)  │
+│  - Capabilities: Render, Eidolons (calls capability impls) │
 └─────────────────────────────────────────────────────────┘
 ```
 
 **Key pattern:** The core never performs side-effects directly. It emits Effects that the shell handles, then the shell sends responses back via `handleResponse()`.
+
+**Capability implementations:** Pure Rust crates in `crates/` (e.g., `eidolons-hello`) implement capability logic. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
 
 **Two codegen pipelines:**
 - `uniffi-bindgen-swift` → FFI bridge (`processEvent`, `handleResponse`, `view`)
@@ -108,7 +109,6 @@ nix build '.#server-oci--aarch64-unknown-linux-musl'  # Linux ARM64 container
 nix flake check   # All checks (fmt, clippy, tests, binding sync)
 
 # Swift bindings (after changing Rust APIs)
-nix run '.#update-core-swift-bindings'            # eidolons/ bindings
 nix run '.#update-eidolons-shared-swift-bindings' # eidolons-shared/ bindings
 ```
 
@@ -127,9 +127,10 @@ Targets defined in `rust-toolchain.toml`:
 | `flake.nix` | Nix build definitions, cross-compile targets, CI checks |
 | `rust-toolchain.toml` | Pinned Rust version (1.92.0) and targets |
 | `Cargo.toml` | Workspace config, release profile (LTO, single codegen unit) |
-| `eidolons-server/Cargo.toml` | Server dependencies |
-| `eidolons/Package.swift` | Core library Swift Package config |
+| `crates/eidolons-server/Cargo.toml` | Server dependencies |
+| `crates/eidolons-hello/src/lib.rs` | Hello capability implementation (pure Rust) |
 | `apps/eidolons-shared/Package.swift` | Shared core Swift Package (EidolonsShared + SharedTypes) |
+| `apps/eidolons-shared/src/lib.rs` | FFI bridge + capability re-exports |
 | `apps/eidolons-shared/src/app.rs` | Crux App implementation (Event, Model, ViewModel, Effect) |
 | `apps/macos/Package.swift` | macOS app Swift Package config |
 | `apps/macos/Sources/Eidolons/Core.swift` | Swift shell bridge (handles Crux event/effect loop) |

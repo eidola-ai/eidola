@@ -1,8 +1,7 @@
 [workspace]
 
 members = [
-    "eidolons",
-    "eidolons-server",
+    "crates/*",
     "tools/*",
     "apps/eidolons-shared",
 ]

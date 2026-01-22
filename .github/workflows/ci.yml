@@ -40,6 +40,30 @@ jobs:
       - name: Run all checks
         run: nix flake check --show-trace --max-jobs auto
 
+      - name: Verify generated code is up to date
+        run: |
+          set -euo pipefail
+
+          echo "=== Regenerating Swift bindings ==="
+          nix run '.#update-eidolons-shared-swift-bindings'
+
+          echo "=== Regenerating OpenAPI spec ==="
+          nix run '.#update-server-openapi'
+
+          echo "=== Checking for uncommitted changes ==="
+          if ! git diff --quiet; then
+            echo "::error::Generated code is out of date. Please run the following commands and commit the changes:"
+            echo "::error::  nix run '.#update-eidolons-shared-swift-bindings'"
+            echo "::error::  nix run '.#update-server-openapi'"
+            echo ""
+            echo "Diff of outdated files:"
+            git diff --stat
+            git diff
+            exit 1
+          fi
+
+          echo "All generated code is up to date."
+
       - name: Build all packages
         run: |
           mkdir -p $RUNNER_TEMP/out
@@ -57,16 +81,11 @@ jobs:
 
       - name: Run Swift tests
         run: |
-          # Build the XCFrameworks via Nix and update the local paths
-          nix run '.#update-eidolons-swift-xcframework'
+          # Build the XCFramework via Nix and update the local path
           nix run '.#update-eidolons-shared-swift-xcframework'
 
-          # Run Swift tests for core library
-          cd eidolons
-          swift test
-
           # Run Swift tests for shared core
-          cd ../apps/eidolons-shared
+          cd apps/eidolons-shared
           swift test
 
           # Run Swift tests for macOS app

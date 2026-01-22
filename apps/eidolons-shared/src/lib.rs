@@ -4,10 +4,18 @@ pub mod capabilities;
 use std::sync::LazyLock;
 
 pub use app::{Effect, EidolonsApp, Event, Model, ViewModel};
-pub use capabilities::eidolons::{EidolonsRequest, EidolonsResponse};
+pub use capabilities::hello::{HelloRequest, HelloResponse};
 pub use crux_core::{Core, bridge::Bridge};
 
 uniffi::setup_scaffolding!();
+
+// Re-export capability implementations via FFI
+
+/// Returns a greeting for the given name.
+#[uniffi::export]
+pub fn hello(name: &str) -> String {
+    eidolons_hello::hello(name)
+}
 
 /// Static bridge instance that holds the core application
 static CORE: LazyLock<Bridge<EidolonsApp>> = LazyLock::new(|| Bridge::new(Core::new()));

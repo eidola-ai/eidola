@@ -5,16 +5,16 @@ use crux_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::capabilities::eidolons::{EidolonsRequest, EidolonsResponse, hello};
+use crate::capabilities::hello::{HelloRequest, HelloResponse, hello};
 
 /// Events that can be sent from the shell to the core
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// Request a greeting for the given name
     Greet(String),
-    /// Response from the eidolons capability with the greeting
+    /// Response from the hello capability with the greeting
     #[serde(skip)]
-    GreetingReceived(EidolonsResponse),
+    GreetingReceived(HelloResponse),
 }
 
 /// The internal application model (private state)
@@ -34,8 +34,8 @@ pub struct ViewModel {
 pub enum Effect {
     /// Request a render of the current view
     Render(RenderOperation),
-    /// Request the eidolons capability
-    Eidolons(EidolonsRequest),
+    /// Request the hello capability
+    Hello(HelloRequest),
 }
 
 /// The main Crux application
@@ -81,7 +81,7 @@ mod tests {
     use crux_core::testing::AppTester;
 
     #[test]
-    fn test_greet_emits_eidolons_effect() {
+    fn test_greet_emits_hello_effect() {
         let app = AppTester::<EidolonsApp>::default();
         let mut model = Model::default();
 
@@ -89,10 +89,10 @@ mod tests {
 
         let effect = cmd.expect_one_effect();
         match effect {
-            Effect::Eidolons(req) => {
+            Effect::Hello(req) => {
                 assert_eq!(req.operation.name, "World");
             }
-            _ => panic!("Expected Eidolons effect"),
+            _ => panic!("Expected Hello effect"),
         }
     }
 
@@ -101,7 +101,7 @@ mod tests {
         let app = AppTester::<EidolonsApp>::default();
         let mut model = Model::default();
 
-        let response = EidolonsResponse {
+        let response = HelloResponse {
             greeting: "Hello, World!".to_string(),
         };
         let cmd = app.update(Event::GreetingReceived(response), &mut model);
