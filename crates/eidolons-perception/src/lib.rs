@@ -3,6 +3,10 @@ use burn::backend::Autodiff;
 use burn_ndarray::NdArray;
 use burn_wgpu::{Wgpu, WgpuDevice};
 
+pub mod model_manager;
+
+pub use model_manager::{ModelConfig, TextGenerationModel};
+
 /// Backend type aliases for convenience.
 pub type WgpuBackend = Wgpu<f32, i32, u8>;
 pub type NdArrayBackend = NdArray<f32>;
