@@ -1,0 +1,108 @@
+use anyhow::{Context, Result};
+use burn::backend::Autodiff;
+use burn_ndarray::NdArray;
+use burn_wgpu::{Wgpu, WgpuDevice};
+
+/// Backend type aliases for convenience.
+pub type WgpuBackend = Wgpu<f32, i32, u8>;
+pub type NdArrayBackend = NdArray<f32>;
+pub type AutodiffWgpuBackend = Autodiff<WgpuBackend>;
+pub type AutodiffNdArrayBackend = Autodiff<NdArrayBackend>;
+
+/// Represents the initialized compute backend.
+#[derive(Debug, Clone)]
+pub enum Backend {
+    /// GPU-accelerated backend (Metal on macOS, Vulkan on Linux/Windows).
+    Wgpu,
+    /// CPU fallback using ndarray.
+    NdArray,
+}
+
+/// Manages backend initialization and selection for ML inference.
+#[derive(Debug)]
+pub struct BackendManager {
+    backend: Backend,
+}
+
+impl BackendManager {
+    /// Returns which backend was initialized.
+    pub fn backend(&self) -> &Backend {
+        &self.backend
+    }
+
+    /// Check if using GPU acceleration.
+    pub fn is_gpu_accelerated(&self) -> bool {
+        matches!(self.backend, Backend::Wgpu)
+    }
+}
+
+/// Attempts to initialize the best available compute backend.
+///
+/// Tries WGPU (GPU via Metal/Vulkan) first, then falls back to NdArray (CPU).
+pub fn init_backend() -> Result<BackendManager> {
+    // Try WGPU backend first (provides Metal on macOS, Vulkan elsewhere)
+    match try_init_wgpu() {
+        Ok(()) => {
+            return Ok(BackendManager {
+                backend: Backend::Wgpu,
+            });
+        }
+        Err(e) => {
+            eprintln!("WGPU backend unavailable: {e}. Falling back to CPU.");
+        }
+    }
+
+    // Fall back to NdArray (CPU)
+    try_init_ndarray().context("Failed to initialize any backend")?;
+
+    Ok(BackendManager {
+        backend: Backend::NdArray,
+    })
+}
+
+/// Attempts to initialize the WGPU backend.
+fn try_init_wgpu() -> Result<()> {
+    // Attempt to get default device - this will fail if no GPU is available
+    let device = WgpuDevice::default();
+
+    // Verify we can create a simple tensor on the device
+    use burn::tensor::Tensor;
+    let _tensor: Tensor<WgpuBackend, 1> = Tensor::from_floats([1.0, 2.0, 3.0], &device);
+
+    Ok(())
+}
+
+/// Attempts to initialize the NdArray (CPU) backend.
+fn try_init_ndarray() -> Result<()> {
+    use burn::tensor::Tensor;
+    use burn_ndarray::NdArrayDevice;
+
+    let device = NdArrayDevice::Cpu;
+
+    // Verify we can create a simple tensor
+    let _tensor: Tensor<NdArray<f32>, 1> = Tensor::from_floats([1.0, 2.0, 3.0], &device);
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backend_init() {
+        let manager = init_backend().expect("Backend initialization should not crash");
+
+        // Should have initialized some backend
+        match manager.backend() {
+            Backend::Wgpu => {
+                println!("Initialized with WGPU (GPU) backend");
+                assert!(manager.is_gpu_accelerated());
+            }
+            Backend::NdArray => {
+                println!("Initialized with NdArray (CPU) backend");
+                assert!(!manager.is_gpu_accelerated());
+            }
+        }
+    }
+}
