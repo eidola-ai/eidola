@@ -3,7 +3,7 @@ import Serde
 
 indirect public enum Effect: Hashable {
     case render(SharedTypes.RenderOperation)
-    case eidolons(SharedTypes.EidolonsRequest)
+    case hello(SharedTypes.HelloRequest)
 
     public func serialize<S: Serializer>(serializer: S) throws {
         try serializer.increase_container_depth()
@@ -11,7 +11,7 @@ indirect public enum Effect: Hashable {
         case .render(let x):
             try serializer.serialize_variant_index(value: 0)
             try x.serialize(serializer: serializer)
-        case .eidolons(let x):
+        case .hello(let x):
             try serializer.serialize_variant_index(value: 1)
             try x.serialize(serializer: serializer)
         }
@@ -33,86 +33,14 @@ indirect public enum Effect: Hashable {
             try deserializer.decrease_container_depth()
             return .render(x)
         case 1:
-            let x = try SharedTypes.EidolonsRequest.deserialize(deserializer: deserializer)
+            let x = try SharedTypes.HelloRequest.deserialize(deserializer: deserializer)
             try deserializer.decrease_container_depth()
-            return .eidolons(x)
+            return .hello(x)
         default: throw DeserializationError.invalidInput(issue: "Unknown variant index for Effect: \(index)")
         }
     }
 
     public static func bincodeDeserialize(input: [UInt8]) throws -> Effect {
-        let deserializer = BincodeDeserializer.init(input: input);
-        let obj = try deserialize(deserializer: deserializer)
-        if deserializer.get_buffer_offset() < input.count {
-            throw DeserializationError.invalidInput(issue: "Some input bytes were not read")
-        }
-        return obj
-    }
-}
-
-public struct EidolonsRequest: Hashable {
-    @Indirect public var name: String
-
-    public init(name: String) {
-        self.name = name
-    }
-
-    public func serialize<S: Serializer>(serializer: S) throws {
-        try serializer.increase_container_depth()
-        try serializer.serialize_str(value: self.name)
-        try serializer.decrease_container_depth()
-    }
-
-    public func bincodeSerialize() throws -> [UInt8] {
-        let serializer = BincodeSerializer.init();
-        try self.serialize(serializer: serializer)
-        return serializer.get_bytes()
-    }
-
-    public static func deserialize<D: Deserializer>(deserializer: D) throws -> EidolonsRequest {
-        try deserializer.increase_container_depth()
-        let name = try deserializer.deserialize_str()
-        try deserializer.decrease_container_depth()
-        return EidolonsRequest.init(name: name)
-    }
-
-    public static func bincodeDeserialize(input: [UInt8]) throws -> EidolonsRequest {
-        let deserializer = BincodeDeserializer.init(input: input);
-        let obj = try deserialize(deserializer: deserializer)
-        if deserializer.get_buffer_offset() < input.count {
-            throw DeserializationError.invalidInput(issue: "Some input bytes were not read")
-        }
-        return obj
-    }
-}
-
-public struct EidolonsResponse: Hashable {
-    @Indirect public var greeting: String
-
-    public init(greeting: String) {
-        self.greeting = greeting
-    }
-
-    public func serialize<S: Serializer>(serializer: S) throws {
-        try serializer.increase_container_depth()
-        try serializer.serialize_str(value: self.greeting)
-        try serializer.decrease_container_depth()
-    }
-
-    public func bincodeSerialize() throws -> [UInt8] {
-        let serializer = BincodeSerializer.init();
-        try self.serialize(serializer: serializer)
-        return serializer.get_bytes()
-    }
-
-    public static func deserialize<D: Deserializer>(deserializer: D) throws -> EidolonsResponse {
-        try deserializer.increase_container_depth()
-        let greeting = try deserializer.deserialize_str()
-        try deserializer.decrease_container_depth()
-        return EidolonsResponse.init(greeting: greeting)
-    }
-
-    public static func bincodeDeserialize(input: [UInt8]) throws -> EidolonsResponse {
         let deserializer = BincodeDeserializer.init(input: input);
         let obj = try deserialize(deserializer: deserializer)
         if deserializer.get_buffer_offset() < input.count {
@@ -154,6 +82,78 @@ indirect public enum Event: Hashable {
     }
 
     public static func bincodeDeserialize(input: [UInt8]) throws -> Event {
+        let deserializer = BincodeDeserializer.init(input: input);
+        let obj = try deserialize(deserializer: deserializer)
+        if deserializer.get_buffer_offset() < input.count {
+            throw DeserializationError.invalidInput(issue: "Some input bytes were not read")
+        }
+        return obj
+    }
+}
+
+public struct HelloRequest: Hashable {
+    @Indirect public var name: String
+
+    public init(name: String) {
+        self.name = name
+    }
+
+    public func serialize<S: Serializer>(serializer: S) throws {
+        try serializer.increase_container_depth()
+        try serializer.serialize_str(value: self.name)
+        try serializer.decrease_container_depth()
+    }
+
+    public func bincodeSerialize() throws -> [UInt8] {
+        let serializer = BincodeSerializer.init();
+        try self.serialize(serializer: serializer)
+        return serializer.get_bytes()
+    }
+
+    public static func deserialize<D: Deserializer>(deserializer: D) throws -> HelloRequest {
+        try deserializer.increase_container_depth()
+        let name = try deserializer.deserialize_str()
+        try deserializer.decrease_container_depth()
+        return HelloRequest.init(name: name)
+    }
+
+    public static func bincodeDeserialize(input: [UInt8]) throws -> HelloRequest {
+        let deserializer = BincodeDeserializer.init(input: input);
+        let obj = try deserialize(deserializer: deserializer)
+        if deserializer.get_buffer_offset() < input.count {
+            throw DeserializationError.invalidInput(issue: "Some input bytes were not read")
+        }
+        return obj
+    }
+}
+
+public struct HelloResponse: Hashable {
+    @Indirect public var greeting: String
+
+    public init(greeting: String) {
+        self.greeting = greeting
+    }
+
+    public func serialize<S: Serializer>(serializer: S) throws {
+        try serializer.increase_container_depth()
+        try serializer.serialize_str(value: self.greeting)
+        try serializer.decrease_container_depth()
+    }
+
+    public func bincodeSerialize() throws -> [UInt8] {
+        let serializer = BincodeSerializer.init();
+        try self.serialize(serializer: serializer)
+        return serializer.get_bytes()
+    }
+
+    public static func deserialize<D: Deserializer>(deserializer: D) throws -> HelloResponse {
+        try deserializer.increase_container_depth()
+        let greeting = try deserializer.deserialize_str()
+        try deserializer.decrease_container_depth()
+        return HelloResponse.init(greeting: greeting)
+    }
+
+    public static func bincodeDeserialize(input: [UInt8]) throws -> HelloResponse {
         let deserializer = BincodeDeserializer.init(input: input);
         let obj = try deserialize(deserializer: deserializer)
         if deserializer.get_buffer_offset() < input.count {
