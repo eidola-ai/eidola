@@ -12,16 +12,8 @@ struct ContentView: View {
   @State private var core = Core()
 
   var body: some View {
-    VStack {
-      Image(systemName: "globe")
-        .imageScale(.large)
-        .foregroundStyle(.tint)
-      Text(core.viewModel.greeting.isEmpty ? "Loading..." : core.viewModel.greeting)
-    }
-    .padding()
-    .task {
-      core.update(event: .greet("Apple"))
-    }
+    ChatView(core: core)
+      .frame(minWidth: 400, minHeight: 500)
   }
 }
 

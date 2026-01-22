@@ -43,7 +43,10 @@ let package = Package(
       resources: [
         .process("Assets.xcassets")
       ],
-      swiftSettings: swiftSettings
+      swiftSettings: swiftSettings,
+      linkerSettings: [
+        .linkedFramework("SystemConfiguration")
+      ]
     ),
     .testTarget(
       name: "EidolonsTests",
