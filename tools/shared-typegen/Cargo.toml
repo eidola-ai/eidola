@@ -1,0 +1,16 @@
+[package]
+name = "shared-typegen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+crux_core = { version = "0.16", features = ["typegen"] }
+eidolons-shared = { path = "../../apps/eidolons-shared", features = ["typegen"] }
+anyhow = "1.0"
+
+[[bin]]
+name = "shared-typegen"
+path = "src/main.rs"

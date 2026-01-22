@@ -1,9 +1,10 @@
 # Eidolons
 
-Eidolons consists of three components:
+Eidolons consists of four components:
 - **Server** (`eidolons-server/`) - An OpenAI-compatible proxy that routes requests to AI providers (currently Anthropic Claude)
-- **Core library** (`eidolons/`) - A Rust library with Swift bindings for macOS apps
-- **macOS app** (`apps/macos/`) - SwiftUI app with Xcode wrapper for development
+- **Core library** (`eidolons/`) - A Rust library with Swift bindings for business logic
+- **Shared core** (`apps/eidolons-shared/`) - Crux-based cross-platform app core managing state and effects
+- **macOS app** (`apps/macos/`) - SwiftUI shell that renders the shared core's view model
 
 All builds are deterministic and reproducible via Nix.
 
@@ -31,12 +32,14 @@ ANTHROPIC_API_KEY="<sk-ant-YOUR_API_KEY>" cargo run -p eidolons-server
 
 **Updating generated files:**
 ```bash
-nix run '.#update-core-swift-bindings'  # Update Swift bindings (after changing eidolons/ API)
-nix run '.#update-server-openapi'       # Update OpenAPI spec (after changing server API)
+nix run '.#update-core-swift-bindings'           # Update eidolons/ Swift bindings
+nix run '.#update-eidolons-shared-swift-bindings' # Update shared core Swift bindings
+nix run '.#update-server-openapi'                # Update OpenAPI spec
 ```
 
-Generated Swift bindings are committed to `eidolons/swift/Sources/EidolonsCore/` and verified by CI.
-The OpenAPI spec is committed to `eidolons-server/openapi.json` and verified by CI.
+Generated Swift bindings are committed and verified by CI:
+- `eidolons/swift/` - Core library bindings
+- `apps/eidolons-shared/swift/` - Shared core bindings (UniFFI + Crux types)
 
 ## Building for release
 
@@ -44,9 +47,10 @@ This project uses Nix for reproducible builds. [Install Nix](https://nixos.org/d
 
 ```bash
 # Build targets
-nix build '.#server'                 # Server binary (native)
-nix build '.#server-oci'             # Server OCI image (native, for macOS won't run in Docker)
-nix build '.#eidolons-swift-xcframework' # XCFramework for macOS apps
+nix build '.#server'                          # Server binary (native)
+nix build '.#server-oci'                      # Server OCI image (native, for macOS won't run in Docker)
+nix build '.#eidolons-swift-xcframework'      # Core library XCFramework
+nix build '.#eidolons-shared-swift-xcframework' # Shared core XCFramework
 
 # Cross-compile Linux binaries
 nix build '.#server--aarch64-unknown-linux-musl' # Linux ARM64 binary

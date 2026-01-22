@@ -1,0 +1,25 @@
+[package]
+name = "eidolons-shared"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[features]
+default = []
+typegen = ["crux_core/typegen"]
+
+[dependencies]
+crux_core = "0.16"
+serde = { version = "1.0", features = ["derive"] }
+uniffi = "0.30.0"
+
+[build-dependencies]
+uniffi = { version = "0.30.0", features = ["build"] }
+
+[dev-dependencies]
+serde_json = "1.0"
