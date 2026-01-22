@@ -15,7 +15,13 @@ import SharedTypes
 public final class Core {
   public private(set) var viewModel: SharedTypes.ViewModel
 
+  /// The perception service for AI inference
+  private let perceptionService: PerceptionService
+
   public init() {
+    // Initialize perception service (model loading happens lazily via initialize())
+    perceptionService = PerceptionService()
+
     // Get initial view model from core
     let viewBytes = EidolonsShared.view()
     viewModel = try! SharedTypes.ViewModel.bincodeDeserialize(input: [UInt8](viewBytes))
@@ -59,6 +65,49 @@ public final class Core {
       let moreRequestBytes = EidolonsShared.handleResponse(
         id: request.id, data: Data(responseBytes))
       processRequests(moreRequestBytes)
+
+    case .perception(let perceptionRequest):
+      // Perception capability: call the AI service asynchronously
+      let requestId = request.id
+      Task {
+        await handlePerception(requestId: requestId, prompt: perceptionRequest.prompt)
+      }
     }
+  }
+
+  /// Handles perception requests asynchronously
+  private func handlePerception(requestId: UInt32, prompt: String) async {
+    // Ensure the service is initialized (downloads model if needed)
+    let isReady = await perceptionService.isReady()
+    if !isReady {
+      do {
+        try await perceptionService.initialize()
+      } catch {
+        // On initialization failure, return an error message
+        let response = SharedTypes.PerceptionResponse(
+          response: "Error initializing AI: \(error.localizedDescription)")
+        sendPerceptionResponse(requestId: requestId, response: response)
+        return
+      }
+    }
+
+    // Call the AI service
+    do {
+      let result = try await perceptionService.chat(message: prompt)
+      let response = SharedTypes.PerceptionResponse(response: result)
+      sendPerceptionResponse(requestId: requestId, response: response)
+    } catch {
+      let response = SharedTypes.PerceptionResponse(
+        response: "Error: \(error.localizedDescription)")
+      sendPerceptionResponse(requestId: requestId, response: response)
+    }
+  }
+
+  /// Sends a perception response back to the core
+  private func sendPerceptionResponse(requestId: UInt32, response: SharedTypes.PerceptionResponse) {
+    let responseBytes = try! response.bincodeSerialize()
+    let moreRequestBytes = EidolonsShared.handleResponse(
+      id: requestId, data: Data(responseBytes))
+    processRequests(moreRequestBytes)
   }
 }
