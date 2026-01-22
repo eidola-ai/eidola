@@ -76,10 +76,9 @@ impl TextGenerationModel {
             .context("Failed to download config.json")?;
 
         // Parse the configuration
-        let config_content =
-            tokio::fs::read_to_string(&config_path)
-                .await
-                .context("Failed to read config.json")?;
+        let config_content = tokio::fs::read_to_string(&config_path)
+            .await
+            .context("Failed to read config.json")?;
         let config: ModelConfig =
             serde_json::from_str(&config_content).context("Failed to parse config.json")?;
 
@@ -121,10 +120,7 @@ impl TextGenerationModel {
             return Ok(path);
         }
 
-        anyhow::bail!(
-            "Could not find model weights. Tried: {:?}",
-            weight_files
-        )
+        anyhow::bail!("Could not find model weights. Tried: {:?}", weight_files)
     }
 
     /// Returns the model configuration.
