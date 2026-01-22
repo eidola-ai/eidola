@@ -17,10 +17,10 @@ typegen = ["crux_core/typegen"]
 crux_core = "0.16"
 eidolons-hello = { path = "../../crates/eidolons-hello" }
 serde = { version = "1.0", features = ["derive"] }
-uniffi = "0.30.0"
+uniffi = "0.31.0"
 
 [build-dependencies]
-uniffi = { version = "0.30.0", features = ["build"] }
+uniffi = { version = "0.31.0", features = ["build"] }
 
 [dev-dependencies]
 serde_json = "1.0"
