@@ -741,11 +741,6 @@
                 echo "✓ Swift files are properly formatted"
                 touch $out
               '';
-
-          # Ensure the primary artifacts are built
-          builds-server-oci = self.packages.${system}.server-oci;
-          builds-eidolons-shared-swift-xcframework = self.packages.${system}.eidolons-shared-swift-xcframework;
-
         };
 
         apps = {
@@ -761,26 +756,7 @@
                 ];
 
                 text = ''
-                  set -euo pipefail
-
-                  # Sanity check: must run from repo root (or adjust logic)
-                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
-                    echo "error: not in a git repository" >&2
-                    exit 1
-                  fi
-
-                  repo_root="$(git rev-parse --show-toplevel)"
-                  dest="$repo_root/crates/eidolons-server/openapi.json"
-
-                  echo "Copying OpenAPI spec from Nix store:"
-                  echo "  source: ${self.packages.${system}.server-openapi-spec}/openapi.json"
-                  echo "  dest:   $dest"
-
-                  cp "${self.packages.${system}.server-openapi-spec}/openapi.json" "$dest"
-                  chmod +w "$dest"
-
-                  echo "Done. Review changes and commit:"
-                  echo "  git status"
+                  ${./scripts/update-server-openapi.sh} "${self.packages.${system}.server-openapi-spec}/openapi.json"
                 '';
               }
             }/bin/update-server-openapi";
@@ -798,39 +774,9 @@
                 ];
 
                 text = ''
-                  set -euo pipefail
-
-                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
-                    echo "error: not in a git repository" >&2
-                    exit 1
-                  fi
-
-                  repo_root="$(git rev-parse --show-toplevel)"
-
-                  # Update UniFFI bindings
-                  dest="$repo_root/apps/eidolons-shared/swift/Sources"
-                  echo "Syncing Swift bindings from Nix store:"
-                  echo "  source: ${self.packages.${system}.eidolons-shared-swift-bindings}"
-                  echo "  dest:   $dest"
-
-                  mkdir -p "$dest"
-                  rm -rf "$dest"
-                  cp -R "${self.packages.${system}.eidolons-shared-swift-bindings}/Sources" "$dest"
-                  chmod -R +w "$dest"
-
-                  # Update Crux typegen types
-                  types_dest="$repo_root/apps/eidolons-shared/swift/generated"
-                  echo "Syncing Crux typegen Swift types:"
-                  echo "  source: ${self.packages.${system}.eidolons-shared-swift-types}"
-                  echo "  dest:   $types_dest"
-
-                  rm -rf "$types_dest"
-                  mkdir -p "$types_dest"
-                  cp -R "${self.packages.${system}.eidolons-shared-swift-types}/SharedTypes" "$types_dest/SharedTypes"
-                  chmod -R +w "$types_dest"
-
-                  echo "Done. Review changes and commit:"
-                  echo "  git status"
+                  ${./scripts/update-shared-bindings.sh} \
+                    "${self.packages.${system}.eidolons-shared-swift-bindings}/Sources" \
+                    "${self.packages.${system}.eidolons-shared-swift-types}"
                 '';
               }
             }/bin/update-eidolons-shared-swift-bindings";
@@ -848,26 +794,7 @@
                 ];
 
                 text = ''
-                  set -euo pipefail
-
-                  if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
-                    echo "error: not in a git repository" >&2
-                    exit 1
-                  fi
-
-                  repo_root="$(git rev-parse --show-toplevel)"
-                  dest="$repo_root/apps/eidolons-shared/target/apple/libeidolons_shared-rs.xcframework"
-
-                  echo "Copying shared core XCframework from Nix store:"
-                  echo "  source: ${self.packages.${system}.eidolons-shared-swift-xcframework}"
-                  echo "  dest:   $dest"
-
-                  mkdir -p "$dest"
-                  rm -rf "$dest"
-                  cp -R "${self.packages.${system}.eidolons-shared-swift-xcframework}/libeidolons_shared-rs.xcframework" "$dest"
-                  chmod -R +w "$dest"
-
-                  echo "Done."
+                  ${./scripts/update-shared-xcframework.sh} "${self.packages.${system}.eidolons-shared-swift-xcframework}"
                 '';
               }
             }/bin/update-eidolons-shared-swift-xcframework";

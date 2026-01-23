@@ -104,13 +104,23 @@ ANTHROPIC_API_KEY="<sk-ant-YOUR_API_KEY>" cargo run -p eidolons-server
 ```
 
 **Updating generated files:**
+If you change Rust APIs or types, you must update the committed Swift bindings or OpenAPI spec:
 ```bash
-nix run '.#update-eidolons-shared-swift-bindings' # Update shared core Swift bindings
-nix run '.#update-server-openapi'                 # Update OpenAPI spec
+nix run '.#update-eidolons-shared-swift-bindings'     # Update bindings and types
+nix run '.#update-eidolons-shared-swift-xcframework'  # Update the static XCFramework
+nix run '.#update-server-openapi'                     # Update OpenAPI spec
 ```
 
-Generated Swift bindings are committed and verified by CI:
+Note that these can also be updated outside of nix:
+```bash
+scripts/update-server-openapi.sh crates/eidolons-server/openapi.json
+# ...
+```
+
+Generated artifacts are committed and verified by CI:
 - `apps/eidolons-shared/swift/` - Shared core bindings (UniFFI + Crux types)
+- `apps/eidolons-shared/target/apple/` - Compiled XCFramework
+- `crates/eidolons-server/openapi.json` - Server API specification
 
 ## Building for release
 
@@ -119,7 +129,7 @@ This project uses Nix for reproducible builds. [Install Nix](https://nixos.org/d
 ```bash
 # Build targets
 nix build '.#server'                            # Server binary (native)
-nix build '.#server-oci'                        # Server OCI image (native, for macOS won't run in Docker)
+nix build '.#server-oci'                        # Server OCI image (native)
 nix build '.#eidolons-shared-swift-xcframework' # Shared core XCFramework
 
 # Cross-compile Linux binaries
@@ -130,7 +140,7 @@ nix build '.#server--x86_64-unknown-linux-musl'  # Linux x86_64 binary
 nix build '.#server-oci--aarch64-unknown-linux-musl' # ARM64 OCI image
 nix build '.#server-oci--x86_64-unknown-linux-musl'  # x86_64 OCI image
 
-# Run all checks
+# Run checks (tests, linting, formatting)
 nix flake check
 ```
 
