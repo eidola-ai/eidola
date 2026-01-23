@@ -72,7 +72,12 @@ jobs:
           nix build '.#server-oci--x86_64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--x86_64-unknown-linux-musl.tar.gz
           nix build '.#server-oci--aarch64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--aarch64-unknown-linux-musl.tar.gz
 
-          # TODO: build native apps
+          # Build the XCFramework via Nix and update the local path
+          nix run '.#update-eidolons-shared-swift-xcframework'
+
+          # Build native apps
+          # Note that we *cannot* use nix until Swift 6 is available in nixpkgs
+          ( cd apps/macos && Support/package-app.sh )
 
       - name: Verify build outputs
         run: |
@@ -81,16 +86,11 @@ jobs:
 
       - name: Run Swift tests
         run: |
-          # Build the XCFramework via Nix and update the local path
-          nix run '.#update-eidolons-shared-swift-xcframework'
-
           # Run Swift tests for shared core
-          cd apps/eidolons-shared
-          swift test
+          ( cd apps/eidolons-shared && swift test )
 
           # Run Swift tests for macOS app
-          cd ../macos
-          swift test
+          ( cd apps/macos && swift test )
 
       - name: Determine image tags
         id: tags
