@@ -76,11 +76,22 @@ rm -f "$DEST/EidolonsShared/"*.swift
 rm -f "$DEST/EidolonsSharedFFI/"*.{h,c,modulemap}
 
 # Copy new files
-# Note: uniffi-bindgen outputs everything into one dir in our script usage above
-cp "$SOURCE_BINDINGS/"*.swift "$DEST/EidolonsShared/"
-cp "$SOURCE_BINDINGS/"*.h "$DEST/EidolonsSharedFFI/"
-cp "$SOURCE_BINDINGS/module.modulemap" "$DEST/EidolonsSharedFFI/"
-cp "$SOURCE_BINDINGS/eidolons_sharedFFI.c" "$DEST/EidolonsSharedFFI/"
+# Handle both flat outputs (local temp dir) and Nix outputs (Sources/EidolonsShared, Sources/EidolonsSharedFFI)
+if [[ -d "$SOURCE_BINDINGS/EidolonsShared" && -d "$SOURCE_BINDINGS/EidolonsSharedFFI" ]]; then
+  BINDINGS_SWIFT_DIR="$SOURCE_BINDINGS/EidolonsShared"
+  BINDINGS_FFI_DIR="$SOURCE_BINDINGS/EidolonsSharedFFI"
+elif [[ -d "$SOURCE_BINDINGS/Sources/EidolonsShared" && -d "$SOURCE_BINDINGS/Sources/EidolonsSharedFFI" ]]; then
+  BINDINGS_SWIFT_DIR="$SOURCE_BINDINGS/Sources/EidolonsShared"
+  BINDINGS_FFI_DIR="$SOURCE_BINDINGS/Sources/EidolonsSharedFFI"
+else
+  BINDINGS_SWIFT_DIR="$SOURCE_BINDINGS"
+  BINDINGS_FFI_DIR="$SOURCE_BINDINGS"
+fi
+
+cp "$BINDINGS_SWIFT_DIR/"*.swift "$DEST/EidolonsShared/"
+cp "$BINDINGS_FFI_DIR/"*.h "$DEST/EidolonsSharedFFI/"
+cp "$BINDINGS_FFI_DIR/module.modulemap" "$DEST/EidolonsSharedFFI/"
+cp "$BINDINGS_FFI_DIR/eidolons_sharedFFI.c" "$DEST/EidolonsSharedFFI/"
 
 # Update Crux typegen types
 TYPES_DEST="$REPO_ROOT/apps/eidolons-shared/swift/generated"
