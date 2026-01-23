@@ -111,12 +111,13 @@ nix run '.#update-eidolons-shared-swift-xcframework'  # Update the static XCFram
 nix run '.#update-server-openapi'                     # Update OpenAPI spec
 ```
 
-These can also be updated outside of Nix using your local Rust toolchain (auto-generates via `cargo run`):
+These can also be updated outside of Nix using your local Rust toolchain (auto-generates via `cargo run` and `cargo build`):
 ```bash
 scripts/update-shared-bindings.sh
 scripts/update-server-openapi.sh
+scripts/update-shared-xcframework.sh
 ```
-*Note: `update-shared-xcframework.sh` still requires an explicit source path as building multi-arch frameworks is platform-dependent.*
+*Note: `update-shared-xcframework.sh` requires a macOS host for local generation.*
 
 Generated artifacts are committed and verified by CI:
 - `apps/eidolons-shared/swift/` - Shared core bindings (UniFFI + Crux types)
