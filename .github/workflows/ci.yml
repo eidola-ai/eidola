@@ -90,7 +90,7 @@ jobs:
           ( cd apps/eidolons-shared && swift test )
 
           # Run Swift tests for macOS app
-          ( cd ../macos && swift test )
+          ( cd apps/macos && swift test )
 
       - name: Determine image tags
         id: tags
