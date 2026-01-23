@@ -524,6 +524,9 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
  * This service wraps the perception crate's TextGenerationModel and exposes
  * it via UniFFI for use in Swift/Kotlin shells.
  *
+ * The model runs on a dedicated inference thread, allowing GPU-accelerated
+ * inference without requiring WGPU types to be `Send + Sync`.
+ *
  * # Usage
  *
  * ```swift
@@ -554,8 +557,8 @@ public protocol PerceptionServiceProtocol: AnyObject, Sendable {
     /**
      * Initializes the service by downloading and loading the model.
      *
-     * This is an async operation that may take time depending on network
-     * speed and whether the model is already cached.
+     * This spawns a dedicated inference thread that owns the model,
+     * enabling GPU acceleration without thread-safety constraints.
      *
      * # Errors
      *
@@ -582,6 +585,9 @@ public protocol PerceptionServiceProtocol: AnyObject, Sendable {
  *
  * This service wraps the perception crate's TextGenerationModel and exposes
  * it via UniFFI for use in Swift/Kotlin shells.
+ *
+ * The model runs on a dedicated inference thread, allowing GPU-accelerated
+ * inference without requiring WGPU types to be `Send + Sync`.
  *
  * # Usage
  *
@@ -687,8 +693,8 @@ open func chat(message: String)async throws  -> String  {
     /**
      * Initializes the service by downloading and loading the model.
      *
-     * This is an async operation that may take time depending on network
-     * speed and whether the model is already cached.
+     * This spawns a dedicated inference thread that owns the model,
+     * enabling GPU acceleration without thread-safety constraints.
      *
      * # Errors
      *
@@ -814,6 +820,8 @@ public enum PerceptionError: Swift.Error, Equatable, Hashable, Foundation.Locali
     case LoadFailed(message: String
     )
     case AlreadyInitialized
+    case InferenceFailed(message: String
+    )
 
     
 
@@ -846,6 +854,9 @@ public struct FfiConverterTypePerceptionError: FfiConverterRustBuffer {
             message: try FfiConverterString.read(from: &buf)
             )
         case 3: return .AlreadyInitialized
+        case 4: return .InferenceFailed(
+            message: try FfiConverterString.read(from: &buf)
+            )
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -870,6 +881,11 @@ public struct FfiConverterTypePerceptionError: FfiConverterRustBuffer {
         case .AlreadyInitialized:
             writeInt(&buf, Int32(3))
         
+        
+        case let .InferenceFailed(message):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(message, into: &buf)
+            
         }
     }
 }
@@ -1015,7 +1031,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_eidolons_shared_checksum_method_perceptionservice_chat() != 63550) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_eidolons_shared_checksum_method_perceptionservice_initialize() != 5377) {
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_initialize() != 39172) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_eidolons_shared_checksum_method_perceptionservice_is_ready() != 2554) {

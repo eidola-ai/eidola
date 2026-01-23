@@ -1,15 +1,24 @@
 use anyhow::{Context, Result};
 use burn::backend::Autodiff;
 use burn_ndarray::NdArray;
+#[cfg(feature = "gpu")]
 use burn_wgpu::{Wgpu, WgpuDevice};
 
+pub mod generation;
+pub mod llama;
 pub mod model_manager;
+pub mod tokenizer;
 
-pub use model_manager::{ModelConfig, TextGenerationModel};
+pub use generation::{GenerationConfig, generate, generate_greedy};
+pub use llama::{Llama, LlamaConfig};
+pub use model_manager::{InferenceBackend, ModelConfig, TextGenerationModel};
+pub use tokenizer::TinyLlamaTokenizer;
 
 /// Backend type aliases for convenience.
+#[cfg(feature = "gpu")]
 pub type WgpuBackend = Wgpu<f32, i32, u8>;
 pub type NdArrayBackend = NdArray<f32>;
+#[cfg(feature = "gpu")]
 pub type AutodiffWgpuBackend = Autodiff<WgpuBackend>;
 pub type AutodiffNdArrayBackend = Autodiff<NdArrayBackend>;
 
@@ -17,6 +26,8 @@ pub type AutodiffNdArrayBackend = Autodiff<NdArrayBackend>;
 #[derive(Debug, Clone)]
 pub enum Backend {
     /// GPU-accelerated backend (Metal on macOS, Vulkan on Linux/Windows).
+    /// Only available with the `gpu` feature.
+    #[cfg(feature = "gpu")]
     Wgpu,
     /// CPU fallback using ndarray.
     NdArray,
@@ -36,23 +47,31 @@ impl BackendManager {
 
     /// Check if using GPU acceleration.
     pub fn is_gpu_accelerated(&self) -> bool {
-        matches!(self.backend, Backend::Wgpu)
+        #[cfg(feature = "gpu")]
+        if matches!(self.backend, Backend::Wgpu) {
+            return true;
+        }
+        false
     }
 }
 
 /// Attempts to initialize the best available compute backend.
 ///
-/// Tries WGPU (GPU via Metal/Vulkan) first, then falls back to NdArray (CPU).
+/// With `gpu` feature: tries WGPU (GPU via Metal/Vulkan) first, then falls back to NdArray (CPU).
+/// Without `gpu` feature: uses NdArray (CPU) only.
 pub fn init_backend() -> Result<BackendManager> {
-    // Try WGPU backend first (provides Metal on macOS, Vulkan elsewhere)
-    match try_init_wgpu() {
-        Ok(()) => {
-            return Ok(BackendManager {
-                backend: Backend::Wgpu,
-            });
-        }
-        Err(e) => {
-            eprintln!("WGPU backend unavailable: {e}. Falling back to CPU.");
+    #[cfg(feature = "gpu")]
+    {
+        // Try WGPU backend first (provides Metal on macOS, Vulkan elsewhere)
+        match try_init_wgpu() {
+            Ok(()) => {
+                return Ok(BackendManager {
+                    backend: Backend::Wgpu,
+                });
+            }
+            Err(e) => {
+                eprintln!("WGPU backend unavailable: {e}. Falling back to CPU.");
+            }
         }
     }
 
@@ -65,6 +84,7 @@ pub fn init_backend() -> Result<BackendManager> {
 }
 
 /// Attempts to initialize the WGPU backend.
+#[cfg(feature = "gpu")]
 fn try_init_wgpu() -> Result<()> {
     use std::panic;
 
@@ -114,6 +134,7 @@ mod tests {
 
         // Should have initialized some backend
         match manager.backend() {
+            #[cfg(feature = "gpu")]
             Backend::Wgpu => {
                 println!("Initialized with WGPU (GPU) backend");
                 assert!(manager.is_gpu_accelerated());
