@@ -92,24 +92,36 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 
 ## Build Commands
 
-All builds use Nix for reproducibility. Run `nix develop` to enter dev shell.
+For rapid iteration, **prefer the local Rust toolchain** inside the Nix development shell. Nix is the final source of authority for CI and releases, but standard `cargo` commands allow for incremental compilation.
 
 ```bash
-# Development
+# 1. Enter the development environment
+nix develop
+
+# 2. Development (Inner Loop - PREFERRED)
 cargo build -p eidolons-server    # Quick local build
-cargo clippy -p eidolons-server   # Lint
+cargo test                        # Run tests
+cargo clippy                      # Lint
 cargo fmt                         # Format
 
-# Production builds (Nix)
+# 3. Updating generated files (after changing Rust APIs/types)
+# These scripts auto-generate artifacts using your local toolchain.
+scripts/update-shared-bindings.sh
+scripts/update-server-openapi.sh
+scripts/update-shared-xcframework.sh  # Requires macOS
+
+# 4. Verification (Simulates CI)
+# Optimized for speed; focuses on correctness, not heavy artifact building.
+nix flake check
+
+# 5. Production builds (Nix - Final Authority)
 nix build '.#server'                              # Native binary
-nix build '.#server--aarch64-unknown-linux-musl'  # Linux ARM64
-nix build '.#server-oci--aarch64-unknown-linux-musl'  # Linux ARM64 container
+nix build '.#server-oci'                          # OCI image
+nix build '.#eidolons-shared-swift-xcframework'   # Shared core XCFramework
 
-# Checks
-nix flake check   # All checks (fmt, clippy, tests, binding sync)
-
-# Swift bindings (after changing Rust APIs)
-nix run '.#update-eidolons-shared-swift-bindings' # eidolons-shared/ bindings
+# 6. Nix-based updates (for perfect CI parity)
+nix run '.#update-eidolons-shared-swift-bindings'
+nix run '.#update-server-openapi'
 ```
 
 ## Cross-Compilation
