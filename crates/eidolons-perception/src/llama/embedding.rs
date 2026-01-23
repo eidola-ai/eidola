@@ -14,7 +14,7 @@ pub struct Embedding<B: Backend> {
 }
 
 impl<B: Backend> Embedding<B> {
-    /// Creates a new embedding layer.
+    /// Creates a new embedding layer with random initialization.
     ///
     /// # Arguments
     ///
@@ -29,6 +29,15 @@ impl<B: Backend> Embedding<B> {
         }
         .init([vocab_size, hidden_size], device);
 
+        Self { weight }
+    }
+
+    /// Creates an embedding layer from pre-loaded weights.
+    ///
+    /// # Arguments
+    ///
+    /// * `weight` - Pre-loaded weight parameter of shape [vocab_size, hidden_size]
+    pub fn from_weights(weight: Param<Tensor<B, 2>>) -> Self {
         Self { weight }
     }
 

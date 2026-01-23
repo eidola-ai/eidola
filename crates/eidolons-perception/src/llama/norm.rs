@@ -18,7 +18,7 @@ pub struct RmsNorm<B: Backend> {
 }
 
 impl<B: Backend> RmsNorm<B> {
-    /// Creates a new RMSNorm layer.
+    /// Creates a new RMSNorm layer with default initialization.
     ///
     /// # Arguments
     ///
@@ -29,6 +29,16 @@ impl<B: Backend> RmsNorm<B> {
         // Initialize weight to ones
         let weight: Param<Tensor<B, 1>> = Initializer::Ones.init([hidden_size], device);
 
+        Self { weight, eps }
+    }
+
+    /// Creates a RMSNorm layer from pre-loaded weights.
+    ///
+    /// # Arguments
+    ///
+    /// * `weight` - Pre-loaded weight parameter of shape [hidden_size]
+    /// * `eps` - Small value for numerical stability
+    pub fn from_weights(weight: Param<Tensor<B, 1>>, eps: f64) -> Self {
         Self { weight, eps }
     }
 

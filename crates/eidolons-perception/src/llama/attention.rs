@@ -1,8 +1,30 @@
 //! Multi-head attention with Rotary Position Embeddings (RoPE) for Llama.
 
-use burn::module::Module;
-use burn::nn::{Initializer, Linear, LinearConfig};
+use burn::module::{Module, Param};
+use burn::nn::{Initializer, Linear, LinearConfig, LinearRecord};
 use burn::prelude::*;
+
+/// Creates a Linear layer from pre-loaded weights (no bias).
+///
+/// Expects weights in Burn format [in_features, out_features].
+/// (HuggingFace weights should be transposed before calling this function.)
+fn linear_from_weight<B: Backend>(weight: Param<Tensor<B, 2>>) -> Linear<B> {
+    // Burn stores weights as [in_features, out_features]
+    let [in_features, out_features] = weight.dims();
+    let device = weight.device();
+
+    // Create a Linear layer with the correct shape
+    let linear = LinearConfig::new(in_features, out_features)
+        .with_bias(false)
+        .init(&device);
+
+    // Create record with loaded weights and load it
+    let record = LinearRecord {
+        weight,
+        bias: None,
+    };
+    linear.load_record(record)
+}
 
 /// Multi-head attention with Rotary Position Embeddings.
 ///
@@ -79,6 +101,43 @@ impl<B: Backend> LlamaAttention<B> {
         }
     }
 
+    /// Creates an attention layer from pre-loaded weights.
+    ///
+    /// # Arguments
+    ///
+    /// * `q_proj_weight` - Query projection weights [hidden_size, num_heads * head_dim]
+    /// * `k_proj_weight` - Key projection weights [hidden_size, num_kv_heads * head_dim]
+    /// * `v_proj_weight` - Value projection weights [hidden_size, num_kv_heads * head_dim]
+    /// * `o_proj_weight` - Output projection weights [num_heads * head_dim, hidden_size]
+    /// * `num_heads` - Number of attention heads
+    /// * `num_kv_heads` - Number of key-value heads (for GQA)
+    /// * `rope_theta` - Rope theta for positional encoding
+    pub fn from_weights(
+        q_proj_weight: Param<Tensor<B, 2>>,
+        k_proj_weight: Param<Tensor<B, 2>>,
+        v_proj_weight: Param<Tensor<B, 2>>,
+        o_proj_weight: Param<Tensor<B, 2>>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        rope_theta: f64,
+    ) -> Self {
+        // Infer dimensions from weight shapes
+        // Linear weights in HuggingFace are [out_features, in_features]
+        let hidden_size = q_proj_weight.dims()[1];
+        let head_dim = hidden_size / num_heads;
+
+        Self {
+            q_proj: linear_from_weight(q_proj_weight),
+            k_proj: linear_from_weight(k_proj_weight),
+            v_proj: linear_from_weight(v_proj_weight),
+            o_proj: linear_from_weight(o_proj_weight),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_theta,
+        }
+    }
+
     /// Forward pass through the attention layer.
     pub fn forward(
         &self,
@@ -134,8 +193,15 @@ impl<B: Backend> LlamaAttention<B> {
         self.o_proj.forward(out)
     }
 
-    /// Simplified rotary position embeddings.
-    /// Uses a simpler implementation that avoids complex tensor slicing.
+    /// Rotary position embeddings using HuggingFace's split/half format.
+    ///
+    /// HuggingFace Llama uses the "split" format where:
+    /// - First half of head_dim and second half form rotation pairs
+    /// - This differs from the "interleaved" format used by Meta's original implementation
+    ///
+    /// The rotation formula (matching HuggingFace's rotate_half):
+    /// - new_first_half = first_half * cos - second_half * sin
+    /// - new_second_half = second_half * cos + first_half * sin
     fn apply_rope_simple(
         &self,
         x: Tensor<B, 4>,
@@ -144,7 +210,7 @@ impl<B: Backend> LlamaAttention<B> {
     ) -> Tensor<B, 4> {
         use burn::tensor::TensorData;
 
-        let [batch_size, seq_len, num_heads, head_dim] = x.dims();
+        let [_batch_size, seq_len, _num_heads, head_dim] = x.dims();
         let half_dim = head_dim / 2;
 
         // Generate position indices and frequencies
@@ -167,49 +233,49 @@ impl<B: Backend> LlamaAttention<B> {
         let cos = angles.clone().cos().reshape([1, seq_len, 1, half_dim]);
         let sin = angles.sin().reshape([1, seq_len, 1, half_dim]);
 
-        // Split x into even and odd parts using narrow
+        // Split x into first half and second half (HuggingFace format)
         // x shape: [batch, seq_len, num_heads, head_dim]
-        // We need to interleave the rotation, but for simplicity let's use a
-        // reshape-based approach that splits the last dim in half
+        // first_half: x[..., :half_dim], second_half: x[..., half_dim:]
+        let x_first_half = x.clone().narrow(3, 0, half_dim);
+        let x_second_half = x.narrow(3, half_dim, half_dim);
 
-        // Reshape to [batch, seq_len, num_heads, half_dim, 2]
-        let x_paired = x.reshape([batch_size, seq_len, num_heads, half_dim, 2]);
+        // Apply rotation (HuggingFace rotate_half formula):
+        // new_first_half = first_half * cos - second_half * sin
+        // new_second_half = second_half * cos + first_half * sin
+        let new_first_half = x_first_half.clone() * cos.clone() - x_second_half.clone() * sin.clone();
+        let new_second_half = x_second_half * cos + x_first_half * sin;
 
-        // Extract even (index 0) and odd (index 1) elements using narrow
-        let x_even = x_paired
-            .clone()
-            .narrow(4, 0, 1)
-            .reshape([batch_size, seq_len, num_heads, half_dim]);
-        let x_odd = x_paired
-            .narrow(4, 1, 1)
-            .reshape([batch_size, seq_len, num_heads, half_dim]);
-
-        // Apply rotation: [cos, -sin; sin, cos] to [even; odd]
-        let x_even_rot = x_even.clone() * cos.clone() - x_odd.clone() * sin.clone();
-        let x_odd_rot = x_even * sin + x_odd * cos;
-
-        // Interleave back: stack along last dim then reshape
-        let x_even_rot = x_even_rot.reshape([batch_size, seq_len, num_heads, half_dim, 1]);
-        let x_odd_rot = x_odd_rot.reshape([batch_size, seq_len, num_heads, half_dim, 1]);
-        let x_rot = Tensor::cat(vec![x_even_rot, x_odd_rot], 4);
-
-        x_rot.reshape([batch_size, seq_len, num_heads, head_dim])
+        // Concatenate back: [new_first_half, new_second_half]
+        Tensor::cat(vec![new_first_half, new_second_half], 3)
     }
 
     /// Expands K and V for grouped-query attention.
+    ///
+    /// In GQA, each KV head is shared by multiple Q heads.
+    /// For example, with 4 KV heads and 32 Q heads, each KV head serves 8 Q heads.
+    /// The expansion replicates each KV head consecutively: [kv0,kv0,...,kv1,kv1,...]
     fn expand_kv(&self, k: Tensor<B, 4>, v: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>) {
         if self.num_kv_heads == self.num_heads {
             return (k, v);
         }
 
-        let [batch_size, _num_kv_heads, seq_len, head_dim] = k.dims();
+        let [batch_size, num_kv_heads, seq_len, head_dim] = k.dims();
         let repeat_factor = self.num_heads / self.num_kv_heads;
 
-        // Repeat K and V along the head dimension
-        let k = k.repeat_dim(1, repeat_factor);
-        let v = v.repeat_dim(1, repeat_factor);
+        // Expand each KV head to serve multiple Q heads.
+        // Strategy: reshape to add a repeat dimension, expand, then flatten.
+        //
+        // K shape: [batch, num_kv_heads, seq, head_dim]
+        // -> reshape to [batch, num_kv_heads, 1, seq, head_dim]
+        // -> repeat along dim 2 to [batch, num_kv_heads, repeat_factor, seq, head_dim]
+        // -> reshape to [batch, num_heads, seq, head_dim]
 
-        // Reshape to correct dimensions
+        let k = k.reshape([batch_size, num_kv_heads, 1, seq_len, head_dim]);
+        let v = v.reshape([batch_size, num_kv_heads, 1, seq_len, head_dim]);
+
+        let k = k.repeat_dim(2, repeat_factor);
+        let v = v.repeat_dim(2, repeat_factor);
+
         let k = k.reshape([batch_size, self.num_heads, seq_len, head_dim]);
         let v = v.reshape([batch_size, self.num_heads, seq_len, head_dim]);
 

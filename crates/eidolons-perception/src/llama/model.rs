@@ -5,8 +5,28 @@ use super::config::LlamaConfig;
 use super::embedding::Embedding;
 use super::mlp::LlamaMlp;
 use super::norm::RmsNorm;
-use burn::module::Module;
+use burn::module::{Module, Param};
+use burn::nn::{Linear, LinearConfig, LinearRecord};
 use burn::prelude::*;
+
+/// Creates a Linear layer from pre-loaded weights (no bias).
+///
+/// Expects weights in Burn format [in_features, out_features].
+fn linear_from_weight<B: Backend>(weight: Param<Tensor<B, 2>>) -> Linear<B> {
+    // Burn stores weights as [in_features, out_features]
+    let [in_features, out_features] = weight.dims();
+    let device = weight.device();
+
+    let linear = LinearConfig::new(in_features, out_features)
+        .with_bias(false)
+        .init(&device);
+
+    let record = LinearRecord {
+        weight,
+        bias: None,
+    };
+    linear.load_record(record)
+}
 
 /// A single transformer layer in Llama.
 #[derive(Module, Debug)]
@@ -22,7 +42,7 @@ pub struct LlamaLayer<B: Backend> {
 }
 
 impl<B: Backend> LlamaLayer<B> {
-    /// Creates a new transformer layer.
+    /// Creates a new transformer layer with random initialization.
     pub fn new(config: &LlamaConfig, device: &B::Device) -> Self {
         Self {
             self_attn: LlamaAttention::new(
@@ -35,6 +55,21 @@ impl<B: Backend> LlamaLayer<B> {
             mlp: LlamaMlp::new(config.hidden_size, config.intermediate_size, device),
             input_layernorm: RmsNorm::new(config.hidden_size, config.rms_norm_eps, device),
             post_attention_layernorm: RmsNorm::new(config.hidden_size, config.rms_norm_eps, device),
+        }
+    }
+
+    /// Creates a transformer layer from pre-loaded weights.
+    pub fn from_weights(
+        self_attn: LlamaAttention<B>,
+        mlp: LlamaMlp<B>,
+        input_layernorm: RmsNorm<B>,
+        post_attention_layernorm: RmsNorm<B>,
+    ) -> Self {
+        Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
         }
     }
 
@@ -95,6 +130,31 @@ impl<B: Backend> Llama<B> {
             norm,
             lm_head,
             vocab_size: config.vocab_size,
+        }
+    }
+
+    /// Creates a Llama model from pre-loaded weights.
+    ///
+    /// # Arguments
+    ///
+    /// * `embed_tokens` - Token embedding layer
+    /// * `layers` - Transformer layers
+    /// * `norm` - Final layer normalization
+    /// * `lm_head_weight` - LM head weights
+    /// * `vocab_size` - Vocabulary size
+    pub fn from_weights(
+        embed_tokens: Embedding<B>,
+        layers: Vec<LlamaLayer<B>>,
+        norm: RmsNorm<B>,
+        lm_head_weight: Param<Tensor<B, 2>>,
+        vocab_size: usize,
+    ) -> Self {
+        Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head: linear_from_weight(lm_head_weight),
+            vocab_size,
         }
     }
 

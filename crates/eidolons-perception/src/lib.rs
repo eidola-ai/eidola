@@ -8,6 +8,7 @@ pub mod generation;
 pub mod llama;
 pub mod model_manager;
 pub mod tokenizer;
+pub mod weights;
 
 pub use generation::{GenerationConfig, generate, generate_greedy};
 pub use llama::{Llama, LlamaConfig};

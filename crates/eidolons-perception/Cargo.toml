@@ -46,5 +46,8 @@ rand = "0.8"
 # Half-precision float conversion for weight loading
 half = "2.4"
 
+# Safe transmute for tensor data conversion
+bytemuck = { version = "1.14", features = ["derive"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }

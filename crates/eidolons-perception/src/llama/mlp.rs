@@ -1,9 +1,28 @@
 //! Feed-forward network (MLP) with SwiGLU activation for Llama.
 
-use burn::module::Module;
-use burn::nn::{Initializer, Linear, LinearConfig};
+use burn::module::{Module, Param};
+use burn::nn::{Initializer, Linear, LinearConfig, LinearRecord};
 use burn::prelude::*;
 use burn::tensor::activation::sigmoid;
+
+/// Creates a Linear layer from pre-loaded weights (no bias).
+///
+/// Expects weights in Burn format [in_features, out_features].
+fn linear_from_weight<B: Backend>(weight: Param<Tensor<B, 2>>) -> Linear<B> {
+    // Burn stores weights as [in_features, out_features]
+    let [in_features, out_features] = weight.dims();
+    let device = weight.device();
+
+    let linear = LinearConfig::new(in_features, out_features)
+        .with_bias(false)
+        .init(&device);
+
+    let record = LinearRecord {
+        weight,
+        bias: None,
+    };
+    linear.load_record(record)
+}
 
 /// Feed-forward network with SwiGLU activation.
 ///
@@ -52,6 +71,25 @@ impl<B: Backend> LlamaMlp<B> {
             gate_proj,
             up_proj,
             down_proj,
+        }
+    }
+
+    /// Creates an MLP layer from pre-loaded weights.
+    ///
+    /// # Arguments
+    ///
+    /// * `gate_proj_weight` - Gate projection weights [hidden_size, intermediate_size]
+    /// * `up_proj_weight` - Up projection weights [hidden_size, intermediate_size]
+    /// * `down_proj_weight` - Down projection weights [intermediate_size, hidden_size]
+    pub fn from_weights(
+        gate_proj_weight: Param<Tensor<B, 2>>,
+        up_proj_weight: Param<Tensor<B, 2>>,
+        down_proj_weight: Param<Tensor<B, 2>>,
+    ) -> Self {
+        Self {
+            gate_proj: linear_from_weight(gate_proj_weight),
+            up_proj: linear_from_weight(up_proj_weight),
+            down_proj: linear_from_weight(down_proj_weight),
         }
     }
 

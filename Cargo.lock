@@ -2424,6 +2424,7 @@ dependencies = [
  "burn-cubecl",
  "burn-ndarray",
  "burn-wgpu",
+ "bytemuck",
  "half",
  "hf-hub",
  "rand 0.8.5",
