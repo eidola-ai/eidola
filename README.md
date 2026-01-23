@@ -104,18 +104,19 @@ ANTHROPIC_API_KEY="<sk-ant-YOUR_API_KEY>" cargo run -p eidolons-server
 ```
 
 **Updating generated files:**
-If you change Rust APIs or types, you must update the committed Swift bindings or OpenAPI spec:
+If you change Rust APIs or types, you must update the committed Swift bindings or OpenAPI spec. The preferred way is using Nix, which ensures the same environment as CI:
 ```bash
 nix run '.#update-eidolons-shared-swift-bindings'     # Update bindings and types
 nix run '.#update-eidolons-shared-swift-xcframework'  # Update the static XCFramework
 nix run '.#update-server-openapi'                     # Update OpenAPI spec
 ```
 
-Note that these can also be updated outside of nix:
+These can also be updated outside of Nix using your local Rust toolchain (auto-generates via `cargo run`):
 ```bash
-scripts/update-server-openapi.sh crates/eidolons-server/openapi.json
-# ...
+scripts/update-shared-bindings.sh
+scripts/update-server-openapi.sh
 ```
+*Note: `update-shared-xcframework.sh` still requires an explicit source path as building multi-arch frameworks is platform-dependent.*
 
 Generated artifacts are committed and verified by CI:
 - `apps/eidolons-shared/swift/` - Shared core bindings (UniFFI + Crux types)
