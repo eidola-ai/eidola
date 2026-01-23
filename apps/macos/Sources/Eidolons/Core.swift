@@ -69,14 +69,21 @@ public final class Core {
     case .perception(let perceptionRequest):
       // Perception capability: call the AI service asynchronously
       let requestId = request.id
+      // Convert Crux ChatMessage to UniFFI ServiceChatMessage
+      let messages = perceptionRequest.messages.map { msg in
+        ServiceChatMessage(
+          role: msg.role == .user ? .user : .assistant,
+          content: msg.content
+        )
+      }
       Task {
-        await handlePerception(requestId: requestId, prompt: perceptionRequest.prompt)
+        await handlePerception(requestId: requestId, messages: messages)
       }
     }
   }
 
   /// Handles perception requests asynchronously
-  private func handlePerception(requestId: UInt32, prompt: String) async {
+  private func handlePerception(requestId: UInt32, messages: [ServiceChatMessage]) async {
     // Ensure the service is initialized (downloads model if needed)
     let isReady = await perceptionService.isReady()
     if !isReady {
@@ -91,9 +98,9 @@ public final class Core {
       }
     }
 
-    // Call the AI service
+    // Call the AI service with full conversation history
     do {
-      let result = try await perceptionService.chat(message: prompt)
+      let result = try await perceptionService.chat(messages: messages)
       let response = SharedTypes.PerceptionResponse(response: result)
       sendPerceptionResponse(requestId: requestId, response: response)
     } catch {

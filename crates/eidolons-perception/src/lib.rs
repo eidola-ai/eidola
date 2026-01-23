@@ -13,7 +13,7 @@ pub mod weights;
 pub use generation::{GenerationConfig, generate, generate_greedy};
 pub use llama::{Llama, LlamaConfig};
 pub use model_manager::{InferenceBackend, ModelConfig, TextGenerationModel};
-pub use tokenizer::TinyLlamaTokenizer;
+pub use tokenizer::{ChatRole, FormatMessage, TinyLlamaTokenizer};
 
 /// Backend type aliases for convenience.
 #[cfg(feature = "gpu")]

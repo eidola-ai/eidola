@@ -220,15 +220,15 @@ public struct HelloResponse: Hashable {
 }
 
 public struct PerceptionRequest: Hashable {
-    @Indirect public var prompt: String
+    @Indirect public var messages: [SharedTypes.ChatMessage]
 
-    public init(prompt: String) {
-        self.prompt = prompt
+    public init(messages: [SharedTypes.ChatMessage]) {
+        self.messages = messages
     }
 
     public func serialize<S: Serializer>(serializer: S) throws {
         try serializer.increase_container_depth()
-        try serializer.serialize_str(value: self.prompt)
+        try serialize_vector_ChatMessage(value: self.messages, serializer: serializer)
         try serializer.decrease_container_depth()
     }
 
@@ -240,9 +240,9 @@ public struct PerceptionRequest: Hashable {
 
     public static func deserialize<D: Deserializer>(deserializer: D) throws -> PerceptionRequest {
         try deserializer.increase_container_depth()
-        let prompt = try deserializer.deserialize_str()
+        let messages = try deserialize_vector_ChatMessage(deserializer: deserializer)
         try deserializer.decrease_container_depth()
-        return PerceptionRequest.init(prompt: prompt)
+        return PerceptionRequest.init(messages: messages)
     }
 
     public static func bincodeDeserialize(input: [UInt8]) throws -> PerceptionRequest {

@@ -2,8 +2,27 @@
 //!
 //! Uses a dedicated inference thread to avoid `Send + Sync` requirements on GPU types.
 
+use eidolons_perception::{ChatRole, FormatMessage};
 use std::sync::{Arc, LazyLock, RwLock};
 use tokio::sync::{mpsc, oneshot};
+
+/// Role of a chat message sender (UniFFI-compatible).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ServiceRole {
+    /// Message from the user
+    User,
+    /// Message from the AI assistant
+    Assistant,
+}
+
+/// A chat message for the perception service (UniFFI-compatible).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ServiceChatMessage {
+    /// The role of the message sender
+    pub role: ServiceRole,
+    /// The message content
+    pub content: String,
+}
 
 /// Shared Tokio runtime for all async services (Perception, Memory, etc.)
 ///
@@ -32,9 +51,9 @@ pub enum PerceptionError {
 
 /// Commands sent to the inference thread.
 enum InferenceCommand {
-    /// Generate a response for the given prompt.
+    /// Generate a response for the given conversation.
     Generate {
-        prompt: String,
+        messages: Vec<ServiceChatMessage>,
         response_tx: oneshot::Sender<Result<String, String>>,
     },
     /// Get model info.
@@ -111,10 +130,22 @@ impl InferenceHandle {
             rt.block_on(async {
                 while let Some(cmd) = command_rx.recv().await {
                     match cmd {
-                        InferenceCommand::Generate { prompt, response_tx } => {
+                        InferenceCommand::Generate { messages, response_tx } => {
+                            // Convert messages to the format expected by the model
+                            let format_messages: Vec<FormatMessage<'_>> = messages
+                                .iter()
+                                .map(|m| FormatMessage {
+                                    role: match m.role {
+                                        ServiceRole::User => ChatRole::User,
+                                        ServiceRole::Assistant => ChatRole::Assistant,
+                                    },
+                                    content: &m.content,
+                                })
+                                .collect();
+
                             // Catch panics during inference
                             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                model.generate(&prompt)
+                                model.generate_from_conversation(&format_messages)
                             }));
                             match result {
                                 Ok(output) => {
@@ -259,11 +290,11 @@ impl PerceptionService {
         state.is_some_and(|s| matches!(&*s, ServiceState::Ready(_)))
     }
 
-    /// Generates a response for the given message.
+    /// Generates a response for the given conversation history.
     ///
     /// # Arguments
     ///
-    /// * `message` - The input message/prompt
+    /// * `messages` - The conversation history as a list of messages
     ///
     /// # Returns
     ///
@@ -272,7 +303,7 @@ impl PerceptionService {
     /// # Errors
     ///
     /// Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
-    pub async fn chat(&self, message: String) -> Result<String, PerceptionError> {
+    pub async fn chat(&self, messages: Vec<ServiceChatMessage>) -> Result<String, PerceptionError> {
         let handle = {
             let state = self
                 .state
@@ -288,7 +319,7 @@ impl PerceptionService {
         let (response_tx, response_rx) = oneshot::channel();
         handle
             .send(InferenceCommand::Generate {
-                prompt: message,
+                messages,
                 response_tx,
             })
             .await
@@ -354,7 +385,11 @@ mod tests {
         assert!(!service.is_ready().await);
 
         // Chat should fail before initialization
-        let result = service.chat("test".to_string()).await;
+        let messages = vec![ServiceChatMessage {
+            role: ServiceRole::User,
+            content: "test".to_string(),
+        }];
+        let result = service.chat(messages).await;
         assert!(matches!(result, Err(PerceptionError::NotInitialized)));
     }
 
@@ -382,12 +417,35 @@ mod tests {
             println!("Model info: {}", info);
         }
 
-        // Run inference
+        // Run inference with single message
         println!("Running inference...");
-        let response = service
-            .chat("Hello!".to_string())
-            .await
-            .expect("Chat should succeed");
+        let messages = vec![ServiceChatMessage {
+            role: ServiceRole::User,
+            content: "Hello!".to_string(),
+        }];
+        let response = service.chat(messages).await.expect("Chat should succeed");
         println!("Chat response: {}", response);
+
+        // Run multi-turn inference
+        println!("Running multi-turn inference...");
+        let messages = vec![
+            ServiceChatMessage {
+                role: ServiceRole::User,
+                content: "What is 2 + 2?".to_string(),
+            },
+            ServiceChatMessage {
+                role: ServiceRole::Assistant,
+                content: "2 + 2 equals 4.".to_string(),
+            },
+            ServiceChatMessage {
+                role: ServiceRole::User,
+                content: "And what is 3 + 3?".to_string(),
+            },
+        ];
+        let response = service
+            .chat(messages)
+            .await
+            .expect("Multi-turn chat should succeed");
+        println!("Multi-turn response: {}", response);
     }
 }

@@ -538,11 +538,11 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 public protocol PerceptionServiceProtocol: AnyObject, Sendable {
     
     /**
-     * Generates a response for the given message.
+     * Generates a response for the given conversation history.
      *
      * # Arguments
      *
-     * * `message` - The input message/prompt
+     * * `messages` - The conversation history as a list of messages
      *
      * # Returns
      *
@@ -552,7 +552,7 @@ public protocol PerceptionServiceProtocol: AnyObject, Sendable {
      *
      * Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
      */
-    func chat(message: String) async throws  -> String
+    func chat(messages: [ServiceChatMessage]) async throws  -> String
     
     /**
      * Initializes the service by downloading and loading the model.
@@ -659,11 +659,11 @@ public convenience init() {
 
     
     /**
-     * Generates a response for the given message.
+     * Generates a response for the given conversation history.
      *
      * # Arguments
      *
-     * * `message` - The input message/prompt
+     * * `messages` - The conversation history as a list of messages
      *
      * # Returns
      *
@@ -673,13 +673,13 @@ public convenience init() {
      *
      * Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
      */
-open func chat(message: String)async throws  -> String  {
+open func chat(messages: [ServiceChatMessage])async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_eidolons_shared_fn_method_perceptionservice_chat(
                     self.uniffiCloneHandle(),
-                    FfiConverterString.lower(message)
+                    FfiConverterSequenceTypeServiceChatMessage.lower(messages)
                 )
             },
             pollFunc: ffi_eidolons_shared_rust_future_poll_rust_buffer,
@@ -810,6 +810,73 @@ public func FfiConverterTypePerceptionService_lower(_ value: PerceptionService) 
 
 
 /**
+ * A chat message for the perception service (UniFFI-compatible).
+ */
+public struct ServiceChatMessage: Equatable, Hashable {
+    /**
+     * The role of the message sender
+     */
+    public var role: ServiceRole
+    /**
+     * The message content
+     */
+    public var content: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The role of the message sender
+         */role: ServiceRole, 
+        /**
+         * The message content
+         */content: String) {
+        self.role = role
+        self.content = content
+    }
+
+    
+}
+
+#if compiler(>=6)
+extension ServiceChatMessage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeServiceChatMessage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ServiceChatMessage {
+        return
+            try ServiceChatMessage(
+                role: FfiConverterTypeServiceRole.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ServiceChatMessage, into buf: inout [UInt8]) {
+        FfiConverterTypeServiceRole.write(value.role, into: &buf)
+        FfiConverterString.write(value.content, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeServiceChatMessage_lift(_ buf: RustBuffer) throws -> ServiceChatMessage {
+    return try FfiConverterTypeServiceChatMessage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeServiceChatMessage_lower(_ value: ServiceChatMessage) -> RustBuffer {
+    return FfiConverterTypeServiceChatMessage.lower(value)
+}
+
+
+/**
  * Error type for perception service operations.
  */
 public enum PerceptionError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
@@ -903,6 +970,105 @@ public func FfiConverterTypePerceptionError_lift(_ buf: RustBuffer) throws -> Pe
 #endif
 public func FfiConverterTypePerceptionError_lower(_ value: PerceptionError) -> RustBuffer {
     return FfiConverterTypePerceptionError.lower(value)
+}
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Role of a chat message sender (UniFFI-compatible).
+ */
+
+public enum ServiceRole: Equatable, Hashable {
+    
+    /**
+     * Message from the user
+     */
+    case user
+    /**
+     * Message from the AI assistant
+     */
+    case assistant
+
+
+
+}
+
+#if compiler(>=6)
+extension ServiceRole: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeServiceRole: FfiConverterRustBuffer {
+    typealias SwiftType = ServiceRole
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ServiceRole {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .user
+        
+        case 2: return .assistant
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ServiceRole, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .user:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .assistant:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeServiceRole_lift(_ buf: RustBuffer) throws -> ServiceRole {
+    return try FfiConverterTypeServiceRole.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeServiceRole_lower(_ value: ServiceRole) -> RustBuffer {
+    return FfiConverterTypeServiceRole.lower(value)
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeServiceChatMessage: FfiConverterRustBuffer {
+    typealias SwiftType = [ServiceChatMessage]
+
+    public static func write(_ value: [ServiceChatMessage], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeServiceChatMessage.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ServiceChatMessage] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ServiceChatMessage]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeServiceChatMessage.read(from: &buf))
+        }
+        return seq
+    }
 }
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
@@ -1028,7 +1194,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_eidolons_shared_checksum_func_view() != 29235) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_eidolons_shared_checksum_method_perceptionservice_chat() != 63550) {
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_chat() != 9735) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_eidolons_shared_checksum_method_perceptionservice_initialize() != 39172) {

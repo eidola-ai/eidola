@@ -357,6 +357,67 @@ impl TextGenerationModel {
         self.generate_with_config(prompt, GenerationConfig::default())
     }
 
+    /// Generates text from a multi-turn conversation.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - The conversation history as a slice of messages
+    ///
+    /// # Returns
+    ///
+    /// Generated text response that continues the conversation.
+    pub fn generate_from_conversation(&self, messages: &[crate::tokenizer::FormatMessage<'_>]) -> String {
+        self.generate_from_conversation_with_config(messages, GenerationConfig::default())
+    }
+
+    /// Generates text from a multi-turn conversation with custom configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - The conversation history as a slice of messages
+    /// * `gen_config` - Generation configuration (temperature, top-p, etc.)
+    ///
+    /// # Returns
+    ///
+    /// Generated text response.
+    pub fn generate_from_conversation_with_config(
+        &self,
+        messages: &[crate::tokenizer::FormatMessage<'_>],
+        gen_config: GenerationConfig,
+    ) -> String {
+        // Format the conversation using ChatML template
+        let formatted_prompt = TinyLlamaTokenizer::format_multi_turn_prompt(messages);
+
+        // Encode prompt
+        let input_ids = match self.tokenizer.encode(&formatted_prompt, true) {
+            Ok(ids) => ids,
+            Err(e) => {
+                eprintln!("Tokenization error: {}", e);
+                return format!("[Tokenization error: {}]", e);
+            }
+        };
+
+        // Run generation based on backend
+        let output_ids = match &self.model {
+            #[cfg(feature = "gpu")]
+            LoadedModel::Wgpu { model, device } => generate(model, input_ids, &gen_config, device),
+            LoadedModel::NdArray { model, device } => {
+                generate(model, input_ids, &gen_config, device)
+            }
+        };
+
+        // Decode output (skip the input tokens)
+        let new_tokens = &output_ids[output_ids.len().saturating_sub(gen_config.max_new_tokens)..];
+
+        match self.tokenizer.decode(new_tokens, true) {
+            Ok(text) => text.trim().to_string(),
+            Err(e) => {
+                eprintln!("Decoding error: {}", e);
+                format!("[Decoding error: {}]", e)
+            }
+        }
+    }
+
     /// Generates text with custom configuration.
     ///
     /// # Arguments
@@ -684,6 +745,41 @@ mod tests {
                 prompt
             );
         }
+    }
+
+    /// Test that single-turn and multi-turn produce same output for single message.
+    /// Run with: cargo test -p eidolons-perception --release -- --ignored test_single_vs_multi_turn --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn test_single_vs_multi_turn() {
+        use crate::tokenizer::{ChatRole, FormatMessage};
+
+        println!("Loading model...");
+        let model = TextGenerationModel::load()
+            .await
+            .expect("Failed to load model");
+
+        let prompt = "Hello!";
+        println!("\nTesting prompt: {}", prompt);
+
+        // Test single-turn
+        println!("\n=== Single-turn (original generate) ===");
+        let single_response = model.generate(prompt);
+        println!("Response: {}", single_response);
+
+        // Test multi-turn with single message
+        println!("\n=== Multi-turn (generate_from_conversation) ===");
+        let messages = vec![FormatMessage {
+            role: ChatRole::User,
+            content: prompt,
+        }];
+        let multi_response = model.generate_from_conversation(&messages);
+        println!("Response: {}", multi_response);
+
+        // The responses should be similar (not necessarily identical due to sampling)
+        println!("\n=== Comparison ===");
+        println!("Single-turn length: {}", single_response.len());
+        println!("Multi-turn length: {}", multi_response.len());
     }
 
     /// Diagnostic test to examine model logits and greedy decoding.

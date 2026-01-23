@@ -13,6 +13,24 @@ pub const EOS_TOKEN: &str = "</s>";
 pub const BOS_TOKEN_ID: u32 = 1;
 pub const EOS_TOKEN_ID: u32 = 2;
 
+/// Role for multi-turn chat formatting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    /// User message
+    User,
+    /// Assistant message
+    Assistant,
+}
+
+/// A message in a multi-turn conversation for formatting.
+#[derive(Debug, Clone)]
+pub struct FormatMessage<'a> {
+    /// The role of the message sender
+    pub role: ChatRole,
+    /// The message content
+    pub content: &'a str,
+}
+
 /// Wrapper around the HuggingFace tokenizer for TinyLlama models.
 #[derive(Debug)]
 pub struct TinyLlamaTokenizer {
@@ -108,6 +126,49 @@ impl TinyLlamaTokenizer {
             user_message
         )
     }
+
+    /// Formats a multi-turn conversation for TinyLlama.
+    ///
+    /// Uses the ChatML format:
+    /// ```text
+    /// <|system|>
+    /// You are a helpful assistant.</s>
+    /// <|user|>
+    /// {first user message}</s>
+    /// <|assistant|>
+    /// {first assistant response}</s>
+    /// <|user|>
+    /// {second user message}</s>
+    /// <|assistant|>
+    /// ```
+    ///
+    /// The final `<|assistant|>` tag prompts the model to generate a response.
+    pub fn format_multi_turn_prompt(messages: &[FormatMessage<'_>]) -> String {
+        let mut formatted = String::new();
+
+        // Start with system prompt
+        formatted.push_str("<|system|>\nYou are a helpful assistant.</s>\n");
+
+        // Add each message in the conversation
+        for msg in messages {
+            match msg.role {
+                ChatRole::User => {
+                    formatted.push_str("<|user|>\n");
+                    formatted.push_str(msg.content);
+                    formatted.push_str("</s>\n");
+                }
+                ChatRole::Assistant => {
+                    formatted.push_str("<|assistant|>\n");
+                    formatted.push_str(msg.content);
+                    formatted.push_str("</s>\n");
+                }
+            }
+        }
+
+        // Add assistant prefix for model to continue
+        formatted.push_str("<|assistant|>\n");
+        formatted
+    }
 }
 
 /// Loads a tokenizer from the HuggingFace hub cache.
@@ -139,5 +200,70 @@ mod tests {
         assert!(formatted.contains("<|user|>"));
         assert!(formatted.contains("Hello!"));
         assert!(formatted.contains("<|assistant|>"));
+    }
+
+    #[test]
+    fn test_multi_turn_format_single_message() {
+        let messages = vec![FormatMessage {
+            role: ChatRole::User,
+            content: "Hello!",
+        }];
+        let formatted = TinyLlamaTokenizer::format_multi_turn_prompt(&messages);
+
+        assert!(formatted.contains("<|system|>"));
+        assert!(formatted.contains("<|user|>\nHello!</s>"));
+        assert!(formatted.ends_with("<|assistant|>\n"));
+    }
+
+    #[test]
+    fn test_multi_turn_matches_single_turn_format() {
+        // Single user message through multi-turn should match single-turn exactly
+        let single_turn = TinyLlamaTokenizer::format_chat_prompt("Hello!");
+
+        let messages = vec![FormatMessage {
+            role: ChatRole::User,
+            content: "Hello!",
+        }];
+        let multi_turn = TinyLlamaTokenizer::format_multi_turn_prompt(&messages);
+
+        println!("=== Single-turn format ===");
+        println!("{:?}", single_turn);
+        println!("=== Multi-turn format ===");
+        println!("{:?}", multi_turn);
+
+        assert_eq!(single_turn, multi_turn, "Single message multi-turn should match single-turn format exactly");
+    }
+
+    #[test]
+    fn test_multi_turn_format_conversation() {
+        let messages = vec![
+            FormatMessage {
+                role: ChatRole::User,
+                content: "What is 2+2?",
+            },
+            FormatMessage {
+                role: ChatRole::Assistant,
+                content: "2+2 equals 4.",
+            },
+            FormatMessage {
+                role: ChatRole::User,
+                content: "And 3+3?",
+            },
+        ];
+        let formatted = TinyLlamaTokenizer::format_multi_turn_prompt(&messages);
+
+        // Check structure
+        assert!(formatted.contains("<|system|>\nYou are a helpful assistant.</s>"));
+        assert!(formatted.contains("<|user|>\nWhat is 2+2?</s>"));
+        assert!(formatted.contains("<|assistant|>\n2+2 equals 4.</s>"));
+        assert!(formatted.contains("<|user|>\nAnd 3+3?</s>"));
+        assert!(formatted.ends_with("<|assistant|>\n"));
+
+        // Check order (user1 before assistant, assistant before user2)
+        let user1_pos = formatted.find("What is 2+2?").unwrap();
+        let asst_pos = formatted.find("2+2 equals 4.").unwrap();
+        let user2_pos = formatted.find("And 3+3?").unwrap();
+        assert!(user1_pos < asst_pos);
+        assert!(asst_pos < user2_pos);
     }
 }

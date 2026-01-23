@@ -6,25 +6,9 @@ use crux_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::capabilities::hello::{HelloRequest, HelloResponse, hello};
-use crate::capabilities::perception::{PerceptionRequest, PerceptionResponse, ask};
-
-/// Role of a chat message sender
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum Role {
-    /// Message from the user
-    User,
-    /// Message from the AI assistant
-    Assistant,
-}
-
-/// A single message in the conversation
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ChatMessage {
-    /// Who sent this message
-    pub role: Role,
-    /// The message content
-    pub content: String,
-}
+use crate::capabilities::perception::{
+    ChatMessage, PerceptionRequest, PerceptionResponse, Role, ask_with_history,
+};
 
 /// Events that can be sent from the shell to the core
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -105,12 +89,16 @@ impl App for EidolonsApp {
                 // Add user message to conversation
                 model.conversation.push(ChatMessage {
                     role: Role::User,
-                    content: message.clone(),
+                    content: message,
                 });
                 model.is_processing = true;
 
-                // Request AI response and render to show loading state
-                Command::all([render(), ask(message).then_send(Event::PerceptionResponse)])
+                // Pass full conversation history to perception for context-aware responses
+                let messages = model.conversation.clone();
+                Command::all([
+                    render(),
+                    ask_with_history(messages).then_send(Event::PerceptionResponse),
+                ])
             }
             Event::PerceptionResponse(response) => {
                 // Add assistant message to conversation
@@ -212,12 +200,16 @@ mod tests {
         assert_eq!(effects.len(), 2);
 
         let has_render = effects.iter().any(|e| matches!(e, Effect::Render(_)));
-        let has_perception = effects
-            .iter()
-            .any(|e| matches!(e, Effect::Perception(req) if req.operation.prompt == "Hello AI"));
+        let has_perception = effects.iter().any(|e| {
+            matches!(e, Effect::Perception(req) if
+                req.operation.messages.len() == 1 &&
+                req.operation.messages[0].content == "Hello AI" &&
+                req.operation.messages[0].role == Role::User
+            )
+        });
 
         assert!(has_render, "Should have Render effect");
-        assert!(has_perception, "Should have Perception effect");
+        assert!(has_perception, "Should have Perception effect with full conversation");
     }
 
     #[test]
