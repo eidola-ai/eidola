@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::capabilities::hello::{HelloRequest, HelloResponse, hello};
 use crate::capabilities::perception::{
-    ChatMessage, PerceptionRequest, PerceptionResponse, Role, ask_with_history,
+    ChatMessage, PerceptionRequest, PerceptionResponse, PerceptionStreamingRequest,
+    PerceptionStreamingResponse, Role, ask_with_history, ask_with_history_streaming,
 };
 
 /// Events that can be sent from the shell to the core
@@ -18,11 +19,19 @@ pub enum Event {
     /// Response from the hello capability with the greeting
     #[serde(skip)]
     GreetingReceived(HelloResponse),
-    /// Submit a chat message to the AI
+    /// Submit a chat message to the AI (non-streaming)
     SubmitMessage(String),
-    /// Response from the perception capability
+    /// Submit a chat message to the AI with streaming response
+    SubmitMessageStreaming(String),
+    /// Response from the perception capability (non-streaming)
     #[serde(skip)]
     PerceptionResponse(PerceptionResponse),
+    /// A chunk of text received during streaming
+    PerceptionChunk(String),
+    /// Streaming generation completed successfully
+    PerceptionStreamComplete,
+    /// An error occurred during streaming generation
+    PerceptionStreamError(String),
 }
 
 /// The internal application model (private state)
@@ -34,6 +43,8 @@ pub struct Model {
     pub conversation: Vec<ChatMessage>,
     /// Whether we're waiting for an AI response
     pub is_processing: bool,
+    /// The current streaming response being built up
+    pub streaming_response: String,
 }
 
 /// The view model exposed to the shell (public view state)
@@ -45,6 +56,8 @@ pub struct ViewModel {
     pub conversation: Vec<ChatMessage>,
     /// Whether we're waiting for an AI response
     pub is_processing: bool,
+    /// The current streaming text being generated
+    pub streaming_text: String,
 }
 
 /// Side effects the core can request from the shell
@@ -54,8 +67,10 @@ pub enum Effect {
     Render(RenderOperation),
     /// Request the hello capability
     Hello(HelloRequest),
-    /// Request the perception capability
+    /// Request the perception capability (non-streaming)
     Perception(PerceptionRequest),
+    /// Request the perception capability with streaming
+    PerceptionStreaming(PerceptionStreamingRequest),
 }
 
 /// The main Crux application
@@ -110,6 +125,64 @@ impl App for EidolonsApp {
 
                 render()
             }
+            Event::SubmitMessageStreaming(message) => {
+                // Add user message to conversation
+                model.conversation.push(ChatMessage {
+                    role: Role::User,
+                    content: message,
+                });
+                model.is_processing = true;
+                model.streaming_response.clear();
+
+                // Pass full conversation history to perception for streaming response
+                let messages = model.conversation.clone();
+
+                // Create a command that streams responses and sends events for each
+                let stream_cmd = Command::new(|ctx| async move {
+                    use futures::StreamExt;
+                    let mut stream = ask_with_history_streaming(messages).into_stream(ctx.clone());
+                    while let Some(response) = stream.next().await {
+                        match response {
+                            PerceptionStreamingResponse::Chunk(text) => {
+                                ctx.send_event(Event::PerceptionChunk(text));
+                            }
+                            PerceptionStreamingResponse::Done => {
+                                ctx.send_event(Event::PerceptionStreamComplete);
+                            }
+                            PerceptionStreamingResponse::Error(e) => {
+                                ctx.send_event(Event::PerceptionStreamError(e));
+                            }
+                        }
+                    }
+                });
+
+                Command::all([render(), stream_cmd])
+            }
+            Event::PerceptionChunk(text) => {
+                // Append the chunk to the streaming response
+                model.streaming_response.push_str(&text);
+                render()
+            }
+            Event::PerceptionStreamComplete => {
+                // Move the completed streaming response to conversation
+                let response = std::mem::take(&mut model.streaming_response);
+                model.conversation.push(ChatMessage {
+                    role: Role::Assistant,
+                    content: response,
+                });
+                model.is_processing = false;
+                render()
+            }
+            Event::PerceptionStreamError(error) => {
+                // Add error as assistant message
+                model.conversation.push(ChatMessage {
+                    role: Role::Assistant,
+                    content: format!("Error: {}", error),
+                });
+                model.streaming_response.clear();
+                model.is_processing = false;
+                render()
+            }
         }
     }
 
@@ -118,6 +191,7 @@ impl App for EidolonsApp {
             greeting: model.greeting.clone().unwrap_or_default(),
             conversation: model.conversation.clone(),
             is_processing: model.is_processing,
+            streaming_text: model.streaming_response.clone(),
         }
     }
 }
@@ -209,7 +283,10 @@ mod tests {
         });
 
         assert!(has_render, "Should have Render effect");
-        assert!(has_perception, "Should have Perception effect with full conversation");
+        assert!(
+            has_perception,
+            "Should have Perception effect with full conversation"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 use crate::NdArrayBackend;
 #[cfg(feature = "gpu")]
 use crate::WgpuBackend;
-use crate::generation::{GenerationConfig, generate};
+use crate::generation::{GenerationConfig, StreamToken, generate, generate_streaming};
 use crate::llama::{Llama, LlamaConfig};
 use crate::tokenizer::{TinyLlamaTokenizer, load_tokenizer};
 use crate::weights::load_llama_from_safetensors;
@@ -18,6 +18,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Once;
+use std::sync::mpsc;
 
 /// Ensures the TLS crypto provider is installed exactly once.
 static CRYPTO_PROVIDER_INIT: Once = Once::new();
@@ -64,6 +65,17 @@ pub enum InferenceBackend {
     /// CPU inference using ndarray.
     #[default]
     NdArray,
+}
+
+/// Chunk emitted during streaming text generation.
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    /// A chunk of decoded text.
+    Text(String),
+    /// Generation is complete.
+    Done,
+    /// An error occurred during generation.
+    Error(String),
 }
 
 /// Internal model representation that can use either backend.
@@ -366,7 +378,10 @@ impl TextGenerationModel {
     /// # Returns
     ///
     /// Generated text response that continues the conversation.
-    pub fn generate_from_conversation(&self, messages: &[crate::tokenizer::FormatMessage<'_>]) -> String {
+    pub fn generate_from_conversation(
+        &self,
+        messages: &[crate::tokenizer::FormatMessage<'_>],
+    ) -> String {
         self.generate_from_conversation_with_config(messages, GenerationConfig::default())
     }
 
@@ -416,6 +431,102 @@ impl TextGenerationModel {
                 format!("[Decoding error: {}]", e)
             }
         }
+    }
+
+    /// Generates text from a conversation with streaming output.
+    ///
+    /// Each chunk of generated text is sent through the provided channel
+    /// as it's produced, enabling real-time streaming to the UI.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - The conversation history as a slice of messages
+    /// * `gen_config` - Generation configuration (temperature, top-p, etc.)
+    /// * `chunk_tx` - Channel sender for streaming text chunks
+    pub fn generate_from_conversation_streaming(
+        &self,
+        messages: &[crate::tokenizer::FormatMessage<'_>],
+        gen_config: GenerationConfig,
+        chunk_tx: mpsc::Sender<StreamChunk>,
+    ) {
+        // Format the conversation using ChatML template
+        let formatted_prompt = TinyLlamaTokenizer::format_multi_turn_prompt(messages);
+
+        // Encode prompt
+        let input_ids = match self.tokenizer.encode(&formatted_prompt, true) {
+            Ok(ids) => ids,
+            Err(e) => {
+                eprintln!("Tokenization error: {}", e);
+                let _ = chunk_tx.send(StreamChunk::Error(format!("Tokenization error: {}", e)));
+                return;
+            }
+        };
+
+        // Create channel for token streaming
+        let (token_tx, token_rx) = mpsc::channel::<StreamToken>();
+
+        // Use scoped threads so we can borrow the tokenizer
+        std::thread::scope(|scope| {
+            // Spawn a thread to process tokens and send chunks
+            // This runs concurrently with generation
+            let tokenizer_ref = &self.tokenizer;
+            let chunk_tx_ref = &chunk_tx;
+
+            let receiver_handle = scope.spawn(move || {
+                let mut generated_tokens = Vec::new();
+                let mut last_decoded_len = 0;
+
+                for stream_token in token_rx {
+                    match stream_token {
+                        StreamToken::Token(token_id) => {
+                            generated_tokens.push(token_id);
+
+                            // Decode all generated tokens so far
+                            match tokenizer_ref.decode(&generated_tokens, true) {
+                                Ok(text) => {
+                                    let text = text.trim_start();
+                                    // Only send new characters
+                                    if text.len() > last_decoded_len {
+                                        let new_text = &text[last_decoded_len..];
+                                        if !new_text.is_empty() {
+                                            let _ = chunk_tx_ref
+                                                .send(StreamChunk::Text(new_text.to_string()));
+                                        }
+                                        last_decoded_len = text.len();
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Incremental decode error: {}", e);
+                                    // Continue anyway, we'll get the full text at the end
+                                }
+                            }
+                        }
+                        StreamToken::Done => {
+                            let _ = chunk_tx_ref.send(StreamChunk::Done);
+                            break;
+                        }
+                        StreamToken::Error(e) => {
+                            let _ = chunk_tx_ref.send(StreamChunk::Error(e));
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Run generation on this thread (tokens are processed concurrently)
+            match &self.model {
+                #[cfg(feature = "gpu")]
+                LoadedModel::Wgpu { model, device } => {
+                    generate_streaming(model, input_ids, &gen_config, device, token_tx);
+                }
+                LoadedModel::NdArray { model, device } => {
+                    generate_streaming(model, input_ids, &gen_config, device, token_tx);
+                }
+            }
+
+            // Wait for receiver to finish processing all tokens
+            let _ = receiver_handle.join();
+        });
     }
 
     /// Generates text with custom configuration.
@@ -604,10 +715,7 @@ mod tests {
         println!("Response: {}", response);
 
         // Basic coherence checks
-        assert!(
-            !response.is_empty(),
-            "Response should not be empty"
-        );
+        assert!(!response.is_empty(), "Response should not be empty");
 
         assert!(
             !response.contains("[Tokenization error"),
@@ -654,9 +762,7 @@ mod tests {
         let has_long_repetition = response
             .as_bytes()
             .windows(10)
-            .any(|window| {
-                window.iter().all(|&b| b == window[0])
-            });
+            .any(|window| window.iter().all(|&b| b == window[0]));
 
         assert!(
             !has_long_repetition,
@@ -668,7 +774,8 @@ mod tests {
         let words: Vec<&str> = response.split_whitespace().collect();
         if words.len() >= 4 {
             // Count word frequency
-            let mut word_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            let mut word_counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
             for word in &words {
                 *word_counts.entry(*word).or_insert(0) += 1;
             }
@@ -804,9 +911,14 @@ mod tests {
 
         let input_ids = model.tokenizer().encode(&formatted, true).unwrap();
         println!("Input token IDs: {:?}", input_ids);
-        println!("Input tokens: {:?}",
-            input_ids.iter()
-                .map(|&id| model.tokenizer().decode(&[id], false).unwrap_or_else(|_| format!("<{}>", id)))
+        println!(
+            "Input tokens: {:?}",
+            input_ids
+                .iter()
+                .map(|&id| model
+                    .tokenizer()
+                    .decode(&[id], false)
+                    .unwrap_or_else(|_| format!("<{}>", id)))
                 .collect::<Vec<_>>()
         );
 
@@ -840,7 +952,10 @@ mod tests {
                 println!("Generated token IDs: {:?}", new_tokens);
                 println!("Generated tokens:");
                 for (i, &id) in new_tokens.iter().enumerate() {
-                    let token_str = model.tokenizer().decode(&[id], false).unwrap_or_else(|_| format!("<{}>", id));
+                    let token_str = model
+                        .tokenizer()
+                        .decode(&[id], false)
+                        .unwrap_or_else(|_| format!("<{}>", id));
                     println!("  {}: {} -> '{}'", i, id, token_str);
                 }
 
@@ -926,8 +1041,8 @@ mod tests {
         println!("  ... ({} total tensors)", names.len());
 
         // Load a few weights and check their statistics
-        use burn_ndarray::NdArrayDevice;
         use crate::NdArrayBackend;
+        use burn_ndarray::NdArrayDevice;
 
         let device = NdArrayDevice::Cpu;
 
@@ -940,11 +1055,19 @@ mod tests {
         println!("Expected: [32000, 2048]");
 
         let embed_mean: f32 = embed_data.iter().sum::<f32>() / embed_data.len() as f32;
-        let embed_std: f32 = (embed_data.iter().map(|x| (x - embed_mean).powi(2)).sum::<f32>() / embed_data.len() as f32).sqrt();
+        let embed_std: f32 = (embed_data
+            .iter()
+            .map(|x| (x - embed_mean).powi(2))
+            .sum::<f32>()
+            / embed_data.len() as f32)
+            .sqrt();
         let embed_min = embed_data.iter().cloned().fold(f32::INFINITY, f32::min);
         let embed_max = embed_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-        println!("Embedding stats: mean={:.6}, std={:.6}, min={:.6}, max={:.6}", embed_mean, embed_std, embed_min, embed_max);
+        println!(
+            "Embedding stats: mean={:.6}, std={:.6}, min={:.6}, max={:.6}",
+            embed_mean, embed_std, embed_min, embed_max
+        );
 
         // Check for NaN/Inf
         let nan_count = embed_data.iter().filter(|x| x.is_nan()).count();
@@ -952,28 +1075,46 @@ mod tests {
         println!("NaN count: {}, Inf count: {}", nan_count, inf_count);
 
         println!("\n--- Checking layer 0 attention weights ---");
-        let attn_weights = loader.load_attention_weights::<NdArrayBackend>(0, &device).unwrap();
+        let attn_weights = loader
+            .load_attention_weights::<NdArrayBackend>(0, &device)
+            .unwrap();
 
         let q_shape = attn_weights.q_proj.dims();
         let q_data: Vec<f32> = attn_weights.q_proj.val().to_data().to_vec().unwrap();
-        println!("Q projection shape: {:?} (expected [2048, 2048] after transpose)", q_shape);
+        println!(
+            "Q projection shape: {:?} (expected [2048, 2048] after transpose)",
+            q_shape
+        );
         let q_mean: f32 = q_data.iter().sum::<f32>() / q_data.len() as f32;
-        let q_std: f32 = (q_data.iter().map(|x| (x - q_mean).powi(2)).sum::<f32>() / q_data.len() as f32).sqrt();
+        let q_std: f32 =
+            (q_data.iter().map(|x| (x - q_mean).powi(2)).sum::<f32>() / q_data.len() as f32).sqrt();
         println!("Q stats: mean={:.6}, std={:.6}", q_mean, q_std);
 
         let k_shape = attn_weights.k_proj.dims();
-        println!("K projection shape: {:?} (expected [2048, 256] after transpose)", k_shape);
+        println!(
+            "K projection shape: {:?} (expected [2048, 256] after transpose)",
+            k_shape
+        );
 
         let v_shape = attn_weights.v_proj.dims();
-        println!("V projection shape: {:?} (expected [2048, 256] after transpose)", v_shape);
+        println!(
+            "V projection shape: {:?} (expected [2048, 256] after transpose)",
+            v_shape
+        );
 
         let o_shape = attn_weights.o_proj.dims();
-        println!("O projection shape: {:?} (expected [2048, 2048] after transpose)", o_shape);
+        println!(
+            "O projection shape: {:?} (expected [2048, 2048] after transpose)",
+            o_shape
+        );
 
         println!("\n--- Checking LM head weights ---");
         let lm_head = loader.load_lm_head::<NdArrayBackend>(&device).unwrap();
         let lm_shape = lm_head.dims();
-        println!("LM head shape: {:?} (expected [2048, 32000] after transpose)", lm_shape);
+        println!(
+            "LM head shape: {:?} (expected [2048, 32000] after transpose)",
+            lm_shape
+        );
 
         // Verify shapes are correct
         assert_eq!(embed_shape, [32000, 2048], "Embedding shape mismatch");
@@ -991,9 +1132,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_forward_pass_diagnostic() {
-        use burn::tensor::TensorData;
-        use crate::weights::load_llama_from_safetensors;
         use crate::NdArrayBackend;
+        use crate::weights::load_llama_from_safetensors;
+        use burn::tensor::TensorData;
         use burn_ndarray::NdArrayDevice;
 
         println!("Setting up...");
@@ -1025,7 +1166,9 @@ mod tests {
 
         println!("\nLoading model with NdArray backend...");
         let device = NdArrayDevice::Cpu;
-        let model = load_llama_from_safetensors::<NdArrayBackend>(&weights_data, &llama_config, &device).unwrap();
+        let model =
+            load_llama_from_safetensors::<NdArrayBackend>(&weights_data, &llama_config, &device)
+                .unwrap();
 
         // Create a simple input: just the BOS token
         let input_ids: Vec<i32> = vec![1]; // BOS token
@@ -1048,9 +1191,14 @@ mod tests {
 
         // Statistics
         let mean: f32 = logits_data.iter().sum::<f32>() / logits_data.len() as f32;
-        let std: f32 = (logits_data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / logits_data.len() as f32).sqrt();
+        let std: f32 = (logits_data.iter().map(|x| (x - mean).powi(2)).sum::<f32>()
+            / logits_data.len() as f32)
+            .sqrt();
         let min = logits_data.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max = logits_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max = logits_data
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
 
         println!("\nLogits statistics:");
         println!("  mean: {:.4}", mean);
@@ -1072,31 +1220,45 @@ mod tests {
         // Load tokenizer for decoding
         let tokenizer = crate::tokenizer::load_tokenizer(&repo).await.unwrap();
         for (idx, logit) in indexed.iter().take(10) {
-            let token_str = tokenizer.decode(&[*idx as u32], false).unwrap_or_else(|_| format!("<{}>", idx));
-            println!("  {}: id={}, logit={:.4}, token='{}'", indexed.iter().position(|(i, _)| i == idx).unwrap(), idx, logit, token_str);
+            let token_str = tokenizer
+                .decode(&[*idx as u32], false)
+                .unwrap_or_else(|_| format!("<{}>", idx));
+            println!(
+                "  {}: id={}, logit={:.4}, token='{}'",
+                indexed.iter().position(|(i, _)| i == idx).unwrap(),
+                idx,
+                logit,
+                token_str
+            );
         }
 
         // Softmax to get probabilities for top tokens
         let softmax_logits = burn::tensor::activation::softmax(
             burn::tensor::Tensor::<NdArrayBackend, 1>::from_data(
                 TensorData::new(logits_data.clone(), [logits_data.len()]),
-                &device
+                &device,
             ),
-            0
+            0,
         );
         let probs: Vec<f32> = softmax_logits.to_data().to_vec().unwrap();
 
         println!("\nTop 10 token probabilities:");
         for (idx, _logit) in indexed.iter().take(10) {
             let prob = probs[*idx];
-            let token_str = tokenizer.decode(&[*idx as u32], false).unwrap_or_else(|_| format!("<{}>", idx));
+            let token_str = tokenizer
+                .decode(&[*idx as u32], false)
+                .unwrap_or_else(|_| format!("<{}>", idx));
             println!("  id={}: prob={:.4}, token='{}'", idx, prob, token_str);
         }
 
         // Basic sanity check
         assert!(nan_count == 0, "Logits contain NaN values");
         assert!(inf_count == 0, "Logits contain Inf values");
-        assert!(std > 0.1, "Logits have very low variance (std={:.4}), model may not be working", std);
+        assert!(
+            std > 0.1,
+            "Logits have very low variance (std={:.4}), model may not be working",
+            std
+        );
     }
 
     /// Diagnostic test to verify embedding produces distinct vectors.
@@ -1104,10 +1266,10 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_embedding_distinctness() {
-        use burn::tensor::TensorData;
-        use crate::weights::LlamaWeightLoader;
         use crate::NdArrayBackend;
         use crate::llama::embedding::Embedding;
+        use crate::weights::LlamaWeightLoader;
+        use burn::tensor::TensorData;
         use burn_ndarray::NdArrayDevice;
 
         println!("Setting up...");
@@ -1141,16 +1303,24 @@ mod tests {
 
         for &token_id in &test_tokens {
             let input_ids: burn::tensor::Tensor<NdArrayBackend, 2, burn::tensor::Int> =
-                burn::tensor::Tensor::from_data(TensorData::new(vec![token_id as i32], [1, 1]), &device);
+                burn::tensor::Tensor::from_data(
+                    TensorData::new(vec![token_id as i32], [1, 1]),
+                    &device,
+                );
 
             let embed_output = embed.forward(input_ids);
             let embed_data: Vec<f32> = embed_output.reshape([2048]).to_data().to_vec().unwrap();
 
             let mean: f32 = embed_data.iter().sum::<f32>() / embed_data.len() as f32;
-            let std: f32 = (embed_data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / embed_data.len() as f32).sqrt();
+            let std: f32 = (embed_data.iter().map(|x| (x - mean).powi(2)).sum::<f32>()
+                / embed_data.len() as f32)
+                .sqrt();
             let first_5: Vec<f32> = embed_data.iter().take(5).cloned().collect();
 
-            println!("Token {}: mean={:.6}, std={:.6}, first_5={:?}", token_id, mean, std, first_5);
+            println!(
+                "Token {}: mean={:.6}, std={:.6}, first_5={:?}",
+                token_id, mean, std, first_5
+            );
 
             embeddings.push((token_id, embed_data));
         }
@@ -1173,7 +1343,9 @@ mod tests {
                 assert!(
                     cosine < 0.99,
                     "Embeddings for tokens {} and {} are too similar (cosine={})",
-                    id_i, id_j, cosine
+                    id_i,
+                    id_j,
+                    cosine
                 );
             }
         }
@@ -1186,9 +1358,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_sequence_logits() {
-        use burn::tensor::TensorData;
-        use crate::weights::load_llama_from_safetensors;
         use crate::NdArrayBackend;
+        use crate::weights::load_llama_from_safetensors;
+        use burn::tensor::TensorData;
         use burn_ndarray::NdArrayDevice;
 
         println!("Setting up...");
@@ -1210,7 +1382,9 @@ mod tests {
         let weights_data = tokio::fs::read(&weights_path).await.unwrap();
 
         let device = NdArrayDevice::Cpu;
-        let model = load_llama_from_safetensors::<NdArrayBackend>(&weights_data, &llama_config, &device).unwrap();
+        let model =
+            load_llama_from_safetensors::<NdArrayBackend>(&weights_data, &llama_config, &device)
+                .unwrap();
 
         // Test with a short sequence: "Hello" -> [1, 15043] (BOS + Hello)
         let input_ids = vec![1i32, 15043]; // BOS + "Hello" token
@@ -1229,7 +1403,9 @@ mod tests {
             let logits_data: Vec<f32> = pos_logits_flat.to_data().to_vec().unwrap();
 
             let mean: f32 = logits_data.iter().sum::<f32>() / logits_data.len() as f32;
-            let std: f32 = (logits_data.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / logits_data.len() as f32).sqrt();
+            let std: f32 = (logits_data.iter().map(|x| (x - mean).powi(2)).sum::<f32>()
+                / logits_data.len() as f32)
+                .sqrt();
 
             // Get top 5 tokens
             let mut indexed: Vec<(usize, f32)> = logits_data.iter().cloned().enumerate().collect();
@@ -1240,25 +1416,37 @@ mod tests {
 
             let tokenizer = crate::tokenizer::load_tokenizer(&repo).await.unwrap();
             for (idx, logit) in indexed.iter().take(5) {
-                let token_str = tokenizer.decode(&[*idx as u32], false).unwrap_or_else(|_| "?".into());
+                let token_str = tokenizer
+                    .decode(&[*idx as u32], false)
+                    .unwrap_or_else(|_| "?".into());
                 println!("  id={}: logit={:.4}, token='{}'", idx, logit, token_str);
             }
         }
 
         // The logits at position 0 and position 1 should be different
-        let logits0 = logits.clone().slice([0..1, 0..1, 0..32000]).reshape([32000]);
+        let logits0 = logits
+            .clone()
+            .slice([0..1, 0..1, 0..32000])
+            .reshape([32000]);
         let logits1 = logits.slice([0..1, 1..2, 0..32000]).reshape([32000]);
 
         let logits0_data: Vec<f32> = logits0.to_data().to_vec().unwrap();
         let logits1_data: Vec<f32> = logits1.to_data().to_vec().unwrap();
 
         // Compute cosine similarity
-        let dot: f32 = logits0_data.iter().zip(logits1_data.iter()).map(|(a, b)| a * b).sum();
+        let dot: f32 = logits0_data
+            .iter()
+            .zip(logits1_data.iter())
+            .map(|(a, b)| a * b)
+            .sum();
         let norm0: f32 = logits0_data.iter().map(|x| x * x).sum::<f32>().sqrt();
         let norm1: f32 = logits1_data.iter().map(|x| x * x).sum::<f32>().sqrt();
         let cosine = dot / (norm0 * norm1);
 
-        println!("\nCosine similarity between pos 0 and pos 1 logits: {:.4}", cosine);
+        println!(
+            "\nCosine similarity between pos 0 and pos 1 logits: {:.4}",
+            cosine
+        );
 
         assert!(
             cosine < 0.99,

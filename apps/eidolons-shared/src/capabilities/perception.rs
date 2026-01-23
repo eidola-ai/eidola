@@ -1,4 +1,6 @@
+use crux_core::command::StreamBuilder;
 use crux_core::{Command, Request, capability::Operation, command::RequestBuilder};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 /// Role of a chat message sender
@@ -37,8 +39,36 @@ pub struct PerceptionResponse {
     pub response: String,
 }
 
+/// Request for streaming perception.
+///
+/// The shell receives this request, calls the perception service's streaming API,
+/// and sends back multiple `PerceptionStreamingResponse` items via `handleResponse`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PerceptionStreamingRequest {
+    /// Full conversation history for multi-turn chat
+    pub messages: Vec<ChatMessage>,
+}
+
+/// A single response in the perception stream.
+///
+/// The shell sends one of these for each chunk of generated text,
+/// and a final `Done` or `Error` to signal completion.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum PerceptionStreamingResponse {
+    /// A chunk of generated text
+    Chunk(String),
+    /// Generation completed successfully
+    Done,
+    /// An error occurred during generation
+    Error(String),
+}
+
 impl Operation for PerceptionRequest {
     type Output = PerceptionResponse;
+}
+
+impl Operation for PerceptionStreamingRequest {
+    type Output = PerceptionStreamingResponse;
 }
 
 /// Request an AI response for the given conversation history
@@ -56,6 +86,21 @@ where
     Command::request_from_shell(PerceptionRequest { messages })
 }
 
+/// Request a streaming AI response for the given conversation history.
+///
+/// Returns a `StreamBuilder` that yields `PerceptionStreamingResponse` items.
+/// The shell calls `handleResponse` multiple times with the same request ID,
+/// once for each chunk, and finally with `Done` or `Error`.
+pub fn ask_with_history_streaming<Effect, Event>(
+    messages: Vec<ChatMessage>,
+) -> StreamBuilder<Effect, Event, impl Stream<Item = PerceptionStreamingResponse>>
+where
+    Effect: Send + From<Request<PerceptionStreamingRequest>> + 'static,
+    Event: Send + 'static,
+{
+    Command::stream_from_shell(PerceptionStreamingRequest { messages })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,12 +108,10 @@ mod tests {
     #[test]
     fn test_perception_request_serialization() {
         let req = PerceptionRequest {
-            messages: vec![
-                ChatMessage {
-                    role: Role::User,
-                    content: "Hello, AI!".to_string(),
-                },
-            ],
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hello, AI!".to_string(),
+            }],
         };
 
         let json = serde_json::to_string(&req).unwrap();

@@ -45,6 +45,7 @@ indirect public enum Effect: Hashable {
     case render(SharedTypes.RenderOperation)
     case hello(SharedTypes.HelloRequest)
     case perception(SharedTypes.PerceptionRequest)
+    case perceptionStreaming(SharedTypes.PerceptionStreamingRequest)
 
     public func serialize<S: Serializer>(serializer: S) throws {
         try serializer.increase_container_depth()
@@ -57,6 +58,9 @@ indirect public enum Effect: Hashable {
             try x.serialize(serializer: serializer)
         case .perception(let x):
             try serializer.serialize_variant_index(value: 2)
+            try x.serialize(serializer: serializer)
+        case .perceptionStreaming(let x):
+            try serializer.serialize_variant_index(value: 3)
             try x.serialize(serializer: serializer)
         }
         try serializer.decrease_container_depth()
@@ -84,6 +88,10 @@ indirect public enum Effect: Hashable {
             let x = try SharedTypes.PerceptionRequest.deserialize(deserializer: deserializer)
             try deserializer.decrease_container_depth()
             return .perception(x)
+        case 3:
+            let x = try SharedTypes.PerceptionStreamingRequest.deserialize(deserializer: deserializer)
+            try deserializer.decrease_container_depth()
+            return .perceptionStreaming(x)
         default: throw DeserializationError.invalidInput(issue: "Unknown variant index for Effect: \(index)")
         }
     }
@@ -101,6 +109,10 @@ indirect public enum Effect: Hashable {
 indirect public enum Event: Hashable {
     case greet(String)
     case submitMessage(String)
+    case submitMessageStreaming(String)
+    case perceptionChunk(String)
+    case perceptionStreamComplete
+    case perceptionStreamError(String)
 
     public func serialize<S: Serializer>(serializer: S) throws {
         try serializer.increase_container_depth()
@@ -110,6 +122,17 @@ indirect public enum Event: Hashable {
             try serializer.serialize_str(value: x)
         case .submitMessage(let x):
             try serializer.serialize_variant_index(value: 1)
+            try serializer.serialize_str(value: x)
+        case .submitMessageStreaming(let x):
+            try serializer.serialize_variant_index(value: 2)
+            try serializer.serialize_str(value: x)
+        case .perceptionChunk(let x):
+            try serializer.serialize_variant_index(value: 3)
+            try serializer.serialize_str(value: x)
+        case .perceptionStreamComplete:
+            try serializer.serialize_variant_index(value: 4)
+        case .perceptionStreamError(let x):
+            try serializer.serialize_variant_index(value: 5)
             try serializer.serialize_str(value: x)
         }
         try serializer.decrease_container_depth()
@@ -133,6 +156,21 @@ indirect public enum Event: Hashable {
             let x = try deserializer.deserialize_str()
             try deserializer.decrease_container_depth()
             return .submitMessage(x)
+        case 2:
+            let x = try deserializer.deserialize_str()
+            try deserializer.decrease_container_depth()
+            return .submitMessageStreaming(x)
+        case 3:
+            let x = try deserializer.deserialize_str()
+            try deserializer.decrease_container_depth()
+            return .perceptionChunk(x)
+        case 4:
+            try deserializer.decrease_container_depth()
+            return .perceptionStreamComplete
+        case 5:
+            let x = try deserializer.deserialize_str()
+            try deserializer.decrease_container_depth()
+            return .perceptionStreamError(x)
         default: throw DeserializationError.invalidInput(issue: "Unknown variant index for Event: \(index)")
         }
     }
@@ -291,6 +329,97 @@ public struct PerceptionResponse: Hashable {
     }
 }
 
+public struct PerceptionStreamingRequest: Hashable {
+    @Indirect public var messages: [SharedTypes.ChatMessage]
+
+    public init(messages: [SharedTypes.ChatMessage]) {
+        self.messages = messages
+    }
+
+    public func serialize<S: Serializer>(serializer: S) throws {
+        try serializer.increase_container_depth()
+        try serialize_vector_ChatMessage(value: self.messages, serializer: serializer)
+        try serializer.decrease_container_depth()
+    }
+
+    public func bincodeSerialize() throws -> [UInt8] {
+        let serializer = BincodeSerializer.init();
+        try self.serialize(serializer: serializer)
+        return serializer.get_bytes()
+    }
+
+    public static func deserialize<D: Deserializer>(deserializer: D) throws -> PerceptionStreamingRequest {
+        try deserializer.increase_container_depth()
+        let messages = try deserialize_vector_ChatMessage(deserializer: deserializer)
+        try deserializer.decrease_container_depth()
+        return PerceptionStreamingRequest.init(messages: messages)
+    }
+
+    public static func bincodeDeserialize(input: [UInt8]) throws -> PerceptionStreamingRequest {
+        let deserializer = BincodeDeserializer.init(input: input);
+        let obj = try deserialize(deserializer: deserializer)
+        if deserializer.get_buffer_offset() < input.count {
+            throw DeserializationError.invalidInput(issue: "Some input bytes were not read")
+        }
+        return obj
+    }
+}
+
+indirect public enum PerceptionStreamingResponse: Hashable {
+    case chunk(String)
+    case done
+    case error(String)
+
+    public func serialize<S: Serializer>(serializer: S) throws {
+        try serializer.increase_container_depth()
+        switch self {
+        case .chunk(let x):
+            try serializer.serialize_variant_index(value: 0)
+            try serializer.serialize_str(value: x)
+        case .done:
+            try serializer.serialize_variant_index(value: 1)
+        case .error(let x):
+            try serializer.serialize_variant_index(value: 2)
+            try serializer.serialize_str(value: x)
+        }
+        try serializer.decrease_container_depth()
+    }
+
+    public func bincodeSerialize() throws -> [UInt8] {
+        let serializer = BincodeSerializer.init();
+        try self.serialize(serializer: serializer)
+        return serializer.get_bytes()
+    }
+
+    public static func deserialize<D: Deserializer>(deserializer: D) throws -> PerceptionStreamingResponse {
+        let index = try deserializer.deserialize_variant_index()
+        try deserializer.increase_container_depth()
+        switch index {
+        case 0:
+            let x = try deserializer.deserialize_str()
+            try deserializer.decrease_container_depth()
+            return .chunk(x)
+        case 1:
+            try deserializer.decrease_container_depth()
+            return .done
+        case 2:
+            let x = try deserializer.deserialize_str()
+            try deserializer.decrease_container_depth()
+            return .error(x)
+        default: throw DeserializationError.invalidInput(issue: "Unknown variant index for PerceptionStreamingResponse: \(index)")
+        }
+    }
+
+    public static func bincodeDeserialize(input: [UInt8]) throws -> PerceptionStreamingResponse {
+        let deserializer = BincodeDeserializer.init(input: input);
+        let obj = try deserialize(deserializer: deserializer)
+        if deserializer.get_buffer_offset() < input.count {
+            throw DeserializationError.invalidInput(issue: "Some input bytes were not read")
+        }
+        return obj
+    }
+}
+
 public struct RenderOperation: Hashable {
 
     public init() {
@@ -412,11 +541,13 @@ public struct ViewModel: Hashable {
     @Indirect public var greeting: String
     @Indirect public var conversation: [SharedTypes.ChatMessage]
     @Indirect public var is_processing: Bool
+    @Indirect public var streaming_text: String
 
-    public init(greeting: String, conversation: [SharedTypes.ChatMessage], is_processing: Bool) {
+    public init(greeting: String, conversation: [SharedTypes.ChatMessage], is_processing: Bool, streaming_text: String) {
         self.greeting = greeting
         self.conversation = conversation
         self.is_processing = is_processing
+        self.streaming_text = streaming_text
     }
 
     public func serialize<S: Serializer>(serializer: S) throws {
@@ -424,6 +555,7 @@ public struct ViewModel: Hashable {
         try serializer.serialize_str(value: self.greeting)
         try serialize_vector_ChatMessage(value: self.conversation, serializer: serializer)
         try serializer.serialize_bool(value: self.is_processing)
+        try serializer.serialize_str(value: self.streaming_text)
         try serializer.decrease_container_depth()
     }
 
@@ -438,8 +570,9 @@ public struct ViewModel: Hashable {
         let greeting = try deserializer.deserialize_str()
         let conversation = try deserialize_vector_ChatMessage(deserializer: deserializer)
         let is_processing = try deserializer.deserialize_bool()
+        let streaming_text = try deserializer.deserialize_str()
         try deserializer.decrease_container_depth()
-        return ViewModel.init(greeting: greeting, conversation: conversation, is_processing: is_processing)
+        return ViewModel.init(greeting: greeting, conversation: conversation, is_processing: is_processing, streaming_text: streaming_text)
     }
 
     public static func bincodeDeserialize(input: [UInt8]) throws -> ViewModel {

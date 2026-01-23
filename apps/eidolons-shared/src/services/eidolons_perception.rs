@@ -2,8 +2,8 @@
 //!
 //! Uses a dedicated inference thread to avoid `Send + Sync` requirements on GPU types.
 
-use eidolons_perception::{ChatRole, FormatMessage};
-use std::sync::{Arc, LazyLock, RwLock};
+use eidolons_perception::{ChatRole, FormatMessage, StreamChunk};
+use std::sync::{Arc, LazyLock, RwLock, mpsc as std_mpsc};
 use tokio::sync::{mpsc, oneshot};
 
 /// Role of a chat message sender (UniFFI-compatible).
@@ -22,6 +22,20 @@ pub struct ServiceChatMessage {
     pub role: ServiceRole,
     /// The message content
     pub content: String,
+}
+
+/// Callback interface for streaming text generation.
+///
+/// Swift/Kotlin shells implement this trait to receive streaming tokens
+/// as they are generated.
+#[uniffi::export(callback_interface)]
+pub trait StreamingCallback: Send + Sync {
+    /// Called when a new chunk of text is generated.
+    fn on_chunk(&self, text: String);
+    /// Called when generation is complete.
+    fn on_complete(&self);
+    /// Called when an error occurs during generation.
+    fn on_error(&self, error: String);
 }
 
 /// Shared Tokio runtime for all async services (Perception, Memory, etc.)
@@ -55,6 +69,11 @@ enum InferenceCommand {
     Generate {
         messages: Vec<ServiceChatMessage>,
         response_tx: oneshot::Sender<Result<String, String>>,
+    },
+    /// Generate a response with streaming output.
+    GenerateStreaming {
+        messages: Vec<ServiceChatMessage>,
+        callback: Box<dyn StreamingCallback>,
     },
     /// Get model info.
     ModelInfo {
@@ -161,6 +180,70 @@ impl InferenceHandle {
                                     };
                                     let _ = response_tx.send(Err(format!("Inference panicked: {}", msg)));
                                 }
+                            }
+                        }
+                        InferenceCommand::GenerateStreaming { messages, callback } => {
+                            // Convert messages to the format expected by the model
+                            let format_messages: Vec<FormatMessage<'_>> = messages
+                                .iter()
+                                .map(|m| FormatMessage {
+                                    role: match m.role {
+                                        ServiceRole::User => ChatRole::User,
+                                        ServiceRole::Assistant => ChatRole::Assistant,
+                                    },
+                                    content: &m.content,
+                                })
+                                .collect();
+
+                            // Create channel for streaming chunks
+                            let (chunk_tx, chunk_rx) = std_mpsc::channel::<StreamChunk>();
+
+                            // Spawn thread to process chunks CONCURRENTLY with generation.
+                            // This ensures callbacks fire as chunks are produced, not after
+                            // generation completes.
+                            let callback_handle = std::thread::spawn(move || {
+                                for chunk in chunk_rx {
+                                    match chunk {
+                                        StreamChunk::Text(text) => {
+                                            callback.on_chunk(text);
+                                        }
+                                        StreamChunk::Done => {
+                                            callback.on_complete();
+                                            break;
+                                        }
+                                        StreamChunk::Error(e) => {
+                                            callback.on_error(e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+
+                            // Run generation (sends chunks while callback thread processes them)
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                model.generate_from_conversation_streaming(
+                                    &format_messages,
+                                    eidolons_perception::GenerationConfig::default(),
+                                    chunk_tx,
+                                );
+                            }));
+
+                            // Wait for callback thread to finish processing all chunks
+                            let _ = callback_handle.join();
+
+                            // Handle generation panic (callback thread may have already
+                            // received an error via the channel if generation failed gracefully)
+                            if let Err(e) = result {
+                                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = e.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "Unknown panic during streaming inference".to_string()
+                                };
+                                // Note: callback thread may have already exited, but we log
+                                // the panic for debugging purposes
+                                eprintln!("Streaming inference panicked: {}", msg);
                             }
                         }
                         InferenceCommand::ModelInfo { response_tx } => {
@@ -333,6 +416,46 @@ impl PerceptionService {
                 message: "Inference thread died".to_string(),
             })?
             .map_err(|e| PerceptionError::InferenceFailed { message: e })
+    }
+
+    /// Generates a response for the given conversation with streaming output.
+    ///
+    /// Tokens are streamed through the callback as they are generated,
+    /// enabling real-time display in the UI.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - The conversation history as a list of messages
+    /// * `callback` - Callback to receive streaming chunks
+    ///
+    /// # Errors
+    ///
+    /// Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
+    pub async fn chat_streaming(
+        &self,
+        messages: Vec<ServiceChatMessage>,
+        callback: Box<dyn StreamingCallback>,
+    ) -> Result<(), PerceptionError> {
+        let handle = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| PerceptionError::NotInitialized)?;
+            match &*state {
+                ServiceState::Ready(handle) => handle.command_tx.clone(),
+                _ => return Err(PerceptionError::NotInitialized),
+            }
+        };
+
+        // Send streaming command
+        handle
+            .send(InferenceCommand::GenerateStreaming { messages, callback })
+            .await
+            .map_err(|_| PerceptionError::InferenceFailed {
+                message: "Inference thread not responding".to_string(),
+            })?;
+
+        Ok(())
     }
 
     /// Returns model configuration information if initialized.

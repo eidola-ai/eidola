@@ -115,9 +115,10 @@ These can also be updated outside of Nix using your local Rust toolchain (auto-g
 ```bash
 scripts/update-shared-bindings.sh
 scripts/update-server-openapi.sh
-scripts/update-shared-xcframework.sh
+scripts/update-shared-xcframework-dev.sh  # Fast: native architecture only (preferred for development)
+scripts/update-shared-xcframework.sh      # Full: all architectures (used in CI)
 ```
-*Note: `update-shared-xcframework.sh` requires a macOS host for local generation.*
+*Note: XCFramework scripts require a macOS host.*
 
 Generated artifacts are committed and verified by CI:
 - `apps/eidolons-shared/swift/` - Shared core bindings (UniFFI + Crux types)

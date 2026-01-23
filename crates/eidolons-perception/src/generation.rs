@@ -8,6 +8,7 @@ use burn::prelude::*;
 use burn::tensor::TensorData;
 use rand::Rng;
 use rand::distributions::Distribution;
+use std::sync::mpsc;
 
 /// Configuration for text generation.
 #[derive(Debug, Clone)]
@@ -34,6 +35,17 @@ impl Default for GenerationConfig {
             include_eos: false,
         }
     }
+}
+
+/// Token emitted during streaming generation.
+#[derive(Debug, Clone)]
+pub enum StreamToken {
+    /// A newly generated token.
+    Token(u32),
+    /// Generation is complete.
+    Done,
+    /// An error occurred during generation.
+    Error(String),
 }
 
 /// Generates tokens autoregressively from a Llama model.
@@ -85,6 +97,81 @@ pub fn generate<B: Backend>(
 
         tokens.push(next_token);
         generated_count += 1;
+    }
+
+    tokens
+}
+
+/// Generates tokens autoregressively, sending each token through a channel.
+///
+/// This is the streaming variant of `generate()`. Each generated token is sent
+/// through the provided channel immediately after generation, enabling real-time
+/// streaming of generated text.
+///
+/// # Arguments
+///
+/// * `model` - The Llama model to generate from
+/// * `input_ids` - Initial token IDs (prompt)
+/// * `config` - Generation configuration
+/// * `device` - Device to run inference on
+/// * `token_tx` - Channel sender for streaming tokens
+///
+/// # Returns
+///
+/// Vector of generated token IDs (including the input).
+pub fn generate_streaming<B: Backend>(
+    model: &Llama<B>,
+    input_ids: Vec<u32>,
+    config: &GenerationConfig,
+    device: &B::Device,
+    token_tx: mpsc::Sender<StreamToken>,
+) -> Vec<u32> {
+    let mut rng = rand::thread_rng();
+    let mut tokens = input_ids.clone();
+    let mut generated_count = 0;
+
+    while generated_count < config.max_new_tokens {
+        // Create input tensor from current tokens
+        let token_data: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let data = TensorData::new(token_data.clone(), [1, tokens.len()]);
+        let input_tensor: Tensor<B, 2, Int> = Tensor::from_data(data, device);
+
+        // Forward pass through model
+        let logits = model.forward(input_tensor, 0);
+
+        // Get logits for the last token only
+        let [_batch, seq_len, vocab_size] = logits.dims();
+        let last_logits = logits.slice([0..1, (seq_len - 1)..seq_len, 0..vocab_size]);
+        let last_logits = last_logits.reshape([vocab_size]);
+
+        // Sample next token
+        let next_token = sample_token(&last_logits, config, &mut rng);
+
+        // Check for EOS
+        if next_token == config.eos_token_id {
+            if config.include_eos {
+                tokens.push(next_token);
+                // Send EOS token if included
+                let _ = token_tx.send(StreamToken::Token(next_token));
+            }
+            // Signal completion
+            let _ = token_tx.send(StreamToken::Done);
+            break;
+        }
+
+        tokens.push(next_token);
+        generated_count += 1;
+
+        // Send the newly generated token
+        if token_tx.send(StreamToken::Token(next_token)).is_err() {
+            // Receiver dropped, stop generation
+            break;
+        }
+    }
+
+    // If we reached max tokens without EOS, still signal completion
+    if generated_count >= config.max_new_tokens {
+        let _ = token_tx.send(StreamToken::Done);
     }
 
     tokens

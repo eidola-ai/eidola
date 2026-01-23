@@ -414,7 +414,13 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 
 
 // Public interface members begin here.
-
+// Magic number for the Rust proxy to call using the same mechanism as every other method,
+// to free the callback once it's dropped by Rust.
+private let IDX_CALLBACK_FREE: Int32 = 0
+// Callback return codes
+private let UNIFFI_CALLBACK_SUCCESS: Int32 = 0
+private let UNIFFI_CALLBACK_ERROR: Int32 = 1
+private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -555,6 +561,23 @@ public protocol PerceptionServiceProtocol: AnyObject, Sendable {
     func chat(messages: [ServiceChatMessage]) async throws  -> String
     
     /**
+     * Generates a response for the given conversation with streaming output.
+     *
+     * Tokens are streamed through the callback as they are generated,
+     * enabling real-time display in the UI.
+     *
+     * # Arguments
+     *
+     * * `messages` - The conversation history as a list of messages
+     * * `callback` - Callback to receive streaming chunks
+     *
+     * # Errors
+     *
+     * Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
+     */
+    func chatStreaming(messages: [ServiceChatMessage], callback: StreamingCallback) async throws 
+    
+    /**
      * Initializes the service by downloading and loading the model.
      *
      * This spawns a dedicated inference thread that owns the model,
@@ -686,6 +709,38 @@ open func chat(messages: [ServiceChatMessage])async throws  -> String  {
             completeFunc: ffi_eidolons_shared_rust_future_complete_rust_buffer,
             freeFunc: ffi_eidolons_shared_rust_future_free_rust_buffer,
             liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypePerceptionError_lift
+        )
+}
+    
+    /**
+     * Generates a response for the given conversation with streaming output.
+     *
+     * Tokens are streamed through the callback as they are generated,
+     * enabling real-time display in the UI.
+     *
+     * # Arguments
+     *
+     * * `messages` - The conversation history as a list of messages
+     * * `callback` - Callback to receive streaming chunks
+     *
+     * # Errors
+     *
+     * Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
+     */
+open func chatStreaming(messages: [ServiceChatMessage], callback: StreamingCallback)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_eidolons_shared_fn_method_perceptionservice_chat_streaming(
+                    self.uniffiCloneHandle(),
+                    FfiConverterSequenceTypeServiceChatMessage.lower(messages),FfiConverterCallbackInterfaceStreamingCallback_lower(callback)
+                )
+            },
+            pollFunc: ffi_eidolons_shared_rust_future_poll_void,
+            completeFunc: ffi_eidolons_shared_rust_future_complete_void,
+            freeFunc: ffi_eidolons_shared_rust_future_free_void,
+            liftFunc: { $0 },
             errorHandler: FfiConverterTypePerceptionError_lift
         )
 }
@@ -1046,6 +1101,195 @@ public func FfiConverterTypeServiceRole_lower(_ value: ServiceRole) -> RustBuffe
 }
 
 
+
+
+
+/**
+ * Callback interface for streaming text generation.
+ *
+ * Swift/Kotlin shells implement this trait to receive streaming tokens
+ * as they are generated.
+ */
+public protocol StreamingCallback: AnyObject, Sendable {
+    
+    /**
+     * Called when a new chunk of text is generated.
+     */
+    func onChunk(text: String) 
+    
+    /**
+     * Called when generation is complete.
+     */
+    func onComplete() 
+    
+    /**
+     * Called when an error occurs during generation.
+     */
+    func onError(error: String) 
+    
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceStreamingCallback {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // This creates 1-element array, since this seems to be the only way to construct a const
+    // pointer that we can pass to the Rust code.
+    static let vtable: [UniffiVTableCallbackInterfaceStreamingCallback] = [UniffiVTableCallbackInterfaceStreamingCallback(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterCallbackInterfaceStreamingCallback.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface StreamingCallback: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterCallbackInterfaceStreamingCallback.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface StreamingCallback: handle missing in uniffiClone")
+            }
+        },
+        onChunk: { (
+            uniffiHandle: UInt64,
+            text: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceStreamingCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onChunk(
+                     text: try FfiConverterString.lift(text)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onComplete: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceStreamingCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onComplete(
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onError: { (
+            uniffiHandle: UInt64,
+            error: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceStreamingCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onError(
+                     error: try FfiConverterString.lift(error)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )]
+}
+
+private func uniffiCallbackInitStreamingCallback() {
+    uniffi_eidolons_shared_fn_init_callback_vtable_streamingcallback(UniffiCallbackInterfaceStreamingCallback.vtable)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceStreamingCallback {
+    fileprivate static let handleMap = UniffiHandleMap<StreamingCallback>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceStreamingCallback : FfiConverter {
+    typealias SwiftType = StreamingCallback
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceStreamingCallback_lift(_ handle: UInt64) throws -> StreamingCallback {
+    return try FfiConverterCallbackInterfaceStreamingCallback.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceStreamingCallback_lower(_ v: StreamingCallback) -> UInt64 {
+    return FfiConverterCallbackInterfaceStreamingCallback.lower(v)
+}
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -1197,6 +1441,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_eidolons_shared_checksum_method_perceptionservice_chat() != 9735) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_chat_streaming() != 44418) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_eidolons_shared_checksum_method_perceptionservice_initialize() != 39172) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1209,7 +1456,17 @@ private let initializationResult: InitializationResult = {
     if (uniffi_eidolons_shared_checksum_constructor_perceptionservice_new() != 33440) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_eidolons_shared_checksum_method_streamingcallback_on_chunk() != 42735) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_eidolons_shared_checksum_method_streamingcallback_on_complete() != 54813) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_eidolons_shared_checksum_method_streamingcallback_on_error() != 37854) {
+        return InitializationResult.apiChecksumMismatch
+    }
 
+    uniffiCallbackInitStreamingCallback()
     return InitializationResult.ok
 }()
 

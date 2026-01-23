@@ -24,6 +24,12 @@ struct ChatView: View {
               MessageBubble(message: message)
                 .id(index)
             }
+
+            // Show streaming response while generating
+            if core.viewModel.is_processing && !core.viewModel.streaming_text.isEmpty {
+              StreamingMessageBubble(text: core.viewModel.streaming_text)
+                .id("streaming")
+            }
           }
           .padding()
         }
@@ -32,6 +38,14 @@ struct ChatView: View {
           if newCount > 0 {
             withAnimation {
               proxy.scrollTo(newCount - 1, anchor: .bottom)
+            }
+          }
+        }
+        .onChange(of: core.viewModel.streaming_text) { _, _ in
+          // Scroll to streaming message as it updates
+          if core.viewModel.is_processing {
+            withAnimation {
+              proxy.scrollTo("streaming", anchor: .bottom)
             }
           }
         }
@@ -74,7 +88,39 @@ struct ChatView: View {
     guard !message.isEmpty else { return }
 
     inputText = ""
-    core.update(event: .submitMessage(message))
+    // Use streaming for real-time token-by-token display
+    core.update(event: .submitMessageStreaming(message))
+  }
+}
+
+/// Message bubble for streaming responses (assistant style with typing indicator)
+struct StreamingMessageBubble: View {
+  let text: String
+
+  var body: some View {
+    HStack {
+      VStack(alignment: .leading, spacing: 4) {
+        Text(text)
+          .padding(.horizontal, 14)
+          .padding(.vertical, 10)
+          .background(Color(.windowBackgroundColor).opacity(0.8))
+          .foregroundColor(.primary)
+          .cornerRadius(16)
+          .textSelection(.enabled)
+
+        // Typing indicator
+        HStack(spacing: 4) {
+          ForEach(0..<3, id: \.self) { index in
+            Circle()
+              .fill(Color.secondary.opacity(0.6))
+              .frame(width: 6, height: 6)
+          }
+        }
+        .padding(.leading, 14)
+      }
+
+      Spacer(minLength: 60)
+    }
   }
 }
 

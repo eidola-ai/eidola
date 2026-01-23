@@ -243,6 +243,38 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_STREAMING_CALLBACK_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_STREAMING_CALLBACK_METHOD0
+typedef void (*UniffiCallbackInterfaceStreamingCallbackMethod0)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_STREAMING_CALLBACK_METHOD1
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_STREAMING_CALLBACK_METHOD1
+typedef void (*UniffiCallbackInterfaceStreamingCallbackMethod1)(uint64_t, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_STREAMING_CALLBACK_METHOD2
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_STREAMING_CALLBACK_METHOD2
+typedef void (*UniffiCallbackInterfaceStreamingCallbackMethod2)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_STREAMING_CALLBACK
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_STREAMING_CALLBACK
+typedef struct UniffiVTableCallbackInterfaceStreamingCallback {
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+    UniffiCallbackInterfaceClone _Nonnull uniffiClone;
+    UniffiCallbackInterfaceStreamingCallbackMethod0 _Nonnull onChunk;
+    UniffiCallbackInterfaceStreamingCallbackMethod1 _Nonnull onComplete;
+    UniffiCallbackInterfaceStreamingCallbackMethod2 _Nonnull onError;
+} UniffiVTableCallbackInterfaceStreamingCallback;
+
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_CLONE_PERCEPTIONSERVICE
 #define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_CLONE_PERCEPTIONSERVICE
 uint64_t uniffi_eidolons_shared_fn_clone_perceptionservice(uint64_t handle, RustCallStatus *_Nonnull out_status
@@ -264,6 +296,11 @@ uint64_t uniffi_eidolons_shared_fn_constructor_perceptionservice_new(RustCallSta
 uint64_t uniffi_eidolons_shared_fn_method_perceptionservice_chat(uint64_t ptr, RustBuffer messages
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_METHOD_PERCEPTIONSERVICE_CHAT_STREAMING
+#define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_METHOD_PERCEPTIONSERVICE_CHAT_STREAMING
+uint64_t uniffi_eidolons_shared_fn_method_perceptionservice_chat_streaming(uint64_t ptr, RustBuffer messages, uint64_t callback
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_METHOD_PERCEPTIONSERVICE_INITIALIZE
 #define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_METHOD_PERCEPTIONSERVICE_INITIALIZE
 uint64_t uniffi_eidolons_shared_fn_method_perceptionservice_initialize(uint64_t ptr
@@ -277,6 +314,11 @@ uint64_t uniffi_eidolons_shared_fn_method_perceptionservice_is_ready(uint64_t pt
 #ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_METHOD_PERCEPTIONSERVICE_MODEL_INFO
 #define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_METHOD_PERCEPTIONSERVICE_MODEL_INFO
 uint64_t uniffi_eidolons_shared_fn_method_perceptionservice_model_info(uint64_t ptr
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_INIT_CALLBACK_VTABLE_STREAMINGCALLBACK
+#define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_INIT_CALLBACK_VTABLE_STREAMINGCALLBACK
+void uniffi_eidolons_shared_fn_init_callback_vtable_streamingcallback(const UniffiVTableCallbackInterfaceStreamingCallback* _Nonnull vtable
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_FUNC_HANDLE_RESPONSE
@@ -590,6 +632,12 @@ uint16_t uniffi_eidolons_shared_checksum_method_perceptionservice_chat(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_METHOD_PERCEPTIONSERVICE_CHAT_STREAMING
+#define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_METHOD_PERCEPTIONSERVICE_CHAT_STREAMING
+uint16_t uniffi_eidolons_shared_checksum_method_perceptionservice_chat_streaming(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_METHOD_PERCEPTIONSERVICE_INITIALIZE
 #define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_METHOD_PERCEPTIONSERVICE_INITIALIZE
 uint16_t uniffi_eidolons_shared_checksum_method_perceptionservice_initialize(void
@@ -611,6 +659,24 @@ uint16_t uniffi_eidolons_shared_checksum_method_perceptionservice_model_info(voi
 #ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_CONSTRUCTOR_PERCEPTIONSERVICE_NEW
 #define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_CONSTRUCTOR_PERCEPTIONSERVICE_NEW
 uint16_t uniffi_eidolons_shared_checksum_constructor_perceptionservice_new(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_METHOD_STREAMINGCALLBACK_ON_CHUNK
+#define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_METHOD_STREAMINGCALLBACK_ON_CHUNK
+uint16_t uniffi_eidolons_shared_checksum_method_streamingcallback_on_chunk(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_METHOD_STREAMINGCALLBACK_ON_COMPLETE
+#define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_METHOD_STREAMINGCALLBACK_ON_COMPLETE
+uint16_t uniffi_eidolons_shared_checksum_method_streamingcallback_on_complete(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_METHOD_STREAMINGCALLBACK_ON_ERROR
+#define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_METHOD_STREAMINGCALLBACK_ON_ERROR
+uint16_t uniffi_eidolons_shared_checksum_method_streamingcallback_on_error(void
     
 );
 #endif

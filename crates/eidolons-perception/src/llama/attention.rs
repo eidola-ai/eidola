@@ -19,10 +19,7 @@ fn linear_from_weight<B: Backend>(weight: Param<Tensor<B, 2>>) -> Linear<B> {
         .init(&device);
 
     // Create record with loaded weights and load it
-    let record = LinearRecord {
-        weight,
-        bias: None,
-    };
+    let record = LinearRecord { weight, bias: None };
     linear.load_record(record)
 }
 
@@ -242,7 +239,8 @@ impl<B: Backend> LlamaAttention<B> {
         // Apply rotation (HuggingFace rotate_half formula):
         // new_first_half = first_half * cos - second_half * sin
         // new_second_half = second_half * cos + first_half * sin
-        let new_first_half = x_first_half.clone() * cos.clone() - x_second_half.clone() * sin.clone();
+        let new_first_half =
+            x_first_half.clone() * cos.clone() - x_second_half.clone() * sin.clone();
         let new_second_half = x_second_half * cos + x_first_half * sin;
 
         // Concatenate back: [new_first_half, new_second_half]

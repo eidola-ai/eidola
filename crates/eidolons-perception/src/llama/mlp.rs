@@ -17,10 +17,7 @@ fn linear_from_weight<B: Backend>(weight: Param<Tensor<B, 2>>) -> Linear<B> {
         .with_bias(false)
         .init(&device);
 
-    let record = LinearRecord {
-        weight,
-        bias: None,
-    };
+    let record = LinearRecord { weight, bias: None };
     linear.load_record(record)
 }
 

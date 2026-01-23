@@ -231,7 +231,10 @@ mod tests {
         println!("=== Multi-turn format ===");
         println!("{:?}", multi_turn);
 
-        assert_eq!(single_turn, multi_turn, "Single message multi-turn should match single-turn format exactly");
+        assert_eq!(
+            single_turn, multi_turn,
+            "Single message multi-turn should match single-turn format exactly"
+        );
     }
 
     #[test]

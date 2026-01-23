@@ -108,7 +108,8 @@ cargo fmt                         # Format
 # These scripts auto-generate artifacts using your local toolchain.
 scripts/update-shared-bindings.sh
 scripts/update-server-openapi.sh
-scripts/update-shared-xcframework.sh  # Requires macOS
+scripts/update-shared-xcframework-dev.sh  # Fast dev build (native arch only)
+scripts/update-shared-xcframework.sh      # Full build (all architectures, CI)
 
 # 4. Verification (Simulates CI)
 # Optimized for speed; focuses on correctness, not heavy artifact building.

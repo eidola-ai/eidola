@@ -10,9 +10,11 @@ pub mod model_manager;
 pub mod tokenizer;
 pub mod weights;
 
-pub use generation::{GenerationConfig, generate, generate_greedy};
+pub use generation::{
+    GenerationConfig, StreamToken, generate, generate_greedy, generate_streaming,
+};
 pub use llama::{Llama, LlamaConfig};
-pub use model_manager::{InferenceBackend, ModelConfig, TextGenerationModel};
+pub use model_manager::{InferenceBackend, ModelConfig, StreamChunk, TextGenerationModel};
 pub use tokenizer::{ChatRole, FormatMessage, TinyLlamaTokenizer};
 
 /// Backend type aliases for convenience.
