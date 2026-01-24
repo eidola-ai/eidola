@@ -7,15 +7,19 @@ use burn_wgpu::{Wgpu, WgpuDevice};
 pub mod generation;
 pub mod llama;
 pub mod model_manager;
+pub mod qwen3;
 pub mod tokenizer;
 pub mod weights;
 
 pub use generation::{
-    GenerationConfig, StreamToken, generate, generate_greedy, generate_streaming,
+    CausalLM, GenerationConfig, StreamToken, generate, generate_greedy, generate_streaming,
 };
 pub use llama::{Llama, LlamaConfig};
-pub use model_manager::{InferenceBackend, ModelConfig, StreamChunk, TextGenerationModel};
-pub use tokenizer::{ChatRole, FormatMessage, TinyLlamaTokenizer};
+pub use model_manager::{
+    InferenceBackend, ModelArchitecture, ModelConfig, StreamChunk, TextGenerationModel,
+};
+pub use qwen3::{Qwen3, Qwen3Config};
+pub use tokenizer::{ChatRole, FormatMessage, Qwen3Tokenizer, TinyLlamaTokenizer};
 
 /// Backend type aliases for convenience.
 #[cfg(feature = "gpu")]

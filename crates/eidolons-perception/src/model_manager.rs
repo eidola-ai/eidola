@@ -1,14 +1,15 @@
 //! Model manager for text generation models.
 //!
-//! Handles downloading, loading, and running inference with Llama models.
+//! Handles downloading, loading, and running inference with Llama and Qwen3 models.
 
 use crate::NdArrayBackend;
 #[cfg(feature = "gpu")]
 use crate::WgpuBackend;
 use crate::generation::{GenerationConfig, StreamToken, generate, generate_streaming};
 use crate::llama::{Llama, LlamaConfig};
-use crate::tokenizer::{TinyLlamaTokenizer, load_tokenizer};
-use crate::weights::load_llama_from_safetensors;
+use crate::qwen3::{Qwen3, Qwen3Config};
+use crate::tokenizer::{Qwen3Tokenizer, TinyLlamaTokenizer, load_qwen3_tokenizer, load_tokenizer};
+use crate::weights::{load_llama_from_safetensors, load_qwen3_from_safetensors};
 use anyhow::{Context, Result};
 use burn_ndarray::NdArrayDevice;
 #[cfg(feature = "gpu")]
@@ -67,6 +68,15 @@ pub enum InferenceBackend {
     NdArray,
 }
 
+/// Supported model architectures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelArchitecture {
+    /// Llama-family models (TinyLlama, Llama 2, etc.)
+    Llama,
+    /// Qwen3 models with QK-Norm
+    Qwen3,
+}
+
 /// Chunk emitted during streaming text generation.
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
@@ -78,33 +88,53 @@ pub enum StreamChunk {
     Error(String),
 }
 
-/// Internal model representation that can use either backend.
+/// Internal model representation that can use either backend and architecture.
 enum LoadedModel {
     #[cfg(feature = "gpu")]
-    Wgpu {
+    LlamaWgpu {
         model: Llama<WgpuBackend>,
         device: WgpuDevice,
     },
-    NdArray {
+    LlamaNdArray {
         model: Llama<NdArrayBackend>,
         device: NdArrayDevice,
     },
+    #[cfg(feature = "gpu")]
+    Qwen3Wgpu {
+        model: Qwen3<WgpuBackend>,
+        device: WgpuDevice,
+    },
+    Qwen3NdArray {
+        model: Qwen3<NdArrayBackend>,
+        device: NdArrayDevice,
+    },
+}
+
+/// Tokenizer that can handle multiple model types.
+enum LoadedTokenizer {
+    TinyLlama(TinyLlamaTokenizer),
+    Qwen3(Qwen3Tokenizer),
 }
 
 /// Represents a loaded text generation model.
 ///
 /// Supports both GPU (WGPU) and CPU (NdArray) backends for inference.
+/// Supports Llama and Qwen3 architectures.
 /// Thread-safety for FFI is handled by wrapping in a Mutex at the service layer.
 pub struct TextGenerationModel {
     /// The model configuration from HuggingFace.
     config: ModelConfig,
-    /// The Llama configuration parsed for model construction.
-    llama_config: LlamaConfig,
+    /// The detected architecture.
+    architecture: ModelArchitecture,
+    /// The Llama configuration (if Llama architecture).
+    llama_config: Option<LlamaConfig>,
+    /// The Qwen3 configuration (if Qwen3 architecture).
+    qwen3_config: Option<Qwen3Config>,
     /// Path to the cached model weights.
     weights_path: PathBuf,
     /// The tokenizer for encoding/decoding text.
-    tokenizer: TinyLlamaTokenizer,
-    /// The loaded model (either WGPU or NdArray backend).
+    tokenizer: LoadedTokenizer,
+    /// The loaded model (either WGPU or NdArray backend, Llama or Qwen3).
     model: LoadedModel,
 }
 
@@ -113,13 +143,17 @@ impl std::fmt::Debug for TextGenerationModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TextGenerationModel")
             .field("config", &self.config)
+            .field("architecture", &self.architecture)
             .field("weights_path", &self.weights_path)
             .field(
                 "backend",
                 &match &self.model {
                     #[cfg(feature = "gpu")]
-                    LoadedModel::Wgpu { .. } => "Wgpu",
-                    LoadedModel::NdArray { .. } => "NdArray",
+                    LoadedModel::LlamaWgpu { .. } => "Wgpu",
+                    LoadedModel::LlamaNdArray { .. } => "NdArray",
+                    #[cfg(feature = "gpu")]
+                    LoadedModel::Qwen3Wgpu { .. } => "Wgpu",
+                    LoadedModel::Qwen3NdArray { .. } => "NdArray",
                 },
             )
             .finish()
@@ -128,7 +162,9 @@ impl std::fmt::Debug for TextGenerationModel {
 
 impl TextGenerationModel {
     /// The default model repository to use.
-    pub const DEFAULT_REPO: &'static str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0";
+    /// Using Qwen3-0.6B as a reasonable default - small enough for CPU inference
+    /// while still having the QK-Norm architecture.
+    pub const DEFAULT_REPO: &'static str = "Qwen/Qwen3-0.6B";
 
     /// Loads a text generation model from HuggingFace Hub.
     ///
@@ -192,20 +228,77 @@ impl TextGenerationModel {
         let config: ModelConfig =
             serde_json::from_str(&config_content).context("Failed to parse config.json")?;
 
-        // Parse LlamaConfig for model construction
-        let llama_config: LlamaConfig =
-            serde_json::from_str(&config_content).context("Failed to parse Llama config")?;
-
-        // Download tokenizer
-        let tokenizer = load_tokenizer(&repo)
-            .await
-            .context("Failed to load tokenizer")?;
+        // Detect architecture from config
+        let architecture = Self::detect_architecture(&config)?;
 
         // Download model weights
         let weights_path = Self::download_weights(&repo).await?;
 
         // Load the safetensors weights file
         let weights_data = Self::load_weights_data(&weights_path).await?;
+
+        // Load model based on architecture
+        match architecture {
+            ModelArchitecture::Llama => {
+                Self::load_llama_model(
+                    config,
+                    config_content,
+                    weights_data,
+                    weights_path,
+                    &repo,
+                    backend,
+                )
+                .await
+            }
+            ModelArchitecture::Qwen3 => {
+                Self::load_qwen3_model(
+                    config,
+                    config_content,
+                    weights_data,
+                    weights_path,
+                    &repo,
+                    backend,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Detects the model architecture from the config.
+    fn detect_architecture(config: &ModelConfig) -> Result<ModelArchitecture> {
+        if let Some(arch) = config.architectures.first() {
+            match arch.as_str() {
+                "LlamaForCausalLM" => Ok(ModelArchitecture::Llama),
+                // Only Qwen3 is supported (has QK-Norm). Qwen2 is not supported.
+                "Qwen3ForCausalLM" => Ok(ModelArchitecture::Qwen3),
+                other => anyhow::bail!(
+                    "Unsupported model architecture: {}. Supported: LlamaForCausalLM, Qwen3ForCausalLM",
+                    other
+                ),
+            }
+        } else {
+            // Default to Llama if no architecture specified
+            Ok(ModelArchitecture::Llama)
+        }
+    }
+
+    /// Loads a Llama model.
+    async fn load_llama_model(
+        config: ModelConfig,
+        config_content: String,
+        weights_data: Vec<u8>,
+        weights_path: PathBuf,
+        repo: &hf_hub::api::tokio::ApiRepo,
+        backend: InferenceBackend,
+    ) -> Result<Self> {
+        // Parse LlamaConfig for model construction
+        let llama_config: LlamaConfig =
+            serde_json::from_str(&config_content).context("Failed to parse Llama config")?;
+
+        // Download tokenizer
+        let tokenizer = load_tokenizer(repo)
+            .await
+            .context("Failed to load tokenizer")?;
 
         // Initialize the model with loaded weights
         let model = match backend {
@@ -218,7 +311,7 @@ impl TextGenerationModel {
                     &device,
                 )
                 .context("Failed to load model weights for WGPU backend")?;
-                LoadedModel::Wgpu { model, device }
+                LoadedModel::LlamaWgpu { model, device }
             }
             InferenceBackend::NdArray => {
                 let device = NdArrayDevice::Cpu;
@@ -228,15 +321,71 @@ impl TextGenerationModel {
                     &device,
                 )
                 .context("Failed to load model weights for NdArray backend")?;
-                LoadedModel::NdArray { model, device }
+                LoadedModel::LlamaNdArray { model, device }
             }
         };
 
         Ok(Self {
             config,
-            llama_config,
+            architecture: ModelArchitecture::Llama,
+            llama_config: Some(llama_config),
+            qwen3_config: None,
             weights_path,
-            tokenizer,
+            tokenizer: LoadedTokenizer::TinyLlama(tokenizer),
+            model,
+        })
+    }
+
+    /// Loads a Qwen3 model.
+    async fn load_qwen3_model(
+        config: ModelConfig,
+        config_content: String,
+        weights_data: Vec<u8>,
+        weights_path: PathBuf,
+        repo: &hf_hub::api::tokio::ApiRepo,
+        backend: InferenceBackend,
+    ) -> Result<Self> {
+        // Parse Qwen3Config for model construction
+        let qwen3_config: Qwen3Config =
+            serde_json::from_str(&config_content).context("Failed to parse Qwen3 config")?;
+
+        // Download tokenizer
+        let tokenizer = load_qwen3_tokenizer(repo)
+            .await
+            .context("Failed to load tokenizer")?;
+
+        // Initialize the model with loaded weights
+        let model = match backend {
+            #[cfg(feature = "gpu")]
+            InferenceBackend::Wgpu => {
+                let device = try_init_wgpu()?;
+                let model = load_qwen3_from_safetensors::<WgpuBackend>(
+                    &weights_data,
+                    &qwen3_config,
+                    &device,
+                )
+                .context("Failed to load Qwen3 model weights for WGPU backend")?;
+                LoadedModel::Qwen3Wgpu { model, device }
+            }
+            InferenceBackend::NdArray => {
+                let device = NdArrayDevice::Cpu;
+                let model = load_qwen3_from_safetensors::<NdArrayBackend>(
+                    &weights_data,
+                    &qwen3_config,
+                    &device,
+                )
+                .context("Failed to load Qwen3 model weights for NdArray backend")?;
+                LoadedModel::Qwen3NdArray { model, device }
+            }
+        };
+
+        Ok(Self {
+            config,
+            architecture: ModelArchitecture::Qwen3,
+            llama_config: None,
+            qwen3_config: Some(qwen3_config),
+            weights_path,
+            tokenizer: LoadedTokenizer::Qwen3(tokenizer),
             model,
         })
     }
@@ -328,9 +477,19 @@ impl TextGenerationModel {
         &self.config
     }
 
-    /// Returns the Llama-specific configuration.
-    pub fn llama_config(&self) -> &LlamaConfig {
-        &self.llama_config
+    /// Returns the detected model architecture.
+    pub fn architecture(&self) -> ModelArchitecture {
+        self.architecture
+    }
+
+    /// Returns the Llama-specific configuration (if Llama architecture).
+    pub fn llama_config(&self) -> Option<&LlamaConfig> {
+        self.llama_config.as_ref()
+    }
+
+    /// Returns the Qwen3-specific configuration (if Qwen3 architecture).
+    pub fn qwen3_config(&self) -> Option<&Qwen3Config> {
+        self.qwen3_config.as_ref()
     }
 
     /// Returns the path to the cached model weights.
@@ -342,16 +501,20 @@ impl TextGenerationModel {
     pub fn backend(&self) -> InferenceBackend {
         match &self.model {
             #[cfg(feature = "gpu")]
-            LoadedModel::Wgpu { .. } => InferenceBackend::Wgpu,
-            LoadedModel::NdArray { .. } => InferenceBackend::NdArray,
+            LoadedModel::LlamaWgpu { .. } => InferenceBackend::Wgpu,
+            LoadedModel::LlamaNdArray { .. } => InferenceBackend::NdArray,
+            #[cfg(feature = "gpu")]
+            LoadedModel::Qwen3Wgpu { .. } => InferenceBackend::Wgpu,
+            LoadedModel::Qwen3NdArray { .. } => InferenceBackend::NdArray,
         }
     }
 
     /// Returns whether the model is using GPU acceleration.
     pub fn is_gpu_accelerated(&self) -> bool {
         #[cfg(feature = "gpu")]
-        if matches!(self.model, LoadedModel::Wgpu { .. }) {
-            return true;
+        match &self.model {
+            LoadedModel::LlamaWgpu { .. } | LoadedModel::Qwen3Wgpu { .. } => return true,
+            _ => {}
         }
         false
     }
@@ -398,25 +561,58 @@ impl TextGenerationModel {
     pub fn generate_from_conversation_with_config(
         &self,
         messages: &[crate::tokenizer::FormatMessage<'_>],
-        gen_config: GenerationConfig,
+        mut gen_config: GenerationConfig,
     ) -> String {
-        // Format the conversation using ChatML template
-        let formatted_prompt = TinyLlamaTokenizer::format_multi_turn_prompt(messages);
-
-        // Encode prompt
-        let input_ids = match self.tokenizer.encode(&formatted_prompt, true) {
-            Ok(ids) => ids,
-            Err(e) => {
-                eprintln!("Tokenization error: {}", e);
-                return format!("[Tokenization error: {}]", e);
+        // Use this model's EOS tokens if not explicitly set
+        if gen_config.eos_token_id == 2 && gen_config.additional_eos_ids.is_empty() {
+            // Default was used, override with model's EOS tokens
+            let all_eos = self.all_eos_token_ids();
+            if !all_eos.is_empty() {
+                gen_config.eos_token_id = all_eos[0];
+                gen_config.additional_eos_ids = all_eos[1..].to_vec();
+            }
+        }
+        // Format and encode based on architecture
+        let (formatted_prompt, input_ids) = match &self.tokenizer {
+            LoadedTokenizer::TinyLlama(tok) => {
+                let formatted = TinyLlamaTokenizer::format_multi_turn_prompt(messages);
+                let ids = match tok.encode(&formatted, true) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        eprintln!("Tokenization error: {}", e);
+                        return format!("[Tokenization error: {}]", e);
+                    }
+                };
+                (formatted, ids)
+            }
+            LoadedTokenizer::Qwen3(tok) => {
+                let formatted = Qwen3Tokenizer::format_multi_turn_prompt(messages);
+                let ids = match tok.encode(&formatted, true) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        eprintln!("Tokenization error: {}", e);
+                        return format!("[Tokenization error: {}]", e);
+                    }
+                };
+                (formatted, ids)
             }
         };
+        let _ = formatted_prompt; // Suppress unused warning
 
-        // Run generation based on backend
+        // Run generation based on backend and architecture
         let output_ids = match &self.model {
             #[cfg(feature = "gpu")]
-            LoadedModel::Wgpu { model, device } => generate(model, input_ids, &gen_config, device),
-            LoadedModel::NdArray { model, device } => {
+            LoadedModel::LlamaWgpu { model, device } => {
+                generate(model, input_ids, &gen_config, device)
+            }
+            LoadedModel::LlamaNdArray { model, device } => {
+                generate(model, input_ids, &gen_config, device)
+            }
+            #[cfg(feature = "gpu")]
+            LoadedModel::Qwen3Wgpu { model, device } => {
+                generate(model, input_ids, &gen_config, device)
+            }
+            LoadedModel::Qwen3NdArray { model, device } => {
                 generate(model, input_ids, &gen_config, device)
             }
         };
@@ -424,7 +620,12 @@ impl TextGenerationModel {
         // Decode output (skip the input tokens)
         let new_tokens = &output_ids[output_ids.len().saturating_sub(gen_config.max_new_tokens)..];
 
-        match self.tokenizer.decode(new_tokens, true) {
+        let decoded = match &self.tokenizer {
+            LoadedTokenizer::TinyLlama(tok) => tok.decode(new_tokens, true),
+            LoadedTokenizer::Qwen3(tok) => tok.decode(new_tokens, true),
+        };
+
+        match decoded {
             Ok(text) => text.trim().to_string(),
             Err(e) => {
                 eprintln!("Decoding error: {}", e);
@@ -446,19 +647,43 @@ impl TextGenerationModel {
     pub fn generate_from_conversation_streaming(
         &self,
         messages: &[crate::tokenizer::FormatMessage<'_>],
-        gen_config: GenerationConfig,
+        mut gen_config: GenerationConfig,
         chunk_tx: mpsc::Sender<StreamChunk>,
     ) {
-        // Format the conversation using ChatML template
-        let formatted_prompt = TinyLlamaTokenizer::format_multi_turn_prompt(messages);
-
-        // Encode prompt
-        let input_ids = match self.tokenizer.encode(&formatted_prompt, true) {
-            Ok(ids) => ids,
-            Err(e) => {
-                eprintln!("Tokenization error: {}", e);
-                let _ = chunk_tx.send(StreamChunk::Error(format!("Tokenization error: {}", e)));
-                return;
+        // Use this model's EOS tokens if not explicitly set
+        if gen_config.eos_token_id == 2 && gen_config.additional_eos_ids.is_empty() {
+            // Default was used, override with model's EOS tokens
+            let all_eos = self.all_eos_token_ids();
+            if !all_eos.is_empty() {
+                gen_config.eos_token_id = all_eos[0];
+                gen_config.additional_eos_ids = all_eos[1..].to_vec();
+            }
+        }
+        // Format and encode based on architecture
+        let input_ids = match &self.tokenizer {
+            LoadedTokenizer::TinyLlama(tok) => {
+                let formatted = TinyLlamaTokenizer::format_multi_turn_prompt(messages);
+                match tok.encode(&formatted, true) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        eprintln!("Tokenization error: {}", e);
+                        let _ =
+                            chunk_tx.send(StreamChunk::Error(format!("Tokenization error: {}", e)));
+                        return;
+                    }
+                }
+            }
+            LoadedTokenizer::Qwen3(tok) => {
+                let formatted = Qwen3Tokenizer::format_multi_turn_prompt(messages);
+                match tok.encode(&formatted, true) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        eprintln!("Tokenization error: {}", e);
+                        let _ =
+                            chunk_tx.send(StreamChunk::Error(format!("Tokenization error: {}", e)));
+                        return;
+                    }
+                }
             }
         };
 
@@ -482,7 +707,14 @@ impl TextGenerationModel {
                             generated_tokens.push(token_id);
 
                             // Decode all generated tokens so far
-                            match tokenizer_ref.decode(&generated_tokens, true) {
+                            let decode_result = match tokenizer_ref {
+                                LoadedTokenizer::TinyLlama(tok) => {
+                                    tok.decode(&generated_tokens, true)
+                                }
+                                LoadedTokenizer::Qwen3(tok) => tok.decode(&generated_tokens, true),
+                            };
+
+                            match decode_result {
                                 Ok(text) => {
                                     let text = text.trim_start();
                                     // Only send new characters
@@ -516,10 +748,17 @@ impl TextGenerationModel {
             // Run generation on this thread (tokens are processed concurrently)
             match &self.model {
                 #[cfg(feature = "gpu")]
-                LoadedModel::Wgpu { model, device } => {
+                LoadedModel::LlamaWgpu { model, device } => {
                     generate_streaming(model, input_ids, &gen_config, device, token_tx);
                 }
-                LoadedModel::NdArray { model, device } => {
+                LoadedModel::LlamaNdArray { model, device } => {
+                    generate_streaming(model, input_ids, &gen_config, device, token_tx);
+                }
+                #[cfg(feature = "gpu")]
+                LoadedModel::Qwen3Wgpu { model, device } => {
+                    generate_streaming(model, input_ids, &gen_config, device, token_tx);
+                }
+                LoadedModel::Qwen3NdArray { model, device } => {
                     generate_streaming(model, input_ids, &gen_config, device, token_tx);
                 }
             }
@@ -539,24 +778,54 @@ impl TextGenerationModel {
     /// # Returns
     ///
     /// Generated text response.
-    pub fn generate_with_config(&self, prompt: &str, gen_config: GenerationConfig) -> String {
-        // Format prompt for TinyLlama chat
-        let formatted_prompt = TinyLlamaTokenizer::format_chat_prompt(prompt);
-
-        // Encode prompt
-        let input_ids = match self.tokenizer.encode(&formatted_prompt, true) {
-            Ok(ids) => ids,
-            Err(e) => {
-                eprintln!("Tokenization error: {}", e);
-                return format!("[Tokenization error: {}]", e);
+    pub fn generate_with_config(&self, prompt: &str, mut gen_config: GenerationConfig) -> String {
+        // Use this model's EOS tokens if not explicitly set
+        if gen_config.eos_token_id == 2 && gen_config.additional_eos_ids.is_empty() {
+            // Default was used, override with model's EOS tokens
+            let all_eos = self.all_eos_token_ids();
+            if !all_eos.is_empty() {
+                gen_config.eos_token_id = all_eos[0];
+                gen_config.additional_eos_ids = all_eos[1..].to_vec();
+            }
+        }
+        // Format and encode based on architecture
+        let input_ids = match &self.tokenizer {
+            LoadedTokenizer::TinyLlama(tok) => {
+                let formatted = TinyLlamaTokenizer::format_chat_prompt(prompt);
+                match tok.encode(&formatted, true) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        eprintln!("Tokenization error: {}", e);
+                        return format!("[Tokenization error: {}]", e);
+                    }
+                }
+            }
+            LoadedTokenizer::Qwen3(tok) => {
+                let formatted = Qwen3Tokenizer::format_chat_prompt(prompt);
+                match tok.encode(&formatted, true) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        eprintln!("Tokenization error: {}", e);
+                        return format!("[Tokenization error: {}]", e);
+                    }
+                }
             }
         };
 
-        // Run generation based on backend
+        // Run generation based on backend and architecture
         let output_ids = match &self.model {
             #[cfg(feature = "gpu")]
-            LoadedModel::Wgpu { model, device } => generate(model, input_ids, &gen_config, device),
-            LoadedModel::NdArray { model, device } => {
+            LoadedModel::LlamaWgpu { model, device } => {
+                generate(model, input_ids, &gen_config, device)
+            }
+            LoadedModel::LlamaNdArray { model, device } => {
+                generate(model, input_ids, &gen_config, device)
+            }
+            #[cfg(feature = "gpu")]
+            LoadedModel::Qwen3Wgpu { model, device } => {
+                generate(model, input_ids, &gen_config, device)
+            }
+            LoadedModel::Qwen3NdArray { model, device } => {
                 generate(model, input_ids, &gen_config, device)
             }
         };
@@ -564,7 +833,12 @@ impl TextGenerationModel {
         // Decode output (skip the input tokens)
         let new_tokens = &output_ids[output_ids.len().saturating_sub(gen_config.max_new_tokens)..];
 
-        match self.tokenizer.decode(new_tokens, true) {
+        let decoded = match &self.tokenizer {
+            LoadedTokenizer::TinyLlama(tok) => tok.decode(new_tokens, true),
+            LoadedTokenizer::Qwen3(tok) => tok.decode(new_tokens, true),
+        };
+
+        match decoded {
             Ok(text) => text.trim().to_string(),
             Err(e) => {
                 eprintln!("Decoding error: {}", e);
@@ -573,9 +847,52 @@ impl TextGenerationModel {
         }
     }
 
-    /// Returns a reference to the tokenizer.
-    pub fn tokenizer(&self) -> &TinyLlamaTokenizer {
-        &self.tokenizer
+    /// Returns a reference to the TinyLlama tokenizer (if using Llama architecture).
+    /// For architecture-agnostic access, use the generate methods instead.
+    pub fn tokenizer(&self) -> Option<&TinyLlamaTokenizer> {
+        match &self.tokenizer {
+            LoadedTokenizer::TinyLlama(tok) => Some(tok),
+            LoadedTokenizer::Qwen3(_) => None,
+        }
+    }
+
+    /// Returns a reference to the Qwen3 tokenizer (if using Qwen3 architecture).
+    pub fn qwen3_tokenizer(&self) -> Option<&Qwen3Tokenizer> {
+        match &self.tokenizer {
+            LoadedTokenizer::TinyLlama(_) => None,
+            LoadedTokenizer::Qwen3(tok) => Some(tok),
+        }
+    }
+
+    /// Returns the EOS token ID for this model.
+    pub fn eos_token_id(&self) -> u32 {
+        match &self.tokenizer {
+            LoadedTokenizer::TinyLlama(tok) => tok.eos_token_id(),
+            LoadedTokenizer::Qwen3(tok) => tok.eos_token_id(),
+        }
+    }
+
+    /// Returns all EOS token IDs for this model.
+    pub fn all_eos_token_ids(&self) -> Vec<u32> {
+        match &self.tokenizer {
+            LoadedTokenizer::TinyLlama(tok) => vec![tok.eos_token_id()],
+            LoadedTokenizer::Qwen3(tok) => tok.all_eos_token_ids(),
+        }
+    }
+
+    /// Returns a GenerationConfig with the correct EOS tokens for this model.
+    pub fn default_generation_config(&self) -> GenerationConfig {
+        let all_eos = self.all_eos_token_ids();
+        let (primary, additional) = if all_eos.is_empty() {
+            (2, Vec::new()) // fallback
+        } else {
+            (all_eos[0], all_eos[1..].to_vec())
+        };
+        GenerationConfig {
+            eos_token_id: primary,
+            additional_eos_ids: additional,
+            ..GenerationConfig::default()
+        }
     }
 }
 
@@ -909,14 +1226,14 @@ mod tests {
         let formatted = TinyLlamaTokenizer::format_chat_prompt(prompt);
         println!("Formatted prompt: {}", formatted);
 
-        let input_ids = model.tokenizer().encode(&formatted, true).unwrap();
+        let tokenizer = model.tokenizer().expect("Expected TinyLlama tokenizer");
+        let input_ids = tokenizer.encode(&formatted, true).unwrap();
         println!("Input token IDs: {:?}", input_ids);
         println!(
             "Input tokens: {:?}",
             input_ids
                 .iter()
-                .map(|&id| model
-                    .tokenizer()
+                .map(|&id| tokenizer
                     .decode(&[id], false)
                     .unwrap_or_else(|_| format!("<{}>", id)))
                 .collect::<Vec<_>>()
@@ -932,8 +1249,7 @@ mod tests {
                     max_new_tokens: 10,
                     temperature: 1.0,
                     top_p: 1.0,
-                    eos_token_id: 2,
-                    include_eos: false,
+                    ..GenerationConfig::default()
                 };
                 let response = model.generate_with_config(prompt, gen_config);
                 println!("Greedy-ish response (10 tokens): {}", response);
@@ -945,26 +1261,24 @@ mod tests {
         // Run greedy generation to eliminate sampling randomness
         println!("\nRunning greedy decoding (no sampling randomness)...");
         match &model.model {
-            LoadedModel::NdArray { model: llama, .. } => {
+            LoadedModel::LlamaNdArray { model: llama, .. } => {
                 let output_ids = generate_greedy(llama, input_ids.clone(), 20, 2, &device);
                 let new_tokens: Vec<u32> = output_ids[input_ids.len()..].to_vec();
 
                 println!("Generated token IDs: {:?}", new_tokens);
                 println!("Generated tokens:");
                 for (i, &id) in new_tokens.iter().enumerate() {
-                    let token_str = model
-                        .tokenizer()
+                    let token_str = tokenizer
                         .decode(&[id], false)
                         .unwrap_or_else(|_| format!("<{}>", id));
                     println!("  {}: {} -> '{}'", i, id, token_str);
                 }
 
-                let full_response = model.tokenizer().decode(&new_tokens, true).unwrap();
+                let full_response = tokenizer.decode(&new_tokens, true).unwrap();
                 println!("\nFull greedy response: {}", full_response);
             }
-            #[cfg(feature = "gpu")]
             _ => {
-                println!("Skipping detailed analysis for non-NdArray backend");
+                println!("Skipping detailed analysis for non-Llama-NdArray backend");
             }
         }
     }
@@ -986,9 +1300,10 @@ mod tests {
             "I am a helpful assistant.",
         ];
 
+        let tokenizer = model.tokenizer().expect("Expected TinyLlama tokenizer");
         for test_str in test_strings {
-            let tokens = model.tokenizer().encode(test_str, false).unwrap();
-            let decoded = model.tokenizer().decode(&tokens, false).unwrap();
+            let tokens = tokenizer.encode(test_str, false).unwrap();
+            let decoded = tokenizer.decode(&tokens, false).unwrap();
 
             println!("Original:  '{}'", test_str);
             println!("Tokens:    {:?}", tokens);
