@@ -128,6 +128,7 @@ impl<B: Backend> Qwen3Attention<B> {
     /// * `head_dim` - Dimension per head
     /// * `rms_norm_eps` - Epsilon for RMSNorm
     /// * `rope_theta` - Rope theta for positional encoding
+    #[allow(clippy::too_many_arguments)]
     pub fn from_weights(
         q_proj_weight: Param<Tensor<B, 2>>,
         k_proj_weight: Param<Tensor<B, 2>>,
