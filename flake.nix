@@ -717,6 +717,88 @@
                 touch $out
               '';
 
+          # Checks that committed Swift bindings are up to date with generated ones
+          swift-bindings-current =
+            pkgs.runCommand "check-swift-bindings"
+              {
+                buildInputs = [ pkgs.diffutils ];
+              }
+              ''
+                echo "Checking if committed Swift bindings match generated ones..."
+
+                # Check EidolonsShared Swift files
+                GENERATED_SWIFT="${self.packages.${system}.eidolons-shared-swift-bindings}/Sources/EidolonsShared"
+                COMMITTED_SWIFT="${repoSrc}/apps/eidolons-shared/swift/Sources/EidolonsShared"
+
+                if [ ! -d "$COMMITTED_SWIFT" ]; then
+                  echo "ERROR: No committed Swift bindings found at apps/eidolons-shared/swift/Sources/EidolonsShared"
+                  echo "Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "Then commit the generated files."
+                  exit 1
+                fi
+
+                if ! diff -r "$GENERATED_SWIFT" "$COMMITTED_SWIFT"; then
+                  echo ""
+                  echo "ERROR: Committed EidolonsShared Swift bindings don't match generated ones!"
+                  echo ""
+                  echo "To fix this:"
+                  echo "  1. Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "  2. Review the changes"
+                  echo "  3. Commit the updated bindings"
+                  echo ""
+                  exit 1
+                fi
+
+                # Check EidolonsSharedFFI C headers
+                GENERATED_FFI="${self.packages.${system}.eidolons-shared-swift-bindings}/Sources/EidolonsSharedFFI"
+                COMMITTED_FFI="${repoSrc}/apps/eidolons-shared/swift/Sources/EidolonsSharedFFI"
+
+                if [ ! -d "$COMMITTED_FFI" ]; then
+                  echo "ERROR: No committed FFI headers found at apps/eidolons-shared/swift/Sources/EidolonsSharedFFI"
+                  echo "Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "Then commit the generated files."
+                  exit 1
+                fi
+
+                if ! diff -r "$GENERATED_FFI" "$COMMITTED_FFI"; then
+                  echo ""
+                  echo "ERROR: Committed EidolonsSharedFFI headers don't match generated ones!"
+                  echo ""
+                  echo "To fix this:"
+                  echo "  1. Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "  2. Review the changes"
+                  echo "  3. Commit the updated headers"
+                  echo ""
+                  exit 1
+                fi
+
+                # Check SharedTypes (Crux typegen)
+                GENERATED_TYPES="${self.packages.${system}.eidolons-shared-swift-types}/SharedTypes"
+                COMMITTED_TYPES="${repoSrc}/apps/eidolons-shared/swift/generated/SharedTypes"
+
+                if [ ! -d "$COMMITTED_TYPES" ]; then
+                  echo "ERROR: No committed SharedTypes found at apps/eidolons-shared/swift/generated/SharedTypes"
+                  echo "Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "Then commit the generated files."
+                  exit 1
+                fi
+
+                if ! diff -r "$GENERATED_TYPES" "$COMMITTED_TYPES"; then
+                  echo ""
+                  echo "ERROR: Committed SharedTypes don't match generated ones!"
+                  echo ""
+                  echo "To fix this:"
+                  echo "  1. Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "  2. Review the changes"
+                  echo "  3. Commit the updated types"
+                  echo ""
+                  exit 1
+                fi
+
+                echo "Swift bindings are up to date"
+                touch $out
+              '';
+
           # Verify Swift formatting for all Swift files in the repo
           swift-formatting =
             pkgs.runCommand "check-swift-formatting"
