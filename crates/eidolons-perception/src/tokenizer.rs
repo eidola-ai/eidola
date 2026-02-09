@@ -283,9 +283,12 @@ impl Qwen3Tokenizer {
     }
 
     /// Returns all EOS token IDs that should stop generation.
-    /// Includes both <|im_end|> (151645) and <|endoftext|> (151643).
+    /// Only <|im_end|> (151645) is used — this is the proper end-of-turn marker
+    /// in chat mode. <|endoftext|> (151643) is NOT included because Qwen3's
+    /// thinking mode emits it during <think> blocks, which would cause
+    /// premature termination.
     pub fn all_eos_token_ids(&self) -> Vec<u32> {
-        vec![QWEN3_IM_END_TOKEN_ID, QWEN3_BOS_TOKEN_ID] // 151645, 151643
+        vec![QWEN3_IM_END_TOKEN_ID] // 151645
     }
 
     /// Formats a prompt for the Qwen3 chat format (ChatML).

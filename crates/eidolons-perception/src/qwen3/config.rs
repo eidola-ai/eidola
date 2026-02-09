@@ -52,9 +52,10 @@ pub struct Qwen3Config {
     #[serde(default = "default_bos_token_id")]
     pub bos_token_id: u32,
 
-    /// End of sequence token IDs.
-    /// Qwen3 configs often have multiple EOS tokens: [151645, 151643]
-    /// where 151645 is <|im_end|> and 151643 is <|endoftext|>.
+    /// End of sequence token IDs from the model config.
+    /// Qwen3 configs list [151645, 151643] (<|im_end|> and <|endoftext|>).
+    /// Note: for generation, only <|im_end|> is used as the stop token — see
+    /// Qwen3Tokenizer::all_eos_token_ids() which filters for thinking mode.
     #[serde(
         default = "default_eos_token_ids",
         deserialize_with = "deserialize_eos_token_ids",
@@ -102,7 +103,9 @@ fn default_bos_token_id() -> u32 {
 }
 
 fn default_eos_token_ids() -> Vec<u32> {
-    // Qwen3 uses both <|im_end|> (151645) and <|endoftext|> (151643)
+    // Qwen3 config lists both <|im_end|> (151645) and <|endoftext|> (151643).
+    // Note: for generation, only <|im_end|> is used as the stop token — see
+    // Qwen3Tokenizer::all_eos_token_ids() which filters this for thinking mode.
     vec![151645, 151643]
 }
 
