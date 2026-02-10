@@ -31,6 +31,8 @@ eidolons/
 │       ├── Xcode/            # Xcode project wrapper
 │       ├── Support/          # Shared build files (Info.plist, scripts)
 │       └── Package.swift     # Swift Package Manager config
+├── docs/
+│   └── design/           # Architecture Decision Records (ADRs)
 ├── tools/            # Build tooling
 │   ├── uniffi-bindgen-swift/  # UniFFI binding generator
 │   └── shared-typegen/        # Crux type generator for Swift
@@ -149,6 +151,18 @@ Targets defined in `rust-toolchain.toml`:
 | `apps/macos/Sources/Eidolons/Core.swift` | Swift shell bridge (handles Crux event/effect loop) |
 | `apps/macos/Support/Info.plist` | Shared app Info.plist |
 | `apps/macos/Support/package-app.sh` | CLI build script for .app bundle |
+
+## Design Documents
+
+Architecture decisions are recorded in [`docs/design/`](docs/design/). See the
+[index](docs/design/README.md) for a full list. Key decisions:
+
+- [Model Weight Management](docs/design/model-weight-management.md) — weights as pinned dependencies, hash-verified at every boundary
+- [Pure Rust, Zero C Dependencies](docs/design/pure-rust-zero-c-dependencies.md) — rustls-rustcrypto, webpki-roots, no C cross-compiler needed
+- [Reproducible Builds](docs/design/reproducible-builds.md) — Nix, Crane, deterministic settings, CI-verified generated artifacts
+- [Crux Cross-Platform Architecture](docs/design/crux-cross-platform-architecture.md) — Elm-like core/shell split, UniFFI, bincode FFI bridge
+- [OpenAI-Compatible Proxy Server](docs/design/openai-compatible-proxy-server.md) — canonical API format, stateless proxy, distroless OCI
+- [On-Device Inference with Burn](docs/design/on-device-inference-with-burn.md) — pure Rust ML, WGPU GPU backend, model-per-crate
 
 ## Conventions
 
