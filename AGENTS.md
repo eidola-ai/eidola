@@ -14,16 +14,16 @@ eidolons/
 │   │       ├── anthropic.rs  # Anthropic API types
 │   │       ├── transform.rs  # Format conversion
 │   │       └── proxy.rs      # Upstream HTTP client
-│   └── eidolons-hello/   # Hello capability (example)
-│       └── src/lib.rs
+│   ├── eidolons-hello/   # Hello capability (example)
+│   │   └── src/lib.rs
+│   └── eidolons-shared/  # Crux-based shared core (exclusive FFI generator)
+│       ├── src/
+│       │   ├── lib.rs        # FFI bridge (processEvent, handleResponse, view, capabilities)
+│       │   ├── app.rs        # Crux App impl (Event, Model, ViewModel, Effect)
+│       │   └── capabilities/ # Crux capabilities (e.g., eidolons)
+│       ├── swift/            # Generated bindings (UniFFI + Crux types)
+│       └── Package.swift     # Swift Package exposing EidolonsShared + SharedTypes
 ├── apps/
-│   ├── eidolons-shared/  # Crux-based shared core (exclusive FFI generator)
-│   │   ├── src/
-│   │   │   ├── lib.rs        # FFI bridge (processEvent, handleResponse, view, capabilities)
-│   │   │   ├── app.rs        # Crux App impl (Event, Model, ViewModel, Effect)
-│   │   │   └── capabilities/ # Crux capabilities (e.g., eidolons)
-│   │   ├── swift/            # Generated bindings (UniFFI + Crux types)
-│   │   └── Package.swift     # Swift Package exposing EidolonsShared + SharedTypes
 │   └── macos/            # macOS app (SwiftPM + Xcode wrapper)
 │       ├── Sources/
 │       │   ├── Eidolons/         # SwiftUI shell (Core.swift, ContentView.swift)
@@ -31,6 +31,8 @@ eidolons/
 │       ├── Xcode/            # Xcode project wrapper
 │       ├── Support/          # Shared build files (Info.plist, scripts)
 │       └── Package.swift     # Swift Package Manager config
+├── docs/
+│   └── design/           # Architecture Decision Records (ADRs)
 ├── tools/            # Build tooling
 │   ├── uniffi-bindgen-swift/  # UniFFI binding generator
 │   └── shared-typegen/        # Crux type generator for Swift
@@ -73,7 +75,7 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 └─────────────────────┬───────────────────────────────────┘
                       │ FFI (UniFFI + bincode)
 ┌─────────────────────▼───────────────────────────────────┐
-│  Crux Core (apps/eidolons-shared)                       │
+│  Crux Core (crates/eidolons-shared)                      │
 │  - Event: user actions (e.g., Greet)                    │
 │  - Model: private app state                             │
 │  - ViewModel: public view state                         │
@@ -108,7 +110,8 @@ cargo fmt                         # Format
 # These scripts auto-generate artifacts using your local toolchain.
 scripts/update-shared-bindings.sh
 scripts/update-server-openapi.sh
-scripts/update-shared-xcframework.sh  # Requires macOS
+scripts/update-shared-xcframework-dev.sh  # Fast dev build (native arch only)
+scripts/update-shared-xcframework.sh      # Full build (all architectures, CI)
 
 # 4. Verification (Simulates CI)
 # Optimized for speed; focuses on correctness, not heavy artifact building.
@@ -141,13 +144,25 @@ Targets defined in `rust-toolchain.toml`:
 | `Cargo.toml` | Workspace config, release profile (LTO, single codegen unit) |
 | `crates/eidolons-server/Cargo.toml` | Server dependencies |
 | `crates/eidolons-hello/src/lib.rs` | Hello capability implementation (pure Rust) |
-| `apps/eidolons-shared/Package.swift` | Shared core Swift Package (EidolonsShared + SharedTypes) |
-| `apps/eidolons-shared/src/lib.rs` | FFI bridge + capability re-exports |
-| `apps/eidolons-shared/src/app.rs` | Crux App implementation (Event, Model, ViewModel, Effect) |
+| `crates/eidolons-shared/Package.swift` | Shared core Swift Package (EidolonsShared + SharedTypes) |
+| `crates/eidolons-shared/src/lib.rs` | FFI bridge + capability re-exports |
+| `crates/eidolons-shared/src/app.rs` | Crux App implementation (Event, Model, ViewModel, Effect) |
 | `apps/macos/Package.swift` | macOS app Swift Package config |
 | `apps/macos/Sources/Eidolons/Core.swift` | Swift shell bridge (handles Crux event/effect loop) |
 | `apps/macos/Support/Info.plist` | Shared app Info.plist |
 | `apps/macos/Support/package-app.sh` | CLI build script for .app bundle |
+
+## Design Documents
+
+Architecture decisions are recorded in [`docs/design/`](docs/design/). See the
+[index](docs/design/README.md) for a full list. Key decisions:
+
+- [Model Weight Management](docs/design/model-weight-management.md) — weights as pinned dependencies, hash-verified at every boundary
+- [Pure Rust, Zero C Dependencies](docs/design/pure-rust-zero-c-dependencies.md) — rustls-rustcrypto, webpki-roots, no C cross-compiler needed
+- [Reproducible Builds](docs/design/reproducible-builds.md) — Nix, Crane, deterministic settings, CI-verified generated artifacts
+- [Crux Cross-Platform Architecture](docs/design/crux-cross-platform-architecture.md) — Elm-like core/shell split, UniFFI, bincode FFI bridge
+- [OpenAI-Compatible Proxy Server](docs/design/openai-compatible-proxy-server.md) — canonical API format, stateless proxy, distroless OCI
+- [On-Device Inference with Burn](docs/design/on-device-inference-with-burn.md) — pure Rust ML, WGPU GPU backend, model-per-crate
 
 ## Conventions
 

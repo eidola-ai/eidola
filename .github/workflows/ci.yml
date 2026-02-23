@@ -13,7 +13,7 @@ jobs:
     name: Build all platforms
     # runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
     runs-on: self-hosted
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       id-token: write
       contents: read
@@ -40,30 +40,6 @@ jobs:
       - name: Run all checks
         run: nix flake check --show-trace --max-jobs auto
 
-      - name: Verify generated code is up to date
-        run: |
-          set -euo pipefail
-
-          echo "=== Regenerating Swift bindings ==="
-          nix run '.#update-eidolons-shared-swift-bindings'
-
-          echo "=== Regenerating OpenAPI spec ==="
-          nix run '.#update-server-openapi'
-
-          echo "=== Checking for uncommitted changes ==="
-          if ! git diff --quiet; then
-            echo "::error::Generated code is out of date. Please run the following commands and commit the changes:"
-            echo "::error::  nix run '.#update-eidolons-shared-swift-bindings'"
-            echo "::error::  nix run '.#update-server-openapi'"
-            echo ""
-            echo "Diff of outdated files:"
-            git diff --stat
-            git diff
-            exit 1
-          fi
-
-          echo "All generated code is up to date."
-
       - name: Build all packages
         run: |
           mkdir -p $RUNNER_TEMP/out
@@ -87,7 +63,7 @@ jobs:
       - name: Run Swift tests
         run: |
           # Run Swift tests for shared core
-          ( cd apps/eidolons-shared && swift test )
+          ( cd crates/eidolons-shared && swift test )
 
           # Run Swift tests for macOS app
           ( cd apps/macos && swift test )

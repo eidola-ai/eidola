@@ -3,7 +3,6 @@
 members = [
     "crates/*",
     "tools/*",
-    "apps/eidolons-shared",
 ]
 resolver = "2"
 

@@ -78,7 +78,7 @@ Eidolons consists of these components:
 - **Crates** (`crates/`) - Rust crates including:
   - `eidolons-server` - OpenAI-compatible proxy that routes requests to AI providers (currently Anthropic Claude)
   - `eidolons-hello` - Example capability implementation
-- **APP: shared core** (`apps/eidolons-shared/`) - Crux-based cross-platform app core managing state and effects, exposing capabilities via FFI
+  - `eidolons-shared` - Crux-based cross-platform app core managing state and effects, exposing capabilities via FFI
 - **APP: macOS** (`apps/macos/`) - SwiftUI shell that renders the shared core's view model
 
 All builds are deterministic and reproducible via Nix.
@@ -115,13 +115,14 @@ These can also be updated outside of Nix using your local Rust toolchain (auto-g
 ```bash
 scripts/update-shared-bindings.sh
 scripts/update-server-openapi.sh
-scripts/update-shared-xcframework.sh
+scripts/update-shared-xcframework-dev.sh  # Fast: native architecture only (preferred for development)
+scripts/update-shared-xcframework.sh      # Full: all architectures (used in CI)
 ```
-*Note: `update-shared-xcframework.sh` requires a macOS host for local generation.*
+*Note: XCFramework scripts require a macOS host.*
 
 Generated artifacts are committed and verified by CI:
-- `apps/eidolons-shared/swift/` - Shared core bindings (UniFFI + Crux types)
-- `apps/eidolons-shared/target/apple/` - Compiled XCFramework
+- `crates/eidolons-shared/swift/` - Shared core bindings (UniFFI + Crux types)
+- `crates/eidolons-shared/target/apple/` - Compiled XCFramework
 - `crates/eidolons-server/openapi.json` - Server API specification
 
 ## Building for release
