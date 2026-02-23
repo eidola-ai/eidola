@@ -19,7 +19,7 @@ burn = { version = "0.20", features = ["autodiff"] }
 burn-cubecl = { version = "0.20", optional = true }
 burn-wgpu = { version = "0.20", features = ["metal"], optional = true }
 burn-ndarray = "0.20"
-qwen3-burn = { git = "https://github.com/eidolons-ai/qwen3-burn.git", branch = "burn-mlx", default-features = false, features = ["ndarray"] }
+qwen3-burn = { git = "https://github.com/eidolons-ai/qwen3-burn.git", branch = "main", default-features = false, features = ["ndarray"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 
