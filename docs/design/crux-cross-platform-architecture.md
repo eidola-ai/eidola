@@ -43,7 +43,7 @@ platform shells handle all I/O and rendering.
 └─────────────────────┬───────────────────────────────────────┘
                       │ FFI (UniFFI + bincode)
 ┌─────────────────────▼───────────────────────────────────────┐
-│  Crux Core (apps/eidolons-shared)                           │
+│  Crux Core (crates/eidolons-shared)                          │
 │  - Event: user actions + capability responses               │
 │  - Model: private app state (not exposed to shell)          │
 │  - ViewModel: public view state (serialized to shell)       │

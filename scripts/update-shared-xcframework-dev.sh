@@ -88,7 +88,7 @@ cat > "$XCFW_PATH/Info.plist" << 'EOF'
 </plist>
 EOF
 
-DEST="$REPO_ROOT/apps/eidolons-shared/target/apple/libeidolons_shared-rs.xcframework"
+DEST="$REPO_ROOT/crates/eidolons-shared/target/apple/libeidolons_shared-rs.xcframework"
 
 echo "Copying shared core XCframework..."
 echo "  Source: $TEMP_ROOT"

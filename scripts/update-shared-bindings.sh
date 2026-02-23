@@ -63,7 +63,7 @@ STUB
 fi
 
 # Update UniFFI bindings
-DEST="$REPO_ROOT/apps/eidolons-shared/swift/Sources"
+DEST="$REPO_ROOT/crates/eidolons-shared/swift/Sources"
 echo "Syncing Swift bindings..."
 echo "  Source: $SOURCE_BINDINGS"
 echo "  Dest:   $DEST"
@@ -94,7 +94,7 @@ cp "$BINDINGS_FFI_DIR/module.modulemap" "$DEST/EidolonsSharedFFI/"
 cp "$BINDINGS_FFI_DIR/eidolons_sharedFFI.c" "$DEST/EidolonsSharedFFI/"
 
 # Update Crux typegen types
-TYPES_DEST="$REPO_ROOT/apps/eidolons-shared/swift/generated"
+TYPES_DEST="$REPO_ROOT/crates/eidolons-shared/swift/generated"
 echo "Syncing Crux typegen Swift types..."
 echo "  Source: $SOURCE_TYPES"
 echo "  Dest:   $TYPES_DEST"

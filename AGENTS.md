@@ -14,16 +14,16 @@ eidolons/
 │   │       ├── anthropic.rs  # Anthropic API types
 │   │       ├── transform.rs  # Format conversion
 │   │       └── proxy.rs      # Upstream HTTP client
-│   └── eidolons-hello/   # Hello capability (example)
-│       └── src/lib.rs
+│   ├── eidolons-hello/   # Hello capability (example)
+│   │   └── src/lib.rs
+│   └── eidolons-shared/  # Crux-based shared core (exclusive FFI generator)
+│       ├── src/
+│       │   ├── lib.rs        # FFI bridge (processEvent, handleResponse, view, capabilities)
+│       │   ├── app.rs        # Crux App impl (Event, Model, ViewModel, Effect)
+│       │   └── capabilities/ # Crux capabilities (e.g., eidolons)
+│       ├── swift/            # Generated bindings (UniFFI + Crux types)
+│       └── Package.swift     # Swift Package exposing EidolonsShared + SharedTypes
 ├── apps/
-│   ├── eidolons-shared/  # Crux-based shared core (exclusive FFI generator)
-│   │   ├── src/
-│   │   │   ├── lib.rs        # FFI bridge (processEvent, handleResponse, view, capabilities)
-│   │   │   ├── app.rs        # Crux App impl (Event, Model, ViewModel, Effect)
-│   │   │   └── capabilities/ # Crux capabilities (e.g., eidolons)
-│   │   ├── swift/            # Generated bindings (UniFFI + Crux types)
-│   │   └── Package.swift     # Swift Package exposing EidolonsShared + SharedTypes
 │   └── macos/            # macOS app (SwiftPM + Xcode wrapper)
 │       ├── Sources/
 │       │   ├── Eidolons/         # SwiftUI shell (Core.swift, ContentView.swift)
@@ -75,7 +75,7 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 └─────────────────────┬───────────────────────────────────┘
                       │ FFI (UniFFI + bincode)
 ┌─────────────────────▼───────────────────────────────────┐
-│  Crux Core (apps/eidolons-shared)                       │
+│  Crux Core (crates/eidolons-shared)                      │
 │  - Event: user actions (e.g., Greet)                    │
 │  - Model: private app state                             │
 │  - ViewModel: public view state                         │
@@ -144,9 +144,9 @@ Targets defined in `rust-toolchain.toml`:
 | `Cargo.toml` | Workspace config, release profile (LTO, single codegen unit) |
 | `crates/eidolons-server/Cargo.toml` | Server dependencies |
 | `crates/eidolons-hello/src/lib.rs` | Hello capability implementation (pure Rust) |
-| `apps/eidolons-shared/Package.swift` | Shared core Swift Package (EidolonsShared + SharedTypes) |
-| `apps/eidolons-shared/src/lib.rs` | FFI bridge + capability re-exports |
-| `apps/eidolons-shared/src/app.rs` | Crux App implementation (Event, Model, ViewModel, Effect) |
+| `crates/eidolons-shared/Package.swift` | Shared core Swift Package (EidolonsShared + SharedTypes) |
+| `crates/eidolons-shared/src/lib.rs` | FFI bridge + capability re-exports |
+| `crates/eidolons-shared/src/app.rs` | Crux App implementation (Event, Model, ViewModel, Effect) |
 | `apps/macos/Package.swift` | macOS app Swift Package config |
 | `apps/macos/Sources/Eidolons/Core.swift` | Swift shell bridge (handles Crux event/effect loop) |
 | `apps/macos/Support/Info.plist` | Shared app Info.plist |

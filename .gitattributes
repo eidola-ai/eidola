@@ -8,14 +8,14 @@ eidolons/swift/Sources/EidolonsCoreFFI/*.c linguist-generated=true
 eidolons/swift/Sources/EidolonsCoreFFI/*.modulemap linguist-generated=true
 
 # Shared core (eidolons-shared/) Swift bindings - UniFFI
-apps/eidolons-shared/swift/Sources/EidolonsShared/*.swift linguist-generated=true
-apps/eidolons-shared/swift/Sources/EidolonsSharedFFI/*.h linguist-generated=true
-apps/eidolons-shared/swift/Sources/EidolonsSharedFFI/*.c linguist-generated=true
-apps/eidolons-shared/swift/Sources/EidolonsSharedFFI/*.modulemap linguist-generated=true
+crates/eidolons-shared/swift/Sources/EidolonsShared/*.swift linguist-generated=true
+crates/eidolons-shared/swift/Sources/EidolonsSharedFFI/*.h linguist-generated=true
+crates/eidolons-shared/swift/Sources/EidolonsSharedFFI/*.c linguist-generated=true
+crates/eidolons-shared/swift/Sources/EidolonsSharedFFI/*.modulemap linguist-generated=true
 
 # Shared core (eidolons-shared/) Swift bindings - Crux TypeGen
-apps/eidolons-shared/swift/generated/SharedTypes/Sources/SharedTypes/*.swift linguist-generated=true
-apps/eidolons-shared/swift/generated/SharedTypes/Sources/Serde/*.swift linguist-generated=true
+crates/eidolons-shared/swift/generated/SharedTypes/Sources/SharedTypes/*.swift linguist-generated=true
+crates/eidolons-shared/swift/generated/SharedTypes/Sources/Serde/*.swift linguist-generated=true
 
 # Server OpenAPI spec
 eidolons-server/openapi.json linguist-generated=true

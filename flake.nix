@@ -728,10 +728,10 @@
 
                 # Check EidolonsShared Swift files
                 GENERATED_SWIFT="${self.packages.${system}.eidolons-shared-swift-bindings}/Sources/EidolonsShared"
-                COMMITTED_SWIFT="${repoSrc}/apps/eidolons-shared/swift/Sources/EidolonsShared"
+                COMMITTED_SWIFT="${repoSrc}/crates/eidolons-shared/swift/Sources/EidolonsShared"
 
                 if [ ! -d "$COMMITTED_SWIFT" ]; then
-                  echo "ERROR: No committed Swift bindings found at apps/eidolons-shared/swift/Sources/EidolonsShared"
+                  echo "ERROR: No committed Swift bindings found at crates/eidolons-shared/swift/Sources/EidolonsShared"
                   echo "Run: nix run '.#update-eidolons-shared-swift-bindings'"
                   echo "Then commit the generated files."
                   exit 1
@@ -751,10 +751,10 @@
 
                 # Check EidolonsSharedFFI C headers
                 GENERATED_FFI="${self.packages.${system}.eidolons-shared-swift-bindings}/Sources/EidolonsSharedFFI"
-                COMMITTED_FFI="${repoSrc}/apps/eidolons-shared/swift/Sources/EidolonsSharedFFI"
+                COMMITTED_FFI="${repoSrc}/crates/eidolons-shared/swift/Sources/EidolonsSharedFFI"
 
                 if [ ! -d "$COMMITTED_FFI" ]; then
-                  echo "ERROR: No committed FFI headers found at apps/eidolons-shared/swift/Sources/EidolonsSharedFFI"
+                  echo "ERROR: No committed FFI headers found at crates/eidolons-shared/swift/Sources/EidolonsSharedFFI"
                   echo "Run: nix run '.#update-eidolons-shared-swift-bindings'"
                   echo "Then commit the generated files."
                   exit 1
@@ -774,10 +774,10 @@
 
                 # Check SharedTypes (Crux typegen)
                 GENERATED_TYPES="${self.packages.${system}.eidolons-shared-swift-types}/SharedTypes"
-                COMMITTED_TYPES="${repoSrc}/apps/eidolons-shared/swift/generated/SharedTypes"
+                COMMITTED_TYPES="${repoSrc}/crates/eidolons-shared/swift/generated/SharedTypes"
 
                 if [ ! -d "$COMMITTED_TYPES" ]; then
-                  echo "ERROR: No committed SharedTypes found at apps/eidolons-shared/swift/generated/SharedTypes"
+                  echo "ERROR: No committed SharedTypes found at crates/eidolons-shared/swift/generated/SharedTypes"
                   echo "Run: nix run '.#update-eidolons-shared-swift-bindings'"
                   echo "Then commit the generated files."
                   exit 1
@@ -809,13 +809,13 @@
                 echo "Checking Swift formatting..."
 
                 # Find all Swift files, excluding:
-                # - apps/eidolons-shared/swift/Sources/EidolonsShared (auto-generated bindings)
-                # - apps/eidolons-shared/swift/generated (auto-generated Crux types)
+                # - crates/eidolons-shared/swift/Sources/EidolonsShared (auto-generated bindings)
+                # - crates/eidolons-shared/swift/generated (auto-generated Crux types)
                 # - Any .build directories (SwiftPM build artifacts)
                 # Note: .git is already excluded by crane's source filtering
                 find ${repoSrc} \
-                  -path '*/apps/eidolons-shared/swift/Sources/EidolonsShared' -prune -o \
-                  -path '*/apps/eidolons-shared/swift/generated' -prune -o \
+                  -path '*/crates/eidolons-shared/swift/Sources/EidolonsShared' -prune -o \
+                  -path '*/crates/eidolons-shared/swift/generated' -prune -o \
                   -path '*/.build' -prune -o \
                   -name '*.swift' -print0 \
                   | xargs -0 -r swift-format lint --strict
@@ -942,8 +942,8 @@
 
                   # Use git ls-files to respect .gitignore, exclude auto-generated bindings
                   git ls-files '*.swift' \
-                    | grep -v '^apps/eidolons-shared/swift/Sources/EidolonsShared/' \
-                    | grep -v '^apps/eidolons-shared/swift/generated/' \
+                    | grep -v '^crates/eidolons-shared/swift/Sources/EidolonsShared/' \
+                    | grep -v '^crates/eidolons-shared/swift/generated/' \
                     | xargs -r swift-format format --in-place
 
                   echo "Done. Review changes and commit:"

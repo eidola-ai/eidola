@@ -63,7 +63,7 @@ jobs:
       - name: Run Swift tests
         run: |
           # Run Swift tests for shared core
-          ( cd apps/eidolons-shared && swift test )
+          ( cd crates/eidolons-shared && swift test )
 
           # Run Swift tests for macOS app
           ( cd apps/macos && swift test )

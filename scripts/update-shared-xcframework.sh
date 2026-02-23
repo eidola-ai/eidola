@@ -87,7 +87,7 @@ EOF
   SOURCE_XCFRAMEWORK="$TEMP_ROOT"
 fi
 
-DEST="$REPO_ROOT/apps/eidolons-shared/target/apple/libeidolons_shared-rs.xcframework"
+DEST="$REPO_ROOT/crates/eidolons-shared/target/apple/libeidolons_shared-rs.xcframework"
 
 echo "Copying shared core XCframework..."
 echo "  Source: $SOURCE_XCFRAMEWORK"

@@ -107,7 +107,7 @@ Cargo release profile (`Cargo.toml`):
 Two categories of generated code are committed to the repository:
 
 1. **Swift bindings** (UniFFI + Crux typegen) — committed in
-   `apps/eidolons-shared/swift/`. Swift developers can build without running
+   `crates/eidolons-shared/swift/`. Swift developers can build without running
    the Rust codegen toolchain.
 2. **OpenAPI specification** — generated from Rust type annotations via utoipa.
 

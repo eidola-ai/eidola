@@ -21,7 +21,7 @@ let package = Package(
   ],
   dependencies: [
     .package(url: "https://github.com/swiftlang/swift-testing.git", from: "6.2.3"),
-    .package(path: "../eidolons-shared"),
+    .package(path: "../../crates/eidolons-shared"),
   ],
   targets: [
     .target(
