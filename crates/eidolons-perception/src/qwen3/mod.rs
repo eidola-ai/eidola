@@ -1,19 +1,10 @@
-//! Qwen3 model implementation using burn framework.
+//! Qwen3 model via the qwen3-burn crate.
 //!
-//! This module provides a Qwen3 architecture with QK-Norm (RMSNorm applied to Q and K
-//! before RoPE). The key differences from Llama are:
-//!
-//! - **QK-Norm**: RMSNorm is applied to Q and K vectors before RoPE, improving training stability
-//! - **Untied embeddings**: Separate `embed_tokens` and `lm_head` weights (not shared)
-//! - **Higher RoPE theta**: 1,000,000 for extended context (vs Llama's 10,000)
-//! - **Larger vocabulary**: 151,936 tokens
-//!
-//! The MLP (SwiGLU) and RMSNorm layers are reused from the Llama implementation since
-//! they are identical.
+//! Re-exports from `qwen3_burn` for Qwen3 architecture support including
+//! KV cache, chunked prefill, GGUF support, and quantization.
 
-pub mod attention;
-pub mod config;
-pub mod model;
-
-pub use config::Qwen3Config;
-pub use model::Qwen3;
+pub use qwen3_burn::model::{
+    GenerationEvent, GenerationOutput, GenerationParams, QuantizationMode, Qwen3 as Qwen3Model,
+    Qwen3Config, StopReason,
+};
+pub use qwen3_burn::sampling::Sampler;

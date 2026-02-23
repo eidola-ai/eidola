@@ -204,6 +204,8 @@ pub async fn load_tokenizer(repo: &hf_hub::api::tokio::ApiRepo) -> Result<TinyLl
 /// Wrapper around the HuggingFace tokenizer for Qwen3 models.
 ///
 /// Qwen3 uses the ChatML format with `<|im_start|>` and `<|im_end|>` tags.
+/// The inner `tokenizers::Tokenizer` is passed directly to qwen3-burn's
+/// generate methods (which accept `&tokenizers::Tokenizer`).
 #[derive(Debug)]
 pub struct Qwen3Tokenizer {
     tokenizer: Tokenizer,
@@ -224,6 +226,13 @@ impl Qwen3Tokenizer {
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
         Ok(Self { tokenizer })
+    }
+
+    /// Returns a reference to the inner HuggingFace tokenizer.
+    ///
+    /// This can be passed directly to qwen3-burn's generate methods.
+    pub fn inner(&self) -> &Tokenizer {
+        &self.tokenizer
     }
 
     /// Encodes text into token IDs.

@@ -18,7 +18,7 @@ pub use llama::{Llama, LlamaConfig};
 pub use model_manager::{
     InferenceBackend, ModelArchitecture, ModelConfig, StreamChunk, TextGenerationModel,
 };
-pub use qwen3::{Qwen3, Qwen3Config};
+pub use qwen3::{QuantizationMode, Qwen3Config, Qwen3Model};
 pub use tokenizer::{ChatRole, FormatMessage, Qwen3Tokenizer, TinyLlamaTokenizer};
 
 /// Backend type aliases for convenience.

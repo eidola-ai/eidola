@@ -7,17 +7,19 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-default = ["gpu"]
+default = []
 # Enable GPU acceleration via WGPU (Metal on macOS, Vulkan elsewhere).
 # Note: WGPU types are not Send+Sync, so this feature is incompatible with UniFFI.
-# For FFI consumers, use `default-features = false`.
-gpu = ["burn-wgpu", "burn-cubecl"]
+gpu = ["burn-wgpu", "burn-cubecl", "qwen3-burn/wgpu"]
+# Enable Apple Silicon native acceleration via MLX backend.
+mlx = ["qwen3-burn/mlx"]
 
 [dependencies]
 burn = { version = "0.20", features = ["autodiff"] }
 burn-cubecl = { version = "0.20", optional = true }
 burn-wgpu = { version = "0.20", features = ["metal"], optional = true }
 burn-ndarray = "0.20"
+qwen3-burn = { git = "https://github.com/eidolons-ai/qwen3-burn.git", branch = "burn-mlx", default-features = false, features = ["ndarray"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 
@@ -35,7 +37,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Tokenization (pure Rust - use features that avoid C dependencies)
-tokenizers = { version = "0.21", default-features = false, features = ["unstable_wasm", "onig"] }
+tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm", "onig"] }
 
 # SafeTensors loading for model weights
 safetensors = "0.4"

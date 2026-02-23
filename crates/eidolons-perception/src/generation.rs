@@ -4,7 +4,6 @@
 //! temperature-scaled sampling and nucleus (top-p) filtering.
 
 use crate::llama::Llama;
-use crate::qwen3::Qwen3;
 use burn::prelude::*;
 use burn::tensor::TensorData;
 use rand::Rng;
@@ -39,16 +38,6 @@ impl<B: Backend> CausalLM<B> for Llama<B> {
 
     fn vocab_size(&self) -> usize {
         Llama::vocab_size(self)
-    }
-}
-
-impl<B: Backend> CausalLM<B> for Qwen3<B> {
-    fn forward(&self, input_ids: Tensor<B, 2, Int>, start_pos: usize) -> Tensor<B, 3> {
-        Qwen3::forward(self, input_ids, start_pos)
-    }
-
-    fn vocab_size(&self) -> usize {
-        Qwen3::vocab_size(self)
     }
 }
 
