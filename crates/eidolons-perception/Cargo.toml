@@ -24,7 +24,7 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 
 # HuggingFace Hub - use tokio/reqwest backend without ureq (which hardcodes ring)
-hf-hub = { version = "0.4", default-features = false, features = ["tokio"] }
+hf-hub = { version = "0.5", default-features = false, features = ["tokio"] }
 
 # Pure Rust TLS crypto provider
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
