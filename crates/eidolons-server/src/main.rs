@@ -1,9 +1,10 @@
-//! Eidolons Server - An OpenAI-compatible proxy for AI providers.
+//! Eidolons Server - A privacy-transparent AI proxy.
 //!
 //! This server accepts requests in OpenAI Chat Completions API format and
-//! proxies them to configured upstream AI providers (currently Anthropic Claude).
+//! proxies them to upstream AI providers via RedPill.ai, enriching responses
+//! with inline privacy metadata and cryptographic verification.
 
-use eidolons_server::{anthropic, api_doc::ApiDoc, proxy, transform};
+use eidolons_server::api_doc::ApiDoc;
 use utoipa::OpenApi;
 
 use std::convert::Infallible;
@@ -22,17 +23,29 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
-use eidolons_server::openai::{ChatCompletionRequest, ErrorResponse};
-use eidolons_server::proxy::AnthropicClient;
-use eidolons_server::transform::StreamTransformer;
+use eidolons_server::attestation::AttestationClient;
+use eidolons_server::auth::{self, AnyValidator, NoopValidator};
+use eidolons_server::backend::{BackendStreamEvent, ChatBackend, RedPillBackend};
+use eidolons_server::error::ServerError;
+use eidolons_server::response::{
+    EidolonsResponse, EidolonsStreamMetadata, SSE_DONE, build_privacy_metadata,
+    build_verification_metadata, sse_data,
+};
+use eidolons_server::types::{ChatCompletionRequest, ErrorResponse};
 
 /// Server configuration.
 struct Config {
     /// Address to bind the server to.
     bind_addr: SocketAddr,
 
-    /// Anthropic API key.
-    anthropic_api_key: String,
+    /// RedPill API key (used for both chat completions and attestation).
+    redpill_api_key: String,
+
+    /// RedPill base URL (default: https://api.redpill.ai/v1).
+    redpill_base_url: Option<String>,
+
+    /// Authorization mode: "privacy_pass", "none" (default: "none" for development).
+    auth_mode: String,
 }
 
 impl Config {
@@ -43,19 +56,27 @@ impl Config {
             .parse()
             .map_err(|e| format!("invalid BIND_ADDR: {}", e))?;
 
-        let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY")
-            .map_err(|_| "ANTHROPIC_API_KEY environment variable is required")?;
+        let redpill_api_key = std::env::var("REDPILL_API_KEY")
+            .map_err(|_| "REDPILL_API_KEY environment variable is required")?;
+
+        let redpill_base_url = std::env::var("REDPILL_BASE_URL").ok();
+
+        let auth_mode = std::env::var("AUTH_MODE").unwrap_or_else(|_| "none".to_string());
 
         Ok(Config {
             bind_addr,
-            anthropic_api_key,
+            redpill_api_key,
+            redpill_base_url,
+            auth_mode,
         })
     }
 }
 
 /// Shared application state.
 struct AppState {
-    client: AnthropicClient,
+    backend: RedPillBackend,
+    validator: AnyValidator,
+    attestation: AttestationClient,
 }
 
 #[tokio::main]
@@ -80,10 +101,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })?;
 
     info!("Starting Eidolons server on {}", config.bind_addr);
+    info!("Auth mode: {}", config.auth_mode);
+
+    // Build the token validator
+    let validator = match config.auth_mode.as_str() {
+        "none" => {
+            warn!("Running with no authentication (development mode)");
+            AnyValidator::Noop(NoopValidator)
+        }
+        other => {
+            return Err(format!("unknown AUTH_MODE: {} (expected: none)", other).into());
+        }
+    };
 
     // Create shared state
     let state = Arc::new(AppState {
-        client: AnthropicClient::new(config.anthropic_api_key),
+        backend: RedPillBackend::new(
+            config.redpill_api_key.clone(),
+            config.redpill_base_url.clone(),
+        ),
+        validator,
+        attestation: AttestationClient::new(config.redpill_api_key, config.redpill_base_url),
     });
 
     // Bind TCP listener
@@ -133,6 +171,9 @@ async fn handle_request(
             json_response(StatusCode::OK, &spec)
         }
 
+        // List available models
+        (Method::GET, "/v1/models") => handle_list_models(state).await,
+
         // OpenAI-compatible chat completions endpoint
         (Method::POST, "/v1/chat/completions") => handle_chat_completions(req, state).await,
 
@@ -149,163 +190,173 @@ async fn handle_request(
     Ok(response)
 }
 
+/// Handle the list models endpoint.
+async fn handle_list_models(
+    state: Arc<AppState>,
+) -> Response<BoxBody<Bytes, Infallible>> {
+    match state.backend.list_models().await {
+        Ok(models) => json_response(
+            StatusCode::OK,
+            &serde_json::to_string(&models).unwrap(),
+        ),
+        Err(e) => {
+            error!("Failed to list models: {}", e);
+            error_response(&e)
+        }
+    }
+}
+
 /// Handle the chat completions endpoint.
 async fn handle_chat_completions(
     req: Request<hyper::body::Incoming>,
     state: Arc<AppState>,
 ) -> Response<BoxBody<Bytes, Infallible>> {
+    // Authenticate the request
+    let auth_context = match auth::authenticate(&req, &state.validator).await {
+        Ok(ctx) => ctx,
+        Err(e) => return error_response(&e),
+    };
+
     // Read request body
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             error!("Failed to read request body: {}", e);
-            let error = ErrorResponse::new("failed to read request body", "invalid_request_error");
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &serde_json::to_string(&error).unwrap(),
-            );
+            return error_response(&ServerError::BadRequest {
+                message: "failed to read request body".to_string(),
+            });
         }
     };
 
     // Parse OpenAI request
-    let openai_request: ChatCompletionRequest = match serde_json::from_slice(&body_bytes) {
+    let request: ChatCompletionRequest = match serde_json::from_slice(&body_bytes) {
         Ok(req) => req,
         Err(e) => {
-            error!("Failed to parse request: {}", e);
-            let error = ErrorResponse::new(
-                format!("invalid request body: {}", e),
-                "invalid_request_error",
-            );
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &serde_json::to_string(&error).unwrap(),
-            );
+            return error_response(&ServerError::BadRequest {
+                message: format!("invalid request body: {}", e),
+            });
         }
     };
 
-    let is_streaming = openai_request.stream;
-    let original_model = openai_request.model.clone();
-
-    // Transform to Anthropic format
-    let anthropic_request = match transform::openai_to_anthropic(openai_request) {
-        Ok(req) => req,
-        Err(e) => {
-            error!("Failed to transform request: {}", e);
-            let error = ErrorResponse::new(e.to_string(), "invalid_request_error");
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &serde_json::to_string(&error).unwrap(),
-            );
-        }
-    };
-
-    if is_streaming {
-        handle_streaming_request(&state, anthropic_request, &original_model).await
+    if request.stream {
+        handle_streaming_request(state, &request, &auth_context).await
     } else {
-        handle_non_streaming_request(&state, anthropic_request, &original_model).await
+        handle_non_streaming_request(&state, &request, &auth_context).await
     }
 }
 
 /// Handle a non-streaming chat completion request.
 async fn handle_non_streaming_request(
     state: &AppState,
-    request: anthropic::MessagesRequest,
-    original_model: &str,
+    request: &ChatCompletionRequest,
+    auth_context: &auth::AuthContext,
 ) -> Response<BoxBody<Bytes, Infallible>> {
-    match state.client.send(&request).await {
-        Ok(response) => {
-            let openai_response = transform::anthropic_to_openai(response, original_model);
-            json_response(
-                StatusCode::OK,
-                &serde_json::to_string(&openai_response).unwrap(),
-            )
-        }
+    let backend_response = match state.backend.send(request).await {
+        Ok(resp) => resp,
         Err(e) => {
-            error!("Upstream error: {}", e);
-            let (status, error) = match &e {
-                proxy::ProxyError::Upstream {
-                    status,
-                    error_type,
-                    message,
-                } => {
-                    let http_status =
-                        StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-                    (http_status, ErrorResponse::new(message, error_type))
-                }
-                _ => (
-                    StatusCode::BAD_GATEWAY,
-                    ErrorResponse::new(e.to_string(), "upstream_error"),
-                ),
-            };
-            json_response(status, &serde_json::to_string(&error).unwrap())
+            error!("Backend error: {}", e);
+            return error_response(&e);
         }
-    }
+    };
+
+    let meta = &backend_response.meta;
+    let is_tee = meta.tee_type.is_some();
+
+    // Fetch attestation for TEE models (best-effort)
+    let backend_attestation = if is_tee {
+        if let Some(chat_id) = &meta.chat_id {
+            state
+                .attestation
+                .fetch_signature(chat_id, &meta.backend_model)
+                .await
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let privacy = build_privacy_metadata(auth_context, is_tee, &meta.provider);
+    let verification = build_verification_metadata(backend_attestation);
+
+    let eidolons_response =
+        EidolonsResponse::from_completion(backend_response.response, privacy, verification);
+
+    json_response(
+        StatusCode::OK,
+        &serde_json::to_string(&eidolons_response).unwrap(),
+    )
 }
 
 /// Handle a streaming chat completion request.
 async fn handle_streaming_request(
-    state: &AppState,
-    request: anthropic::MessagesRequest,
-    original_model: &str,
+    state: Arc<AppState>,
+    request: &ChatCompletionRequest,
+    auth_context: &auth::AuthContext,
 ) -> Response<BoxBody<Bytes, Infallible>> {
-    // Start streaming from Anthropic
-    let mut upstream_rx = match state.client.send_stream(&request).await {
+    let mut upstream_rx = match state.backend.send_stream(request).await {
         Ok(rx) => rx,
         Err(e) => {
             error!("Failed to start stream: {}", e);
-            let (status, error) = match &e {
-                proxy::ProxyError::Upstream {
-                    status,
-                    error_type,
-                    message,
-                } => {
-                    let http_status =
-                        StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-                    (http_status, ErrorResponse::new(message, error_type))
-                }
-                _ => (
-                    StatusCode::BAD_GATEWAY,
-                    ErrorResponse::new(e.to_string(), "upstream_error"),
-                ),
-            };
-            return json_response(status, &serde_json::to_string(&error).unwrap());
+            return error_response(&e);
         }
     };
 
-    // Create channel for transformed SSE output
+    // Create channel for SSE output
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(32);
-    let model = original_model.to_string();
+    let auth_context = auth_context.clone();
 
-    // Spawn task to transform and forward events
     tokio::spawn(async move {
-        let mut transformer = StreamTransformer::new(model);
-
         while let Some(event_result) = upstream_rx.recv().await {
             match event_result {
-                Ok(event) => {
-                    if let Some(chunk) = transformer.transform(event) {
-                        let sse_data =
-                            format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap());
-                        if tx
-                            .send(Ok(Frame::data(Bytes::from(sse_data))))
-                            .await
-                            .is_err()
-                        {
-                            break; // Client disconnected
-                        }
+                Ok(BackendStreamEvent::Chunk(chunk)) => {
+                    let data = sse_data(&chunk);
+                    if tx.send(Ok(Frame::data(Bytes::from(data)))).await.is_err() {
+                        return; // Client disconnected
                     }
+                }
+                Ok(BackendStreamEvent::Done(meta)) => {
+                    let is_tee = meta.tee_type.is_some();
+
+                    // Fetch attestation for TEE models (best-effort)
+                    let backend_attestation = if is_tee {
+                        if let Some(chat_id) = &meta.chat_id {
+                            state
+                                .attestation
+                                .fetch_signature(chat_id, &meta.backend_model)
+                                .await
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let privacy = build_privacy_metadata(&auth_context, is_tee, &meta.provider);
+                    let verification = build_verification_metadata(backend_attestation);
+
+                    let stream_meta = EidolonsStreamMetadata::new(
+                        meta.chat_id.unwrap_or_default(),
+                        privacy,
+                        verification,
+                    );
+
+                    // Send metadata event
+                    let data = sse_data(&stream_meta);
+                    let _ = tx.send(Ok(Frame::data(Bytes::from(data)))).await;
+
+                    // Send [DONE]
+                    let _ = tx
+                        .send(Ok(Frame::data(Bytes::from(SSE_DONE.to_string()))))
+                        .await;
+                    return;
                 }
                 Err(e) => {
                     error!("Stream error: {}", e);
-                    break;
+                    return;
                 }
             }
         }
-
-        // Send final [DONE] marker
-        let _ = tx
-            .send(Ok(Frame::data(Bytes::from("data: [DONE]\n\n"))))
-            .await;
     });
 
     // Create streaming response
@@ -319,6 +370,13 @@ async fn handle_streaming_request(
         .header("connection", "keep-alive")
         .body(BodyExt::boxed(body))
         .unwrap()
+}
+
+/// Convert a `ServerError` into an HTTP response.
+fn error_response(err: &ServerError) -> Response<BoxBody<Bytes, Infallible>> {
+    let status = err.status_code();
+    let body = err.to_error_response();
+    json_response(status, &serde_json::to_string(&body).unwrap())
 }
 
 /// Create a JSON response with the given status and body.
@@ -348,6 +406,10 @@ mod tests {
             "missing /health path"
         );
         assert!(
+            spec.paths.paths.contains_key("/v1/models"),
+            "missing /v1/models path"
+        );
+        assert!(
             spec.paths.paths.contains_key("/v1/chat/completions"),
             "missing /v1/chat/completions path"
         );
@@ -357,10 +419,6 @@ mod tests {
         assert!(
             schemas.schemas.contains_key("ChatCompletionRequest"),
             "missing ChatCompletionRequest schema"
-        );
-        assert!(
-            schemas.schemas.contains_key("ChatCompletionResponse"),
-            "missing ChatCompletionResponse schema"
         );
 
         // Verify JSON serialization works

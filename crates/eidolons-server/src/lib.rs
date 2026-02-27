@@ -2,8 +2,10 @@
 //!
 //! This module exposes the server's internal types for testing and reuse.
 
-pub mod anthropic;
 pub mod api_doc;
-pub mod openai;
-pub mod proxy;
-pub mod transform;
+pub mod attestation;
+pub mod auth;
+pub mod backend;
+pub mod error;
+pub mod response;
+pub mod types;

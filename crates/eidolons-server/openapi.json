@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Eidolons API",
-    "description": "OpenAI-compatible proxy API for AI providers",
+    "description": "Privacy-transparent AI proxy API with inline verification metadata",
     "contact": {
       "name": "Mike Marcacci"
     },
@@ -42,6 +42,7 @@
           "openapi_paths"
         ],
         "summary": "Create a chat completion.",
+        "description": "Proxies the request to the configured backend and returns a response\nenriched with privacy and verification metadata.",
         "operationId": "chat_completions",
         "requestBody": {
           "content": {
@@ -55,11 +56,11 @@
         },
         "responses": {
           "200": {
-            "description": "Chat completion response",
+            "description": "Chat completion response with privacy and verification metadata",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ChatCompletionResponse"
+                  "$ref": "#/components/schemas/EidolonsResponse"
                 }
               }
             }
@@ -70,6 +71,47 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream provider error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "openapi_paths"
+        ],
+        "summary": "List available models.",
+        "operationId": "list_models",
+        "responses": {
+          "200": {
+            "description": "List of available models",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelsResponse"
                 }
               }
             }
@@ -105,6 +147,73 @@
           },
           "role": {
             "$ref": "#/components/schemas/Role"
+          }
+        }
+      },
+      "AttestationStatus": {
+        "type": "string",
+        "description": "Attestation status.",
+        "enum": [
+          "unavailable",
+          "verified"
+        ]
+      },
+      "AuthMethod": {
+        "type": "string",
+        "description": "Supported authorization methods.",
+        "enum": [
+          "privacy_pass",
+          "none"
+        ]
+      },
+      "AuthorizationInfo": {
+        "type": "object",
+        "description": "Authorization information.",
+        "required": [
+          "method",
+          "linkable"
+        ],
+        "properties": {
+          "linkable": {
+            "type": "boolean",
+            "description": "Whether this authorization method allows linking across requests."
+          },
+          "method": {
+            "$ref": "#/components/schemas/AuthMethod",
+            "description": "The authorization method used."
+          }
+        }
+      },
+      "BackendAttestation": {
+        "type": "object",
+        "description": "Backend attestation from the inference provider.",
+        "required": [
+          "provider",
+          "signing_address",
+          "signature",
+          "signed_content",
+          "signing_algorithm"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string",
+            "description": "The provider that issued the attestation (e.g., \"redpill\")."
+          },
+          "signature": {
+            "type": "string",
+            "description": "The ECDSA signature over the signed content."
+          },
+          "signed_content": {
+            "type": "string",
+            "description": "What was signed: \"sha256(request_body):sha256(response_body)\"."
+          },
+          "signing_address": {
+            "type": "string",
+            "description": "The signing address (e.g., Ethereum address for Phala/RedPill)."
+          },
+          "signing_algorithm": {
+            "type": "string",
+            "description": "The signing algorithm (e.g., \"ecdsa\")."
           }
         }
       },
@@ -148,7 +257,7 @@
       },
       "ChatCompletionRequest": {
         "type": "object",
-        "description": "A chat completion request in OpenAI format.",
+        "description": "A chat completion request.",
         "required": [
           "model",
           "messages"
@@ -204,15 +313,9 @@
             ],
             "format": "float",
             "description": "Nucleus sampling parameter."
-          },
-          "user": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "A unique identifier for the end-user."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ChatCompletionResponse": {
         "type": "object",
@@ -390,6 +493,124 @@
         ],
         "description": "A content part within a multimodal message."
       },
+      "DataExposure": {
+        "type": "object",
+        "description": "Describes a party's visibility into request/response data.",
+        "required": [
+          "party",
+          "sees",
+          "confidentiality",
+          "logged"
+        ],
+        "properties": {
+          "confidentiality": {
+            "type": "string",
+            "description": "How confidentiality is enforced: \"tee\" or \"provider-policy\"."
+          },
+          "logged": {
+            "type": "string",
+            "description": "Whether this party logs requests: \"none\", \"unknown\", \"yes\"."
+          },
+          "party": {
+            "type": "string",
+            "description": "The party (e.g., \"eidolons-proxy\", \"phala-gpu-tee\", \"anthropic\")."
+          },
+          "sees": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What data this party can see (e.g., [\"prompt\", \"response\", \"token_count\"])."
+          }
+        }
+      },
+      "EidolonsResponse": {
+        "type": "object",
+        "description": "An Eidolons chat completion response.",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices",
+          "privacy",
+          "verification"
+        ],
+        "properties": {
+          "choices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Choice"
+            },
+            "description": "Completion choices."
+          },
+          "created": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp of when the completion was created.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for the completion."
+          },
+          "model": {
+            "type": "string",
+            "description": "The model that produced the completion."
+          },
+          "object": {
+            "type": "string",
+            "description": "The object type."
+          },
+          "privacy": {
+            "$ref": "#/components/schemas/PrivacyMetadata",
+            "description": "Privacy metadata describing data exposure and authorization."
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage",
+                "description": "Token usage statistics."
+              }
+            ]
+          },
+          "verification": {
+            "$ref": "#/components/schemas/VerificationMetadata",
+            "description": "Verification metadata with cryptographic attestations."
+          }
+        }
+      },
+      "EidolonsStreamMetadata": {
+        "type": "object",
+        "description": "Metadata event sent as the final SSE event before [DONE] in streaming responses.\n\nClients identify this by checking `object == \"eidolons.chat.completion.metadata\"`.\nStandard OpenAI clients will ignore it.",
+        "required": [
+          "object",
+          "id",
+          "privacy",
+          "verification"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The completion ID this metadata belongs to."
+          },
+          "object": {
+            "type": "string",
+            "description": "The object type."
+          },
+          "privacy": {
+            "$ref": "#/components/schemas/PrivacyMetadata",
+            "description": "Privacy metadata."
+          },
+          "verification": {
+            "$ref": "#/components/schemas/VerificationMetadata",
+            "description": "Verification metadata."
+          }
+        }
+      },
       "ErrorDetail": {
         "type": "object",
         "required": [
@@ -450,7 +671,8 @@
             "type": "string",
             "description": "The URL of the image, or a base64-encoded data URI."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "Message": {
         "type": "object",
@@ -475,7 +697,8 @@
             "$ref": "#/components/schemas/Role",
             "description": "The role of the message author."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "MessageContent": {
         "oneOf": [
@@ -490,6 +713,98 @@
           }
         ],
         "description": "Message content can be a simple string or array of content parts (for multimodal)."
+      },
+      "Model": {
+        "type": "object",
+        "description": "A model descriptor.",
+        "required": [
+          "id",
+          "name",
+          "created",
+          "description",
+          "context_length"
+        ],
+        "properties": {
+          "context_length": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Maximum context window size in tokens.",
+            "minimum": 0
+          },
+          "created": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp of when the model was created.",
+            "minimum": 0
+          },
+          "description": {
+            "type": "string",
+            "description": "Short description of the model's capabilities."
+          },
+          "id": {
+            "type": "string",
+            "description": "The model identifier (e.g. \"openai/gpt-4o\")."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable display name."
+          }
+        }
+      },
+      "ModelsResponse": {
+        "type": "object",
+        "description": "A list of available models.",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Model"
+            },
+            "description": "The list of models."
+          }
+        }
+      },
+      "PrivacyMetadata": {
+        "type": "object",
+        "description": "Privacy metadata describing how the request was authorized, what data is\nvisible to which parties, and transport security properties.",
+        "required": [
+          "authorization",
+          "data_exposure",
+          "transport"
+        ],
+        "properties": {
+          "authorization": {
+            "$ref": "#/components/schemas/AuthorizationInfo",
+            "description": "Authorization details."
+          },
+          "data_exposure": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DataExposure"
+            },
+            "description": "Which parties can see which data, and under what guarantees."
+          },
+          "transport": {
+            "$ref": "#/components/schemas/TransportInfo",
+            "description": "Transport security between hops."
+          }
+        }
+      },
+      "ProxyAttestation": {
+        "type": "object",
+        "description": "Proxy attestation (placeholder for future TEE deployment).",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/AttestationStatus",
+            "description": "Current attestation status."
+          }
+        }
       },
       "Role": {
         "type": "string",
@@ -514,6 +829,31 @@
         ],
         "description": "Stop sequence can be a single string or array of strings."
       },
+      "TeeType": {
+        "type": "string",
+        "description": "The type of Trusted Execution Environment backing a model.",
+        "enum": [
+          "phala_gpu"
+        ]
+      },
+      "TransportInfo": {
+        "type": "object",
+        "description": "Transport security information.",
+        "required": [
+          "client_to_proxy",
+          "proxy_to_backend"
+        ],
+        "properties": {
+          "client_to_proxy": {
+            "type": "string",
+            "description": "Transport from client to this proxy."
+          },
+          "proxy_to_backend": {
+            "type": "string",
+            "description": "Transport from this proxy to the backend."
+          }
+        }
+      },
       "Usage": {
         "type": "object",
         "description": "Token usage statistics.",
@@ -537,6 +877,34 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          }
+        }
+      },
+      "VerificationMetadata": {
+        "type": "object",
+        "description": "Verification metadata with cryptographic attestations for the proxy and backend.",
+        "properties": {
+          "backend": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BackendAttestation",
+                "description": "Backend attestation (only for TEE-backed models like phala/*)."
+              }
+            ]
+          },
+          "proxy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProxyAttestation",
+                "description": "Proxy attestation (None until the proxy runs in a TEE)."
+              }
+            ]
           }
         }
       }

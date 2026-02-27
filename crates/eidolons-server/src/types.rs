@@ -1,14 +1,15 @@
-//! OpenAI-compatible API types for chat completions.
+//! Core API types for chat completions.
 //!
-//! These types represent the de facto standard API format used by most LLM gateways.
+//! These types follow the de facto standard format used by most LLM gateways.
 
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// A chat completion request in OpenAI format.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+/// A chat completion request.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     /// ID of the model to use.
     pub model: String,
@@ -35,14 +36,10 @@ pub struct ChatCompletionRequest {
     /// Up to 4 sequences where the API will stop generating.
     #[serde(default)]
     pub stop: Option<StopSequence>,
-
-    /// A unique identifier for the end-user.
-    #[serde(default)]
-    pub user: Option<String>,
 }
 
 /// Stop sequence can be a single string or array of strings.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum StopSequence {
     Single(String),
@@ -60,6 +57,7 @@ impl StopSequence {
 
 /// A message in the conversation.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Message {
     /// The role of the message author.
     pub role: Role,
@@ -118,6 +116,7 @@ pub enum ContentPart {
 
 /// An image URL reference.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ImageUrl {
     /// The URL of the image, or a base64-encoded data URI.
     pub url: String,
@@ -128,13 +127,13 @@ pub struct ImageUrl {
 }
 
 /// A chat completion response.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChatCompletionResponse {
     /// Unique identifier for the completion.
     pub id: String,
 
     /// The object type (always "chat.completion").
-    pub object: &'static str,
+    pub object: String,
 
     /// Unix timestamp of when the completion was created.
     pub created: u64,
@@ -154,7 +153,7 @@ impl ChatCompletionResponse {
     pub fn new(id: String, model: String, choices: Vec<Choice>, usage: Option<Usage>) -> Self {
         Self {
             id,
-            object: "chat.completion",
+            object: "chat.completion".to_string(),
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -167,7 +166,7 @@ impl ChatCompletionResponse {
 }
 
 /// A completion choice.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Choice {
     /// The index of this choice.
     pub index: u32,
@@ -180,14 +179,14 @@ pub struct Choice {
 }
 
 /// An assistant message in a response.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AssistantMessage {
     pub role: Role,
     pub content: Option<String>,
 }
 
 /// The reason the model stopped generating.
-#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
@@ -196,7 +195,7 @@ pub enum FinishReason {
 }
 
 /// Token usage statistics.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -204,13 +203,13 @@ pub struct Usage {
 }
 
 /// A streaming chat completion chunk.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChatCompletionChunk {
     /// Unique identifier for the completion.
     pub id: String,
 
     /// The object type (always "chat.completion.chunk").
-    pub object: &'static str,
+    pub object: String,
 
     /// Unix timestamp of when the chunk was created.
     pub created: u64,
@@ -226,7 +225,7 @@ impl ChatCompletionChunk {
     pub fn new(id: String, model: String, choices: Vec<ChunkChoice>) -> Self {
         Self {
             id,
-            object: "chat.completion.chunk",
+            object: "chat.completion.chunk".to_string(),
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -238,7 +237,7 @@ impl ChatCompletionChunk {
 }
 
 /// A choice delta in a streaming chunk.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChunkChoice {
     /// The index of this choice.
     pub index: u32,
@@ -251,7 +250,7 @@ pub struct ChunkChoice {
 }
 
 /// A delta update in a streaming response.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
@@ -260,13 +259,39 @@ pub struct ChunkDelta {
     pub content: Option<String>,
 }
 
+/// A list of available models.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelsResponse {
+    /// The list of models.
+    pub data: Vec<Model>,
+}
+
+/// A model descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Model {
+    /// The model identifier (e.g. "openai/gpt-4o").
+    pub id: String,
+
+    /// Human-readable display name.
+    pub name: String,
+
+    /// Unix timestamp of when the model was created.
+    pub created: u64,
+
+    /// Short description of the model's capabilities.
+    pub description: String,
+
+    /// Maximum context window size in tokens.
+    pub context_length: u64,
+}
+
 /// An error response in OpenAI format.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,
 }
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorDetail {
     pub message: String,
     #[serde(rename = "type")]
@@ -323,8 +348,7 @@ mod tests {
             "temperature": 0.7,
             "top_p": 0.9,
             "stream": true,
-            "stop": ["END"],
-            "user": "user-123"
+            "stop": ["END"]
         }"#;
 
         let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
@@ -334,7 +358,6 @@ mod tests {
         assert_eq!(request.top_p, Some(0.9));
         assert!(request.stream);
         assert!(matches!(&request.stop, Some(StopSequence::Multiple(v)) if v == &["END"]));
-        assert_eq!(request.user, Some("user-123".to_string()));
     }
 
     #[test]
@@ -463,7 +486,7 @@ mod tests {
     fn test_serialize_response() {
         let response = ChatCompletionResponse {
             id: "chatcmpl-123".to_string(),
-            object: "chat.completion",
+            object: "chat.completion".to_string(),
             created: 1234567890,
             model: "gpt-4o".to_string(),
             choices: vec![Choice {
@@ -491,7 +514,7 @@ mod tests {
     fn test_serialize_chunk() {
         let chunk = ChatCompletionChunk {
             id: "chatcmpl-123".to_string(),
-            object: "chat.completion.chunk",
+            object: "chat.completion.chunk".to_string(),
             created: 1234567890,
             model: "gpt-4o".to_string(),
             choices: vec![ChunkChoice {
@@ -509,6 +532,27 @@ mod tests {
         assert!(json.contains("\"role\":\"assistant\""));
         // content should be omitted when None (skip_serializing_if)
         assert!(!json.contains("\"content\":null"));
+    }
+
+    #[test]
+    fn test_reject_unknown_fields_in_request() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "foo": "bar"
+        }"#;
+        let err = serde_json::from_str::<ChatCompletionRequest>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_reject_unknown_fields_in_message() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hi", "foo": "bar"}]
+        }"#;
+        let err = serde_json::from_str::<ChatCompletionRequest>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
