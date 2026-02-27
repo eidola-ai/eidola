@@ -290,7 +290,7 @@ mod tests {
             usage: None,
             privacy: PrivacyMetadata {
                 authorization: AuthorizationInfo {
-                    method: AuthMethod::PrivacyPass,
+                    method: AuthMethod::AnonymousCreditToken,
                     linkable: false,
                 },
                 data_exposure: vec![],
@@ -307,7 +307,7 @@ mod tests {
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"object\":\"eidolons.chat.completion\""));
-        assert!(json.contains("\"method\":\"privacy_pass\""));
+        assert!(json.contains("\"method\":\"anonymous_credit_token\""));
         assert!(json.contains("\"linkable\":false"));
     }
 
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn test_build_privacy_metadata_tee() {
         let auth = crate::auth::AuthContext {
-            method: AuthMethod::PrivacyPass,
+            method: AuthMethod::AnonymousCreditToken,
         };
         let privacy = build_privacy_metadata(&auth, true, "redpill");
         assert_eq!(privacy.data_exposure.len(), 2);

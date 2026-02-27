@@ -37,11 +37,10 @@ utoipa = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Privacy Pass (RFC 9576/9577/9578) token validation
-privacypass = { git = "https://github.com/raphaelrobert/privacypass.git" }
-async-trait = "0.1"
+# Anonymous Credit Tokens (Privacy Pass ACT)
+anonymous-credit-tokens = "0.4"
 
-# HTTP types (used by privacypass auth module)
+# HTTP types (used by auth module)
 http = "1"
 
 # Utilities
