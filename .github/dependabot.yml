@@ -28,6 +28,17 @@ updates:
     schedule:
       interval: "weekly"
 
+  # Maintain dependencies for Docker (Containerfiles).
+  - package-ecosystem: "docker"
+    directory: "/crates/eidolons-server"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker"
+    directory: "/docker/postgresql"
+    schedule:
+      interval: "weekly"
+
   # Maintain dependencies for Swift Package Manager.
   - package-ecosystem: "swift"
     directory: "/core/swift"
