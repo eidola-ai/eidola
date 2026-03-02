@@ -352,52 +352,6 @@
               generate-openapi > $out/openapi.json
             '';
 
-        # Build OCI (Docker) image containing the server
-        # - rustTarget: Rust target triple
-        # - nixCrossSystem: pkgsCross attr name, or null for native pkgs
-        #
-        # Design decisions:
-        # - Distroless: No shell or package manager (minimal attack surface)
-        # - Static binary: musl-linked, self-contained (no libc dependency)
-        # - CA certs: Embedded via webpki-roots crate (no system certs needed)
-        # - Non-root: Runs as unprivileged user (UID 65534 = nobody)
-        # - Entrypoint: Server is the only thing this container does
-        mkServerOCI =
-          rustTarget: nixCrossSystem:
-          let
-            server = mkPackage {
-              pname = "eidolons-server";
-              inherit rustTarget nixCrossSystem;
-            };
-          in
-          pkgs.dockerTools.buildLayeredImage {
-            name = "eidolons-server";
-            tag = "latest";
-
-            contents = [ server ];
-
-            config = {
-              Entrypoint = [ "${server}/bin/eidolons-server" ];
-
-              # Bind to all interfaces (required for container networking)
-              # ANTHROPIC_API_KEY must be provided at runtime
-              Env = [
-                "BIND_ADDR=0.0.0.0:8080"
-              ];
-
-              # Run as unprivileged user (nobody)
-              User = "65534:65534";
-
-              # Document the exposed port
-              ExposedPorts = {
-                "8080/tcp" = { };
-              };
-            };
-
-            # Reproducible timestamp for deterministic builds
-            created = "1970-01-01T00:00:00Z";
-          };
-
         # Build the uniffi-bindgen-swift tool (native only)
         uniffiBindgenSwift = mkPackage {
           pname = "uniffi-bindgen-swift";
@@ -600,34 +554,7 @@
             rustTarget = nativeRustTarget;
             nixCrossSystem = null;
           };
-          server-oci = mkServerOCI nativeRustTarget null;
           server-openapi-spec = serverOpenApiSpec;
-
-          # Server binaries cross-compiled for specific targets
-          server--aarch64-unknown-linux-musl = mkPackage {
-            pname = "eidolons-server";
-            rustTarget = "aarch64-unknown-linux-musl";
-            nixCrossSystem = "aarch64-multiplatform-musl";
-          };
-          server--x86_64-unknown-linux-musl = mkPackage {
-            pname = "eidolons-server";
-            rustTarget = "x86_64-unknown-linux-musl";
-            nixCrossSystem = "musl64";
-          };
-          server--aarch64-apple-darwin = mkPackage {
-            pname = "eidolons-server";
-            rustTarget = "aarch64-apple-darwin";
-            nixCrossSystem = "aarch64-darwin";
-          };
-          server--x86_64-apple-darwin = mkPackage {
-            pname = "eidolons-server";
-            rustTarget = "x86_64-apple-darwin";
-            nixCrossSystem = "x86_64-darwin";
-          };
-
-          # Server OCI images cross-compiled for specific targets
-          server-oci--aarch64-unknown-linux-musl = mkServerOCI "aarch64-unknown-linux-musl" "aarch64-multiplatform-musl";
-          server-oci--x86_64-unknown-linux-musl = mkServerOCI "x86_64-unknown-linux-musl" "musl64";
 
           # Shared core Swift binding generation
           eidolons-shared-swift-types = eidolonsSharedSwiftTypes;
@@ -635,19 +562,9 @@
           eidolons-shared-swift-xcframework = eidolonsSharedSwiftXCFramework;
         };
 
-        # Development shell with Rust toolchain and tools
+        # Development shell (lightweight — daily Rust dev uses rustup)
         devShells.default = pkgs.mkShell {
           buildInputs = [
-            # Rust toolchain
-            rustToolchain
-
-            # Additional rust tools
-            pkgs.cargo-watch
-            pkgs.rust-analyzer
-
-            # Interact with OCI images
-            pkgs.crane
-
             # Pin GitHub actions
             pkgs.pinact
           ];

@@ -191,14 +191,9 @@ async fn handle_request(
 }
 
 /// Handle the list models endpoint.
-async fn handle_list_models(
-    state: Arc<AppState>,
-) -> Response<BoxBody<Bytes, Infallible>> {
+async fn handle_list_models(state: Arc<AppState>) -> Response<BoxBody<Bytes, Infallible>> {
     match state.backend.list_models().await {
-        Ok(models) => json_response(
-            StatusCode::OK,
-            &serde_json::to_string(&models).unwrap(),
-        ),
+        Ok(models) => json_response(StatusCode::OK, &serde_json::to_string(&models).unwrap()),
         Err(e) => {
             error!("Failed to list models: {}", e);
             error_response(&e)

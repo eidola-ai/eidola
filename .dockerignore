@@ -1,0 +1,10 @@
+.git
+.github
+.claude
+.env
+result
+result-*
+apps/
+docs/
+target/
+*.md

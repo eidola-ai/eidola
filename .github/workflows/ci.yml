@@ -17,7 +17,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-      packages: write
 
     steps:
       - name: Checkout code
@@ -40,25 +39,14 @@ jobs:
       - name: Run all checks
         run: nix flake check --show-trace --max-jobs auto
 
-      - name: Build all packages
+      - name: Build Swift packages
         run: |
-          mkdir -p $RUNNER_TEMP/out
-
-          # OCI images (Linux only)
-          nix build '.#server-oci--x86_64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--x86_64-unknown-linux-musl.tar.gz
-          nix build '.#server-oci--aarch64-unknown-linux-musl' -L -o $RUNNER_TEMP/out/server-oci--aarch64-unknown-linux-musl.tar.gz
-
           # Build the XCFramework via Nix and update the local path
           nix run '.#update-eidolons-shared-swift-xcframework'
 
           # Build native apps
           # Note that we *cannot* use nix until Swift 6 is available in nixpkgs
           ( cd apps/macos && Support/package-app.sh )
-
-      - name: Verify build outputs
-        run: |
-          echo "=== Server OCI images ==="
-          ls -lh $RUNNER_TEMP/out/server-oci--*
 
       - name: Run Swift tests
         run: |
@@ -67,87 +55,3 @@ jobs:
 
           # Run Swift tests for macOS app
           ( cd apps/macos && swift test )
-
-      - name: Determine image tags
-        id: tags
-        env:
-          REPO_OWNER: ${{ github.repository_owner }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          COMMIT_SHA: ${{ github.sha }}
-          GIT_REF: ${{ github.ref }}
-        run: |
-          # Lowercase repository owner for GHCR
-          OWNER=$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')
-
-          if [ "${EVENT_NAME}" = "pull_request" ]; then
-            TAG_PREFIX="pr-${PR_NUMBER}"
-          else
-            TAG_PREFIX="sha-$(echo ${COMMIT_SHA} | cut -c1-7)"
-            # Also tag as 'latest' for main branch
-            if [ "${GIT_REF}" = "refs/heads/main" ]; then
-              echo "is_main=true" >> $GITHUB_OUTPUT
-            fi
-          fi
-
-          echo "owner=${OWNER}" >> $GITHUB_OUTPUT
-          echo "tag_prefix=${TAG_PREFIX}" >> $GITHUB_OUTPUT
-
-      - name: Push images to GHCR (crane)
-        env:
-          OWNER: ${{ steps.tags.outputs.owner }}
-          TAG_PREFIX: ${{ steps.tags.outputs.tag_prefix }}
-          IS_MAIN: ${{ steps.tags.outputs.is_main }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ACTOR: ${{ github.actor }}
-        run: |
-          set -euo pipefail
-
-          IMAGE="ghcr.io/${OWNER}/eidolons-server"
-          export IMAGE
-
-          # Use crane from the pinned flake (no Docker needed)
-          nix develop --command bash -c '
-            set -euo pipefail
-
-            # Authenticate once for GHCR
-            crane auth login ghcr.io -u "$GITHUB_ACTOR" -p "$GITHUB_TOKEN"
-
-            # Use a local directory for intermediate files. The GitHub Actions runner
-            # is ephemeral, so explicit cleanup is not necessary.
-            mkdir -p $RUNNER_TEMP/out/oci-images
-
-            # dockerTools outputs gzip-compressed archives; crane expects plain tar
-            gunzip_archive() {
-              local gz="$1"
-              local out="$2"
-              gzip -dc "$gz" > "$out"
-            }
-
-            # Decompress archives once
-            tar_x86="$RUNNER_TEMP/out/oci-images/server-oci--x86_64-unknown-linux-musl.tar"
-            tar_arm="$RUNNER_TEMP/out/oci-images/server-oci--aarch64-unknown-linux-musl.tar"
-            gunzip_archive $RUNNER_TEMP/out/server-oci--x86_64-unknown-linux-musl.tar.gz "$tar_x86"
-            gunzip_archive $RUNNER_TEMP/out/server-oci--aarch64-unknown-linux-musl.tar.gz "$tar_arm"
-
-            # Push architecture-specific images
-            crane push "$tar_x86" "${IMAGE}:${TAG_PREFIX}-amd64"
-            crane push "$tar_arm" "${IMAGE}:${TAG_PREFIX}-arm64"
-
-            # Optional "latest" tags for main
-            if [ "${IS_MAIN}" = "true" ]; then
-              crane push "$tar_x86" "${IMAGE}:latest-amd64"
-              crane push "$tar_arm" "${IMAGE}:latest-arm64"
-            fi
-
-            # Create multi-arch manifests pointing at the uploaded images
-            crane index append -t "${IMAGE}:${TAG_PREFIX}" \
-              -m "${IMAGE}:${TAG_PREFIX}-amd64" \
-              -m "${IMAGE}:${TAG_PREFIX}-arm64"
-
-            if [ "${IS_MAIN}" = "true" ]; then
-              crane index append -t "${IMAGE}:latest" \
-                -m "${IMAGE}:latest-amd64" \
-                -m "${IMAGE}:latest-arm64"
-            fi
-          '

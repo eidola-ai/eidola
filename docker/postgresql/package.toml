@@ -1,0 +1,12 @@
+[package]
+name = "postgresql"
+version = "17.4"
+description = "A powerful, open source object-relational database system with over 35 years of active development that has earned it a strong reputation for reliability, feature robustness, and performance."
+website = "https://www.postgresql.org/"
+license = "PostgreSQL"
+
+[sources.postgresql]
+hash = "e69d0714c3a8480c208aadba6c031fb8ce9cf580930c8012bf748c8b5ed11850"
+format = "tar.gz"
+file = "postgresql-{version}.{format}"
+mirrors = [ "https://ftp.postgresql.org/pub/source/v{version}/{file}",]

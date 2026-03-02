@@ -8,12 +8,14 @@ Guidance for AI coding agents working in this repository.
 eidolons/
 ├── crates/           # Rust crates
 │   ├── eidolons-server/  # OpenAI-compatible AI proxy server
-│   │   └── src/
-│   │       ├── main.rs       # HTTP server (hyper + tokio)
-│   │       ├── openai.rs     # OpenAI API types
-│   │       ├── anthropic.rs  # Anthropic API types
-│   │       ├── transform.rs  # Format conversion
-│   │       └── proxy.rs      # Upstream HTTP client
+│   │   ├── src/
+│   │   │   ├── main.rs       # HTTP server (hyper + tokio)
+│   │   │   ├── openai.rs     # OpenAI API types
+│   │   │   ├── anthropic.rs  # Anthropic API types
+│   │   │   ├── transform.rs  # Format conversion
+│   │   │   └── proxy.rs      # Upstream HTTP client
+│   │   ├── schema.sql        # PostgreSQL schema (billing, ACT keys, nullifiers)
+│   │   └── Containerfile     # StageX-based OCI build
 │   ├── eidolons-hello/   # Hello capability (example)
 │   │   └── src/lib.rs
 │   └── eidolons-shared/  # Crux-based shared core (exclusive FFI generator)
@@ -36,27 +38,42 @@ eidolons/
 ├── tools/            # Build tooling
 │   ├── uniffi-bindgen-swift/  # UniFFI binding generator
 │   └── shared-typegen/        # Crux type generator for Swift
-└── flake.nix         # Nix build definitions
+├── scripts/          # Codegen helper scripts (wrapped by justfile)
+├── justfile          # Task runner (primary development interface)
+├── artifact-manifest.json    # Committed OCI image digests (reproducibility invariant)
+├── compose.yaml              # Development environment (postgres + server)
+├── docker-bake.hcl           # Reproducible OCI build settings (overlays compose.yaml)
+├── .dockerignore             # Excludes non-build files from OCI build context
+└── flake.nix         # Nix: CI checks, Swift/XCFramework builds
 ```
 
 ## Server Architecture
 
-The server is an OpenAI-compatible proxy that translates requests to upstream AI providers.
+The server is an OpenAI-compatible proxy that translates requests to upstream AI providers. It includes a billing system with anonymous credit tokens (ACT) for privacy-preserving usage tracking.
 
-**Current upstream:** Anthropic Claude (Messages API)
+**Current upstream:** RedPill.ai (OpenAI-compatible, routes to various model providers)
+
+**Database:** PostgreSQL 16+ (see `crates/eidolons-server/schema.sql`)
+
+**Deployment:** Phala dstack — all services run inside a single Confidential VM (CVM) with encrypted disk backed by Intel TDX.
+
+**CI:** Two workflows — `ci.yml` (self-hosted Mac: Nix checks, Swift builds/tests) and `oci.yml` (ubuntu-latest: OCI image builds, manifest verification, GHCR publishing).
+
+**Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidolons-server` and `ghcr.io/<owner>/eidolons-postgres`.
 
 **Key design decisions:**
-- Pure Rust TLS via `rustls-rustcrypto` (enables cross-compilation, no C dependencies)
+- Pure Rust TLS via `rustls-rustcrypto` (no C dependencies)
 - Statically linked musl binaries for Linux deployment
-- Distroless OCI images (~9MB, runs as non-root)
-- Request-based (no sessions/caching)
+- StageX-based OCI images (reproducible, `FROM scratch`, runs as non-root)
+- Request-based (no sessions/caching in the proxy layer)
 
 **API endpoints:**
 - `GET /health` - Health check
-- `POST /v1/chat/completions` - OpenAI-compatible chat completions (proxied to Anthropic)
+- `POST /v1/chat/completions` - OpenAI-compatible chat completions (proxied to RedPill)
 
 **Environment variables:**
-- `ANTHROPIC_API_KEY` (required) - Anthropic API key
+- `REDPILL_API_KEY` (required) - RedPill API key
+- `DATABASE_URL` (required) - PostgreSQL connection string
 - `BIND_ADDR` (default: `127.0.0.1:8080`) - Address to bind
 
 ## Crux Architecture
@@ -94,62 +111,64 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 
 ## Build Commands
 
-For rapid iteration, **prefer the local Rust toolchain** inside the Nix development shell. Nix is the final source of authority for CI and releases, but standard `cargo` commands allow for incremental compilation.
+**Prerequisites:** `rustup`, `just`, `docker`
+
+The `justfile` is the primary development interface. Run `just` to see all available recipes.
 
 ```bash
-# 1. Enter the development environment
-nix develop
+# --- Development (daily workflow) ---
 
-# 2. Development (Inner Loop - PREFERRED)
-cargo build -p eidolons-server    # Quick local build
-cargo test                        # Run tests
-cargo clippy                      # Lint
-cargo fmt                         # Format
+just db                       # Start postgres in Docker
+just db-reset                 # Apply/reset schema.sql
+cargo run -p eidolons-server  # Run server on host (fast iteration)
+cargo test                    # Run tests
+just check                    # Lint (clippy + fmt)
 
-# 3. Updating generated files (after changing Rust APIs/types)
-# These scripts auto-generate artifacts using your local toolchain.
-scripts/update-shared-bindings.sh
-scripts/update-server-openapi.sh
-scripts/update-shared-xcframework-dev.sh  # Fast dev build (native arch only)
-scripts/update-shared-xcframework.sh      # Full build (all architectures, CI)
+# Full stack in containers (validates OCI build + service topology)
+just dev
 
-# 4. Verification (Simulates CI)
-# Optimized for speed; focuses on correctness, not heavy artifact building.
-nix flake check
+# --- Codegen (after changing Rust APIs/types) ---
 
-# 5. Production builds (Nix - Final Authority)
-nix build '.#server'                              # Native binary
-nix build '.#server-oci'                          # OCI image
-nix build '.#eidolons-shared-swift-xcframework'   # Shared core XCFramework
+just update-bindings          # UniFFI Swift bindings + Crux types
+just update-openapi           # OpenAPI spec
+just update-xcframework       # XCFramework (dev, native arch only)
 
-# 6. Nix-based updates (for perfect CI parity)
+# --- OCI ---
+
+just oci-build                # Build all OCI images (reproducible, via buildx bake)
+just update-manifest          # Rebuild images and update artifact-manifest.json
+
+# --- CI / Release (Nix) ---
+
+just ci-check                 # nix flake check (fmt, clippy, tests, artifact freshness)
+just ci-build-xcframework     # XCFramework via Nix (universal binary)
+
+# --- Nix-based codegen (for CI parity) ---
+
 nix run '.#update-eidolons-shared-swift-bindings'
 nix run '.#update-server-openapi'
 ```
-
-## Cross-Compilation
-
-Targets defined in `rust-toolchain.toml`:
-- macOS: `aarch64-apple-darwin`, `x86_64-apple-darwin`
-- Linux: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
-
-**OCI images:** Use `server-oci--<linux-target>` for Docker. The native `server-oci` builds for macOS and won't run in Docker.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `flake.nix` | Nix build definitions, cross-compile targets, CI checks |
-| `rust-toolchain.toml` | Pinned Rust version (1.92.0) and targets |
+| `justfile` | Task runner — primary development interface |
+| `compose.yaml` | Dev environment: postgres + server |
+| `docker-bake.hcl` | Reproducible OCI build settings (overlays compose.yaml) |
+| `artifact-manifest.json` | Committed OCI image digests — CI verifies builds match |
+| `crates/eidolons-server/Containerfile` | StageX-based OCI image build |
+| `crates/eidolons-server/schema.sql` | PostgreSQL schema (billing, ACT, nullifiers) |
+| `.env.example` | Template for local environment variables |
+| `flake.nix` | Nix: CI checks, Swift codegen, XCFramework builds |
+| `rust-toolchain.toml` | Pinned Rust version and targets |
 | `Cargo.toml` | Workspace config, release profile (LTO, single codegen unit) |
 | `crates/eidolons-server/Cargo.toml` | Server dependencies |
-| `crates/eidolons-hello/src/lib.rs` | Hello capability implementation (pure Rust) |
 | `crates/eidolons-shared/Package.swift` | Shared core Swift Package (EidolonsShared + SharedTypes) |
 | `crates/eidolons-shared/src/lib.rs` | FFI bridge + capability re-exports |
 | `crates/eidolons-shared/src/app.rs` | Crux App implementation (Event, Model, ViewModel, Effect) |
 | `apps/macos/Package.swift` | macOS app Swift Package config |
 | `apps/macos/Sources/Eidolons/Core.swift` | Swift shell bridge (handles Crux event/effect loop) |
-| `apps/macos/Support/Info.plist` | Shared app Info.plist |
 | `apps/macos/Support/package-app.sh` | CLI build script for .app bundle |
 
 ## Design Documents
@@ -167,6 +186,12 @@ Architecture decisions are recorded in [`docs/design/`](docs/design/). See the
 ## Conventions
 
 - Pure Rust dependencies preferred (for cross-compilation)
-- No caching/state in server (request-based)
+- `just` is the task runner — wrap scripts and common commands as recipes
+- `compose.yaml` defines the dev environment; `docker-bake.hcl` overlays reproducible build settings
+- `docker buildx bake` is the single entry point for all OCI image builds
+- Server OCI images are built with StageX (reproducible, `FROM scratch`, runs as non-root)
+- Nix is used for CI quality gates and Swift/XCFramework builds, not daily Rust development
+- `rustup` + `rust-toolchain.toml` manages the Rust toolchain for development
 - OpenAI API format as the canonical interface
 - Deterministic builds (no timestamps, fixed codegen)
+- `artifact-manifest.json` records expected OCI digests; CI verifies builds match and suggests updates on PRs

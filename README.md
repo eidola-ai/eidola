@@ -76,21 +76,22 @@ This architecture ensures that the "Conscious" mind (the UI) remains snappy and 
 
 Eidolons consists of these components:
 - **Crates** (`crates/`) - Rust crates including:
-  - `eidolons-server` - OpenAI-compatible proxy that routes requests to AI providers (currently Anthropic Claude)
+  - `eidolons-server` - Privacy-transparent OpenAI-compatible proxy that routes requests through RedPill.ai with inline attestation metadata
   - `eidolons-hello` - Example capability implementation
   - `eidolons-shared` - Crux-based cross-platform app core managing state and effects, exposing capabilities via FFI
 - **APP: macOS** (`apps/macos/`) - SwiftUI shell that renders the shared core's view model
 
-All builds are deterministic and reproducible via Nix.
+**Prerequisites:** `rustup`, `just`, `docker`
 
-Enter a development shell with Rust toolchain and tools:
-```bash
-nix develop  # Provides Rust toolchain, cargo-watch, rust-analyzer
-```
-
-Or use your own Rust installation with the toolchain specified in `rust-toolchain.toml`.
+The Rust toolchain version is pinned in `rust-toolchain.toml` and installed automatically by rustup. Run `just` to see all available recipes.
 
 ```bash
+# Start postgres for local development
+just db
+
+# Run the server on the host (fast iteration with incremental compilation)
+REDPILL_API_KEY="<YOUR_KEY>" cargo run -p eidolons-server
+
 # Lint and format
 cargo fmt
 cargo clippy
@@ -98,27 +99,24 @@ cargo clippy
 # Run tests
 cargo test
 
-# Run the server
-ANTHROPIC_API_KEY="<sk-ant-YOUR_API_KEY>" cargo run -p eidolons-server
-
+# Full stack in containers (postgres + server)
+just dev
 ```
 
 **Updating generated files:**
-If you change Rust APIs or types, you must update the committed Swift bindings or OpenAPI spec. The preferred way is using Nix, which ensures the same environment as CI:
+If you change Rust APIs or types, update the committed Swift bindings or OpenAPI spec:
 ```bash
-nix run '.#update-eidolons-shared-swift-bindings'     # Update bindings and types
-nix run '.#update-eidolons-shared-swift-xcframework'  # Update the static XCFramework
-nix run '.#update-server-openapi'                     # Update OpenAPI spec
+just update-bindings      # UniFFI Swift bindings + Crux types
+just update-openapi       # OpenAPI spec
+just update-xcframework   # XCFramework (dev, native arch only)
 ```
 
-These can also be updated outside of Nix using your local Rust toolchain (auto-generates via `cargo run` and `cargo build`):
+For CI parity, Nix-based equivalents are available:
 ```bash
-scripts/update-shared-bindings.sh
-scripts/update-server-openapi.sh
-scripts/update-shared-xcframework-dev.sh  # Fast: native architecture only (preferred for development)
-scripts/update-shared-xcframework.sh      # Full: all architectures (used in CI)
+nix run '.#update-eidolons-shared-swift-bindings'
+nix run '.#update-eidolons-shared-swift-xcframework'
+nix run '.#update-server-openapi'
 ```
-*Note: XCFramework scripts require a macOS host.*
 
 Generated artifacts are committed and verified by CI:
 - `crates/eidolons-shared/swift/` - Shared core bindings (UniFFI + Crux types)
@@ -127,41 +125,49 @@ Generated artifacts are committed and verified by CI:
 
 ## Building for release
 
-This project uses Nix for reproducible builds. [Install Nix](https://nixos.org/download.html) with flakes enabled.
+### Server OCI image
+
+The server image is built with a [StageX](https://stagex.tools/)-based Containerfile for reproducible, fully-bootstrapped builds:
 
 ```bash
-# Build targets
-nix build '.#server'                            # Server binary (native)
-nix build '.#server-oci'                        # Server OCI image (native)
-nix build '.#eidolons-shared-swift-xcframework' # Shared core XCFramework
+# Build the server OCI image
+just oci-build
 
-# Cross-compile Linux binaries
-nix build '.#server--aarch64-unknown-linux-musl' # Linux ARM64 binary
-nix build '.#server--x86_64-unknown-linux-musl'  # Linux x86_64 binary
+# Or directly:
+docker build -f crates/eidolons-server/Containerfile -t eidolons-server:dev .
+```
 
-# Build the OCI (docker) image
-nix build '.#server-oci--aarch64-unknown-linux-musl' # ARM64 OCI image
-nix build '.#server-oci--x86_64-unknown-linux-musl'  # x86_64 OCI image
+The image is `FROM scratch` with a statically-linked musl binary (~9MB, runs as non-root UID 65534).
 
-# Run checks (tests, linting, formatting)
-nix flake check
+### Swift / macOS
+
+Nix handles XCFramework and macOS app builds:
+
+```bash
+nix build '.#eidolons-shared-swift-xcframework'   # Shared core XCFramework
+
+# macOS app
+( cd apps/macos && Support/package-app.sh )
+```
+
+### CI checks
+
+```bash
+nix flake check   # Runs: cargo fmt, clippy, tests, openapi/binding freshness, Swift formatting
 ```
 
 ## Server
 
-The server exposes an OpenAI-compatible `/v1/chat/completions` endpoint that proxies to Anthropic's Claude API, handling format translation and streaming.
+The server exposes an OpenAI-compatible `/v1/chat/completions` endpoint that proxies requests through RedPill.ai, enriching responses with privacy-transparent attestation metadata.
 
 ### Running with Docker
 
 ```bash
-# Build the Linux container image
-nix build '.#server-oci--aarch64-unknown-linux-musl'  # ARM64
-# OR
-nix build '.#server-oci--x86_64-unknown-linux-musl'   # x86_64
+# Build the image
+just oci-build
 
-# Load and run
-docker load < result
-docker run --rm -d -p 8080:8080 -e ANTHROPIC_API_KEY="<sk-ant-YOUR_API_KEY>" eidolons-server:latest
+# Run
+docker run --rm -d -p 8080:8080 -e REDPILL_API_KEY="<YOUR_KEY>" eidolons-server:dev
 
 # Test
 curl http://localhost:8080/health
@@ -169,3 +175,21 @@ curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"Hello!"}]}'
 ```
+
+### Running with Docker Compose
+
+```bash
+# Copy and fill in your API key
+cp .env.example .env
+
+# Start postgres + server
+just dev
+
+# Or just postgres (run server on the host for fast iteration)
+just db
+cargo run -p eidolons-server
+```
+
+### Production deployment (dstack)
+
+The server is deployed to Phala dstack TEEs. All services run inside a single Confidential VM with encrypted storage.
