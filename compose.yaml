@@ -1,7 +1,6 @@
 services:
   postgres:
     image: eidolons-postgres:dev
-    platform: linux/amd64
     build:
       context: .
       dockerfile: docker/postgresql/Containerfile
@@ -22,7 +21,6 @@ services:
 
   server:
     image: eidolons-server:dev
-    platform: linux/amd64
     build:
       context: .
       dockerfile: crates/eidolons-server/Containerfile

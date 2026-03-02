@@ -14,6 +14,7 @@ variable "TAGS" {
 # ── Base target: shared settings applied to all images ─────────────────────────
 
 target "_common" {
+  platforms = ["linux/amd64"]
   args = {
     SOURCE_DATE_EPOCH = "${SOURCE_DATE_EPOCH}"
   }
@@ -24,8 +25,8 @@ target "_common" {
 # ── Local dev targets (compose.yaml overlay) ──────────────────────────────────
 # context and dockerfile come from compose.yaml; not repeated here.
 # The docker driver does not support rewrite-timestamp or force-compression,
-# so local builds omit them. Full reproducibility is enforced in CI via the
-# docker-container driver.
+# so local builds omit them. Once all base images are published to a registry,
+# switch to a docker-container builder to enable full local reproducibility.
 
 target "server" {
   inherits = ["_common"]
