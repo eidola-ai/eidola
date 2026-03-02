@@ -22,10 +22,6 @@ CREATE TABLE account (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     credential_secret_hash TEXT NOT NULL,
     stripe_customer_id  TEXT UNIQUE,
-    subscription_status TEXT NOT NULL DEFAULT 'none'
-        CHECK (subscription_status IN ('none', 'active', 'past_due', 'canceled')),
-    subscription_plan   TEXT
-        CHECK (subscription_plan IN ('standard', 'pro') OR subscription_plan IS NULL),
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -49,15 +45,6 @@ COMMENT ON COLUMN account.stripe_customer_id IS
     'NULL for accounts that have never made a payment. UNIQUE because one Stripe '
     'customer should map to exactly one account.';
 
-COMMENT ON COLUMN account.subscription_status IS
-    'Denormalized from Stripe webhook events. "none" means never subscribed '
-    'or fully canceled. "past_due" means payment retry is in progress. '
-    'Only "active" allows subscription balance to be provisioned.';
-
-COMMENT ON COLUMN account.subscription_plan IS
-    'NULL when subscription_status is "none". Otherwise reflects the current '
-    'plan tier. Used for display and for determining credit amounts on renewal.';
-
 CREATE INDEX idx_account_stripe_customer ON account (stripe_customer_id)
     WHERE stripe_customer_id IS NOT NULL;
 
@@ -72,7 +59,7 @@ CREATE TABLE credit_ledger (
     reason          TEXT NOT NULL
         CHECK (reason IN (
             'subscription_renewal',
-            'topup',
+            'purchase',
             'refund',
             'act_issuance',
             'dispute_clawback',
@@ -89,7 +76,7 @@ CREATE TABLE credit_ledger (
     -- Stripe-originated entries must carry their event ID for idempotency.
     CONSTRAINT require_stripe_event_id CHECK (
         reason NOT IN (
-            'subscription_renewal', 'topup', 'refund',
+            'subscription_renewal', 'purchase', 'refund',
             'dispute_clawback', 'dispute_reversal'
         )
         OR stripe_event_id IS NOT NULL
@@ -100,7 +87,7 @@ CREATE TABLE credit_ledger (
     CONSTRAINT delta_nonzero CHECK (delta != 0),
     CONSTRAINT delta_sign CHECK (
         reason = 'manual_adjustment'
-        OR (reason IN ('subscription_renewal', 'topup', 'dispute_reversal') AND delta > 0)
+        OR (reason IN ('subscription_renewal', 'purchase', 'dispute_reversal') AND delta > 0)
         OR (reason IN ('act_issuance', 'refund', 'dispute_clawback') AND delta < 0)
     ),
 
@@ -135,7 +122,7 @@ COMMENT ON COLUMN credit_ledger.reason IS
     'Informational tag for filtering and auditing. Does not drive business '
     'logic — only delta and expires_at have operational meaning. Reasons: '
     'subscription_renewal = recurring Stripe subscription payment; '
-    'topup = one-time Stripe purchase (premium pricing, no expiry); '
+    'purchase = one-time Stripe purchase (premium pricing, no expiry); '
     'refund = Stripe refund (full or partial), cooperative; '
     'act_issuance = credits converted into anonymous tokens (the privacy boundary); '
     'dispute_clawback = Stripe dispute/chargeback, adversarial; '
