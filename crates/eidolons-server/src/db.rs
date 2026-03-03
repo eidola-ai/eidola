@@ -11,7 +11,7 @@ use crate::error::ServerError;
 /// A row from the `account` table.
 pub struct AccountRow {
     pub id: Uuid,
-    pub credential_secret_hash: String,
+    pub secret_hash: String,
     pub stripe_customer_id: Option<String>,
     pub created_at: SystemTime,
 }
@@ -46,7 +46,7 @@ pub async fn insert_account(
 
     let row = client
         .query_one(
-            "INSERT INTO account (id, credential_secret_hash) VALUES ($1, $2) RETURNING created_at",
+            "INSERT INTO account (id, secret_hash) VALUES ($1, $2) RETURNING created_at",
             &[&id, &credential_hash],
         )
         .await
@@ -64,7 +64,7 @@ pub async fn get_account_by_id(pool: &Pool, id: Uuid) -> Result<AccountRow, Serv
 
     let row = client
         .query_opt(
-            "SELECT id, credential_secret_hash, stripe_customer_id, created_at \
+            "SELECT id, secret_hash, stripe_customer_id, created_at \
              FROM account WHERE id = $1",
             &[&id],
         )
@@ -74,7 +74,7 @@ pub async fn get_account_by_id(pool: &Pool, id: Uuid) -> Result<AccountRow, Serv
     match row {
         Some(row) => Ok(AccountRow {
             id: row.get("id"),
-            credential_secret_hash: row.get("credential_secret_hash"),
+            secret_hash: row.get("secret_hash"),
             stripe_customer_id: row.get("stripe_customer_id"),
             created_at: row.get("created_at"),
         }),

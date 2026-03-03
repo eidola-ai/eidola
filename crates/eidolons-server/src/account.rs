@@ -75,7 +75,7 @@ pub async fn authenticate_account(
         }
     })?;
 
-    let parsed_hash = PasswordHash::new(&account.credential_secret_hash)
+    let parsed_hash = PasswordHash::new(&account.secret_hash)
         .map_err(|_| ServerError::Internal("corrupt credential hash".to_string()))?;
 
     Argon2::default()

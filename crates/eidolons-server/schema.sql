@@ -20,7 +20,7 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";  -- for gen_random_uuid()
 
 CREATE TABLE account (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    credential_secret_hash TEXT NOT NULL,
+    secret_hash         TEXT NOT NULL,
     stripe_customer_id  TEXT UNIQUE,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -36,8 +36,8 @@ COMMENT ON COLUMN account.id IS
     'Public account identifier, exposed in the API as account_id. '
     'Safe to include in logs.';
 
-COMMENT ON COLUMN account.credential_secret_hash IS
-    'Argon2id hash of the credential secret. The plaintext is returned '
+COMMENT ON COLUMN account.secret_hash IS
+    'Argon2id hash of the account secret. The plaintext is returned '
     'exactly once at account creation and never stored.';
 
 COMMENT ON COLUMN account.stripe_customer_id IS
