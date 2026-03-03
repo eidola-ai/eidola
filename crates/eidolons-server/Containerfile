@@ -17,19 +17,29 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ ./crates/
 COPY tools/ ./tools/
 
-RUN cargo fetch --locked --target ${TARGET}
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    cargo fetch --locked --target ${TARGET}
 
 # ── build ──────────────────────────────────────────────────────────────────────
 # Compile sources (no network access).
+# Cache mounts persist the cargo registry and target dir across builds without
+# affecting the final image. The binary is copied to /out because cache mounts
+# are only available during RUN, not COPY.
 FROM fetch AS build
 
-RUN --network=none cargo build --frozen --release --target ${TARGET} -p eidolons-server
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/src/target \
+    --network=none \
+    cargo build --frozen --release --target ${TARGET} -p eidolons-server \
+    && install -D target/${TARGET}/release/eidolons-server /out/eidolons-server
 
 # ── install ────────────────────────────────────────────────────────────────────
 # Place binary into /rootfs.
 FROM scratch AS install
 
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/eidolons-server /rootfs/eidolons-server
+COPY --from=build /out/eidolons-server /rootfs/eidolons-server
 
 # ── package ────────────────────────────────────────────────────────────────────
 # Final minimal image.
