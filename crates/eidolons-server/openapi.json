@@ -6,12 +6,18 @@
     "contact": {
       "name": "Mike Marcacci"
     },
+    "license": {
+      "name": "",
+      "identifier": "UNLICENSED"
+    },
     "version": "0.1.0"
   },
   "paths": {
     "/health": {
       "get": {
-        "tags": ["openapi_paths"],
+        "tags": [
+          "openapi_paths"
+        ],
         "summary": "Health check endpoint.",
         "operationId": "health",
         "responses": {
@@ -33,7 +39,9 @@
     },
     "/v1/account": {
       "get": {
-        "tags": ["openapi_paths"],
+        "tags": [
+          "openapi_paths"
+        ],
         "summary": "Get account information.",
         "description": "Requires HTTP Basic auth (account_id:secret).",
         "operationId": "get_account",
@@ -66,7 +74,9 @@
         ]
       },
       "post": {
-        "tags": ["openapi_paths"],
+        "tags": [
+          "openapi_paths"
+        ],
         "summary": "Create a new account.",
         "description": "Returns the account ID and credential secret. The credential secret is\nreturned exactly once and never stored in plaintext.",
         "operationId": "create_account",
@@ -96,7 +106,9 @@
     },
     "/v1/account/purchase": {
       "post": {
-        "tags": ["openapi_paths"],
+        "tags": [
+          "openapi_paths"
+        ],
         "summary": "Create a one-time purchase checkout session.",
         "description": "Returns a Stripe Checkout URL for a one-time payment.\nRequires HTTP Basic auth.",
         "operationId": "create_purchase",
@@ -161,7 +173,9 @@
     },
     "/v1/account/subscription": {
       "get": {
-        "tags": ["openapi_paths"],
+        "tags": [
+          "openapi_paths"
+        ],
         "summary": "Get subscription details.",
         "description": "Returns the active subscription and a Stripe portal URL for management.\nRequires HTTP Basic auth.",
         "operationId": "get_subscription",
@@ -214,7 +228,9 @@
         ]
       },
       "post": {
-        "tags": ["openapi_paths"],
+        "tags": [
+          "openapi_paths"
+        ],
         "summary": "Create a subscription checkout session.",
         "description": "Returns a Stripe Checkout URL. Fails with 409 if the account already\nhas an active subscription. Requires HTTP Basic auth.",
         "operationId": "create_subscription",
@@ -269,7 +285,9 @@
     },
     "/v1/chat/completions": {
       "post": {
-        "tags": ["openapi_paths"],
+        "tags": [
+          "openapi_paths"
+        ],
         "summary": "Create a chat completion.",
         "description": "Proxies the request to the configured backend and returns a response\nenriched with privacy and verification metadata.",
         "operationId": "chat_completions",
@@ -329,7 +347,9 @@
     },
     "/v1/models": {
       "get": {
-        "tags": ["openapi_paths"],
+        "tags": [
+          "openapi_paths"
+        ],
         "summary": "List available models.",
         "operationId": "list_models",
         "responses": {
@@ -362,10 +382,15 @@
       "AssistantMessage": {
         "type": "object",
         "description": "An assistant message in a response.",
-        "required": ["role"],
+        "required": [
+          "role"
+        ],
         "properties": {
           "content": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "role": {
             "$ref": "#/components/schemas/Role"
@@ -375,17 +400,26 @@
       "AttestationStatus": {
         "type": "string",
         "description": "Attestation status.",
-        "enum": ["unavailable", "verified"]
+        "enum": [
+          "unavailable",
+          "verified"
+        ]
       },
       "AuthMethod": {
         "type": "string",
         "description": "Supported authorization methods.",
-        "enum": ["anonymous_credit_token", "none"]
+        "enum": [
+          "anonymous_credit_token",
+          "none"
+        ]
       },
       "AuthorizationInfo": {
         "type": "object",
         "description": "Authorization information.",
-        "required": ["method", "linkable"],
+        "required": [
+          "method",
+          "linkable"
+        ],
         "properties": {
           "linkable": {
             "type": "boolean",
@@ -433,7 +467,13 @@
       "ChatCompletionChunk": {
         "type": "object",
         "description": "A streaming chat completion chunk.",
-        "required": ["id", "object", "created", "model", "choices"],
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices"
+        ],
         "properties": {
           "choices": {
             "type": "array",
@@ -465,10 +505,16 @@
       "ChatCompletionRequest": {
         "type": "object",
         "description": "A chat completion request.",
-        "required": ["model", "messages"],
+        "required": [
+          "model",
+          "messages"
+        ],
         "properties": {
           "max_tokens": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int32",
             "description": "The maximum number of tokens to generate.",
             "minimum": 0
@@ -500,12 +546,18 @@
             "description": "Whether to stream partial responses."
           },
           "temperature": {
-            "type": ["number", "null"],
+            "type": [
+              "number",
+              "null"
+            ],
             "format": "float",
             "description": "Sampling temperature between 0 and 2."
           },
           "top_p": {
-            "type": ["number", "null"],
+            "type": [
+              "number",
+              "null"
+            ],
             "format": "float",
             "description": "Nucleus sampling parameter."
           }
@@ -515,7 +567,13 @@
       "ChatCompletionResponse": {
         "type": "object",
         "description": "A chat completion response.",
-        "required": ["id", "object", "created", "model", "choices"],
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices"
+        ],
         "properties": {
           "choices": {
             "type": "array",
@@ -557,7 +615,9 @@
       },
       "CheckoutUrlResponse": {
         "type": "object",
-        "required": ["checkout_url"],
+        "required": [
+          "checkout_url"
+        ],
         "properties": {
           "checkout_url": {
             "type": "string"
@@ -567,7 +627,10 @@
       "Choice": {
         "type": "object",
         "description": "A completion choice.",
-        "required": ["index", "message"],
+        "required": [
+          "index",
+          "message"
+        ],
         "properties": {
           "finish_reason": {
             "oneOf": [
@@ -595,7 +658,10 @@
       "ChunkChoice": {
         "type": "object",
         "description": "A choice delta in a streaming chunk.",
-        "required": ["index", "delta"],
+        "required": [
+          "index",
+          "delta"
+        ],
         "properties": {
           "delta": {
             "$ref": "#/components/schemas/ChunkDelta",
@@ -625,7 +691,10 @@
         "description": "A delta update in a streaming response.",
         "properties": {
           "content": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "role": {
             "oneOf": [
@@ -644,28 +713,38 @@
           {
             "type": "object",
             "description": "Text content.",
-            "required": ["text", "type"],
+            "required": [
+              "text",
+              "type"
+            ],
             "properties": {
               "text": {
                 "type": "string"
               },
               "type": {
                 "type": "string",
-                "enum": ["text"]
+                "enum": [
+                  "text"
+                ]
               }
             }
           },
           {
             "type": "object",
             "description": "Image content via URL.",
-            "required": ["image_url", "type"],
+            "required": [
+              "image_url",
+              "type"
+            ],
             "properties": {
               "image_url": {
                 "$ref": "#/components/schemas/ImageUrl"
               },
               "type": {
                 "type": "string",
-                "enum": ["image_url"]
+                "enum": [
+                  "image_url"
+                ]
               }
             }
           }
@@ -674,7 +753,11 @@
       },
       "CreateAccountResponse": {
         "type": "object",
-        "required": ["account_id", "secret", "created_at"],
+        "required": [
+          "account_id",
+          "secret",
+          "created_at"
+        ],
         "properties": {
           "account_id": {
             "type": "string",
@@ -691,7 +774,12 @@
       "DataExposure": {
         "type": "object",
         "description": "Describes a party's visibility into request/response data.",
-        "required": ["party", "sees", "confidentiality", "logged"],
+        "required": [
+          "party",
+          "sees",
+          "confidentiality",
+          "logged"
+        ],
         "properties": {
           "confidentiality": {
             "type": "string",
@@ -776,7 +864,12 @@
       "EidolonsStreamMetadata": {
         "type": "object",
         "description": "Metadata event sent as the final SSE event before [DONE] in streaming responses.\n\nClients identify this by checking `object == \"eidolons.chat.completion.metadata\"`.\nStandard OpenAI clients will ignore it.",
-        "required": ["object", "id", "privacy", "verification"],
+        "required": [
+          "object",
+          "id",
+          "privacy",
+          "verification"
+        ],
         "properties": {
           "id": {
             "type": "string",
@@ -798,10 +891,16 @@
       },
       "ErrorDetail": {
         "type": "object",
-        "required": ["message", "type"],
+        "required": [
+          "message",
+          "type"
+        ],
         "properties": {
           "code": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "message": {
             "type": "string"
@@ -814,7 +913,9 @@
       "ErrorResponse": {
         "type": "object",
         "description": "An error response in OpenAI format.",
-        "required": ["error"],
+        "required": [
+          "error"
+        ],
         "properties": {
           "error": {
             "$ref": "#/components/schemas/ErrorDetail"
@@ -824,11 +925,18 @@
       "FinishReason": {
         "type": "string",
         "description": "The reason the model stopped generating.",
-        "enum": ["stop", "length", "content_filter"]
+        "enum": [
+          "stop",
+          "length",
+          "content_filter"
+        ]
       },
       "GetAccountResponse": {
         "type": "object",
-        "required": ["id", "created_at"],
+        "required": [
+          "id",
+          "created_at"
+        ],
         "properties": {
           "created_at": {
             "type": "string"
@@ -838,17 +946,25 @@
             "format": "uuid"
           },
           "stripe_customer_id": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
       "ImageUrl": {
         "type": "object",
         "description": "An image URL reference.",
-        "required": ["url"],
+        "required": [
+          "url"
+        ],
         "properties": {
           "detail": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Optional detail level for the image."
           },
           "url": {
@@ -861,14 +977,20 @@
       "Message": {
         "type": "object",
         "description": "A message in the conversation.",
-        "required": ["role", "content"],
+        "required": [
+          "role",
+          "content"
+        ],
         "properties": {
           "content": {
             "$ref": "#/components/schemas/MessageContent",
             "description": "The content of the message."
           },
           "name": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "An optional name for the participant."
           },
           "role": {
@@ -895,7 +1017,13 @@
       "Model": {
         "type": "object",
         "description": "A model descriptor.",
-        "required": ["id", "name", "created", "description", "context_length"],
+        "required": [
+          "id",
+          "name",
+          "created",
+          "description",
+          "context_length"
+        ],
         "properties": {
           "context_length": {
             "type": "integer",
@@ -926,7 +1054,9 @@
       "ModelsResponse": {
         "type": "object",
         "description": "A list of available models.",
-        "required": ["data"],
+        "required": [
+          "data"
+        ],
         "properties": {
           "data": {
             "type": "array",
@@ -940,7 +1070,11 @@
       "PrivacyMetadata": {
         "type": "object",
         "description": "Privacy metadata describing how the request was authorized, what data is\nvisible to which parties, and transport security properties.",
-        "required": ["authorization", "data_exposure", "transport"],
+        "required": [
+          "authorization",
+          "data_exposure",
+          "transport"
+        ],
         "properties": {
           "authorization": {
             "$ref": "#/components/schemas/AuthorizationInfo",
@@ -962,7 +1096,9 @@
       "ProxyAttestation": {
         "type": "object",
         "description": "Proxy attestation (placeholder for future TEE deployment).",
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "properties": {
           "status": {
             "$ref": "#/components/schemas/AttestationStatus",
@@ -972,7 +1108,9 @@
       },
       "PurchaseRequest": {
         "type": "object",
-        "required": ["price_id"],
+        "required": [
+          "price_id"
+        ],
         "properties": {
           "cancel_url": {
             "type": "string"
@@ -988,7 +1126,11 @@
       "Role": {
         "type": "string",
         "description": "The role of a message author.",
-        "enum": ["system", "user", "assistant"]
+        "enum": [
+          "system",
+          "user",
+          "assistant"
+        ]
       },
       "StopSequence": {
         "oneOf": [
@@ -1006,10 +1148,17 @@
       },
       "SubscriptionResponse": {
         "type": "object",
-        "required": ["id", "status", "management_url"],
+        "required": [
+          "id",
+          "status",
+          "management_url"
+        ],
         "properties": {
           "current_period_end": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "type": "string"
@@ -1025,12 +1174,17 @@
       "TeeType": {
         "type": "string",
         "description": "The type of Trusted Execution Environment backing a model.",
-        "enum": ["phala_gpu"]
+        "enum": [
+          "phala_gpu"
+        ]
       },
       "TransportInfo": {
         "type": "object",
         "description": "Transport security information.",
-        "required": ["client_to_proxy", "proxy_to_backend"],
+        "required": [
+          "client_to_proxy",
+          "proxy_to_backend"
+        ],
         "properties": {
           "client_to_proxy": {
             "type": "string",
@@ -1045,7 +1199,11 @@
       "Usage": {
         "type": "object",
         "description": "Token usage statistics.",
-        "required": ["prompt_tokens", "completion_tokens", "total_tokens"],
+        "required": [
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens"
+        ],
         "properties": {
           "completion_tokens": {
             "type": "integer",

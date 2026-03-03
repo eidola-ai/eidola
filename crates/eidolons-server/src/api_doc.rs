@@ -25,7 +25,8 @@ use crate::types::{
     info(
         title = "Eidolons API",
         description = "Privacy-transparent AI proxy API with inline verification metadata",
-        version = "0.1.0"
+        version = "0.1.0",
+        license(identifier = "UNLICENSED"),
     ),
     paths(
         openapi_paths::health,
