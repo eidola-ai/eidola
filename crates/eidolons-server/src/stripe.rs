@@ -3,6 +3,8 @@
 //! Only the endpoints needed for account management are implemented.
 //! Uses form-encoded bodies (Stripe's native format) and Bearer auth.
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -50,6 +52,47 @@ struct StripeErrorResponse {
 #[derive(Debug, Deserialize)]
 struct StripeErrorBody {
     pub message: String,
+}
+
+/// Stripe product (expanded from a price).
+#[derive(Debug, Deserialize)]
+pub struct StripeProduct {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+}
+
+/// Stripe recurring billing info on a price.
+#[derive(Debug, Deserialize)]
+pub struct StripeRecurring {
+    pub interval: String,
+    pub interval_count: i64,
+}
+
+/// Stripe price with expanded product (returned by list).
+#[derive(Debug, Deserialize)]
+pub struct StripePrice {
+    pub id: String,
+    pub currency: String,
+    #[serde(default)]
+    pub unit_amount: Option<i64>,
+    #[serde(rename = "type")]
+    pub price_type: String,
+    #[serde(default)]
+    pub recurring: Option<StripeRecurring>,
+    pub product: StripeProduct,
+    #[serde(default)]
+    pub lookup_key: Option<String>,
+}
+
+/// Minimal price representation (just enough to determine checkout mode).
+#[derive(Debug, Deserialize)]
+pub struct StripePriceMinimal {
+    #[serde(default)]
+    pub recurring: Option<StripeRecurring>,
 }
 
 /// Parameters for creating a Stripe Checkout Session.
@@ -135,6 +178,61 @@ impl StripeClient {
             .map_err(|e| ServerError::Parse(format!("stripe subscriptions: {}", e)))?;
 
         Ok(list.data)
+    }
+
+    /// List active prices with expanded product info.
+    pub async fn list_prices(&self) -> Result<Vec<StripePrice>, ServerError> {
+        let response = self
+            .client
+            .get(format!("{}/prices", self.base_url))
+            .bearer_auth(&self.api_key)
+            .query(&[
+                ("active", "true"),
+                ("expand[]", "data.product"),
+                ("limit", "100"),
+            ])
+            .send()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(stripe_error(&body));
+        }
+
+        let list: ListResponse<StripePrice> = serde_json::from_slice(&body)
+            .map_err(|e| ServerError::Parse(format!("stripe prices: {}", e)))?;
+
+        Ok(list.data)
+    }
+
+    /// Fetch a single price to determine its type (recurring vs one-time).
+    pub async fn get_price(&self, price_id: &str) -> Result<StripePriceMinimal, ServerError> {
+        let response = self
+            .client
+            .get(format!("{}/prices/{}", self.base_url, price_id))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(stripe_error(&body));
+        }
+
+        serde_json::from_slice(&body)
+            .map_err(|e| ServerError::Parse(format!("stripe price: {}", e)))
     }
 
     /// Create a Stripe Checkout Session and return the checkout URL.

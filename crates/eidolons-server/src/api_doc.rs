@@ -4,8 +4,8 @@ use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::account::{
-    CheckoutUrlResponse, CreateAccountResponse, GetAccountResponse, PurchaseRequest,
-    SubscriptionResponse,
+    CheckoutRequest, CheckoutUrlResponse, CreateAccountResponse, GetAccountResponse,
+    ListPricesResponse, PriceResponse, RecurringResponse, SubscriptionResponse,
 };
 use crate::auth::AuthMethod;
 use crate::backend::TeeType;
@@ -28,15 +28,18 @@ use crate::types::{
         version = "0.1.0",
         license(identifier = "UNLICENSED"),
     ),
+    servers(
+        (url = "http://localhost:8080", description = "Local"),
+    ),
     paths(
         openapi_paths::health,
         openapi_paths::list_models,
         openapi_paths::chat_completions,
+        openapi_paths::list_prices,
         openapi_paths::create_account,
         openapi_paths::get_account,
         openapi_paths::get_subscription,
-        openapi_paths::create_subscription,
-        openapi_paths::create_purchase,
+        openapi_paths::create_checkout,
     ),
     components(schemas(
         // Request types
@@ -79,7 +82,11 @@ use crate::types::{
         GetAccountResponse,
         SubscriptionResponse,
         CheckoutUrlResponse,
-        PurchaseRequest,
+        CheckoutRequest,
+        // Pricing types
+        ListPricesResponse,
+        PriceResponse,
+        RecurringResponse,
         // Error types
         ErrorResponse,
         ErrorDetail,
@@ -114,8 +121,8 @@ impl Modify for BasicAuthAddon {
 #[allow(dead_code)]
 mod openapi_paths {
     use crate::account::{
-        CheckoutUrlResponse, CreateAccountResponse, GetAccountResponse, PurchaseRequest,
-        SubscriptionResponse,
+        CheckoutRequest, CheckoutUrlResponse, CreateAccountResponse, GetAccountResponse,
+        ListPricesResponse, SubscriptionResponse,
     };
     use crate::response::EidolonsResponse;
     use crate::types::{ChatCompletionRequest, ErrorResponse, ModelsResponse};
@@ -203,38 +210,37 @@ mod openapi_paths {
     )]
     pub fn get_subscription() {}
 
-    /// Create a subscription checkout session.
+    /// List available prices.
     ///
-    /// Returns a Stripe Checkout URL. Fails with 409 if the account already
-    /// has an active subscription. Requires HTTP Basic auth.
+    /// Returns all active prices from Stripe with product details.
     #[utoipa::path(
-        post,
-        path = "/v1/account/subscription",
-        security(("basic" = [])),
+        get,
+        path = "/v1/prices",
         responses(
-            (status = 200, description = "Checkout session created", body = CheckoutUrlResponse),
-            (status = 401, description = "Invalid credentials", body = ErrorResponse),
-            (status = 409, description = "Already subscribed", body = ErrorResponse),
+            (status = 200, description = "List of available prices", body = ListPricesResponse),
             (status = 503, description = "Stripe not configured", body = ErrorResponse)
         )
     )]
-    pub fn create_subscription() {}
+    pub fn list_prices() {}
 
-    /// Create a one-time purchase checkout session.
+    /// Create a checkout session.
     ///
-    /// Returns a Stripe Checkout URL for a one-time payment.
-    /// Requires HTTP Basic auth.
+    /// Accepts any active Stripe price ID. Automatically determines whether to
+    /// create a subscription or one-time payment checkout based on the price type.
+    /// For subscription prices, fails with 409 if the account already has an
+    /// active subscription. Requires HTTP Basic auth.
     #[utoipa::path(
         post,
-        path = "/v1/account/purchase",
-        request_body = PurchaseRequest,
+        path = "/v1/account/checkout",
+        request_body = CheckoutRequest,
         security(("basic" = [])),
         responses(
             (status = 200, description = "Checkout session created", body = CheckoutUrlResponse),
             (status = 400, description = "Invalid request", body = ErrorResponse),
             (status = 401, description = "Invalid credentials", body = ErrorResponse),
+            (status = 409, description = "Already subscribed", body = ErrorResponse),
             (status = 503, description = "Stripe not configured", body = ErrorResponse)
         )
     )]
-    pub fn create_purchase() {}
+    pub fn create_checkout() {}
 }

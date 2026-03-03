@@ -120,12 +120,41 @@ pub struct CheckoutUrlResponse {
 }
 
 #[derive(Deserialize, ToSchema)]
-pub struct PurchaseRequest {
+pub struct CheckoutRequest {
     pub price_id: String,
     #[serde(default = "default_success_url")]
     pub success_url: String,
     #[serde(default = "default_cancel_url")]
     pub cancel_url: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PriceResponse {
+    pub id: String,
+    pub product_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_amount: Option<i64>,
+    pub currency: String,
+    #[serde(rename = "type")]
+    pub price_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurring: Option<RecurringResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookup_key: Option<String>,
+    pub credits: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct RecurringResponse {
+    pub interval: String,
+    pub interval_count: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ListPricesResponse {
+    pub data: Vec<PriceResponse>,
 }
 
 fn default_success_url() -> String {
@@ -360,67 +389,49 @@ pub async fn handle_get_subscription(
     json_response(StatusCode::OK, &serde_json::to_string(&resp).unwrap())
 }
 
-/// POST /v1/account/subscription — create a subscription checkout (authenticated).
-pub async fn handle_create_subscription(
-    pool: &Pool,
-    stripe: &Option<StripeClient>,
-    account_id: Uuid,
-    subscription_price_id: &Option<String>,
-) -> Response<BoxBody> {
+/// GET /v1/prices — list available prices.
+pub async fn handle_list_prices(stripe: &Option<StripeClient>) -> Response<BoxBody> {
     let stripe = match require_stripe(stripe) {
         Ok(s) => s,
         Err(e) => return error_response(&e),
     };
 
-    let price_id = match subscription_price_id {
-        Some(id) => id,
-        None => {
-            return error_response(&ServerError::ServiceUnavailable(
-                "subscription price not configured".to_string(),
-            ));
-        }
-    };
-
-    // Ensure Stripe customer exists.
-    let customer_id = match ensure_stripe_customer(pool, stripe, account_id).await {
-        Ok(id) => id,
+    let prices = match stripe.list_prices().await {
+        Ok(p) => p,
         Err(e) => return error_response(&e),
     };
 
-    // Check for existing active/past_due subscriptions.
-    match stripe.list_subscriptions(&customer_id).await {
-        Ok(subs) => {
-            if subs
-                .iter()
-                .any(|s| s.status == "active" || s.status == "past_due" || s.status == "trialing")
-            {
-                return error_response(&ServerError::Conflict {
-                    message: "account already has an active subscription".to_string(),
-                });
-            }
-        }
-        Err(e) => return error_response(&e),
-    }
+    let data = prices
+        .into_iter()
+        .filter_map(|p| {
+            let credits: i64 = p.product.metadata.get("credits")?.parse().ok()?;
+            Some(PriceResponse {
+                id: p.id,
+                product_name: p.product.name,
+                product_description: p.product.description,
+                unit_amount: p.unit_amount,
+                currency: p.currency,
+                price_type: p.price_type,
+                recurring: p.recurring.map(|r| RecurringResponse {
+                    interval: r.interval,
+                    interval_count: r.interval_count,
+                }),
+                lookup_key: p.lookup_key,
+                credits,
+            })
+        })
+        .collect();
 
-    let params = CheckoutParams {
-        customer_id: &customer_id,
-        price_id,
-        mode: "subscription",
-        success_url: "https://eidolons.ai/payment/success",
-        cancel_url: "https://eidolons.ai/payment/cancel",
-    };
-
-    let checkout_url = match stripe.create_checkout_session(&params).await {
-        Ok(url) => url,
-        Err(e) => return error_response(&e),
-    };
-
-    let resp = CheckoutUrlResponse { checkout_url };
+    let resp = ListPricesResponse { data };
     json_response(StatusCode::OK, &serde_json::to_string(&resp).unwrap())
 }
 
-/// POST /v1/account/purchase — create a one-time purchase checkout (authenticated).
-pub async fn handle_create_purchase(
+/// POST /v1/account/checkout — create a checkout session (authenticated).
+///
+/// Accepts any active Stripe price ID. Automatically determines whether to
+/// create a subscription or one-time payment checkout based on the price type.
+/// For subscription prices, enforces the one-active-subscription constraint.
+pub async fn handle_create_checkout(
     req: Request<Incoming>,
     pool: &Pool,
     stripe: &Option<StripeClient>,
@@ -441,7 +452,7 @@ pub async fn handle_create_purchase(
         }
     };
 
-    let purchase_req: PurchaseRequest = match serde_json::from_slice(&body_bytes) {
+    let checkout_req: CheckoutRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
         Err(e) => {
             return error_response(&ServerError::BadRequest {
@@ -450,18 +461,59 @@ pub async fn handle_create_purchase(
         }
     };
 
+    if checkout_req.price_id.is_empty() {
+        return error_response(&ServerError::BadRequest {
+            message: "price_id must not be empty".to_string(),
+        });
+    }
+    if checkout_req.success_url.is_empty() {
+        return error_response(&ServerError::BadRequest {
+            message: "success_url must not be empty".to_string(),
+        });
+    }
+    if checkout_req.cancel_url.is_empty() {
+        return error_response(&ServerError::BadRequest {
+            message: "cancel_url must not be empty".to_string(),
+        });
+    }
+
     // Ensure Stripe customer exists.
     let customer_id = match ensure_stripe_customer(pool, stripe, account_id).await {
         Ok(id) => id,
         Err(e) => return error_response(&e),
     };
 
+    // Fetch the price to determine if it's recurring (subscription) or one-time.
+    let price = match stripe.get_price(&checkout_req.price_id).await {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+
+    let mode = if price.recurring.is_some() {
+        // Enforce one active subscription per customer.
+        match stripe.list_subscriptions(&customer_id).await {
+            Ok(subs) => {
+                if subs.iter().any(|s| {
+                    s.status == "active" || s.status == "past_due" || s.status == "trialing"
+                }) {
+                    return error_response(&ServerError::Conflict {
+                        message: "account already has an active subscription".to_string(),
+                    });
+                }
+            }
+            Err(e) => return error_response(&e),
+        }
+        "subscription"
+    } else {
+        "payment"
+    };
+
     let params = CheckoutParams {
         customer_id: &customer_id,
-        price_id: &purchase_req.price_id,
-        mode: "payment",
-        success_url: &purchase_req.success_url,
-        cancel_url: &purchase_req.cancel_url,
+        price_id: &checkout_req.price_id,
+        mode,
+        success_url: &checkout_req.success_url,
+        cancel_url: &checkout_req.cancel_url,
     };
 
     let checkout_url = match stripe.create_checkout_session(&params).await {

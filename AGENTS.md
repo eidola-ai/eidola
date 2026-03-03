@@ -83,7 +83,6 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - `DATABASE_URL` (required) - PostgreSQL connection string
 - `BIND_ADDR` (default: `127.0.0.1:8080`) - Address to bind
 - `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
-- `STRIPE_SUBSCRIPTION_PRICE_ID` (optional) - Stripe Price ID for subscription product
 
 ## Crux Architecture
 

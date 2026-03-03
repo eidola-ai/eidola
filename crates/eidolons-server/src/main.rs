@@ -54,9 +54,6 @@ struct Config {
 
     /// Stripe secret API key (optional — endpoints return 503 without it).
     stripe_api_key: Option<String>,
-
-    /// Stripe Price ID for the subscription product (optional).
-    stripe_subscription_price_id: Option<String>,
 }
 
 impl Config {
@@ -77,8 +74,9 @@ impl Config {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
 
-        let stripe_api_key = std::env::var("STRIPE_API_KEY").ok();
-        let stripe_subscription_price_id = std::env::var("STRIPE_SUBSCRIPTION_PRICE_ID").ok();
+        let stripe_api_key = std::env::var("STRIPE_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         Ok(Config {
             bind_addr,
@@ -87,7 +85,6 @@ impl Config {
             auth_mode,
             database_url,
             stripe_api_key,
-            stripe_subscription_price_id,
         })
     }
 }
@@ -99,7 +96,6 @@ struct AppState {
     attestation: AttestationClient,
     db_pool: deadpool_postgres::Pool,
     stripe: Option<StripeClient>,
-    stripe_subscription_price_id: Option<String>,
 }
 
 #[tokio::main]
@@ -159,7 +155,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         attestation: AttestationClient::new(config.redpill_api_key, config.redpill_base_url),
         db_pool,
         stripe,
-        stripe_subscription_price_id: config.stripe_subscription_price_id,
     });
 
     // Bind TCP listener
@@ -215,6 +210,9 @@ async fn handle_request(
         // OpenAI-compatible chat completions endpoint
         (Method::POST, "/v1/chat/completions") => handle_chat_completions(req, state).await,
 
+        // Pricing
+        (Method::GET, "/v1/prices") => account::handle_list_prices(&state.stripe).await,
+
         // Account management
         (Method::POST, "/v1/account") => account::handle_create_account(&state.db_pool).await,
         (Method::GET, "/v1/account") => {
@@ -232,25 +230,16 @@ async fn handle_request(
                 Err(e) => error_response(&e),
             }
         }
-        (Method::POST, "/v1/account/subscription") => {
+        (Method::POST, "/v1/account/checkout") => {
             match account::authenticate_account(&req, &state.db_pool).await {
                 Ok(account_id) => {
-                    account::handle_create_subscription(
+                    account::handle_create_checkout(
+                        req,
                         &state.db_pool,
                         &state.stripe,
                         account_id,
-                        &state.stripe_subscription_price_id,
                     )
                     .await
-                }
-                Err(e) => error_response(&e),
-            }
-        }
-        (Method::POST, "/v1/account/purchase") => {
-            match account::authenticate_account(&req, &state.db_pool).await {
-                Ok(account_id) => {
-                    account::handle_create_purchase(req, &state.db_pool, &state.stripe, account_id)
-                        .await
                 }
                 Err(e) => error_response(&e),
             }

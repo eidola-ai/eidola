@@ -28,7 +28,6 @@ services:
       DATABASE_URL: postgres://eidolons@postgres/eidolons
       REDPILL_API_KEY: ${REDPILL_API_KEY}
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}
-      STRIPE_SUBSCRIPTION_PRICE_ID: ${STRIPE_SUBSCRIPTION_PRICE_ID:-}
       BIND_ADDR: 0.0.0.0:8080
     ports:
       - "8080:8080"

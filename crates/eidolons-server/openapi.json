@@ -12,6 +12,12 @@
     },
     "version": "0.1.0"
   },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "Local"
+    }
+  ],
   "paths": {
     "/health": {
       "get": {
@@ -104,19 +110,19 @@
         }
       }
     },
-    "/v1/account/purchase": {
+    "/v1/account/checkout": {
       "post": {
         "tags": [
           "openapi_paths"
         ],
-        "summary": "Create a one-time purchase checkout session.",
-        "description": "Returns a Stripe Checkout URL for a one-time payment.\nRequires HTTP Basic auth.",
-        "operationId": "create_purchase",
+        "summary": "Create a checkout session.",
+        "description": "Accepts any active Stripe price ID. Automatically determines whether to\ncreate a subscription or one-time payment checkout based on the price type.\nFor subscription prices, fails with 409 if the account already has an\nactive subscription. Requires HTTP Basic auth.",
+        "operationId": "create_checkout",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PurchaseRequest"
+                "$ref": "#/components/schemas/CheckoutRequest"
               }
             }
           },
@@ -145,6 +151,16 @@
           },
           "401": {
             "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already subscribed",
             "content": {
               "application/json": {
                 "schema": {
@@ -202,61 +218,6 @@
           },
           "404": {
             "description": "No Stripe customer or no subscription",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Stripe not configured",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "basic": []
-          }
-        ]
-      },
-      "post": {
-        "tags": [
-          "openapi_paths"
-        ],
-        "summary": "Create a subscription checkout session.",
-        "description": "Returns a Stripe Checkout URL. Fails with 409 if the account already\nhas an active subscription. Requires HTTP Basic auth.",
-        "operationId": "create_subscription",
-        "responses": {
-          "200": {
-            "description": "Checkout session created",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CheckoutUrlResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Invalid credentials",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Already subscribed",
             "content": {
               "application/json": {
                 "schema": {
@@ -365,6 +326,38 @@
           },
           "502": {
             "description": "Upstream provider error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/prices": {
+      "get": {
+        "tags": [
+          "openapi_paths"
+        ],
+        "summary": "List available prices.",
+        "description": "Returns all active prices from Stripe with product details.",
+        "operationId": "list_prices",
+        "responses": {
+          "200": {
+            "description": "List of available prices",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListPricesResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Stripe not configured",
             "content": {
               "application/json": {
                 "schema": {
@@ -610,6 +603,23 @@
                 "description": "Usage statistics for the request."
               }
             ]
+          }
+        }
+      },
+      "CheckoutRequest": {
+        "type": "object",
+        "required": [
+          "price_id"
+        ],
+        "properties": {
+          "cancel_url": {
+            "type": "string"
+          },
+          "price_id": {
+            "type": "string"
+          },
+          "success_url": {
+            "type": "string"
           }
         }
       },
@@ -974,6 +984,20 @@
         },
         "additionalProperties": false
       },
+      "ListPricesResponse": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PriceResponse"
+            }
+          }
+        }
+      },
       "Message": {
         "type": "object",
         "description": "A message in the conversation.",
@@ -1067,6 +1091,63 @@
           }
         }
       },
+      "PriceResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "product_name",
+          "currency",
+          "type",
+          "credits"
+        ],
+        "properties": {
+          "credits": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "lookup_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_name": {
+            "type": "string"
+          },
+          "recurring": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RecurringResponse"
+              }
+            ]
+          },
+          "type": {
+            "type": "string"
+          },
+          "unit_amount": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
       "PrivacyMetadata": {
         "type": "object",
         "description": "Privacy metadata describing how the request was authorized, what data is\nvisible to which parties, and transport security properties.",
@@ -1106,20 +1187,19 @@
           }
         }
       },
-      "PurchaseRequest": {
+      "RecurringResponse": {
         "type": "object",
         "required": [
-          "price_id"
+          "interval",
+          "interval_count"
         ],
         "properties": {
-          "cancel_url": {
+          "interval": {
             "type": "string"
           },
-          "price_id": {
-            "type": "string"
-          },
-          "success_url": {
-            "type": "string"
+          "interval_count": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
