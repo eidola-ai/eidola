@@ -6,9 +6,9 @@ default:
 
 # --- Development ---
 
-# Start postgres + server (full stack in containers)
+# Start postgres + server (full stack in containers, fast dev build)
 dev:
-    docker buildx bake
+    CARGO_PROFILE=docker-dev docker buildx bake
     docker compose up --no-build
 
 # Start just postgres (for running the server on the host with cargo)

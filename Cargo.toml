@@ -13,6 +13,10 @@ authors = ["Mike Marcacci"]
 repository = "https://github.com/eidolons-ai/eidolons"
 publish = false
 
+[profile.docker-dev]
+inherits = "dev"
+opt-level = 1
+
 [profile.release]
 # Incremental compilation is disabled to avoid non-determinism.
 incremental = false

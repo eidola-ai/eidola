@@ -11,12 +11,18 @@ variable "TAGS" {
   default = "dev"
 }
 
+# Cargo profile: "release" for reproducible builds, "docker-dev" for fast iteration
+variable "CARGO_PROFILE" {
+  default = "release"
+}
+
 # ── Base target: shared settings applied to all images ─────────────────────────
 
 target "_common" {
   platforms = ["linux/amd64"]
   args = {
     SOURCE_DATE_EPOCH = "${SOURCE_DATE_EPOCH}"
+    CARGO_PROFILE     = "${CARGO_PROFILE}"
   }
   # Disable provenance attestations (non-deterministic metadata)
   attest = []

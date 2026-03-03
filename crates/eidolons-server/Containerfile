@@ -4,6 +4,8 @@
 # Environment variables, pinned toolchain digest.
 FROM stagex/pallet-rust@sha256:4062550919db682ebaeea07661551b5b89b3921e3f3a2b0bc665ddea7f6af1ca AS base
 
+ARG CARGO_PROFILE=release
+
 ENV TARGET=x86_64-unknown-linux-musl
 ENV RUSTFLAGS="-C target-feature=+crt-static"
 
@@ -28,12 +30,14 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # are only available during RUN, not COPY.
 FROM fetch AS build
 
+ARG CARGO_PROFILE=release
+
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/src/target \
     --network=none \
-    cargo build --frozen --release --target ${TARGET} -p eidolons-server \
-    && install -D target/${TARGET}/release/eidolons-server /out/eidolons-server
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidolons-server \
+    && install -D target/${TARGET}/${CARGO_PROFILE}/eidolons-server /out/eidolons-server
 
 # ── install ────────────────────────────────────────────────────────────────────
 # Place binary into /rootfs.
