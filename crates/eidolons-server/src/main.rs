@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
+use eidolons_server::account;
 use eidolons_server::attestation::AttestationClient;
 use eidolons_server::auth::{self, AnyValidator, NoopValidator};
 use eidolons_server::backend::{BackendStreamEvent, ChatBackend, RedPillBackend};
@@ -31,6 +32,7 @@ use eidolons_server::response::{
     EidolonsResponse, EidolonsStreamMetadata, SSE_DONE, build_privacy_metadata,
     build_verification_metadata, sse_data,
 };
+use eidolons_server::stripe::StripeClient;
 use eidolons_server::types::{ChatCompletionRequest, ErrorResponse};
 
 /// Server configuration.
@@ -46,6 +48,15 @@ struct Config {
 
     /// Authorization mode: "privacy_pass", "none" (default: "none" for development).
     auth_mode: String,
+
+    /// PostgreSQL connection string.
+    database_url: String,
+
+    /// Stripe secret API key (optional — endpoints return 503 without it).
+    stripe_api_key: Option<String>,
+
+    /// Stripe Price ID for the subscription product (optional).
+    stripe_subscription_price_id: Option<String>,
 }
 
 impl Config {
@@ -63,11 +74,20 @@ impl Config {
 
         let auth_mode = std::env::var("AUTH_MODE").unwrap_or_else(|_| "none".to_string());
 
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| "DATABASE_URL environment variable is required")?;
+
+        let stripe_api_key = std::env::var("STRIPE_API_KEY").ok();
+        let stripe_subscription_price_id = std::env::var("STRIPE_SUBSCRIPTION_PRICE_ID").ok();
+
         Ok(Config {
             bind_addr,
             redpill_api_key,
             redpill_base_url,
             auth_mode,
+            database_url,
+            stripe_api_key,
+            stripe_subscription_price_id,
         })
     }
 }
@@ -77,6 +97,9 @@ struct AppState {
     backend: RedPillBackend,
     validator: AnyValidator,
     attestation: AttestationClient,
+    db_pool: deadpool_postgres::Pool,
+    stripe: Option<StripeClient>,
+    stripe_subscription_price_id: Option<String>,
 }
 
 #[tokio::main]
@@ -114,6 +137,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
+    // Create database connection pool
+    let db_pool = eidolons_server::db::create_pool(&config.database_url).map_err(|e| {
+        error!("Database pool error: {}", e);
+        e
+    })?;
+
+    // Create Stripe client (optional)
+    let stripe = config.stripe_api_key.map(StripeClient::new);
+    if stripe.is_none() {
+        warn!("STRIPE_API_KEY not set — account billing endpoints will return 503");
+    }
+
     // Create shared state
     let state = Arc::new(AppState {
         backend: RedPillBackend::new(
@@ -122,6 +157,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ),
         validator,
         attestation: AttestationClient::new(config.redpill_api_key, config.redpill_base_url),
+        db_pool,
+        stripe,
+        stripe_subscription_price_id: config.stripe_subscription_price_id,
     });
 
     // Bind TCP listener
@@ -176,6 +214,47 @@ async fn handle_request(
 
         // OpenAI-compatible chat completions endpoint
         (Method::POST, "/v1/chat/completions") => handle_chat_completions(req, state).await,
+
+        // Account management
+        (Method::POST, "/v1/account") => account::handle_create_account(&state.db_pool).await,
+        (Method::GET, "/v1/account") => {
+            match account::authenticate_account(&req, &state.db_pool).await {
+                Ok(account_id) => account::handle_get_account(&state.db_pool, account_id).await,
+                Err(e) => error_response(&e),
+            }
+        }
+        (Method::GET, "/v1/account/subscription") => {
+            match account::authenticate_account(&req, &state.db_pool).await {
+                Ok(account_id) => {
+                    account::handle_get_subscription(&state.db_pool, &state.stripe, account_id)
+                        .await
+                }
+                Err(e) => error_response(&e),
+            }
+        }
+        (Method::POST, "/v1/account/subscription") => {
+            match account::authenticate_account(&req, &state.db_pool).await {
+                Ok(account_id) => {
+                    account::handle_create_subscription(
+                        &state.db_pool,
+                        &state.stripe,
+                        account_id,
+                        &state.stripe_subscription_price_id,
+                    )
+                    .await
+                }
+                Err(e) => error_response(&e),
+            }
+        }
+        (Method::POST, "/v1/account/purchase") => {
+            match account::authenticate_account(&req, &state.db_pool).await {
+                Ok(account_id) => {
+                    account::handle_create_purchase(req, &state.db_pool, &state.stripe, account_id)
+                        .await
+                }
+                Err(e) => error_response(&e),
+            }
+        }
 
         // 404 for everything else
         _ => {

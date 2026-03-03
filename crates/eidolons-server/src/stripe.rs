@@ -1,0 +1,220 @@
+//! Thin Stripe API client.
+//!
+//! Only the endpoints needed for account management are implemented.
+//! Uses form-encoded bodies (Stripe's native format) and Bearer auth.
+
+use serde::Deserialize;
+use uuid::Uuid;
+
+use crate::error::ServerError;
+
+/// Minimal Stripe subscription representation.
+#[derive(Debug, Deserialize)]
+pub struct Subscription {
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub current_period_end: Option<i64>,
+}
+
+/// Stripe list response wrapper.
+#[derive(Debug, Deserialize)]
+struct ListResponse<T> {
+    pub data: Vec<T>,
+}
+
+/// Stripe checkout session (only the URL field we need).
+#[derive(Debug, Deserialize)]
+struct CheckoutSession {
+    pub url: Option<String>,
+}
+
+/// Stripe customer (only the ID field we need).
+#[derive(Debug, Deserialize)]
+struct Customer {
+    pub id: String,
+}
+
+/// Stripe billing portal session.
+#[derive(Debug, Deserialize)]
+struct PortalSession {
+    pub url: String,
+}
+
+/// Stripe API error response.
+#[derive(Debug, Deserialize)]
+struct StripeErrorResponse {
+    pub error: StripeErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeErrorBody {
+    pub message: String,
+}
+
+/// Parameters for creating a Stripe Checkout Session.
+pub struct CheckoutParams<'a> {
+    pub customer_id: &'a str,
+    pub price_id: &'a str,
+    pub mode: &'a str,
+    pub success_url: &'a str,
+    pub cancel_url: &'a str,
+}
+
+pub struct StripeClient {
+    client: reqwest::Client,
+    api_key: String,
+    base_url: String,
+}
+
+impl StripeClient {
+    pub fn new(api_key: String) -> Self {
+        let client = reqwest::Client::builder()
+            .build()
+            .expect("failed to build HTTP client");
+
+        Self {
+            client,
+            api_key,
+            base_url: "https://api.stripe.com/v1".to_string(),
+        }
+    }
+
+    /// Create a Stripe customer linked to an account.
+    pub async fn create_customer(&self, account_id: Uuid) -> Result<String, ServerError> {
+        let response = self
+            .client
+            .post(format!("{}/customers", self.base_url))
+            .bearer_auth(&self.api_key)
+            .form(&[("metadata[account_id]", account_id.to_string())])
+            .send()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(stripe_error(&body));
+        }
+
+        let customer: Customer = serde_json::from_slice(&body)
+            .map_err(|e| ServerError::Parse(format!("stripe customer: {}", e)))?;
+
+        Ok(customer.id)
+    }
+
+    /// List subscriptions for a Stripe customer.
+    pub async fn list_subscriptions(
+        &self,
+        customer_id: &str,
+    ) -> Result<Vec<Subscription>, ServerError> {
+        let response = self
+            .client
+            .get(format!("{}/subscriptions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .query(&[("customer", customer_id), ("limit", "10")])
+            .send()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(stripe_error(&body));
+        }
+
+        let list: ListResponse<Subscription> = serde_json::from_slice(&body)
+            .map_err(|e| ServerError::Parse(format!("stripe subscriptions: {}", e)))?;
+
+        Ok(list.data)
+    }
+
+    /// Create a Stripe Checkout Session and return the checkout URL.
+    pub async fn create_checkout_session(
+        &self,
+        params: &CheckoutParams<'_>,
+    ) -> Result<String, ServerError> {
+        let form: Vec<(&str, &str)> = vec![
+            ("customer", params.customer_id),
+            ("mode", params.mode),
+            ("line_items[0][price]", params.price_id),
+            ("line_items[0][quantity]", "1"),
+            ("success_url", params.success_url),
+            ("cancel_url", params.cancel_url),
+        ];
+
+        let response = self
+            .client
+            .post(format!("{}/checkout/sessions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(stripe_error(&body));
+        }
+
+        let session: CheckoutSession = serde_json::from_slice(&body)
+            .map_err(|e| ServerError::Parse(format!("stripe checkout: {}", e)))?;
+
+        session
+            .url
+            .ok_or_else(|| ServerError::Parse("stripe checkout session missing url".to_string()))
+    }
+
+    /// Create a Stripe billing portal session and return the portal URL.
+    pub async fn create_portal_session(
+        &self,
+        customer_id: &str,
+        return_url: &str,
+    ) -> Result<String, ServerError> {
+        let response = self
+            .client
+            .post(format!("{}/billing_portal/sessions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .form(&[("customer", customer_id), ("return_url", return_url)])
+            .send()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(stripe_error(&body));
+        }
+
+        let session: PortalSession = serde_json::from_slice(&body)
+            .map_err(|e| ServerError::Parse(format!("stripe portal: {}", e)))?;
+
+        Ok(session.url)
+    }
+}
+
+/// Parse a Stripe error response body into a ServerError.
+fn stripe_error(body: &[u8]) -> ServerError {
+    if let Ok(err) = serde_json::from_slice::<StripeErrorResponse>(body) {
+        ServerError::Network(format!("stripe error: {}", err.error.message))
+    } else {
+        ServerError::Network(format!("stripe error: {}", String::from_utf8_lossy(body)))
+    }
+}

@@ -9,11 +9,18 @@ eidolons/
 ├── crates/           # Rust crates
 │   ├── eidolons-server/  # OpenAI-compatible AI proxy server
 │   │   ├── src/
-│   │   │   ├── main.rs       # HTTP server (hyper + tokio)
-│   │   │   ├── openai.rs     # OpenAI API types
-│   │   │   ├── anthropic.rs  # Anthropic API types
-│   │   │   ├── transform.rs  # Format conversion
-│   │   │   └── proxy.rs      # Upstream HTTP client
+│   │   │   ├── main.rs       # HTTP server (hyper + tokio), routing, Config, AppState
+│   │   │   ├── lib.rs        # Module declarations
+│   │   │   ├── account.rs    # Account handlers, Basic auth (Argon2id)
+│   │   │   ├── db.rs         # Database pool (deadpool-postgres) and query helpers
+│   │   │   ├── stripe.rs     # Thin Stripe API client (checkout, subscriptions, portal)
+│   │   │   ├── auth.rs       # Token auth (AnyValidator dispatch for chat completions)
+│   │   │   ├── backend.rs    # ChatBackend trait and RedPill.ai implementation
+│   │   │   ├── types.rs      # OpenAI API request/response types
+│   │   │   ├── response.rs   # Eidolons response types with privacy metadata
+│   │   │   ├── attestation.rs # RedPill TEE attestation signature fetching
+│   │   │   ├── error.rs      # ServerError enum and HTTP status mapping
+│   │   │   └── api_doc.rs    # OpenAPI spec generation (utoipa)
 │   │   ├── schema.sql        # PostgreSQL schema (billing, ACT keys, nullifiers)
 │   │   └── Containerfile     # StageX-based OCI build
 │   ├── eidolons-hello/   # Hello capability (example)
@@ -66,15 +73,17 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - Statically linked musl binaries for Linux deployment
 - StageX-based OCI images (reproducible, `FROM scratch`, runs as non-root)
 - Request-based (no sessions/caching in the proxy layer)
+- Account auth (Basic + Argon2id) is separate from chat completions auth (AnyValidator/ACT)
+- Stripe integration via thin `reqwest` wrapper (no `async-stripe` dependency)
 
-**API endpoints:**
-- `GET /health` - Health check
-- `POST /v1/chat/completions` - OpenAI-compatible chat completions (proxied to RedPill)
+**API endpoints:** Defined in `crates/eidolons-server/openapi.json` (generated from utoipa annotations — see Conventions).
 
 **Environment variables:**
 - `REDPILL_API_KEY` (required) - RedPill API key
 - `DATABASE_URL` (required) - PostgreSQL connection string
 - `BIND_ADDR` (default: `127.0.0.1:8080`) - Address to bind
+- `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
+- `STRIPE_SUBSCRIPTION_PRICE_ID` (optional) - Stripe Price ID for subscription product
 
 ## Crux Architecture
 
@@ -193,5 +202,6 @@ Architecture decisions are recorded in [`docs/design/`](docs/design/). See the
 - Nix is used for CI quality gates and Swift/XCFramework builds, not daily Rust development
 - `rustup` + `rust-toolchain.toml` manages the Rust toolchain for development
 - OpenAI API format as the canonical interface
+- Server API is documented via utoipa `#[utoipa::path]` annotations in `api_doc.rs` and `ToSchema` derives on request/response types. When adding or changing server endpoints, update the annotations and run `just update-openapi` to regenerate the committed `openapi.json`
 - Deterministic builds (no timestamps, fixed codegen)
 - `artifact-manifest.json` records expected OCI digests; CI verifies builds match and suggests updates on PRs

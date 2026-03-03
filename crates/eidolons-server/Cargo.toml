@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # OpenAPI documentation
-utoipa = "5"
+utoipa = { version = "5", features = ["uuid"] }
 
 # Logging
 tracing = "0.1"
@@ -42,6 +42,19 @@ anonymous-credit-tokens = "0.4"
 
 # HTTP types (used by auth module)
 http = "1"
+
+# Database
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+deadpool-postgres = "0.14"
+
+# Authentication
+argon2 = "0.5"
+
+# Identifiers
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Encoding
+base64 = "0.22"
 
 # Utilities
 futures-util = "0.3"

@@ -26,6 +26,15 @@ pub enum ServerError {
     /// Failed to parse upstream response.
     Parse(String),
 
+    /// Resource not found (404).
+    NotFound { message: String },
+
+    /// Conflict with existing resource (409).
+    Conflict { message: String },
+
+    /// Service unavailable (503).
+    ServiceUnavailable(String),
+
     /// Internal server error (500).
     Internal(String),
 }
@@ -39,7 +48,10 @@ impl ServerError {
             ServerError::Backend { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
+            ServerError::NotFound { .. } => StatusCode::NOT_FOUND,
+            ServerError::Conflict { .. } => StatusCode::CONFLICT,
             ServerError::Network(_) | ServerError::Parse(_) => StatusCode::BAD_GATEWAY,
+            ServerError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ServerError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -58,8 +70,11 @@ impl ServerError {
                 message,
                 ..
             } => ErrorResponse::new(message, error_type),
+            ServerError::NotFound { message } => ErrorResponse::new(message, "not_found"),
+            ServerError::Conflict { message } => ErrorResponse::new(message, "conflict"),
             ServerError::Network(msg) => ErrorResponse::new(msg, "upstream_error"),
             ServerError::Parse(msg) => ErrorResponse::new(msg, "upstream_error"),
+            ServerError::ServiceUnavailable(msg) => ErrorResponse::new(msg, "service_unavailable"),
             ServerError::Internal(msg) => ErrorResponse::new(msg, "internal_error"),
         }
     }
@@ -75,8 +90,11 @@ impl std::fmt::Display for ServerError {
                 error_type,
                 message,
             } => write!(f, "backend error ({}): {}: {}", status, error_type, message),
+            ServerError::NotFound { message } => write!(f, "not found: {}", message),
+            ServerError::Conflict { message } => write!(f, "conflict: {}", message),
             ServerError::Network(msg) => write!(f, "network error: {}", msg),
             ServerError::Parse(msg) => write!(f, "parse error: {}", msg),
+            ServerError::ServiceUnavailable(msg) => write!(f, "service unavailable: {}", msg),
             ServerError::Internal(msg) => write!(f, "internal error: {}", msg),
         }
     }
