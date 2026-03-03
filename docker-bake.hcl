@@ -31,6 +31,8 @@ target "_common" {
 target "server" {
   inherits = ["_common"]
   tags     = ["eidolons-server:dev"]
+  cache-from = ["type=local,src=.buildx-cache/server"]
+  cache-to   = ["type=local,dest=.buildx-cache/server,mode=max"]
 }
 
 target "postgres" {
