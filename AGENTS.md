@@ -20,6 +20,7 @@ eidolons/
 │   │   │   ├── response.rs   # Eidolons response types with privacy metadata
 │   │   │   ├── attestation.rs # RedPill TEE attestation signature fetching
 │   │   │   ├── webhook.rs    # Stripe webhook signature verification and event dispatch
+│   │   │   ├── tokens.rs     # ACT issuance: key mgmt, encryption, GET /v1/keys, POST /v1/account/tokens
 │   │   │   ├── error.rs      # ServerError enum and HTTP status mapping
 │   │   │   └── api_doc.rs    # OpenAPI spec generation (utoipa)
 │   │   ├── schema.sql        # PostgreSQL schema (billing, ACT keys, nullifiers)
@@ -85,6 +86,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - `BIND_ADDR` (default: `127.0.0.1:8080`) - Address to bind
 - `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
 - `STRIPE_WEBHOOK_SECRET` (optional) - Stripe webhook signing secret; webhook endpoint returns 503 without it
+- `ACT_MASTER_KEY` (optional) - Hex-encoded 32-byte AES-256 master key for issuer key encryption; token issuance endpoints return 503 without it
 
 ## Crux Architecture
 

@@ -167,7 +167,7 @@ nix flake check   # Runs: cargo fmt, clippy, tests, openapi/binding freshness, S
 
 ## Server
 
-The server exposes an OpenAI-compatible `/v1/chat/completions` endpoint that proxies requests through RedPill.ai, enriching responses with privacy-transparent attestation metadata. It also provides account management with Argon2id credential auth, Stripe Checkout integration for subscriptions and one-time purchases, Stripe webhook handling for billing lifecycle events, and credit balance/ledger endpoints.
+The server exposes an OpenAI-compatible `/v1/chat/completions` endpoint that proxies requests through RedPill.ai, enriching responses with privacy-transparent attestation metadata. It also provides account management with Argon2id credential auth, Stripe Checkout integration for subscriptions and one-time purchases, Stripe webhook handling for billing lifecycle events, credit balance/ledger endpoints, and Anonymous Credit Token (ACT) issuance for privacy-preserving usage.
 
 The full API is documented in [`crates/eidolons-server/openapi.json`](crates/eidolons-server/openapi.json), which is also served at `GET /openapi.json` at runtime.
 

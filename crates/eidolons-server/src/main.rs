@@ -58,6 +58,10 @@ struct Config {
 
     /// Stripe webhook signing secret (optional — webhook endpoint returns 503 without it).
     stripe_webhook_secret: Option<String>,
+
+    /// AES-256 master key for issuer key encryption (hex-encoded, 32 bytes).
+    /// Optional — token issuance endpoints return 503 without it.
+    act_master_key: Option<[u8; 32]>,
 }
 
 impl Config {
@@ -86,6 +90,23 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
+        let act_master_key = std::env::var("ACT_MASTER_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let bytes =
+                    hex::decode(&s).map_err(|_| "ACT_MASTER_KEY must be valid hex".to_string())?;
+                if bytes.len() != 32 {
+                    return Err(
+                        "ACT_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string()
+                    );
+                }
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                Ok(key)
+            })
+            .transpose()?;
+
         Ok(Config {
             bind_addr,
             redpill_api_key,
@@ -94,6 +115,7 @@ impl Config {
             database_url,
             stripe_api_key,
             stripe_webhook_secret,
+            act_master_key,
         })
     }
 }
@@ -106,6 +128,8 @@ struct AppState {
     db_pool: deadpool_postgres::Pool,
     stripe: Option<StripeClient>,
     stripe_webhook_secret: Option<String>,
+    act_master_key: Option<[u8; 32]>,
+    act_key_cache: eidolons_server::tokens::KeyCache,
 }
 
 #[tokio::main]
@@ -158,6 +182,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         warn!("STRIPE_WEBHOOK_SECRET not set — webhook endpoint will return 503");
     }
 
+    // ACT key cache
+    let act_key_cache: eidolons_server::tokens::KeyCache = Default::default();
+    if config.act_master_key.is_none() {
+        warn!("ACT_MASTER_KEY not set — token issuance endpoints will return 503");
+    }
+
     // Create shared state
     let state = Arc::new(AppState {
         backend: RedPillBackend::new(
@@ -169,7 +199,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         db_pool,
         stripe,
         stripe_webhook_secret: config.stripe_webhook_secret,
+        act_master_key: config.act_master_key,
+        act_key_cache,
     });
+
+    // Pre-warm the current epoch's issuer key if master key is configured.
+    if let Some(ref mk) = state.act_master_key {
+        match eidolons_server::tokens::ensure_current_epoch_key(
+            &state.act_key_cache,
+            mk,
+            &state.db_pool,
+        )
+        .await
+        {
+            Ok(epoch) => info!("Issuer key ready for epoch {}", epoch),
+            Err(e) => warn!("Failed to pre-warm issuer key: {}", e),
+        }
+    }
 
     // Bind TCP listener
     let listener = TcpListener::bind(config.bind_addr).await?;
@@ -267,6 +313,29 @@ async fn handle_request(
                 Err(e) => error_response(&e),
             }
         }
+
+        // Token issuance
+        (Method::GET, "/v1/keys") => {
+            eidolons_server::tokens::handle_list_keys(&state.db_pool).await
+        }
+        (Method::POST, "/v1/account/tokens") => match &state.act_master_key {
+            Some(mk) => match account::authenticate_account(&req, &state.db_pool).await {
+                Ok(account_id) => {
+                    eidolons_server::tokens::handle_issue_tokens(
+                        req,
+                        &state.db_pool,
+                        &state.act_key_cache,
+                        mk,
+                        account_id,
+                    )
+                    .await
+                }
+                Err(e) => error_response(&e),
+            },
+            None => error_response(&ServerError::ServiceUnavailable(
+                "token issuance is not configured".to_string(),
+            )),
+        },
 
         // Stripe webhook
         (Method::POST, "/v1/webhooks/stripe") => match &state.stripe_webhook_secret {

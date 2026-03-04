@@ -29,6 +29,9 @@ pub enum ServerError {
     /// Resource not found (404).
     NotFound { message: String },
 
+    /// Insufficient credit balance (402).
+    PaymentRequired { message: String, available: i64 },
+
     /// Conflict with existing resource (409).
     Conflict { message: String },
 
@@ -48,6 +51,7 @@ impl ServerError {
             ServerError::Backend { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
+            ServerError::PaymentRequired { .. } => StatusCode::PAYMENT_REQUIRED,
             ServerError::NotFound { .. } => StatusCode::NOT_FOUND,
             ServerError::Conflict { .. } => StatusCode::CONFLICT,
             ServerError::Network(_) | ServerError::Parse(_) => StatusCode::BAD_GATEWAY,
@@ -64,6 +68,9 @@ impl ServerError {
             }
             ServerError::Unauthorized { message } => {
                 ErrorResponse::new(message, "authentication_error")
+            }
+            ServerError::PaymentRequired { message, .. } => {
+                ErrorResponse::new(message, "insufficient_balance")
             }
             ServerError::Backend {
                 error_type,
@@ -90,6 +97,13 @@ impl std::fmt::Display for ServerError {
                 error_type,
                 message,
             } => write!(f, "backend error ({}): {}: {}", status, error_type, message),
+            ServerError::PaymentRequired { message, available } => {
+                write!(
+                    f,
+                    "payment required: {} (available: {})",
+                    message, available
+                )
+            }
             ServerError::NotFound { message } => write!(f, "not found: {}", message),
             ServerError::Conflict { message } => write!(f, "conflict: {}", message),
             ServerError::Network(msg) => write!(f, "network error: {}", msg),

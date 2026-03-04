@@ -14,6 +14,7 @@ use crate::response::{
     AttestationStatus, AuthorizationInfo, BackendAttestation, DataExposure, EidolonsResponse,
     EidolonsStreamMetadata, PrivacyMetadata, ProxyAttestation, TransportInfo, VerificationMetadata,
 };
+use crate::tokens::{IssueTokensRequest, IssueTokensResponse, IssuerKeyResponse, ListKeysResponse};
 use crate::types::{
     AssistantMessage, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice,
     ChunkChoice, ChunkDelta, ContentPart, ErrorDetail, ErrorResponse, FinishReason, ImageUrl,
@@ -44,6 +45,8 @@ use crate::types::{
         openapi_paths::get_balances,
         openapi_paths::get_ledger,
         openapi_paths::stripe_webhook,
+        openapi_paths::list_keys,
+        openapi_paths::issue_tokens,
     ),
     components(schemas(
         // Request types
@@ -96,6 +99,11 @@ use crate::types::{
         BalancePool,
         LedgerResponse,
         LedgerEntry,
+        // Token issuance types
+        ListKeysResponse,
+        IssuerKeyResponse,
+        IssueTokensRequest,
+        IssueTokensResponse,
         // Error types
         ErrorResponse,
         ErrorDetail,
@@ -134,6 +142,7 @@ mod openapi_paths {
         GetAccountResponse, LedgerResponse, ListPricesResponse, SubscriptionResponse,
     };
     use crate::response::EidolonsResponse;
+    use crate::tokens::{IssueTokensRequest, IssueTokensResponse, ListKeysResponse};
     use crate::types::{ChatCompletionRequest, ErrorResponse, ModelsResponse};
 
     /// Health check endpoint.
@@ -303,4 +312,37 @@ mod openapi_paths {
         )
     )]
     pub fn stripe_webhook() {}
+
+    /// List valid issuer public keys.
+    ///
+    /// Returns public keys for all epochs whose tokens are still accepted.
+    /// Clients use these to determine which key to request issuance under.
+    #[utoipa::path(
+        get,
+        path = "/v1/keys",
+        responses(
+            (status = 200, description = "Valid issuer public keys", body = ListKeysResponse),
+        )
+    )]
+    pub fn list_keys() {}
+
+    /// Issue anonymous credit tokens.
+    ///
+    /// Atomically debits the account's credit balance and issues a signed
+    /// anonymous credit token. The issuance request and response use CBOR
+    /// encoding (base64url-no-pad). Requires HTTP Basic auth.
+    #[utoipa::path(
+        post,
+        path = "/v1/account/tokens",
+        request_body = IssueTokensRequest,
+        security(("basic" = [])),
+        responses(
+            (status = 200, description = "Token issued", body = IssueTokensResponse),
+            (status = 400, description = "Invalid request", body = ErrorResponse),
+            (status = 401, description = "Invalid credentials", body = ErrorResponse),
+            (status = 402, description = "Insufficient credit balance", body = ErrorResponse),
+            (status = 503, description = "Token issuance not configured", body = ErrorResponse),
+        )
+    )]
+    pub fn issue_tokens() {}
 }

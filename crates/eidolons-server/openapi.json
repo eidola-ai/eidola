@@ -348,6 +348,83 @@
         ]
       }
     },
+    "/v1/account/tokens": {
+      "post": {
+        "tags": [
+          "openapi_paths"
+        ],
+        "summary": "Issue anonymous credit tokens.",
+        "description": "Atomically debits the account's credit balance and issues a signed\nanonymous credit token. The issuance request and response use CBOR\nencoding (base64url-no-pad). Requires HTTP Basic auth.",
+        "operationId": "issue_tokens",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueTokensRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Token issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueTokensResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient credit balance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Token issuance not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
     "/v1/chat/completions": {
       "post": {
         "tags": [
@@ -403,6 +480,28 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/keys": {
+      "get": {
+        "tags": [
+          "openapi_paths"
+        ],
+        "summary": "List valid issuer public keys.",
+        "description": "Returns public keys for all epochs whose tokens are still accepted.\nClients use these to determine which key to request issuance under.",
+        "operationId": "list_keys",
+        "responses": {
+          "200": {
+            "description": "Valid issuer public keys",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListKeysResponse"
                 }
               }
             }
@@ -1164,6 +1263,92 @@
         },
         "additionalProperties": false
       },
+      "IssueTokensRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/account/tokens`.",
+        "required": [
+          "issuance_request",
+          "credits"
+        ],
+        "properties": {
+          "credits": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of micro-dollar credits to load into the token. Must be > 0."
+          },
+          "issuance_request": {
+            "type": "string",
+            "description": "Base64-encoded CBOR `IssuanceRequest` from the client."
+          }
+        }
+      },
+      "IssueTokensResponse": {
+        "type": "object",
+        "description": "Response for `POST /v1/account/tokens`.",
+        "required": [
+          "issuance_response",
+          "epoch",
+          "credits",
+          "ledger_entry_id"
+        ],
+        "properties": {
+          "credits": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Credits loaded into the token."
+          },
+          "epoch": {
+            "type": "string",
+            "description": "The epoch of the issuer key used."
+          },
+          "issuance_response": {
+            "type": "string",
+            "description": "Base64-encoded CBOR `IssuanceResponse`."
+          },
+          "ledger_entry_id": {
+            "type": "string",
+            "description": "The ledger entry ID for this issuance."
+          }
+        }
+      },
+      "IssuerKeyResponse": {
+        "type": "object",
+        "description": "A single issuer public key in the `GET /v1/keys` response.",
+        "required": [
+          "epoch",
+          "public_key",
+          "domain_separator",
+          "valid_from",
+          "valid_until",
+          "accept_until"
+        ],
+        "properties": {
+          "accept_until": {
+            "type": "string",
+            "description": "End of the acceptance window (ISO 8601)."
+          },
+          "domain_separator": {
+            "type": "string",
+            "description": "Domain separator used for parameter generation."
+          },
+          "epoch": {
+            "type": "string",
+            "description": "Epoch identifier (YYYY-MM)."
+          },
+          "public_key": {
+            "type": "string",
+            "description": "Base64-encoded CBOR public key (compressed Ristretto255 point)."
+          },
+          "valid_from": {
+            "type": "string",
+            "description": "Start of the issuance window (ISO 8601)."
+          },
+          "valid_until": {
+            "type": "string",
+            "description": "End of the issuance window (ISO 8601)."
+          }
+        }
+      },
       "LedgerEntry": {
         "type": "object",
         "required": [
@@ -1229,6 +1414,21 @@
           },
           "has_more": {
             "type": "boolean"
+          }
+        }
+      },
+      "ListKeysResponse": {
+        "type": "object",
+        "description": "Response for `GET /v1/keys`.",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IssuerKeyResponse"
+            }
           }
         }
       },

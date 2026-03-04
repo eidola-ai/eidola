@@ -178,6 +178,159 @@ pub async fn insert_credit_ledger(
     Ok(result == 1)
 }
 
+// --- Issuer Key queries ---
+
+/// A row from the `issuer_key` table.
+pub struct IssuerKeyRow {
+    pub epoch: String,
+    pub private_key_enc: Vec<u8>,
+    pub public_key: Vec<u8>,
+    pub domain_separator: String,
+    pub valid_from: SystemTime,
+    pub valid_until: SystemTime,
+    pub accept_until: SystemTime,
+}
+
+/// Retrieve an issuer key by epoch.
+pub async fn get_issuer_key_by_epoch(
+    pool: &Pool,
+    epoch: &str,
+) -> Result<Option<IssuerKeyRow>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {}", e)))?;
+
+    let row = client
+        .query_opt(
+            "SELECT epoch, private_key_enc, public_key, domain_separator, \
+                    valid_from, valid_until, accept_until \
+             FROM issuer_key WHERE epoch = $1",
+            &[&epoch],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("query issuer_key failed: {}", e)))?;
+
+    Ok(row.map(|r| IssuerKeyRow {
+        epoch: r.get("epoch"),
+        private_key_enc: r.get("private_key_enc"),
+        public_key: r.get("public_key"),
+        domain_separator: r.get("domain_separator"),
+        valid_from: r.get("valid_from"),
+        valid_until: r.get("valid_until"),
+        accept_until: r.get("accept_until"),
+    }))
+}
+
+/// Insert a new issuer key. Returns true if inserted, false if the epoch
+/// already exists (race-safe via ON CONFLICT DO NOTHING).
+pub async fn insert_issuer_key(pool: &Pool, key: &IssuerKeyRow) -> Result<bool, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {}", e)))?;
+
+    let result = client
+        .execute(
+            "INSERT INTO issuer_key \
+                (epoch, private_key_enc, public_key, domain_separator, \
+                 valid_from, valid_until, accept_until) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (epoch) DO NOTHING",
+            &[
+                &key.epoch.as_str(),
+                &key.private_key_enc.as_slice(),
+                &key.public_key.as_slice(),
+                &key.domain_separator.as_str(),
+                &key.valid_from,
+                &key.valid_until,
+                &key.accept_until,
+            ],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("insert issuer_key failed: {}", e)))?;
+
+    Ok(result == 1)
+}
+
+/// Retrieve all issuer keys that are still valid for spending (accept_until > now()).
+pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {}", e)))?;
+
+    let rows = client
+        .query(
+            "SELECT epoch, private_key_enc, public_key, domain_separator, \
+                    valid_from, valid_until, accept_until \
+             FROM issuer_key WHERE accept_until > now() \
+             ORDER BY valid_from DESC",
+            &[],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("query valid issuer_keys failed: {}", e)))?;
+
+    Ok(rows
+        .iter()
+        .map(|r| IssuerKeyRow {
+            epoch: r.get("epoch"),
+            private_key_enc: r.get("private_key_enc"),
+            public_key: r.get("public_key"),
+            domain_separator: r.get("domain_separator"),
+            valid_from: r.get("valid_from"),
+            valid_until: r.get("valid_until"),
+            accept_until: r.get("accept_until"),
+        })
+        .collect())
+}
+
+/// Atomically debit credits from an account for ACT issuance.
+///
+/// Returns `Some(ledger_entry_id)` if the debit succeeded, `None` if
+/// the account has insufficient balance. The balance check and debit
+/// happen in a single SQL statement to prevent TOCTOU races.
+pub async fn insert_act_issuance(
+    pool: &Pool,
+    account_id: Uuid,
+    credits: i64,
+    token_epoch: &str,
+) -> Result<Option<Uuid>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {}", e)))?;
+
+    let row = client
+        .query_opt(
+            "INSERT INTO credit_ledger \
+                (id, account_id, delta, reason, token_epoch, token_credits, created_at) \
+             SELECT gen_random_uuid(), $1, -$2, 'act_issuance', $3, $2, now() \
+             WHERE available_balance($1) >= $2 \
+             RETURNING id",
+            &[&account_id, &credits, &token_epoch],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("act issuance debit failed: {}", e)))?;
+
+    Ok(row.map(|r| r.get::<_, Uuid>("id")))
+}
+
+/// Get the current available balance for an account.
+pub async fn get_available_balance(pool: &Pool, account_id: Uuid) -> Result<i64, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {}", e)))?;
+
+    let row = client
+        .query_one("SELECT available_balance($1) as balance", &[&account_id])
+        .await
+        .map_err(|e| ServerError::Internal(format!("balance query failed: {}", e)))?;
+
+    Ok(row.get("balance"))
+}
+
 /// A single balance pool row.
 pub struct BalancePoolRow {
     pub expires_at: Option<SystemTime>,
