@@ -166,9 +166,7 @@ pub async fn handle_stripe_webhook(
 
     // Dispatch by event type.
     let outcome = match event.event_type.as_str() {
-        "checkout.session.completed" => {
-            handle_checkout_completed(&event, pool, stripe).await
-        }
+        "checkout.session.completed" => handle_checkout_completed(&event, pool, stripe).await,
         "invoice.paid" => handle_invoice_paid(&event, pool, stripe).await,
         "customer.subscription.deleted" => {
             info!(
@@ -181,7 +179,10 @@ pub async fn handle_stripe_webhook(
         "charge.dispute.created" => handle_dispute_created(&event, pool).await,
         "charge.dispute.closed" => handle_dispute_closed(&event, pool).await,
         _ => {
-            info!("webhook: ignoring unhandled event type {}", event.event_type);
+            info!(
+                "webhook: ignoring unhandled event type {}",
+                event.event_type
+            );
             WebhookOutcome::Handled
         }
     };
@@ -240,7 +241,10 @@ async fn handle_checkout_completed(
             return WebhookOutcome::Handled;
         }
         Err(e) => {
-            error!("webhook: db error looking up customer {}: {}", customer_id, e);
+            error!(
+                "webhook: db error looking up customer {}: {}",
+                customer_id, e
+            );
             return WebhookOutcome::RetryableError;
         }
     };
@@ -257,7 +261,10 @@ async fn handle_checkout_completed(
     let line_items = match stripe.list_checkout_line_items(session_id).await {
         Ok(items) => items,
         Err(e) => {
-            error!("webhook: failed to fetch line items for {}: {}", session_id, e);
+            error!(
+                "webhook: failed to fetch line items for {}: {}",
+                session_id, e
+            );
             return WebhookOutcome::RetryableError;
         }
     };
@@ -265,10 +272,7 @@ async fn handle_checkout_completed(
     let product_id = match line_items.first().map(|item| item.price.product.as_str()) {
         Some(id) => id,
         None => {
-            error!(
-                "webhook: no line items for checkout session {}",
-                session_id
-            );
+            error!("webhook: no line items for checkout session {}", session_id);
             return WebhookOutcome::Handled;
         }
     };
@@ -284,7 +288,11 @@ async fn handle_checkout_completed(
         }
     };
 
-    let credits = match product.metadata.get("credits").and_then(|s| s.parse::<i64>().ok()) {
+    let credits = match product
+        .metadata
+        .get("credits")
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(c) => c,
         None => {
             error!(
@@ -298,8 +306,15 @@ async fn handle_checkout_completed(
     // Purchases expire after 1 year.
     let expires_at = SystemTime::now() + Duration::from_secs(365 * 24 * 3600);
 
-    match db::insert_credit_ledger(pool, account.id, credits, "purchase", &event.id, Some(expires_at))
-        .await
+    match db::insert_credit_ledger(
+        pool,
+        account.id,
+        credits,
+        "purchase",
+        &event.id,
+        Some(expires_at),
+    )
+    .await
     {
         Ok(true) => info!(
             "webhook: credited {} to account {} (purchase, event {})",
@@ -342,14 +357,14 @@ async fn handle_invoice_paid(
     let account = match db::get_account_by_stripe_customer(pool, customer_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {
-            warn!(
-                "webhook: orphan customer {} in invoice.paid",
-                customer_id
-            );
+            warn!("webhook: orphan customer {} in invoice.paid", customer_id);
             return WebhookOutcome::Handled;
         }
         Err(e) => {
-            error!("webhook: db error looking up customer {}: {}", customer_id, e);
+            error!(
+                "webhook: db error looking up customer {}: {}",
+                customer_id, e
+            );
             return WebhookOutcome::RetryableError;
         }
     };
@@ -360,10 +375,7 @@ async fn handle_invoice_paid(
     let first_line = match lines.as_array().and_then(|arr| arr.first()) {
         Some(line) => line,
         None => {
-            error!(
-                "webhook: no line items on invoice (event {})",
-                event.id
-            );
+            error!("webhook: no line items on invoice (event {})", event.id);
             return WebhookOutcome::Handled;
         }
     };
@@ -399,7 +411,11 @@ async fn handle_invoice_paid(
         }
     };
 
-    let credits = match product.metadata.get("credits").and_then(|s| s.parse::<i64>().ok()) {
+    let credits = match product
+        .metadata
+        .get("credits")
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(c) => c,
         None => {
             error!(
@@ -460,7 +476,10 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
             return WebhookOutcome::Handled;
         }
         Err(e) => {
-            error!("webhook: db error looking up customer {}: {}", customer_id, e);
+            error!(
+                "webhook: db error looking up customer {}: {}",
+                customer_id, e
+            );
             return WebhookOutcome::RetryableError;
         }
     };
@@ -477,7 +496,10 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
     let delta = match cents_to_microdollars(amount_refunded).and_then(i64::checked_neg) {
         Some(d) => d,
         None => {
-            error!("webhook: amount overflow in charge.refunded (event {})", event.id);
+            error!(
+                "webhook: amount overflow in charge.refunded (event {})",
+                event.id
+            );
             return WebhookOutcome::Handled;
         }
     };
@@ -529,7 +551,10 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
             return WebhookOutcome::Handled;
         }
         Err(e) => {
-            error!("webhook: db error looking up customer {}: {}", customer_id, e);
+            error!(
+                "webhook: db error looking up customer {}: {}",
+                customer_id, e
+            );
             return WebhookOutcome::RetryableError;
         }
     };
@@ -546,7 +571,10 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
     let delta = match cents_to_microdollars(amount).and_then(i64::checked_neg) {
         Some(d) => d,
         None => {
-            error!("webhook: amount overflow in charge.dispute.created (event {})", event.id);
+            error!(
+                "webhook: amount overflow in charge.dispute.created (event {})",
+                event.id
+            );
             return WebhookOutcome::Handled;
         }
     };
@@ -598,7 +626,10 @@ async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutco
             return WebhookOutcome::Handled;
         }
         Err(e) => {
-            error!("webhook: db error looking up customer {}: {}", customer_id, e);
+            error!(
+                "webhook: db error looking up customer {}: {}",
+                customer_id, e
+            );
             return WebhookOutcome::RetryableError;
         }
     };
@@ -615,7 +646,10 @@ async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutco
     let delta = match cents_to_microdollars(amount) {
         Some(d) => d,
         None => {
-            error!("webhook: amount overflow in charge.dispute.closed (event {})", event.id);
+            error!(
+                "webhook: amount overflow in charge.dispute.closed (event {})",
+                event.id
+            );
             return WebhookOutcome::Handled;
         }
     };
@@ -800,9 +834,7 @@ mod tests {
     }
 
     fn test_stripe() -> Option<StripeClient> {
-        std::env::var("STRIPE_API_KEY")
-            .ok()
-            .map(StripeClient::new)
+        std::env::var("STRIPE_API_KEY").ok().map(StripeClient::new)
     }
 
     /// Return the product ID to use in invoice tests.

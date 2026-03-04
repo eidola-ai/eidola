@@ -19,6 +19,7 @@ eidolons/
 │   │   │   ├── types.rs      # OpenAI API request/response types
 │   │   │   ├── response.rs   # Eidolons response types with privacy metadata
 │   │   │   ├── attestation.rs # RedPill TEE attestation signature fetching
+│   │   │   ├── webhook.rs    # Stripe webhook signature verification and event dispatch
 │   │   │   ├── error.rs      # ServerError enum and HTTP status mapping
 │   │   │   └── api_doc.rs    # OpenAPI spec generation (utoipa)
 │   │   ├── schema.sql        # PostgreSQL schema (billing, ACT keys, nullifiers)
@@ -45,7 +46,7 @@ eidolons/
 ├── tools/            # Build tooling
 │   ├── uniffi-bindgen-swift/  # UniFFI binding generator
 │   └── shared-typegen/        # Crux type generator for Swift
-├── scripts/          # Codegen helper scripts (wrapped by justfile)
+├── scripts/          # Dev and test scripts (wrapped by justfile)
 ├── justfile          # Task runner (primary development interface)
 ├── artifact-manifest.json    # Committed OCI image digests (reproducibility invariant)
 ├── compose.yaml              # Development environment (postgres + server)
@@ -83,6 +84,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - `DATABASE_URL` (required) - PostgreSQL connection string
 - `BIND_ADDR` (default: `127.0.0.1:8080`) - Address to bind
 - `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
+- `STRIPE_WEBHOOK_SECRET` (optional) - Stripe webhook signing secret; webhook endpoint returns 503 without it
 
 ## Crux Architecture
 
@@ -135,6 +137,14 @@ just check                    # Lint (clippy + fmt)
 # Full stack in containers (validates OCI build + service topology)
 just dev
 
+# Full stack with Stripe webhook forwarding (requires STRIPE_API_KEY)
+just dev-stripe
+
+# --- Testing ---
+
+just test-integration         # Integration tests (requires: just db && just db-reset)
+just test-webhook-smoke       # E2E webhook smoke tests (requires STRIPE_API_KEY)
+
 # --- Codegen (after changing Rust APIs/types) ---
 
 just update-bindings          # UniFFI Swift bindings + Crux types
@@ -162,7 +172,7 @@ nix run '.#update-server-openapi'
 | File | Purpose |
 |------|---------|
 | `justfile` | Task runner — primary development interface |
-| `compose.yaml` | Dev environment: postgres + server |
+| `compose.yaml` | Dev environment: postgres + server + stripe-cli (test profile) |
 | `docker-bake.hcl` | Reproducible OCI build settings (overlays compose.yaml) |
 | `artifact-manifest.json` | Committed OCI image digests — CI verifies builds match |
 | `crates/eidolons-server/Containerfile` | StageX-based OCI image build |
@@ -177,6 +187,8 @@ nix run '.#update-server-openapi'
 | `crates/eidolons-shared/src/app.rs` | Crux App implementation (Event, Model, ViewModel, Effect) |
 | `apps/macos/Package.swift` | macOS app Swift Package config |
 | `apps/macos/Sources/Eidolons/Core.swift` | Swift shell bridge (handles Crux event/effect loop) |
+| `scripts/dev-stripe.sh` | Start full stack with Stripe webhook forwarding |
+| `scripts/test-webhook-smoke.sh` | E2E webhook smoke tests |
 | `apps/macos/Support/package-app.sh` | CLI build script for .app bundle |
 
 ## Design Documents
@@ -204,3 +216,5 @@ Architecture decisions are recorded in [`docs/design/`](docs/design/). See the
 - Server API is documented via utoipa `#[utoipa::path]` annotations in `api_doc.rs` and `ToSchema` derives on request/response types. When adding or changing server endpoints, update the annotations and run `just update-openapi` to regenerate the committed `openapi.json`
 - Deterministic builds (no timestamps, fixed codegen)
 - `artifact-manifest.json` records expected OCI digests; CI verifies builds match and suggests updates on PRs
+- Before committing, ensure `README.md` and `AGENTS.md` are updated to reflect any changes (new files, endpoints, env vars, build commands, etc.)
+- Omit any tool-specific "co-authored by" lines from commit messages

@@ -3,8 +3,8 @@
 use std::time::SystemTime;
 
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
-use tokio_postgres::types::ToSql;
 use tokio_postgres::NoTls;
+use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 use crate::error::ServerError;

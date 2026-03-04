@@ -247,22 +247,15 @@ async fn handle_request(
         (Method::POST, "/v1/account/checkout") => {
             match account::authenticate_account(&req, &state.db_pool).await {
                 Ok(account_id) => {
-                    account::handle_create_checkout(
-                        req,
-                        &state.db_pool,
-                        &state.stripe,
-                        account_id,
-                    )
-                    .await
+                    account::handle_create_checkout(req, &state.db_pool, &state.stripe, account_id)
+                        .await
                 }
                 Err(e) => error_response(&e),
             }
         }
         (Method::GET, "/v1/account/balances") => {
             match account::authenticate_account(&req, &state.db_pool).await {
-                Ok(account_id) => {
-                    account::handle_get_balances(&state.db_pool, account_id).await
-                }
+                Ok(account_id) => account::handle_get_balances(&state.db_pool, account_id).await,
                 Err(e) => error_response(&e),
             }
         }
@@ -276,24 +269,14 @@ async fn handle_request(
         }
 
         // Stripe webhook
-        (Method::POST, "/v1/webhooks/stripe") => {
-            match &state.stripe_webhook_secret {
-                Some(secret) => {
-                    webhook::handle_stripe_webhook(
-                        req,
-                        &state.db_pool,
-                        &state.stripe,
-                        secret,
-                    )
-                    .await
-                }
-                None => {
-                    error_response(&ServerError::ServiceUnavailable(
-                        "webhook secret is not configured".to_string(),
-                    ))
-                }
+        (Method::POST, "/v1/webhooks/stripe") => match &state.stripe_webhook_secret {
+            Some(secret) => {
+                webhook::handle_stripe_webhook(req, &state.db_pool, &state.stripe, secret).await
             }
-        }
+            None => error_response(&ServerError::ServiceUnavailable(
+                "webhook secret is not configured".to_string(),
+            )),
+        },
 
         // 404 for everything else
         _ => {

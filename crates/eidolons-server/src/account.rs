@@ -662,18 +662,11 @@ pub async fn handle_get_ledger(
         .unwrap_or(50_i64)
         .clamp(1, 200);
 
-    let rows = match db::get_ledger_entries(
-        pool,
-        account_id,
-        reasons.as_deref(),
-        cursor,
-        limit,
-    )
-    .await
-    {
-        Ok(e) => e,
-        Err(e) => return error_response(&e),
-    };
+    let rows =
+        match db::get_ledger_entries(pool, account_id, reasons.as_deref(), cursor, limit).await {
+            Ok(e) => e,
+            Err(e) => return error_response(&e),
+        };
 
     let has_more = rows.len() as i64 > limit;
     let rows: Vec<_> = if has_more {
@@ -684,8 +677,7 @@ pub async fn handle_get_ledger(
 
     // Encode cursor from the last entry if there are more pages.
     let next_cursor = if has_more {
-        rows.last()
-            .and_then(|e| encode_cursor(e.created_at, e.id))
+        rows.last().and_then(|e| encode_cursor(e.created_at, e.id))
     } else {
         None
     };
@@ -736,10 +728,8 @@ fn url_decode(s: &str) -> String {
             let lo = chars.next();
             if let (Some(hi), Some(lo)) = (hi, lo) {
                 let hex = [hi, lo];
-                if let Ok(decoded) = u8::from_str_radix(
-                    std::str::from_utf8(&hex).unwrap_or(""),
-                    16,
-                ) {
+                if let Ok(decoded) = u8::from_str_radix(std::str::from_utf8(&hex).unwrap_or(""), 16)
+                {
                     result.push(decoded as char);
                     continue;
                 }
@@ -753,4 +743,3 @@ fn url_decode(s: &str) -> String {
     }
     result
 }
-

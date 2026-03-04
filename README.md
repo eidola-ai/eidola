@@ -76,7 +76,7 @@ This architecture ensures that the "Conscious" mind (the UI) remains snappy and 
 
 Eidolons consists of these components:
 - **Crates** (`crates/`) - Rust crates including:
-  - `eidolons-server` - Privacy-transparent OpenAI-compatible proxy with account management, Stripe billing, and inline attestation metadata
+  - `eidolons-server` - Privacy-transparent OpenAI-compatible proxy with account management, Stripe billing/webhooks, credit ledger, and inline attestation metadata
   - `eidolons-hello` - Example capability implementation
   - `eidolons-shared` - Crux-based cross-platform app core managing state and effects, exposing capabilities via FFI
 - **APP: macOS** (`apps/macos/`) - SwiftUI shell that renders the shared core's view model
@@ -101,6 +101,15 @@ cargo test
 
 # Full stack in containers (postgres + server)
 just dev
+
+# Full stack with Stripe webhook forwarding (requires STRIPE_API_KEY)
+just dev-stripe
+
+# Integration tests (requires: just db && just db-reset)
+just test-integration
+
+# E2E webhook smoke tests (requires STRIPE_API_KEY)
+just test-webhook-smoke
 ```
 
 **Updating generated files:**
@@ -158,7 +167,7 @@ nix flake check   # Runs: cargo fmt, clippy, tests, openapi/binding freshness, S
 
 ## Server
 
-The server exposes an OpenAI-compatible `/v1/chat/completions` endpoint that proxies requests through RedPill.ai, enriching responses with privacy-transparent attestation metadata. It also provides account management with Argon2id credential auth and Stripe Checkout integration for subscriptions and one-time purchases.
+The server exposes an OpenAI-compatible `/v1/chat/completions` endpoint that proxies requests through RedPill.ai, enriching responses with privacy-transparent attestation metadata. It also provides account management with Argon2id credential auth, Stripe Checkout integration for subscriptions and one-time purchases, Stripe webhook handling for billing lifecycle events, and credit balance/ledger endpoints.
 
 The full API is documented in [`crates/eidolons-server/openapi.json`](crates/eidolons-server/openapi.json), which is also served at `GET /openapi.json` at runtime.
 
@@ -186,6 +195,9 @@ cp .env.example .env
 
 # Start postgres + server
 just dev
+
+# Start with Stripe webhook forwarding (requires STRIPE_API_KEY)
+just dev-stripe
 
 # Or just postgres (run server on the host for fast iteration)
 just db
