@@ -95,6 +95,19 @@ pub struct StripePriceMinimal {
     pub recurring: Option<StripeRecurring>,
 }
 
+/// A price nested inside a checkout line item.
+#[derive(Debug, Deserialize)]
+pub struct CheckoutLineItemPrice {
+    /// Product ID (string when not expanded).
+    pub product: String,
+}
+
+/// A single line item from a checkout session.
+#[derive(Debug, Deserialize)]
+pub struct CheckoutLineItem {
+    pub price: CheckoutLineItemPrice,
+}
+
 /// Parameters for creating a Stripe Checkout Session.
 pub struct CheckoutParams<'a> {
     pub customer_id: &'a str,
@@ -102,6 +115,7 @@ pub struct CheckoutParams<'a> {
     pub mode: &'a str,
     pub success_url: &'a str,
     pub cancel_url: &'a str,
+    pub client_reference_id: Option<&'a str>,
 }
 
 pub struct StripeClient {
@@ -235,12 +249,36 @@ impl StripeClient {
             .map_err(|e| ServerError::Parse(format!("stripe price: {}", e)))
     }
 
+    /// Fetch a single product by ID.
+    pub async fn get_product(&self, product_id: &str) -> Result<StripeProduct, ServerError> {
+        let response = self
+            .client
+            .get(format!("{}/products/{}", self.base_url, product_id))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(stripe_error(&body));
+        }
+
+        serde_json::from_slice(&body)
+            .map_err(|e| ServerError::Parse(format!("stripe product: {}", e)))
+    }
+
     /// Create a Stripe Checkout Session and return the checkout URL.
     pub async fn create_checkout_session(
         &self,
         params: &CheckoutParams<'_>,
     ) -> Result<String, ServerError> {
-        let form: Vec<(&str, &str)> = vec![
+        let mut form: Vec<(&str, &str)> = vec![
             ("customer", params.customer_id),
             ("mode", params.mode),
             ("line_items[0][price]", params.price_id),
@@ -248,6 +286,10 @@ impl StripeClient {
             ("success_url", params.success_url),
             ("cancel_url", params.cancel_url),
         ];
+
+        if let Some(ref_id) = params.client_reference_id {
+            form.push(("client_reference_id", ref_id));
+        }
 
         let response = self
             .client
@@ -274,6 +316,39 @@ impl StripeClient {
         session
             .url
             .ok_or_else(|| ServerError::Parse("stripe checkout session missing url".to_string()))
+    }
+
+    /// List line items for a checkout session (price expanded to get product ID).
+    pub async fn list_checkout_line_items(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<CheckoutLineItem>, ServerError> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/checkout/sessions/{}/line_items",
+                self.base_url, session_id
+            ))
+            .bearer_auth(&self.api_key)
+            .query(&[("expand[]", "data.price")])
+            .send()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(stripe_error(&body));
+        }
+
+        let list: ListResponse<CheckoutLineItem> = serde_json::from_slice(&body)
+            .map_err(|e| ServerError::Parse(format!("stripe line items: {}", e)))?;
+
+        Ok(list.data)
     }
 
     /// Create a Stripe billing portal session and return the portal URL.

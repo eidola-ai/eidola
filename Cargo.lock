@@ -2665,6 +2665,8 @@ dependencies = [
  "bytes",
  "deadpool-postgres",
  "futures-util",
+ "hex",
+ "hmac",
  "http",
  "http-body-util",
  "hyper",
@@ -2674,6 +2676,8 @@ dependencies = [
  "rustls-rustcrypto",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tokio",
  "tokio-postgres",
  "tokio-stream",
@@ -3802,6 +3806,12 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hexf-parse"

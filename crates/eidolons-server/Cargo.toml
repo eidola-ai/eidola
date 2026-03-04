@@ -55,6 +55,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Encoding
 base64 = "0.22"
+hex = "0.4"
+
+# Webhook signature verification
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
 
 # Utilities
 futures-util = "0.3"

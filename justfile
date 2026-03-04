@@ -11,6 +11,10 @@ dev:
     CARGO_PROFILE=docker-dev docker buildx bake
     docker compose up --no-build
 
+# Start full stack with Stripe webhook forwarding (requires STRIPE_API_KEY)
+dev-stripe:
+    ./scripts/dev-stripe.sh
+
 # Start just postgres (for running the server on the host with cargo)
 db:
     docker buildx bake postgres
@@ -31,6 +35,14 @@ build:
 # Run all tests
 test:
     cargo test
+
+# Run integration tests (requires: just db && just db-reset)
+test-integration:
+    DATABASE_URL="${DATABASE_URL:-postgres://eidolons@localhost/eidolons}" cargo test -p eidolons-server -- --ignored
+
+# Run E2E webhook smoke tests (requires STRIPE_API_KEY)
+test-webhook-smoke:
+    ./scripts/test-webhook-smoke.sh
 
 # Lint and format check
 check:

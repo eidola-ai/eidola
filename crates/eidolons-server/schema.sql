@@ -261,36 +261,6 @@ COMMENT ON COLUMN nullifier.recorded_at IS
     'that nullifiers were recorded before refunds were issued.';
 
 -- ---------------------------------------------------------------------------
--- Convenience Views
--- ---------------------------------------------------------------------------
-
-CREATE VIEW account_balance AS
-    SELECT
-        account_id,
-        COALESCE(SUM(delta) FILTER (
-            WHERE expires_at IS NOT NULL AND expires_at > now()
-        ), 0) AS expiring_credits,
-        MIN(expires_at) FILTER (
-            WHERE expires_at IS NOT NULL AND expires_at > now() AND delta > 0
-        ) AS earliest_expiry,
-        COALESCE(SUM(delta) FILTER (
-            WHERE expires_at IS NULL
-        ), 0) AS permanent_credits,
-        COALESCE(SUM(delta) FILTER (
-            WHERE expires_at IS NULL OR expires_at > now()
-        ), 0) AS total_available
-    FROM credit_ledger
-    GROUP BY account_id;
-
-COMMENT ON VIEW account_balance IS
-    'Derived view of per-account credit balances, broken down by expiring '
-    '(subscription) and permanent (top-up) pools. total_available is the '
-    'number used for provisioning eligibility checks. Debit entries should '
-    'carry the same expires_at as the balance pool they consume from so the '
-    'breakdown stays accurate. The provisioning endpoint should consume '
-    'expiring credits first, selecting those with the earliest expires_at.';
-
--- ---------------------------------------------------------------------------
 -- Helper Functions
 -- ---------------------------------------------------------------------------
 

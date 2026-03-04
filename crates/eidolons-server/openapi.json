@@ -110,6 +110,43 @@
         }
       }
     },
+    "/v1/account/balances": {
+      "get": {
+        "tags": [
+          "openapi_paths"
+        ],
+        "summary": "Get account balance breakdown.",
+        "description": "Returns the total available balance and per-pool breakdown.\nRequires HTTP Basic auth.",
+        "operationId": "get_balances",
+        "responses": {
+          "200": {
+            "description": "Balance breakdown",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BalancesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
     "/v1/account/checkout": {
       "post": {
         "tags": [
@@ -171,6 +208,73 @@
           },
           "503": {
             "description": "Stripe not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
+    "/v1/account/ledger": {
+      "get": {
+        "tags": [
+          "openapi_paths"
+        ],
+        "summary": "Get credit ledger entries.",
+        "description": "Returns paginated ledger entries with optional filtering by reason type.\nRequires HTTP Basic auth.",
+        "operationId": "get_ledger",
+        "parameters": [
+          {
+            "name": "reason",
+            "in": "query",
+            "description": "Comma-separated reason filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque pagination cursor from a previous response",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max entries to return (default 50, max 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ledger entries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LedgerResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
             "content": {
               "application/json": {
                 "schema": {
@@ -368,6 +472,41 @@
           }
         }
       }
+    },
+    "/v1/webhooks/stripe": {
+      "post": {
+        "tags": [
+          "openapi_paths"
+        ],
+        "summary": "Stripe webhook endpoint.",
+        "description": "Receives and processes Stripe webhook events. Verifies the webhook\nsignature before processing. Always returns 200 except for signature\nverification failures.",
+        "operationId": "stripe_webhook",
+        "responses": {
+          "200": {
+            "description": "Event received"
+          },
+          "400": {
+            "description": "Signature verification failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Webhook secret not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -454,6 +593,47 @@
           "signing_algorithm": {
             "type": "string",
             "description": "The signing algorithm (e.g., \"ecdsa\")."
+          }
+        }
+      },
+      "BalancePool": {
+        "type": "object",
+        "required": [
+          "amount",
+          "source"
+        ],
+        "properties": {
+          "amount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          }
+        }
+      },
+      "BalancesResponse": {
+        "type": "object",
+        "required": [
+          "available",
+          "pools"
+        ],
+        "properties": {
+          "available": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "pools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BalancePool"
+            }
           }
         }
       },
@@ -983,6 +1163,74 @@
           }
         },
         "additionalProperties": false
+      },
+      "LedgerEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "delta",
+          "reason",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "delta": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "token_credits": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "token_epoch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "LedgerResponse": {
+        "type": "object",
+        "required": [
+          "data",
+          "has_more"
+        ],
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LedgerEntry"
+            }
+          },
+          "has_more": {
+            "type": "boolean"
+          }
+        }
       },
       "ListPricesResponse": {
         "type": "object",

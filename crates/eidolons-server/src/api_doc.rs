@@ -4,8 +4,9 @@ use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::account::{
-    CheckoutRequest, CheckoutUrlResponse, CreateAccountResponse, GetAccountResponse,
-    ListPricesResponse, PriceResponse, RecurringResponse, SubscriptionResponse,
+    BalancePool, BalancesResponse, CheckoutRequest, CheckoutUrlResponse, CreateAccountResponse,
+    GetAccountResponse, LedgerEntry, LedgerResponse, ListPricesResponse, PriceResponse,
+    RecurringResponse, SubscriptionResponse,
 };
 use crate::auth::AuthMethod;
 use crate::backend::TeeType;
@@ -40,6 +41,9 @@ use crate::types::{
         openapi_paths::get_account,
         openapi_paths::get_subscription,
         openapi_paths::create_checkout,
+        openapi_paths::get_balances,
+        openapi_paths::get_ledger,
+        openapi_paths::stripe_webhook,
     ),
     components(schemas(
         // Request types
@@ -87,6 +91,11 @@ use crate::types::{
         ListPricesResponse,
         PriceResponse,
         RecurringResponse,
+        // Balance & ledger types
+        BalancesResponse,
+        BalancePool,
+        LedgerResponse,
+        LedgerEntry,
         // Error types
         ErrorResponse,
         ErrorDetail,
@@ -121,8 +130,8 @@ impl Modify for BasicAuthAddon {
 #[allow(dead_code)]
 mod openapi_paths {
     use crate::account::{
-        CheckoutRequest, CheckoutUrlResponse, CreateAccountResponse, GetAccountResponse,
-        ListPricesResponse, SubscriptionResponse,
+        BalancesResponse, CheckoutRequest, CheckoutUrlResponse, CreateAccountResponse,
+        GetAccountResponse, LedgerResponse, ListPricesResponse, SubscriptionResponse,
     };
     use crate::response::EidolonsResponse;
     use crate::types::{ChatCompletionRequest, ErrorResponse, ModelsResponse};
@@ -243,4 +252,55 @@ mod openapi_paths {
         )
     )]
     pub fn create_checkout() {}
+
+    /// Get account balance breakdown.
+    ///
+    /// Returns the total available balance and per-pool breakdown.
+    /// Requires HTTP Basic auth.
+    #[utoipa::path(
+        get,
+        path = "/v1/account/balances",
+        security(("basic" = [])),
+        responses(
+            (status = 200, description = "Balance breakdown", body = BalancesResponse),
+            (status = 401, description = "Invalid credentials", body = ErrorResponse)
+        )
+    )]
+    pub fn get_balances() {}
+
+    /// Get credit ledger entries.
+    ///
+    /// Returns paginated ledger entries with optional filtering by reason type.
+    /// Requires HTTP Basic auth.
+    #[utoipa::path(
+        get,
+        path = "/v1/account/ledger",
+        security(("basic" = [])),
+        params(
+            ("reason" = Option<String>, Query, description = "Comma-separated reason filter"),
+            ("cursor" = Option<String>, Query, description = "Opaque pagination cursor from a previous response"),
+            ("limit" = Option<i64>, Query, description = "Max entries to return (default 50, max 200)"),
+        ),
+        responses(
+            (status = 200, description = "Ledger entries", body = LedgerResponse),
+            (status = 401, description = "Invalid credentials", body = ErrorResponse)
+        )
+    )]
+    pub fn get_ledger() {}
+
+    /// Stripe webhook endpoint.
+    ///
+    /// Receives and processes Stripe webhook events. Verifies the webhook
+    /// signature before processing. Always returns 200 except for signature
+    /// verification failures.
+    #[utoipa::path(
+        post,
+        path = "/v1/webhooks/stripe",
+        responses(
+            (status = 200, description = "Event received"),
+            (status = 400, description = "Signature verification failed", body = ErrorResponse),
+            (status = 503, description = "Webhook secret not configured", body = ErrorResponse)
+        )
+    )]
+    pub fn stripe_webhook() {}
 }

@@ -157,6 +157,42 @@ pub struct ListPricesResponse {
     pub data: Vec<PriceResponse>,
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct BalancesResponse {
+    pub available: i64,
+    pub pools: Vec<BalancePool>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct BalancePool {
+    pub amount: i64,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LedgerResponse {
+    pub data: Vec<LedgerEntry>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub delta: i64,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_epoch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_credits: Option<i64>,
+}
+
 fn default_success_url() -> String {
     "https://eidolons.ai/payment/success".to_string()
 }
@@ -233,6 +269,28 @@ fn unix_to_iso(secs: i64) -> String {
     let y = if m <= 2 { y + 1 } else { y };
 
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Encode a ledger pagination cursor from `(created_at, id)`.
+fn encode_cursor(created_at: SystemTime, id: Uuid) -> Option<String> {
+    let secs = system_time_to_unix_seconds(created_at)?;
+    let plain = format!("{}:{}", secs, id);
+    Some(URL_SAFE_NO_PAD.encode(plain.as_bytes()))
+}
+
+/// Decode a ledger pagination cursor into `(created_at, id)`.
+fn decode_cursor(cursor: &str) -> Option<(SystemTime, Uuid)> {
+    let bytes = URL_SAFE_NO_PAD.decode(cursor).ok()?;
+    let plain = String::from_utf8(bytes).ok()?;
+    let (secs_str, id_str) = plain.split_once(':')?;
+    let secs: i64 = secs_str.parse().ok()?;
+    let id = Uuid::parse_str(id_str).ok()?;
+    let ts = if secs >= 0 {
+        UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
+    } else {
+        UNIX_EPOCH.checked_sub(std::time::Duration::from_secs((-secs) as u64))?
+    };
+    Some((ts, id))
 }
 
 fn require_stripe(stripe: &Option<StripeClient>) -> Result<&StripeClient, ServerError> {
@@ -508,12 +566,14 @@ pub async fn handle_create_checkout(
         "payment"
     };
 
+    let account_id_str = account_id.to_string();
     let params = CheckoutParams {
         customer_id: &customer_id,
         price_id: &checkout_req.price_id,
         mode,
         success_url: &checkout_req.success_url,
         cancel_url: &checkout_req.cancel_url,
+        client_reference_id: Some(&account_id_str),
     };
 
     let checkout_url = match stripe.create_checkout_session(&params).await {
@@ -543,3 +603,154 @@ async fn ensure_stripe_customer(
 
 // Bring the trait into scope for fill_bytes.
 use argon2::password_hash::rand_core::RngCore;
+
+/// GET /v1/account/balances — get credit balance breakdown (authenticated).
+pub async fn handle_get_balances(pool: &Pool, account_id: Uuid) -> Response<BoxBody> {
+    let (total, pools) = match db::get_balance_pools(pool, account_id).await {
+        Ok(r) => r,
+        Err(e) => return error_response(&e),
+    };
+
+    let pools = pools
+        .into_iter()
+        .map(|p| {
+            let source = match p.source_reason.as_deref() {
+                Some("subscription_renewal") => "subscription",
+                Some("purchase") => "purchase",
+                _ => "other",
+            };
+            BalancePool {
+                amount: p.pool_amount,
+                source: source.to_string(),
+                expires_at: p.expires_at.and_then(|t| system_time_to_iso(t).ok()),
+            }
+        })
+        .collect();
+
+    let resp = BalancesResponse {
+        available: total,
+        pools,
+    };
+
+    json_response(StatusCode::OK, &serde_json::to_string(&resp).unwrap())
+}
+
+/// GET /v1/account/ledger — get credit ledger entries (authenticated).
+pub async fn handle_get_ledger(
+    req: &Request<Incoming>,
+    pool: &Pool,
+    account_id: Uuid,
+) -> Response<BoxBody> {
+    // Parse query parameters.
+    let query_str = req.uri().query().unwrap_or("");
+    let params: Vec<(String, String)> = url_decode_pairs(query_str);
+
+    let reasons: Option<Vec<String>> = params
+        .iter()
+        .find(|(k, _)| k == "reason")
+        .map(|(_, v)| v.split(',').map(|s| s.trim().to_string()).collect());
+
+    let cursor = params
+        .iter()
+        .find(|(k, _)| k == "cursor")
+        .and_then(|(_, v)| decode_cursor(v));
+
+    let limit: i64 = params
+        .iter()
+        .find(|(k, _)| k == "limit")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(50_i64)
+        .clamp(1, 200);
+
+    let rows = match db::get_ledger_entries(
+        pool,
+        account_id,
+        reasons.as_deref(),
+        cursor,
+        limit,
+    )
+    .await
+    {
+        Ok(e) => e,
+        Err(e) => return error_response(&e),
+    };
+
+    let has_more = rows.len() as i64 > limit;
+    let rows: Vec<_> = if has_more {
+        rows.into_iter().take(limit as usize).collect()
+    } else {
+        rows
+    };
+
+    // Encode cursor from the last entry if there are more pages.
+    let next_cursor = if has_more {
+        rows.last()
+            .and_then(|e| encode_cursor(e.created_at, e.id))
+    } else {
+        None
+    };
+
+    let data: Vec<LedgerEntry> = rows
+        .into_iter()
+        .map(|e| {
+            let is_act = e.reason == "act_issuance";
+            LedgerEntry {
+                id: e.id,
+                delta: e.delta,
+                reason: e.reason,
+                expires_at: e.expires_at.and_then(|t| system_time_to_iso(t).ok()),
+                created_at: system_time_to_iso(e.created_at).unwrap_or_default(),
+                token_epoch: if is_act { e.token_epoch } else { None },
+                token_credits: if is_act { e.token_credits } else { None },
+            }
+        })
+        .collect();
+
+    let resp = LedgerResponse {
+        data,
+        has_more,
+        cursor: next_cursor,
+    };
+    json_response(StatusCode::OK, &serde_json::to_string(&resp).unwrap())
+}
+
+/// Parse URL-encoded query string into key-value pairs.
+fn url_decode_pairs(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            Some((url_decode(k), url_decode(v)))
+        })
+        .collect()
+}
+
+/// Minimal URL percent-decoding.
+fn url_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next();
+            let lo = chars.next();
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                let hex = [hi, lo];
+                if let Ok(decoded) = u8::from_str_radix(
+                    std::str::from_utf8(&hex).unwrap_or(""),
+                    16,
+                ) {
+                    result.push(decoded as char);
+                    continue;
+                }
+            }
+            result.push('%');
+        } else if b == b'+' {
+            result.push(' ');
+        } else {
+            result.push(b as char);
+        }
+    }
+    result
+}
+

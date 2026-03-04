@@ -34,6 +34,7 @@ use eidolons_server::response::{
 };
 use eidolons_server::stripe::StripeClient;
 use eidolons_server::types::{ChatCompletionRequest, ErrorResponse};
+use eidolons_server::webhook;
 
 /// Server configuration.
 struct Config {
@@ -54,6 +55,9 @@ struct Config {
 
     /// Stripe secret API key (optional — endpoints return 503 without it).
     stripe_api_key: Option<String>,
+
+    /// Stripe webhook signing secret (optional — webhook endpoint returns 503 without it).
+    stripe_webhook_secret: Option<String>,
 }
 
 impl Config {
@@ -78,6 +82,10 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
+        let stripe_webhook_secret = std::env::var("STRIPE_WEBHOOK_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         Ok(Config {
             bind_addr,
             redpill_api_key,
@@ -85,6 +93,7 @@ impl Config {
             auth_mode,
             database_url,
             stripe_api_key,
+            stripe_webhook_secret,
         })
     }
 }
@@ -96,6 +105,7 @@ struct AppState {
     attestation: AttestationClient,
     db_pool: deadpool_postgres::Pool,
     stripe: Option<StripeClient>,
+    stripe_webhook_secret: Option<String>,
 }
 
 #[tokio::main]
@@ -144,6 +154,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if stripe.is_none() {
         warn!("STRIPE_API_KEY not set — account billing endpoints will return 503");
     }
+    if config.stripe_webhook_secret.is_none() {
+        warn!("STRIPE_WEBHOOK_SECRET not set — webhook endpoint will return 503");
+    }
 
     // Create shared state
     let state = Arc::new(AppState {
@@ -155,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         attestation: AttestationClient::new(config.redpill_api_key, config.redpill_base_url),
         db_pool,
         stripe,
+        stripe_webhook_secret: config.stripe_webhook_secret,
     });
 
     // Bind TCP listener
@@ -242,6 +256,42 @@ async fn handle_request(
                     .await
                 }
                 Err(e) => error_response(&e),
+            }
+        }
+        (Method::GET, "/v1/account/balances") => {
+            match account::authenticate_account(&req, &state.db_pool).await {
+                Ok(account_id) => {
+                    account::handle_get_balances(&state.db_pool, account_id).await
+                }
+                Err(e) => error_response(&e),
+            }
+        }
+        (Method::GET, "/v1/account/ledger") => {
+            match account::authenticate_account(&req, &state.db_pool).await {
+                Ok(account_id) => {
+                    account::handle_get_ledger(&req, &state.db_pool, account_id).await
+                }
+                Err(e) => error_response(&e),
+            }
+        }
+
+        // Stripe webhook
+        (Method::POST, "/v1/webhooks/stripe") => {
+            match &state.stripe_webhook_secret {
+                Some(secret) => {
+                    webhook::handle_stripe_webhook(
+                        req,
+                        &state.db_pool,
+                        &state.stripe,
+                        secret,
+                    )
+                    .await
+                }
+                None => {
+                    error_response(&ServerError::ServiceUnavailable(
+                        "webhook secret is not configured".to_string(),
+                    ))
+                }
             }
         }
 
@@ -482,6 +532,19 @@ mod tests {
         assert!(
             schemas.schemas.contains_key("ChatCompletionRequest"),
             "missing ChatCompletionRequest schema"
+        );
+
+        assert!(
+            spec.paths.paths.contains_key("/v1/account/balances"),
+            "missing /v1/account/balances path"
+        );
+        assert!(
+            spec.paths.paths.contains_key("/v1/account/ledger"),
+            "missing /v1/account/ledger path"
+        );
+        assert!(
+            spec.paths.paths.contains_key("/v1/webhooks/stripe"),
+            "missing /v1/webhooks/stripe path"
         );
 
         // Verify JSON serialization works
