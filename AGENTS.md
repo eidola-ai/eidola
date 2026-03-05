@@ -35,6 +35,9 @@ eidolons/
 │       ├── swift/            # Generated bindings (UniFFI + Crux types)
 │       └── Package.swift     # Swift Package exposing EidolonsShared + SharedTypes
 ├── apps/
+│   ├── cli/              # Pure Rust CLI app (iocraft TUI + smol async)
+│   │   └── src/
+│   │       └── main.rs       # Crux shell: event loop, effect handling, TUI rendering
 │   └── macos/            # macOS app (SwiftPM + Xcode wrapper)
 │       ├── Sources/
 │       │   ├── Eidolons/         # SwiftUI shell (Core.swift, ContentView.swift)
@@ -91,7 +94,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 
 ## Crux Architecture
 
-The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform state management. The architecture separates the core (Rust) from the shell (Swift):
+The apps use [Crux](https://redbadger.github.io/crux/) for cross-platform state management. The architecture separates the core (Rust) from the shells (Swift for macOS, Rust for CLI):
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -134,6 +137,7 @@ The `justfile` is the primary development interface. Run `just` to see all avail
 just db                       # Start postgres in Docker
 just db-reset                 # Apply/reset schema.sql
 cargo run -p eidolons-server  # Run server on host (fast iteration)
+cargo run -p eidolons-cli     # Run CLI app (iocraft TUI shell)
 cargo test                    # Run tests
 just check                    # Lint (clippy + fmt)
 
@@ -189,6 +193,7 @@ nix run '.#update-server-openapi'
 | `crates/eidolons-shared/Package.swift` | Shared core Swift Package (EidolonsShared + SharedTypes) |
 | `crates/eidolons-shared/src/lib.rs` | FFI bridge + capability re-exports |
 | `crates/eidolons-shared/src/app.rs` | Crux App implementation (Event, Model, ViewModel, Effect) |
+| `apps/cli/src/main.rs` | CLI Crux shell (iocraft TUI, smol async runtime) |
 | `apps/macos/Package.swift` | macOS app Swift Package config |
 | `apps/macos/Sources/Eidolons/Core.swift` | Swift shell bridge (handles Crux event/effect loop) |
 | `scripts/dev-stripe.sh` | Start full stack with Stripe webhook forwarding |

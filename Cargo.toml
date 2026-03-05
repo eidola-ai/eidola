@@ -1,6 +1,7 @@
 [workspace]
 
 members = [
+    "apps/cli",
     "crates/*",
     "tools/*",
 ]
