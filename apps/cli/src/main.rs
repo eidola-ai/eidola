@@ -1,5 +1,7 @@
 mod config;
 
+use std::io::IsTerminal;
+
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use uuid::Uuid;
@@ -40,6 +42,18 @@ enum AccountCommand {
         #[arg(long)]
         secret: String,
     },
+    /// List available prices
+    Prices,
+    /// Create a checkout session and open payment link
+    Checkout {
+        /// Stripe price ID
+        price_id: String,
+        /// Print URL instead of opening browser
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Show credit balances
+    Balances,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +68,49 @@ struct GetAccountResponse {
     id: Uuid,
     stripe_customer_id: Option<String>,
     created_at: String,
+}
+
+#[derive(Deserialize)]
+struct ListPricesResponse {
+    data: Vec<PriceResponse>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct PriceResponse {
+    id: String,
+    product_name: String,
+    product_description: Option<String>,
+    unit_amount: Option<i64>,
+    currency: String,
+    #[serde(rename = "type")]
+    price_type: String,
+    recurring: Option<RecurringResponse>,
+    credits: i64,
+}
+
+#[derive(Deserialize)]
+struct RecurringResponse {
+    interval: String,
+    interval_count: i64,
+}
+
+#[derive(Deserialize)]
+struct CheckoutUrlResponse {
+    checkout_url: String,
+}
+
+#[derive(Deserialize)]
+struct BalancesResponse {
+    available: i64,
+    pools: Vec<BalancePool>,
+}
+
+#[derive(Deserialize)]
+struct BalancePool {
+    amount: i64,
+    source: String,
+    expires_at: Option<String>,
 }
 
 fn require_base_url(config: &Config) -> Result<&str, String> {
@@ -120,6 +177,12 @@ async fn run(cli: Cli) -> Result<(), String> {
             Some(AccountCommand::Configure { id, secret }) => {
                 cmd_account_configure(&id, &secret)
             }
+            Some(AccountCommand::Prices) => cmd_account_prices().await,
+            Some(AccountCommand::Checkout {
+                price_id,
+                no_browser,
+            }) => cmd_account_checkout(&price_id, no_browser).await,
+            Some(AccountCommand::Balances) => cmd_account_balances().await,
         },
     }
 }
@@ -218,5 +281,134 @@ fn cmd_account_configure(id: &str, secret: &str) -> Result<(), String> {
     config.account_secret = Some(secret.to_string());
     config.save()?;
     println!("account configured");
+    Ok(())
+}
+
+async fn cmd_account_prices() -> Result<(), String> {
+    let config = Config::load();
+    let base_url = require_base_url(&config)?;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base_url}/v1/prices"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("server returned {status}: {body}"));
+    }
+
+    let prices: ListPricesResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse response: {e}"))?;
+
+    if prices.data.is_empty() {
+        println!("no prices available");
+        return Ok(());
+    }
+
+    for p in &prices.data {
+        let amount = p
+            .unit_amount
+            .map(|a| format!("{}.{:02} {}", a / 100, a % 100, p.currency.to_uppercase()))
+            .unwrap_or_else(|| "free".to_string());
+
+        let recurrence = p
+            .recurring
+            .as_ref()
+            .map(|r| {
+                if r.interval_count == 1 {
+                    format!("/{}", r.interval)
+                } else {
+                    format!("/{}x{}", r.interval_count, r.interval)
+                }
+            })
+            .unwrap_or_default();
+
+        println!(
+            "{}: {} ({}{}, {} credits)",
+            p.id, p.product_name, amount, recurrence, p.credits
+        );
+        if let Some(desc) = &p.product_description {
+            println!("  {desc}");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_account_checkout(price_id: &str, no_browser: bool) -> Result<(), String> {
+    let config = Config::load();
+    let base_url = require_base_url(&config)?;
+    let (id, secret) = require_credentials(&config)?;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base_url}/v1/account/checkout"))
+        .basic_auth(id, Some(secret))
+        .json(&serde_json::json!({ "price_id": price_id }))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("server returned {status}: {body}"));
+    }
+
+    let checkout: CheckoutUrlResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse response: {e}"))?;
+
+    let should_open = !no_browser && std::io::stdout().is_terminal();
+
+    if should_open {
+        println!("{}", checkout.checkout_url);
+        open::that(&checkout.checkout_url)
+            .map_err(|e| format!("failed to open browser: {e}"))?;
+    } else {
+        println!("{}", checkout.checkout_url);
+    }
+    Ok(())
+}
+
+async fn cmd_account_balances() -> Result<(), String> {
+    let config = Config::load();
+    let base_url = require_base_url(&config)?;
+    let (id, secret) = require_credentials(&config)?;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base_url}/v1/account/balances"))
+        .basic_auth(id, Some(secret))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("server returned {status}: {body}"));
+    }
+
+    let balances: BalancesResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse response: {e}"))?;
+
+    println!("available: {}", balances.available);
+    for pool in &balances.pools {
+        let expires = pool
+            .expires_at
+            .as_deref()
+            .map(|e| format!(", expires {e}"))
+            .unwrap_or_default();
+        println!("  {} ({}{})", pool.amount, pool.source, expires);
+    }
     Ok(())
 }

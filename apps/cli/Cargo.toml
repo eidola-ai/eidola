@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 crux_core = "0.16"
 dirs = "6"
 eidolons-shared = { path = "../../crates/eidolons-shared" }
+open = "5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
