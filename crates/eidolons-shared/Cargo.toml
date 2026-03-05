@@ -10,19 +10,14 @@ publish.workspace = true
 crate-type = ["cdylib", "staticlib", "lib"]
 
 [features]
-default = ["mlx"]
-# Apple Silicon native acceleration via MLX backend (macOS only).
-mlx = ["eidolons-perception/mlx"]
+default = []
 typegen = ["crux_core/typegen"]
 
 [dependencies]
 crux_core = "0.16"
-dirs = "6"
-eidolons-perception = { path = "../../crates/eidolons-perception", default-features = false }
 futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["sync"] }
 uniffi = "0.30.0"
 
 [build-dependencies]
@@ -30,3 +25,4 @@ uniffi = { version = "0.31.0", features = ["build"] }
 
 [dev-dependencies]
 serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt"] }

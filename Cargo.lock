@@ -2690,8 +2690,6 @@ name = "eidolons-shared"
 version = "0.1.0"
 dependencies = [
  "crux_core",
- "dirs",
- "eidolons-perception",
  "futures",
  "serde",
  "serde_json",

@@ -525,100 +525,46 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 /**
- * Service for text generation using ML models.
+ * Stub perception service.
  *
- * This service wraps the perception crate's TextGenerationModel and exposes
- * it via UniFFI for use in Swift/Kotlin shells.
- *
- * The model runs on a dedicated inference thread, allowing GPU-accelerated
- * inference without requiring WGPU types to be `Send + Sync`.
- *
- * # Usage
- *
- * ```swift
- * let service = PerceptionService()
- * try await service.initialize()
- * let response = try await service.chat(message: "Hello!")
- * ```
+ * Maintains the same UniFFI interface as the real implementation so the
+ * macOS shell compiles unchanged. All inference methods return a placeholder
+ * message indicating that on-device inference is not yet available.
  */
 public protocol PerceptionServiceProtocol: AnyObject, Sendable {
     
     /**
-     * Generates a response for the given conversation history.
-     *
-     * # Arguments
-     *
-     * * `messages` - The conversation history as a list of messages
-     *
-     * # Returns
-     *
-     * The generated response string.
-     *
-     * # Errors
-     *
-     * Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
+     * Returns a placeholder response.
      */
     func chat(messages: [ServiceChatMessage]) async throws  -> String
     
     /**
-     * Generates a response for the given conversation with streaming output.
-     *
-     * Tokens are streamed through the callback as they are generated,
-     * enabling real-time display in the UI.
-     *
-     * # Arguments
-     *
-     * * `messages` - The conversation history as a list of messages
-     * * `callback` - Callback to receive streaming chunks
-     *
-     * # Errors
-     *
-     * Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
+     * Sends a single placeholder chunk and completes.
      */
     func chatStreaming(messages: [ServiceChatMessage], callback: StreamingCallback) async throws 
     
     /**
-     * Initializes the service by downloading and loading the model.
-     *
-     * This spawns a dedicated inference thread that owns the model,
-     * enabling GPU acceleration without thread-safety constraints.
-     *
-     * # Errors
-     *
-     * Returns `PerceptionError::AlreadyInitialized` if called twice.
-     * Returns `PerceptionError::LoadFailed` if model download or loading fails.
+     * Stub initialize — always succeeds immediately.
      */
     func initialize() async throws 
     
     /**
-     * Returns whether the model is initialized and ready for inference.
+     * Returns whether the service has been initialized.
      */
     func isReady() async  -> Bool
     
     /**
-     * Returns model configuration information if initialized.
-     *
-     * Returns a JSON string with model details, or an error if not initialized.
+     * Returns stub model info.
      */
     func modelInfo() async throws  -> String
     
 }
 /**
- * Service for text generation using ML models.
+ * Stub perception service.
  *
- * This service wraps the perception crate's TextGenerationModel and exposes
- * it via UniFFI for use in Swift/Kotlin shells.
- *
- * The model runs on a dedicated inference thread, allowing GPU-accelerated
- * inference without requiring WGPU types to be `Send + Sync`.
- *
- * # Usage
- *
- * ```swift
- * let service = PerceptionService()
- * try await service.initialize()
- * let response = try await service.chat(message: "Hello!")
- * ```
+ * Maintains the same UniFFI interface as the real implementation so the
+ * macOS shell compiles unchanged. All inference methods return a placeholder
+ * message indicating that on-device inference is not yet available.
  */
 open class PerceptionService: PerceptionServiceProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -660,10 +606,7 @@ open class PerceptionService: PerceptionServiceProtocol, @unchecked Sendable {
         return try! rustCall { uniffi_eidolons_shared_fn_clone_perceptionservice(self.handle, $0) }
     }
     /**
-     * Creates a new uninitialized perception service.
-     *
-     * This is a cheap operation that does not download any model weights.
-     * Call `initialize()` to download and load the model.
+     * Creates a new perception service stub.
      */
 public convenience init() {
     let handle =
@@ -687,19 +630,7 @@ public convenience init() {
 
     
     /**
-     * Generates a response for the given conversation history.
-     *
-     * # Arguments
-     *
-     * * `messages` - The conversation history as a list of messages
-     *
-     * # Returns
-     *
-     * The generated response string.
-     *
-     * # Errors
-     *
-     * Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
+     * Returns a placeholder response.
      */
 open func chat(messages: [ServiceChatMessage])async throws  -> String  {
     return
@@ -719,19 +650,7 @@ open func chat(messages: [ServiceChatMessage])async throws  -> String  {
 }
     
     /**
-     * Generates a response for the given conversation with streaming output.
-     *
-     * Tokens are streamed through the callback as they are generated,
-     * enabling real-time display in the UI.
-     *
-     * # Arguments
-     *
-     * * `messages` - The conversation history as a list of messages
-     * * `callback` - Callback to receive streaming chunks
-     *
-     * # Errors
-     *
-     * Returns `PerceptionError::NotInitialized` if `initialize()` hasn't been called.
+     * Sends a single placeholder chunk and completes.
      */
 open func chatStreaming(messages: [ServiceChatMessage], callback: StreamingCallback)async throws   {
     return
@@ -751,15 +670,7 @@ open func chatStreaming(messages: [ServiceChatMessage], callback: StreamingCallb
 }
     
     /**
-     * Initializes the service by downloading and loading the model.
-     *
-     * This spawns a dedicated inference thread that owns the model,
-     * enabling GPU acceleration without thread-safety constraints.
-     *
-     * # Errors
-     *
-     * Returns `PerceptionError::AlreadyInitialized` if called twice.
-     * Returns `PerceptionError::LoadFailed` if model download or loading fails.
+     * Stub initialize — always succeeds immediately.
      */
 open func initialize()async throws   {
     return
@@ -779,7 +690,7 @@ open func initialize()async throws   {
 }
     
     /**
-     * Returns whether the model is initialized and ready for inference.
+     * Returns whether the service has been initialized.
      */
 open func isReady()async  -> Bool  {
     return
@@ -800,9 +711,7 @@ open func isReady()async  -> Bool  {
 }
     
     /**
-     * Returns model configuration information if initialized.
-     *
-     * Returns a JSON string with model details, or an error if not initialized.
+     * Returns stub model info.
      */
 open func modelInfo()async throws  -> String  {
     return
@@ -1436,22 +1345,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_eidolons_shared_checksum_func_view() != 29235) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_eidolons_shared_checksum_method_perceptionservice_chat() != 9735) {
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_chat() != 44570) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_eidolons_shared_checksum_method_perceptionservice_chat_streaming() != 44418) {
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_chat_streaming() != 14334) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_eidolons_shared_checksum_method_perceptionservice_initialize() != 39172) {
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_initialize() != 65523) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_eidolons_shared_checksum_method_perceptionservice_is_ready() != 2554) {
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_is_ready() != 23830) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_eidolons_shared_checksum_method_perceptionservice_model_info() != 57901) {
+    if (uniffi_eidolons_shared_checksum_method_perceptionservice_model_info() != 47616) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_eidolons_shared_checksum_constructor_perceptionservice_new() != 33440) {
+    if (uniffi_eidolons_shared_checksum_constructor_perceptionservice_new() != 9518) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_eidolons_shared_checksum_method_streamingcallback_on_chunk() != 42735) {
