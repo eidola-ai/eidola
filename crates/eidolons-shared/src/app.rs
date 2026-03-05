@@ -5,7 +5,6 @@ use crux_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::capabilities::hello::{HelloRequest, HelloResponse, hello};
 use crate::capabilities::perception::{
     ChatMessage, PerceptionRequest, PerceptionResponse, PerceptionStreamingRequest,
     PerceptionStreamingResponse, Role, ask_with_history, ask_with_history_streaming,
@@ -14,11 +13,6 @@ use crate::capabilities::perception::{
 /// Events that can be sent from the shell to the core
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// Request a greeting for the given name
-    Greet(String),
-    /// Response from the hello capability with the greeting
-    #[serde(skip)]
-    GreetingReceived(HelloResponse),
     /// Submit a chat message to the AI (non-streaming)
     SubmitMessage(String),
     /// Submit a chat message to the AI with streaming response
@@ -37,8 +31,6 @@ pub enum Event {
 /// The internal application model (private state)
 #[derive(Default)]
 pub struct Model {
-    /// The greeting from the hello capability
-    greeting: Option<String>,
     /// The conversation history
     pub conversation: Vec<ChatMessage>,
     /// Whether we're waiting for an AI response
@@ -50,8 +42,6 @@ pub struct Model {
 /// The view model exposed to the shell (public view state)
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq, Eq)]
 pub struct ViewModel {
-    /// The greeting message
-    pub greeting: String,
     /// The conversation history
     pub conversation: Vec<ChatMessage>,
     /// Whether we're waiting for an AI response
@@ -65,8 +55,6 @@ pub struct ViewModel {
 pub enum Effect {
     /// Request a render of the current view
     Render(RenderOperation),
-    /// Request the hello capability
-    Hello(HelloRequest),
     /// Request the perception capability (non-streaming)
     Perception(PerceptionRequest),
     /// Request the perception capability with streaming
@@ -91,15 +79,6 @@ impl App for EidolonsApp {
         _caps: &Self::Capabilities,
     ) -> Command<Self::Effect, Self::Event> {
         match event {
-            Event::Greet(name) => {
-                // Request the greeting from the eidolons capability
-                hello(name).then_send(Event::GreetingReceived)
-            }
-            Event::GreetingReceived(response) => {
-                // Store the greeting and trigger a render
-                model.greeting = Some(response.greeting);
-                render()
-            }
             Event::SubmitMessage(message) => {
                 // Add user message to conversation
                 model.conversation.push(ChatMessage {
@@ -188,7 +167,6 @@ impl App for EidolonsApp {
 
     fn view(&self, model: &Self::Model) -> Self::ViewModel {
         ViewModel {
-            greeting: model.greeting.clone().unwrap_or_default(),
             conversation: model.conversation.clone(),
             is_processing: model.is_processing,
             streaming_text: model.streaming_response.clone(),
@@ -200,59 +178,6 @@ impl App for EidolonsApp {
 mod tests {
     use super::*;
     use crux_core::testing::AppTester;
-
-    #[test]
-    fn test_greet_emits_hello_effect() {
-        let app = AppTester::<EidolonsApp>::default();
-        let mut model = Model::default();
-
-        let cmd = app.update(Event::Greet("World".to_string()), &mut model);
-
-        let effect = cmd.expect_one_effect();
-        match effect {
-            Effect::Hello(req) => {
-                assert_eq!(req.operation.name, "World");
-            }
-            _ => panic!("Expected Hello effect"),
-        }
-    }
-
-    #[test]
-    fn test_greeting_received_updates_model() {
-        let app = AppTester::<EidolonsApp>::default();
-        let mut model = Model::default();
-
-        let response = HelloResponse {
-            greeting: "Hello, World!".to_string(),
-        };
-        let cmd = app.update(Event::GreetingReceived(response), &mut model);
-
-        assert_eq!(model.greeting, Some("Hello, World!".to_string()));
-
-        let effect = cmd.expect_one_effect();
-        assert!(matches!(effect, Effect::Render(_)));
-    }
-
-    #[test]
-    fn test_view_returns_greeting() {
-        let app = EidolonsApp;
-        let model = Model {
-            greeting: Some("Hello, Test!".to_string()),
-            ..Default::default()
-        };
-
-        let view = app.view(&model);
-        assert_eq!(view.greeting, "Hello, Test!");
-    }
-
-    #[test]
-    fn test_view_returns_empty_when_no_greeting() {
-        let app = EidolonsApp;
-        let model = Model::default();
-
-        let view = app.view(&model);
-        assert_eq!(view.greeting, "");
-    }
 
     #[test]
     fn test_submit_message_adds_user_message_and_requests_perception() {

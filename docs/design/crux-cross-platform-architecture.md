@@ -91,7 +91,7 @@ Both outputs are committed to the repository and CI-verified for freshness
 ### Capability implementations
 
 Pure Rust crates in `crates/` implement capability logic (e.g.,
-`eidolons-hello`, `eidolons-perception`). These are compiled into
+`eidolons-perception`). These are compiled into
 `eidolons-shared` and re-exported via UniFFI as services that the Swift shell
 can call directly.
 

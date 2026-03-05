@@ -99,15 +99,6 @@ public final class Core {
       let viewBytes = EidolonsShared.view()
       viewModel = try! SharedTypes.ViewModel.bincodeDeserialize(input: [UInt8](viewBytes))
 
-    case .hello(let helloRequest):
-      // Hello capability: call the library and send response back
-      let greeting = EidolonsShared.hello(name: helloRequest.name)
-      let response = SharedTypes.HelloResponse(greeting: greeting)
-      let responseBytes = try! response.bincodeSerialize()
-      let moreRequestBytes = EidolonsShared.handleResponse(
-        id: request.id, data: Data(responseBytes))
-      processRequests(moreRequestBytes)
-
     case .perception(let perceptionRequest):
       // Perception capability: call the AI service asynchronously
       let requestId = request.id

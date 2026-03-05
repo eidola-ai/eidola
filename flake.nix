@@ -32,7 +32,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
 
         # SHA256 for rust-toolchain.toml (single source of truth)
-        rustToolchainSha256 = "sha256-sqSWJDUxc+zaz1nBWMAJKTAGBuGWP25GCftIOlCEAtA=";
+        rustToolchainSha256 = "sha256-SBKjxhC6zHTu0SyJwxLlQHItzMzYZ71VCWQC2hOzpRY=";
 
         # Get the exact Rust toolchain specified in rust-toolchain.toml
         rustToolchain = fenix.packages.${system}.fromToolchainFile {
@@ -202,6 +202,9 @@
         commonArgs = {
           strictDeps = true;
 
+          # Build tools required by native dependencies (e.g., mlx-sys-burn)
+          nativeBuildInputs = [ pkgs.cmake ];
+
           # Deterministic build settings
           CARGO_INCREMENTAL = "false"; # Disable incremental compilation
           SOURCE_DATE_EPOCH = "0"; # Fixed timestamp
@@ -278,7 +281,12 @@
 
         # Build per-package dependencies (only compiles deps that package needs)
         mkPackageDeps =
-          pname: rustTarget: nixCrossSystem:
+          {
+            pname,
+            rustTarget,
+            nixCrossSystem,
+            extraCargoArgs ? "",
+          }:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
             deps = packageDeps.${pname} or [ ];
@@ -292,7 +300,7 @@
               src = filteredSrc;
               pname = "${pname}-deps";
               # Only build deps for this specific package
-              cargoExtraArgs = "-p ${pname}";
+              cargoExtraArgs = "-p ${pname} ${extraCargoArgs}";
             }
           );
 
@@ -303,13 +311,16 @@
             rustTarget,
             nixCrossSystem,
             crateType ? null,
+            extraCargoArgs ? "",
           }:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
             deps = packageDeps.${pname} or [ ];
             relevantCrates = [ pname ] ++ deps;
             filteredSrc = mkFilteredSrc relevantCrates;
-            packageCargoArtifacts = mkPackageDeps pname rustTarget nixCrossSystem;
+            packageCargoArtifacts = mkPackageDeps {
+              inherit pname rustTarget nixCrossSystem extraCargoArgs;
+            };
             cratePath = cratePaths.${pname};
             crateTypeSetup =
               if crateType == null then
@@ -329,7 +340,7 @@
               src = filteredSrc;
               cargoArtifacts = packageCargoArtifacts;
               inherit pname;
-              cargoExtraArgs = "-p ${pname}";
+              cargoExtraArgs = "-p ${pname} ${extraCargoArgs}";
             }
           );
 
@@ -431,12 +442,14 @@
             chmod -R +w .
 
             # Find the dylib (native build, cdylib for uniffi-bindgen-swift)
+            # Built without default features (MLX) since bindings only need the FFI interface
             DYLIB="${
               mkPackage {
                 pname = "eidolons-shared";
                 rustTarget = nativeRustTarget;
                 nixCrossSystem = null;
                 crateType = "cdylib";
+                extraCargoArgs = "--no-default-features";
               }
             }/lib/libeidolons_shared.dylib"
 

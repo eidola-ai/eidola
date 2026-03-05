@@ -326,11 +326,6 @@ void uniffi_eidolons_shared_fn_init_callback_vtable_streamingcallback(const Unif
 RustBuffer uniffi_eidolons_shared_fn_func_handle_response(uint32_t id, RustBuffer data, RustCallStatus *_Nonnull out_status
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_FUNC_HELLO
-#define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_FUNC_HELLO
-RustBuffer uniffi_eidolons_shared_fn_func_hello(RustBuffer name, RustCallStatus *_Nonnull out_status
-);
-#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_FUNC_PROCESS_EVENT
 #define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_FN_FUNC_PROCESS_EVENT
 RustBuffer uniffi_eidolons_shared_fn_func_process_event(RustBuffer data, RustCallStatus *_Nonnull out_status
@@ -605,12 +600,6 @@ void ffi_eidolons_shared_rust_future_complete_void(uint64_t handle, RustCallStat
 #ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_FUNC_HANDLE_RESPONSE
 #define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_FUNC_HANDLE_RESPONSE
 uint16_t uniffi_eidolons_shared_checksum_func_handle_response(void
-    
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_FUNC_HELLO
-#define UNIFFI_FFIDEF_UNIFFI_EIDOLONS_SHARED_CHECKSUM_FUNC_HELLO
-uint16_t uniffi_eidolons_shared_checksum_func_hello(void
     
 );
 #endif

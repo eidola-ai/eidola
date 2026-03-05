@@ -27,8 +27,6 @@ eidolons/
 │   │   │   └── api_doc.rs    # OpenAPI schemas + security modifier (paths collected by OpenApiRouter)
 │   │   ├── schema.sql        # PostgreSQL schema (billing, ACT keys, nullifiers)
 │   │   └── Containerfile     # StageX-based OCI build
-│   ├── eidolons-hello/   # Hello capability (example)
-│   │   └── src/lib.rs
 │   └── eidolons-shared/  # Crux-based shared core (exclusive FFI generator)
 │       ├── src/
 │       │   ├── lib.rs        # FFI bridge (processEvent, handleResponse, view, capabilities)
@@ -118,7 +116,7 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 
 **Key pattern:** The core never performs side-effects directly. It emits Effects that the shell handles, then the shell sends responses back via `handleResponse()`.
 
-**Capability implementations:** Pure Rust crates in `crates/` (e.g., `eidolons-hello`) implement capability logic. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
+**Capability implementations:** Pure Rust crates in `crates/` (e.g., `eidolons-perception`) implement capability logic. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
 
 **Two codegen pipelines:**
 - `uniffi-bindgen-swift` → FFI bridge (`processEvent`, `handleResponse`, `view`)

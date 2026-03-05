@@ -2633,10 +2633,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eidolons-hello"
-version = "0.1.0"
-
-[[package]]
 name = "eidolons-perception"
 version = "0.1.0"
 dependencies = [
@@ -2695,7 +2691,6 @@ version = "0.1.0"
 dependencies = [
  "crux_core",
  "dirs",
- "eidolons-hello",
  "eidolons-perception",
  "futures",
  "serde",

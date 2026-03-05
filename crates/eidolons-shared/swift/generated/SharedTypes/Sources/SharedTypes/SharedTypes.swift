@@ -43,7 +43,6 @@ public struct ChatMessage: Hashable {
 
 indirect public enum Effect: Hashable {
     case render(SharedTypes.RenderOperation)
-    case hello(SharedTypes.HelloRequest)
     case perception(SharedTypes.PerceptionRequest)
     case perceptionStreaming(SharedTypes.PerceptionStreamingRequest)
 
@@ -53,14 +52,11 @@ indirect public enum Effect: Hashable {
         case .render(let x):
             try serializer.serialize_variant_index(value: 0)
             try x.serialize(serializer: serializer)
-        case .hello(let x):
+        case .perception(let x):
             try serializer.serialize_variant_index(value: 1)
             try x.serialize(serializer: serializer)
-        case .perception(let x):
-            try serializer.serialize_variant_index(value: 2)
-            try x.serialize(serializer: serializer)
         case .perceptionStreaming(let x):
-            try serializer.serialize_variant_index(value: 3)
+            try serializer.serialize_variant_index(value: 2)
             try x.serialize(serializer: serializer)
         }
         try serializer.decrease_container_depth()
@@ -81,14 +77,10 @@ indirect public enum Effect: Hashable {
             try deserializer.decrease_container_depth()
             return .render(x)
         case 1:
-            let x = try SharedTypes.HelloRequest.deserialize(deserializer: deserializer)
-            try deserializer.decrease_container_depth()
-            return .hello(x)
-        case 2:
             let x = try SharedTypes.PerceptionRequest.deserialize(deserializer: deserializer)
             try deserializer.decrease_container_depth()
             return .perception(x)
-        case 3:
+        case 2:
             let x = try SharedTypes.PerceptionStreamingRequest.deserialize(deserializer: deserializer)
             try deserializer.decrease_container_depth()
             return .perceptionStreaming(x)
@@ -107,7 +99,6 @@ indirect public enum Effect: Hashable {
 }
 
 indirect public enum Event: Hashable {
-    case greet(String)
     case submitMessage(String)
     case submitMessageStreaming(String)
     case perceptionChunk(String)
@@ -117,22 +108,19 @@ indirect public enum Event: Hashable {
     public func serialize<S: Serializer>(serializer: S) throws {
         try serializer.increase_container_depth()
         switch self {
-        case .greet(let x):
+        case .submitMessage(let x):
             try serializer.serialize_variant_index(value: 0)
             try serializer.serialize_str(value: x)
-        case .submitMessage(let x):
+        case .submitMessageStreaming(let x):
             try serializer.serialize_variant_index(value: 1)
             try serializer.serialize_str(value: x)
-        case .submitMessageStreaming(let x):
+        case .perceptionChunk(let x):
             try serializer.serialize_variant_index(value: 2)
             try serializer.serialize_str(value: x)
-        case .perceptionChunk(let x):
-            try serializer.serialize_variant_index(value: 3)
-            try serializer.serialize_str(value: x)
         case .perceptionStreamComplete:
-            try serializer.serialize_variant_index(value: 4)
+            try serializer.serialize_variant_index(value: 3)
         case .perceptionStreamError(let x):
-            try serializer.serialize_variant_index(value: 5)
+            try serializer.serialize_variant_index(value: 4)
             try serializer.serialize_str(value: x)
         }
         try serializer.decrease_container_depth()
@@ -151,23 +139,19 @@ indirect public enum Event: Hashable {
         case 0:
             let x = try deserializer.deserialize_str()
             try deserializer.decrease_container_depth()
-            return .greet(x)
+            return .submitMessage(x)
         case 1:
             let x = try deserializer.deserialize_str()
             try deserializer.decrease_container_depth()
-            return .submitMessage(x)
+            return .submitMessageStreaming(x)
         case 2:
             let x = try deserializer.deserialize_str()
             try deserializer.decrease_container_depth()
-            return .submitMessageStreaming(x)
-        case 3:
-            let x = try deserializer.deserialize_str()
-            try deserializer.decrease_container_depth()
             return .perceptionChunk(x)
-        case 4:
+        case 3:
             try deserializer.decrease_container_depth()
             return .perceptionStreamComplete
-        case 5:
+        case 4:
             let x = try deserializer.deserialize_str()
             try deserializer.decrease_container_depth()
             return .perceptionStreamError(x)
@@ -176,78 +160,6 @@ indirect public enum Event: Hashable {
     }
 
     public static func bincodeDeserialize(input: [UInt8]) throws -> Event {
-        let deserializer = BincodeDeserializer.init(input: input);
-        let obj = try deserialize(deserializer: deserializer)
-        if deserializer.get_buffer_offset() < input.count {
-            throw DeserializationError.invalidInput(issue: "Some input bytes were not read")
-        }
-        return obj
-    }
-}
-
-public struct HelloRequest: Hashable {
-    @Indirect public var name: String
-
-    public init(name: String) {
-        self.name = name
-    }
-
-    public func serialize<S: Serializer>(serializer: S) throws {
-        try serializer.increase_container_depth()
-        try serializer.serialize_str(value: self.name)
-        try serializer.decrease_container_depth()
-    }
-
-    public func bincodeSerialize() throws -> [UInt8] {
-        let serializer = BincodeSerializer.init();
-        try self.serialize(serializer: serializer)
-        return serializer.get_bytes()
-    }
-
-    public static func deserialize<D: Deserializer>(deserializer: D) throws -> HelloRequest {
-        try deserializer.increase_container_depth()
-        let name = try deserializer.deserialize_str()
-        try deserializer.decrease_container_depth()
-        return HelloRequest.init(name: name)
-    }
-
-    public static func bincodeDeserialize(input: [UInt8]) throws -> HelloRequest {
-        let deserializer = BincodeDeserializer.init(input: input);
-        let obj = try deserialize(deserializer: deserializer)
-        if deserializer.get_buffer_offset() < input.count {
-            throw DeserializationError.invalidInput(issue: "Some input bytes were not read")
-        }
-        return obj
-    }
-}
-
-public struct HelloResponse: Hashable {
-    @Indirect public var greeting: String
-
-    public init(greeting: String) {
-        self.greeting = greeting
-    }
-
-    public func serialize<S: Serializer>(serializer: S) throws {
-        try serializer.increase_container_depth()
-        try serializer.serialize_str(value: self.greeting)
-        try serializer.decrease_container_depth()
-    }
-
-    public func bincodeSerialize() throws -> [UInt8] {
-        let serializer = BincodeSerializer.init();
-        try self.serialize(serializer: serializer)
-        return serializer.get_bytes()
-    }
-
-    public static func deserialize<D: Deserializer>(deserializer: D) throws -> HelloResponse {
-        try deserializer.increase_container_depth()
-        let greeting = try deserializer.deserialize_str()
-        try deserializer.decrease_container_depth()
-        return HelloResponse.init(greeting: greeting)
-    }
-
-    public static func bincodeDeserialize(input: [UInt8]) throws -> HelloResponse {
         let deserializer = BincodeDeserializer.init(input: input);
         let obj = try deserialize(deserializer: deserializer)
         if deserializer.get_buffer_offset() < input.count {
@@ -538,13 +450,11 @@ indirect public enum Role: Hashable {
 }
 
 public struct ViewModel: Hashable {
-    @Indirect public var greeting: String
     @Indirect public var conversation: [SharedTypes.ChatMessage]
     @Indirect public var is_processing: Bool
     @Indirect public var streaming_text: String
 
-    public init(greeting: String, conversation: [SharedTypes.ChatMessage], is_processing: Bool, streaming_text: String) {
-        self.greeting = greeting
+    public init(conversation: [SharedTypes.ChatMessage], is_processing: Bool, streaming_text: String) {
         self.conversation = conversation
         self.is_processing = is_processing
         self.streaming_text = streaming_text
@@ -552,7 +462,6 @@ public struct ViewModel: Hashable {
 
     public func serialize<S: Serializer>(serializer: S) throws {
         try serializer.increase_container_depth()
-        try serializer.serialize_str(value: self.greeting)
         try serialize_vector_ChatMessage(value: self.conversation, serializer: serializer)
         try serializer.serialize_bool(value: self.is_processing)
         try serializer.serialize_str(value: self.streaming_text)
@@ -567,12 +476,11 @@ public struct ViewModel: Hashable {
 
     public static func deserialize<D: Deserializer>(deserializer: D) throws -> ViewModel {
         try deserializer.increase_container_depth()
-        let greeting = try deserializer.deserialize_str()
         let conversation = try deserialize_vector_ChatMessage(deserializer: deserializer)
         let is_processing = try deserializer.deserialize_bool()
         let streaming_text = try deserializer.deserialize_str()
         try deserializer.decrease_container_depth()
-        return ViewModel.init(greeting: greeting, conversation: conversation, is_processing: is_processing, streaming_text: streaming_text)
+        return ViewModel.init(conversation: conversation, is_processing: is_processing, streaming_text: streaming_text)
     }
 
     public static func bincodeDeserialize(input: [UInt8]) throws -> ViewModel {
