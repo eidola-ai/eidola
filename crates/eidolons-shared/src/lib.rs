@@ -2,7 +2,11 @@ pub mod app;
 
 use std::sync::LazyLock;
 
-pub use app::{Effect, EffectFfi, EidolonsApp, Event, Model, ViewModel};
+pub use app::{
+    BalancePoolViewModel, BalancesBody, CheckoutBody, CreateAccountBody, Effect, EffectFfi,
+    EidolonsApp, Event, GetAccountBody, ListPricesBody, Model, PriceBody, PriceViewModel, Screen,
+    ViewModel,
+};
 pub use crux_core::{Core, bridge::Bridge};
 
 uniffi::setup_scaffolding!();
