@@ -16,6 +16,7 @@ WORKDIR /src
 FROM base AS fetch
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY apps/ ./apps/
 COPY crates/ ./crates/
 COPY tools/ ./tools/
 

@@ -28,4 +28,3 @@ core/target/
 .DS_Store
 
 .buildx-cache
-.pgdata

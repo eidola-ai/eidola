@@ -11,7 +11,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./.pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
       - ./crates/eidolons-server/schema.sql:/schema/schema.sql:ro
       - ./crates/eidolons-server/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     healthcheck:
@@ -43,3 +43,6 @@ services:
     environment:
       STRIPE_API_KEY: ${STRIPE_API_KEY}
     command: ["listen", "--forward-to", "http://server:8080/v1/webhooks/stripe"]
+
+volumes:
+  pgdata:

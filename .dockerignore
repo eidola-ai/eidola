@@ -4,9 +4,8 @@
 .env
 result
 result-*
-apps/
+apps/macos/
 docs/
 target/
 *.md
 .buildx-cache
-.pgdata
