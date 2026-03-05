@@ -1,10 +1,6 @@
-//! Consolidated utility functions: calendar, cursor encoding, epoch computation.
+//! Consolidated utility functions: calendar and epoch computation.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use uuid::Uuid;
 
 use crate::error::ServerError;
 
@@ -94,32 +90,6 @@ pub fn system_time_to_iso(t: SystemTime) -> Result<String, ServerError> {
 /// Like `system_time_to_iso` but returns an empty string on error.
 pub fn system_time_to_iso_lossy(t: SystemTime) -> String {
     system_time_to_iso(t).unwrap_or_default()
-}
-
-// ---------------------------------------------------------------------------
-// Cursor encoding (ledger pagination)
-// ---------------------------------------------------------------------------
-
-/// Encode a ledger pagination cursor from `(created_at, id)`.
-pub fn encode_cursor(created_at: SystemTime, id: Uuid) -> Option<String> {
-    let secs = system_time_to_unix_seconds(created_at)?;
-    let plain = format!("{}:{}", secs, id);
-    Some(URL_SAFE_NO_PAD.encode(plain.as_bytes()))
-}
-
-/// Decode a ledger pagination cursor into `(created_at, id)`.
-pub fn decode_cursor(cursor: &str) -> Option<(SystemTime, Uuid)> {
-    let bytes = URL_SAFE_NO_PAD.decode(cursor).ok()?;
-    let plain = String::from_utf8(bytes).ok()?;
-    let (secs_str, id_str) = plain.split_once(':')?;
-    let secs: i64 = secs_str.parse().ok()?;
-    let id = Uuid::parse_str(id_str).ok()?;
-    let ts = if secs >= 0 {
-        UNIX_EPOCH + Duration::from_secs(secs as u64)
-    } else {
-        UNIX_EPOCH.checked_sub(Duration::from_secs((-secs) as u64))?
-    };
-    Some((ts, id))
 }
 
 // ---------------------------------------------------------------------------

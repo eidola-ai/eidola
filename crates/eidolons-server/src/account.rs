@@ -1,7 +1,7 @@
 //! Account management HTTP handlers.
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use base64::Engine;
@@ -14,7 +14,7 @@ use crate::AppState;
 use crate::auth::BasicAuth;
 use crate::db;
 use crate::error::ServerError;
-use crate::helpers::{decode_cursor, encode_cursor, system_time_to_iso, unix_to_iso};
+use crate::helpers::{system_time_to_iso, unix_to_iso};
 use crate::stripe::{CheckoutParams, StripeClient};
 
 // ---------------------------------------------------------------------------
@@ -104,9 +104,6 @@ pub struct BalancePool {
 #[derive(Serialize, ToSchema)]
 pub struct LedgerResponse {
     pub data: Vec<LedgerEntry>,
-    pub has_more: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -123,12 +120,6 @@ pub struct LedgerEntry {
     pub token_credits: Option<i64>,
 }
 
-#[derive(Deserialize)]
-pub struct LedgerQuery {
-    pub reason: Option<String>,
-    pub cursor: Option<String>,
-    pub limit: Option<i64>,
-}
 
 fn default_success_url() -> String {
     "https://eidolons.ai/payment/success".to_string()
@@ -442,11 +433,6 @@ pub async fn get_balances(
     path = "/v1/account/ledger",
     tag = "Linked",
     security(("basic" = [])),
-    params(
-        ("reason" = Option<String>, Query, description = "Comma-separated reason filter"),
-        ("cursor" = Option<String>, Query, description = "Opaque pagination cursor from a previous response"),
-        ("limit" = Option<i64>, Query, description = "Max entries to return (default 50, max 200)"),
-    ),
     responses(
         (status = 200, description = "Ledger entries", body = LedgerResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse)
@@ -455,37 +441,8 @@ pub async fn get_balances(
 pub async fn get_ledger(
     BasicAuth(account_id): BasicAuth,
     State(state): State<AppState>,
-    Query(query): Query<LedgerQuery>,
 ) -> Result<Json<LedgerResponse>, ServerError> {
-    let reasons: Option<Vec<String>> = query
-        .reason
-        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
-
-    let cursor = query.cursor.as_deref().and_then(decode_cursor);
-
-    let limit: i64 = query.limit.unwrap_or(50).clamp(1, 200);
-
-    let rows = db::get_ledger_entries(
-        &state.db_pool,
-        account_id,
-        reasons.as_deref(),
-        cursor,
-        limit,
-    )
-    .await?;
-
-    let has_more = rows.len() as i64 > limit;
-    let rows: Vec<_> = if has_more {
-        rows.into_iter().take(limit as usize).collect()
-    } else {
-        rows
-    };
-
-    let next_cursor = if has_more {
-        rows.last().and_then(|e| encode_cursor(e.created_at, e.id))
-    } else {
-        None
-    };
+    let rows = db::get_ledger_entries(&state.db_pool, account_id).await?;
 
     let data: Vec<LedgerEntry> = rows
         .into_iter()
@@ -503,9 +460,5 @@ pub async fn get_ledger(
         })
         .collect();
 
-    Ok(Json(LedgerResponse {
-        data,
-        has_more,
-        cursor: next_cursor,
-    }))
+    Ok(Json(LedgerResponse { data }))
 }

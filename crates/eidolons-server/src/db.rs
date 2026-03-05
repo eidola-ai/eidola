@@ -4,7 +4,6 @@ use std::time::SystemTime;
 
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres::NoTls;
-use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 use crate::error::ServerError;
@@ -395,58 +394,23 @@ pub struct LedgerEntryRow {
     pub token_credits: Option<i64>,
 }
 
-/// Get ledger entries for an account with optional filtering and cursor pagination.
-///
-/// The cursor is a `(created_at, id)` tuple for keyset pagination, ensuring
-/// stable ordering even when multiple entries share the same timestamp.
+/// Get all ledger entries for an account, sorted by created_at ASC, id ASC.
 pub async fn get_ledger_entries(
     pool: &Pool,
     account_id: Uuid,
-    reasons: Option<&[String]>,
-    cursor: Option<(SystemTime, Uuid)>,
-    limit: i64,
 ) -> Result<Vec<LedgerEntryRow>, ServerError> {
     let client = pool
         .get()
         .await
         .map_err(|e| ServerError::Internal(format!("db pool error: {}", e)))?;
 
-    // Build query dynamically based on optional filters.
-    let mut query = String::from(
-        "SELECT id, delta, reason, expires_at, created_at, token_epoch, token_credits \
-         FROM credit_ledger WHERE account_id = $1",
-    );
-    let mut params: Vec<Box<dyn ToSql + Sync + Send>> = vec![Box::new(account_id)];
-    let mut param_idx = 2u32;
-
-    if let Some(reasons) = reasons {
-        query.push_str(&format!(" AND reason = ANY(${})", param_idx));
-        params.push(Box::new(reasons.to_vec()));
-        param_idx += 1;
-    }
-
-    if let Some((cursor_ts, cursor_id)) = cursor {
-        query.push_str(&format!(
-            " AND (created_at, id) < (${}, ${})",
-            param_idx,
-            param_idx + 1
-        ));
-        params.push(Box::new(cursor_ts));
-        params.push(Box::new(cursor_id));
-        param_idx += 2;
-    }
-
-    let _ = param_idx;
-
-    query.push_str(&format!(
-        " ORDER BY created_at DESC, id DESC LIMIT {}",
-        limit + 1
-    ));
-
-    let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| &**p as _).collect();
-
     let rows = client
-        .query(&query, &param_refs)
+        .query(
+            "SELECT id, delta, reason, expires_at, created_at, token_epoch, token_credits \
+             FROM credit_ledger WHERE account_id = $1 \
+             ORDER BY created_at ASC, id ASC",
+            &[&account_id],
+        )
         .await
         .map_err(|e| ServerError::Internal(format!("ledger query failed: {}", e)))?;
 
