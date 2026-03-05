@@ -1,7 +1,7 @@
 //! Authorization middleware for the Eidolons server.
 //!
-//! Supports Anonymous Credit Tokens (Privacy Pass ACT) for privacy-preserving
-//! rate-limited authorization.
+//! Supports anonymous credentials for privacy-preserving rate-limited
+//! authorization.
 
 use axum::extract::FromRequestParts;
 use axum::http::HeaderValue;
@@ -26,8 +26,8 @@ pub struct AuthContext {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
-    /// Anonymous Credit Token (Privacy Pass ACT).
-    AnonymousCreditToken,
+    /// Anonymous credential for privacy-preserving usage.
+    AnonymousCredential,
     /// No authentication (development only).
     None,
 }
@@ -36,7 +36,7 @@ impl AuthMethod {
     /// Whether requests using this method are linkable across requests.
     pub fn linkable(&self) -> bool {
         match self {
-            AuthMethod::AnonymousCreditToken => false,
+            AuthMethod::AnonymousCredential => false,
             AuthMethod::None => false,
         }
     }
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_auth_method_linkable() {
-        assert!(!AuthMethod::AnonymousCreditToken.linkable());
+        assert!(!AuthMethod::AnonymousCredential.linkable());
         assert!(!AuthMethod::None.linkable());
     }
 }

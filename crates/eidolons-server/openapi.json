@@ -221,6 +221,82 @@
         ]
       }
     },
+    "/v1/account/credentials": {
+      "post": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "`POST /v1/account/credentials` — issue anonymous credentials (authenticated).",
+        "operationId": "issue_credentials",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueCredentialsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Credential issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueCredentialsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient credit balance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Credential issuance not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
     "/v1/account/ledger": {
       "get": {
         "tags": [
@@ -228,36 +304,6 @@
         ],
         "summary": "GET /v1/account/ledger — get credit ledger entries (authenticated).",
         "operationId": "get_ledger",
-        "parameters": [
-          {
-            "name": "reason",
-            "in": "query",
-            "description": "Comma-separated reason filter",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "cursor",
-            "in": "query",
-            "description": "Opaque pagination cursor from a previous response",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "description": "Max entries to return (default 50, max 200)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "description": "Ledger entries",
@@ -327,82 +373,6 @@
           },
           "503": {
             "description": "Stripe not configured",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "basic": []
-          }
-        ]
-      }
-    },
-    "/v1/account/tokens": {
-      "post": {
-        "tags": [
-          "Linked"
-        ],
-        "summary": "`POST /v1/account/tokens` — issue anonymous credit tokens (authenticated).",
-        "operationId": "issue_tokens",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/IssueTokensRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Token issued",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IssueTokensResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Invalid credentials",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "402": {
-            "description": "Insufficient credit balance",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Token issuance not configured",
             "content": {
               "application/json": {
                 "schema": {
@@ -631,7 +601,7 @@
         "type": "string",
         "description": "Supported authorization methods.",
         "enum": [
-          "anonymous_credit_token",
+          "anonymous_credential",
           "none"
         ]
       },
@@ -1254,9 +1224,9 @@
         },
         "additionalProperties": false
       },
-      "IssueTokensRequest": {
+      "IssueCredentialsRequest": {
         "type": "object",
-        "description": "Request body for `POST /v1/account/tokens`.",
+        "description": "Request body for `POST /v1/account/credentials`.",
         "required": [
           "issuance_request",
           "credits"
@@ -1273,9 +1243,9 @@
           }
         }
       },
-      "IssueTokensResponse": {
+      "IssueCredentialsResponse": {
         "type": "object",
-        "description": "Response for `POST /v1/account/tokens`.",
+        "description": "Response for `POST /v1/account/credentials`.",
         "required": [
           "issuance_response",
           "epoch",
@@ -1352,6 +1322,19 @@
           "created_at": {
             "type": "string"
           },
+          "credential_credits": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "credential_epoch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "delta": {
             "type": "integer",
             "format": "int64"
@@ -1368,43 +1351,20 @@
           },
           "reason": {
             "type": "string"
-          },
-          "token_credits": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
-          },
-          "token_epoch": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
         }
       },
       "LedgerResponse": {
         "type": "object",
         "required": [
-          "data",
-          "has_more"
+          "data"
         ],
         "properties": {
-          "cursor": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "data": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/LedgerEntry"
             }
-          },
-          "has_more": {
-            "type": "boolean"
           }
         }
       },
@@ -1782,7 +1742,7 @@
     },
     {
       "name": "Unlinked",
-      "description": "Endpoints authenticated with anonymous credit tokens — usage cannot be linked back to an account."
+      "description": "Endpoints authenticated with anonymous credentials — usage cannot be linked back to an account."
     }
   ]
 }

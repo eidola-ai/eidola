@@ -22,10 +22,10 @@ eidolons/
 │   │   │   ├── response.rs   # Eidolons response types with privacy metadata
 │   │   │   ├── attestation.rs # RedPill TEE attestation signature fetching
 │   │   │   ├── webhook.rs    # Stripe webhook signature verification and event dispatch
-│   │   │   ├── tokens.rs     # ACT issuance: key mgmt, encryption, GET /v1/keys, POST /v1/account/tokens
+│   │   │   ├── credentials.rs # Credential issuance: key mgmt, encryption, GET /v1/keys, POST /v1/account/credentials
 │   │   │   ├── error.rs      # ServerError enum, HTTP status mapping, IntoResponse impl
 │   │   │   └── api_doc.rs    # OpenAPI schemas + security modifier (paths collected by OpenApiRouter)
-│   │   ├── schema.sql        # PostgreSQL schema (billing, ACT keys, nullifiers)
+│   │   ├── schema.sql        # PostgreSQL schema (billing, credential keys, nullifiers)
 │   │   └── Containerfile     # StageX-based OCI build
 │   └── eidolons-shared/  # Crux-based shared core (exclusive FFI generator)
 │       ├── src/
@@ -63,7 +63,7 @@ eidolons/
 
 ## Server Architecture
 
-The server is an OpenAI-compatible proxy that translates requests to upstream AI providers. It includes a billing system with anonymous credit tokens (ACT) for privacy-preserving usage tracking.
+The server is an OpenAI-compatible proxy that translates requests to upstream AI providers. It includes a billing system with anonymous credentials for privacy-preserving usage tracking.
 
 **Current upstream:** RedPill.ai (OpenAI-compatible, routes to various model providers)
 
@@ -92,7 +92,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - `BIND_ADDR` (default: `127.0.0.1:8080`) - Address to bind
 - `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
 - `STRIPE_WEBHOOK_SECRET` (optional) - Stripe webhook signing secret; webhook endpoint returns 503 without it
-- `ACT_MASTER_KEY` (optional) - Hex-encoded 32-byte AES-256 master key for issuer key encryption; token issuance endpoints return 503 without it
+- `CREDENTIAL_MASTER_KEY` (optional) - Hex-encoded 32-byte AES-256 master key for issuer key encryption; credential issuance endpoints return 503 without it
 
 ## Crux Architecture
 
@@ -204,7 +204,7 @@ nix run '.#update-server-openapi'
 | `artifact-manifest.json` | Committed OCI image digests — CI verifies builds match |
 | `crates/eidolons-server/src/helpers.rs` | Consolidated calendar, cursor, epoch utilities |
 | `crates/eidolons-server/Containerfile` | StageX-based OCI image build |
-| `crates/eidolons-server/schema.sql` | PostgreSQL schema (billing, ACT, nullifiers) |
+| `crates/eidolons-server/schema.sql` | PostgreSQL schema (billing, credentials, nullifiers) |
 | `.env.example` | Template for local environment variables |
 | `flake.nix` | Nix: CI checks, Swift codegen, XCFramework builds |
 | `rust-toolchain.toml` | Pinned Rust version and targets |

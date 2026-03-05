@@ -18,7 +18,7 @@ pub mod handlers;
 pub mod helpers;
 pub mod response;
 pub mod stripe;
-pub mod tokens;
+pub mod credentials;
 pub mod types;
 pub mod webhook;
 
@@ -35,8 +35,8 @@ pub struct AppStateInner {
     pub db_pool: deadpool_postgres::Pool,
     pub stripe: Option<stripe::StripeClient>,
     pub stripe_webhook_secret: Option<String>,
-    pub act_master_key: Option<[u8; 32]>,
-    pub act_key_cache: tokens::KeyCache,
+    pub credential_master_key: Option<[u8; 32]>,
+    pub credential_key_cache: credentials::KeyCache,
 }
 
 impl AppState {
@@ -48,8 +48,8 @@ impl AppState {
         db_pool: deadpool_postgres::Pool,
         stripe: Option<stripe::StripeClient>,
         stripe_webhook_secret: Option<String>,
-        act_master_key: Option<[u8; 32]>,
-        act_key_cache: tokens::KeyCache,
+        credential_master_key: Option<[u8; 32]>,
+        credential_key_cache: credentials::KeyCache,
     ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
@@ -59,8 +59,8 @@ impl AppState {
                 db_pool,
                 stripe,
                 stripe_webhook_secret,
-                act_master_key,
-                act_key_cache,
+                credential_master_key,
+                credential_key_cache,
             }),
         }
     }
@@ -87,7 +87,7 @@ pub fn build_router() -> OpenApiRouter<AppState> {
         .routes(routes!(account::create_checkout))
         .routes(routes!(account::get_balances))
         .routes(routes!(account::get_ledger))
-        .routes(routes!(tokens::list_keys))
-        .routes(routes!(tokens::issue_tokens))
+        .routes(routes!(credentials::list_keys))
+        .routes(routes!(credentials::issue_credentials))
         .routes(routes!(webhook::stripe_webhook))
 }

@@ -2,8 +2,8 @@
 -- Targeting PostgreSQL 16+
 --
 -- This schema covers the "identified" side of the system: accounts, payments,
--- credit balances, and ACT provisioning records. It also includes issuer key
--- management and nullifier storage, which serve both the identified and
+-- credit balances, and credential provisioning records. It also includes issuer
+-- key management and nullifier storage, which serve both the identified and
 -- anonymous contexts but require durable persistence.
 
 BEGIN;
@@ -61,7 +61,7 @@ CREATE TABLE credit_ledger (
             'subscription_renewal',
             'purchase',
             'refund',
-            'act_issuance',
+            'credential_issuance',
             'dispute_clawback',
             'dispute_reversal',
             'manual_adjustment'
@@ -69,8 +69,8 @@ CREATE TABLE credit_ledger (
     stripe_event_id TEXT UNIQUE,
     memo            TEXT,
     expires_at      TIMESTAMPTZ,
-    token_epoch     TEXT,
-    token_credits   BIGINT,
+    credential_epoch     TEXT,
+    credential_credits   BIGINT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     -- Stripe-originated entries must carry their event ID for idempotency.
@@ -88,21 +88,21 @@ CREATE TABLE credit_ledger (
     CONSTRAINT delta_sign CHECK (
         reason = 'manual_adjustment'
         OR (reason IN ('subscription_renewal', 'purchase', 'dispute_reversal') AND delta > 0)
-        OR (reason IN ('act_issuance', 'refund', 'dispute_clawback') AND delta < 0)
+        OR (reason IN ('credential_issuance', 'refund', 'dispute_clawback') AND delta < 0)
     ),
 
-    -- token_epoch and token_credits are only set for ACT issuance entries.
-    CONSTRAINT act_issuance_metadata CHECK (
-        (reason = 'act_issuance' AND token_epoch IS NOT NULL AND token_credits IS NOT NULL)
+    -- credential_epoch and credential_credits are only set for credential issuance entries.
+    CONSTRAINT credential_issuance_metadata CHECK (
+        (reason = 'credential_issuance' AND credential_epoch IS NOT NULL AND credential_credits IS NOT NULL)
         OR
-        (reason != 'act_issuance' AND token_epoch IS NULL AND token_credits IS NULL)
+        (reason != 'credential_issuance' AND credential_epoch IS NULL AND credential_credits IS NULL)
     ),
 
-    -- token_credits must equal the absolute value of delta on issuance rows.
+    -- credential_credits must equal the absolute value of delta on issuance rows.
     -- Redundant by construction, but guards against application bugs.
-    CONSTRAINT act_issuance_credits_match CHECK (
-        reason != 'act_issuance'
-        OR token_credits = -delta
+    CONSTRAINT credential_issuance_credits_match CHECK (
+        reason != 'credential_issuance'
+        OR credential_credits = -delta
     )
 );
 
@@ -116,7 +116,7 @@ COMMENT ON TABLE credit_ledger IS
 COMMENT ON COLUMN credit_ledger.delta IS
     'Credit amount in micro-dollars (1 credit = $0.000001). Positive for '
     'credits added (payments, adjustments), negative for credits consumed '
-    '(ACT issuance, refunds, clawbacks). A $20 subscription renewal is +20000000.';
+    '(credential issuance, refunds, clawbacks). A $20 subscription renewal is +20000000.';
 
 COMMENT ON COLUMN credit_ledger.reason IS
     'Informational tag for filtering and auditing. Does not drive business '
@@ -124,7 +124,7 @@ COMMENT ON COLUMN credit_ledger.reason IS
     'subscription_renewal = recurring Stripe subscription payment; '
     'purchase = one-time Stripe purchase (premium pricing, no expiry); '
     'refund = Stripe refund (full or partial), cooperative; '
-    'act_issuance = credits converted into anonymous tokens (the privacy boundary); '
+    'credential_issuance = credits converted into anonymous credentials (the privacy boundary); '
     'dispute_clawback = Stripe dispute/chargeback, adversarial; '
     'dispute_reversal = dispute resolved in our favor; '
     'manual_adjustment = admin correction (positive or negative).';
@@ -144,7 +144,7 @@ COMMENT ON COLUMN credit_ledger.expires_at IS
     'For subscription renewals, set to the billing period end date. '
     'Expired credits are excluded from balance calculations by the query, '
     'not by a cron job. '
-    'For debit entries (act_issuance, refund, dispute_clawback), set to '
+    'For debit entries (credential_issuance, refund, dispute_clawback), set to '
     'match the balance pool being consumed. E.g., if consuming subscription '
     'credits expiring Mar 1, the debit also carries expires_at = Mar 1. '
     'This keeps the expiring vs permanent breakdown accurate.';
@@ -153,15 +153,15 @@ COMMENT ON COLUMN credit_ledger.created_at IS
     'When this ledger entry was created in our system. NOT the upstream event '
     'timestamp — for that, look up the stripe_event_id via Stripe''s API.';
 
-COMMENT ON COLUMN credit_ledger.token_epoch IS
-    'Only set for act_issuance entries. The issuer key epoch (e.g., "2026-03") '
-    'used to sign the token. Allows querying "how many credits were provisioned '
+COMMENT ON COLUMN credit_ledger.credential_epoch IS
+    'Only set for credential_issuance entries. The issuer key epoch (e.g., "2026-03") '
+    'used to sign the credential. Allows querying "how many credits were provisioned '
     'in each epoch" without joining to issuer_key.';
 
-COMMENT ON COLUMN credit_ledger.token_credits IS
-    'Only set for act_issuance entries. The credit amount loaded into the '
-    'issued token. Always equals -delta by constraint. Stored explicitly for '
-    'query convenience ("show me the distribution of token sizes").';
+COMMENT ON COLUMN credit_ledger.credential_credits IS
+    'Only set for credential_issuance entries. The credit amount loaded into the '
+    'issued credential. Always equals -delta by constraint. Stored explicitly for '
+    'query convenience ("show me the distribution of credential sizes").';
 
 -- Primary query path: "what is this account's available balance?"
 CREATE INDEX idx_ledger_account_balance ON credit_ledger (account_id, expires_at)
@@ -190,8 +190,8 @@ CREATE TABLE issuer_key (
 );
 
 COMMENT ON TABLE issuer_key IS
-    'ACT issuer key pairs, rotated monthly. The private key is encrypted at '
-    'rest (application-layer encryption using a TEE-held master key). The '
+    'Credential issuer key pairs, rotated monthly. The private key is encrypted '
+    'at rest (application-layer encryption using a TEE-held master key). The '
     'public key and domain separator are served publicly via GET /v1/keys. '
     'Key epochs align with calendar months to simplify billing period alignment.';
 
@@ -200,28 +200,28 @@ COMMENT ON COLUMN issuer_key.epoch IS
     'target for the nullifier table. Aligns with calendar months.';
 
 COMMENT ON COLUMN issuer_key.private_key_enc IS
-    'AES-256-GCM encrypted ACT private key (Ristretto255 scalar). Decrypted '
-    'only inside the TEE at runtime. The encryption key is derived from the '
-    'TEE''s sealing key.';
+    'AES-256-GCM encrypted credential private key (Ristretto255 scalar). '
+    'Decrypted only inside the TEE at runtime. The encryption key is derived '
+    'from the TEE''s sealing key.';
 
 COMMENT ON COLUMN issuer_key.public_key IS
-    'ACT public key (compressed Ristretto255 point, 32 bytes). Served to '
-    'clients for token verification.';
+    'Credential public key (compressed Ristretto255 point, 32 bytes). Served '
+    'to clients for credential verification.';
 
 COMMENT ON COLUMN issuer_key.domain_separator IS
-    'Full ACT domain separator string, e.g., '
+    'Full domain separator string, e.g., '
     '''ACT-v1:eidolons:inference:production:2026-03''. Included in all '
     'cryptographic operations for domain separation.';
 
 COMMENT ON COLUMN issuer_key.valid_from IS
-    'Start of the period during which new tokens may be issued with this key.';
+    'Start of the period during which new credentials may be issued with this key.';
 
 COMMENT ON COLUMN issuer_key.valid_until IS
-    'End of the issuance window. After this, no new tokens are issued with '
-    'this key, but existing tokens remain spendable until accept_until.';
+    'End of the issuance window. After this, no new credentials are issued with '
+    'this key, but existing credentials remain spendable until accept_until.';
 
 COMMENT ON COLUMN issuer_key.accept_until IS
-    'Grace period end. Tokens signed by this key are accepted for spending '
+    'Grace period end. Credentials signed by this key are accepted for spending '
     'until this timestamp. Typically 2-3 days after valid_until to give '
     'clients time to spend down. Nullifiers for this key can be pruned after '
     'this date.';
@@ -238,9 +238,9 @@ CREATE TABLE nullifier (
 );
 
 COMMENT ON TABLE nullifier IS
-    'Spent ACT token nullifiers. A nullifier must be durably recorded BEFORE '
-    'a refund token is issued to prevent the forking attack (re-spending a '
-    'token with a different amount to create divergent token chains). '
+    'Spent credential nullifiers. A nullifier must be durably recorded BEFORE '
+    'a refund credential is issued to prevent the forking attack (re-spending a '
+    'credential with a different amount to create divergent credential chains). '
     'The compound primary key (epoch, value) partitions nullifiers by key '
     'epoch, enabling efficient bulk pruning once an epoch''s accept_until has '
     'passed. This table lives in the same database as the billing schema for '
@@ -248,7 +248,7 @@ COMMENT ON TABLE nullifier IS
     'it would move to the service environment''s own durable store.';
 
 COMMENT ON COLUMN nullifier.epoch IS
-    'The issuer key epoch under which this token was issued and spent. '
+    'The issuer key epoch under which this credential was issued and spent. '
     'Partitions the nullifier space for lifecycle management.';
 
 COMMENT ON COLUMN nullifier.value IS
@@ -276,8 +276,8 @@ $$;
 
 COMMENT ON FUNCTION available_balance IS
     'Returns the total available credit balance for an account. Used as a '
-    'fast check before ACT provisioning. For the full breakdown (expiring '
-    'vs permanent), query the account_balance view instead.';
+    'fast check before credential provisioning. For the full breakdown '
+    '(expiring vs permanent), query the account_balance view instead.';
 
 CREATE FUNCTION record_nullifier(p_epoch TEXT, p_value BYTEA)
 RETURNS BOOLEAN
@@ -296,7 +296,7 @@ COMMENT ON FUNCTION record_nullifier IS
     'Attempts to record a nullifier. Returns TRUE on success, FALSE if the '
     'nullifier was already recorded (double-spend). Uses the primary key '
     'unique constraint for atomicity — no TOCTOU race. The caller MUST NOT '
-    'issue a refund token unless this function returns TRUE.';
+    'issue a refund credential unless this function returns TRUE.';
 
 CREATE FUNCTION prune_expired_nullifiers()
 RETURNS BIGINT
@@ -316,7 +316,7 @@ $$;
 
 COMMENT ON FUNCTION prune_expired_nullifiers IS
     'Removes nullifiers for key epochs whose accept_until has passed. '
-    'Tokens from these epochs can no longer be spent, so their nullifiers '
+    'Credentials from these epochs can no longer be spent, so their nullifiers '
     'are no longer needed. Returns the number of nullifiers pruned. '
     'Safe to run periodically (e.g., daily) or manually after key rotation.';
 

@@ -36,7 +36,7 @@ utoipa = { version = "5", features = ["uuid"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Anonymous Credit Tokens (Privacy Pass ACT)
+# Anonymous credentials (Privacy Pass)
 anonymous-credit-tokens = "0.4"
 aes-gcm = "0.10"
 hkdf = "0.12"

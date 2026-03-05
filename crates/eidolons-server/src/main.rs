@@ -15,7 +15,7 @@ use eidolons_server::attestation::AttestationClient;
 use eidolons_server::auth::{AnyValidator, NoopValidator};
 use eidolons_server::backend::RedPillBackend;
 use eidolons_server::stripe::StripeClient;
-use eidolons_server::tokens;
+use eidolons_server::credentials;
 
 /// Server configuration.
 struct Config {
@@ -26,7 +26,7 @@ struct Config {
     database_url: String,
     stripe_api_key: Option<String>,
     stripe_webhook_secret: Option<String>,
-    act_master_key: Option<[u8; 32]>,
+    credential_master_key: Option<[u8; 32]>,
 }
 
 impl Config {
@@ -54,15 +54,15 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
-        let act_master_key = std::env::var("ACT_MASTER_KEY")
+        let credential_master_key = std::env::var("CREDENTIAL_MASTER_KEY")
             .ok()
             .filter(|s| !s.is_empty())
             .map(|s| {
-                let bytes =
-                    hex::decode(&s).map_err(|_| "ACT_MASTER_KEY must be valid hex".to_string())?;
+                let bytes = hex::decode(&s)
+                    .map_err(|_| "CREDENTIAL_MASTER_KEY must be valid hex".to_string())?;
                 if bytes.len() != 32 {
                     return Err(
-                        "ACT_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string()
+                        "CREDENTIAL_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string()
                     );
                 }
                 let mut key = [0u8; 32];
@@ -79,7 +79,7 @@ impl Config {
             database_url,
             stripe_api_key,
             stripe_webhook_secret,
-            act_master_key,
+            credential_master_key,
         })
     }
 }
@@ -134,10 +134,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         warn!("STRIPE_WEBHOOK_SECRET not set — webhook endpoint will return 503");
     }
 
-    // ACT key cache
-    let act_key_cache: tokens::KeyCache = Default::default();
-    if config.act_master_key.is_none() {
-        warn!("ACT_MASTER_KEY not set — token issuance endpoints will return 503");
+    // Credential key cache
+    let credential_key_cache: credentials::KeyCache = Default::default();
+    if config.credential_master_key.is_none() {
+        warn!("CREDENTIAL_MASTER_KEY not set — credential issuance endpoints will return 503");
     }
 
     // Create shared state
@@ -151,13 +151,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         db_pool,
         stripe,
         config.stripe_webhook_secret,
-        config.act_master_key,
-        act_key_cache,
+        config.credential_master_key,
+        credential_key_cache,
     );
 
     // Pre-warm the current epoch's issuer key if master key is configured.
-    if let Some(ref mk) = state.act_master_key {
-        match tokens::ensure_current_epoch_key(&state.act_key_cache, mk, &state.db_pool).await {
+    if let Some(ref mk) = state.credential_master_key {
+        match credentials::ensure_current_epoch_key(&state.credential_key_cache, mk, &state.db_pool).await {
             Ok(epoch) => info!("Issuer key ready for epoch {}", epoch),
             Err(e) => warn!("Failed to pre-warm issuer key: {}", e),
         }

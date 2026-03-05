@@ -115,9 +115,9 @@ pub struct LedgerEntry {
     pub expires_at: Option<String>,
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_epoch: Option<String>,
+    pub credential_epoch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_credits: Option<i64>,
+    pub credential_credits: Option<i64>,
 }
 
 
@@ -447,15 +447,15 @@ pub async fn get_ledger(
     let data: Vec<LedgerEntry> = rows
         .into_iter()
         .map(|e| {
-            let is_act = e.reason == "act_issuance";
+            let is_credential = e.reason == "credential_issuance";
             LedgerEntry {
                 id: e.id,
                 delta: e.delta,
                 reason: e.reason,
                 expires_at: e.expires_at.and_then(|t| system_time_to_iso(t).ok()),
                 created_at: system_time_to_iso(e.created_at).unwrap_or_default(),
-                token_epoch: if is_act { e.token_epoch } else { None },
-                token_credits: if is_act { e.token_credits } else { None },
+                credential_epoch: if is_credential { e.credential_epoch } else { None },
+                credential_credits: if is_credential { e.credential_credits } else { None },
             }
         })
         .collect();

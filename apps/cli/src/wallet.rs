@@ -1,4 +1,4 @@
-struct ACT {
+struct Credential {
 
 }
 

@@ -1,4 +1,4 @@
-//! ACT (Anonymous Credit Token) issuance: key management and token endpoints.
+//! Credential issuance: key management and credential endpoints.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -237,18 +237,18 @@ pub struct ListKeysResponse {
     pub data: Vec<IssuerKeyResponse>,
 }
 
-/// Request body for `POST /v1/account/tokens`.
+/// Request body for `POST /v1/account/credentials`.
 #[derive(Deserialize, ToSchema)]
-pub struct IssueTokensRequest {
+pub struct IssueCredentialsRequest {
     /// Base64-encoded CBOR `IssuanceRequest`.
     pub issuance_request: String,
     /// Number of credits to issue.
     pub credits: i64,
 }
 
-/// Response for `POST /v1/account/tokens`.
+/// Response for `POST /v1/account/credentials`.
 #[derive(Serialize, ToSchema)]
-pub struct IssueTokensResponse {
+pub struct IssueCredentialsResponse {
     /// Base64-encoded CBOR `IssuanceResponse`.
     pub issuance_response: String,
     /// Epoch identifier (YYYY-MM).
@@ -292,28 +292,28 @@ pub async fn list_keys(
     Ok(Json(ListKeysResponse { data }))
 }
 
-/// `POST /v1/account/tokens` — issue anonymous credit tokens (authenticated).
+/// `POST /v1/account/credentials` — issue anonymous credentials (authenticated).
 #[utoipa::path(
     post,
-    path = "/v1/account/tokens",
+    path = "/v1/account/credentials",
     tag = "Linked",
-    request_body = IssueTokensRequest,
+    request_body = IssueCredentialsRequest,
     security(("basic" = [])),
     responses(
-        (status = 200, description = "Token issued", body = IssueTokensResponse),
+        (status = 200, description = "Credential issued", body = IssueCredentialsResponse),
         (status = 400, description = "Invalid request", body = crate::types::ErrorResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
         (status = 402, description = "Insufficient credit balance", body = crate::types::ErrorResponse),
-        (status = 503, description = "Token issuance not configured", body = crate::types::ErrorResponse),
+        (status = 503, description = "Credential issuance not configured", body = crate::types::ErrorResponse),
     )
 )]
-pub async fn issue_tokens(
+pub async fn issue_credentials(
     BasicAuth(account_id): BasicAuth,
     State(state): State<AppState>,
-    Json(request): Json<IssueTokensRequest>,
-) -> Result<Json<IssueTokensResponse>, ServerError> {
-    let master_key = state.act_master_key.as_ref().ok_or_else(|| {
-        ServerError::ServiceUnavailable("token issuance is not configured".to_string())
+    Json(request): Json<IssueCredentialsRequest>,
+) -> Result<Json<IssueCredentialsResponse>, ServerError> {
+    let master_key = state.credential_master_key.as_ref().ok_or_else(|| {
+        ServerError::ServiceUnavailable("credential issuance is not configured".to_string())
     })?;
 
     if request.credits <= 0 {
@@ -338,24 +338,31 @@ pub async fn issue_tokens(
             message: format!("invalid credit amount: {}", e),
         })?;
 
-    let epoch = ensure_current_epoch_key(&state.act_key_cache, master_key, &state.db_pool).await?;
+    let epoch =
+        ensure_current_epoch_key(&state.credential_key_cache, master_key, &state.db_pool).await?;
 
-    let ledger_entry_id =
-        match db::insert_act_issuance(&state.db_pool, account_id, request.credits, &epoch).await? {
-            Some(id) => id,
-            None => {
-                let available = db::get_available_balance(&state.db_pool, account_id)
-                    .await
-                    .unwrap_or(0);
-                return Err(ServerError::PaymentRequired {
-                    message: "insufficient balance".to_string(),
-                    available,
-                });
-            }
-        };
+    let ledger_entry_id = match db::insert_credential_issuance(
+        &state.db_pool,
+        account_id,
+        request.credits,
+        &epoch,
+    )
+    .await?
+    {
+        Some(id) => id,
+        None => {
+            let available = db::get_available_balance(&state.db_pool, account_id)
+                .await
+                .unwrap_or(0);
+            return Err(ServerError::PaymentRequired {
+                message: "insufficient balance".to_string(),
+                available,
+            });
+        }
+    };
 
     let issuance_response = {
-        let cache = state.act_key_cache.read().await;
+        let cache = state.credential_key_cache.read().await;
         let key = cache.get(&epoch).ok_or_else(|| {
             ServerError::Internal("epoch key evicted from cache unexpectedly".to_string())
         })?;
@@ -368,7 +375,7 @@ pub async fn issue_tokens(
                 OsRng,
             )
             .map_err(|e| {
-                warn!("ACT issuance failed: {}", e);
+                warn!("credential issuance failed: {}", e);
                 ServerError::BadRequest {
                     message: format!("issuance failed: {}", e),
                 }
@@ -380,11 +387,11 @@ pub async fn issue_tokens(
         .map_err(|e| ServerError::Internal(format!("failed to encode issuance response: {}", e)))?;
 
     info!(
-        "issued ACT: account={}, credits={}, ledger_entry={}",
+        "issued credential: account={}, credits={}, ledger_entry={}",
         account_id, request.credits, ledger_entry_id
     );
 
-    Ok(Json(IssueTokensResponse {
+    Ok(Json(IssueCredentialsResponse {
         issuance_response: URL_SAFE_NO_PAD.encode(&response_cbor),
         epoch,
         credits: request.credits,

@@ -284,16 +284,16 @@ pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, Ser
         .collect())
 }
 
-/// Atomically debit credits from an account for ACT issuance.
+/// Atomically debit credits from an account for credential issuance.
 ///
 /// Returns `Some(ledger_entry_id)` if the debit succeeded, `None` if
 /// the account has insufficient balance. The balance check and debit
 /// happen in a single SQL statement to prevent TOCTOU races.
-pub async fn insert_act_issuance(
+pub async fn insert_credential_issuance(
     pool: &Pool,
     account_id: Uuid,
     credits: i64,
-    token_epoch: &str,
+    credential_epoch: &str,
 ) -> Result<Option<Uuid>, ServerError> {
     let client = pool
         .get()
@@ -303,14 +303,14 @@ pub async fn insert_act_issuance(
     let row = client
         .query_opt(
             "INSERT INTO credit_ledger \
-                (id, account_id, delta, reason, token_epoch, token_credits, created_at) \
-             SELECT gen_random_uuid(), $1, -$2, 'act_issuance', $3, $2, now() \
+                (id, account_id, delta, reason, credential_epoch, credential_credits, created_at) \
+             SELECT gen_random_uuid(), $1, -$2, 'credential_issuance', $3, $2, now() \
              WHERE available_balance($1) >= $2 \
              RETURNING id",
-            &[&account_id, &credits, &token_epoch],
+            &[&account_id, &credits, &credential_epoch],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("act issuance debit failed: {}", e)))?;
+        .map_err(|e| ServerError::Internal(format!("credential issuance debit failed: {}", e)))?;
 
     Ok(row.map(|r| r.get::<_, Uuid>("id")))
 }
@@ -390,8 +390,8 @@ pub struct LedgerEntryRow {
     pub reason: String,
     pub expires_at: Option<SystemTime>,
     pub created_at: SystemTime,
-    pub token_epoch: Option<String>,
-    pub token_credits: Option<i64>,
+    pub credential_epoch: Option<String>,
+    pub credential_credits: Option<i64>,
 }
 
 /// Get all ledger entries for an account, sorted by created_at ASC, id ASC.
@@ -406,7 +406,7 @@ pub async fn get_ledger_entries(
 
     let rows = client
         .query(
-            "SELECT id, delta, reason, expires_at, created_at, token_epoch, token_credits \
+            "SELECT id, delta, reason, expires_at, created_at, credential_epoch, credential_credits \
              FROM credit_ledger WHERE account_id = $1 \
              ORDER BY created_at ASC, id ASC",
             &[&account_id],
@@ -422,8 +422,8 @@ pub async fn get_ledger_entries(
             reason: row.get("reason"),
             expires_at: row.get("expires_at"),
             created_at: row.get("created_at"),
-            token_epoch: row.get("token_epoch"),
-            token_credits: row.get("token_credits"),
+            credential_epoch: row.get("credential_epoch"),
+            credential_credits: row.get("credential_credits"),
         })
         .collect())
 }

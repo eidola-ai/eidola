@@ -26,7 +26,7 @@ use crate::types::{ChatCompletionChunk, ChatCompletionResponse, ChunkChoice, Chu
     tags(
         (name = "Public", description = "Unauthenticated endpoints available to anyone."),
         (name = "Linked", description = "Authenticated endpoints tied to a known account (HTTP Basic auth)."),
-        (name = "Unlinked", description = "Endpoints authenticated with anonymous credit tokens — usage cannot be linked back to an account."),
+        (name = "Unlinked", description = "Endpoints authenticated with anonymous credentials — usage cannot be linked back to an account."),
     ),
     components(schemas(
         // SSE streaming types — not referenced from #[utoipa::path] response
