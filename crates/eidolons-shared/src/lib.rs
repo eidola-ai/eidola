@@ -1,13 +1,9 @@
 pub mod app;
-pub mod capabilities;
-pub mod services;
 
 use std::sync::LazyLock;
 
 pub use app::{Effect, EffectFfi, EidolonsApp, Event, Model, ViewModel};
-pub use capabilities::perception::{ChatMessage, PerceptionRequest, PerceptionResponse, Role};
 pub use crux_core::{Core, bridge::Bridge};
-pub use services::{PerceptionError, PerceptionService, ServiceChatMessage, ServiceRole};
 
 uniffi::setup_scaffolding!();
 
