@@ -3,10 +3,16 @@
 //! Supports Anonymous Credit Tokens (Privacy Pass ACT) for privacy-preserving
 //! rate-limited authorization.
 
-use http::HeaderValue;
+use axum::extract::FromRequestParts;
+use axum::http::HeaderValue;
+use axum::http::header::AUTHORIZATION;
+use axum::http::request::Parts;
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use base64::Engine;
+
+use crate::AppState;
 use crate::error::ServerError;
 
 /// Result of successful token validation.
@@ -88,31 +94,113 @@ impl TokenValidator for NoopValidator {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: extract and validate from a hyper request
+// TokenAuth extractor (for chat completions / metered endpoints)
 // ---------------------------------------------------------------------------
 
-/// Extract the Authorization header and validate it.
-///
-/// For `NoopValidator`, missing headers are accepted.
-/// For other validators, a missing header returns 401.
-pub async fn authenticate(
-    req: &hyper::Request<hyper::body::Incoming>,
-    validator: &AnyValidator,
-) -> Result<AuthContext, ServerError> {
-    match req.headers().get(http::header::AUTHORIZATION) {
-        Some(header) => validator.validate(header).await,
-        None => {
-            // NoopValidator accepts missing headers
-            if matches!(validator, AnyValidator::Noop(_)) {
-                Ok(AuthContext {
-                    method: AuthMethod::None,
-                })
-            } else {
-                Err(ServerError::Unauthorized {
-                    message: "missing Authorization header".to_string(),
-                })
+/// Axum extractor that validates token-based auth (ACT / noop).
+pub struct TokenAuth(pub AuthContext);
+
+impl FromRequestParts<AppState> for TokenAuth {
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        match parts.headers.get(AUTHORIZATION) {
+            Some(header) => {
+                let ctx = state.validator.validate(header).await?;
+                Ok(TokenAuth(ctx))
+            }
+            None => {
+                if matches!(state.validator, AnyValidator::Noop(_)) {
+                    Ok(TokenAuth(AuthContext {
+                        method: AuthMethod::None,
+                    }))
+                } else {
+                    Err(ServerError::Unauthorized {
+                        message: "missing Authorization header".to_string(),
+                    })
+                }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BasicAuth extractor (for account endpoints)
+// ---------------------------------------------------------------------------
+
+/// Axum extractor that validates HTTP Basic auth against the account table.
+///
+/// The username is the account UUID, and the password is the credential secret.
+pub struct BasicAuth(pub uuid::Uuid);
+
+impl FromRequestParts<AppState> for BasicAuth {
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        use argon2::Argon2;
+        use argon2::password_hash::{PasswordHash, PasswordVerifier};
+
+        let header = parts
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| ServerError::Unauthorized {
+                message: "missing authorization header".to_string(),
+            })?;
+
+        let encoded = header
+            .strip_prefix("Basic ")
+            .ok_or_else(|| ServerError::Unauthorized {
+                message: "expected Basic auth".to_string(),
+            })?;
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| ServerError::Unauthorized {
+                message: "invalid base64 in authorization header".to_string(),
+            })?;
+
+        let decoded_str = String::from_utf8(decoded).map_err(|_| ServerError::Unauthorized {
+            message: "invalid utf-8 in authorization header".to_string(),
+        })?;
+
+        let (account_id_str, secret) =
+            decoded_str
+                .split_once(':')
+                .ok_or_else(|| ServerError::Unauthorized {
+                    message: "invalid Basic auth format".to_string(),
+                })?;
+
+        let account_id =
+            uuid::Uuid::parse_str(account_id_str).map_err(|_| ServerError::Unauthorized {
+                message: "invalid account_id".to_string(),
+            })?;
+
+        let account = crate::db::get_account_by_id(&state.db_pool, account_id)
+            .await
+            .map_err(|e| match e {
+                ServerError::NotFound { .. } => ServerError::Unauthorized {
+                    message: "invalid credentials".to_string(),
+                },
+                other => other,
+            })?;
+
+        let parsed_hash = PasswordHash::new(&account.secret_hash)
+            .map_err(|_| ServerError::Internal("corrupt credential hash".to_string()))?;
+
+        Argon2::default()
+            .verify_password(secret.as_bytes(), &parsed_hash)
+            .map_err(|_| ServerError::Unauthorized {
+                message: "invalid credentials".to_string(),
+            })?;
+
+        Ok(BasicAuth(account_id))
     }
 }
 

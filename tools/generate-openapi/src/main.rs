@@ -3,12 +3,15 @@
 //! This binary outputs the OpenAPI JSON specification to stdout.
 //! It is used by the build system to generate the committed openapi.json file.
 
-use eidolons_server::api_doc::ApiDoc;
-use utoipa::OpenApi;
-
 fn main() {
-    let spec = ApiDoc::openapi()
+    // Must install the crypto provider before constructing RedPillBackend (reqwest needs it).
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+
+    // Build the full router so OpenApiRouter collects paths from handler annotations.
+    let (_, spec) = eidolons_server::build_router().split_for_parts();
+
+    let json = spec
         .to_pretty_json()
         .expect("Failed to serialize OpenAPI spec");
-    println!("{}", spec);
+    println!("{}", json);
 }

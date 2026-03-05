@@ -1,6 +1,6 @@
 //! Unified error handling for the Eidolons server.
 
-use hyper::StatusCode;
+use axum::http::StatusCode;
 
 use crate::types::ErrorResponse;
 
@@ -115,3 +115,11 @@ impl std::fmt::Display for ServerError {
 }
 
 impl std::error::Error for ServerError {}
+
+impl axum::response::IntoResponse for ServerError {
+    fn into_response(self) -> axum::response::Response {
+        let status = self.status_code();
+        let body = self.to_error_response();
+        (status, axum::Json(body)).into_response()
+    }
+}

@@ -9,20 +9,22 @@ eidolons/
 ├── crates/           # Rust crates
 │   ├── eidolons-server/  # OpenAI-compatible AI proxy server
 │   │   ├── src/
-│   │   │   ├── main.rs       # HTTP server (hyper + tokio), routing, Config, AppState
-│   │   │   ├── lib.rs        # Module declarations
-│   │   │   ├── account.rs    # Account handlers, Basic auth (Argon2id)
+│   │   │   ├── main.rs       # HTTP server (axum + tokio), Config, serves OpenApiRouter
+│   │   │   ├── lib.rs        # Module declarations, AppState (Clone via Arc), build_router()
+│   │   │   ├── handlers.rs   # Core handlers: health, models, chat completions (axum extractors)
+│   │   │   ├── helpers.rs    # Consolidated utilities: calendar, cursor encoding, epoch computation
+│   │   │   ├── account.rs    # Account handlers (axum extractors)
 │   │   │   ├── db.rs         # Database pool (deadpool-postgres) and query helpers
 │   │   │   ├── stripe.rs     # Thin Stripe API client (checkout, subscriptions, portal)
-│   │   │   ├── auth.rs       # Token auth (AnyValidator dispatch for chat completions)
+│   │   │   ├── auth.rs       # TokenAuth + BasicAuth extractors, AnyValidator dispatch
 │   │   │   ├── backend.rs    # ChatBackend trait and RedPill.ai implementation
 │   │   │   ├── types.rs      # OpenAI API request/response types
 │   │   │   ├── response.rs   # Eidolons response types with privacy metadata
 │   │   │   ├── attestation.rs # RedPill TEE attestation signature fetching
 │   │   │   ├── webhook.rs    # Stripe webhook signature verification and event dispatch
 │   │   │   ├── tokens.rs     # ACT issuance: key mgmt, encryption, GET /v1/keys, POST /v1/account/tokens
-│   │   │   ├── error.rs      # ServerError enum and HTTP status mapping
-│   │   │   └── api_doc.rs    # OpenAPI spec generation (utoipa)
+│   │   │   ├── error.rs      # ServerError enum, HTTP status mapping, IntoResponse impl
+│   │   │   └── api_doc.rs    # OpenAPI schemas + security modifier (paths collected by OpenApiRouter)
 │   │   ├── schema.sql        # PostgreSQL schema (billing, ACT keys, nullifiers)
 │   │   └── Containerfile     # StageX-based OCI build
 │   ├── eidolons-hello/   # Hello capability (example)
@@ -71,11 +73,12 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 **Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidolons-server` and `ghcr.io/<owner>/eidolons-postgres`.
 
 **Key design decisions:**
+- Axum-based HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration
 - Pure Rust TLS via `rustls-rustcrypto` (no C dependencies)
 - Statically linked musl binaries for Linux deployment
 - StageX-based OCI images (reproducible, `FROM scratch`, runs as non-root)
 - Request-based (no sessions/caching in the proxy layer)
-- Account auth (Basic + Argon2id) is separate from chat completions auth (AnyValidator/ACT)
+- Account auth (Basic + Argon2id) via `BasicAuth` extractor, chat completions auth via `TokenAuth` extractor
 - Stripe integration via thin `reqwest` wrapper (no `async-stripe` dependency)
 
 **API endpoints:** Defined in `crates/eidolons-server/openapi.json` (generated from utoipa annotations — see Conventions).
@@ -177,6 +180,7 @@ nix run '.#update-server-openapi'
 | `compose.yaml` | Dev environment: postgres + server + stripe-cli (test profile) |
 | `docker-bake.hcl` | Reproducible OCI build settings (overlays compose.yaml) |
 | `artifact-manifest.json` | Committed OCI image digests — CI verifies builds match |
+| `crates/eidolons-server/src/helpers.rs` | Consolidated calendar, cursor, epoch utilities |
 | `crates/eidolons-server/Containerfile` | StageX-based OCI image build |
 | `crates/eidolons-server/schema.sql` | PostgreSQL schema (billing, ACT, nullifiers) |
 | `.env.example` | Template for local environment variables |
@@ -215,7 +219,7 @@ Architecture decisions are recorded in [`docs/design/`](docs/design/). See the
 - Nix is used for CI quality gates and Swift/XCFramework builds, not daily Rust development
 - `rustup` + `rust-toolchain.toml` manages the Rust toolchain for development
 - OpenAI API format as the canonical interface
-- Server API is documented via utoipa `#[utoipa::path]` annotations in `api_doc.rs` and `ToSchema` derives on request/response types. When adding or changing server endpoints, update the annotations and run `just update-openapi` to regenerate the committed `openapi.json`
+- Server API is documented via utoipa `#[utoipa::path]` annotations on handler functions and `ToSchema` derives on request/response types. `OpenApiRouter` (in `lib.rs::build_router()`) collects paths and recursively discovers schemas automatically — only SSE streaming types that aren't referenced from path annotations are listed manually in `api_doc.rs`. When adding or changing server endpoints, add the annotation on the handler and register it in `build_router()` via `routes!()`, then run `just update-openapi` to regenerate the committed `openapi.json`
 - Deterministic builds (no timestamps, fixed codegen)
 - `artifact-manifest.json` records expected OCI digests; CI verifies builds match and suggests updates on PRs
 - Before committing, ensure `README.md` and `AGENTS.md` are updated to reflect any changes (new files, endpoints, env vars, build commands, etc.)

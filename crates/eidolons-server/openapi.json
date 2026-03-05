@@ -22,7 +22,7 @@
     "/health": {
       "get": {
         "tags": [
-          "openapi_paths"
+          "Public"
         ],
         "summary": "Health check endpoint.",
         "operationId": "health",
@@ -46,10 +46,9 @@
     "/v1/account": {
       "get": {
         "tags": [
-          "openapi_paths"
+          "Linked"
         ],
-        "summary": "Get account information.",
-        "description": "Requires HTTP Basic auth (account_id:secret).",
+        "summary": "GET /v1/account — retrieve account info (authenticated).",
         "operationId": "get_account",
         "responses": {
           "200": {
@@ -81,10 +80,9 @@
       },
       "post": {
         "tags": [
-          "openapi_paths"
+          "Linked"
         ],
-        "summary": "Create a new account.",
-        "description": "Returns the account ID and credential secret. The credential secret is\nreturned exactly once and never stored in plaintext.",
+        "summary": "POST /v1/account — create a new account.",
         "operationId": "create_account",
         "responses": {
           "201": {
@@ -113,10 +111,9 @@
     "/v1/account/balances": {
       "get": {
         "tags": [
-          "openapi_paths"
+          "Linked"
         ],
-        "summary": "Get account balance breakdown.",
-        "description": "Returns the total available balance and per-pool breakdown.\nRequires HTTP Basic auth.",
+        "summary": "GET /v1/account/balances — get credit balance breakdown (authenticated).",
         "operationId": "get_balances",
         "responses": {
           "200": {
@@ -150,10 +147,10 @@
     "/v1/account/checkout": {
       "post": {
         "tags": [
-          "openapi_paths"
+          "Linked"
         ],
-        "summary": "Create a checkout session.",
-        "description": "Accepts any active Stripe price ID. Automatically determines whether to\ncreate a subscription or one-time payment checkout based on the price type.\nFor subscription prices, fails with 409 if the account already has an\nactive subscription. Requires HTTP Basic auth.",
+        "summary": "POST /v1/account/checkout — create a checkout session (authenticated).",
+        "description": "Accepts any active Stripe price ID. Automatically determines whether to\ncreate a subscription or one-time payment checkout based on the price type.\nFor subscription prices, enforces the one-active-subscription constraint.",
         "operationId": "create_checkout",
         "requestBody": {
           "content": {
@@ -227,10 +224,9 @@
     "/v1/account/ledger": {
       "get": {
         "tags": [
-          "openapi_paths"
+          "Linked"
         ],
-        "summary": "Get credit ledger entries.",
-        "description": "Returns paginated ledger entries with optional filtering by reason type.\nRequires HTTP Basic auth.",
+        "summary": "GET /v1/account/ledger — get credit ledger entries (authenticated).",
         "operationId": "get_ledger",
         "parameters": [
           {
@@ -294,10 +290,9 @@
     "/v1/account/subscription": {
       "get": {
         "tags": [
-          "openapi_paths"
+          "Linked"
         ],
-        "summary": "Get subscription details.",
-        "description": "Returns the active subscription and a Stripe portal URL for management.\nRequires HTTP Basic auth.",
+        "summary": "GET /v1/account/subscription — get subscription details (authenticated).",
         "operationId": "get_subscription",
         "responses": {
           "200": {
@@ -351,10 +346,9 @@
     "/v1/account/tokens": {
       "post": {
         "tags": [
-          "openapi_paths"
+          "Linked"
         ],
-        "summary": "Issue anonymous credit tokens.",
-        "description": "Atomically debits the account's credit balance and issues a signed\nanonymous credit token. The issuance request and response use CBOR\nencoding (base64url-no-pad). Requires HTTP Basic auth.",
+        "summary": "`POST /v1/account/tokens` — issue anonymous credit tokens (authenticated).",
         "operationId": "issue_tokens",
         "requestBody": {
           "content": {
@@ -428,7 +422,7 @@
     "/v1/chat/completions": {
       "post": {
         "tags": [
-          "openapi_paths"
+          "Unlinked"
         ],
         "summary": "Create a chat completion.",
         "description": "Proxies the request to the configured backend and returns a response\nenriched with privacy and verification metadata.",
@@ -490,10 +484,9 @@
     "/v1/keys": {
       "get": {
         "tags": [
-          "openapi_paths"
+          "Public"
         ],
-        "summary": "List valid issuer public keys.",
-        "description": "Returns public keys for all epochs whose tokens are still accepted.\nClients use these to determine which key to request issuance under.",
+        "summary": "`GET /v1/keys` — list valid issuer public keys (unauthenticated).",
         "operationId": "list_keys",
         "responses": {
           "200": {
@@ -512,7 +505,7 @@
     "/v1/models": {
       "get": {
         "tags": [
-          "openapi_paths"
+          "Public"
         ],
         "summary": "List available models.",
         "operationId": "list_models",
@@ -543,10 +536,9 @@
     "/v1/prices": {
       "get": {
         "tags": [
-          "openapi_paths"
+          "Public"
         ],
-        "summary": "List available prices.",
-        "description": "Returns all active prices from Stripe with product details.",
+        "summary": "GET /v1/prices — list available prices.",
         "operationId": "list_prices",
         "responses": {
           "200": {
@@ -575,10 +567,9 @@
     "/v1/webhooks/stripe": {
       "post": {
         "tags": [
-          "openapi_paths"
+          "Linked"
         ],
-        "summary": "Stripe webhook endpoint.",
-        "description": "Receives and processes Stripe webhook events. Verifies the webhook\nsignature before processing. Always returns 200 except for signature\nverification failures.",
+        "summary": "POST /v1/webhooks/stripe",
         "operationId": "stripe_webhook",
         "responses": {
           "200": {
@@ -1274,11 +1265,11 @@
           "credits": {
             "type": "integer",
             "format": "int64",
-            "description": "Number of micro-dollar credits to load into the token. Must be > 0."
+            "description": "Number of credits to issue."
           },
           "issuance_request": {
             "type": "string",
-            "description": "Base64-encoded CBOR `IssuanceRequest` from the client."
+            "description": "Base64-encoded CBOR `IssuanceRequest`."
           }
         }
       },
@@ -1295,11 +1286,11 @@
           "credits": {
             "type": "integer",
             "format": "int64",
-            "description": "Credits loaded into the token."
+            "description": "Number of credits issued."
           },
           "epoch": {
             "type": "string",
-            "description": "The epoch of the issuer key used."
+            "description": "Epoch identifier (YYYY-MM)."
           },
           "issuance_response": {
             "type": "string",
@@ -1699,13 +1690,6 @@
           }
         }
       },
-      "TeeType": {
-        "type": "string",
-        "description": "The type of Trusted Execution Environment backing a model.",
-        "enum": [
-          "phala_gpu"
-        ]
-      },
       "TransportInfo": {
         "type": "object",
         "description": "Transport security information.",
@@ -1786,5 +1770,19 @@
         "description": "Account credentials. Username is the account UUID, password is the secret returned at account creation."
       }
     }
-  }
+  },
+  "tags": [
+    {
+      "name": "Public",
+      "description": "Unauthenticated endpoints available to anyone."
+    },
+    {
+      "name": "Linked",
+      "description": "Authenticated endpoints tied to a known account (HTTP Basic auth)."
+    },
+    {
+      "name": "Unlinked",
+      "description": "Endpoints authenticated with anonymous credit tokens — usage cannot be linked back to an account."
+    }
+  ]
 }

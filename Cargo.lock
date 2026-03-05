@@ -2663,6 +2663,7 @@ dependencies = [
  "aes-gcm",
  "anonymous-credit-tokens",
  "argon2",
+ "axum",
  "base64 0.22.1",
  "bytes",
  "deadpool-postgres",
@@ -2670,10 +2671,6 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
  "rand_core 0.6.4",
  "reqwest",
  "rustls",
@@ -2688,6 +2685,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "utoipa",
+ "utoipa-axum",
  "uuid",
 ]
 
@@ -3436,7 +3434,8 @@ name = "generate-openapi"
 version = "0.1.0"
 dependencies = [
  "eidolons-server",
- "utoipa",
+ "rustls",
+ "rustls-rustcrypto",
 ]
 
 [[package]]
@@ -8112,6 +8111,19 @@ dependencies = [
  "serde",
  "serde_json",
  "utoipa-gen",
+]
+
+[[package]]
+name = "utoipa-axum"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c25bae5bccc842449ec0c5ddc5cbb6a3a1eaeac4503895dc105a1138f8234a0"
+dependencies = [
+ "axum",
+ "paste",
+ "tower-layer",
+ "tower-service",
+ "utoipa",
 ]
 
 [[package]]

@@ -1,22 +1,23 @@
 //! Stripe webhook handling: signature verification and event dispatch.
 
-use std::convert::Infallible;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::Json;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use bytes::Bytes;
 use deadpool_postgres::Pool;
 use hmac::{Hmac, Mac};
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::{Request, Response, StatusCode};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
+use crate::AppState;
 use crate::db;
+use crate::error::ServerError;
 use crate::stripe::StripeClient;
 
-type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Maximum age for a webhook signature (5 minutes).
@@ -55,14 +56,12 @@ fn verify_signature_at(
     let timestamp = timestamp.ok_or("missing timestamp")?;
     let signature = signature.ok_or("missing v1 signature")?;
 
-    // Check staleness.
     let ts_secs: u64 = timestamp.parse().map_err(|_| "invalid timestamp")?;
     let event_time = UNIX_EPOCH + Duration::from_secs(ts_secs);
     if now.duration_since(event_time).unwrap_or(Duration::MAX) > MAX_SIGNATURE_AGE {
         return Err("stale timestamp");
     }
 
-    // Compute expected HMAC.
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| "invalid webhook secret")?;
     mac.update(timestamp.as_bytes());
@@ -70,10 +69,8 @@ fn verify_signature_at(
     mac.update(body);
     let expected = mac.finalize().into_bytes();
 
-    // Decode the provided hex signature.
     let provided = hex::decode(signature).map_err(|_| "invalid hex signature")?;
 
-    // Constant-time comparison.
     if expected.as_slice().ct_eq(&provided).into() {
         Ok(())
     } else {
@@ -102,10 +99,6 @@ struct StripeEventData {
 // Webhook outcome
 // ---------------------------------------------------------------------------
 
-/// Signals whether a webhook handler failure is retryable.
-///
-/// `Handled` → 200 (event processed or permanently unprocessable).
-/// `RetryableError` → 500 (transient failure; Stripe will retry).
 enum WebhookOutcome {
     Handled,
     RetryableError,
@@ -122,15 +115,30 @@ impl WebhookOutcome {
 // ---------------------------------------------------------------------------
 
 /// POST /v1/webhooks/stripe
-pub async fn handle_stripe_webhook(
-    req: Request<Incoming>,
-    pool: &Pool,
-    stripe: &Option<StripeClient>,
-    webhook_secret: &str,
-) -> Response<BoxBody> {
-    // Extract signature header before consuming body.
-    let sig_header = match req
-        .headers()
+#[utoipa::path(
+    post,
+    path = "/v1/webhooks/stripe",
+    tag = "Linked",
+    responses(
+        (status = 200, description = "Event received"),
+        (status = 400, description = "Signature verification failed", body = crate::types::ErrorResponse),
+        (status = 503, description = "Webhook secret not configured", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn stripe_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let webhook_secret = match &state.stripe_webhook_secret {
+        Some(s) => s,
+        None => {
+            return ServerError::ServiceUnavailable("webhook secret is not configured".to_string())
+                .into_response();
+        }
+    };
+
+    let sig_header = match headers
         .get("stripe-signature")
         .and_then(|v| v.to_str().ok())
     {
@@ -138,23 +146,12 @@ pub async fn handle_stripe_webhook(
         None => return bad_request("missing stripe-signature header"),
     };
 
-    // Read raw body.
-    let body_bytes = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            error!("webhook: failed to read body: {}", e);
-            return bad_request("failed to read request body");
-        }
-    };
-
-    // Verify signature.
-    if let Err(reason) = verify_signature(&sig_header, &body_bytes, webhook_secret) {
+    if let Err(reason) = verify_signature(&sig_header, &body, webhook_secret) {
         warn!("webhook: signature verification failed: {}", reason);
         return bad_request(&format!("signature verification failed: {}", reason));
     }
 
-    // Parse event.
-    let event: StripeEvent = match serde_json::from_slice(&body_bytes) {
+    let event: StripeEvent = match serde_json::from_slice(&body) {
         Ok(e) => e,
         Err(e) => {
             error!("webhook: failed to parse event: {}", e);
@@ -164,10 +161,11 @@ pub async fn handle_stripe_webhook(
 
     info!("webhook: received {} ({})", event.event_type, event.id);
 
-    // Dispatch by event type.
     let outcome = match event.event_type.as_str() {
-        "checkout.session.completed" => handle_checkout_completed(&event, pool, stripe).await,
-        "invoice.paid" => handle_invoice_paid(&event, pool, stripe).await,
+        "checkout.session.completed" => {
+            handle_checkout_completed(&event, &state.db_pool, &state.stripe).await
+        }
+        "invoice.paid" => handle_invoice_paid(&event, &state.db_pool, &state.stripe).await,
         "customer.subscription.deleted" => {
             info!(
                 "webhook: subscription deleted (event {}), no ledger action",
@@ -175,9 +173,9 @@ pub async fn handle_stripe_webhook(
             );
             WebhookOutcome::Handled
         }
-        "charge.refunded" => handle_charge_refunded(&event, pool).await,
-        "charge.dispute.created" => handle_dispute_created(&event, pool).await,
-        "charge.dispute.closed" => handle_dispute_closed(&event, pool).await,
+        "charge.refunded" => handle_charge_refunded(&event, &state.db_pool).await,
+        "charge.dispute.created" => handle_dispute_created(&event, &state.db_pool).await,
+        "charge.dispute.closed" => handle_dispute_closed(&event, &state.db_pool).await,
         _ => {
             info!(
                 "webhook: ignoring unhandled event type {}",
@@ -230,7 +228,6 @@ async fn handle_checkout_completed(
         }
     };
 
-    // Look up account by stripe customer.
     let account = match db::get_account_by_stripe_customer(pool, customer_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {
@@ -249,7 +246,6 @@ async fn handle_checkout_completed(
         }
     };
 
-    // Fetch line items to find the product, then read credits from product metadata.
     let stripe = match stripe.as_ref() {
         Some(s) => s,
         None => {
@@ -303,7 +299,6 @@ async fn handle_checkout_completed(
         }
     };
 
-    // Purchases expire after 1 year.
     let expires_at = SystemTime::now() + Duration::from_secs(365 * 24 * 3600);
 
     match db::insert_credit_ledger(
@@ -369,8 +364,6 @@ async fn handle_invoice_paid(
         }
     };
 
-    // Extract the product ID and period from the first line item.
-    // Stripe's current API nests it under pricing.price_details.product.
     let lines = &obj["lines"]["data"];
     let first_line = match lines.as_array().and_then(|arr| arr.first()) {
         Some(line) => line,
@@ -391,7 +384,6 @@ async fn handle_invoice_paid(
         }
     };
 
-    // Fetch the product from Stripe to read credits metadata.
     let stripe = match stripe.as_ref() {
         Some(s) => s,
         None => {
@@ -426,9 +418,7 @@ async fn handle_invoice_paid(
         }
     };
 
-    // expires_at = period end from the first line.
     let period_end = first_line["period"]["end"].as_i64();
-
     let expires_at = period_end.map(|ts| UNIX_EPOCH + Duration::from_secs(ts as u64));
 
     match db::insert_credit_ledger(
@@ -492,7 +482,6 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         }
     };
 
-    // Convert cents to micro-dollars (1 cent = 10,000 micro-dollars).
     let delta = match cents_to_microdollars(amount_refunded).and_then(i64::checked_neg) {
         Some(d) => d,
         None => {
@@ -523,13 +512,9 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
     let obj = &event.data.object;
 
     let customer_id = match obj["charge"].as_str() {
-        Some(_) => {
-            // The dispute object has the customer on the charge, but Stripe
-            // also embeds it directly on newer API versions.
-            obj["customer"]
-                .as_str()
-                .or_else(|| obj["charge_object"]["customer"].as_str())
-        }
+        Some(_) => obj["customer"]
+            .as_str()
+            .or_else(|| obj["charge_object"]["customer"].as_str()),
         None => obj["customer"].as_str(),
     };
 
@@ -567,7 +552,6 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         }
     };
 
-    // Convert cents to micro-dollars.
     let delta = match cents_to_microdollars(amount).and_then(i64::checked_neg) {
         Some(d) => d,
         None => {
@@ -642,7 +626,6 @@ async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutco
         }
     };
 
-    // Reversal: positive delta (credits returned).
     let delta = match cents_to_microdollars(amount) {
         Some(d) => d,
         None => {
@@ -675,37 +658,28 @@ async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutco
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert Stripe cents to micro-dollars with overflow check.
-///
-/// Returns `None` if the multiplication would overflow `i64`.
 fn cents_to_microdollars(cents: i64) -> Option<i64> {
     cents.checked_mul(10_000)
 }
 
-fn internal_error() -> Response<BoxBody> {
-    let body = serde_json::json!({"error": "internal error"}).to_string();
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)).boxed())
-        .unwrap()
+fn internal_error() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "internal error"})),
+    )
+        .into_response()
 }
 
-fn ok_empty() -> Response<BoxBody> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from("{}")).boxed())
-        .unwrap()
+fn ok_empty() -> axum::response::Response {
+    (StatusCode::OK, Json(serde_json::json!({}))).into_response()
 }
 
-fn bad_request(msg: &str) -> Response<BoxBody> {
-    let body = serde_json::json!({"error": msg}).to_string();
-    Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)).boxed())
-        .unwrap()
+fn bad_request(msg: &str) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": msg})),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -777,7 +751,7 @@ mod tests {
 
     #[test]
     fn stale_timestamp() {
-        let ts = now_secs() - 600; // 10 minutes ago
+        let ts = now_secs() - 600;
         let header = make_signature(ts, TEST_BODY, TEST_SECRET);
         let now = UNIX_EPOCH + Duration::from_secs(ts + 600);
         assert_eq!(
@@ -837,12 +811,6 @@ mod tests {
         std::env::var("STRIPE_API_KEY").ok().map(StripeClient::new)
     }
 
-    /// Return the product ID to use in invoice tests.
-    ///
-    /// Set `TEST_STRIPE_PRODUCT_ID` to a Stripe product whose metadata
-    /// contains `credits`.  The integration tests that exercise the full
-    /// invoice flow need this (plus a running Stripe key) to fetch product
-    /// metadata.
     fn test_product_id() -> String {
         std::env::var("TEST_STRIPE_PRODUCT_ID")
             .expect("TEST_STRIPE_PRODUCT_ID must be set for invoice integration tests")
@@ -857,7 +825,7 @@ mod tests {
         let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
         let account_id = create_test_account(&pool, &cust).await;
 
-        let period_end = now_secs() + 30 * 24 * 3600; // 30 days from now
+        let period_end = now_secs() + 30 * 24 * 3600;
         let event = make_event(
             &format!("evt_{}", uuid::Uuid::new_v4()),
             "invoice.paid",
@@ -889,7 +857,6 @@ mod tests {
         let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
         let account_id = create_test_account(&pool, &cust).await;
 
-        // billing_reason="manual" exits before reaching Stripe.
         let event = make_event(
             &format!("evt_{}", uuid::Uuid::new_v4()),
             "invoice.paid",
@@ -914,7 +881,6 @@ mod tests {
         let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
         let account_id = create_test_account(&pool, &cust).await;
 
-        // Pre-credit the account.
         db::insert_credit_ledger(
             &pool,
             account_id,
@@ -938,7 +904,6 @@ mod tests {
         let outcome = handle_charge_refunded(&event, &pool).await;
 
         assert!(!outcome.is_retryable());
-        // 1000 cents = 10,000,000 micro-dollars deducted.
         assert_eq!(get_balance(&pool, account_id).await, 40_000_000);
         assert_eq!(count_ledger_entries(&pool, account_id).await, 2);
     }
@@ -950,7 +915,6 @@ mod tests {
         let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
         let account_id = create_test_account(&pool, &cust).await;
 
-        // Pre-credit.
         db::insert_credit_ledger(
             &pool,
             account_id,
@@ -975,7 +939,6 @@ mod tests {
         let outcome = handle_dispute_created(&event, &pool).await;
 
         assert!(!outcome.is_retryable());
-        // 500 cents = 5,000,000 micro-dollars clawed back.
         assert_eq!(get_balance(&pool, account_id).await, 45_000_000);
         assert_eq!(count_ledger_entries(&pool, account_id).await, 2);
     }
@@ -1000,7 +963,6 @@ mod tests {
         let outcome = handle_dispute_closed(&event, &pool).await;
 
         assert!(!outcome.is_retryable());
-        // 500 cents = 5,000,000 micro-dollars reversed (positive).
         assert_eq!(get_balance(&pool, account_id).await, 5_000_000);
         assert_eq!(count_ledger_entries(&pool, account_id).await, 1);
     }
@@ -1070,7 +1032,6 @@ mod tests {
     async fn orphan_customer_no_panic() {
         let pool = test_pool();
 
-        // Orphan customer exits before reaching Stripe.
         let event = make_event(
             &format!("evt_{}", uuid::Uuid::new_v4()),
             "invoice.paid",
@@ -1081,7 +1042,6 @@ mod tests {
             }),
         );
 
-        // Should not panic — handler logs a warning and returns Handled.
         let outcome = handle_invoice_paid(&event, &pool, &None).await;
         assert!(!outcome.is_retryable());
     }

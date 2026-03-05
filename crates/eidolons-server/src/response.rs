@@ -263,18 +263,6 @@ pub fn build_verification_metadata(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers for streaming: wrap a ChatCompletionChunk as an SSE event
-// ---------------------------------------------------------------------------
-
-/// Serialize a streaming chunk or metadata event as an SSE data line.
-pub fn sse_data<T: Serialize>(event: &T) -> String {
-    format!("data: {}\n\n", serde_json::to_string(event).unwrap())
-}
-
-/// The final SSE marker.
-pub const SSE_DONE: &str = "data: [DONE]\n\n";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,13 +322,6 @@ mod tests {
 
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"object\":\"eidolons.chat.completion.metadata\""));
-    }
-
-    #[test]
-    fn test_sse_data_formatting() {
-        let data = sse_data(&serde_json::json!({"test": true}));
-        assert!(data.starts_with("data: "));
-        assert!(data.ends_with("\n\n"));
     }
 
     #[test]
