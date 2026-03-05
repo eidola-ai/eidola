@@ -1,4 +1,5 @@
 mod config;
+mod db;
 
 use std::io::IsTerminal;
 

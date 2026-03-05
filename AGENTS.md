@@ -36,8 +36,10 @@ eidolons/
 │       └── Package.swift     # Swift Package exposing EidolonsShared + SharedTypes
 ├── apps/
 │   ├── cli/              # Pure Rust CLI app (iocraft TUI + smol async)
+│   │   ├── schema.sql        # Canonical SQLite schema (wallet, credentials)
 │   │   └── src/
-│   │       └── main.rs       # Crux shell: event loop, effect handling, TUI rendering
+│   │       ├── main.rs       # Crux shell: event loop, effect handling, TUI rendering
+│   │       └── db.rs         # Embedded Turso/libSQL database with migrations
 │   └── macos/            # macOS app (SwiftPM + Xcode wrapper)
 │       ├── Sources/
 │       │   ├── Eidolons/         # SwiftUI shell (Core.swift, ContentView.swift)
@@ -125,6 +127,24 @@ The apps use [Crux](https://redbadger.github.io/crux/) for cross-platform state 
 - `uniffi-bindgen-swift` → FFI bridge (`processEvent`, `handleResponse`, `view`)
 - `crux_core::typegen` → Domain types (`Event`, `Effect`, `ViewModel`) with bincode serialization
 
+## CLI Database & Migrations
+
+The CLI uses an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidolons/eidolons.db` for local app data (wallet credentials, conversation history, etc.).
+
+**Schema management:**
+- `apps/cli/schema.sql` is the canonical schema — always reflects the current desired state
+- Fresh installs apply `schema.sql` directly via `execute_batch` and set `PRAGMA user_version` to `LATEST_VERSION`
+- Existing databases run incremental migrations in `db.rs` (gated by `user_version`)
+
+**Adding a migration:**
+1. Update `schema.sql` to the new desired state
+2. Add a `MIGRATION_N` constant in `db.rs` with the ALTER/CREATE statements
+3. Add an `if current_version < N` block in `migrate()` that runs the migration and sets `user_version`
+4. Bump `LATEST_VERSION`
+5. Run `cargo test -p eidolons-cli` — the `migrations_match_schema` test structurally compares a fresh-from-schema database against a fully-migrated database (via `PRAGMA table_info`, `PRAGMA index_info`, and view SQL)
+
+**Limitations:** The `turso` crate does not support `ALTER TABLE ALTER COLUMN` (a libSQL C extension). To add `NOT NULL` columns, use `ADD COLUMN ... DEFAULT <value>` — the default persists and must also be declared in `schema.sql` so both paths match.
+
 ## Build Commands
 
 **Prerequisites:** `rustup`, `just`, `docker`
@@ -193,6 +213,8 @@ nix run '.#update-server-openapi'
 | `crates/eidolons-shared/Package.swift` | Shared core Swift Package (EidolonsShared + SharedTypes) |
 | `crates/eidolons-shared/src/lib.rs` | FFI bridge + capability re-exports |
 | `crates/eidolons-shared/src/app.rs` | Crux App implementation (Event, Model, ViewModel, Effect) |
+| `apps/cli/schema.sql` | Canonical CLI SQLite schema (used for fresh installs) |
+| `apps/cli/src/db.rs` | Embedded Turso database: open, initialize, migrate |
 | `apps/cli/src/main.rs` | CLI Crux shell (iocraft TUI, smol async runtime) |
 | `apps/macos/Package.swift` | macOS app Swift Package config |
 | `apps/macos/Sources/Eidolons/Core.swift` | Swift shell bridge (handles Crux event/effect loop) |
