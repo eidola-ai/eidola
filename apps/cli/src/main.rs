@@ -151,12 +151,12 @@ struct ListKeysResponse {
 
 #[derive(Deserialize)]
 struct IssuerKeyResponse {
-    epoch: String,
+    id: String,
     public_key: String,
     domain_separator: String,
     #[allow(dead_code)]
-    valid_from: String,
-    valid_until: String,
+    issue_from: String,
+    issue_until: String,
     #[allow(dead_code)]
     accept_until: String,
 }
@@ -164,7 +164,7 @@ struct IssuerKeyResponse {
 #[derive(Deserialize)]
 struct IssueCredentialsResponse {
     issuance_response: String,
-    epoch: String,
+    issuer_key_id: String,
     credits: i64,
     #[allow(dead_code)]
     ledger_entry_id: String,
@@ -181,7 +181,11 @@ fn now_iso() -> String {
         .as_secs();
     let days = (secs / 86400) as i64;
     let time_of_day = secs % 86400;
-    let (hour, min, sec) = (time_of_day / 3600, (time_of_day % 3600) / 60, time_of_day % 60);
+    let (hour, min, sec) = (
+        time_of_day / 3600,
+        (time_of_day % 3600) / 60,
+        time_of_day % 60,
+    );
     let z = days + 719468;
     let era = z.div_euclid(146097);
     let doe = z.rem_euclid(146097) as u64;
@@ -256,9 +260,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             None => cmd_account_show().await,
             Some(AccountCommand::Create) => cmd_account_create().await,
             Some(AccountCommand::Reset) => cmd_account_reset(),
-            Some(AccountCommand::Configure { id, secret }) => {
-                cmd_account_configure(&id, &secret)
-            }
+            Some(AccountCommand::Configure { id, secret }) => cmd_account_configure(&id, &secret),
             Some(AccountCommand::Prices) => cmd_account_prices().await,
             Some(AccountCommand::Checkout {
                 price_id,
@@ -457,8 +459,7 @@ async fn cmd_account_checkout(price_id: &str, no_browser: bool) -> Result<(), St
 
     if should_open {
         println!("{}", checkout.checkout_url);
-        open::that(&checkout.checkout_url)
-            .map_err(|e| format!("failed to open browser: {e}"))?;
+        open::that(&checkout.checkout_url).map_err(|e| format!("failed to open browser: {e}"))?;
     } else {
         println!("{}", checkout.checkout_url);
     }
@@ -542,8 +543,15 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
     let public_key = PublicKey::from_cbor(&public_key_cbor)
         .map_err(|e| format!("invalid public key CBOR: {e}"))?;
 
-    // Reconstruct params from epoch
-    let params = Params::new("eidolons", "inference", "production", &key.epoch);
+    // Reconstruct params from domain separator (ACT-v1:org:service:env:period)
+    let ds_parts: Vec<&str> = key.domain_separator.split(':').collect();
+    if ds_parts.len() != 5 {
+        return Err(format!(
+            "invalid domain separator: {}",
+            key.domain_separator
+        ));
+    }
+    let params = Params::new(ds_parts[1], ds_parts[2], ds_parts[3], ds_parts[4]);
 
     // 2. Open database
     let database = db::open().await?;
@@ -553,16 +561,18 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
 
     // 3. Store issuer key locally
     let domain_separator = &key.domain_separator;
-    let params_hash = blake3::hash(domain_separator.as_bytes()).to_hex().to_string();
+    let params_hash = blake3::hash(domain_separator.as_bytes())
+        .to_hex()
+        .to_string();
     let now = now_iso();
 
     db::upsert_issuer_key(
         &conn,
-        &key.epoch,
+        &key.id,
         &params_hash,
         &public_key_cbor,
         domain_separator.as_bytes(),
-        &key.valid_until,
+        &key.issue_until,
         &now,
     )
     .await?;
@@ -578,7 +588,7 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
     db::insert_pre_credential_issuance(
         &conn,
         &pre_credential_id,
-        &key.epoch,
+        &key.id,
         &pre_issuance_cbor,
         credits,
         &now,
@@ -631,14 +641,14 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
         .map_err(|e| format!("failed to encode credit token: {e}"))?;
 
     let nonce_hex = hex_encode(&credit_token.nullifier().to_bytes());
-    let token_credits =
-        scalar_to_credit::<128>(&credit_token.credits()).map_err(|e| format!("invalid credit amount in token: {e}"))?;
+    let token_credits = scalar_to_credit::<128>(&credit_token.credits())
+        .map_err(|e| format!("invalid credit amount in token: {e}"))?;
 
     db::insert_credential(
         &conn,
         &nonce_hex,
         &pre_credential_id,
-        &issued.epoch,
+        &issued.issuer_key_id,
         &token_cbor,
         token_credits as i64,
         0,
@@ -648,7 +658,7 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
 
     println!("credential allocated: {nonce_hex}");
     println!("credits: {}", issued.credits);
-    println!("epoch: {}", issued.epoch);
+    println!("issuer_key_id: {}", issued.issuer_key_id);
     Ok(())
 }
 
@@ -666,10 +676,7 @@ async fn cmd_wallet_credentials_list() -> Result<(), String> {
     }
 
     for c in &credentials {
-        println!(
-            "{}: {} credits (gen {})",
-            c.nonce, c.credits, c.generation
-        );
+        println!("{}: {} credits (gen {})", c.nonce, c.credits, c.generation);
     }
     Ok(())
 }

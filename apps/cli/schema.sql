@@ -4,7 +4,7 @@ PRAGMA foreign_keys = ON;
 -- Issuer key registry
 -- ============================================================
 CREATE TABLE issuer_key (
-    key_id          TEXT PRIMARY KEY,
+    id              TEXT PRIMARY KEY,
     params_hash     TEXT NOT NULL,
     public_key_data BLOB NOT NULL,
     params_data     BLOB NOT NULL,
@@ -19,7 +19,7 @@ CREATE TABLE pre_credential (
     id              TEXT PRIMARY KEY,
     type            TEXT NOT NULL CHECK (type IN ('issuance', 'refund')),
     credential_nonce TEXT REFERENCES credential(nonce),
-    issuer_key_id   TEXT NOT NULL REFERENCES issuer_key(key_id),
+    issuer_key_id   TEXT NOT NULL REFERENCES issuer_key(id),
     data            BLOB NOT NULL,
     credits         INTEGER,
     spend_amount    INTEGER,
@@ -73,7 +73,7 @@ SELECT
     c_next.nonce            AS successor_nonce
 FROM credential c
 JOIN issuer_key ik
-    ON  ik.key_id = c.issuer_key_id
+    ON  ik.id = c.issuer_key_id
 LEFT JOIN pre_credential pc_spend
     ON  pc_spend.credential_nonce = c.nonce
     AND pc_spend.type = 'refund'

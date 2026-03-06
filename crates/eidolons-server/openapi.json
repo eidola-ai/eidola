@@ -1248,7 +1248,7 @@
         "description": "Response for `POST /v1/account/credentials`.",
         "required": [
           "issuance_response",
-          "epoch",
+          "issuer_key_id",
           "credits",
           "ledger_entry_id"
         ],
@@ -1258,13 +1258,13 @@
             "format": "int64",
             "description": "Number of credits issued."
           },
-          "epoch": {
-            "type": "string",
-            "description": "Epoch identifier (YYYY-MM)."
-          },
           "issuance_response": {
             "type": "string",
             "description": "Base64-encoded CBOR `IssuanceResponse`."
+          },
+          "issuer_key_id": {
+            "type": "string",
+            "description": "Issuer key identifier (UUID)."
           },
           "ledger_entry_id": {
             "type": "string",
@@ -1276,11 +1276,11 @@
         "type": "object",
         "description": "A single issuer public key in the `GET /v1/keys` response.",
         "required": [
-          "epoch",
+          "id",
           "public_key",
           "domain_separator",
-          "valid_from",
-          "valid_until",
+          "issue_from",
+          "issue_until",
           "accept_until"
         ],
         "properties": {
@@ -1292,21 +1292,21 @@
             "type": "string",
             "description": "Domain separator used for parameter generation."
           },
-          "epoch": {
+          "id": {
             "type": "string",
-            "description": "Epoch identifier (YYYY-MM)."
+            "description": "Unique key identifier (UUID)."
+          },
+          "issue_from": {
+            "type": "string",
+            "description": "Start of the issuance window (ISO 8601)."
+          },
+          "issue_until": {
+            "type": "string",
+            "description": "End of the issuance window (ISO 8601)."
           },
           "public_key": {
             "type": "string",
             "description": "Base64-encoded CBOR public key (compressed Ristretto255 point)."
-          },
-          "valid_from": {
-            "type": "string",
-            "description": "Start of the issuance window (ISO 8601)."
-          },
-          "valid_until": {
-            "type": "string",
-            "description": "End of the issuance window (ISO 8601)."
           }
         }
       },
@@ -1329,7 +1329,7 @@
             ],
             "format": "int64"
           },
-          "credential_epoch": {
+          "credential_key_id": {
             "type": [
               "string",
               "null"

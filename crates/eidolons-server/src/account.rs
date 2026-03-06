@@ -115,11 +115,10 @@ pub struct LedgerEntry {
     pub expires_at: Option<String>,
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub credential_epoch: Option<String>,
+    pub credential_key_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_credits: Option<i64>,
 }
-
 
 fn default_success_url() -> String {
     "https://eidolons.ai/payment/success".to_string()
@@ -454,8 +453,16 @@ pub async fn get_ledger(
                 reason: e.reason,
                 expires_at: e.expires_at.and_then(|t| system_time_to_iso(t).ok()),
                 created_at: system_time_to_iso(e.created_at).unwrap_or_default(),
-                credential_epoch: if is_credential { e.credential_epoch } else { None },
-                credential_credits: if is_credential { e.credential_credits } else { None },
+                credential_key_id: if is_credential {
+                    e.credential_key_id.map(|id| id.to_string())
+                } else {
+                    None
+                },
+                credential_credits: if is_credential {
+                    e.credential_credits
+                } else {
+                    None
+                },
             }
         })
         .collect();

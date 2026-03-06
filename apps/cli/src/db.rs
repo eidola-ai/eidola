@@ -95,7 +95,7 @@ async fn set_user_version(conn: &Connection, version: i64) -> Result<(), String>
 /// Upsert an issuer key (insert or ignore if already exists).
 pub async fn upsert_issuer_key(
     conn: &Connection,
-    key_id: &str,
+    id: &str,
     params_hash: &str,
     public_key_data: &[u8],
     params_data: &[u8],
@@ -103,10 +103,10 @@ pub async fn upsert_issuer_key(
     created_at: &str,
 ) -> Result<(), String> {
     conn.execute(
-        "INSERT OR IGNORE INTO issuer_key (key_id, params_hash, public_key_data, params_data, expires_at, created_at) \
+        "INSERT OR IGNORE INTO issuer_key (id, params_hash, public_key_data, params_data, expires_at, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         (
-            Value::Text(key_id.to_string()),
+            Value::Text(id.to_string()),
             Value::Text(params_hash.to_string()),
             Value::Blob(public_key_data.to_vec()),
             Value::Blob(params_data.to_vec()),
@@ -153,6 +153,7 @@ pub async fn insert_pre_credential_issuance(
 // ---------------------------------------------------------------------------
 
 /// Insert a completed credential.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_credential(
     conn: &Connection,
     nonce: &str,
@@ -182,6 +183,7 @@ pub async fn insert_credential(
 }
 
 /// A row from the credential_lifecycle view.
+#[allow(dead_code)]
 pub struct CredentialRow {
     pub nonce: String,
     pub credits: i64,
@@ -211,11 +213,21 @@ pub async fn list_active_credentials(conn: &Connection) -> Result<Vec<Credential
         .map_err(|e| format!("failed to read row: {e}"))?
     {
         results.push(CredentialRow {
-            nonce: row.get::<String>(0).map_err(|e| format!("failed to read nonce: {e}"))?,
-            credits: row.get::<i64>(1).map_err(|e| format!("failed to read credits: {e}"))?,
-            generation: row.get::<i64>(2).map_err(|e| format!("failed to read generation: {e}"))?,
-            created_at: row.get::<String>(3).map_err(|e| format!("failed to read created_at: {e}"))?,
-            state: row.get::<String>(4).map_err(|e| format!("failed to read state: {e}"))?,
+            nonce: row
+                .get::<String>(0)
+                .map_err(|e| format!("failed to read nonce: {e}"))?,
+            credits: row
+                .get::<i64>(1)
+                .map_err(|e| format!("failed to read credits: {e}"))?,
+            generation: row
+                .get::<i64>(2)
+                .map_err(|e| format!("failed to read generation: {e}"))?,
+            created_at: row
+                .get::<String>(3)
+                .map_err(|e| format!("failed to read created_at: {e}"))?,
+            state: row
+                .get::<String>(4)
+                .map_err(|e| format!("failed to read state: {e}"))?,
         });
     }
     Ok(results)
@@ -230,7 +242,7 @@ PRAGMA foreign_keys = ON;
 
 -- Issuer key registry
 CREATE TABLE issuer_key (
-    key_id          TEXT PRIMARY KEY,
+    id              TEXT PRIMARY KEY,
     params_hash     TEXT NOT NULL,
     public_key_data BLOB NOT NULL,
     params_data     BLOB NOT NULL,
@@ -243,7 +255,7 @@ CREATE TABLE pre_credential (
     id              TEXT PRIMARY KEY,
     type            TEXT NOT NULL CHECK (type IN ('issuance', 'refund')),
     credential_nonce TEXT REFERENCES credential(nonce),
-    issuer_key_id   TEXT NOT NULL REFERENCES issuer_key(key_id),
+    issuer_key_id   TEXT NOT NULL REFERENCES issuer_key(id),
     data            BLOB NOT NULL,
     credits         INTEGER,
     spend_amount    INTEGER,
@@ -266,7 +278,7 @@ CREATE TABLE credential (
     pre_credential_id   TEXT NOT NULL UNIQUE
                         REFERENCES pre_credential(id),
     issuer_key_id       TEXT NOT NULL
-                        REFERENCES issuer_key(key_id),
+                        REFERENCES issuer_key(id),
     data                BLOB NOT NULL,
     credits             INTEGER NOT NULL,
     generation          INTEGER NOT NULL DEFAULT 0,
@@ -293,7 +305,7 @@ SELECT
     c_next.nonce            AS successor_nonce
 FROM credential c
 JOIN issuer_key ik
-    ON  ik.key_id = c.issuer_key_id
+    ON  ik.id = c.issuer_key_id
 LEFT JOIN pre_credential pc_spend
     ON  pc_spend.credential_nonce = c.nonce
     AND pc_spend.type = 'refund'
@@ -310,20 +322,14 @@ mod tests {
     use super::*;
 
     async fn open_memory_fresh() -> Database {
-        let db = Builder::new_local(":memory:")
-            .build()
-            .await
-            .unwrap();
+        let db = Builder::new_local(":memory:").build().await.unwrap();
         let conn = db.connect().unwrap();
         initialize(&conn).await.unwrap();
         db
     }
 
     async fn open_memory_migrated() -> Database {
-        let db = Builder::new_local(":memory:")
-            .build()
-            .await
-            .unwrap();
+        let db = Builder::new_local(":memory:").build().await.unwrap();
         let conn = db.connect().unwrap();
         migrate(&conn, 0).await.unwrap();
         set_user_version(&conn, LATEST_VERSION).await.unwrap();
@@ -344,10 +350,7 @@ mod tests {
         let mut rows = stmt.query(()).await.unwrap();
         let mut objects = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
-            objects.push((
-                row.get::<String>(0).unwrap(),
-                row.get::<String>(1).unwrap(),
-            ));
+            objects.push((row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()));
         }
         objects
     }
@@ -366,11 +369,11 @@ mod tests {
         let mut cols = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
             cols.push((
-                row.get::<String>(1).unwrap(),          // name
-                row.get::<String>(2).unwrap(),          // type
-                row.get::<i64>(3).unwrap() != 0,        // notnull
-                row.get::<Option<String>>(4).unwrap(),  // dflt_value
-                row.get::<i64>(5).unwrap() != 0,        // pk
+                row.get::<String>(1).unwrap(),         // name
+                row.get::<String>(2).unwrap(),         // type
+                row.get::<i64>(3).unwrap() != 0,       // notnull
+                row.get::<Option<String>>(4).unwrap(), // dflt_value
+                row.get::<i64>(5).unwrap() != 0,       // pk
             ));
         }
         cols.sort_by(|a, b| a.0.cmp(&b.0));
@@ -399,7 +402,12 @@ mod tests {
             .await
             .unwrap();
         let mut rows = stmt.query([name]).await.unwrap();
-        rows.next().await.unwrap().unwrap().get::<String>(0).unwrap()
+        rows.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap()
     }
 
     #[tokio::test]

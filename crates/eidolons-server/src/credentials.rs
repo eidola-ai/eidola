@@ -18,6 +18,8 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
+use uuid::Uuid;
+
 use crate::AppState;
 use crate::auth::BasicAuth;
 use crate::db;
@@ -32,12 +34,12 @@ use crate::helpers::{current_epoch, epoch_boundaries, system_time_to_iso_lossy};
 pub struct DecryptedIssuerKey {
     pub secret_key: PrivateKey,
     pub params: Params,
-    pub epoch: String,
-    pub valid_until: SystemTime,
+    pub id: Uuid,
+    pub issue_until: SystemTime,
 }
 
-/// Thread-safe cache of decrypted issuer keys, keyed by epoch string.
-pub type KeyCache = Arc<RwLock<HashMap<String, DecryptedIssuerKey>>>;
+/// Thread-safe cache of decrypted issuer keys, keyed by UUID.
+pub type KeyCache = Arc<RwLock<HashMap<Uuid, DecryptedIssuerKey>>>;
 
 // ---------------------------------------------------------------------------
 // Key encryption / decryption
@@ -110,44 +112,52 @@ fn domain_separator(epoch: &str) -> String {
 // Key lifecycle
 // ---------------------------------------------------------------------------
 
-/// Ensure a key exists for the current epoch. Returns the epoch string.
+/// Ensure a key exists for the current period. Returns the key UUID.
 ///
-/// 1. Check in-memory cache.
+/// 1. Check in-memory cache for a key still within its issuance window.
 /// 2. Check database (decrypt + cache if found).
 /// 3. Generate new key → encrypt → insert → cache.
-pub async fn ensure_current_epoch_key(
+pub async fn ensure_current_key(
     key_cache: &KeyCache,
     master_key: &[u8; 32],
     pool: &deadpool_postgres::Pool,
-) -> Result<String, ServerError> {
-    let epoch = current_epoch();
+) -> Result<Uuid, ServerError> {
+    let now = SystemTime::now();
 
-    // Fast path: already cached.
+    // Fast path: already cached and still valid for issuance.
     {
         let cache = key_cache.read().await;
-        if cache.contains_key(&epoch) {
-            return Ok(epoch);
+        for (id, key) in cache.iter() {
+            if key.issue_until > now {
+                return Ok(*id);
+            }
         }
     }
 
+    // Compute the current epoch string for key generation purposes.
+    let epoch = current_epoch();
+
     // Check the database.
-    if let Some(row) = db::get_issuer_key_by_epoch(pool, &epoch).await? {
-        let plaintext = decrypt_private_key(master_key, &epoch, &row.private_key_enc)?;
+    if let Some(row) = db::get_current_issuer_key(pool).await? {
+        let id_str = row.id.to_string();
+        let plaintext = decrypt_private_key(master_key, &id_str, &row.private_key_enc)?;
         let secret_key = PrivateKey::from_cbor(&plaintext).map_err(|e| {
             ServerError::Internal(format!("failed to decode issuer private key: {}", e))
         })?;
         let params = Params::new("eidolons", "inference", "production", &epoch);
+        let key_id = row.id;
         let mut cache = key_cache.write().await;
-        cache.entry(epoch.clone()).or_insert(DecryptedIssuerKey {
+        cache.entry(key_id).or_insert(DecryptedIssuerKey {
             secret_key,
             params,
-            epoch: epoch.clone(),
-            valid_until: row.valid_until,
+            id: key_id,
+            issue_until: row.issue_until,
         });
-        return Ok(epoch);
+        return Ok(key_id);
     }
 
     // Generate a new key pair.
+    let key_id = Uuid::new_v4();
     let secret_key = PrivateKey::random(OsRng);
     let public_key_cbor = secret_key
         .public()
@@ -156,58 +166,56 @@ pub async fn ensure_current_epoch_key(
     let private_key_cbor = secret_key
         .to_cbor()
         .map_err(|e| ServerError::Internal(format!("failed to encode private key: {}", e)))?;
-    let encrypted = encrypt_private_key(master_key, &epoch, &private_key_cbor)?;
+    let id_str = key_id.to_string();
+    let encrypted = encrypt_private_key(master_key, &id_str, &private_key_cbor)?;
 
-    let (valid_from, valid_until, accept_until) = epoch_boundaries(&epoch)?;
+    let (issue_from, issue_until, accept_until) = epoch_boundaries(&epoch)?;
     let ds = domain_separator(&epoch);
 
     let row_to_insert = db::IssuerKeyRow {
-        epoch: epoch.clone(),
+        id: key_id,
         private_key_enc: encrypted,
         public_key: public_key_cbor,
         domain_separator: ds,
-        valid_from,
-        valid_until,
+        issue_from,
+        issue_until,
         accept_until,
     };
     let inserted = db::insert_issuer_key(pool, &row_to_insert).await?;
 
     if !inserted {
-        info!(
-            "issuer key for epoch {} was created concurrently, loading winner",
-            epoch
-        );
-        let row = db::get_issuer_key_by_epoch(pool, &epoch)
-            .await?
-            .ok_or_else(|| {
-                ServerError::Internal("issuer key vanished after concurrent insert".to_string())
-            })?;
-        let plaintext = decrypt_private_key(master_key, &epoch, &row.private_key_enc)?;
+        info!("issuer key for current period was created concurrently, loading winner");
+        let row = db::get_current_issuer_key(pool).await?.ok_or_else(|| {
+            ServerError::Internal("issuer key vanished after concurrent insert".to_string())
+        })?;
+        let winner_id_str = row.id.to_string();
+        let plaintext = decrypt_private_key(master_key, &winner_id_str, &row.private_key_enc)?;
         let secret_key = PrivateKey::from_cbor(&plaintext).map_err(|e| {
             ServerError::Internal(format!("failed to decode issuer private key: {}", e))
         })?;
         let params = Params::new("eidolons", "inference", "production", &epoch);
+        let winner_id = row.id;
         let mut cache = key_cache.write().await;
-        cache.entry(epoch.clone()).or_insert(DecryptedIssuerKey {
+        cache.entry(winner_id).or_insert(DecryptedIssuerKey {
             secret_key,
             params,
-            epoch: epoch.clone(),
-            valid_until: row.valid_until,
+            id: winner_id,
+            issue_until: row.issue_until,
         });
-        return Ok(epoch);
+        return Ok(winner_id);
     }
 
-    info!("generated new issuer key for epoch {}", epoch);
+    info!("generated new issuer key {}", key_id);
     let params = Params::new("eidolons", "inference", "production", &epoch);
     let mut cache = key_cache.write().await;
-    cache.entry(epoch.clone()).or_insert(DecryptedIssuerKey {
+    cache.entry(key_id).or_insert(DecryptedIssuerKey {
         secret_key,
         params,
-        epoch: epoch.clone(),
-        valid_until,
+        id: key_id,
+        issue_until,
     });
 
-    Ok(epoch)
+    Ok(key_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -217,16 +225,16 @@ pub async fn ensure_current_epoch_key(
 /// A single issuer public key in the `GET /v1/keys` response.
 #[derive(Serialize, ToSchema)]
 pub struct IssuerKeyResponse {
-    /// Epoch identifier (YYYY-MM).
-    pub epoch: String,
+    /// Unique key identifier (UUID).
+    pub id: String,
     /// Base64-encoded CBOR public key (compressed Ristretto255 point).
     pub public_key: String,
     /// Domain separator used for parameter generation.
     pub domain_separator: String,
     /// Start of the issuance window (ISO 8601).
-    pub valid_from: String,
+    pub issue_from: String,
     /// End of the issuance window (ISO 8601).
-    pub valid_until: String,
+    pub issue_until: String,
     /// End of the acceptance window (ISO 8601).
     pub accept_until: String,
 }
@@ -251,8 +259,8 @@ pub struct IssueCredentialsRequest {
 pub struct IssueCredentialsResponse {
     /// Base64-encoded CBOR `IssuanceResponse`.
     pub issuance_response: String,
-    /// Epoch identifier (YYYY-MM).
-    pub epoch: String,
+    /// Issuer key identifier (UUID).
+    pub issuer_key_id: String,
     /// Number of credits issued.
     pub credits: i64,
     /// The ledger entry ID for this issuance.
@@ -280,11 +288,11 @@ pub async fn list_keys(
     let data: Vec<IssuerKeyResponse> = rows
         .into_iter()
         .map(|r| IssuerKeyResponse {
-            epoch: r.epoch,
+            id: r.id.to_string(),
             public_key: URL_SAFE_NO_PAD.encode(&r.public_key),
             domain_separator: r.domain_separator,
-            valid_from: system_time_to_iso_lossy(r.valid_from),
-            valid_until: system_time_to_iso_lossy(r.valid_until),
+            issue_from: system_time_to_iso_lossy(r.issue_from),
+            issue_until: system_time_to_iso_lossy(r.issue_until),
             accept_until: system_time_to_iso_lossy(r.accept_until),
         })
         .collect();
@@ -338,36 +346,32 @@ pub async fn issue_credentials(
             message: format!("invalid credit amount: {}", e),
         })?;
 
-    let epoch =
-        ensure_current_epoch_key(&state.credential_key_cache, master_key, &state.db_pool).await?;
+    let key_id =
+        ensure_current_key(&state.credential_key_cache, master_key, &state.db_pool).await?;
 
-    let ledger_entry_id = match db::insert_credential_issuance(
-        &state.db_pool,
-        account_id,
-        request.credits,
-        &epoch,
-    )
-    .await?
-    {
-        Some(id) => id,
-        None => {
-            let available = match db::get_available_balance(&state.db_pool, account_id).await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("failed to fetch balance for 402 response: {e}");
-                    0
-                }
-            };
-            return Err(ServerError::PaymentRequired {
-                message: "insufficient balance".to_string(),
-                available,
-            });
-        }
-    };
+    let ledger_entry_id =
+        match db::insert_credential_issuance(&state.db_pool, account_id, request.credits, key_id)
+            .await?
+        {
+            Some(id) => id,
+            None => {
+                let available = match db::get_available_balance(&state.db_pool, account_id).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to fetch balance for 402 response: {e}");
+                        0
+                    }
+                };
+                return Err(ServerError::PaymentRequired {
+                    message: "insufficient balance".to_string(),
+                    available,
+                });
+            }
+        };
 
     let issuance_response = {
         let cache = state.credential_key_cache.read().await;
-        let key = cache.get(&epoch).ok_or_else(|| {
+        let key = cache.get(&key_id).ok_or_else(|| {
             ServerError::Internal("epoch key evicted from cache unexpectedly".to_string())
         })?;
         key.secret_key
@@ -397,7 +401,7 @@ pub async fn issue_credentials(
 
     Ok(Json(IssueCredentialsResponse {
         issuance_response: URL_SAFE_NO_PAD.encode(&response_cbor),
-        epoch,
+        issuer_key_id: key_id.to_string(),
         credits: request.credits,
         ledger_entry_id: ledger_entry_id.to_string(),
     }))

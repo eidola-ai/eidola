@@ -14,8 +14,8 @@ use eidolons_server::AppState;
 use eidolons_server::attestation::AttestationClient;
 use eidolons_server::auth::{AnyValidator, NoopValidator};
 use eidolons_server::backend::RedPillBackend;
-use eidolons_server::stripe::StripeClient;
 use eidolons_server::credentials;
+use eidolons_server::stripe::StripeClient;
 
 /// Server configuration.
 struct Config {
@@ -62,7 +62,7 @@ impl Config {
                     .map_err(|_| "CREDENTIAL_MASTER_KEY must be valid hex".to_string())?;
                 if bytes.len() != 32 {
                     return Err(
-                        "CREDENTIAL_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string()
+                        "CREDENTIAL_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string(),
                     );
                 }
                 let mut key = [0u8; 32];
@@ -155,10 +155,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         credential_key_cache,
     );
 
-    // Pre-warm the current epoch's issuer key if master key is configured.
+    // Pre-warm the current issuer key if master key is configured.
     if let Some(ref mk) = state.credential_master_key {
-        match credentials::ensure_current_epoch_key(&state.credential_key_cache, mk, &state.db_pool).await {
-            Ok(epoch) => info!("Issuer key ready for epoch {}", epoch),
+        match credentials::ensure_current_key(&state.credential_key_cache, mk, &state.db_pool).await
+        {
+            Ok(key_id) => info!("Issuer key ready: {}", key_id),
             Err(e) => warn!("Failed to pre-warm issuer key: {}", e),
         }
     }

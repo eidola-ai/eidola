@@ -181,20 +181,17 @@ pub async fn insert_credit_ledger(
 
 /// A row from the `issuer_key` table.
 pub struct IssuerKeyRow {
-    pub epoch: String,
+    pub id: Uuid,
     pub private_key_enc: Vec<u8>,
     pub public_key: Vec<u8>,
     pub domain_separator: String,
-    pub valid_from: SystemTime,
-    pub valid_until: SystemTime,
+    pub issue_from: SystemTime,
+    pub issue_until: SystemTime,
     pub accept_until: SystemTime,
 }
 
-/// Retrieve an issuer key by epoch.
-pub async fn get_issuer_key_by_epoch(
-    pool: &Pool,
-    epoch: &str,
-) -> Result<Option<IssuerKeyRow>, ServerError> {
+/// Retrieve the currently active issuer key (issue_from <= now < issue_until).
+pub async fn get_current_issuer_key(pool: &Pool) -> Result<Option<IssuerKeyRow>, ServerError> {
     let client = pool
         .get()
         .await
@@ -202,27 +199,27 @@ pub async fn get_issuer_key_by_epoch(
 
     let row = client
         .query_opt(
-            "SELECT epoch, private_key_enc, public_key, domain_separator, \
-                    valid_from, valid_until, accept_until \
-             FROM issuer_key WHERE epoch = $1",
-            &[&epoch],
+            "SELECT id, private_key_enc, public_key, domain_separator, \
+                    issue_from, issue_until, accept_until \
+             FROM issuer_key WHERE issue_from <= now() AND issue_until > now()",
+            &[],
         )
         .await
         .map_err(|e| ServerError::Internal(format!("query issuer_key failed: {e:?}")))?;
 
     Ok(row.map(|r| IssuerKeyRow {
-        epoch: r.get("epoch"),
+        id: r.get("id"),
         private_key_enc: r.get("private_key_enc"),
         public_key: r.get("public_key"),
         domain_separator: r.get("domain_separator"),
-        valid_from: r.get("valid_from"),
-        valid_until: r.get("valid_until"),
+        issue_from: r.get("issue_from"),
+        issue_until: r.get("issue_until"),
         accept_until: r.get("accept_until"),
     }))
 }
 
-/// Insert a new issuer key. Returns true if inserted, false if the epoch
-/// already exists (race-safe via ON CONFLICT DO NOTHING).
+/// Insert a new issuer key. Returns true if inserted, false if a key for the
+/// same period already exists (race-safe via ON CONFLICT on issue_from).
 pub async fn insert_issuer_key(pool: &Pool, key: &IssuerKeyRow) -> Result<bool, ServerError> {
     let client = pool
         .get()
@@ -232,17 +229,17 @@ pub async fn insert_issuer_key(pool: &Pool, key: &IssuerKeyRow) -> Result<bool, 
     let result = client
         .execute(
             "INSERT INTO issuer_key \
-                (epoch, private_key_enc, public_key, domain_separator, \
-                 valid_from, valid_until, accept_until) \
+                (id, private_key_enc, public_key, domain_separator, \
+                 issue_from, issue_until, accept_until) \
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (epoch) DO NOTHING",
+             ON CONFLICT (issue_from) DO NOTHING",
             &[
-                &key.epoch.as_str(),
+                &key.id,
                 &key.private_key_enc.as_slice(),
                 &key.public_key.as_slice(),
                 &key.domain_separator.as_str(),
-                &key.valid_from,
-                &key.valid_until,
+                &key.issue_from,
+                &key.issue_until,
                 &key.accept_until,
             ],
         )
@@ -261,10 +258,10 @@ pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, Ser
 
     let rows = client
         .query(
-            "SELECT epoch, private_key_enc, public_key, domain_separator, \
-                    valid_from, valid_until, accept_until \
+            "SELECT id, private_key_enc, public_key, domain_separator, \
+                    issue_from, issue_until, accept_until \
              FROM issuer_key WHERE accept_until > now() \
-             ORDER BY valid_from DESC",
+             ORDER BY issue_from DESC",
             &[],
         )
         .await
@@ -273,12 +270,12 @@ pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, Ser
     Ok(rows
         .iter()
         .map(|r| IssuerKeyRow {
-            epoch: r.get("epoch"),
+            id: r.get("id"),
             private_key_enc: r.get("private_key_enc"),
             public_key: r.get("public_key"),
             domain_separator: r.get("domain_separator"),
-            valid_from: r.get("valid_from"),
-            valid_until: r.get("valid_until"),
+            issue_from: r.get("issue_from"),
+            issue_until: r.get("issue_until"),
             accept_until: r.get("accept_until"),
         })
         .collect())
@@ -293,7 +290,7 @@ pub async fn insert_credential_issuance(
     pool: &Pool,
     account_id: Uuid,
     credits: i64,
-    credential_epoch: &str,
+    credential_key_id: Uuid,
 ) -> Result<Option<Uuid>, ServerError> {
     let client = pool
         .get()
@@ -303,11 +300,11 @@ pub async fn insert_credential_issuance(
     let row = client
         .query_opt(
             "INSERT INTO credit_ledger \
-                (id, account_id, delta, reason, credential_epoch, credential_credits, created_at) \
+                (id, account_id, delta, reason, credential_key_id, credential_credits, created_at) \
              SELECT gen_random_uuid(), $1, -$2::bigint, 'credential_issuance', $3, $2::bigint, now() \
              WHERE available_balance($1) >= $2::bigint \
              RETURNING id",
-            &[&account_id, &credits, &credential_epoch],
+            &[&account_id, &credits, &credential_key_id],
         )
         .await
         .map_err(|e| ServerError::Internal(format!("credential issuance debit failed: {e:?}")))?;
@@ -390,7 +387,7 @@ pub struct LedgerEntryRow {
     pub reason: String,
     pub expires_at: Option<SystemTime>,
     pub created_at: SystemTime,
-    pub credential_epoch: Option<String>,
+    pub credential_key_id: Option<Uuid>,
     pub credential_credits: Option<i64>,
 }
 
@@ -406,7 +403,7 @@ pub async fn get_ledger_entries(
 
     let rows = client
         .query(
-            "SELECT id, delta, reason, expires_at, created_at, credential_epoch, credential_credits \
+            "SELECT id, delta, reason, expires_at, created_at, credential_key_id, credential_credits \
              FROM credit_ledger WHERE account_id = $1 \
              ORDER BY created_at ASC, id ASC",
             &[&account_id],
@@ -422,7 +419,7 @@ pub async fn get_ledger_entries(
             reason: row.get("reason"),
             expires_at: row.get("expires_at"),
             created_at: row.get("created_at"),
-            credential_epoch: row.get("credential_epoch"),
+            credential_key_id: row.get("credential_key_id"),
             credential_credits: row.get("credential_credits"),
         })
         .collect())

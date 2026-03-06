@@ -12,13 +12,13 @@ pub mod api_doc;
 pub mod attestation;
 pub mod auth;
 pub mod backend;
+pub mod credentials;
 pub mod db;
 pub mod error;
 pub mod handlers;
 pub mod helpers;
 pub mod response;
 pub mod stripe;
-pub mod credentials;
 pub mod types;
 pub mod webhook;
 

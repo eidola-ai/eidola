@@ -49,6 +49,64 @@ CREATE INDEX idx_account_stripe_customer ON account (stripe_customer_id)
     WHERE stripe_customer_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
+-- Issuer Key
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE issuer_key (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    private_key_enc BYTEA NOT NULL,
+    public_key      BYTEA NOT NULL,
+    domain_separator TEXT NOT NULL,
+    issue_from      TIMESTAMPTZ NOT NULL,
+    issue_until     TIMESTAMPTZ NOT NULL,
+    accept_until    TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT issue_window CHECK (issue_from < issue_until),
+    CONSTRAINT grace_window CHECK (issue_until <= accept_until)
+);
+
+-- Only one key per issuance period (used for race-safe upsert).
+CREATE UNIQUE INDEX idx_issuer_key_issue_from ON issuer_key (issue_from);
+
+COMMENT ON TABLE issuer_key IS
+    'Credential issuer key pairs, rotated monthly. The private key is encrypted '
+    'at rest (application-layer encryption using a TEE-held master key). The '
+    'public key and domain separator are served publicly via GET /v1/keys. '
+    'Key periods align with calendar months to simplify billing period alignment.';
+
+COMMENT ON COLUMN issuer_key.id IS
+    'Unique key identifier (UUID). Primary key and foreign key '
+    'target for the nullifier table.';
+
+COMMENT ON COLUMN issuer_key.private_key_enc IS
+    'AES-256-GCM encrypted credential private key (Ristretto255 scalar). '
+    'Decrypted only inside the TEE at runtime. The encryption key is derived '
+    'from the TEE''s sealing key.';
+
+COMMENT ON COLUMN issuer_key.public_key IS
+    'Credential public key (compressed Ristretto255 point, 32 bytes). Served '
+    'to clients for credential verification.';
+
+COMMENT ON COLUMN issuer_key.domain_separator IS
+    'Full domain separator string, e.g., '
+    '''ACT-v1:eidolons:inference:production:2026-03''. Included in all '
+    'cryptographic operations for domain separation.';
+
+COMMENT ON COLUMN issuer_key.issue_from IS
+    'Start of the period during which new credentials may be issued with this key.';
+
+COMMENT ON COLUMN issuer_key.issue_until IS
+    'End of the issuance window. After this, no new credentials are issued with '
+    'this key, but existing credentials remain spendable until accept_until.';
+
+COMMENT ON COLUMN issuer_key.accept_until IS
+    'Grace period end. Credentials signed by this key are accepted for spending '
+    'until this timestamp. Typically 2-3 days after issue_until to give '
+    'clients time to spend down. Nullifiers for this key can be pruned after '
+    'this date.';
+
+-- ---------------------------------------------------------------------------
 -- Credit Ledger
 -- ---------------------------------------------------------------------------
 
@@ -69,7 +127,7 @@ CREATE TABLE credit_ledger (
     stripe_event_id TEXT UNIQUE,
     memo            TEXT,
     expires_at      TIMESTAMPTZ,
-    credential_epoch     TEXT,
+    credential_key_id    UUID REFERENCES issuer_key(id),
     credential_credits   BIGINT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -91,11 +149,11 @@ CREATE TABLE credit_ledger (
         OR (reason IN ('credential_issuance', 'refund', 'dispute_clawback') AND delta < 0)
     ),
 
-    -- credential_epoch and credential_credits are only set for credential issuance entries.
+    -- credential_key_id and credential_credits are only set for credential issuance entries.
     CONSTRAINT credential_issuance_metadata CHECK (
-        (reason = 'credential_issuance' AND credential_epoch IS NOT NULL AND credential_credits IS NOT NULL)
+        (reason = 'credential_issuance' AND credential_key_id IS NOT NULL AND credential_credits IS NOT NULL)
         OR
-        (reason != 'credential_issuance' AND credential_epoch IS NULL AND credential_credits IS NULL)
+        (reason != 'credential_issuance' AND credential_key_id IS NULL AND credential_credits IS NULL)
     ),
 
     -- credential_credits must equal the absolute value of delta on issuance rows.
@@ -153,10 +211,10 @@ COMMENT ON COLUMN credit_ledger.created_at IS
     'When this ledger entry was created in our system. NOT the upstream event '
     'timestamp — for that, look up the stripe_event_id via Stripe''s API.';
 
-COMMENT ON COLUMN credit_ledger.credential_epoch IS
-    'Only set for credential_issuance entries. The issuer key epoch (e.g., "2026-03") '
+COMMENT ON COLUMN credit_ledger.credential_key_id IS
+    'Only set for credential_issuance entries. The issuer key ID '
     'used to sign the credential. Allows querying "how many credits were provisioned '
-    'in each epoch" without joining to issuer_key.';
+    'per key" without joining to issuer_key.';
 
 COMMENT ON COLUMN credit_ledger.credential_credits IS
     'Only set for credential_issuance entries. The credit amount loaded into the '
@@ -171,89 +229,33 @@ CREATE INDEX idx_ledger_account_balance ON credit_ledger (account_id, expires_at
 CREATE INDEX idx_ledger_reason_created ON credit_ledger (reason, created_at);
 
 -- ---------------------------------------------------------------------------
--- Issuer Key
--- ---------------------------------------------------------------------------
-
-CREATE TABLE issuer_key (
-    epoch           TEXT PRIMARY KEY,
-    private_key_enc BYTEA NOT NULL,
-    public_key      BYTEA NOT NULL,
-    domain_separator TEXT NOT NULL,
-    valid_from      TIMESTAMPTZ NOT NULL,
-    valid_until     TIMESTAMPTZ NOT NULL,
-    accept_until    TIMESTAMPTZ NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    CONSTRAINT epoch_format CHECK (epoch ~ '^\d{4}-\d{2}$'),
-    CONSTRAINT valid_window CHECK (valid_from < valid_until),
-    CONSTRAINT grace_window CHECK (valid_until <= accept_until)
-);
-
-COMMENT ON TABLE issuer_key IS
-    'Credential issuer key pairs, rotated monthly. The private key is encrypted '
-    'at rest (application-layer encryption using a TEE-held master key). The '
-    'public key and domain separator are served publicly via GET /v1/keys. '
-    'Key epochs align with calendar months to simplify billing period alignment.';
-
-COMMENT ON COLUMN issuer_key.epoch IS
-    'Key epoch identifier in YYYY-MM format. Primary key and foreign key '
-    'target for the nullifier table. Aligns with calendar months.';
-
-COMMENT ON COLUMN issuer_key.private_key_enc IS
-    'AES-256-GCM encrypted credential private key (Ristretto255 scalar). '
-    'Decrypted only inside the TEE at runtime. The encryption key is derived '
-    'from the TEE''s sealing key.';
-
-COMMENT ON COLUMN issuer_key.public_key IS
-    'Credential public key (compressed Ristretto255 point, 32 bytes). Served '
-    'to clients for credential verification.';
-
-COMMENT ON COLUMN issuer_key.domain_separator IS
-    'Full domain separator string, e.g., '
-    '''ACT-v1:eidolons:inference:production:2026-03''. Included in all '
-    'cryptographic operations for domain separation.';
-
-COMMENT ON COLUMN issuer_key.valid_from IS
-    'Start of the period during which new credentials may be issued with this key.';
-
-COMMENT ON COLUMN issuer_key.valid_until IS
-    'End of the issuance window. After this, no new credentials are issued with '
-    'this key, but existing credentials remain spendable until accept_until.';
-
-COMMENT ON COLUMN issuer_key.accept_until IS
-    'Grace period end. Credentials signed by this key are accepted for spending '
-    'until this timestamp. Typically 2-3 days after valid_until to give '
-    'clients time to spend down. Nullifiers for this key can be pruned after '
-    'this date.';
-
--- ---------------------------------------------------------------------------
 -- Nullifier
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE nullifier (
-    epoch       TEXT NOT NULL REFERENCES issuer_key(epoch),
-    value       BYTEA NOT NULL,
-    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (epoch, value)
+    issuer_key_id UUID NOT NULL REFERENCES issuer_key(id),
+    value         BYTEA NOT NULL,
+    recorded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (issuer_key_id, value)
 );
 
 COMMENT ON TABLE nullifier IS
     'Spent credential nullifiers. A nullifier must be durably recorded BEFORE '
     'a refund credential is issued to prevent the forking attack (re-spending a '
     'credential with a different amount to create divergent credential chains). '
-    'The compound primary key (epoch, value) partitions nullifiers by key '
-    'epoch, enabling efficient bulk pruning once an epoch''s accept_until has '
+    'The compound primary key (issuer_key_id, value) partitions nullifiers by key, '
+    'enabling efficient bulk pruning once a key''s accept_until has '
     'passed. This table lives in the same database as the billing schema for '
     'durability guarantees. In a production split-environment deployment, '
     'it would move to the service environment''s own durable store.';
 
-COMMENT ON COLUMN nullifier.epoch IS
-    'The issuer key epoch under which this credential was issued and spent. '
+COMMENT ON COLUMN nullifier.issuer_key_id IS
+    'The issuer key under which this credential was issued and spent. '
     'Partitions the nullifier space for lifecycle management.';
 
 COMMENT ON COLUMN nullifier.value IS
     'The raw nullifier scalar (32 bytes for Ristretto255). Revealed in the '
-    'clear during the spend proof. Uniqueness within an epoch is enforced by '
+    'clear during the spend proof. Uniqueness within a key is enforced by '
     'the primary key — a duplicate insert fails, indicating a double-spend.';
 
 COMMENT ON COLUMN nullifier.recorded_at IS
@@ -279,12 +281,12 @@ COMMENT ON FUNCTION available_balance IS
     'fast check before credential provisioning. For the full breakdown '
     '(expiring vs permanent), query the account_balance view instead.';
 
-CREATE FUNCTION record_nullifier(p_epoch TEXT, p_value BYTEA)
+CREATE FUNCTION record_nullifier(p_issuer_key_id UUID, p_value BYTEA)
 RETURNS BOOLEAN
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    INSERT INTO nullifier (epoch, value) VALUES (p_epoch, p_value);
+    INSERT INTO nullifier (issuer_key_id, value) VALUES (p_issuer_key_id, p_value);
     RETURN TRUE;
 EXCEPTION
     WHEN unique_violation THEN
@@ -306,8 +308,8 @@ DECLARE
     pruned BIGINT;
 BEGIN
     DELETE FROM nullifier
-    WHERE epoch IN (
-        SELECT epoch FROM issuer_key WHERE accept_until < now()
+    WHERE issuer_key_id IN (
+        SELECT id FROM issuer_key WHERE accept_until < now()
     );
     GET DIAGNOSTICS pruned = ROW_COUNT;
     RETURN pruned;
@@ -315,8 +317,8 @@ END;
 $$;
 
 COMMENT ON FUNCTION prune_expired_nullifiers IS
-    'Removes nullifiers for key epochs whose accept_until has passed. '
-    'Credentials from these epochs can no longer be spent, so their nullifiers '
+    'Removes nullifiers for keys whose accept_until has passed. '
+    'Credentials from these keys can no longer be spent, so their nullifiers '
     'are no longer needed. Returns the number of nullifiers pruned. '
     'Safe to run periodically (e.g., daily) or manually after key rotation.';
 
