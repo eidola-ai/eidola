@@ -351,9 +351,13 @@ pub async fn issue_credentials(
     {
         Some(id) => id,
         None => {
-            let available = db::get_available_balance(&state.db_pool, account_id)
-                .await
-                .unwrap_or(0);
+            let available = match db::get_available_balance(&state.db_pool, account_id).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("failed to fetch balance for 402 response: {e}");
+                    0
+                }
+            };
             return Err(ServerError::PaymentRequired {
                 message: "insufficient balance".to_string(),
                 available,

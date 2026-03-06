@@ -1,6 +1,7 @@
 //! Unified error handling for the Eidolons server.
 
 use axum::http::StatusCode;
+use tracing::{error, warn};
 
 use crate::types::ErrorResponse;
 
@@ -119,6 +120,11 @@ impl std::error::Error for ServerError {}
 impl axum::response::IntoResponse for ServerError {
     fn into_response(self) -> axum::response::Response {
         let status = self.status_code();
+        if status.is_server_error() {
+            error!(status = status.as_u16(), "{self}");
+        } else if status.is_client_error() {
+            warn!(status = status.as_u16(), "{self}");
+        }
         let body = self.to_error_response();
         (status, axum::Json(body)).into_response()
     }

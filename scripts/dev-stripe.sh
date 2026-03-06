@@ -13,7 +13,8 @@ set -euo pipefail
 cleanup() {
     echo ""
     echo "==> Cleaning up..."
-    docker compose --profile test down --volumes --remove-orphans 2>/dev/null || true
+    # docker compose --profile test down --volumes --remove-orphans 2>/dev/null || true
+    docker compose --profile test down --remove-orphans 2>/dev/null || true
 }
 trap cleanup EXIT
 
