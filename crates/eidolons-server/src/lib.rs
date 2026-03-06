@@ -30,7 +30,6 @@ pub struct AppState {
 
 pub struct AppStateInner {
     pub backend: backend::RedPillBackend,
-    pub validator: auth::AnyValidator,
     pub attestation: attestation::AttestationClient,
     pub db_pool: deadpool_postgres::Pool,
     pub stripe: Option<stripe::StripeClient>,
@@ -44,7 +43,6 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend: backend::RedPillBackend,
-        validator: auth::AnyValidator,
         attestation: attestation::AttestationClient,
         db_pool: deadpool_postgres::Pool,
         stripe: Option<stripe::StripeClient>,
@@ -56,7 +54,6 @@ impl AppState {
         Self {
             inner: Arc::new(AppStateInner {
                 backend,
-                validator,
                 attestation,
                 db_pool,
                 stripe,

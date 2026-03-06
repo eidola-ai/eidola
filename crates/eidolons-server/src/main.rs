@@ -12,7 +12,6 @@ use tracing::{error, info, warn};
 
 use eidolons_server::AppState;
 use eidolons_server::attestation::AttestationClient;
-use eidolons_server::auth::{AnyValidator, NoopValidator};
 use eidolons_server::backend::RedPillBackend;
 use eidolons_server::credentials;
 use eidolons_server::helpers::EpochConfig;
@@ -23,7 +22,6 @@ struct Config {
     bind_addr: SocketAddr,
     redpill_api_key: String,
     redpill_base_url: Option<String>,
-    auth_mode: String,
     database_url: String,
     stripe_api_key: Option<String>,
     stripe_webhook_secret: Option<String>,
@@ -42,8 +40,6 @@ impl Config {
             .map_err(|_| "REDPILL_API_KEY environment variable is required")?;
 
         let redpill_base_url = std::env::var("REDPILL_BASE_URL").ok();
-
-        let auth_mode = std::env::var("AUTH_MODE").unwrap_or_else(|_| "none".to_string());
 
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
@@ -86,7 +82,6 @@ impl Config {
             bind_addr,
             redpill_api_key,
             redpill_base_url,
-            auth_mode,
             database_url,
             stripe_api_key,
             stripe_webhook_secret,
@@ -118,18 +113,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })?;
 
     info!("Starting Eidolons server on {}", config.bind_addr);
-    info!("Auth mode: {}", config.auth_mode);
-
-    // Build the token validator
-    let validator = match config.auth_mode.as_str() {
-        "none" => {
-            warn!("Running with no authentication (development mode)");
-            AnyValidator::Noop(NoopValidator)
-        }
-        other => {
-            return Err(format!("unknown AUTH_MODE: {} (expected: none)", other).into());
-        }
-    };
 
     // Create database connection pool
     let db_pool = eidolons_server::db::create_pool(&config.database_url).map_err(|e| {
@@ -160,7 +143,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             config.redpill_base_url.clone(),
             config.pricing_markup,
         ),
-        validator,
         AttestationClient::new(config.redpill_api_key, config.redpill_base_url),
         db_pool,
         stripe,
@@ -180,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .await
         {
-            Ok(key_id) => info!("Issuer key ready: {}", key_id),
+            Ok(key_hash) => info!("Issuer key ready: {}", hex::encode(key_hash)),
             Err(e) => warn!("Failed to provision issuer keys on boot: {}", e),
         }
 

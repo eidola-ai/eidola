@@ -13,7 +13,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use utoipa::ToSchema;
@@ -35,12 +35,14 @@ pub struct DecryptedIssuerKey {
     pub secret_key: PrivateKey,
     pub params: Params,
     pub id: Uuid,
+    pub key_hash: [u8; 32],
+    pub request_context_scalar: Scalar,
     pub issue_from: SystemTime,
     pub issue_until: SystemTime,
 }
 
-/// Thread-safe cache of decrypted issuer keys, keyed by UUID.
-pub type KeyCache = Arc<RwLock<HashMap<Uuid, DecryptedIssuerKey>>>;
+/// Thread-safe cache of decrypted issuer keys, keyed by SHA-256(pkI).
+pub type KeyCache = Arc<RwLock<HashMap<[u8; 32], DecryptedIssuerKey>>>;
 
 // ---------------------------------------------------------------------------
 // Key encryption / decryption
@@ -148,17 +150,99 @@ fn domain_separator() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Issuer key ID and request context (ACT Privacy Pass spec)
+// ---------------------------------------------------------------------------
+
+/// ACT token type (provisional, pending IANA assignment).
+pub const ACT_TOKEN_TYPE: u16 = 0xE5AD;
+
+/// Issuer name used in TokenChallenge and request_context construction.
+const ISSUER_NAME: &str = "eidolons";
+
+/// Origin info used in TokenChallenge and request_context construction.
+const ORIGIN_INFO: &str = "inference";
+
+/// Compute the issuer key ID as SHA-256(pkI_serialized).
+///
+/// Per draft-schlesinger-privacypass-act-01, Section 6.
+pub fn compute_key_hash(public_key_bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(public_key_bytes).into()
+}
+
+/// Compute the request_context bytes.
+///
+/// Per draft-schlesinger-privacypass-act-01, Section 9.2:
+/// `request_context = concat(issuer_name, origin_info, credential_context, issuer_key_id)`
+///
+/// We use empty `credential_context` (key rotation handles expiration).
+pub fn compute_request_context(key_hash: &[u8; 32]) -> Vec<u8> {
+    let mut ctx = Vec::new();
+    ctx.extend_from_slice(ISSUER_NAME.as_bytes());
+    ctx.extend_from_slice(ORIGIN_INFO.as_bytes());
+    // credential_context is empty
+    ctx.extend_from_slice(key_hash);
+    ctx
+}
+
+/// Hash request_context bytes to a Scalar for use as the `ctx` parameter
+/// in ACT cryptographic operations.
+pub fn request_context_to_scalar(request_context: &[u8]) -> Scalar {
+    let hash: [u8; 32] = Sha256::digest(request_context).into();
+    Scalar::from_bytes_mod_order(hash)
+}
+
+/// Serialize a TokenChallenge structure.
+///
+/// Per draft-schlesinger-privacypass-act-01, Section 7:
+/// ```text
+/// struct {
+///     uint16_t token_type = 0xE5AD;
+///     opaque issuer_name<1..2^16-1>;
+///     opaque redemption_context<0..32>;
+///     opaque origin_info<0..2^16-1>;
+///     opaque credential_context<0..32>;
+/// } TokenChallenge;
+/// ```
+///
+/// We use empty `redemption_context` and `credential_context` (no per-request
+/// freshness needed since we have nullifiers, and key rotation handles expiration).
+pub fn serialize_token_challenge() -> Vec<u8> {
+    let mut buf = Vec::new();
+    // token_type (2 bytes, big-endian)
+    buf.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+    // issuer_name with 2-byte length prefix
+    buf.extend_from_slice(&(ISSUER_NAME.len() as u16).to_be_bytes());
+    buf.extend_from_slice(ISSUER_NAME.as_bytes());
+    // redemption_context with 1-byte length prefix (empty)
+    buf.push(0);
+    // origin_info with 2-byte length prefix
+    buf.extend_from_slice(&(ORIGIN_INFO.len() as u16).to_be_bytes());
+    buf.extend_from_slice(ORIGIN_INFO.as_bytes());
+    // credential_context with 1-byte length prefix (empty)
+    buf.push(0);
+    buf
+}
+
+/// Compute the expected challenge_digest = SHA-256(TokenChallenge).
+pub fn compute_challenge_digest() -> [u8; 32] {
+    Sha256::digest(serialize_token_challenge()).into()
+}
+
+// ---------------------------------------------------------------------------
 // Key lifecycle
 // ---------------------------------------------------------------------------
 
-/// Decrypt an issuer key row and insert it into the cache. Returns the key UUID.
+/// Decrypt an issuer key row and insert it into the cache. Returns the key hash.
 fn cache_key(
-    cache: &mut HashMap<Uuid, DecryptedIssuerKey>,
+    cache: &mut HashMap<[u8; 32], DecryptedIssuerKey>,
     master_key: &[u8; 32],
     row: &db::IssuerKeyRow,
-) -> Result<Uuid, ServerError> {
-    if cache.contains_key(&row.id) {
-        return Ok(row.id);
+) -> Result<[u8; 32], ServerError> {
+    let key_hash: [u8; 32] = row.key_hash.as_slice().try_into().map_err(|_| {
+        ServerError::Internal("invalid key_hash length in database".to_string())
+    })?;
+    if cache.contains_key(&key_hash) {
+        return Ok(key_hash);
     }
     let id_str = row.id.to_string();
     let plaintext = decrypt_private_key(master_key, &id_str, &row.private_key_enc)?;
@@ -166,17 +250,21 @@ fn cache_key(
         ServerError::Internal(format!("failed to decode issuer private key: {}", e))
     })?;
     let params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
+    let request_context = compute_request_context(&key_hash);
+    let request_context_scalar = request_context_to_scalar(&request_context);
     cache.insert(
-        row.id,
+        key_hash,
         DecryptedIssuerKey {
             secret_key,
             params,
             id: row.id,
+            key_hash,
+            request_context_scalar,
             issue_from: row.issue_from,
             issue_until: row.issue_until,
         },
     );
-    Ok(row.id)
+    Ok(key_hash)
 }
 
 /// Generate a new issuer key pair and build a row ready for insertion.
@@ -191,6 +279,7 @@ fn generate_key(
         .public()
         .to_cbor()
         .map_err(|e| ServerError::Internal(format!("failed to encode public key: {}", e)))?;
+    let key_hash = compute_key_hash(&public_key_cbor);
     let private_key_cbor = secret_key
         .to_cbor()
         .map_err(|e| ServerError::Internal(format!("failed to encode private key: {}", e)))?;
@@ -201,6 +290,7 @@ fn generate_key(
 
     Ok(db::IssuerKeyRow {
         id: key_id,
+        key_hash: key_hash.to_vec(),
         private_key_enc: encrypted,
         public_key: public_key_cbor,
         domain_separator: domain_separator(),
@@ -211,7 +301,7 @@ fn generate_key(
 }
 
 /// Ensure that both a current key and the next key exist in the database
-/// and are cached in memory. Returns the current key's UUID (for issuance).
+/// and are cached in memory. Returns the current key's hash (for issuance).
 ///
 /// Key chaining: each new key's `issue_from` = predecessor's `issue_until`.
 /// The very first key's `issue_from` = now.
@@ -223,7 +313,7 @@ pub async fn ensure_keys(
     master_key: &[u8; 32],
     pool: &deadpool_postgres::Pool,
     epoch_config: &EpochConfig,
-) -> Result<Uuid, ServerError> {
+) -> Result<[u8; 32], ServerError> {
     let now = SystemTime::now();
 
     // Fast path: check if a valid current key is already cached.
@@ -236,7 +326,7 @@ pub async fn ensure_keys(
             // Also check that a next key exists in cache.
             let has_next = cache.values().any(|k2| k2.issue_from >= k.issue_until);
             if has_next {
-                return Ok(k.id);
+                return Ok(k.key_hash);
             }
         }
     }
@@ -306,17 +396,42 @@ pub async fn ensure_keys(
     // Load all valid keys from DB into cache and find the current one.
     let rows = db::get_valid_issuer_keys(pool).await?;
     let mut cache = key_cache.write().await;
-    let mut current_id = None;
+    let mut current_hash = None;
     for row in &rows {
-        cache_key(&mut cache, master_key, row)?;
+        let kh = cache_key(&mut cache, master_key, row)?;
         if row.issue_from <= now && row.issue_until > now {
-            current_id = Some(row.id);
+            current_hash = Some(kh);
         }
     }
 
-    current_id.ok_or_else(|| {
+    current_hash.ok_or_else(|| {
         ServerError::Internal("no current issuer key found after provisioning".to_string())
     })
+}
+
+/// Load an issuer key for spending verification, checking the cache first
+/// then falling back to the database.
+pub async fn load_key_for_spending(
+    key_cache: &KeyCache,
+    master_key: &[u8; 32],
+    pool: &deadpool_postgres::Pool,
+    key_hash: &[u8; 32],
+) -> Result<(), ServerError> {
+    // Fast path: already in cache
+    if key_cache.read().await.contains_key(key_hash) {
+        return Ok(());
+    }
+
+    // Slow path: load from DB by key hash
+    let row = db::get_issuer_key_by_hash(pool, key_hash)
+        .await?
+        .ok_or_else(|| ServerError::Unauthorized {
+            message: "unknown or expired issuer key".to_string(),
+        })?;
+
+    let mut cache = key_cache.write().await;
+    cache_key(&mut cache, master_key, &row)?;
+    Ok(())
 }
 
 /// Periodic key rotation check interval: 1 hour.
@@ -340,8 +455,8 @@ pub fn spawn_key_rotation_task(
             tokio::time::sleep(sleep_dur).await;
 
             match ensure_keys(&key_cache, &master_key, &pool, &epoch_config).await {
-                Ok(key_id) => {
-                    info!("periodic key check: current key {}", key_id);
+                Ok(key_hash) => {
+                    info!("periodic key check: current key {}", hex::encode(key_hash));
                 }
                 Err(e) => {
                     warn!("periodic key check failed: {}", e);
@@ -358,9 +473,9 @@ pub fn spawn_key_rotation_task(
 /// A single issuer public key in the `GET /v1/keys` response.
 #[derive(Serialize, ToSchema)]
 pub struct IssuerKeyResponse {
-    /// Unique key identifier (UUID).
+    /// Issuer key ID: hex-encoded SHA-256(pkI_serialized).
     pub id: String,
-    /// Base64-encoded CBOR public key (compressed Ristretto255 point).
+    /// Base64url-encoded CBOR public key (compressed Ristretto255 point).
     pub public_key: String,
     /// Domain separator used for parameter generation.
     pub domain_separator: String,
@@ -392,7 +507,7 @@ pub struct IssueCredentialsRequest {
 pub struct IssueCredentialsResponse {
     /// Base64-encoded CBOR `IssuanceResponse`.
     pub issuance_response: String,
-    /// Issuer key identifier (UUID).
+    /// Issuer key identifier: hex-encoded SHA-256(pkI_serialized).
     pub issuer_key_id: String,
     /// Number of credits issued.
     pub credits: i64,
@@ -421,7 +536,7 @@ pub async fn list_keys(
     let data: Vec<IssuerKeyResponse> = rows
         .into_iter()
         .map(|r| IssuerKeyResponse {
-            id: r.id.to_string(),
+            id: hex::encode(&r.key_hash),
             public_key: URL_SAFE_NO_PAD.encode(&r.public_key),
             domain_separator: r.domain_separator,
             issue_from: system_time_to_iso_lossy(r.issue_from),
@@ -479,7 +594,7 @@ pub async fn issue_credentials(
             message: format!("invalid credit amount: {}", e),
         })?;
 
-    let key_id = ensure_keys(
+    let key_hash = ensure_keys(
         &state.credential_key_cache,
         master_key,
         &state.db_pool,
@@ -487,8 +602,19 @@ pub async fn issue_credentials(
     )
     .await?;
 
+    // Look up the UUID for the DB ledger entry (the cache has both).
+    let key_uuid = {
+        let cache = state.credential_key_cache.read().await;
+        cache
+            .get(&key_hash)
+            .map(|k| k.id)
+            .ok_or_else(|| {
+                ServerError::Internal("current key evicted from cache unexpectedly".to_string())
+            })?
+    };
+
     let ledger_entry_id =
-        match db::insert_credential_issuance(&state.db_pool, account_id, request.credits, key_id)
+        match db::insert_credential_issuance(&state.db_pool, account_id, request.credits, key_uuid)
             .await?
         {
             Some(id) => id,
@@ -509,7 +635,7 @@ pub async fn issue_credentials(
 
     let issuance_response = {
         let cache = state.credential_key_cache.read().await;
-        let key = cache.get(&key_id).ok_or_else(|| {
+        let key = cache.get(&key_hash).ok_or_else(|| {
             ServerError::Internal("current key evicted from cache unexpectedly".to_string())
         })?;
         key.secret_key
@@ -517,7 +643,7 @@ pub async fn issue_credentials(
                 &key.params,
                 &issuance_request,
                 credit_scalar,
-                Scalar::ZERO,
+                key.request_context_scalar,
                 OsRng,
             )
             .map_err(|e| {
@@ -539,7 +665,7 @@ pub async fn issue_credentials(
 
     Ok(Json(IssueCredentialsResponse {
         issuance_response: URL_SAFE_NO_PAD.encode(&response_cbor),
-        issuer_key_id: key_id.to_string(),
+        issuer_key_id: hex::encode(key_hash),
         credits: request.credits,
         ledger_entry_id: ledger_entry_id.to_string(),
     }))
@@ -584,6 +710,61 @@ mod tests {
     fn test_domain_separator_is_stable() {
         // The domain separator must never change between key rotations.
         assert_eq!(domain_separator(), "ACT-v1:eidolons:inference:production:2026-03-05");
+    }
+
+    #[test]
+    fn test_compute_key_hash_deterministic() {
+        let pk_bytes = b"test public key bytes";
+        let h1 = compute_key_hash(pk_bytes);
+        let h2 = compute_key_hash(pk_bytes);
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 32);
+    }
+
+    #[test]
+    fn test_request_context_includes_key_hash() {
+        let key_hash = [42u8; 32];
+        let ctx = compute_request_context(&key_hash);
+        // Should contain issuer_name + origin_info + key_hash
+        assert!(ctx.starts_with(b"eidolons"));
+        assert!(ctx.ends_with(&key_hash));
+        assert_eq!(ctx.len(), "eidolons".len() + "inference".len() + 32);
+    }
+
+    #[test]
+    fn test_request_context_scalar_deterministic() {
+        let key_hash = [42u8; 32];
+        let ctx = compute_request_context(&key_hash);
+        let s1 = request_context_to_scalar(&ctx);
+        let s2 = request_context_to_scalar(&ctx);
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn test_different_key_hashes_give_different_contexts() {
+        let ctx1 = request_context_to_scalar(&compute_request_context(&[1u8; 32]));
+        let ctx2 = request_context_to_scalar(&compute_request_context(&[2u8; 32]));
+        assert_ne!(ctx1, ctx2);
+    }
+
+    #[test]
+    fn test_token_challenge_serialization() {
+        let challenge = serialize_token_challenge();
+        // token_type (2) + issuer_name_len (2) + "eidolons" (8) +
+        // redemption_context_len (1) + origin_info_len (2) + "inference" (9) +
+        // credential_context_len (1) = 25
+        assert_eq!(challenge.len(), 25);
+        // Starts with 0xE5AD
+        assert_eq!(challenge[0], 0xE5);
+        assert_eq!(challenge[1], 0xAD);
+    }
+
+    #[test]
+    fn test_challenge_digest_is_stable() {
+        let d1 = compute_challenge_digest();
+        let d2 = compute_challenge_digest();
+        assert_eq!(d1, d2);
+        assert_eq!(d1.len(), 32);
     }
 
     #[test]

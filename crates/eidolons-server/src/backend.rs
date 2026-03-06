@@ -1,8 +1,10 @@
 //! Chat completion backend trait and RedPill.ai implementation.
 
+use std::time::Instant;
+
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use utoipa::ToSchema;
 
 use crate::error::ServerError;
@@ -37,6 +39,9 @@ pub struct BackendMeta {
 
     /// Whether this model runs inside a TEE.
     pub tee_type: Option<TeeType>,
+
+    /// Token usage statistics (from the response or final streaming chunk).
+    pub usage: Option<crate::types::Usage>,
 }
 
 /// A completed (non-streaming) backend response.
@@ -173,11 +178,15 @@ impl RedPillModel {
 /// Sends OpenAI-format requests to RedPill's API, which supports both
 /// frontier providers (OpenAI, Anthropic, etc.) and confidential Phala GPU
 /// TEE models (phala/* prefix).
+/// How long to cache the model list before refreshing.
+const MODEL_CACHE_TTL_SECS: u64 = 300; // 5 minutes
+
 pub struct RedPillBackend {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
     pricing_markup: f64,
+    models_cache: RwLock<Option<(Instant, ModelsResponse)>>,
 }
 
 impl RedPillBackend {
@@ -191,6 +200,7 @@ impl RedPillBackend {
             api_key,
             base_url: base_url.unwrap_or_else(|| "https://api.redpill.ai/v1".to_string()),
             pricing_markup: pricing_markup.unwrap_or(DEFAULT_PRICING_MARKUP),
+            models_cache: RwLock::new(None),
         }
     }
 
@@ -201,6 +211,27 @@ impl RedPillBackend {
         } else {
             None
         }
+    }
+}
+
+impl RedPillBackend {
+    /// Look up a model by ID, using a cached model list.
+    pub async fn lookup_model(&self, model_id: &str) -> Result<Option<Model>, ServerError> {
+        // Check cache
+        {
+            let cache = self.models_cache.read().await;
+            if let Some((fetched_at, ref models)) = *cache {
+                if fetched_at.elapsed().as_secs() < MODEL_CACHE_TTL_SECS {
+                    return Ok(models.data.iter().find(|m| m.id == model_id).cloned());
+                }
+            }
+        }
+
+        // Cache miss or stale — refresh
+        let models = ChatBackend::list_models(self).await?;
+        let result = models.data.iter().find(|m| m.id == model_id).cloned();
+        *self.models_cache.write().await = Some((Instant::now(), models));
+        Ok(result)
     }
 }
 
@@ -298,6 +329,7 @@ impl ChatBackend for RedPillBackend {
             chat_id: Some(completion.id.clone()),
             backend_model: completion.model.clone(),
             tee_type: Self::tee_type_for_model(&request.model),
+            usage: completion.usage.clone(),
         };
 
         Ok(BackendResponse {
@@ -357,6 +389,7 @@ impl ChatBackend for RedPillBackend {
             let mut buffer = String::new();
             let mut chat_id: Option<String> = None;
             let mut backend_model = model.clone();
+            let mut final_usage: Option<crate::types::Usage> = None;
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
@@ -374,6 +407,9 @@ impl ChatBackend for RedPillBackend {
                                         chat_id = Some(chunk.id.clone());
                                     }
                                     backend_model.clone_from(&chunk.model);
+                                    if chunk.usage.is_some() {
+                                        final_usage.clone_from(&chunk.usage);
+                                    }
                                     if tx.send(Ok(BackendStreamEvent::Chunk(chunk))).await.is_err()
                                     {
                                         return; // Client disconnected
@@ -402,6 +438,7 @@ impl ChatBackend for RedPillBackend {
                 chat_id,
                 backend_model,
                 tee_type,
+                usage: final_usage,
             };
             let _ = tx.send(Ok(BackendStreamEvent::Done(meta))).await;
         });

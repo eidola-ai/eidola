@@ -54,6 +54,7 @@ CREATE INDEX idx_account_stripe_customer ON account (stripe_customer_id)
 
 CREATE TABLE issuer_key (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    key_hash        BYTEA NOT NULL,
     private_key_enc BYTEA NOT NULL,
     public_key      BYTEA NOT NULL,
     domain_separator TEXT NOT NULL,
@@ -65,6 +66,9 @@ CREATE TABLE issuer_key (
     CONSTRAINT issue_window CHECK (issue_from < issue_until),
     CONSTRAINT grace_window CHECK (issue_until <= accept_until)
 );
+
+-- Unique index for client-facing key lookup by SHA-256(pkI).
+CREATE UNIQUE INDEX idx_issuer_key_hash ON issuer_key (key_hash);
 
 -- Non-unique index for efficient lookup by issuance period.
 CREATE INDEX idx_issuer_key_issue_from ON issuer_key (issue_from);
@@ -78,8 +82,14 @@ COMMENT ON TABLE issuer_key IS
     'serializable transactions in the application layer.';
 
 COMMENT ON COLUMN issuer_key.id IS
-    'Unique key identifier (UUID). Primary key and foreign key '
+    'Internal key identifier (UUID). Primary key and foreign key '
     'target for the nullifier table.';
+
+COMMENT ON COLUMN issuer_key.key_hash IS
+    'SHA-256 hash of the serialized public key (32 bytes). This is the '
+    'client-facing issuer_key_id per the ACT Privacy Pass spec '
+    '(draft-schlesinger-privacypass-act-01, Section 6). Clients use this '
+    'to identify keys in Token structures and credential requests.';
 
 COMMENT ON COLUMN issuer_key.private_key_enc IS
     'AES-256-GCM encrypted credential private key (Ristretto255 scalar). '

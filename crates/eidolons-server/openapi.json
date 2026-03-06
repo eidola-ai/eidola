@@ -395,7 +395,7 @@
           "Unlinked"
         ],
         "summary": "Create a chat completion.",
-        "description": "Proxies the request to the configured backend and returns a response\nenriched with privacy and verification metadata.",
+        "description": "Requires an ACT (Anonymous Credit Token) for authorization. The spend proof\nis verified, the nullifier is recorded, and a refund token is issued with\nany unspent credits.",
         "operationId": "chat_completions",
         "requestBody": {
           "content": {
@@ -430,6 +430,26 @@
           },
           "401": {
             "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient charge amount",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Credential already spent",
             "content": {
               "application/json": {
                 "schema": {
@@ -732,6 +752,17 @@
           "object": {
             "type": "string",
             "description": "The object type (always \"chat.completion.chunk\")."
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage",
+                "description": "Usage statistics (included in the final chunk by some providers)."
+              }
+            ]
           }
         }
       },
@@ -1094,6 +1125,17 @@
             "$ref": "#/components/schemas/PrivacyMetadata",
             "description": "Privacy metadata describing data exposure and authorization."
           },
+          "refund": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RefundInfo",
+                "description": "Refund token for unspent credits (only present for ACT-authenticated requests)."
+              }
+            ]
+          },
           "usage": {
             "oneOf": [
               {
@@ -1133,6 +1175,17 @@
             "$ref": "#/components/schemas/PrivacyMetadata",
             "description": "Privacy metadata."
           },
+          "refund": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RefundInfo",
+                "description": "Refund token for unspent credits."
+              }
+            ]
+          },
           "verification": {
             "$ref": "#/components/schemas/VerificationMetadata",
             "description": "Verification metadata."
@@ -1162,13 +1215,16 @@
       },
       "ErrorResponse": {
         "type": "object",
-        "description": "An error response in OpenAI format.",
+        "description": "An error response in OpenAI format, optionally including a refund token.",
         "required": [
           "error"
         ],
         "properties": {
           "error": {
             "$ref": "#/components/schemas/ErrorDetail"
+          },
+          "refund": {
+            "description": "Refund token for unspent credits (present when an error occurs after\nthe ACT nullifier has been recorded)."
           }
         }
       },
@@ -1294,7 +1350,7 @@
           },
           "id": {
             "type": "string",
-            "description": "Unique key identifier (UUID)."
+            "description": "Issuer key ID: hex-encoded SHA-256(pkI_serialized)."
           },
           "issue_from": {
             "type": "string",
@@ -1306,7 +1362,7 @@
           },
           "public_key": {
             "type": "string",
-            "description": "Base64-encoded CBOR public key (compressed Ristretto255 point)."
+            "description": "Base64url-encoded CBOR public key (compressed Ristretto255 point)."
           }
         }
       },
@@ -1443,21 +1499,15 @@
         "required": [
           "id",
           "name",
-          "created",
           "description",
-          "context_length"
+          "context_length",
+          "pricing"
         ],
         "properties": {
           "context_length": {
             "type": "integer",
             "format": "int64",
             "description": "Maximum context window size in tokens.",
-            "minimum": 0
-          },
-          "created": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Unix timestamp of when the model was created.",
             "minimum": 0
           },
           "description": {
@@ -1471,6 +1521,26 @@
           "name": {
             "type": "string",
             "description": "Human-readable display name."
+          },
+          "pricing": {
+            "$ref": "#/components/schemas/ModelPricing",
+            "description": "Pricing in integer credits per 1k tokens."
+          }
+        }
+      },
+      "ModelPricing": {
+        "type": "object",
+        "description": "Pricing for a model in scaled integer credits per token.",
+        "required": [
+          "per_prompt_token",
+          "per_completion_token"
+        ],
+        "properties": {
+          "per_completion_token": {
+            "$ref": "#/components/schemas/ScaledPrice"
+          },
+          "per_prompt_token": {
+            "$ref": "#/components/schemas/ScaledPrice"
           }
         }
       },
@@ -1602,6 +1672,24 @@
           }
         }
       },
+      "RefundInfo": {
+        "type": "object",
+        "description": "A refund token issued after spending an ACT.",
+        "required": [
+          "refund",
+          "issuer_key_id"
+        ],
+        "properties": {
+          "issuer_key_id": {
+            "type": "string",
+            "description": "The issuer key ID that signed this refund."
+          },
+          "refund": {
+            "type": "string",
+            "description": "Base64url-encoded CBOR `Refund` message."
+          }
+        }
+      },
       "Role": {
         "type": "string",
         "description": "The role of a message author.",
@@ -1610,6 +1698,26 @@
           "user",
           "assistant"
         ]
+      },
+      "ScaledPrice": {
+        "type": "object",
+        "description": "A price expressed as an integer value with a fixed scale factor.\n\nActual credits per unit = `value / scale_factor`.",
+        "required": [
+          "value",
+          "scale_factor"
+        ],
+        "properties": {
+          "scale_factor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "value": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
       },
       "StopSequence": {
         "oneOf": [

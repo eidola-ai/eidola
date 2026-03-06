@@ -37,6 +37,10 @@ pub struct EidolonsResponse {
 
     /// Verification metadata with cryptographic attestations.
     pub verification: VerificationMetadata,
+
+    /// Refund token for unspent credits (only present for ACT-authenticated requests).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refund: Option<RefundInfo>,
 }
 
 impl EidolonsResponse {
@@ -45,6 +49,7 @@ impl EidolonsResponse {
         response: crate::types::ChatCompletionResponse,
         privacy: PrivacyMetadata,
         verification: VerificationMetadata,
+        refund: Option<RefundInfo>,
     ) -> Self {
         Self {
             id: response.id,
@@ -55,6 +60,7 @@ impl EidolonsResponse {
             usage: response.usage,
             privacy,
             verification,
+            refund,
         }
     }
 }
@@ -166,6 +172,19 @@ pub struct BackendAttestation {
 }
 
 // ---------------------------------------------------------------------------
+// Refund info
+// ---------------------------------------------------------------------------
+
+/// A refund token issued after spending an ACT.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RefundInfo {
+    /// Base64url-encoded CBOR `Refund` message.
+    pub refund: String,
+    /// The issuer key ID that signed this refund.
+    pub issuer_key_id: String,
+}
+
+// ---------------------------------------------------------------------------
 // Streaming metadata event
 // ---------------------------------------------------------------------------
 
@@ -186,15 +205,25 @@ pub struct EidolonsStreamMetadata {
 
     /// Verification metadata.
     pub verification: VerificationMetadata,
+
+    /// Refund token for unspent credits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refund: Option<RefundInfo>,
 }
 
 impl EidolonsStreamMetadata {
-    pub fn new(id: String, privacy: PrivacyMetadata, verification: VerificationMetadata) -> Self {
+    pub fn new(
+        id: String,
+        privacy: PrivacyMetadata,
+        verification: VerificationMetadata,
+        refund: Option<RefundInfo>,
+    ) -> Self {
         Self {
             object: "eidolons.chat.completion.metadata".to_string(),
             id,
             privacy,
             verification,
+            refund,
         }
     }
 }
@@ -291,6 +320,7 @@ mod tests {
                 proxy: None,
                 backend: None,
             },
+            refund: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -318,6 +348,7 @@ mod tests {
                 proxy: None,
                 backend: None,
             },
+            None,
         );
 
         let json = serde_json::to_string(&meta).unwrap();

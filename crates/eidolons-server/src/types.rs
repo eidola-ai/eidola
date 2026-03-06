@@ -219,6 +219,10 @@ pub struct ChatCompletionChunk {
 
     /// List of completion choices (deltas).
     pub choices: Vec<ChunkChoice>,
+
+    /// Usage statistics (included in the final chunk by some providers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 impl ChatCompletionChunk {
@@ -232,6 +236,7 @@ impl ChatCompletionChunk {
                 .as_secs(),
             model,
             choices,
+            usage: None,
         }
     }
 }
@@ -301,10 +306,15 @@ pub struct ScaledPrice {
     pub scale_factor: u64,
 }
 
-/// An error response in OpenAI format.
+/// An error response in OpenAI format, optionally including a refund token.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,
+
+    /// Refund token for unspent credits (present when an error occurs after
+    /// the ACT nullifier has been recorded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refund: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -323,6 +333,7 @@ impl ErrorResponse {
                 error_type: error_type.into(),
                 code: None,
             },
+            refund: None,
         }
     }
 }
@@ -541,6 +552,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
 
         let json = serde_json::to_string(&chunk).unwrap();

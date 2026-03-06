@@ -182,6 +182,7 @@ pub async fn insert_credit_ledger(
 /// A row from the `issuer_key` table.
 pub struct IssuerKeyRow {
     pub id: Uuid,
+    pub key_hash: Vec<u8>,
     pub private_key_enc: Vec<u8>,
     pub public_key: Vec<u8>,
     pub domain_separator: String,
@@ -217,7 +218,7 @@ where
     // Read the latest key inside the transaction.
     let latest_row = tx
         .query_opt(
-            "SELECT id, private_key_enc, public_key, domain_separator, \
+            "SELECT id, key_hash, private_key_enc, public_key, domain_separator, \
                     issue_from, issue_until, accept_until \
              FROM issuer_key ORDER BY issue_from DESC LIMIT 1",
             &[],
@@ -239,11 +240,12 @@ where
 
     tx.execute(
         "INSERT INTO issuer_key \
-            (id, private_key_enc, public_key, domain_separator, \
+            (id, key_hash, private_key_enc, public_key, domain_separator, \
              issue_from, issue_until, accept_until) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         &[
             &key.id,
+            &key.key_hash.as_slice(),
             &key.private_key_enc.as_slice(),
             &key.public_key.as_slice(),
             &key.domain_separator.as_str(),
@@ -272,7 +274,7 @@ pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, Ser
 
     let rows = client
         .query(
-            "SELECT id, private_key_enc, public_key, domain_separator, \
+            "SELECT id, key_hash, private_key_enc, public_key, domain_separator, \
                     issue_from, issue_until, accept_until \
              FROM issuer_key WHERE accept_until > now() \
              ORDER BY issue_from ASC",
@@ -287,6 +289,7 @@ pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, Ser
 fn map_issuer_key_row(r: &tokio_postgres::Row) -> IssuerKeyRow {
     IssuerKeyRow {
         id: r.get("id"),
+        key_hash: r.get("key_hash"),
         private_key_enc: r.get("private_key_enc"),
         public_key: r.get("public_key"),
         domain_separator: r.get("domain_separator"),
@@ -393,6 +396,75 @@ pub async fn get_balance_pools(
         .collect();
 
     Ok((total, pools))
+}
+
+/// Retrieve an issuer key by ID (if still valid for acceptance).
+pub async fn get_issuer_key_by_id(
+    pool: &Pool,
+    id: Uuid,
+) -> Result<Option<IssuerKeyRow>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let row = client
+        .query_opt(
+            "SELECT id, key_hash, private_key_enc, public_key, domain_separator, \
+                    issue_from, issue_until, accept_until \
+             FROM issuer_key WHERE id = $1 AND accept_until > now()",
+            &[&id],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("query issuer_key failed: {e:?}")))?;
+
+    Ok(row.as_ref().map(map_issuer_key_row))
+}
+
+/// Retrieve an issuer key by its SHA-256 hash (if still valid for acceptance).
+pub async fn get_issuer_key_by_hash(
+    pool: &Pool,
+    key_hash: &[u8],
+) -> Result<Option<IssuerKeyRow>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let row = client
+        .query_opt(
+            "SELECT id, key_hash, private_key_enc, public_key, domain_separator, \
+                    issue_from, issue_until, accept_until \
+             FROM issuer_key WHERE key_hash = $1 AND accept_until > now()",
+            &[&key_hash],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("query issuer_key by hash failed: {e:?}")))?;
+
+    Ok(row.as_ref().map(map_issuer_key_row))
+}
+
+/// Atomically record a nullifier. Returns `true` if successfully recorded,
+/// `false` if the nullifier was already present (double-spend attempt).
+pub async fn record_nullifier(
+    pool: &Pool,
+    issuer_key_id: Uuid,
+    value: &[u8],
+) -> Result<bool, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let row = client
+        .query_one(
+            "SELECT record_nullifier($1, $2) as recorded",
+            &[&issuer_key_id, &value],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("record_nullifier failed: {e:?}")))?;
+
+    Ok(row.get::<_, bool>("recorded"))
 }
 
 /// A single ledger entry row.
