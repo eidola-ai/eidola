@@ -76,8 +76,9 @@ This architecture ensures that the "Conscious" mind (the UI) remains snappy and 
 
 Eidolons consists of these components:
 - **Crates** (`crates/`) - Rust crates including:
-  - `eidolons-server` - Privacy-transparent OpenAI-compatible proxy with account management, Stripe billing/webhooks, credit ledger, and inline attestation metadata
+  - `eidolons-server` - Privacy-transparent OpenAI-compatible proxy with account management, Stripe billing/webhooks, credit ledger, and anonymous credential issuance
   - `eidolons-shared` - Crux-based cross-platform app core managing state and effects, exposing capabilities via FFI
+- **APP: CLI** (`apps/cli/`) - Command-line client for account management, credit allocation, and local credential wallet
 - **APP: macOS** (`apps/macos/`) - SwiftUI shell that renders the shared core's view model
 
 **Prerequisites:** `rustup`, `just`, `docker`

@@ -12,7 +12,7 @@ eidolons/
 │   │   │   ├── main.rs       # HTTP server (axum + tokio), Config, serves OpenApiRouter
 │   │   │   ├── lib.rs        # Module declarations, AppState (Clone via Arc), build_router()
 │   │   │   ├── handlers.rs   # Core handlers: health, models, chat completions (axum extractors)
-│   │   │   ├── helpers.rs    # Consolidated utilities: calendar, cursor encoding, epoch computation
+│   │   │   ├── helpers.rs    # Consolidated utilities: calendar, timestamp formatting, key period computation
 │   │   │   ├── account.rs    # Account handlers (axum extractors)
 │   │   │   ├── db.rs         # Database pool (deadpool-postgres) and query helpers
 │   │   │   ├── stripe.rs     # Thin Stripe API client (checkout, subscriptions, portal)
@@ -35,10 +35,11 @@ eidolons/
 │       ├── swift/            # Generated bindings (UniFFI + Crux types)
 │       └── Package.swift     # Swift Package exposing EidolonsShared + SharedTypes
 ├── apps/
-│   ├── cli/              # Pure Rust CLI app (iocraft TUI + smol async)
+│   ├── cli/              # Pure Rust CLI app (clap + tokio)
 │   │   ├── schema.sql        # Canonical SQLite schema (wallet, credentials)
 │   │   └── src/
-│   │       ├── main.rs       # Crux shell: event loop, effect handling, TUI rendering
+│   │       ├── main.rs       # CLI entrypoint: account, wallet, and credential commands
+│   │       ├── config.rs     # Config file persistence (~/.config/eidolons/config.toml)
 │   │       └── db.rs         # Embedded Turso/libSQL database with migrations
 │   └── macos/            # macOS app (SwiftPM + Xcode wrapper)
 │       ├── Sources/
@@ -202,7 +203,7 @@ nix run '.#update-server-openapi'
 | `compose.yaml` | Dev environment: postgres + server + stripe-cli (test profile) |
 | `docker-bake.hcl` | Reproducible OCI build settings (overlays compose.yaml) |
 | `artifact-manifest.json` | Committed OCI image digests — CI verifies builds match |
-| `crates/eidolons-server/src/helpers.rs` | Consolidated calendar, cursor, epoch utilities |
+| `crates/eidolons-server/src/helpers.rs` | Consolidated calendar, timestamp formatting, key period utilities |
 | `crates/eidolons-server/Containerfile` | StageX-based OCI image build |
 | `crates/eidolons-server/schema.sql` | PostgreSQL schema (billing, credentials, nullifiers) |
 | `.env.example` | Template for local environment variables |
@@ -215,7 +216,7 @@ nix run '.#update-server-openapi'
 | `crates/eidolons-shared/src/app.rs` | Crux App implementation (Event, Model, ViewModel, Effect) |
 | `apps/cli/schema.sql` | Canonical CLI SQLite schema (used for fresh installs) |
 | `apps/cli/src/db.rs` | Embedded Turso database: open, initialize, migrate |
-| `apps/cli/src/main.rs` | CLI Crux shell (iocraft TUI, smol async runtime) |
+| `apps/cli/src/main.rs` | CLI entrypoint: account, wallet, and credential commands |
 | `apps/macos/Package.swift` | macOS app Swift Package config |
 | `apps/macos/Sources/Eidolons/Core.swift` | Swift shell bridge (handles Crux event/effect loop) |
 | `scripts/dev-stripe.sh` | Start full stack with Stripe webhook forwarding |
