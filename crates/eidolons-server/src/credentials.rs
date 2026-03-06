@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -24,7 +24,7 @@ use crate::AppState;
 use crate::auth::BasicAuth;
 use crate::db;
 use crate::error::ServerError;
-use crate::helpers::{current_epoch, epoch_boundaries, system_time_to_iso_lossy};
+use crate::helpers::{EpochConfig, system_time_to_iso_lossy};
 
 // ---------------------------------------------------------------------------
 // Key cache types
@@ -35,6 +35,7 @@ pub struct DecryptedIssuerKey {
     pub secret_key: PrivateKey,
     pub params: Params,
     pub id: Uuid,
+    pub issue_from: SystemTime,
     pub issue_until: SystemTime,
 }
 
@@ -45,9 +46,9 @@ pub type KeyCache = Arc<RwLock<HashMap<Uuid, DecryptedIssuerKey>>>;
 // Key encryption / decryption
 // ---------------------------------------------------------------------------
 
-/// Derive a per-epoch AES-256-GCM key from the master key using HKDF-SHA256.
-fn derive_epoch_key(master_key: &[u8; 32], epoch: &str) -> [u8; 32] {
-    let hk = hkdf::Hkdf::<Sha256>::new(Some(epoch.as_bytes()), master_key);
+/// Derive a per-key AES-256-GCM key from the master key using HKDF-SHA256.
+fn derive_key_encryption_key(master_key: &[u8; 32], key_id: &str) -> [u8; 32] {
+    let hk = hkdf::Hkdf::<Sha256>::new(Some(key_id.as_bytes()), master_key);
     let mut okm = [0u8; 32];
     hk.expand(b"eidolons-issuer-key-v1", &mut okm)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
@@ -58,10 +59,10 @@ fn derive_epoch_key(master_key: &[u8; 32], epoch: &str) -> [u8; 32] {
 /// Output format: `nonce (12 bytes) || ciphertext+tag`.
 fn encrypt_private_key(
     master_key: &[u8; 32],
-    epoch: &str,
+    key_id: &str,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, ServerError> {
-    let aes_key = derive_epoch_key(master_key, epoch);
+    let aes_key = derive_key_encryption_key(master_key, key_id);
     let cipher = Aes256Gcm::new_from_slice(&aes_key)
         .map_err(|e| ServerError::Internal(format!("AES key init failed: {}", e)))?;
 
@@ -82,14 +83,14 @@ fn encrypt_private_key(
 /// Decrypt a private key from the `nonce || ciphertext+tag` format.
 fn decrypt_private_key(
     master_key: &[u8; 32],
-    epoch: &str,
+    key_id: &str,
     encrypted: &[u8],
 ) -> Result<Vec<u8>, ServerError> {
     if encrypted.len() < 12 {
         return Err(ServerError::Internal("encrypted key too short".to_string()));
     }
     let (nonce_bytes, ciphertext) = encrypted.split_at(12);
-    let aes_key = derive_epoch_key(master_key, epoch);
+    let aes_key = derive_key_encryption_key(master_key, key_id);
     let cipher = Aes256Gcm::new_from_slice(&aes_key)
         .map_err(|e| ServerError::Internal(format!("AES key init failed: {}", e)))?;
     let nonce = Nonce::from_slice(nonce_bytes);
@@ -103,60 +104,87 @@ fn decrypt_private_key(
 // Domain separator
 // ---------------------------------------------------------------------------
 
-/// Build the domain separator string for an epoch.
-fn domain_separator(epoch: &str) -> String {
-    format!("ACT-v1:eidolons:inference:production:{}", epoch)
+/// Domain separator components for credential operations.
+///
+/// These are baked into all credential issuance and verification via
+/// `Params::new()`, which constructs the full domain separator string
+/// `ACT-v1:{ORG}:{SERVICE}:{DEPLOYMENT}:{VERSION}`.
+///
+/// Per the ACT spec (draft-schlesinger-cfrg-act), the version field is an
+/// ISO 8601 date indicating when parameters were generated. Critically,
+/// the domain separator is orthogonal to key rotation:
+///
+/// - **Key rotation** (every ~7 days) provides temporal epoch boundaries,
+///   nullifier partitioning, and bounds the lifetime of issued credentials.
+///   Keys rotate frequently and automatically.
+///
+/// - **Domain separator** provides cryptographic isolation between different
+///   deployments, services, and protocol versions. It changes only on
+///   protocol upgrades or deployment changes — never as part of routine
+///   key rotation.
+///
+/// We intentionally do NOT rotate the domain separator on a schedule.
+/// Doing so would shrink the anonymity set (which is the intersection of
+/// users sharing the same key AND domain separator) without providing any
+/// benefit that key rotation doesn't already give. Nullifiers are partitioned
+/// by issuer key, not domain separator, so shorter domain separator epochs
+/// would not enable earlier pruning. The spec itself frames version changes
+/// as exceptional: "When parameters need to be updated (e.g., for security
+/// reasons or protocol upgrades), a new version date MUST be used."
+///
+/// If these values ever need to change, all existing credentials become
+/// unspendable under the new parameters — this is by design (cryptographic
+/// isolation), but means changes must be coordinated with a migration plan.
+const DS_ORG: &str = "eidolons";
+const DS_SERVICE: &str = "inference";
+const DS_DEPLOYMENT: &str = "production";
+const DS_VERSION: &str = "2026-03-05";
+
+/// The full domain separator string, for storage in the database.
+/// Must match what `Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION)`
+/// produces internally.
+fn domain_separator() -> String {
+    format!("ACT-v1:{}:{}:{}:{}", DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION)
 }
 
 // ---------------------------------------------------------------------------
 // Key lifecycle
 // ---------------------------------------------------------------------------
 
-/// Ensure a key exists for the current period. Returns the key UUID.
-///
-/// 1. Check in-memory cache for a key still within its issuance window.
-/// 2. Check database (decrypt + cache if found).
-/// 3. Generate new key → encrypt → insert → cache.
-pub async fn ensure_current_key(
-    key_cache: &KeyCache,
+/// Decrypt an issuer key row and insert it into the cache. Returns the key UUID.
+fn cache_key(
+    cache: &mut HashMap<Uuid, DecryptedIssuerKey>,
     master_key: &[u8; 32],
-    pool: &deadpool_postgres::Pool,
+    row: &db::IssuerKeyRow,
 ) -> Result<Uuid, ServerError> {
-    let now = SystemTime::now();
-
-    // Fast path: already cached and still valid for issuance.
-    {
-        let cache = key_cache.read().await;
-        for (id, key) in cache.iter() {
-            if key.issue_until > now {
-                return Ok(*id);
-            }
-        }
+    if cache.contains_key(&row.id) {
+        return Ok(row.id);
     }
-
-    // Compute the current epoch string for key generation purposes.
-    let epoch = current_epoch();
-
-    // Check the database.
-    if let Some(row) = db::get_current_issuer_key(pool).await? {
-        let id_str = row.id.to_string();
-        let plaintext = decrypt_private_key(master_key, &id_str, &row.private_key_enc)?;
-        let secret_key = PrivateKey::from_cbor(&plaintext).map_err(|e| {
-            ServerError::Internal(format!("failed to decode issuer private key: {}", e))
-        })?;
-        let params = Params::new("eidolons", "inference", "production", &epoch);
-        let key_id = row.id;
-        let mut cache = key_cache.write().await;
-        cache.entry(key_id).or_insert(DecryptedIssuerKey {
+    let id_str = row.id.to_string();
+    let plaintext = decrypt_private_key(master_key, &id_str, &row.private_key_enc)?;
+    let secret_key = PrivateKey::from_cbor(&plaintext).map_err(|e| {
+        ServerError::Internal(format!("failed to decode issuer private key: {}", e))
+    })?;
+    let params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
+    cache.insert(
+        row.id,
+        DecryptedIssuerKey {
             secret_key,
             params,
-            id: key_id,
+            id: row.id,
+            issue_from: row.issue_from,
             issue_until: row.issue_until,
-        });
-        return Ok(key_id);
-    }
+        },
+    );
+    Ok(row.id)
+}
 
-    // Generate a new key pair.
+/// Generate a new issuer key pair and build a row ready for insertion.
+fn generate_key(
+    master_key: &[u8; 32],
+    issue_from: SystemTime,
+    epoch_config: &EpochConfig,
+) -> Result<db::IssuerKeyRow, ServerError> {
     let key_id = Uuid::new_v4();
     let secret_key = PrivateKey::random(OsRng);
     let public_key_cbor = secret_key
@@ -169,53 +197,158 @@ pub async fn ensure_current_key(
     let id_str = key_id.to_string();
     let encrypted = encrypt_private_key(master_key, &id_str, &private_key_cbor)?;
 
-    let (issue_from, issue_until, accept_until) = epoch_boundaries(&epoch)?;
-    let ds = domain_separator(&epoch);
+    let (issue_until, accept_until) = epoch_config.boundaries_from(issue_from);
 
-    let row_to_insert = db::IssuerKeyRow {
+    Ok(db::IssuerKeyRow {
         id: key_id,
         private_key_enc: encrypted,
         public_key: public_key_cbor,
-        domain_separator: ds,
+        domain_separator: domain_separator(),
         issue_from,
         issue_until,
         accept_until,
-    };
-    let inserted = db::insert_issuer_key(pool, &row_to_insert).await?;
+    })
+}
 
-    if !inserted {
-        info!("issuer key for current period was created concurrently, loading winner");
-        let row = db::get_current_issuer_key(pool).await?.ok_or_else(|| {
-            ServerError::Internal("issuer key vanished after concurrent insert".to_string())
-        })?;
-        let winner_id_str = row.id.to_string();
-        let plaintext = decrypt_private_key(master_key, &winner_id_str, &row.private_key_enc)?;
-        let secret_key = PrivateKey::from_cbor(&plaintext).map_err(|e| {
-            ServerError::Internal(format!("failed to decode issuer private key: {}", e))
-        })?;
-        let params = Params::new("eidolons", "inference", "production", &epoch);
-        let winner_id = row.id;
-        let mut cache = key_cache.write().await;
-        cache.entry(winner_id).or_insert(DecryptedIssuerKey {
-            secret_key,
-            params,
-            id: winner_id,
-            issue_until: row.issue_until,
-        });
-        return Ok(winner_id);
+/// Ensure that both a current key and the next key exist in the database
+/// and are cached in memory. Returns the current key's UUID (for issuance).
+///
+/// Key chaining: each new key's `issue_from` = predecessor's `issue_until`.
+/// The very first key's `issue_from` = now.
+///
+/// Race safety: uses a serializable transaction so concurrent server instances
+/// cannot create duplicate keys.
+pub async fn ensure_keys(
+    key_cache: &KeyCache,
+    master_key: &[u8; 32],
+    pool: &deadpool_postgres::Pool,
+    epoch_config: &EpochConfig,
+) -> Result<Uuid, ServerError> {
+    let now = SystemTime::now();
+
+    // Fast path: check if a valid current key is already cached.
+    {
+        let cache = key_cache.read().await;
+        let current = cache
+            .values()
+            .find(|k| k.issue_from <= now && k.issue_until > now);
+        if let Some(k) = current {
+            // Also check that a next key exists in cache.
+            let has_next = cache.values().any(|k2| k2.issue_from >= k.issue_until);
+            if has_next {
+                return Ok(k.id);
+            }
+        }
     }
 
-    info!("generated new issuer key {}", key_id);
-    let params = Params::new("eidolons", "inference", "production", &epoch);
-    let mut cache = key_cache.write().await;
-    cache.entry(key_id).or_insert(DecryptedIssuerKey {
-        secret_key,
-        params,
-        id: key_id,
-        issue_until,
-    });
+    // Slow path: check the database and provision any missing keys.
+    // We may need to create up to 2 keys (current + next), or just the next one.
+    loop {
+        let ec = epoch_config.clone();
+        let mk = *master_key;
 
-    Ok(key_id)
+        let result = db::insert_issuer_key_checked(pool, move |latest| {
+            let now = SystemTime::now();
+            match latest {
+                Some(latest_key) => {
+                    if latest_key.issue_until <= now {
+                        // Latest key's issuance window has passed — need a new current key.
+                        // Chain from the latest key's issue_until, but if that's in the past,
+                        // start from now to avoid creating already-expired keys.
+                        let issue_from = if latest_key.issue_until < now {
+                            now
+                        } else {
+                            latest_key.issue_until
+                        };
+                        Ok(Some(generate_key(&mk, issue_from, &ec)?))
+                    } else if latest_key.issue_from <= now {
+                        // Latest key is the current key — need the next key.
+                        Ok(Some(generate_key(&mk, latest_key.issue_until, &ec)?))
+                    } else {
+                        // Latest key is already a future key — nothing to do.
+                        Ok(None)
+                    }
+                }
+                None => {
+                    // No keys at all — bootstrap with issue_from = now.
+                    Ok(Some(generate_key(&mk, now, &ec)?))
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Some(inserted)) => {
+                info!("provisioned issuer key {} (issue_from={})",
+                    inserted.id,
+                    system_time_to_iso_lossy(inserted.issue_from));
+                // Cache it and loop to check if we need another key.
+                let mut cache = key_cache.write().await;
+                cache_key(&mut cache, master_key, &inserted)?;
+                continue;
+            }
+            Ok(None) => {
+                // No key needed — break out and load from DB.
+                break;
+            }
+            Err(e) => {
+                // Serialization failure means another instance raced us — retry.
+                let msg = format!("{e:?}");
+                if msg.contains("serialization") || msg.contains("40001") {
+                    info!("key provisioning serialization conflict, retrying");
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    // Load all valid keys from DB into cache and find the current one.
+    let rows = db::get_valid_issuer_keys(pool).await?;
+    let mut cache = key_cache.write().await;
+    let mut current_id = None;
+    for row in &rows {
+        cache_key(&mut cache, master_key, row)?;
+        if row.issue_from <= now && row.issue_until > now {
+            current_id = Some(row.id);
+        }
+    }
+
+    current_id.ok_or_else(|| {
+        ServerError::Internal("no current issuer key found after provisioning".to_string())
+    })
+}
+
+/// Periodic key rotation check interval: 1 hour.
+const KEY_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Maximum random jitter added to the check interval.
+const KEY_CHECK_JITTER: Duration = Duration::from_secs(300);
+
+/// Spawn a background task that periodically ensures keys are provisioned.
+pub fn spawn_key_rotation_task(
+    key_cache: KeyCache,
+    master_key: [u8; 32],
+    pool: deadpool_postgres::Pool,
+    epoch_config: EpochConfig,
+) {
+    tokio::spawn(async move {
+        loop {
+            // Sleep with jitter.
+            let jitter_secs = OsRng.next_u64() % KEY_CHECK_JITTER.as_secs();
+            let sleep_dur = KEY_CHECK_INTERVAL + Duration::from_secs(jitter_secs);
+            tokio::time::sleep(sleep_dur).await;
+
+            match ensure_keys(&key_cache, &master_key, &pool, &epoch_config).await {
+                Ok(key_id) => {
+                    info!("periodic key check: current key {}", key_id);
+                }
+                Err(e) => {
+                    warn!("periodic key check failed: {}", e);
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -346,8 +479,13 @@ pub async fn issue_credentials(
             message: format!("invalid credit amount: {}", e),
         })?;
 
-    let key_id =
-        ensure_current_key(&state.credential_key_cache, master_key, &state.db_pool).await?;
+    let key_id = ensure_keys(
+        &state.credential_key_cache,
+        master_key,
+        &state.db_pool,
+        &state.epoch_config,
+    )
+    .await?;
 
     let ledger_entry_id =
         match db::insert_credential_issuance(&state.db_pool, account_id, request.credits, key_id)
@@ -372,7 +510,7 @@ pub async fn issue_credentials(
     let issuance_response = {
         let cache = state.credential_key_cache.read().await;
         let key = cache.get(&key_id).ok_or_else(|| {
-            ServerError::Internal("epoch key evicted from cache unexpectedly".to_string())
+            ServerError::Internal("current key evicted from cache unexpectedly".to_string())
         })?;
         key.secret_key
             .issue::<128>(
@@ -414,39 +552,43 @@ pub async fn issue_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::{civil_from_unix, days_from_civil};
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let master_key = [42u8; 32];
-        let epoch = "2026-03";
+        let key_id = "550e8400-e29b-41d4-a716-446655440000";
         let plaintext = b"test private key material";
-        let encrypted = encrypt_private_key(&master_key, epoch, plaintext).unwrap();
-        let decrypted = decrypt_private_key(&master_key, epoch, &encrypted).unwrap();
+        let encrypted = encrypt_private_key(&master_key, key_id, plaintext).unwrap();
+        let decrypted = decrypt_private_key(&master_key, key_id, &encrypted).unwrap();
         assert_eq!(plaintext.as_slice(), &decrypted);
     }
 
     #[test]
-    fn test_decrypt_wrong_epoch_fails() {
+    fn test_decrypt_wrong_key_id_fails() {
         let master_key = [42u8; 32];
-        let encrypted = encrypt_private_key(&master_key, "2026-03", b"secret").unwrap();
-        let result = decrypt_private_key(&master_key, "2026-04", &encrypted);
+        let encrypted = encrypt_private_key(
+            &master_key,
+            "550e8400-e29b-41d4-a716-446655440000",
+            b"secret",
+        )
+        .unwrap();
+        let result = decrypt_private_key(
+            &master_key,
+            "660e8400-e29b-41d4-a716-446655440000",
+            &encrypted,
+        );
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_domain_separator_format() {
-        assert_eq!(
-            domain_separator("2026-03"),
-            "ACT-v1:eidolons:inference:production:2026-03"
-        );
+    fn test_domain_separator_is_stable() {
+        // The domain separator must never change between key rotations.
+        assert_eq!(domain_separator(), "ACT-v1:eidolons:inference:production:2026-03-05");
     }
 
     #[test]
-    fn test_civil_roundtrip() {
-        let days = days_from_civil(2026, 3, 4);
-        let secs = days * 86400;
-        let (y, m, d) = civil_from_unix(secs);
-        assert_eq!((y, m, d), (2026, 3, 4));
+    fn test_params_does_not_panic() {
+        // Verify Params::new accepts our domain separator components (no colons).
+        let _params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
     }
 }

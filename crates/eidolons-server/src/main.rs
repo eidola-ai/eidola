@@ -15,6 +15,7 @@ use eidolons_server::attestation::AttestationClient;
 use eidolons_server::auth::{AnyValidator, NoopValidator};
 use eidolons_server::backend::RedPillBackend;
 use eidolons_server::credentials;
+use eidolons_server::helpers::EpochConfig;
 use eidolons_server::stripe::StripeClient;
 
 /// Server configuration.
@@ -134,8 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         warn!("STRIPE_WEBHOOK_SECRET not set — webhook endpoint will return 503");
     }
 
-    // Credential key cache
+    // Credential key cache and epoch configuration
     let credential_key_cache: credentials::KeyCache = Default::default();
+    let epoch_config = EpochConfig::default();
     if config.credential_master_key.is_none() {
         warn!("CREDENTIAL_MASTER_KEY not set — credential issuance endpoints will return 503");
     }
@@ -153,15 +155,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.stripe_webhook_secret,
         config.credential_master_key,
         credential_key_cache,
+        epoch_config,
     );
 
-    // Pre-warm the current issuer key if master key is configured.
+    // Provision issuer keys on boot and start periodic rotation task.
     if let Some(ref mk) = state.credential_master_key {
-        match credentials::ensure_current_key(&state.credential_key_cache, mk, &state.db_pool).await
+        match credentials::ensure_keys(
+            &state.credential_key_cache,
+            mk,
+            &state.db_pool,
+            &state.epoch_config,
+        )
+        .await
         {
             Ok(key_id) => info!("Issuer key ready: {}", key_id),
-            Err(e) => warn!("Failed to pre-warm issuer key: {}", e),
+            Err(e) => warn!("Failed to provision issuer keys on boot: {}", e),
         }
+
+        credentials::spawn_key_rotation_task(
+            state.credential_key_cache.clone(),
+            *mk,
+            state.db_pool.clone(),
+            state.epoch_config.clone(),
+        );
     }
 
     // Build the router with OpenAPI integration

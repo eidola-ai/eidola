@@ -37,6 +37,7 @@ pub struct AppStateInner {
     pub stripe_webhook_secret: Option<String>,
     pub credential_master_key: Option<[u8; 32]>,
     pub credential_key_cache: credentials::KeyCache,
+    pub epoch_config: helpers::EpochConfig,
 }
 
 impl AppState {
@@ -50,6 +51,7 @@ impl AppState {
         stripe_webhook_secret: Option<String>,
         credential_master_key: Option<[u8; 32]>,
         credential_key_cache: credentials::KeyCache,
+        epoch_config: helpers::EpochConfig,
     ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
@@ -61,6 +63,7 @@ impl AppState {
                 stripe_webhook_secret,
                 credential_master_key,
                 credential_key_cache,
+                epoch_config,
             }),
         }
     }

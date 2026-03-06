@@ -530,10 +530,21 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
         .await
         .map_err(|e| format!("failed to parse keys response: {e}"))?;
 
+    // Filter keys to those matching our expected domain separator.
+    let expected_ds = config.domain_separator();
     let key = keys
         .data
-        .first()
-        .ok_or("no issuer keys available from server")?;
+        .iter()
+        .find(|k| k.domain_separator == expected_ds)
+        .ok_or_else(|| {
+            let server_ds: Vec<&str> = keys.data.iter().map(|k| k.domain_separator.as_str()).collect();
+            format!(
+                "no issuer key matches expected domain separator \"{expected_ds}\"\n\
+                 server advertised: {server_ds:?}\n\
+                 hint: if the server has legitimately changed its domain separator, \
+                 update domain_separator in your config"
+            )
+        })?;
 
     // Decode the public key
     let public_key_cbor = URL_SAFE_NO_PAD
@@ -543,14 +554,10 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
     let public_key = PublicKey::from_cbor(&public_key_cbor)
         .map_err(|e| format!("invalid public key CBOR: {e}"))?;
 
-    // Reconstruct params from domain separator (ACT-v1:org:service:env:period)
-    let ds_parts: Vec<&str> = key.domain_separator.split(':').collect();
-    if ds_parts.len() != 5 {
-        return Err(format!(
-            "invalid domain separator: {}",
-            key.domain_separator
-        ));
-    }
+    // Reconstruct params from the validated domain separator (ACT-v1:org:service:deployment:version).
+    // We already verified key.domain_separator == expected_ds above.
+    let ds_parts: Vec<&str> = expected_ds.split(':').collect();
+    assert_eq!(ds_parts.len(), 5, "compiled-in domain separator has wrong format");
     let params = Params::new(ds_parts[1], ds_parts[2], ds_parts[3], ds_parts[4]);
 
     // 2. Open database

@@ -3,6 +3,18 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// The expected domain separator for credential operations.
+///
+/// This value is checked against the server's advertised domain separator
+/// before issuing or spending any credential. An exact match is required.
+///
+/// This protects against a malicious operator silently changing the domain
+/// separator to partition users into smaller anonymity sets (since credentials
+/// under different domain separators are cryptographically unlinkable).
+/// By hardcoding the expected value in the client and rejecting mismatches,
+/// the operator cannot use the domain separator as a covert linking channel.
+pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidolons:inference:production:2026-03-05";
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11,6 +23,15 @@ pub struct Config {
     pub account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain_separator: Option<String>,
+}
+
+impl Config {
+    /// Returns the domain separator to enforce, falling back to the compiled-in default.
+    pub fn domain_separator(&self) -> &str {
+        self.domain_separator.as_deref().unwrap_or(DEFAULT_DOMAIN_SEPARATOR)
+    }
 }
 
 impl Config {

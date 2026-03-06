@@ -190,66 +190,80 @@ pub struct IssuerKeyRow {
     pub accept_until: SystemTime,
 }
 
-/// Retrieve the currently active issuer key (issue_from <= now < issue_until).
-pub async fn get_current_issuer_key(pool: &Pool) -> Result<Option<IssuerKeyRow>, ServerError> {
-    let client = pool
+/// Insert a new issuer key within a serializable transaction to prevent races.
+///
+/// The `check` callback receives the latest key (if any) inside the transaction
+/// and returns `Ok(Some(key))` to insert or `Ok(None)` to skip. This ensures
+/// the "is a new key needed?" check and the insert are atomic.
+pub async fn insert_issuer_key_checked<F>(
+    pool: &Pool,
+    check: F,
+) -> Result<Option<IssuerKeyRow>, ServerError>
+where
+    F: FnOnce(Option<&IssuerKeyRow>) -> Result<Option<IssuerKeyRow>, ServerError>,
+{
+    let mut client = pool
         .get()
         .await
         .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
 
-    let row = client
+    let tx = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::Serializable)
+        .start()
+        .await
+        .map_err(|e| ServerError::Internal(format!("begin transaction failed: {e:?}")))?;
+
+    // Read the latest key inside the transaction.
+    let latest_row = tx
         .query_opt(
             "SELECT id, private_key_enc, public_key, domain_separator, \
                     issue_from, issue_until, accept_until \
-             FROM issuer_key WHERE issue_from <= now() AND issue_until > now()",
+             FROM issuer_key ORDER BY issue_from DESC LIMIT 1",
             &[],
         )
         .await
-        .map_err(|e| ServerError::Internal(format!("query issuer_key failed: {e:?}")))?;
+        .map_err(|e| ServerError::Internal(format!("query latest issuer_key failed: {e:?}")))?;
 
-    Ok(row.map(|r| IssuerKeyRow {
-        id: r.get("id"),
-        private_key_enc: r.get("private_key_enc"),
-        public_key: r.get("public_key"),
-        domain_separator: r.get("domain_separator"),
-        issue_from: r.get("issue_from"),
-        issue_until: r.get("issue_until"),
-        accept_until: r.get("accept_until"),
-    }))
+    let latest = latest_row.as_ref().map(map_issuer_key_row);
+
+    let key = match check(latest.as_ref())? {
+        Some(k) => k,
+        None => {
+            tx.rollback()
+                .await
+                .map_err(|e| ServerError::Internal(format!("rollback failed: {e:?}")))?;
+            return Ok(None);
+        }
+    };
+
+    tx.execute(
+        "INSERT INTO issuer_key \
+            (id, private_key_enc, public_key, domain_separator, \
+             issue_from, issue_until, accept_until) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        &[
+            &key.id,
+            &key.private_key_enc.as_slice(),
+            &key.public_key.as_slice(),
+            &key.domain_separator.as_str(),
+            &key.issue_from,
+            &key.issue_until,
+            &key.accept_until,
+        ],
+    )
+    .await
+    .map_err(|e| ServerError::Internal(format!("insert issuer_key failed: {e:?}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| ServerError::Internal(format!("commit failed: {e:?}")))?;
+
+    Ok(Some(key))
 }
 
-/// Insert a new issuer key. Returns true if inserted, false if a key for the
-/// same period already exists (race-safe via ON CONFLICT on issue_from).
-pub async fn insert_issuer_key(pool: &Pool, key: &IssuerKeyRow) -> Result<bool, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
-
-    let result = client
-        .execute(
-            "INSERT INTO issuer_key \
-                (id, private_key_enc, public_key, domain_separator, \
-                 issue_from, issue_until, accept_until) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (issue_from) DO NOTHING",
-            &[
-                &key.id,
-                &key.private_key_enc.as_slice(),
-                &key.public_key.as_slice(),
-                &key.domain_separator.as_str(),
-                &key.issue_from,
-                &key.issue_until,
-                &key.accept_until,
-            ],
-        )
-        .await
-        .map_err(|e| ServerError::Internal(format!("insert issuer_key failed: {e:?}")))?;
-
-    Ok(result == 1)
-}
-
-/// Retrieve all issuer keys that are still valid for spending (accept_until > now()).
+/// Retrieve all issuer keys that are still accepted (accept_until > now()),
+/// plus any future keys (issue_from > now()). Ordered by issue_from ASC.
 pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, ServerError> {
     let client = pool
         .get()
@@ -261,24 +275,25 @@ pub async fn get_valid_issuer_keys(pool: &Pool) -> Result<Vec<IssuerKeyRow>, Ser
             "SELECT id, private_key_enc, public_key, domain_separator, \
                     issue_from, issue_until, accept_until \
              FROM issuer_key WHERE accept_until > now() \
-             ORDER BY issue_from DESC",
+             ORDER BY issue_from ASC",
             &[],
         )
         .await
         .map_err(|e| ServerError::Internal(format!("query valid issuer_keys failed: {e:?}")))?;
 
-    Ok(rows
-        .iter()
-        .map(|r| IssuerKeyRow {
-            id: r.get("id"),
-            private_key_enc: r.get("private_key_enc"),
-            public_key: r.get("public_key"),
-            domain_separator: r.get("domain_separator"),
-            issue_from: r.get("issue_from"),
-            issue_until: r.get("issue_until"),
-            accept_until: r.get("accept_until"),
-        })
-        .collect())
+    Ok(rows.iter().map(map_issuer_key_row).collect())
+}
+
+fn map_issuer_key_row(r: &tokio_postgres::Row) -> IssuerKeyRow {
+    IssuerKeyRow {
+        id: r.get("id"),
+        private_key_enc: r.get("private_key_enc"),
+        public_key: r.get("public_key"),
+        domain_separator: r.get("domain_separator"),
+        issue_from: r.get("issue_from"),
+        issue_until: r.get("issue_until"),
+        accept_until: r.get("accept_until"),
+    }
 }
 
 /// Atomically debit credits from an account for credential issuance.

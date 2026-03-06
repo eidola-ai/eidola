@@ -93,49 +93,41 @@ pub fn system_time_to_iso_lossy(t: SystemTime) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Epoch computation
+// Key epoch configuration
 // ---------------------------------------------------------------------------
 
-/// Compute the current epoch string "YYYY-MM" from the system clock.
-pub fn current_epoch() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before epoch")
-        .as_secs() as i64;
-    let (y, m, _) = civil_from_unix(secs);
-    format!("{:04}-{:02}", y, m)
+/// Default key epoch duration: 7 days.
+pub const DEFAULT_EPOCH_DURATION: Duration = Duration::from_secs(7 * 86400);
+
+/// Default grace period: credentials remain accepted for this long after
+/// the issuance window closes. Defaults to one epoch duration.
+pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(7 * 86400);
+
+/// Configuration for key epoch timing.
+#[derive(Debug, Clone)]
+pub struct EpochConfig {
+    /// How long each key is used for issuance.
+    pub epoch_duration: Duration,
+    /// How long after `issue_until` the key's credentials remain accepted.
+    pub grace_period: Duration,
 }
 
-/// Given a "YYYY-MM" epoch string, compute (valid_from, valid_until, accept_until).
-pub fn epoch_boundaries(epoch: &str) -> Result<(SystemTime, SystemTime, SystemTime), ServerError> {
-    let parts: Vec<&str> = epoch.split('-').collect();
-    if parts.len() != 2 {
-        return Err(ServerError::BadRequest {
-            message: "epoch must be YYYY-MM format".to_string(),
-        });
+impl Default for EpochConfig {
+    fn default() -> Self {
+        Self {
+            epoch_duration: DEFAULT_EPOCH_DURATION,
+            grace_period: DEFAULT_GRACE_PERIOD,
+        }
     }
-    let y: i64 = parts[0].parse().map_err(|_| ServerError::BadRequest {
-        message: "invalid epoch year".to_string(),
-    })?;
-    let m: u64 = parts[1].parse().map_err(|_| ServerError::BadRequest {
-        message: "invalid epoch month".to_string(),
-    })?;
-    if !(1..=12).contains(&m) {
-        return Err(ServerError::BadRequest {
-            message: "epoch month must be 1-12".to_string(),
-        });
+}
+
+impl EpochConfig {
+    /// Compute `issue_until` and `accept_until` given an `issue_from` timestamp.
+    pub fn boundaries_from(&self, issue_from: SystemTime) -> (SystemTime, SystemTime) {
+        let issue_until = issue_from + self.epoch_duration;
+        let accept_until = issue_until + self.grace_period;
+        (issue_until, accept_until)
     }
-
-    let valid_from_days = days_from_civil(y, m, 1);
-    let valid_from = UNIX_EPOCH + Duration::from_secs(valid_from_days as u64 * 86400);
-
-    let (ny, nm) = if m == 12 { (y + 1, 1u64) } else { (y, m + 1) };
-    let valid_until_days = days_from_civil(ny, nm, 1);
-    let valid_until = UNIX_EPOCH + Duration::from_secs(valid_until_days as u64 * 86400);
-
-    let accept_until = valid_until + Duration::from_secs(3 * 86400);
-
-    Ok((valid_from, valid_until, accept_until))
 }
 
 // ---------------------------------------------------------------------------
@@ -176,30 +168,25 @@ mod tests {
     }
 
     #[test]
-    fn test_current_epoch_format() {
-        let epoch = current_epoch();
-        assert_eq!(epoch.len(), 7);
-        assert_eq!(epoch.as_bytes()[4], b'-');
-        let year: i64 = epoch[..4].parse().unwrap();
-        let month: u64 = epoch[5..].parse().unwrap();
-        assert!(year >= 2024);
-        assert!((1..=12).contains(&month));
+    fn test_epoch_config_boundaries() {
+        let config = EpochConfig::default();
+        let issue_from = UNIX_EPOCH + Duration::from_secs(days_from_civil(2026, 3, 1) as u64 * 86400);
+        let (issue_until, accept_until) = config.boundaries_from(issue_from);
+        assert_eq!(system_time_to_iso_lossy(issue_from), "2026-03-01T00:00:00Z");
+        assert_eq!(system_time_to_iso_lossy(issue_until), "2026-03-08T00:00:00Z");
+        assert_eq!(system_time_to_iso_lossy(accept_until), "2026-03-15T00:00:00Z");
     }
 
     #[test]
-    fn test_epoch_boundaries() {
-        let (from, until, accept) = epoch_boundaries("2026-03").unwrap();
-        assert_eq!(system_time_to_iso_lossy(from), "2026-03-01T00:00:00Z");
-        assert_eq!(system_time_to_iso_lossy(until), "2026-04-01T00:00:00Z");
-        assert_eq!(system_time_to_iso_lossy(accept), "2026-04-04T00:00:00Z");
-    }
-
-    #[test]
-    fn test_epoch_boundaries_december_wraps() {
-        let (from, until, accept) = epoch_boundaries("2025-12").unwrap();
-        assert_eq!(system_time_to_iso_lossy(from), "2025-12-01T00:00:00Z");
-        assert_eq!(system_time_to_iso_lossy(until), "2026-01-01T00:00:00Z");
-        assert_eq!(system_time_to_iso_lossy(accept), "2026-01-04T00:00:00Z");
+    fn test_epoch_config_custom_durations() {
+        let config = EpochConfig {
+            epoch_duration: Duration::from_secs(30 * 86400),
+            grace_period: Duration::from_secs(3 * 86400),
+        };
+        let issue_from = UNIX_EPOCH + Duration::from_secs(days_from_civil(2026, 3, 1) as u64 * 86400);
+        let (issue_until, accept_until) = config.boundaries_from(issue_from);
+        assert_eq!(system_time_to_iso_lossy(issue_until), "2026-03-31T00:00:00Z");
+        assert_eq!(system_time_to_iso_lossy(accept_until), "2026-04-03T00:00:00Z");
     }
 
     #[test]
@@ -210,10 +197,4 @@ mod tests {
         assert_eq!((y, m, d), (2026, 3, 4));
     }
 
-    #[test]
-    fn test_invalid_epoch_format() {
-        assert!(epoch_boundaries("2026").is_err());
-        assert!(epoch_boundaries("2026-13").is_err());
-        assert!(epoch_boundaries("2026-00").is_err());
-    }
 }

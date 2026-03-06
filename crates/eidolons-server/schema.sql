@@ -66,14 +66,16 @@ CREATE TABLE issuer_key (
     CONSTRAINT grace_window CHECK (issue_until <= accept_until)
 );
 
--- Only one key per issuance period (used for race-safe upsert).
-CREATE UNIQUE INDEX idx_issuer_key_issue_from ON issuer_key (issue_from);
+-- Non-unique index for efficient lookup by issuance period.
+CREATE INDEX idx_issuer_key_issue_from ON issuer_key (issue_from);
 
 COMMENT ON TABLE issuer_key IS
-    'Credential issuer key pairs, rotated monthly. The private key is encrypted '
-    'at rest (application-layer encryption using a TEE-held master key). The '
-    'public key and domain separator are served publicly via GET /v1/keys. '
-    'Key periods align with calendar months to simplify billing period alignment.';
+    'Credential issuer key pairs, rotated periodically (default: every 7 days). '
+    'Each key''s issue_from chains from its predecessor''s issue_until. The '
+    'private key is encrypted at rest (application-layer encryption using a '
+    'TEE-held master key). The public key and domain separator are served '
+    'publicly via GET /v1/keys. Race-safe provisioning is handled by '
+    'serializable transactions in the application layer.';
 
 COMMENT ON COLUMN issuer_key.id IS
     'Unique key identifier (UUID). Primary key and foreign key '
@@ -102,9 +104,8 @@ COMMENT ON COLUMN issuer_key.issue_until IS
 
 COMMENT ON COLUMN issuer_key.accept_until IS
     'Grace period end. Credentials signed by this key are accepted for spending '
-    'until this timestamp. Typically 2-3 days after issue_until to give '
-    'clients time to spend down. Nullifiers for this key can be pruned after '
-    'this date.';
+    'until this timestamp. Defaults to one epoch duration after issue_until. '
+    'Nullifiers for this key can be pruned after this date.';
 
 -- ---------------------------------------------------------------------------
 -- Credit Ledger
