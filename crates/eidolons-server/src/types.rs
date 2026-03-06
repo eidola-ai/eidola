@@ -275,14 +275,30 @@ pub struct Model {
     /// Human-readable display name.
     pub name: String,
 
-    /// Unix timestamp of when the model was created.
-    pub created: u64,
-
     /// Short description of the model's capabilities.
     pub description: String,
 
     /// Maximum context window size in tokens.
     pub context_length: u64,
+
+    /// Pricing in integer credits per 1k tokens.
+    pub pricing: ModelPricing,
+}
+
+/// Pricing for a model in scaled integer credits per token.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelPricing {
+    pub per_prompt_token: ScaledPrice,
+    pub per_completion_token: ScaledPrice,
+}
+
+/// A price expressed as an integer value with a fixed scale factor.
+///
+/// Actual credits per unit = `value / scale_factor`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScaledPrice {
+    pub value: u64,
+    pub scale_factor: u64,
 }
 
 /// An error response in OpenAI format.

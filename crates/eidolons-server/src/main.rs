@@ -28,6 +28,7 @@ struct Config {
     stripe_api_key: Option<String>,
     stripe_webhook_secret: Option<String>,
     credential_master_key: Option<[u8; 32]>,
+    pricing_markup: Option<f64>,
 }
 
 impl Config {
@@ -72,6 +73,15 @@ impl Config {
             })
             .transpose()?;
 
+        let pricing_markup = std::env::var("PRICING_MARKUP")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<f64>()
+                    .map_err(|_| "PRICING_MARKUP must be a valid number".to_string())
+            })
+            .transpose()?;
+
         Ok(Config {
             bind_addr,
             redpill_api_key,
@@ -81,6 +91,7 @@ impl Config {
             stripe_api_key,
             stripe_webhook_secret,
             credential_master_key,
+            pricing_markup,
         })
     }
 }
@@ -147,6 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         RedPillBackend::new(
             config.redpill_api_key.clone(),
             config.redpill_base_url.clone(),
+            config.pricing_markup,
         ),
         validator,
         AttestationClient::new(config.redpill_api_key, config.redpill_base_url),

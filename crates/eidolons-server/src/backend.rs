@@ -7,7 +7,8 @@ use utoipa::ToSchema;
 
 use crate::error::ServerError;
 use crate::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ModelsResponse,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Model, ModelPricing,
+    ModelsResponse, ScaledPrice,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,6 +91,83 @@ pub trait ChatBackend: Send + Sync {
 // RedPill.ai backend
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// RedPill upstream response types (internal)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RedPillModelsResponse {
+    data: Vec<RedPillModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RedPillModel {
+    id: String,
+    name: String,
+    #[allow(dead_code)]
+    created: u64,
+    description: String,
+    context_length: u64,
+    pricing: RedPillPricing,
+}
+
+#[derive(Debug, Deserialize)]
+struct RedPillPricing {
+    prompt: String,
+    completion: String,
+    #[serde(flatten)]
+    other: std::collections::HashMap<String, String>,
+}
+
+/// Default pricing markup factor.
+pub const DEFAULT_PRICING_MARKUP: f64 = 1.5;
+
+/// Fixed scale factor for pricing: credits per token = value / PRICING_SCALE_FACTOR.
+pub const PRICING_SCALE_FACTOR: u64 = 1_000_000;
+
+/// Convert a USD-per-token price string to scaled integer credits,
+/// applying a markup factor and rounding up.
+fn usd_to_scaled_credits(usd_per_token: &str, markup: f64) -> u64 {
+    let usd: f64 = usd_per_token.parse().unwrap_or(0.0);
+    // credits/token = usd * 1e6 (USD→µ$) * markup
+    // scaled value  = credits/token * scale_factor
+    (usd * 1e6 * markup * PRICING_SCALE_FACTOR as f64).ceil() as u64
+}
+
+impl RedPillModel {
+    /// Returns true if all pricing fields beyond prompt/completion are "0" (or absent).
+    fn has_only_known_pricing(&self) -> bool {
+        self.pricing
+            .other
+            .values()
+            .all(|v| v == "0" || v.is_empty())
+    }
+
+    fn into_model(self, markup: f64) -> Model {
+        let p = &self.pricing;
+        Model {
+            id: self.id,
+            name: self.name,
+            description: self.description,
+            context_length: self.context_length,
+            pricing: ModelPricing {
+                per_prompt_token: ScaledPrice {
+                    value: usd_to_scaled_credits(&p.prompt, markup),
+                    scale_factor: PRICING_SCALE_FACTOR,
+                },
+                per_completion_token: ScaledPrice {
+                    value: usd_to_scaled_credits(&p.completion, markup),
+                    scale_factor: PRICING_SCALE_FACTOR,
+                },
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RedPill.ai backend
+// ---------------------------------------------------------------------------
+
 /// RedPill.ai backend.
 ///
 /// Sends OpenAI-format requests to RedPill's API, which supports both
@@ -99,10 +177,11 @@ pub struct RedPillBackend {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    pricing_markup: f64,
 }
 
 impl RedPillBackend {
-    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+    pub fn new(api_key: String, base_url: Option<String>, pricing_markup: Option<f64>) -> Self {
         let client = reqwest::Client::builder()
             .build()
             .expect("failed to build HTTP client");
@@ -111,6 +190,7 @@ impl RedPillBackend {
             client,
             api_key,
             base_url: base_url.unwrap_or_else(|| "https://api.redpill.ai/v1".to_string()),
+            pricing_markup: pricing_markup.unwrap_or(DEFAULT_PRICING_MARKUP),
         }
     }
 
@@ -157,9 +237,19 @@ impl ChatBackend for RedPillBackend {
             });
         }
 
-        serde_json::from_slice(&body).map_err(|e| {
+        let upstream: RedPillModelsResponse = serde_json::from_slice(&body).map_err(|e| {
             tracing::error!("Failed to parse models response: {}", e);
             ServerError::Parse(e.to_string())
+        })?;
+
+        let markup = self.pricing_markup;
+        Ok(ModelsResponse {
+            data: upstream
+                .data
+                .into_iter()
+                .filter(|m| m.has_only_known_pricing())
+                .map(|m| m.into_model(markup))
+                .collect(),
         })
     }
 
@@ -337,6 +427,53 @@ fn extract_sse_data(buffer: &mut String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_has_only_known_pricing() {
+        let model = |other: Vec<(&str, &str)>| RedPillModel {
+            id: "test".into(),
+            name: "test".into(),
+            created: 0,
+            description: "".into(),
+            context_length: 0,
+            pricing: RedPillPricing {
+                prompt: "0.00000004".into(),
+                completion: "0.00000015".into(),
+                other: other.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            },
+        };
+
+        // All zeros — allowed
+        assert!(model(vec![("image", "0"), ("request", "0")]).has_only_known_pricing());
+
+        // Empty other — allowed
+        assert!(model(vec![]).has_only_known_pricing());
+
+        // Non-zero known field — filtered out
+        assert!(!model(vec![("image", "0.001")]).has_only_known_pricing());
+
+        // Non-zero unknown field — filtered out
+        assert!(!model(vec![("mystery_fee", "0.005")]).has_only_known_pricing());
+    }
+
+    #[test]
+    fn test_usd_to_scaled_credits() {
+        // phala/gpt-oss-20b with 1.5x markup, scale_factor = 1_000_000
+        // $0.00000004/token → 0.06 credits/token → 60_000 scaled
+        assert_eq!(usd_to_scaled_credits("0.00000004", 1.5), 60_000);
+        // $0.00000015/token → 0.225 credits/token → 225_000 scaled
+        assert_eq!(usd_to_scaled_credits("0.00000015", 1.5), 225_000);
+
+        // Zero price
+        assert_eq!(usd_to_scaled_credits("0", 1.5), 0);
+
+        // Ceil rounding: $1e-16/token * 1e6 * 1.5 * 1e6 = 0.15 → ceil → 1
+        assert_eq!(usd_to_scaled_credits("0.0000000000000001", 1.5), 1);
+
+        // Invalid input falls back to 0
+        assert_eq!(usd_to_scaled_credits("", 1.5), 0);
+        assert_eq!(usd_to_scaled_credits("not_a_number", 1.5), 0);
+    }
 
     #[test]
     fn test_tee_type_for_model() {

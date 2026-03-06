@@ -25,11 +25,17 @@ just db
 # Set environment variables
 set -a; source .env; set +a
 
-# Run the server on the host
+# Run the server on the host machine with cargo
 cargo run -p eidolons-server
+
+# -- OR --
+
+# Run and automatically recompile/reload the server on 
+# the host machine with bacon
+bacon run-long -- -p eidolons-server
 ```
 
-For automatic recompilation on changes, consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) and using `bacon run -- -p eidolons-server` instead.
+Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) for convenience.
 
 See more available commands:
 
