@@ -1,4 +1,4 @@
-set dotenv-load
+set dotenv-load := true
 
 # List available recipes
 default:
@@ -8,12 +8,7 @@ default:
 
 # Start postgres + server (full stack in containers, fast dev build)
 dev:
-    CARGO_PROFILE=docker-dev docker buildx bake
-    docker compose up --no-build
-
-# Start full stack with Stripe webhook forwarding (requires STRIPE_API_KEY)
-dev-stripe:
-    ./scripts/dev-stripe.sh
+    ./scripts/dev.sh
 
 # Start just postgres (for running the server on the host with cargo)
 db:
@@ -28,9 +23,10 @@ db-reset:
 
 # --- Rust (inner loop, runs on host) ---
 
-# Build the server
-build:
-    cargo build -p eidolons-server
+# Lint and format check
+check:
+    cargo clippy --all-targets -- -D warnings
+    cargo fmt --check
 
 # Run all tests
 test:
@@ -43,11 +39,6 @@ test-integration:
 # Run E2E webhook smoke tests (requires STRIPE_API_KEY)
 test-webhook-smoke:
     ./scripts/test-webhook-smoke.sh
-
-# Lint and format check
-check:
-    cargo clippy --all-targets -- -D warnings
-    cargo fmt --check
 
 # --- Codegen ---
 
@@ -67,11 +58,13 @@ update-xcframework:
 update-xcframework-release:
     ./scripts/update-shared-xcframework.sh
 
-# --- OCI ---
+# --- CI / Release ---
 
-# Build all OCI images (reproducible, via buildx bake)
-oci-build:
+build:
+    # Build OCI images (server, postgresql)
     docker buildx bake
+
+    # TODO: Build apps
 
 # Update artifact-manifest.json with current build digests
 update-manifest:
@@ -82,8 +75,6 @@ update-manifest:
       '{"eidolons-server": $server, "eidolons-postgres": $postgres}' \
       > artifact-manifest.json
     @echo "Updated artifact-manifest.json"
-
-# --- CI / Release (Nix) ---
 
 # Run all Nix checks (formatting, linting, tests, artifact freshness)
 ci-check:
