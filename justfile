@@ -19,7 +19,7 @@ db:
 db-reset:
     docker compose exec postgres dropdb -U eidolons --if-exists eidolons
     docker compose exec postgres createdb -U eidolons eidolons
-    docker compose exec postgres psql -U eidolons -d eidolons -f /schema/schema.sql
+    docker compose exec postgres psql -U eidolons -d eidolons -f /docker-entrypoint-initdb.d/schema.sql
 
 # --- Rust (inner loop, runs on host) ---
 

@@ -52,7 +52,7 @@ for i in $(seq 1 30); do
 done
 
 echo "==> Applying schema..."
-docker compose exec postgres psql -U eidolons -d eidolons -f /schema/schema.sql -q
+docker compose exec postgres psql -U eidolons -d eidolons -f /docker-entrypoint-initdb.d/schema.sql -q
 
 # ── Capture webhook secret ───────────────────────────────────────────────────
 

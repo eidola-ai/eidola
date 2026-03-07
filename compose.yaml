@@ -12,7 +12,6 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./crates/eidolons-server/schema.sql:/schema/schema.sql:ro
       - ./crates/eidolons-server/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "eidolons"]
