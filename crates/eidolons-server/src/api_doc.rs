@@ -1,70 +1,63 @@
 //! OpenAPI documentation for the Eidolons API.
 
-use utoipa::OpenApi;
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 
-use crate::openai::{
-    AssistantMessage, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice,
-    ChunkChoice, ChunkDelta, ContentPart, ErrorDetail, ErrorResponse, FinishReason, ImageUrl,
-    Message, MessageContent, Role, StopSequence, Usage,
-};
+use crate::response::EidolonsStreamMetadata;
+use crate::types::{ChatCompletionChunk, ChatCompletionResponse, ChunkChoice, ChunkDelta};
 
 /// OpenAPI documentation for the Eidolons API.
+///
+/// Paths and schemas are collected automatically by `OpenApiRouter` from
+/// `#[utoipa::path]` annotations and their referenced `ToSchema` types.
+/// Only streaming SSE types (not referenced from path annotations) and
+/// metadata/security modifiers are declared here.
 #[derive(OpenApi)]
 #[openapi(
     info(
         title = "Eidolons API",
-        description = "OpenAI-compatible proxy API for AI providers",
-        version = "0.1.0"
+        description = "Privacy-transparent AI proxy API with inline verification metadata",
+        version = "0.1.0",
+        license(identifier = "UNLICENSED"),
     ),
-    paths(openapi_paths::health, openapi_paths::chat_completions),
+    servers(
+        (url = "http://localhost:8080", description = "Local"),
+    ),
+    tags(
+        (name = "Public", description = "Unauthenticated endpoints available to anyone."),
+        (name = "Linked", description = "Authenticated endpoints tied to a known account (HTTP Basic auth)."),
+        (name = "Unlinked", description = "Endpoints authenticated with anonymous credentials — usage cannot be linked back to an account."),
+    ),
     components(schemas(
-        ChatCompletionRequest,
+        // SSE streaming types — not referenced from #[utoipa::path] response
+        // bodies so they must be registered explicitly.
         ChatCompletionResponse,
         ChatCompletionChunk,
-        Message,
-        Role,
-        MessageContent,
-        ContentPart,
-        ImageUrl,
-        StopSequence,
-        Choice,
         ChunkChoice,
         ChunkDelta,
-        AssistantMessage,
-        FinishReason,
-        Usage,
-        ErrorResponse,
-        ErrorDetail,
-    ))
+        EidolonsStreamMetadata,
+    )),
+    modifiers(&BasicAuthAddon)
 )]
 pub struct ApiDoc;
 
-// Dummy functions for utoipa path documentation.
-// These are never called - they exist only to provide OpenAPI endpoint metadata.
-#[allow(dead_code)]
-mod openapi_paths {
-    use crate::openai::{ChatCompletionRequest, ChatCompletionResponse, ErrorResponse};
+/// Adds the HTTP Basic auth security scheme to the OpenAPI spec.
+struct BasicAuthAddon;
 
-    /// Health check endpoint.
-    #[utoipa::path(
-        get,
-        path = "/health",
-        responses(
-            (status = 200, description = "Server is healthy", body = String, example = json!({"status": "ok"}))
-        )
-    )]
-    pub fn health() {}
-
-    /// Create a chat completion.
-    #[utoipa::path(
-        post,
-        path = "/v1/chat/completions",
-        request_body = ChatCompletionRequest,
-        responses(
-            (status = 200, description = "Chat completion response", body = ChatCompletionResponse),
-            (status = 400, description = "Invalid request", body = ErrorResponse),
-            (status = 502, description = "Upstream provider error", body = ErrorResponse)
-        )
-    )]
-    pub fn chat_completions() {}
+impl Modify for BasicAuthAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_default();
+        components.security_schemes.insert(
+            "basic".to_string(),
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Basic)
+                    .description(Some(
+                        "Account credentials. Username is the account UUID, \
+                         password is the secret returned at account creation.",
+                    ))
+                    .build(),
+            ),
+        );
+    }
 }

@@ -2,8 +2,6 @@
 //  ContentView.swift
 //  Eidolons
 //
-//  Created by Mike Marcacci on 12/17/25.
-//
 
 import SharedTypes
 import SwiftUI
@@ -12,8 +10,17 @@ struct ContentView: View {
   @State private var core = Core()
 
   var body: some View {
-    ChatView(core: core)
-      .frame(minWidth: 400, minHeight: 500)
+    VStack {
+      Text(core.viewModel.greeting.isEmpty ? "Welcome" : core.viewModel.greeting)
+        .font(.largeTitle)
+        .padding()
+
+      Button("Greet") {
+        core.update(event: .greet)
+      }
+      .padding()
+    }
+    .frame(minWidth: 300, minHeight: 200)
   }
 }
 

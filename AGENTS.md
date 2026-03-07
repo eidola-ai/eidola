@@ -2,171 +2,84 @@
 
 Guidance for AI coding agents working in this repository.
 
-## Project Structure
-
-```
-eidolons/
-├── crates/           # Rust crates
-│   ├── eidolons-server/  # OpenAI-compatible AI proxy server
-│   │   └── src/
-│   │       ├── main.rs       # HTTP server (hyper + tokio)
-│   │       ├── openai.rs     # OpenAI API types
-│   │       ├── anthropic.rs  # Anthropic API types
-│   │       ├── transform.rs  # Format conversion
-│   │       └── proxy.rs      # Upstream HTTP client
-│   ├── eidolons-hello/   # Hello capability (example)
-│   │   └── src/lib.rs
-│   └── eidolons-shared/  # Crux-based shared core (exclusive FFI generator)
-│       ├── src/
-│       │   ├── lib.rs        # FFI bridge (processEvent, handleResponse, view, capabilities)
-│       │   ├── app.rs        # Crux App impl (Event, Model, ViewModel, Effect)
-│       │   └── capabilities/ # Crux capabilities (e.g., eidolons)
-│       ├── swift/            # Generated bindings (UniFFI + Crux types)
-│       └── Package.swift     # Swift Package exposing EidolonsShared + SharedTypes
-├── apps/
-│   └── macos/            # macOS app (SwiftPM + Xcode wrapper)
-│       ├── Sources/
-│       │   ├── Eidolons/         # SwiftUI shell (Core.swift, ContentView.swift)
-│       │   └── EidolonsEntrypoint/  # App entrypoint
-│       ├── Xcode/            # Xcode project wrapper
-│       ├── Support/          # Shared build files (Info.plist, scripts)
-│       └── Package.swift     # Swift Package Manager config
-├── docs/
-│   └── design/           # Architecture Decision Records (ADRs)
-├── tools/            # Build tooling
-│   ├── uniffi-bindgen-swift/  # UniFFI binding generator
-│   └── shared-typegen/        # Crux type generator for Swift
-└── flake.nix         # Nix build definitions
-```
-
 ## Server Architecture
 
-The server is an OpenAI-compatible proxy that translates requests to upstream AI providers.
+The server is an OpenAI-compatible proxy that translates requests to upstream AI providers. It includes a billing system with anonymous credentials for privacy-preserving usage tracking.
 
-**Current upstream:** Anthropic Claude (Messages API)
+**Current upstream:** RedPill.ai (OpenAI-compatible, routes to various model providers)
+
+**Database:** PostgreSQL 17+ (see `crates/eidolons-server/schema.sql`)
+
+**Deployment:** Phala dstack — all services run inside a single Confidential VM (CVM) with encrypted disk backed by Intel TDX.
+
+**CI:** Two workflows — `ci.yml` (self-hosted Mac: Nix checks, Swift builds/tests) and `oci.yml` (ubuntu-latest: OCI image builds, manifest verification, GHCR publishing).
+
+**Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidolons-server` and `ghcr.io/<owner>/eidolons-postgres`.
 
 **Key design decisions:**
-- Pure Rust TLS via `rustls-rustcrypto` (enables cross-compilation, no C dependencies)
+- Axum-based HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration
+- Pure Rust TLS via `rustls-rustcrypto` (no C dependencies)
 - Statically linked musl binaries for Linux deployment
-- Distroless OCI images (~9MB, runs as non-root)
-- Request-based (no sessions/caching)
+- StageX-based OCI images (reproducible, `FROM scratch`, runs as non-root)
+- Request-based (no sessions/caching in the proxy layer)
+- Account auth (Basic + Argon2id) via `BasicAuth` extractor, chat completions auth via `TokenAuth` extractor
+- Stripe integration via thin `reqwest` wrapper (no `async-stripe` dependency)
 
-**API endpoints:**
-- `GET /health` - Health check
-- `POST /v1/chat/completions` - OpenAI-compatible chat completions (proxied to Anthropic)
+**API endpoints:** Defined in `crates/eidolons-server/openapi.json` (generated from utoipa annotations — see Conventions).
 
 **Environment variables:**
-- `ANTHROPIC_API_KEY` (required) - Anthropic API key
+- `REDPILL_API_KEY` (required) - RedPill API key
+- `DATABASE_URL` (required) - PostgreSQL connection string
 - `BIND_ADDR` (default: `127.0.0.1:8080`) - Address to bind
+- `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
+- `STRIPE_WEBHOOK_SECRET` (optional) - Stripe webhook signing secret; webhook endpoint returns 503 without it
+- `CREDENTIAL_MASTER_KEY` (optional) - Hex-encoded 32-byte AES-256 master key for issuer key encryption; credential issuance endpoints return 503 without it
 
 ## Crux Architecture
 
-The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform state management. The architecture separates the core (Rust) from the shell (Swift):
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Swift Shell (apps/macos)                               │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │  Core.swift - handles event/effect loop           │  │
-│  │  - Sends Events to core via processEvent()        │  │
-│  │  - Handles Effects (Render, Eidolons capability)  │  │
-│  │  - Updates ViewModel for SwiftUI                  │  │
-│  └───────────────────────────────────────────────────┘  │
-└─────────────────────┬───────────────────────────────────┘
-                      │ FFI (UniFFI + bincode)
-┌─────────────────────▼───────────────────────────────────┐
-│  Crux Core (crates/eidolons-shared)                      │
-│  - Event: user actions (e.g., Greet)                    │
-│  - Model: private app state                             │
-│  - ViewModel: public view state                         │
-│  - Effect: side-effects for shell to handle             │
-│  - Capabilities: Render, Eidolons (calls capability impls) │
-└─────────────────────────────────────────────────────────┘
-```
+The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform state management. The CLI (`apps/cli/`) is a standalone clap/tokio app and does not use Crux.
 
 **Key pattern:** The core never performs side-effects directly. It emits Effects that the shell handles, then the shell sends responses back via `handleResponse()`.
 
-**Capability implementations:** Pure Rust crates in `crates/` (e.g., `eidolons-hello`) implement capability logic. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
+**Capability implementations:** Pure Rust crates in `crates/` (e.g., `eidolons-perception`) implement capability logic. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
 
 **Two codegen pipelines:**
 - `uniffi-bindgen-swift` → FFI bridge (`processEvent`, `handleResponse`, `view`)
 - `crux_core::typegen` → Domain types (`Event`, `Effect`, `ViewModel`) with bincode serialization
 
+## CLI Database & Migrations
+
+The CLI uses an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidolons/eidolons.db` for local app data (wallet credentials, conversation history, etc.).
+
+**Schema management:**
+- `apps/cli/schema.sql` is the canonical schema — always reflects the current desired state
+- Fresh installs apply `schema.sql` directly via `execute_batch` and set `PRAGMA user_version` to `LATEST_VERSION`
+- Existing databases run incremental migrations in `db.rs` (gated by `user_version`)
+
+**Adding a migration:**
+1. Update `schema.sql` to the new desired state
+2. Add a `MIGRATION_N` constant in `db.rs` with the ALTER/CREATE statements
+3. Add an `if current_version < N` block in `migrate()` that runs the migration and sets `user_version`
+4. Bump `LATEST_VERSION`
+5. Run `cargo test -p eidolons-cli` — the `migrations_match_schema` test structurally compares a fresh-from-schema database against a fully-migrated database (via `PRAGMA table_info`, `PRAGMA index_info`, and view SQL)
+
+**Limitations:** The `turso` crate does not support `ALTER TABLE ALTER COLUMN` (a libSQL C extension). To add `NOT NULL` columns, use `ADD COLUMN ... DEFAULT <value>` — the default persists and must also be declared in `schema.sql` so both paths match.
+
 ## Build Commands
 
-For rapid iteration, **prefer the local Rust toolchain** inside the Nix development shell. Nix is the final source of authority for CI and releases, but standard `cargo` commands allow for incremental compilation.
+**Prerequisites:** `rustup`, `just`, `docker`
 
-```bash
-# 1. Enter the development environment
-nix develop
-
-# 2. Development (Inner Loop - PREFERRED)
-cargo build -p eidolons-server    # Quick local build
-cargo test                        # Run tests
-cargo clippy                      # Lint
-cargo fmt                         # Format
-
-# 3. Updating generated files (after changing Rust APIs/types)
-# These scripts auto-generate artifacts using your local toolchain.
-scripts/update-shared-bindings.sh
-scripts/update-server-openapi.sh
-scripts/update-shared-xcframework-dev.sh  # Fast dev build (native arch only)
-scripts/update-shared-xcframework.sh      # Full build (all architectures, CI)
-
-# 4. Verification (Simulates CI)
-# Optimized for speed; focuses on correctness, not heavy artifact building.
-nix flake check
-
-# 5. Production builds (Nix - Final Authority)
-nix build '.#server'                              # Native binary
-nix build '.#server-oci'                          # OCI image
-nix build '.#eidolons-shared-swift-xcframework'   # Shared core XCFramework
-
-# 6. Nix-based updates (for perfect CI parity)
-nix run '.#update-eidolons-shared-swift-bindings'
-nix run '.#update-server-openapi'
-```
-
-## Cross-Compilation
-
-Targets defined in `rust-toolchain.toml`:
-- macOS: `aarch64-apple-darwin`, `x86_64-apple-darwin`
-- Linux: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
-
-**OCI images:** Use `server-oci--<linux-target>` for Docker. The native `server-oci` builds for macOS and won't run in Docker.
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `flake.nix` | Nix build definitions, cross-compile targets, CI checks |
-| `rust-toolchain.toml` | Pinned Rust version (1.92.0) and targets |
-| `Cargo.toml` | Workspace config, release profile (LTO, single codegen unit) |
-| `crates/eidolons-server/Cargo.toml` | Server dependencies |
-| `crates/eidolons-hello/src/lib.rs` | Hello capability implementation (pure Rust) |
-| `crates/eidolons-shared/Package.swift` | Shared core Swift Package (EidolonsShared + SharedTypes) |
-| `crates/eidolons-shared/src/lib.rs` | FFI bridge + capability re-exports |
-| `crates/eidolons-shared/src/app.rs` | Crux App implementation (Event, Model, ViewModel, Effect) |
-| `apps/macos/Package.swift` | macOS app Swift Package config |
-| `apps/macos/Sources/Eidolons/Core.swift` | Swift shell bridge (handles Crux event/effect loop) |
-| `apps/macos/Support/Info.plist` | Shared app Info.plist |
-| `apps/macos/Support/package-app.sh` | CLI build script for .app bundle |
-
-## Design Documents
-
-Architecture decisions are recorded in [`docs/design/`](docs/design/). See the
-[index](docs/design/README.md) for a full list. Key decisions:
-
-- [Model Weight Management](docs/design/model-weight-management.md) — weights as pinned dependencies, hash-verified at every boundary
-- [Pure Rust, Zero C Dependencies](docs/design/pure-rust-zero-c-dependencies.md) — rustls-rustcrypto, webpki-roots, no C cross-compiler needed
-- [Reproducible Builds](docs/design/reproducible-builds.md) — Nix, Crane, deterministic settings, CI-verified generated artifacts
-- [Crux Cross-Platform Architecture](docs/design/crux-cross-platform-architecture.md) — Elm-like core/shell split, UniFFI, bincode FFI bridge
-- [OpenAI-Compatible Proxy Server](docs/design/openai-compatible-proxy-server.md) — canonical API format, stateless proxy, distroless OCI
-- [On-Device Inference with Burn](docs/design/on-device-inference-with-burn.md) — pure Rust ML, WGPU GPU backend, model-per-crate
+The `justfile` is the primary development interface. Run `just` to see all available recipes.
 
 ## Conventions
 
 - Pure Rust dependencies preferred (for cross-compilation)
-- No caching/state in server (request-based)
+- `just` is the task runner — wrap scripts and common commands as recipes
+- Server OCI images are built with StageX (reproducible, `FROM scratch`, runs as non-root)
+- Nix is used for CI quality gates and Swift/XCFramework builds, not daily Rust development
+- `rustup` + `rust-toolchain.toml` manages the Rust toolchain for development
 - OpenAI API format as the canonical interface
-- Deterministic builds (no timestamps, fixed codegen)
+- Server API is documented via utoipa `#[utoipa::path]` annotations on handler functions and `ToSchema` derives on request/response types. `OpenApiRouter` (in `lib.rs::build_router()`) collects paths and recursively discovers schemas automatically — only SSE streaming types that aren't referenced from path annotations are listed manually in `api_doc.rs`. When adding or changing server endpoints, add the annotation on the handler and register it in `build_router()` via `routes!()`, then run `just update-openapi` to regenerate the committed `openapi.json`
+- `artifact-manifest.json` records expected OCI digests; CI verifies builds match and suggests updates on PRs
+- Before committing, ensure `README.md` and `AGENTS.md` are updated to reflect any changes (new files, endpoints, env vars, build commands, etc.)
+- Omit any tool-specific "co-authored by" lines from commit messages

@@ -1,0 +1,164 @@
+name: OCI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  oci:
+    name: Build and verify OCI images
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Build OCI images
+        run: |
+          # setup-buildx-action provides a docker-container driver, which
+          # supports rewrite-timestamp and force-compression for full
+          # reproducibility. Override the default output to enable them.
+          docker buildx bake \
+            --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true' \
+            --metadata-file /tmp/bake-metadata.json
+
+      - name: Extract digests
+        id: digests
+        run: |
+          SERVER_DIGEST=$(jq -r '."server"."containerimage.digest"' /tmp/bake-metadata.json)
+          POSTGRES_DIGEST=$(jq -r '."postgres"."containerimage.digest"' /tmp/bake-metadata.json)
+
+          echo "server=${SERVER_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "postgres=${POSTGRES_DIGEST}" >> "$GITHUB_OUTPUT"
+
+          # Build the expected manifest content
+          ACTUAL=$(jq -n \
+            --arg server "$SERVER_DIGEST" \
+            --arg postgres "$POSTGRES_DIGEST" \
+            '{"eidolons-server": $server, "eidolons-postgres": $postgres}')
+          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$ACTUAL" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Verify artifact manifest
+        id: verify
+        env:
+          ACTUAL: ${{ steps.digests.outputs.actual }}
+        run: |
+          COMMITTED=$(cat artifact-manifest.json)
+
+          if [ "$ACTUAL" = "$COMMITTED" ]; then
+            echo "Artifact manifest matches build output."
+            echo "match=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Artifact manifest does not match build output."
+            echo "Committed:"
+            echo "$COMMITTED"
+            echo "Actual:"
+            echo "$ACTUAL"
+            echo "match=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Suggest manifest update (PR only)
+        if: steps.verify.outputs.match == 'false' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SERVER_DIGEST: ${{ steps.digests.outputs.server }}
+          POSTGRES_DIGEST: ${{ steps.digests.outputs.postgres }}
+        run: |
+          # Count total lines in the manifest file for the suggestion range
+          TOTAL_LINES=$(wc -l < artifact-manifest.json | tr -d ' ')
+
+          SUGGESTION_BODY="The OCI build produced different digests than what is committed. Please accept this suggestion to update the manifest:
+          \`\`\`suggestion
+          {
+            \"eidolons-server\": \"${SERVER_DIGEST}\",
+            \"eidolons-postgres\": \"${POSTGRES_DIGEST}\"
+          }
+          \`\`\`"
+
+          REVIEW_BODY="**Artifact Manifest Update Required**
+
+          The OCI images built from this PR produce different digests than what is committed in \`artifact-manifest.json\`. Accept the suggestion below to update it.
+
+          | Image | Digest |
+          |-------|--------|
+          | eidolons-server | \`${SERVER_DIGEST:0:19}...\` |
+          | eidolons-postgres | \`${POSTGRES_DIGEST:0:19}...\` |"
+
+          gh api --silent \
+            -X POST \
+            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+            -f event='REQUEST_CHANGES' \
+            -f body="$REVIEW_BODY" \
+            --field "comments[0][path]=artifact-manifest.json" \
+            --field "comments[0][line]=${TOTAL_LINES}" \
+            --field "comments[0][start_line]=1" \
+            --field "comments[0][body]=${SUGGESTION_BODY}"
+
+      - name: Fail on manifest mismatch
+        if: steps.verify.outputs.match == 'false'
+        run: exit 1
+
+      - name: Log in to GHCR
+        if: steps.verify.outputs.match == 'true' && github.event_name == 'push'
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine tags
+        if: steps.verify.outputs.match == 'true' && github.event_name == 'push'
+        id: tags
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          COMMIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          OWNER=$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')
+          REGISTRY="ghcr.io/${OWNER}"
+          SHORT_SHA=$(echo "${COMMIT_SHA}" | cut -c1-7)
+
+          TAGS="sha-${SHORT_SHA}"
+
+          if [ "${GIT_REF}" = "refs/heads/main" ]; then
+            TAGS="${TAGS},main"
+          elif [[ "${GIT_REF}" == refs/tags/v* ]]; then
+            VERSION="${GIT_REF#refs/tags/}"
+            TAGS="${TAGS},${VERSION}"
+          fi
+
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Push images to GHCR
+        if: steps.verify.outputs.match == 'true' && github.event_name == 'push'
+        env:
+          REGISTRY: ${{ steps.tags.outputs.registry }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra TAG_LIST <<< "${TAGS}"
+
+          for IMAGE in eidolons-server eidolons-postgres; do
+            for TAG in "${TAG_LIST[@]}"; do
+              docker tag "${IMAGE}:dev" "${REGISTRY}/${IMAGE}:${TAG}"
+              docker push "${REGISTRY}/${IMAGE}:${TAG}"
+            done
+          done

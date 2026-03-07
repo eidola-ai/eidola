@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: eidolons-postgres:dev
+    build:
+      context: .
+      dockerfile: docker/postgresql/Containerfile
+    environment:
+      POSTGRES_USER: eidolons
+      POSTGRES_DB: eidolons
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./crates/eidolons-server/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "eidolons"]
+      interval: 5s
+      retries: 5
+
+  server:
+    image: eidolons-server:dev
+    build:
+      context: .
+      dockerfile: crates/eidolons-server/Containerfile
+    environment:
+      DATABASE_URL: postgres://eidolons@postgres/eidolons
+      REDPILL_API_KEY: ${REDPILL_API_KEY}
+      STRIPE_API_KEY: ${STRIPE_API_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      CREDENTIAL_MASTER_KEY: ${CREDENTIAL_MASTER_KEY:-}
+      BIND_ADDR: 0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  stripe-cli:
+    image: stripe/stripe-cli:latest
+    profiles: ["test"]
+    environment:
+      STRIPE_API_KEY: ${STRIPE_API_KEY}
+    command: ["listen", "--forward-to", "http://server:8080/v1/webhooks/stripe"]
+
+volumes:
+  pgdata:

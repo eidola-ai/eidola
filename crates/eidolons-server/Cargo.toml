@@ -14,10 +14,9 @@ path = "src/main.rs"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP server (minimal)
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
-http-body-util = "0.1"
+# HTTP server
+axum = "0.8"
+utoipa-axum = "0.2"
 
 # HTTP client for upstream requests (using rustls with pure-Rust crypto for cross-compilation)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream"] }
@@ -31,11 +30,36 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # OpenAPI documentation
-utoipa = "5"
+utoipa = { version = "5", features = ["uuid"] }
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Anonymous credentials (Privacy Pass)
+anonymous-credit-tokens = "0.4"
+aes-gcm = "0.10"
+hkdf = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Database
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+deadpool-postgres = "0.14"
+
+# Authentication
+argon2 = "0.5"
+
+# Identifiers
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Encoding
+base64 = "0.22"
+hex = "0.4"
+
+# Webhook signature verification
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
 
 # Utilities
 futures-util = "0.3"

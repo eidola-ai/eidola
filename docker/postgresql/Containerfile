@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+
+# ── base ───────────────────────────────────────────────────────────────────────
+# Pin digests for all StageX package dependencies.
+
+FROM stagex/user-postgresql@sha256:a62d900301404dfb16aafea70edd3ab5c2beb9dd191432a3a97f1073d43994eb AS pkg-postgresql
+FROM stagex/busybox@sha256:3d128909dbc8e7b6c4b8c3c31f4583f01a307907ea179934bb42c4ef056c7efd AS pkg-busybox
+FROM stagex/musl@sha256:d7f6c365f5724c65cadb2b96d9f594e46132ceb366174c89dbf7554897f2bc53 AS pkg-musl
+FROM stagex/zlib@sha256:09d63654e27decb6147f1b23005d539e30db8e53eb2d284e824bcf4d4e7c3c11 AS pkg-zlib
+FROM stagex/core-openssl@sha256:4ecf4f42ad958a25d4622b246aacdbccd523aacbb8ce036f387d39e8a17b9840 AS pkg-openssl
+FROM stagex/core-libcxx@sha256:b14076c9a20cd59210804c6cc774f9af08e513e1b18e35211124f23c6a2afbc5 AS pkg-libcxx
+FROM stagex/core-libcxxabi@sha256:654f762dde9c819bcc32cc781059d42458205c66ab764ef9a20a7f8dff734806 AS pkg-libcxxabi
+FROM stagex/core-libunwind@sha256:b6915f100585cf071af2652843e23c7365be48043afc61d0154b6ef1eb626c0b AS pkg-libunwind
+FROM stagex/core-icu@sha256:68248a0eb064ff1e73998a2d8618ab7a8d3092beae2819e14d32e3e7ef2782f0 AS pkg-icu
+FROM stagex/core-ncurses@sha256:35d72c3b114e43b754efaa7888b4998bc1871aa8fac9bad5c085e9c30689419f AS pkg-ncurses
+FROM stagex/core-readline@sha256:b1df192ced05d70c2d8f0dcf2dc398a9dec0b5be752e6ba23fdfaf0d13a52d9d AS pkg-readline
+FROM stagex/core-libxml2@sha256:e7e5c0b1eb8554575dddf7b92adb920f7d0e0448221f0ddddf68d2852d0cc1e5 AS pkg-libxml2
+
+# ── fetch ──────────────────────────────────────────────────────────────────────
+# (no-op: all dependencies are pre-built StageX packages pinned above)
+
+# ── build ──────────────────────────────────────────────────────────────────────
+# (no-op: using pre-built packages, no compilation needed)
+
+# ── install ────────────────────────────────────────────────────────────────────
+# Assemble filesystem from StageX packages (COPY only, no RUN needed).
+
+FROM scratch AS install
+
+COPY --from=pkg-busybox . /
+COPY --from=pkg-musl . /
+COPY --from=pkg-zlib . /
+COPY --from=pkg-openssl . /
+COPY --from=pkg-libcxx . /
+COPY --from=pkg-libcxxabi . /
+COPY --from=pkg-libunwind . /
+COPY --from=pkg-icu . /
+COPY --from=pkg-ncurses . /
+COPY --from=pkg-readline . /
+COPY --from=pkg-libxml2 . /
+COPY --from=pkg-postgresql . /
+COPY --chmod=755 docker/postgresql/entrypoint.sh /entrypoint.sh
+
+# ── package ────────────────────────────────────────────────────────────────────
+# Create runtime directories and set ownership.
+
+FROM scratch AS package
+
+COPY --from=install / /
+
+RUN --network=none mkdir -p /var/lib/postgresql/data /run/postgresql /docker-entrypoint-initdb.d && \
+    chown -R 1000:1000 /var/lib/postgresql /run/postgresql /docker-entrypoint-initdb.d
+
+# StageX core-readline is missing a DT_NEEDED for ncurses, so termcap symbols
+# (tputs, tgetent, etc.) aren't found by the dynamic linker.
+ENV LD_PRELOAD=/lib/libncursesw.so.6
+ENV PGDATA=/var/lib/postgresql/data
+EXPOSE 5432
+USER 1000:1000
+ENTRYPOINT ["/entrypoint.sh"]

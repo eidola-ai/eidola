@@ -1,0 +1,11 @@
+.git
+.github
+.claude
+.env
+result
+result-*
+apps/macos/
+docs/
+target/
+*.md
+.buildx-cache

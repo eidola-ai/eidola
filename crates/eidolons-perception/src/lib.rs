@@ -10,7 +10,9 @@ pub mod qwen3;
 pub mod tokenizer;
 
 pub use generation::GenerationConfig;
-pub use model_manager::{InferenceBackend, ModelArchitecture, ModelConfig, StreamChunk, TextGenerationModel};
+pub use model_manager::{
+    InferenceBackend, ModelArchitecture, ModelConfig, StreamChunk, TextGenerationModel,
+};
 pub use qwen3::{QuantizationMode, Qwen3Config, Qwen3Model};
 pub use tokenizer::{ChatRole, FormatMessage, Qwen3Tokenizer};
 

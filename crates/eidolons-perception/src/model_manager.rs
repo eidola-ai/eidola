@@ -289,7 +289,9 @@ impl TextGenerationModel {
                 ),
             }
         } else {
-            anyhow::bail!("No architecture specified in config.json. Only Qwen3ForCausalLM is supported.")
+            anyhow::bail!(
+                "No architecture specified in config.json. Only Qwen3ForCausalLM is supported."
+            )
         }
     }
 
