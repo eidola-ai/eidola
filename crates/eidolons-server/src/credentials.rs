@@ -146,7 +146,10 @@ const DS_VERSION: &str = "2026-03-05";
 /// Must match what `Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION)`
 /// produces internally.
 fn domain_separator() -> String {
-    format!("ACT-v1:{}:{}:{}:{}", DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION)
+    format!(
+        "ACT-v1:{}:{}:{}:{}",
+        DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -238,9 +241,10 @@ fn cache_key(
     master_key: &[u8; 32],
     row: &db::IssuerKeyRow,
 ) -> Result<[u8; 32], ServerError> {
-    let key_hash: [u8; 32] = row.key_hash.as_slice().try_into().map_err(|_| {
-        ServerError::Internal("invalid key_hash length in database".to_string())
-    })?;
+    let key_hash: [u8; 32] =
+        row.key_hash.as_slice().try_into().map_err(|_| {
+            ServerError::Internal("invalid key_hash length in database".to_string())
+        })?;
     if cache.contains_key(&key_hash) {
         return Ok(key_hash);
     }
@@ -369,9 +373,11 @@ pub async fn ensure_keys(
 
         match result {
             Ok(Some(inserted)) => {
-                info!("provisioned issuer key {} (issue_from={})",
+                info!(
+                    "provisioned issuer key {} (issue_from={})",
                     inserted.id,
-                    system_time_to_iso_lossy(inserted.issue_from));
+                    system_time_to_iso_lossy(inserted.issue_from)
+                );
                 // Cache it and loop to check if we need another key.
                 let mut cache = key_cache.write().await;
                 cache_key(&mut cache, master_key, &inserted)?;
@@ -605,33 +611,10 @@ pub async fn issue_credentials(
     // Look up the UUID for the DB ledger entry (the cache has both).
     let key_uuid = {
         let cache = state.credential_key_cache.read().await;
-        cache
-            .get(&key_hash)
-            .map(|k| k.id)
-            .ok_or_else(|| {
-                ServerError::Internal("current key evicted from cache unexpectedly".to_string())
-            })?
+        cache.get(&key_hash).map(|k| k.id).ok_or_else(|| {
+            ServerError::Internal("current key evicted from cache unexpectedly".to_string())
+        })?
     };
-
-    let ledger_entry_id =
-        match db::insert_credential_issuance(&state.db_pool, account_id, request.credits, key_uuid)
-            .await?
-        {
-            Some(id) => id,
-            None => {
-                let available = match db::get_available_balance(&state.db_pool, account_id).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("failed to fetch balance for 402 response: {e}");
-                        0
-                    }
-                };
-                return Err(ServerError::PaymentRequired {
-                    message: "insufficient balance".to_string(),
-                    available,
-                });
-            }
-        };
 
     let issuance_response = {
         let cache = state.credential_key_cache.read().await;
@@ -657,6 +640,26 @@ pub async fn issue_credentials(
     let response_cbor = issuance_response
         .to_cbor()
         .map_err(|e| ServerError::Internal(format!("failed to encode issuance response: {}", e)))?;
+
+    let ledger_entry_id =
+        match db::insert_credential_issuance(&state.db_pool, account_id, request.credits, key_uuid)
+            .await?
+        {
+            Some(id) => id,
+            None => {
+                let available = match db::get_available_balance(&state.db_pool, account_id).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("failed to fetch balance for 402 response: {e}");
+                        0
+                    }
+                };
+                return Err(ServerError::PaymentRequired {
+                    message: "insufficient balance".to_string(),
+                    available,
+                });
+            }
+        };
 
     info!(
         "issued credential: account={}, credits={}, ledger_entry={}",
@@ -709,7 +712,10 @@ mod tests {
     #[test]
     fn test_domain_separator_is_stable() {
         // The domain separator must never change between key rotations.
-        assert_eq!(domain_separator(), "ACT-v1:eidolons:inference:production:2026-03-05");
+        assert_eq!(
+            domain_separator(),
+            "ACT-v1:eidolons:inference:production:2026-03-05"
+        );
     }
 
     #[test]
