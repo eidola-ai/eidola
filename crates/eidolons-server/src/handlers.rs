@@ -72,13 +72,9 @@ fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> u128 {
     let sf = PRICING_SCALE_FACTOR as u128;
 
     // Prompt: estimate 1 token per byte of message content.
-    let prompt_bytes: usize = request
-        .messages
-        .iter()
-        .map(|m| m.content.byte_len())
-        .sum();
+    let prompt_bytes: usize = request.messages.iter().map(|m| m.content.byte_len()).sum();
     let prompt_rate = model.pricing.per_prompt_token.value as u128;
-    let prompt_credits = (prompt_bytes as u128 * prompt_rate + sf - 1) / sf;
+    let prompt_credits = (prompt_bytes as u128 * prompt_rate).div_ceil(sf);
 
     // Completion: use max_completion_tokens or fall back to context_length.
     let max_completion = request
@@ -86,7 +82,7 @@ fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> u128 {
         .map(|t| t as u64)
         .unwrap_or(model.context_length);
     let completion_rate = model.pricing.per_completion_token.value as u128;
-    let completion_credits = (max_completion as u128 * completion_rate + sf - 1) / sf;
+    let completion_credits = (max_completion as u128 * completion_rate).div_ceil(sf);
 
     prompt_credits + completion_credits
 }
@@ -98,8 +94,8 @@ fn actual_cost(usage: &Usage, model: &Model) -> u128 {
     let completion_cost =
         usage.completion_tokens as u128 * model.pricing.per_completion_token.value as u128;
     // Ceiling division for each component, then sum
-    let prompt_credits = (prompt_cost + sf - 1) / sf;
-    let completion_credits = (completion_cost + sf - 1) / sf;
+    let prompt_credits = prompt_cost.div_ceil(sf);
+    let completion_credits = completion_cost.div_ceil(sf);
     prompt_credits + completion_credits
 }
 
@@ -117,9 +113,9 @@ async fn issue_refund_async(
         .map_err(|e| ServerError::Internal(format!("invalid refund amount: {e:?}")))?;
 
     let cache = state.credential_key_cache.read().await;
-    let key = cache.get(issuer_key_hash).ok_or_else(|| {
-        ServerError::Internal("issuer key not in cache for refund".to_string())
-    })?;
+    let key = cache
+        .get(issuer_key_hash)
+        .ok_or_else(|| ServerError::Internal("issuer key not in cache for refund".to_string()))?;
 
     let refund = key
         .secret_key
@@ -308,7 +304,13 @@ async fn handle_non_streaming_request(
         Err(e) => {
             // Known error — backend didn't charge. Full refund.
             warn!("Backend error, issuing full refund: {}", e);
-            let refund = issue_refund_async(state, &act.spend_proof, &act.issuer_key_hash, charge_credits).await;
+            let refund = issue_refund_async(
+                state,
+                &act.spend_proof,
+                &act.issuer_key_hash,
+                charge_credits,
+            )
+            .await;
             return Ok(error_response_with_refund(&e, refund.ok()));
         }
     };
@@ -322,7 +324,14 @@ async fn handle_non_streaming_request(
         .unwrap_or(charge_credits); // No usage → charge worst case
 
     let refund_credits = charge_credits.saturating_sub(cost);
-    let refund_info = match issue_refund_async(state, &act.spend_proof, &act.issuer_key_hash, refund_credits).await {
+    let refund_info = match issue_refund_async(
+        state,
+        &act.spend_proof,
+        &act.issuer_key_hash,
+        refund_credits,
+    )
+    .await
+    {
         Ok(info) => Some(info),
         Err(e) => {
             error!("CRITICAL: failed to issue refund: {}", e);
@@ -356,8 +365,12 @@ async fn handle_non_streaming_request(
     let privacy = build_privacy_metadata(&auth_context, is_tee, &meta.provider);
     let verification = build_verification_metadata(backend_attestation);
 
-    let eidolons_response =
-        EidolonsResponse::from_completion(backend_response.response, privacy, verification, refund_info);
+    let eidolons_response = EidolonsResponse::from_completion(
+        backend_response.response,
+        privacy,
+        verification,
+        refund_info,
+    );
 
     Ok(Json(eidolons_response).into_response())
 }
@@ -379,7 +392,13 @@ async fn handle_streaming_request(
         Err(e) => {
             // Known error — upstream didn't process any tokens. Full refund.
             warn!("Stream start error, issuing full refund: {}", e);
-            let refund = issue_refund_async(&state, &act.spend_proof, &act.issuer_key_hash, charge_credits).await;
+            let refund = issue_refund_async(
+                &state,
+                &act.spend_proof,
+                &act.issuer_key_hash,
+                charge_credits,
+            )
+            .await;
             return Ok(error_response_with_refund(&e, refund.ok()));
         }
     };
@@ -394,7 +413,13 @@ async fn handle_streaming_request(
         Err(e) => {
             // Can't serialize spend proof for the spawned task — issue full refund now.
             error!("spend proof re-encode failed: {e:?}");
-            let refund = issue_refund_async(&state, &act.spend_proof, &act.issuer_key_hash, charge_credits).await;
+            let refund = issue_refund_async(
+                &state,
+                &act.spend_proof,
+                &act.issuer_key_hash,
+                charge_credits,
+            )
+            .await;
             let err = ServerError::Internal(format!("spend proof re-encode failed: {e:?}"));
             return Ok(error_response_with_refund(&err, refund.ok()));
         }
@@ -420,7 +445,10 @@ async fn handle_streaming_request(
             match issue_refund_async(state, &proof, issuer_key_hash, refund_credits).await {
                 Ok(info) => Some(info),
                 Err(e) => {
-                    error!("CRITICAL: failed to issue refund ({} credits): {}", refund_credits, e);
+                    error!(
+                        "CRITICAL: failed to issue refund ({} credits): {}",
+                        refund_credits, e
+                    );
                     None
                 }
             }
@@ -434,12 +462,8 @@ async fn handle_streaming_request(
             verification: crate::response::VerificationMetadata,
             chat_id: String,
         ) {
-            let stream_meta = EidolonsStreamMetadata::new(
-                chat_id,
-                privacy,
-                verification,
-                refund_info,
-            );
+            let stream_meta =
+                EidolonsStreamMetadata::new(chat_id, privacy, verification, refund_info);
             let json_str = serde_json::to_string(&stream_meta).unwrap();
             let event = Event::default().data(json_str);
             let _ = tx.send(Ok(event)).await;
@@ -493,17 +517,22 @@ async fn handle_streaming_request(
                     let verification = build_verification_metadata(backend_attestation);
 
                     // Compute refund based on usage.
-                    let cost = final_usage.as_ref().map(|u| {
-                        let sf = PRICING_SCALE_FACTOR as u128;
-                        let pc = u.prompt_tokens as u128
-                            * model_pricing.per_prompt_token.value as u128;
-                        let cc = u.completion_tokens as u128
-                            * model_pricing.per_completion_token.value as u128;
-                        (pc + sf - 1) / sf + (cc + sf - 1) / sf
-                    }).unwrap_or(charge_credits);
+                    let cost = final_usage
+                        .as_ref()
+                        .map(|u| {
+                            let sf = PRICING_SCALE_FACTOR as u128;
+                            let pc = u.prompt_tokens as u128
+                                * model_pricing.per_prompt_token.value as u128;
+                            let cc = u.completion_tokens as u128
+                                * model_pricing.per_completion_token.value as u128;
+                            pc.div_ceil(sf) + cc.div_ceil(sf)
+                        })
+                        .unwrap_or(charge_credits);
 
                     let refund_credits = charge_credits.saturating_sub(cost);
-                    let refund_info = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, refund_credits).await;
+                    let refund_info =
+                        try_refund(&state, &spend_proof_cbor, &issuer_key_hash, refund_credits)
+                            .await;
 
                     send_metadata_event(
                         &tx,
@@ -511,17 +540,20 @@ async fn handle_streaming_request(
                         privacy,
                         verification,
                         meta.chat_id.unwrap_or_default(),
-                    ).await;
+                    )
+                    .await;
                     return;
                 }
                 Err(e) => {
                     // Some chunks may have been delivered and billed; we don't
                     // know the actual cost. Refund 0 (blind remaining value).
                     error!("Stream error, issuing zero refund: {}", e);
-                    let refund_info = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
+                    let refund_info =
+                        try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
                     let privacy = build_privacy_metadata(&auth_context, false, "redpill");
                     let verification = build_verification_metadata(None);
-                    send_metadata_event(&tx, refund_info, privacy, verification, String::new()).await;
+                    send_metadata_event(&tx, refund_info, privacy, verification, String::new())
+                        .await;
                     return;
                 }
             }

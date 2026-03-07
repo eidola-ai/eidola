@@ -563,8 +563,14 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         }
     };
 
-    match db::debit_stripe_event(pool, account.id, microdollars, "dispute_clawback", &event.id)
-        .await
+    match db::debit_stripe_event(
+        pool,
+        account.id,
+        microdollars,
+        "dispute_clawback",
+        &event.id,
+    )
+    .await
     {
         Ok(true) => info!(
             "webhook: debited {} from account {} (dispute_clawback, event {})",

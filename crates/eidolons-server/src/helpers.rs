@@ -170,11 +170,18 @@ mod tests {
     #[test]
     fn test_epoch_config_boundaries() {
         let config = EpochConfig::default();
-        let issue_from = UNIX_EPOCH + Duration::from_secs(days_from_civil(2026, 3, 1) as u64 * 86400);
+        let issue_from =
+            UNIX_EPOCH + Duration::from_secs(days_from_civil(2026, 3, 1) as u64 * 86400);
         let (issue_until, accept_until) = config.boundaries_from(issue_from);
         assert_eq!(system_time_to_iso_lossy(issue_from), "2026-03-01T00:00:00Z");
-        assert_eq!(system_time_to_iso_lossy(issue_until), "2026-03-08T00:00:00Z");
-        assert_eq!(system_time_to_iso_lossy(accept_until), "2026-03-15T00:00:00Z");
+        assert_eq!(
+            system_time_to_iso_lossy(issue_until),
+            "2026-03-08T00:00:00Z"
+        );
+        assert_eq!(
+            system_time_to_iso_lossy(accept_until),
+            "2026-03-15T00:00:00Z"
+        );
     }
 
     #[test]
@@ -183,10 +190,17 @@ mod tests {
             epoch_duration: Duration::from_secs(30 * 86400),
             grace_period: Duration::from_secs(3 * 86400),
         };
-        let issue_from = UNIX_EPOCH + Duration::from_secs(days_from_civil(2026, 3, 1) as u64 * 86400);
+        let issue_from =
+            UNIX_EPOCH + Duration::from_secs(days_from_civil(2026, 3, 1) as u64 * 86400);
         let (issue_until, accept_until) = config.boundaries_from(issue_from);
-        assert_eq!(system_time_to_iso_lossy(issue_until), "2026-03-31T00:00:00Z");
-        assert_eq!(system_time_to_iso_lossy(accept_until), "2026-04-03T00:00:00Z");
+        assert_eq!(
+            system_time_to_iso_lossy(issue_until),
+            "2026-03-31T00:00:00Z"
+        );
+        assert_eq!(
+            system_time_to_iso_lossy(accept_until),
+            "2026-04-03T00:00:00Z"
+        );
     }
 
     #[test]
@@ -196,5 +210,4 @@ mod tests {
         let (y, m, d) = civil_from_unix(secs);
         assert_eq!((y, m, d), (2026, 3, 4));
     }
-
 }
