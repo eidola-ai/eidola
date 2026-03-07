@@ -8,7 +8,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 
 **Current upstream:** RedPill.ai (OpenAI-compatible, routes to various model providers)
 
-**Database:** PostgreSQL 17+ (see `crates/eidolons-server/schema.sql`)
+**Database:** PostgreSQL 17+ (see `crates/eidolons-server/schema/schema.sql`)
 
 **Deployment:** Phala dstack — all services run inside a single Confidential VM (CVM) with encrypted disk backed by Intel TDX.
 
@@ -52,7 +52,7 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 The CLI uses an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidolons/eidolons.db` for local app data (wallet credentials, conversation history, etc.).
 
 **Schema management:**
-- `apps/cli/schema.sql` is the canonical schema — always reflects the current desired state
+- `apps/cli/schema/schema.sql` is the canonical schema — always reflects the current desired state
 - Fresh installs apply `schema.sql` directly via `execute_batch` and set `PRAGMA user_version` to `LATEST_VERSION`
 - Existing databases run incremental migrations in `db.rs` (gated by `user_version`)
 

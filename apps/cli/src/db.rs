@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use turso::{Builder, Connection, Database, Value};
 
-const SCHEMA: &str = include_str!("../schema.sql");
+const SCHEMA: &str = include_str!("../schema/schema.sql");
 const LATEST_VERSION: i64 = 1;
 
 /// Returns the path to the CLI database file.
