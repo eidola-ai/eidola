@@ -228,19 +228,11 @@ async fn authorize_spend(
         });
     }
 
-    // Atomically record the nullifier (using the internal UUID for the FK).
-    let key_uuid = {
-        let cache = state.credential_key_cache.read().await;
-        cache
-            .get(&act.issuer_key_hash)
-            .map(|k| k.id)
-            .ok_or_else(|| {
-                ServerError::Internal("issuer key evicted from cache unexpectedly".to_string())
-            })?
-    };
+    // Atomically record the nullifier.
+    let key_id = hex::encode(act.issuer_key_hash);
     let nullifier = act.spend_proof.nullifier();
     let nullifier_bytes = nullifier.as_bytes().to_vec();
-    let recorded = db::record_nullifier(&state.db_pool, key_uuid, &nullifier_bytes).await?;
+    let recorded = db::record_nullifier(&state.db_pool, &key_id, &nullifier_bytes).await?;
     if !recorded {
         return Err(ServerError::Conflict {
             message: "credential already spent (duplicate nullifier)".to_string(),
