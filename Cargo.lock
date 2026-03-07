@@ -2823,7 +2823,7 @@ dependencies = [
  "burn-wgpu",
  "hf-hub",
  "qwen3-burn",
- "rand 0.8.5",
+ "rand 0.10.0",
  "rustls",
  "rustls-rustcrypto",
  "serde",
