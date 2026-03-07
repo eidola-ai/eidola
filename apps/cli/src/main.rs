@@ -208,7 +208,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd-length hex string".into());
     }
     (0..s.len())
@@ -603,7 +603,11 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
         .iter()
         .find(|k| k.domain_separator == expected_ds)
         .ok_or_else(|| {
-            let server_ds: Vec<&str> = keys.data.iter().map(|k| k.domain_separator.as_str()).collect();
+            let server_ds: Vec<&str> = keys
+                .data
+                .iter()
+                .map(|k| k.domain_separator.as_str())
+                .collect();
             format!(
                 "no issuer key matches expected domain separator \"{expected_ds}\"\n\
                  server advertised: {server_ds:?}\n\
@@ -623,7 +627,11 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
     // Reconstruct params from the validated domain separator (ACT-v1:org:service:deployment:version).
     // We already verified key.domain_separator == expected_ds above.
     let ds_parts: Vec<&str> = expected_ds.split(':').collect();
-    assert_eq!(ds_parts.len(), 5, "compiled-in domain separator has wrong format");
+    assert_eq!(
+        ds_parts.len(),
+        5,
+        "compiled-in domain separator has wrong format"
+    );
     let params = Params::new(ds_parts[1], ds_parts[2], ds_parts[3], ds_parts[4]);
 
     // 2. Open database
@@ -770,9 +778,9 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
     let sf = model.pricing.per_prompt_token.scale_factor as u128;
     let prompt_bytes = prompt.len() as u128;
     let prompt_rate = model.pricing.per_prompt_token.value as u128;
-    let prompt_credits = (prompt_bytes * prompt_rate + sf - 1) / sf;
+    let prompt_credits = (prompt_bytes * prompt_rate).div_ceil(sf);
     let completion_rate = model.pricing.per_completion_token.value as u128;
-    let completion_credits = (max_completion_tokens as u128 * completion_rate + sf - 1) / sf;
+    let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
     let charge_credits = prompt_credits + completion_credits;
 
     if charge_credits == 0 {
@@ -873,8 +881,8 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
         let refund_cbor = URL_SAFE_NO_PAD
             .decode(refund_b64)
             .map_err(|e| format!("invalid refund base64: {e}"))?;
-        let refund = Refund::from_cbor(&refund_cbor)
-            .map_err(|e| format!("invalid refund CBOR: {e}"))?;
+        let refund =
+            Refund::from_cbor(&refund_cbor).map_err(|e| format!("invalid refund CBOR: {e}"))?;
 
         let new_token = pre_refund
             .to_credit_token::<128>(&params, &spend_proof, &refund, &public_key)
@@ -910,15 +918,14 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
     }
 
     // 11. Print response content
-    if let Some(choices) = body.get("choices").and_then(|c| c.as_array()) {
-        if let Some(content) = choices
+    if let Some(choices) = body.get("choices").and_then(|c| c.as_array())
+        && let Some(content) = choices
             .first()
             .and_then(|c| c.get("message"))
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
-        {
-            println!("{content}");
-        }
+    {
+        println!("{content}");
     }
 
     Ok(())

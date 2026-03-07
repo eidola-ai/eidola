@@ -101,11 +101,12 @@ impl FromRequestParts<AppState> for TokenAuth {
                 message: "expected PrivateToken authorization scheme".to_string(),
             })?;
 
-        let token_bytes = URL_SAFE_NO_PAD
-            .decode(payload)
-            .map_err(|_| ServerError::Unauthorized {
-                message: "invalid base64url in PrivateToken".to_string(),
-            })?;
+        let token_bytes =
+            URL_SAFE_NO_PAD
+                .decode(payload)
+                .map_err(|_| ServerError::Unauthorized {
+                    message: "invalid base64url in PrivateToken".to_string(),
+                })?;
 
         // Minimum size: 2 (token_type) + 32 (challenge_digest) + 32 (issuer_key_id) + 1 (spend proof)
         if token_bytes.len() < 67 {
@@ -134,12 +135,11 @@ impl FromRequestParts<AppState> for TokenAuth {
         issuer_key_hash.copy_from_slice(&token_bytes[34..66]);
 
         // Parse spend proof (remaining bytes are CBOR)
-        let spend_proof =
-            SpendProof::<128>::from_cbor(&token_bytes[66..]).map_err(|_| {
-                ServerError::Unauthorized {
-                    message: "invalid CBOR spend proof in token".to_string(),
-                }
-            })?;
+        let spend_proof = SpendProof::<128>::from_cbor(&token_bytes[66..]).map_err(|_| {
+            ServerError::Unauthorized {
+                message: "invalid CBOR spend proof in token".to_string(),
+            }
+        })?;
 
         Ok(TokenAuth(ActSpend {
             challenge_digest,

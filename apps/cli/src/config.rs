@@ -30,7 +30,9 @@ pub struct Config {
 impl Config {
     /// Returns the domain separator to enforce, falling back to the compiled-in default.
     pub fn domain_separator(&self) -> &str {
-        self.domain_separator.as_deref().unwrap_or(DEFAULT_DOMAIN_SEPARATOR)
+        self.domain_separator
+            .as_deref()
+            .unwrap_or(DEFAULT_DOMAIN_SEPARATOR)
     }
 }
 

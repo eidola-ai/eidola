@@ -220,10 +220,10 @@ impl RedPillBackend {
         // Check cache
         {
             let cache = self.models_cache.read().await;
-            if let Some((fetched_at, ref models)) = *cache {
-                if fetched_at.elapsed().as_secs() < MODEL_CACHE_TTL_SECS {
-                    return Ok(models.data.iter().find(|m| m.id == model_id).cloned());
-                }
+            if let Some((fetched_at, ref models)) = *cache
+                && fetched_at.elapsed().as_secs() < MODEL_CACHE_TTL_SECS
+            {
+                return Ok(models.data.iter().find(|m| m.id == model_id).cloned());
             }
         }
 
@@ -476,7 +476,10 @@ mod tests {
             pricing: RedPillPricing {
                 prompt: "0.00000004".into(),
                 completion: "0.00000015".into(),
-                other: other.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+                other: other
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .collect(),
             },
         };
 
