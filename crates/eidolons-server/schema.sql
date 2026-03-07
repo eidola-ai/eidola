@@ -213,10 +213,12 @@ COMMENT ON COLUMN credit_ledger.expires_at IS
     'For subscription renewals, set to the billing period end date. '
     'Expired credits are excluded from balance calculations by the query, '
     'not by a cron job. '
-    'For debit entries (credential_issuance, refund, dispute_clawback), set to '
-    'match the balance pool being consumed. E.g., if consuming subscription '
-    'credits expiring Mar 1, the debit also carries expires_at = Mar 1. '
-    'This keeps the expiring vs permanent breakdown accurate.';
+    'For debit entries (credential_issuance, refund, dispute_clawback), '
+    'debit_account() sets this to match the balance pool being consumed. '
+    'E.g., if consuming subscription credits expiring Mar 1, the debit '
+    'also carries expires_at = Mar 1.  This ensures that when the pool '
+    'expires, its debits expire with it, preventing phantom negative '
+    'balances from outliving the credits they reversed.';
 
 COMMENT ON COLUMN credit_ledger.created_at IS
     'When this ledger entry was created in our system. NOT the upstream event '
@@ -291,6 +293,122 @@ COMMENT ON FUNCTION available_balance IS
     'Returns the total available credit balance for an account. Used as a '
     'fast check before credential provisioning. For the full breakdown '
     '(expiring vs permanent), query the account_balance view instead.';
+
+-- Pool-aware debit: allocates a negative delta across balance pools in FIFO
+-- order (earliest expiry first, permanent last).  Returns an array of inserted
+-- ledger entry IDs on success, NULL if p_require_balance is TRUE and the
+-- account has insufficient balance, or an empty array if the stripe_event_id
+-- has already been processed (idempotent duplicate).
+CREATE FUNCTION debit_account(
+    p_account_id       UUID,
+    p_amount           BIGINT,
+    p_reason           TEXT,
+    p_stripe_event_id  TEXT    DEFAULT NULL,
+    p_credential_key_id UUID   DEFAULT NULL,
+    p_require_balance  BOOLEAN DEFAULT TRUE
+) RETURNS UUID[]
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_remaining BIGINT := p_amount;
+    v_pool      RECORD;
+    v_entry_id  UUID;
+    v_entry_ids UUID[] := '{}';
+    v_take      BIGINT;
+    v_pool_idx  INT := 0;
+    v_event_id  TEXT;
+BEGIN
+    -- Balance check (credential issuance).
+    IF p_require_balance AND available_balance(p_account_id) < p_amount THEN
+        RETURN NULL;
+    END IF;
+
+    -- Idempotency for Stripe-originated events.
+    IF p_stripe_event_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM credit_ledger WHERE stripe_event_id = p_stripe_event_id
+    ) THEN
+        RETURN '{}';
+    END IF;
+
+    -- Allocate across pools (earliest expiry first, permanent last).
+    FOR v_pool IN
+        SELECT expires_at, SUM(delta)::bigint AS pool_amount
+        FROM credit_ledger
+        WHERE account_id = p_account_id
+          AND (expires_at IS NULL OR expires_at > now())
+        GROUP BY expires_at
+        HAVING SUM(delta) > 0
+        ORDER BY expires_at NULLS LAST
+    LOOP
+        EXIT WHEN v_remaining <= 0;
+
+        v_take := LEAST(v_remaining, v_pool.pool_amount);
+        v_pool_idx := v_pool_idx + 1;
+
+        IF p_stripe_event_id IS NOT NULL THEN
+            v_event_id := CASE WHEN v_pool_idx = 1
+                THEN p_stripe_event_id
+                ELSE p_stripe_event_id || ':' || v_pool_idx
+            END;
+        ELSE
+            v_event_id := NULL;
+        END IF;
+
+        INSERT INTO credit_ledger (
+            id, account_id, delta, reason, stripe_event_id, expires_at,
+            credential_key_id, credential_credits, created_at
+        ) VALUES (
+            gen_random_uuid(), p_account_id, -v_take, p_reason, v_event_id,
+            v_pool.expires_at, p_credential_key_id,
+            CASE WHEN p_credential_key_id IS NOT NULL THEN v_take ELSE NULL END,
+            now()
+        )
+        RETURNING id INTO v_entry_id;
+
+        v_entry_ids := v_entry_ids || v_entry_id;
+        v_remaining := v_remaining - v_take;
+    END LOOP;
+
+    -- Remainder that exceeds all positive pools (refunds/clawbacks that
+    -- exceed the current balance).  Placed in the permanent (NULL) pool.
+    IF v_remaining > 0 AND NOT p_require_balance THEN
+        v_pool_idx := v_pool_idx + 1;
+
+        IF p_stripe_event_id IS NOT NULL THEN
+            v_event_id := CASE WHEN v_pool_idx = 1
+                THEN p_stripe_event_id
+                ELSE p_stripe_event_id || ':' || v_pool_idx
+            END;
+        ELSE
+            v_event_id := NULL;
+        END IF;
+
+        INSERT INTO credit_ledger (
+            id, account_id, delta, reason, stripe_event_id, expires_at,
+            credential_key_id, credential_credits, created_at
+        ) VALUES (
+            gen_random_uuid(), p_account_id, -v_remaining, p_reason, v_event_id,
+            NULL, p_credential_key_id,
+            CASE WHEN p_credential_key_id IS NOT NULL THEN v_remaining ELSE NULL END,
+            now()
+        )
+        RETURNING id INTO v_entry_id;
+
+        v_entry_ids := v_entry_ids || v_entry_id;
+    END IF;
+
+    RETURN v_entry_ids;
+END;
+$$;
+
+COMMENT ON FUNCTION debit_account IS
+    'Pool-aware debit function.  Allocates a negative delta across credit '
+    'pools in FIFO order (earliest expiry first, permanent last) so that '
+    'each debit row carries the expires_at of the pool it draws from. '
+    'Returns NULL when p_require_balance is TRUE and the balance is '
+    'insufficient.  Returns an empty array on duplicate stripe_event_id. '
+    'For refunds/clawbacks (p_require_balance = FALSE), any remainder '
+    'beyond existing pools is placed in the permanent (NULL expiry) pool.';
 
 CREATE FUNCTION record_nullifier(p_issuer_key_id UUID, p_value BYTEA)
 RETURNS BOOLEAN

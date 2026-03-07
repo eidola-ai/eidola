@@ -482,8 +482,8 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         }
     };
 
-    let delta = match cents_to_microdollars(amount_refunded).and_then(i64::checked_neg) {
-        Some(d) => d,
+    let amount = match cents_to_microdollars(amount_refunded) {
+        Some(a) => a,
         None => {
             error!(
                 "webhook: amount overflow in charge.refunded (event {})",
@@ -493,10 +493,10 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         }
     };
 
-    match db::insert_credit_ledger(pool, account.id, delta, "refund", &event.id, None).await {
+    match db::debit_stripe_event(pool, account.id, amount, "refund", &event.id).await {
         Ok(true) => info!(
             "webhook: debited {} from account {} (refund, event {})",
-            delta, account.id, event.id
+            amount, account.id, event.id
         ),
         Ok(false) => info!("webhook: duplicate event {}, skipping", event.id),
         Err(e) => {
@@ -552,7 +552,7 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         }
     };
 
-    let delta = match cents_to_microdollars(amount).and_then(i64::checked_neg) {
+    let microdollars = match cents_to_microdollars(amount) {
         Some(d) => d,
         None => {
             error!(
@@ -563,12 +563,12 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         }
     };
 
-    match db::insert_credit_ledger(pool, account.id, delta, "dispute_clawback", &event.id, None)
+    match db::debit_stripe_event(pool, account.id, microdollars, "dispute_clawback", &event.id)
         .await
     {
         Ok(true) => info!(
             "webhook: debited {} from account {} (dispute_clawback, event {})",
-            delta, account.id, event.id
+            microdollars, account.id, event.id
         ),
         Ok(false) => info!("webhook: duplicate event {}, skipping", event.id),
         Err(e) => {

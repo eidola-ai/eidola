@@ -301,9 +301,10 @@ fn map_issuer_key_row(r: &tokio_postgres::Row) -> IssuerKeyRow {
 
 /// Atomically debit credits from an account for credential issuance.
 ///
-/// Returns `Some(ledger_entry_id)` if the debit succeeded, `None` if
-/// the account has insufficient balance. The balance check and debit
-/// happen in a single SQL statement to prevent TOCTOU races.
+/// Credits are drawn from balance pools in FIFO order (earliest expiry
+/// first, permanent last) so each debit row inherits the pool's
+/// `expires_at`.  Returns `Some(first_ledger_entry_id)` if the debit
+/// succeeded, `None` if the account has insufficient balance.
 pub async fn insert_credential_issuance(
     pool: &Pool,
     account_id: Uuid,
@@ -316,18 +317,49 @@ pub async fn insert_credential_issuance(
         .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
 
     let row = client
-        .query_opt(
-            "INSERT INTO credit_ledger \
-                (id, account_id, delta, reason, credential_key_id, credential_credits, created_at) \
-             SELECT gen_random_uuid(), $1, -$2::bigint, 'credential_issuance', $3, $2::bigint, now() \
-             WHERE available_balance($1) >= $2::bigint \
-             RETURNING id",
+        .query_one(
+            "SELECT debit_account($1, $2, 'credential_issuance', NULL, $3, TRUE) AS ids",
             &[&account_id, &credits, &credential_key_id],
         )
         .await
         .map_err(|e| ServerError::Internal(format!("credential issuance debit failed: {e:?}")))?;
 
-    Ok(row.map(|r| r.get::<_, Uuid>("id")))
+    let ids: Option<Vec<Uuid>> = row.get("ids");
+    Ok(ids.and_then(|v| v.into_iter().next()))
+}
+
+/// Debit an account for a Stripe-originated event (refund or clawback).
+///
+/// Credits are drawn from balance pools in FIFO order (earliest expiry
+/// first, permanent last).  Any remainder beyond existing pools is placed
+/// in the permanent (NULL expiry) pool.  Returns `Ok(true)` if inserted,
+/// `Ok(false)` if the `stripe_event_id` was already processed (duplicate).
+pub async fn debit_stripe_event(
+    pool: &Pool,
+    account_id: Uuid,
+    amount: i64,
+    reason: &str,
+    stripe_event_id: &str,
+) -> Result<bool, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let row = client
+        .query_one(
+            "SELECT debit_account($1, $2, $3, $4, NULL, FALSE) AS ids",
+            &[&account_id, &amount, &reason, &stripe_event_id],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("debit_stripe_event failed: {e:?}")))?;
+
+    let ids: Option<Vec<Uuid>> = row.get("ids");
+    match ids {
+        None => Ok(true), // p_require_balance is FALSE, so NULL is never returned
+        Some(v) if v.is_empty() => Ok(false), // duplicate event
+        Some(_) => Ok(true),
+    }
 }
 
 /// Get the current available balance for an account.
