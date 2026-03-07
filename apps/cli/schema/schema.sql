@@ -44,7 +44,7 @@ CREATE TABLE credential (
     pre_credential_id   TEXT NOT NULL UNIQUE
                         REFERENCES pre_credential(id),
     issuer_key_id       TEXT NOT NULL
-                        REFERENCES issuer_key(key_id),
+                        REFERENCES issuer_key(id),
     data                BLOB NOT NULL,
     credits             INTEGER NOT NULL,
     generation          INTEGER NOT NULL DEFAULT 0,
