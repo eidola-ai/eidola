@@ -53,8 +53,7 @@ CREATE INDEX idx_account_stripe_customer ON account (stripe_customer_id)
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE issuer_key (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    key_hash        BYTEA NOT NULL,
+    id              TEXT PRIMARY KEY,
     private_key_enc BYTEA NOT NULL,
     public_key      BYTEA NOT NULL,
     domain_separator TEXT NOT NULL,
@@ -63,12 +62,10 @@ CREATE TABLE issuer_key (
     accept_until    TIMESTAMPTZ NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
+    CONSTRAINT id_is_key_hash CHECK (id = encode(digest(public_key, 'sha256'), 'hex')),
     CONSTRAINT issue_window CHECK (issue_from < issue_until),
     CONSTRAINT grace_window CHECK (issue_until <= accept_until)
 );
-
--- Unique index for client-facing key lookup by SHA-256(pkI).
-CREATE UNIQUE INDEX idx_issuer_key_hash ON issuer_key (key_hash);
 
 -- Non-unique index for efficient lookup by issuance period.
 CREATE INDEX idx_issuer_key_issue_from ON issuer_key (issue_from);
@@ -82,12 +79,8 @@ COMMENT ON TABLE issuer_key IS
     'serializable transactions in the application layer.';
 
 COMMENT ON COLUMN issuer_key.id IS
-    'Internal key identifier (UUID). Primary key and foreign key '
-    'target for the nullifier table.';
-
-COMMENT ON COLUMN issuer_key.key_hash IS
-    'SHA-256 hash of the serialized public key (32 bytes). This is the '
-    'client-facing issuer_key_id per the ACT Privacy Pass spec '
+    'Hex-encoded SHA-256 hash of the serialized public key (64 hex chars). '
+    'This is the issuer_key_id per the ACT Privacy Pass spec '
     '(draft-schlesinger-privacypass-act-01, Section 6). Clients use this '
     'to identify keys in Token structures and credential requests.';
 
@@ -138,7 +131,7 @@ CREATE TABLE credit_ledger (
     stripe_event_id TEXT UNIQUE,
     memo            TEXT,
     expires_at      TIMESTAMPTZ,
-    credential_key_id    UUID REFERENCES issuer_key(id),
+    credential_key_id    TEXT REFERENCES issuer_key(id),
     credential_credits   BIGINT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -246,7 +239,7 @@ CREATE INDEX idx_ledger_reason_created ON credit_ledger (reason, created_at);
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE nullifier (
-    issuer_key_id UUID NOT NULL REFERENCES issuer_key(id),
+    issuer_key_id TEXT NOT NULL REFERENCES issuer_key(id),
     value         BYTEA NOT NULL,
     recorded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (issuer_key_id, value)
@@ -304,7 +297,7 @@ CREATE FUNCTION debit_account(
     p_amount           BIGINT,
     p_reason           TEXT,
     p_stripe_event_id  TEXT    DEFAULT NULL,
-    p_credential_key_id UUID   DEFAULT NULL,
+    p_credential_key_id TEXT   DEFAULT NULL,
     p_require_balance  BOOLEAN DEFAULT TRUE
 ) RETURNS UUID[]
 LANGUAGE plpgsql
@@ -410,7 +403,7 @@ COMMENT ON FUNCTION debit_account IS
     'For refunds/clawbacks (p_require_balance = FALSE), any remainder '
     'beyond existing pools is placed in the permanent (NULL expiry) pool.';
 
-CREATE FUNCTION record_nullifier(p_issuer_key_id UUID, p_value BYTEA)
+CREATE FUNCTION record_nullifier(p_issuer_key_id TEXT, p_value BYTEA)
 RETURNS BOOLEAN
 LANGUAGE plpgsql
 AS $$

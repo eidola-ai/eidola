@@ -18,8 +18,6 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
-use uuid::Uuid;
-
 use crate::AppState;
 use crate::auth::BasicAuth;
 use crate::db;
@@ -34,7 +32,6 @@ use crate::helpers::{EpochConfig, system_time_to_iso_lossy};
 pub struct DecryptedIssuerKey {
     pub secret_key: PrivateKey,
     pub params: Params,
-    pub id: Uuid,
     pub key_hash: [u8; 32],
     pub request_context_scalar: Scalar,
     pub issue_from: SystemTime,
@@ -241,15 +238,11 @@ fn cache_key(
     master_key: &[u8; 32],
     row: &db::IssuerKeyRow,
 ) -> Result<[u8; 32], ServerError> {
-    let key_hash: [u8; 32] =
-        row.key_hash.as_slice().try_into().map_err(|_| {
-            ServerError::Internal("invalid key_hash length in database".to_string())
-        })?;
+    let key_hash = compute_key_hash(&row.public_key);
     if cache.contains_key(&key_hash) {
         return Ok(key_hash);
     }
-    let id_str = row.id.to_string();
-    let plaintext = decrypt_private_key(master_key, &id_str, &row.private_key_enc)?;
+    let plaintext = decrypt_private_key(master_key, &row.id, &row.private_key_enc)?;
     let secret_key = PrivateKey::from_cbor(&plaintext).map_err(|e| {
         ServerError::Internal(format!("failed to decode issuer private key: {}", e))
     })?;
@@ -261,7 +254,6 @@ fn cache_key(
         DecryptedIssuerKey {
             secret_key,
             params,
-            id: row.id,
             key_hash,
             request_context_scalar,
             issue_from: row.issue_from,
@@ -277,24 +269,21 @@ fn generate_key(
     issue_from: SystemTime,
     epoch_config: &EpochConfig,
 ) -> Result<db::IssuerKeyRow, ServerError> {
-    let key_id = Uuid::new_v4();
     let secret_key = PrivateKey::random(OsRng);
     let public_key_cbor = secret_key
         .public()
         .to_cbor()
         .map_err(|e| ServerError::Internal(format!("failed to encode public key: {}", e)))?;
-    let key_hash = compute_key_hash(&public_key_cbor);
+    let id = hex::encode(compute_key_hash(&public_key_cbor));
     let private_key_cbor = secret_key
         .to_cbor()
         .map_err(|e| ServerError::Internal(format!("failed to encode private key: {}", e)))?;
-    let id_str = key_id.to_string();
-    let encrypted = encrypt_private_key(master_key, &id_str, &private_key_cbor)?;
+    let encrypted = encrypt_private_key(master_key, &id, &private_key_cbor)?;
 
     let (issue_until, accept_until) = epoch_config.boundaries_from(issue_from);
 
     Ok(db::IssuerKeyRow {
-        id: key_id,
-        key_hash: key_hash.to_vec(),
+        id,
         private_key_enc: encrypted,
         public_key: public_key_cbor,
         domain_separator: domain_separator(),
@@ -542,7 +531,7 @@ pub async fn list_keys(
     let data: Vec<IssuerKeyResponse> = rows
         .into_iter()
         .map(|r| IssuerKeyResponse {
-            id: hex::encode(&r.key_hash),
+            id: r.id.clone(),
             public_key: URL_SAFE_NO_PAD.encode(&r.public_key),
             domain_separator: r.domain_separator,
             issue_from: system_time_to_iso_lossy(r.issue_from),
@@ -608,13 +597,7 @@ pub async fn issue_credentials(
     )
     .await?;
 
-    // Look up the UUID for the DB ledger entry (the cache has both).
-    let key_uuid = {
-        let cache = state.credential_key_cache.read().await;
-        cache.get(&key_hash).map(|k| k.id).ok_or_else(|| {
-            ServerError::Internal("current key evicted from cache unexpectedly".to_string())
-        })?
-    };
+    let key_id = hex::encode(key_hash);
 
     let issuance_response = {
         let cache = state.credential_key_cache.read().await;
@@ -642,7 +625,7 @@ pub async fn issue_credentials(
         .map_err(|e| ServerError::Internal(format!("failed to encode issuance response: {}", e)))?;
 
     let ledger_entry_id =
-        match db::insert_credential_issuance(&state.db_pool, account_id, request.credits, key_uuid)
+        match db::insert_credential_issuance(&state.db_pool, account_id, request.credits, &key_id)
             .await?
         {
             Some(id) => id,
@@ -668,7 +651,7 @@ pub async fn issue_credentials(
 
     Ok(Json(IssueCredentialsResponse {
         issuance_response: URL_SAFE_NO_PAD.encode(&response_cbor),
-        issuer_key_id: hex::encode(key_hash),
+        issuer_key_id: key_id,
         credits: request.credits,
         ledger_entry_id: ledger_entry_id.to_string(),
     }))
