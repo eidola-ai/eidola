@@ -182,6 +182,94 @@ pub async fn insert_credential(
     Ok(())
 }
 
+/// Insert a pre-credential record for a refund (spend checkpoint).
+pub async fn insert_pre_credential_refund(
+    conn: &Connection,
+    id: &str,
+    credential_nonce: &str,
+    issuer_key_id: &str,
+    data: &[u8],
+    spend_amount: i64,
+    created_at: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, created_at) \
+         VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6)",
+        (
+            Value::Text(id.to_string()),
+            Value::Text(credential_nonce.to_string()),
+            Value::Text(issuer_key_id.to_string()),
+            Value::Blob(data.to_vec()),
+            Value::Integer(spend_amount),
+            Value::Text(created_at.to_string()),
+        ),
+    )
+    .await
+    .map_err(|e| format!("failed to insert refund pre_credential: {e}"))?;
+    Ok(())
+}
+
+/// A spendable credential with associated key data.
+#[allow(dead_code)]
+pub struct SpendableCredential {
+    pub nonce: String,
+    pub issuer_key_id: String,
+    pub data: Vec<u8>,
+    pub credits: i64,
+    pub generation: i64,
+    pub public_key_data: Vec<u8>,
+}
+
+/// Find an active credential with at least `min_credits`, returning it with key data.
+pub async fn find_spendable_credential(
+    conn: &Connection,
+    min_credits: i64,
+) -> Result<Option<SpendableCredential>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.nonce, c.issuer_key_id, c.data, c.credits, c.generation, ik.public_key_data \
+             FROM credential_lifecycle cl \
+             JOIN credential c ON c.nonce = cl.nonce \
+             JOIN issuer_key ik ON ik.id = c.issuer_key_id \
+             WHERE cl.state = 'active' AND c.credits >= ?1 \
+             ORDER BY c.credits ASC \
+             LIMIT 1",
+        )
+        .await
+        .map_err(|e| format!("failed to prepare query: {e}"))?;
+    let mut rows = stmt
+        .query([min_credits])
+        .await
+        .map_err(|e| format!("failed to query credentials: {e}"))?;
+    match rows
+        .next()
+        .await
+        .map_err(|e| format!("failed to read row: {e}"))?
+    {
+        None => Ok(None),
+        Some(row) => Ok(Some(SpendableCredential {
+            nonce: row
+                .get::<String>(0)
+                .map_err(|e| format!("failed to read nonce: {e}"))?,
+            issuer_key_id: row
+                .get::<String>(1)
+                .map_err(|e| format!("failed to read issuer_key_id: {e}"))?,
+            data: row
+                .get::<Vec<u8>>(2)
+                .map_err(|e| format!("failed to read data: {e}"))?,
+            credits: row
+                .get::<i64>(3)
+                .map_err(|e| format!("failed to read credits: {e}"))?,
+            generation: row
+                .get::<i64>(4)
+                .map_err(|e| format!("failed to read generation: {e}"))?,
+            public_key_data: row
+                .get::<Vec<u8>>(5)
+                .map_err(|e| format!("failed to read public_key_data: {e}"))?,
+        })),
+    }
+}
+
 /// A row from the credential_lifecycle view.
 #[allow(dead_code)]
 pub struct CredentialRow {

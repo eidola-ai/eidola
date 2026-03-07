@@ -66,19 +66,29 @@ pub async fn list_models(
 
 /// Compute the worst-case cost in credits for a request.
 ///
-/// Uses `max_tokens` (or the model's context_length) multiplied by the
-/// higher of the prompt/completion per-token rates.
+/// Uses 1-byte-per-token estimate for prompt size plus `max_completion_tokens`
+/// (or context_length) for completion, each at their respective per-token rate.
 fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> u128 {
-    let max_tokens = request
-        .max_tokens
+    let sf = PRICING_SCALE_FACTOR as u128;
+
+    // Prompt: estimate 1 token per byte of message content.
+    let prompt_bytes: usize = request
+        .messages
+        .iter()
+        .map(|m| m.content.byte_len())
+        .sum();
+    let prompt_rate = model.pricing.per_prompt_token.value as u128;
+    let prompt_credits = (prompt_bytes as u128 * prompt_rate + sf - 1) / sf;
+
+    // Completion: use max_completion_tokens or fall back to context_length.
+    let max_completion = request
+        .max_completion_tokens
         .map(|t| t as u64)
         .unwrap_or(model.context_length);
-    let prompt_rate = model.pricing.per_prompt_token.value;
-    let completion_rate = model.pricing.per_completion_token.value;
-    let max_rate = prompt_rate.max(completion_rate) as u128;
-    let sf = PRICING_SCALE_FACTOR as u128;
-    // Ceiling division: (max_tokens * max_rate + sf - 1) / sf
-    (max_tokens as u128 * max_rate + sf - 1) / sf
+    let completion_rate = model.pricing.per_completion_token.value as u128;
+    let completion_credits = (max_completion as u128 * completion_rate + sf - 1) / sf;
+
+    prompt_credits + completion_credits
 }
 
 /// Compute the actual cost in credits from usage data.

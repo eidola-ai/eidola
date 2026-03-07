@@ -4,12 +4,16 @@ mod db;
 use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anonymous_credit_tokens::{IssuanceResponse, Params, PreIssuance, PublicKey, scalar_to_credit};
+use anonymous_credit_tokens::{
+    CreditToken, IssuanceResponse, Params, PreIssuance, PublicKey, Refund, credit_to_scalar,
+    scalar_to_credit,
+};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Parser, Subcommand};
 use rand_core::OsRng;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use config::Config;
@@ -37,6 +41,11 @@ enum Command {
     Wallet {
         #[command(subcommand)]
         command: WalletCommand,
+    },
+    /// Send a chat message
+    Chat {
+        /// The prompt to send
+        prompt: String,
     },
 }
 
@@ -170,8 +179,64 @@ struct IssueCredentialsResponse {
     ledger_entry_id: String,
 }
 
+#[derive(Deserialize)]
+struct ModelPricingInfo {
+    per_prompt_token: ScaledPriceInfo,
+    per_completion_token: ScaledPriceInfo,
+}
+
+#[derive(Deserialize)]
+struct ScaledPriceInfo {
+    value: u64,
+    scale_factor: u64,
+}
+
+#[derive(Deserialize)]
+struct ModelsResponseInfo {
+    data: Vec<ModelListEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelListEntry {
+    id: String,
+    context_length: u64,
+    pricing: ModelPricingInfo,
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("odd-length hex string".into());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("invalid hex: {e}")))
+        .collect()
+}
+
+/// ACT token type (draft-schlesinger-privacypass-act-01).
+const ACT_TOKEN_TYPE: u16 = 0xE5AD;
+const ISSUER_NAME: &str = "eidolons";
+const ORIGIN_INFO: &str = "inference";
+
+/// Serialize TokenChallenge per draft-schlesinger-privacypass-act-01 Section 7.
+fn serialize_token_challenge() -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+    buf.extend_from_slice(&(ISSUER_NAME.len() as u16).to_be_bytes());
+    buf.extend_from_slice(ISSUER_NAME.as_bytes());
+    buf.push(0); // redemption_context (empty)
+    buf.extend_from_slice(&(ORIGIN_INFO.len() as u16).to_be_bytes());
+    buf.extend_from_slice(ORIGIN_INFO.as_bytes());
+    buf.push(0); // credential_context (empty)
+    buf
+}
+
+fn compute_challenge_digest() -> [u8; 32] {
+    Sha256::digest(serialize_token_challenge()).into()
 }
 
 fn now_iso() -> String {
@@ -274,6 +339,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 CredentialsCommand::List => cmd_wallet_credentials_list().await,
             },
         },
+        Some(Command::Chat { prompt }) => cmd_chat(&prompt).await,
     }
 }
 
@@ -666,6 +732,195 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
     println!("credential allocated: {nonce_hex}");
     println!("credits: {}", issued.credits);
     println!("issuer_key_id: {}", issued.issuer_key_id);
+    Ok(())
+}
+
+async fn cmd_chat(prompt: &str) -> Result<(), String> {
+    let config = Config::load();
+    let base_url = require_base_url(&config)?;
+    let client = reqwest::Client::new();
+    let model_id = "phala/qwen3-vl-30b-a3b-instruct";
+
+    // 1. Fetch model info for pricing
+    let resp = client
+        .get(format!("{base_url}/v1/models"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("failed to fetch models: {status}: {body}"));
+    }
+    let models: ModelsResponseInfo = resp
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse models response: {e}"))?;
+    let model = models
+        .data
+        .iter()
+        .find(|m| m.id == model_id)
+        .ok_or_else(|| format!("model not found: {model_id}"))?;
+
+    // 2. Estimate max_completion_tokens: cap at 4096
+    let max_completion_tokens = (model.context_length).min(4096) as u32;
+
+    // 3. Calculate worst-case cost (mirrors server logic):
+    //    prompt_bytes * prompt_rate + max_completion_tokens * completion_rate
+    let sf = model.pricing.per_prompt_token.scale_factor as u128;
+    let prompt_bytes = prompt.len() as u128;
+    let prompt_rate = model.pricing.per_prompt_token.value as u128;
+    let prompt_credits = (prompt_bytes * prompt_rate + sf - 1) / sf;
+    let completion_rate = model.pricing.per_completion_token.value as u128;
+    let completion_credits = (max_completion_tokens as u128 * completion_rate + sf - 1) / sf;
+    let charge_credits = prompt_credits + completion_credits;
+
+    if charge_credits == 0 {
+        return Err("computed charge is zero — model pricing may be missing".into());
+    }
+
+    // 4. Open DB and find a credential with enough credits
+    let database = db::open().await?;
+    let conn = database
+        .connect()
+        .map_err(|e| format!("failed to connect: {e}"))?;
+
+    let cred = db::find_spendable_credential(&conn, charge_credits as i64)
+        .await?
+        .ok_or("no credential with sufficient credits found")?;
+
+    // 5. Load credential and key data
+    let credit_token = CreditToken::from_cbor(&cred.data)
+        .map_err(|e| format!("failed to decode credential: {e}"))?;
+    let public_key = PublicKey::from_cbor(&cred.public_key_data)
+        .map_err(|e| format!("failed to decode public key: {e}"))?;
+
+    let ds = config.domain_separator();
+    let ds_parts: Vec<&str> = ds.split(':').collect();
+    assert_eq!(ds_parts.len(), 5, "domain separator has wrong format");
+    let params = Params::new(ds_parts[1], ds_parts[2], ds_parts[3], ds_parts[4]);
+
+    // 6. Create spend proof
+    let charge_scalar = credit_to_scalar::<128>(charge_credits)
+        .map_err(|e| format!("invalid charge amount: {e:?}"))?;
+    let (spend_proof, pre_refund) = credit_token
+        .prove_spend::<128>(&params, charge_scalar, OsRng)
+        .map_err(|e| format!("failed to create spend proof: {e:?}"))?;
+
+    // 7. Checkpoint PreRefund in database (crash-safe)
+    let pre_refund_cbor = pre_refund
+        .to_cbor()
+        .map_err(|e| format!("failed to encode pre_refund: {e}"))?;
+    let spend_proof_cbor = spend_proof
+        .to_cbor()
+        .map_err(|e| format!("failed to encode spend proof: {e}"))?;
+    let pre_cred_id = Uuid::now_v7().to_string();
+    let now = now_iso();
+    db::insert_pre_credential_refund(
+        &conn,
+        &pre_cred_id,
+        &cred.nonce,
+        &cred.issuer_key_id,
+        &pre_refund_cbor,
+        charge_credits as i64,
+        &now,
+    )
+    .await?;
+
+    // 8. Build ACT wire token: token_type || challenge_digest || issuer_key_id || spend_proof_cbor
+    let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
+    let challenge_digest = compute_challenge_digest();
+
+    let mut token_bytes = Vec::new();
+    token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+    token_bytes.extend_from_slice(&challenge_digest);
+    token_bytes.extend_from_slice(&issuer_key_hash);
+    token_bytes.extend_from_slice(&spend_proof_cbor);
+
+    let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
+    let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+
+    // 9. Send chat completion request
+    let resp = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .header("Authorization", &auth_value)
+        .json(&serde_json::json!({
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_completion_tokens": max_completion_tokens,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse response: {e}"))?;
+
+    // 10. Extract and process refund if present
+    if let Some(refund_obj) = body.get("refund") {
+        let refund_b64 = refund_obj
+            .get("refund")
+            .and_then(|v| v.as_str())
+            .ok_or("missing refund data in response")?;
+        let refund_key_id = refund_obj
+            .get("issuer_key_id")
+            .and_then(|v| v.as_str())
+            .ok_or("missing issuer_key_id in refund")?;
+
+        let refund_cbor = URL_SAFE_NO_PAD
+            .decode(refund_b64)
+            .map_err(|e| format!("invalid refund base64: {e}"))?;
+        let refund = Refund::from_cbor(&refund_cbor)
+            .map_err(|e| format!("invalid refund CBOR: {e}"))?;
+
+        let new_token = pre_refund
+            .to_credit_token::<128>(&params, &spend_proof, &refund, &public_key)
+            .map_err(|e| format!("failed to construct refund credit token: {e:?}"))?;
+
+        let new_token_cbor = new_token
+            .to_cbor()
+            .map_err(|e| format!("failed to encode new credit token: {e}"))?;
+        let new_nonce = hex_encode(&new_token.nullifier().to_bytes());
+        let new_credits = scalar_to_credit::<128>(&new_token.credits())
+            .map_err(|e| format!("invalid credit amount in refund token: {e}"))?;
+
+        db::insert_credential(
+            &conn,
+            &new_nonce,
+            &pre_cred_id,
+            refund_key_id,
+            &new_token_cbor,
+            new_credits as i64,
+            cred.generation + 1,
+            &now,
+        )
+        .await?;
+    }
+
+    if !status.is_success() {
+        let error_msg = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("server returned {status}: {error_msg}"));
+    }
+
+    // 11. Print response content
+    if let Some(choices) = body.get("choices").and_then(|c| c.as_array()) {
+        if let Some(content) = choices
+            .first()
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+        {
+            println!("{content}");
+        }
+    }
+
     Ok(())
 }
 

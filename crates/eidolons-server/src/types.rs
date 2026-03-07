@@ -17,9 +17,9 @@ pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation.
     pub messages: Vec<Message>,
 
-    /// The maximum number of tokens to generate.
+    /// The maximum number of completion tokens to generate.
     #[serde(default)]
-    pub max_tokens: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
 
     /// Sampling temperature between 0 and 2.
     #[serde(default)]
@@ -99,6 +99,20 @@ impl MessageContent {
                     _ => None,
                 })
             }
+        }
+    }
+
+    /// Total byte length of all text content (for token estimation).
+    pub fn byte_len(&self) -> usize {
+        match self {
+            MessageContent::Text(s) => s.len(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .map(|p| match p {
+                    ContentPart::Text { text } => text.len(),
+                    ContentPart::ImageUrl { .. } => 0,
+                })
+                .sum(),
         }
     }
 }
@@ -371,7 +385,7 @@ mod tests {
                 {"role": "system", "content": "You are helpful."},
                 {"role": "user", "content": "Hi"}
             ],
-            "max_tokens": 100,
+            "max_completion_tokens": 100,
             "temperature": 0.7,
             "top_p": 0.9,
             "stream": true,
@@ -380,7 +394,7 @@ mod tests {
 
         let request: ChatCompletionRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(request.max_tokens, Some(100));
+        assert_eq!(request.max_completion_tokens, Some(100));
         assert_eq!(request.temperature, Some(0.7));
         assert_eq!(request.top_p, Some(0.9));
         assert!(request.stream);

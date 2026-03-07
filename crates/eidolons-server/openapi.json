@@ -774,13 +774,13 @@
           "messages"
         ],
         "properties": {
-          "max_tokens": {
+          "max_completion_tokens": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int32",
-            "description": "The maximum number of tokens to generate.",
+            "description": "The maximum number of completion tokens to generate.",
             "minimum": 0
           },
           "messages": {
@@ -1320,7 +1320,7 @@
           },
           "issuer_key_id": {
             "type": "string",
-            "description": "Issuer key identifier (UUID)."
+            "description": "Issuer key identifier: hex-encoded SHA-256(pkI_serialized)."
           },
           "ledger_entry_id": {
             "type": "string",
