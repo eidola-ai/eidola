@@ -326,11 +326,11 @@ async fn handle_non_streaming_request(
         Ok(info) => Some(info),
         Err(e) => {
             error!("CRITICAL: failed to issue refund: {}", e);
-            // Try to issue a full refund as fallback
-            match issue_refund_async(state, &act.spend_proof, &act.issuer_key_hash, charge_credits).await {
+            // We were charged, so fall back to refunding 0 (blind remaining value).
+            match issue_refund_async(state, &act.spend_proof, &act.issuer_key_hash, 0).await {
                 Ok(info) => Some(info),
                 Err(e2) => {
-                    error!("CRITICAL: failed to issue fallback full refund: {}", e2);
+                    error!("CRITICAL: failed to issue fallback zero refund: {}", e2);
                     None
                 }
             }
@@ -377,9 +377,10 @@ async fn handle_streaming_request(
     let mut upstream_rx = match state.backend.send_stream(request).await {
         Ok(rx) => rx,
         Err(e) => {
+            // Known error — upstream didn't process any tokens. Full refund.
             warn!("Stream start error, issuing full refund: {}", e);
-            let _ = issue_refund_async(&state, &act.spend_proof, &act.issuer_key_hash, charge_credits).await;
-            return Err(e);
+            let refund = issue_refund_async(&state, &act.spend_proof, &act.issuer_key_hash, charge_credits).await;
+            return Ok(error_response_with_refund(&e, refund.ok()));
         }
     };
 
@@ -388,13 +389,64 @@ async fn handle_streaming_request(
     // Clone/copy values for the spawned task.
     let issuer_key_hash = act.issuer_key_hash;
     // We need to serialize the spend proof for the spawned task.
-    let spend_proof_cbor = act
-        .spend_proof
-        .to_cbor()
-        .map_err(|e| ServerError::Internal(format!("spend proof re-encode failed: {e:?}")))?;
+    let spend_proof_cbor = match act.spend_proof.to_cbor() {
+        Ok(cbor) => cbor,
+        Err(e) => {
+            // Can't serialize spend proof for the spawned task — issue full refund now.
+            error!("spend proof re-encode failed: {e:?}");
+            let refund = issue_refund_async(&state, &act.spend_proof, &act.issuer_key_hash, charge_credits).await;
+            let err = ServerError::Internal(format!("spend proof re-encode failed: {e:?}"));
+            return Ok(error_response_with_refund(&err, refund.ok()));
+        }
+    };
     let model_pricing = model.pricing.clone();
 
     tokio::spawn(async move {
+        /// Re-parse the spend proof and issue a refund with the given amount.
+        /// Returns None only if the cryptographic operations themselves fail.
+        async fn try_refund(
+            state: &AppState,
+            spend_proof_cbor: &[u8],
+            issuer_key_hash: &[u8; 32],
+            refund_credits: u128,
+        ) -> Option<RefundInfo> {
+            let proof = match SpendProof::<128>::from_cbor(spend_proof_cbor) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("CRITICAL: failed to re-parse spend proof for refund: {e:?}");
+                    return None;
+                }
+            };
+            match issue_refund_async(state, &proof, issuer_key_hash, refund_credits).await {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    error!("CRITICAL: failed to issue refund ({} credits): {}", refund_credits, e);
+                    None
+                }
+            }
+        }
+
+        /// Send a metadata SSE event containing a refund, then [DONE].
+        async fn send_metadata_event(
+            tx: &mpsc::Sender<Result<Event, Infallible>>,
+            refund_info: Option<RefundInfo>,
+            privacy: crate::response::PrivacyMetadata,
+            verification: crate::response::VerificationMetadata,
+            chat_id: String,
+        ) {
+            let stream_meta = EidolonsStreamMetadata::new(
+                chat_id,
+                privacy,
+                verification,
+                refund_info,
+            );
+            let json_str = serde_json::to_string(&stream_meta).unwrap();
+            let event = Event::default().data(json_str);
+            let _ = tx.send(Ok(event)).await;
+            let done_event = Event::default().data("[DONE]");
+            let _ = tx.send(Ok(done_event)).await;
+        }
+
         let mut final_usage: Option<Usage> = None;
 
         while let Some(event_result) = upstream_rx.recv().await {
@@ -407,7 +459,13 @@ async fn handle_streaming_request(
                     let json_str = serde_json::to_string(&chunk).unwrap();
                     let event = Event::default().data(json_str);
                     if tx.send(Ok(event)).await.is_err() {
-                        return; // Client disconnected
+                        // Client disconnected — we were likely billed for tokens
+                        // already streamed but don't know how much. Refund 0
+                        // (returns blind remaining value c - s). The client can't
+                        // receive this, but we issue it for consistency.
+                        warn!("Client disconnected mid-stream, issuing zero refund");
+                        let _ = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
+                        return;
                     }
                 }
                 Ok(BackendStreamEvent::Done(meta)) => {
@@ -445,64 +503,37 @@ async fn handle_streaming_request(
                     }).unwrap_or(charge_credits);
 
                     let refund_credits = charge_credits.saturating_sub(cost);
+                    let refund_info = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, refund_credits).await;
 
-                    // Re-parse the spend proof for refund issuance.
-                    let refund_info = match SpendProof::<128>::from_cbor(&spend_proof_cbor) {
-                        Ok(proof) => {
-                            match issue_refund_async(&state, &proof, &issuer_key_hash, refund_credits).await {
-                                Ok(info) => Some(info),
-                                Err(e) => {
-                                    error!("CRITICAL: failed to issue streaming refund: {}", e);
-                                    // Try full refund
-                                    issue_refund_async(&state, &proof, &issuer_key_hash, charge_credits).await.ok()
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("CRITICAL: failed to re-parse spend proof for refund: {e:?}");
-                            None
-                        }
-                    };
-
-                    let stream_meta = EidolonsStreamMetadata::new(
-                        meta.chat_id.unwrap_or_default(),
+                    send_metadata_event(
+                        &tx,
+                        refund_info,
                         privacy,
                         verification,
-                        refund_info,
-                    );
-
-                    // Send metadata event
-                    let json_str = serde_json::to_string(&stream_meta).unwrap();
-                    let event = Event::default().data(json_str);
-                    let _ = tx.send(Ok(event)).await;
-
-                    // Send [DONE]
-                    let done_event = Event::default().data("[DONE]");
-                    let _ = tx.send(Ok(done_event)).await;
+                        meta.chat_id.unwrap_or_default(),
+                    ).await;
                     return;
                 }
                 Err(e) => {
-                    error!("Stream error, issuing full refund: {}", e);
-                    // Try to issue full refund and send it as a metadata event.
-                    if let Ok(proof) = SpendProof::<128>::from_cbor(&spend_proof_cbor) {
-                        if let Ok(refund_info) = issue_refund_async(&state, &proof, &issuer_key_hash, charge_credits).await {
-                            let error_meta = EidolonsStreamMetadata::new(
-                                String::new(),
-                                build_privacy_metadata(&auth_context, false, "redpill"),
-                                build_verification_metadata(None),
-                                Some(refund_info),
-                            );
-                            let json_str = serde_json::to_string(&error_meta).unwrap();
-                            let event = Event::default().data(json_str);
-                            let _ = tx.send(Ok(event)).await;
-                            let done_event = Event::default().data("[DONE]");
-                            let _ = tx.send(Ok(done_event)).await;
-                        }
-                    }
+                    // Some chunks may have been delivered and billed; we don't
+                    // know the actual cost. Refund 0 (blind remaining value).
+                    error!("Stream error, issuing zero refund: {}", e);
+                    let refund_info = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
+                    let privacy = build_privacy_metadata(&auth_context, false, "redpill");
+                    let verification = build_verification_metadata(None);
+                    send_metadata_event(&tx, refund_info, privacy, verification, String::new()).await;
                     return;
                 }
             }
         }
+
+        // upstream_rx closed without a Done event (unexpected). Chunks may
+        // have been delivered and billed; we don't know the cost. Refund 0.
+        warn!("Upstream channel closed without Done event, issuing zero refund");
+        let refund_info = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
+        let privacy = build_privacy_metadata(&auth_context, false, "redpill");
+        let verification = build_verification_metadata(None);
+        send_metadata_event(&tx, refund_info, privacy, verification, String::new()).await;
     });
 
     let stream = ReceiverStream::new(rx);
