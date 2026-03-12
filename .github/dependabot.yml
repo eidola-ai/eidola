@@ -39,6 +39,16 @@ updates:
     schedule:
       interval: "weekly"
 
+  - package-ecosystem: "docker"
+    directory: "/docker/simulator"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "stripe-cli"
+    directory: "/docker/postgresql"
+    schedule:
+      interval: "weekly"
+
   # Maintain dependencies for Swift Package Manager.
   - package-ecosystem: "swift"
     directory: "/core/swift"
