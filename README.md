@@ -19,8 +19,8 @@ just dev
 To iterate more quickly while building locally:
 
 ```bash
-# Start postgres for local development
-just db
+# Start backing services (postgres + simulator)
+just services
 
 # Set environment variables
 set -a; source .env; set +a

@@ -46,13 +46,20 @@ target "postgres" {
 
 # dstack simulator — local dev only, never pushed to a registry.
 # Built from source because the upstream Docker image (phalanetwork/tappd-simulator)
-# is stale. Pinned to linux/amd64; runs under Rosetta on Apple Silicon.
-# Requires Docker Desktop's "Use Rosetta for x86_64/amd64 emulation" setting.
+# is stale. Platform is omitted so it builds natively (no Rosetta needed).
 target "simulator" {
   context    = "."
   dockerfile = "docker/simulator/Containerfile"
-  platforms  = ["linux/amd64"]
   tags       = ["dstack-simulator:dev"]
+  attest     = []
+}
+
+# Stripe CLI — pins the upstream image by digest so dependabot can propose
+# updates via the Containerfile, rather than silently pulling :latest.
+target "stripe-cli" {
+  context    = "."
+  dockerfile = "docker/stripe-cli/Containerfile"
+  tags       = ["stripe-cli:dev"]
   attest     = []
 }
 

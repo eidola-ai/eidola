@@ -41,7 +41,7 @@ The credential master key (AES-256, used to encrypt issuer private keys at rest 
 
 In local dev (both containerised and host-side), the server connects to the simulator over HTTP via `DSTACK_SIMULATOR_ENDPOINT=http://simulator:8090` (set in `compose.yaml`) or `http://localhost:8090` (set in `.env` for `cargo run`). In production, the SDK auto-discovers the CVM-provided socket at `/var/run/dstack/dstack.sock`.
 
-**dstack simulator:** Built from source (`docker/simulator/`) because the upstream Docker image is stale. A custom `dstack.toml` binds the internal RPC endpoint (GetKey, GetQuote, etc.) to TCP :8090 — the upstream default only uses Unix sockets. The image is `linux/amd64` and requires Docker Desktop's Apple Virtualization framework with Rosetta (not Docker VMM) on Apple Silicon. First build takes ~10 min; subsequent builds use the cargo cache layer.
+**dstack simulator:** Built from source (`docker/simulator/`) because the upstream Docker image is stale. A custom `dstack.toml` binds the internal RPC endpoint (GetKey, GetQuote, etc.) to TCP :8090 — the upstream default only uses Unix sockets. Builds natively for the host platform (no cross-compilation). First build takes ~10 min; subsequent builds use the cargo cache layer.
 
 **Compose files:**
 - `compose.yaml` — local development: simulator + postgres + server + stripe-cli

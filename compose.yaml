@@ -52,7 +52,10 @@ services:
         condition: service_healthy
 
   stripe-cli:
-    image: stripe/stripe-cli:latest
+    image: stripe-cli:dev
+    build:
+      context: .
+      dockerfile: docker/stripe-cli/Containerfile
     profiles: ["test"]
     environment:
       STRIPE_API_KEY: ${STRIPE_API_KEY}

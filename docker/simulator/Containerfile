@@ -6,7 +6,6 @@
 #
 # This builds the simulator fresh from the dstack repository. It's only used
 # for local development — never pushed to a registry.
-# Pinned to linux/amd64; runs under Rosetta on Apple Silicon.
 
 ARG DSTACK_REF=master
 

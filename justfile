@@ -10,8 +10,8 @@ default:
 dev:
     ./scripts/dev.sh
 
-# Start just postgres + simulator (for running the server on the host with cargo)
-db:
+# Start backing services (postgres + simulator) for running the server on the host with cargo
+services:
     docker buildx bake postgres simulator
     docker compose up -d --no-build postgres simulator
 
@@ -36,7 +36,7 @@ check:
 test:
     cargo test
 
-# Run integration tests (requires: just db && just db-reset)
+# Run integration tests (requires: just services && just services-reset)
 test-integration:
     DATABASE_URL="${DATABASE_URL:-postgres://eidolons@localhost/eidolons}" DSTACK_SIMULATOR_ENDPOINT="${DSTACK_SIMULATOR_ENDPOINT:-http://localhost:8090}" cargo test -p eidolons-server -- --ignored
 
