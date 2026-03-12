@@ -30,9 +30,10 @@ services:
       REDPILL_API_KEY: ${REDPILL_API_KEY}
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
-      BIND_ADDR: 0.0.0.0:8080
+      BIND_ADDR: 0.0.0.0:443
+      TLS_SANS: ${TLS_SANS:-}
     ports:
-      - "8080:8080"
+      - "443:443"
     volumes:
       # dstack CVM runtime mounts the real socket here.
       - /var/run/dstack:/var/run/dstack:ro

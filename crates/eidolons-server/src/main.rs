@@ -5,10 +5,14 @@
 //! with inline privacy metadata and cryptographic verification.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::http::StatusCode;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::net::TcpListener;
-use tracing::{error, info, warn};
+use tower_service::Service;
+use tracing::{debug, error, info, warn};
 
 use dstack_sdk::dstack_client::DstackClient;
 
@@ -18,6 +22,7 @@ use eidolons_server::backend::RedPillBackend;
 use eidolons_server::credentials;
 use eidolons_server::helpers::EpochConfig;
 use eidolons_server::stripe::StripeClient;
+use eidolons_server::tls;
 
 /// Server configuration.
 struct Config {
@@ -29,12 +34,14 @@ struct Config {
     stripe_webhook_secret: Option<String>,
     credential_master_key: [u8; 32],
     pricing_markup: Option<f64>,
+    dstack: DstackClient,
+    tls_sans: Vec<String>,
 }
 
 impl Config {
     async fn load() -> Result<Self, String> {
         let bind_addr = std::env::var("BIND_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+            .unwrap_or_else(|_| "127.0.0.1:8443".to_string())
             .parse()
             .map_err(|e| format!("invalid BIND_ADDR: {}", e))?;
 
@@ -62,6 +69,8 @@ impl Config {
                     .map_err(|_| "PRICING_MARKUP must be a valid number".to_string())
             })
             .transpose()?;
+
+        let tls_sans = tls::parse_sans();
 
         // Derive the credential master key from dstack KMS.
         // The SDK auto-discovers the socket at /var/run/dstack/dstack.sock (containers
@@ -94,6 +103,8 @@ impl Config {
             stripe_webhook_secret,
             credential_master_key,
             pricing_markup,
+            dstack,
+            tls_sans,
         })
     }
 }
@@ -191,12 +202,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
     );
 
-    // Bind and serve
-    let listener = TcpListener::bind(config.bind_addr).await?;
-    info!("Listening on http://{}", config.bind_addr);
-    axum::serve(listener, app).await?;
+    // Fetch initial RA-TLS certificate from dstack (fatal on failure).
+    info!("Fetching RA-TLS certificate from dstack...");
+    let initial_cert = tls::fetch_ra_tls_cert(&config.dstack, &config.tls_sans)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch RA-TLS certificate: {e}");
+            e
+        })?;
+    info!("RA-TLS certificate obtained");
 
-    Ok(())
+    let resolver = tls::RaTlsCertResolver::new(initial_cert);
+    let tls_acceptor = tls::build_tls_acceptor(Arc::clone(&resolver));
+
+    // Spawn background cert rotation (attestation quotes expire).
+    tls::spawn_cert_rotation_task(Arc::clone(&resolver), config.dstack, config.tls_sans);
+
+    // Bind and serve with RA-TLS.
+    let listener = TcpListener::bind(config.bind_addr).await?;
+    info!("Listening on https://{}", config.bind_addr);
+
+    loop {
+        let (tcp_stream, remote_addr) = listener.accept().await?;
+        let tls_acceptor = tls_acceptor.clone();
+        let app = app.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("TLS handshake failed from {remote_addr}: {e}");
+                    return;
+                }
+            };
+
+            let io = TokioIo::new(tls_stream);
+            let service = hyper::service::service_fn(move |req| {
+                let mut app = app.clone();
+                async move { app.call(req).await }
+            });
+
+            if let Err(e) = AutoBuilder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await
+            {
+                debug!("Connection error from {remote_addr}: {e}");
+            }
+        });
+    }
 }
 
 #[cfg(test)]

@@ -2032,6 +2032,8 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anonymous-credit-tokens",
+ "anyhow",
+ "arc-swap",
  "argon2",
  "axum",
  "base64",
@@ -2042,9 +2044,12 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "hyper",
+ "hyper-util",
  "rand_core 0.6.4",
  "reqwest",
  "rustls",
+ "rustls-pemfile",
  "rustls-rustcrypto",
  "serde",
  "serde_json",
@@ -2052,7 +2057,9 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "tokio-stream",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "utoipa",
@@ -2599,6 +2606,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap 2.13.0",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2815,6 +2841,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -4226,7 +4253,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.3",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4657,6 +4684,15 @@ dependencies = [
  "rustls-webpki 0.103.9",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

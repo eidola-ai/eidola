@@ -19,6 +19,7 @@ pub mod handlers;
 pub mod helpers;
 pub mod response;
 pub mod stripe;
+pub mod tls;
 pub mod types;
 pub mod webhook;
 

@@ -18,7 +18,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 
 **Key design decisions:**
 - Axum-based HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration
-- Pure Rust TLS via `rustls-rustcrypto` (no C dependencies)
+- RA-TLS termination via `rustls-rustcrypto` + `tokio-rustls` (no C dependencies); attestation-bearing certs from dstack
 - Statically linked musl binaries for Linux deployment
 - StageX-based OCI images (reproducible, `FROM scratch`, runs as non-root)
 - Request-based (no sessions/caching in the proxy layer)
@@ -30,14 +30,17 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 **Environment variables:**
 - `REDPILL_API_KEY` (required) - RedPill API key
 - `DATABASE_URL` (required) - PostgreSQL connection string
-- `BIND_ADDR` (default: `127.0.0.1:8080`) - Address to bind
+- `BIND_ADDR` (default: `127.0.0.1:8443`) - Address to bind (HTTPS)
 - `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
 - `STRIPE_WEBHOOK_SECRET` (optional) - Stripe webhook signing secret; webhook endpoint returns 503 without it
 - `DSTACK_SIMULATOR_ENDPOINT` (optional) - dstack simulator HTTP endpoint (e.g. `http://localhost:8090`) for host-side dev on macOS; omit in containers and production where the SDK auto-discovers the Unix socket
+- `TLS_SANS` (optional) - Comma-separated TLS Subject Alternative Names (default: `localhost,server`); set to the CVM's DNS name or IP in production
 
 **dstack / TEE integration:**
 
 The credential master key (AES-256, used to encrypt issuer private keys at rest in Postgres) is derived deterministically from the dstack KMS via `get_key("eidolons/credential-master-key/v1")` using the `dstack-sdk` crate directly. It is never configured manually — the dstack guest agent (real TEE) or simulator (local dev) provides it. The key is bound to the application's `app_id`, which persists across upgrades, so encrypted issuer keys in the database remain accessible after redeployment.
+
+The server performs its own TLS termination using RA-TLS (Remote Attestation TLS). On startup it calls `get_tls_key()` with `usage_ra_tls: true` to obtain a private key and certificate chain from the dstack guest agent. The certificate embeds an attestation quote in an X.509 extension, allowing clients to cryptographically verify they are communicating with code running inside a TEE. Certificates are regenerated every ~12 hours (with jitter) via a background task, since attestation quotes expire. Each server instance independently obtains its own RA-TLS certificate — no cross-instance coordination is needed. The cert resolver uses lock-free `ArcSwap` for zero-contention hot-swapping on the TLS handshake path.
 
 In local dev (both containerised and host-side), the server connects to the simulator over HTTP via `DSTACK_SIMULATOR_ENDPOINT=http://simulator:8090` (set in `compose.yaml`) or `http://localhost:8090` (set in `.env` for `cargo run`). In production, the SDK auto-discovers the CVM-provided socket at `/var/run/dstack/dstack.sock`.
 
