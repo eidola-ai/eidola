@@ -1,0 +1,44 @@
+# Build the dstack simulator from source.
+#
+# The upstream Docker image (phalanetwork/tappd-simulator) is stale. The binary
+# was renamed from tappd-simulator to dstack-simulator (symlink to
+# dstack-guest-agent) in the dstack repo, but no new image was published.
+#
+# This builds the simulator fresh from the dstack repository. It's only used
+# for local development — never pushed to a registry.
+# Pinned to linux/amd64; runs under Rosetta on Apple Silicon.
+
+ARG DSTACK_REF=master
+
+FROM rust:1-slim-trixie AS build
+ARG DSTACK_REF
+
+RUN apt-get update && apt-get install -y --no-install-recommends git pkg-config && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch "${DSTACK_REF}" \
+    https://github.com/Dstack-TEE/dstack.git /src
+
+WORKDIR /src
+RUN cargo build --release -p dstack-guest-agent
+
+FROM debian:trixie-slim
+
+# curl is used by the compose healthcheck.
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/target/release/dstack-guest-agent /usr/local/bin/dstack-simulator
+
+# Copy the simulator's default fixtures.
+COPY --from=build /src/sdk/simulator/app-compose.json /opt/simulator/
+COPY --from=build /src/sdk/simulator/appkeys.json /opt/simulator/
+COPY --from=build /src/sdk/simulator/attestation.bin /opt/simulator/
+COPY --from=build /src/sdk/simulator/sys-config.json /opt/simulator/
+
+# Our dstack.toml overrides the upstream default to bind the internal RPC
+# endpoint (GetKey, GetQuote, etc.) to TCP :8090 instead of a Unix socket.
+COPY docker/simulator/dstack.toml /opt/simulator/
+
+WORKDIR /opt/simulator
+EXPOSE 8090
+
+ENTRYPOINT ["dstack-simulator"]

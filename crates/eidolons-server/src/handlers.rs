@@ -157,9 +157,7 @@ async fn authorize_spend(
     act: &ActSpend,
     request: &ChatCompletionRequest,
 ) -> Result<(Model, u128), ServerError> {
-    let master_key = state.credential_master_key.as_ref().ok_or_else(|| {
-        ServerError::ServiceUnavailable("credential verification is not configured".to_string())
-    })?;
+    let master_key = &state.credential_master_key;
 
     // Verify the challenge_digest matches our expected TokenChallenge.
     let expected_digest = credentials::compute_challenge_digest();

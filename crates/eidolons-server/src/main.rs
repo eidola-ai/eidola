@@ -10,6 +10,8 @@ use axum::http::StatusCode;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
+use dstack_sdk::dstack_client::DstackClient;
+
 use eidolons_server::AppState;
 use eidolons_server::attestation::AttestationClient;
 use eidolons_server::backend::RedPillBackend;
@@ -25,12 +27,12 @@ struct Config {
     database_url: String,
     stripe_api_key: Option<String>,
     stripe_webhook_secret: Option<String>,
-    credential_master_key: Option<[u8; 32]>,
+    credential_master_key: [u8; 32],
     pricing_markup: Option<f64>,
 }
 
 impl Config {
-    fn from_env() -> Result<Self, String> {
+    async fn load() -> Result<Self, String> {
         let bind_addr = std::env::var("BIND_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
             .parse()
@@ -52,23 +54,6 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
-        let credential_master_key = std::env::var("CREDENTIAL_MASTER_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                let bytes = hex::decode(&s)
-                    .map_err(|_| "CREDENTIAL_MASTER_KEY must be valid hex".to_string())?;
-                if bytes.len() != 32 {
-                    return Err(
-                        "CREDENTIAL_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string(),
-                    );
-                }
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&bytes);
-                Ok(key)
-            })
-            .transpose()?;
-
         let pricing_markup = std::env::var("PRICING_MARKUP")
             .ok()
             .filter(|s| !s.is_empty())
@@ -77,6 +62,28 @@ impl Config {
                     .map_err(|_| "PRICING_MARKUP must be a valid number".to_string())
             })
             .transpose()?;
+
+        // Derive the credential master key from dstack KMS.
+        // The SDK auto-discovers the socket at /var/run/dstack/dstack.sock (containers
+        // and production). For host-side dev on macOS, DSTACK_SIMULATOR_ENDPOINT can
+        // point at the simulator's HTTP port (e.g. http://localhost:8090).
+        let dstack = DstackClient::new(
+            std::env::var("DSTACK_SIMULATOR_ENDPOINT")
+                .ok()
+                .as_deref(),
+        );
+        info!("Deriving credential master key from dstack...");
+        let key_response = dstack
+            .get_key(Some("eidolons/credential-master-key/v1".to_string()), None)
+            .await
+            .map_err(|e| format!("failed to derive credential master key: {e}"))?;
+        let key_bytes = hex::decode(&key_response.key)
+            .map_err(|e| format!("invalid hex in dstack key: {e}"))?;
+        let credential_master_key: [u8; 32] = key_bytes
+            .get(..32)
+            .and_then(|s| <[u8; 32]>::try_from(s).ok())
+            .ok_or("dstack key too short (need >= 32 bytes)")?;
+        info!("Credential master key derived successfully");
 
         Ok(Config {
             bind_addr,
@@ -106,8 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    // Load configuration
-    let config = Config::from_env().map_err(|e| {
+    // Load configuration (includes dstack key derivation)
+    let config = Config::load().await.map_err(|e| {
         error!("Configuration error: {}", e);
         e
     })?;
@@ -132,9 +139,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Credential key cache and epoch configuration
     let credential_key_cache: credentials::KeyCache = Default::default();
     let epoch_config = EpochConfig::default();
-    if config.credential_master_key.is_none() {
-        warn!("CREDENTIAL_MASTER_KEY not set — credential issuance endpoints will return 503");
-    }
 
     // Create shared state
     let state = AppState::new(
@@ -153,26 +157,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Provision issuer keys on boot and start periodic rotation task.
-    if let Some(ref mk) = state.credential_master_key {
-        match credentials::ensure_keys(
-            &state.credential_key_cache,
-            mk,
-            &state.db_pool,
-            &state.epoch_config,
-        )
-        .await
-        {
-            Ok(key_hash) => info!("Issuer key ready: {}", hex::encode(key_hash)),
-            Err(e) => warn!("Failed to provision issuer keys on boot: {}", e),
-        }
-
-        credentials::spawn_key_rotation_task(
-            state.credential_key_cache.clone(),
-            *mk,
-            state.db_pool.clone(),
-            state.epoch_config.clone(),
-        );
+    match credentials::ensure_keys(
+        &state.credential_key_cache,
+        &state.credential_master_key,
+        &state.db_pool,
+        &state.epoch_config,
+    )
+    .await
+    {
+        Ok(key_hash) => info!("Issuer key ready: {}", hex::encode(key_hash)),
+        Err(e) => warn!("Failed to provision issuer keys on boot: {}", e),
     }
+
+    credentials::spawn_key_rotation_task(
+        state.credential_key_cache.clone(),
+        state.credential_master_key,
+        state.db_pool.clone(),
+        state.epoch_config.clone(),
+    );
 
     // Build the router with OpenAPI integration
     let (router, api) = eidolons_server::build_router()

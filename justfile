@@ -6,14 +6,18 @@ default:
 
 # --- Development ---
 
-# Start postgres + server (full stack in containers, fast dev build)
+# Start postgres + server + dstack simulator (full stack in containers)
 dev:
     ./scripts/dev.sh
 
-# Start just postgres (for running the server on the host with cargo)
+# Start just postgres + simulator (for running the server on the host with cargo)
 db:
-    docker buildx bake postgres
-    docker compose up -d --no-build postgres
+    docker buildx bake postgres simulator
+    docker compose up -d --no-build postgres simulator
+
+# Build the dstack simulator image from source (first-time setup)
+build-simulator:
+    docker buildx bake simulator
 
 # Drop and recreate the eidolons database, then apply schema.sql
 db-reset:
@@ -34,7 +38,7 @@ test:
 
 # Run integration tests (requires: just db && just db-reset)
 test-integration:
-    DATABASE_URL="${DATABASE_URL:-postgres://eidolons@localhost/eidolons}" cargo test -p eidolons-server -- --ignored
+    DATABASE_URL="${DATABASE_URL:-postgres://eidolons@localhost/eidolons}" DSTACK_SIMULATOR_ENDPOINT="${DSTACK_SIMULATOR_ENDPOINT:-http://localhost:8090}" cargo test -p eidolons-server -- --ignored
 
 # Run E2E webhook smoke tests (requires STRIPE_API_KEY)
 test-webhook-smoke:

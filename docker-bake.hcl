@@ -44,6 +44,18 @@ target "postgres" {
   tags     = ["eidolons-postgres:dev"]
 }
 
+# dstack simulator — local dev only, never pushed to a registry.
+# Built from source because the upstream Docker image (phalanetwork/tappd-simulator)
+# is stale. Pinned to linux/amd64; runs under Rosetta on Apple Silicon.
+# Requires Docker Desktop's "Use Rosetta for x86_64/amd64 emulation" setting.
+target "simulator" {
+  context    = "."
+  dockerfile = "docker/simulator/Containerfile"
+  platforms  = ["linux/amd64"]
+  tags       = ["dstack-simulator:dev"]
+  attest     = []
+}
+
 group "default" {
   targets = ["server", "postgres"]
 }

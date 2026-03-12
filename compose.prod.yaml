@@ -1,0 +1,44 @@
+# Production compose file for Phala dstack deployment.
+#
+# This file is the deployment "source of truth" — Phala Cloud uses it as the
+# CVM manifest. It is a committed, versioned artifact (like artifact-manifest.json).
+#
+# Image tags must be pinned to specific digests (never :dev or :latest).
+# External secrets (REDPILL_API_KEY, etc.) are configured as Encrypted Secrets
+# in Phala Cloud and injected at CVM startup.
+
+services:
+  postgres:
+    # TODO: pin to digest
+    image: ghcr.io/eidolons-ai/eidolons-postgres:main
+    environment:
+      POSTGRES_USER: eidolons
+      POSTGRES_DB: eidolons
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "eidolons"]
+      interval: 5s
+      retries: 5
+
+  server:
+    # TODO: pin to digest
+    image: ghcr.io/eidolons-ai/eidolons-server:main
+    environment:
+      DATABASE_URL: postgres://eidolons@postgres/eidolons
+      REDPILL_API_KEY: ${REDPILL_API_KEY}
+      STRIPE_API_KEY: ${STRIPE_API_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      BIND_ADDR: 0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    volumes:
+      # dstack CVM runtime mounts the real socket here.
+      - /var/run/dstack:/var/run/dstack:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

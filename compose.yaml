@@ -1,4 +1,17 @@
 services:
+  simulator:
+    image: dstack-simulator:dev
+    build:
+      context: .
+      dockerfile: docker/simulator/Containerfile
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-o", "/dev/null", "-w", "", "-X", "POST", "-H", "Content-Type: application/json", "-d", "{}", "http://localhost:8090/GetKey"]
+      interval: 2s
+      retries: 15
+      start_period: 5s
+
   postgres:
     image: eidolons-postgres:dev
     build:
@@ -28,12 +41,14 @@ services:
       REDPILL_API_KEY: ${REDPILL_API_KEY}
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
-      CREDENTIAL_MASTER_KEY: ${CREDENTIAL_MASTER_KEY:-}
       BIND_ADDR: 0.0.0.0:8080
+      DSTACK_SIMULATOR_ENDPOINT: http://simulator:8090
     ports:
       - "8080:8080"
     depends_on:
       postgres:
+        condition: service_healthy
+      simulator:
         condition: service_healthy
 
   stripe-cli:

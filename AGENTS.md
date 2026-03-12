@@ -33,7 +33,19 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - `BIND_ADDR` (default: `127.0.0.1:8080`) - Address to bind
 - `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
 - `STRIPE_WEBHOOK_SECRET` (optional) - Stripe webhook signing secret; webhook endpoint returns 503 without it
-- `CREDENTIAL_MASTER_KEY` (optional) - Hex-encoded 32-byte AES-256 master key for issuer key encryption; credential issuance endpoints return 503 without it
+- `DSTACK_SIMULATOR_ENDPOINT` (optional) - dstack simulator HTTP endpoint (e.g. `http://localhost:8090`) for host-side dev on macOS; omit in containers and production where the SDK auto-discovers the Unix socket
+
+**dstack / TEE integration:**
+
+The credential master key (AES-256, used to encrypt issuer private keys at rest in Postgres) is derived deterministically from the dstack KMS via `get_key("eidolons/credential-master-key/v1")` using the `dstack-sdk` crate directly. It is never configured manually — the dstack guest agent (real TEE) or simulator (local dev) provides it. The key is bound to the application's `app_id`, which persists across upgrades, so encrypted issuer keys in the database remain accessible after redeployment.
+
+In local dev (both containerised and host-side), the server connects to the simulator over HTTP via `DSTACK_SIMULATOR_ENDPOINT=http://simulator:8090` (set in `compose.yaml`) or `http://localhost:8090` (set in `.env` for `cargo run`). In production, the SDK auto-discovers the CVM-provided socket at `/var/run/dstack/dstack.sock`.
+
+**dstack simulator:** Built from source (`docker/simulator/`) because the upstream Docker image is stale. A custom `dstack.toml` binds the internal RPC endpoint (GetKey, GetQuote, etc.) to TCP :8090 — the upstream default only uses Unix sockets. The image is `linux/amd64` and requires Docker Desktop's Apple Virtualization framework with Rosetta (not Docker VMM) on Apple Silicon. First build takes ~10 min; subsequent builds use the cargo cache layer.
+
+**Compose files:**
+- `compose.yaml` — local development: simulator + postgres + server + stripe-cli
+- `compose.prod.yaml` — Phala CVM deployment artifact: postgres + server (pinned image tags). Committed and versioned like `artifact-manifest.json`. External secrets (`REDPILL_API_KEY`, etc.) are configured as Encrypted Secrets in Phala Cloud.
 
 ## Crux Architecture
 
