@@ -30,7 +30,10 @@ enum Command {
     /// Set the server base URL
     Configure {
         #[arg(long)]
-        base_url: String,
+        base_url: Option<String>,
+        /// Path to a PEM file containing the CA certificate to trust
+        #[arg(long)]
+        ca_cert: Option<String>,
     },
     /// Manage account
     Account {
@@ -264,6 +267,23 @@ fn now_iso() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
+/// Build a reqwest client. When `ca_cert` is configured, only that CA is
+/// trusted (no public WebPKI roots). Otherwise falls back to bundled roots.
+fn build_client(config: &Config) -> Result<reqwest::Client, String> {
+    match config.ca_cert.as_deref() {
+        Some(pem) => {
+            let cert = reqwest::tls::Certificate::from_pem(pem.as_bytes())
+                .map_err(|e| format!("invalid ca_cert PEM in config: {e}"))?;
+            reqwest::Client::builder()
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(cert)
+                .build()
+                .map_err(|e| format!("failed to build HTTP client: {e}"))
+        }
+        None => Ok(reqwest::Client::new()),
+    }
+}
+
 fn require_base_url(config: &Config) -> Result<&str, String> {
     config
         .base_url
@@ -312,13 +332,35 @@ async fn run(cli: Cli) -> Result<(), String> {
                     "<not set>"
                 }
             );
+            println!(
+                "ca_cert: {}",
+                if config.ca_cert.is_some() {
+                    "<set>"
+                } else {
+                    "<not set>"
+                }
+            );
             Ok(())
         }
-        Some(Command::Configure { base_url }) => {
+        Some(Command::Configure { base_url, ca_cert }) => {
+            if base_url.is_none() && ca_cert.is_none() {
+                return Err("specify at least one of --base_url or --ca_cert".into());
+            }
             let mut config = Config::load();
-            config.base_url = Some(base_url.clone());
+            if let Some(url) = &base_url {
+                config.base_url = Some(url.clone());
+                println!("base_url set to {url}");
+            }
+            if let Some(path) = &ca_cert {
+                let pem = std::fs::read_to_string(path)
+                    .map_err(|e| format!("failed to read {path}: {e}"))?;
+                if !pem.contains("-----BEGIN CERTIFICATE-----") {
+                    return Err(format!("{path} does not appear to contain a PEM certificate"));
+                }
+                config.ca_cert = Some(pem);
+                println!("ca_cert set from {path}");
+            }
             config.save()?;
-            println!("base_url set to {base_url}");
             Ok(())
         }
         Some(Command::Account { command }) => match command {
@@ -348,7 +390,7 @@ async fn cmd_account_show() -> Result<(), String> {
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = reqwest::Client::new();
+    let client = build_client(&config)?;
     let resp = client
         .get(format!("{base_url}/v1/account"))
         .basic_auth(id, Some(secret))
@@ -385,7 +427,7 @@ async fn cmd_account_create() -> Result<(), String> {
         );
     }
 
-    let client = reqwest::Client::new();
+    let client = build_client(&config)?;
     let resp = client
         .post(format!("{base_url}/v1/account"))
         .send()
@@ -444,7 +486,7 @@ async fn cmd_account_prices() -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
 
-    let client = reqwest::Client::new();
+    let client = build_client(&config)?;
     let resp = client
         .get(format!("{base_url}/v1/prices"))
         .send()
@@ -501,7 +543,7 @@ async fn cmd_account_checkout(price_id: &str, no_browser: bool) -> Result<(), St
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = reqwest::Client::new();
+    let client = build_client(&config)?;
     let resp = client
         .post(format!("{base_url}/v1/account/checkout"))
         .basic_auth(id, Some(secret))
@@ -537,7 +579,7 @@ async fn cmd_account_balances() -> Result<(), String> {
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = reqwest::Client::new();
+    let client = build_client(&config)?;
     let resp = client
         .get(format!("{base_url}/v1/account/balances"))
         .basic_auth(id, Some(secret))
@@ -576,7 +618,7 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
     let (account_id, secret) = require_credentials(&config)?;
-    let client = reqwest::Client::new();
+    let client = build_client(&config)?;
 
     // 1. Fetch issuer keys from server
     let resp = client
@@ -746,7 +788,7 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
 async fn cmd_chat(prompt: &str) -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
-    let client = reqwest::Client::new();
+    let client = build_client(&config)?;
     let model_id = "phala/qwen3-vl-30b-a3b-instruct";
 
     // 1. Fetch model info for pricing

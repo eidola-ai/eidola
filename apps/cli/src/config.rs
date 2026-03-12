@@ -25,6 +25,12 @@ pub struct Config {
     pub account_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain_separator: Option<String>,
+    /// PEM-encoded CA certificate for RA-TLS verification.
+    /// Typically the dstack App CA (per-app trust anchor), not the
+    /// infrastructure Root CA (which would trust all dstack apps).
+    /// When set, only this CA is trusted (no public WebPKI roots).
+    #[serde(alias = "root_ca", skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
 }
 
 impl Config {
