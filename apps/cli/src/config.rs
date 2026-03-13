@@ -32,10 +32,9 @@ pub struct Config {
     #[serde(alias = "root_ca", skip_serializing_if = "Option::is_none")]
     pub ca_cert: Option<String>,
     /// Trusted compose hashes for RA-TLS attestation verification.
-    /// When non-empty (and `ca_cert` is set), the CLI verifies the server's
-    /// attestation certificate contains a compose_hash in this set before
-    /// sending any application data. When empty/absent, attestation is not
-    /// checked (dev-friendly default).
+    /// When `ca_cert` is set, the CLI always verifies the server's attestation
+    /// certificate contains a compose_hash in this set. If the list is empty,
+    /// no compose_hash can match and every connection is refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_compose_hashes: Vec<String>,
 }

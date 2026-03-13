@@ -7,15 +7,17 @@
 # This builds the simulator fresh from the dstack repository. It's only used
 # for local development — never pushed to a registry.
 
-ARG DSTACK_REF=master
+ARG DSTACK_REF=simulator-realistic-certificates
 
 FROM rust:1-slim-trixie AS build
 ARG DSTACK_REF
 
 RUN apt-get update && apt-get install -y --no-install-recommends git pkg-config && rm -rf /var/lib/apt/lists/*
 
+# TEMPORARY: use our fork until the report_data fix is merged upstream.
+# Revert to Dstack-TEE/dstack.git master once merged.
 RUN git clone --depth 1 --branch "${DSTACK_REF}" \
-    https://github.com/Dstack-TEE/dstack.git /src
+    https://github.com/eidolons-ai/dstack.git /src
 
 WORKDIR /src
 RUN cargo build --release -p dstack-guest-agent

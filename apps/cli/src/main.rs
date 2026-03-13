@@ -269,14 +269,12 @@ fn now_iso() -> String {
 }
 
 /// Build a reqwest client. When `ca_cert` is configured, only that CA is
-/// trusted (no public WebPKI roots). Otherwise falls back to bundled roots.
-///
-/// When `ca_cert` is set AND `trusted_compose_hashes` is non-empty, a custom
-/// `ServerCertVerifier` is installed that additionally checks the RA-TLS
-/// attestation extension on the leaf certificate before sending any data.
+/// trusted (no public WebPKI roots) and the RA-TLS attestation verifier is
+/// always active — the server's compose_hash must appear in
+/// `trusted_compose_hashes` or the connection is refused.
 fn build_client(config: &Config) -> Result<reqwest::Client, String> {
     match config.ca_cert.as_deref() {
-        Some(pem) if !config.trusted_compose_hashes.is_empty() => {
+        Some(pem) => {
             // Build a WebPKI verifier with the pinned CA, then wrap it in
             // our attestation verifier.
             let mut ca_store = rustls::RootCertStore::empty();
@@ -309,17 +307,52 @@ fn build_client(config: &Config) -> Result<reqwest::Client, String> {
                 .build()
                 .map_err(|e| format!("failed to build HTTP client: {e}"))
         }
-        Some(pem) => {
-            let cert = reqwest::tls::Certificate::from_pem(pem.as_bytes())
-                .map_err(|e| format!("invalid ca_cert PEM in config: {e}"))?;
-            reqwest::Client::builder()
-                .tls_built_in_root_certs(false)
-                .add_root_certificate(cert)
-                .build()
-                .map_err(|e| format!("failed to build HTTP client: {e}"))
-        }
         None => Ok(reqwest::Client::new()),
     }
+}
+
+/// Map a reqwest send error to a human-readable message.
+/// Detects RA-TLS attestation failures buried inside the TLS layer and
+/// surfaces them explicitly instead of printing a generic "error sending
+/// request" wrapper.
+fn describe_request_error(e: reqwest::Error) -> String {
+    // Walk the full error chain so we can detect messages from inner layers
+    // (rustls → our AttestationVerifier) that reqwest's Display may truncate.
+    let mut chain = format!("{e}");
+    {
+        let mut source = std::error::Error::source(&e);
+        while let Some(err) = source {
+            use std::fmt::Write;
+            let _ = write!(chain, ": {err}");
+            source = err.source();
+        }
+    }
+    if chain.contains("compose_hash") && chain.contains("not in the trusted set") {
+        return format!(
+            "attestation failed: the server's compose_hash is not in your \
+             trusted_compose_hashes list.\n\
+             The running server version is not trusted by this client.\n\
+             Update trusted_compose_hashes in your config, or verify you are \
+             connecting to the correct server.\n\
+             (inner: {chain})"
+        );
+    }
+    if chain.contains("missing PHALA_RATLS_ATTESTATION") {
+        return format!(
+            "attestation failed: the server's TLS certificate does not contain \
+             an RA-TLS attestation extension.\n\
+             The server may not be running inside a Confidential VM, or the \
+             dstack simulator may not support attestation certificates.\n\
+             (inner: {chain})"
+        );
+    }
+    if chain.contains("attestation") {
+        return format!(
+            "attestation failed: could not verify the server's RA-TLS certificate.\n\
+             (inner: {chain})"
+        );
+    }
+    format!("request failed: {chain}")
 }
 
 fn require_base_url(config: &Config) -> Result<&str, String> {
@@ -379,7 +412,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 }
             );
             if config.trusted_compose_hashes.is_empty() {
-                println!("trusted_compose_hashes: <none>");
+                println!("trusted_compose_hashes: <none> (all connections will be refused)");
             } else {
                 println!(
                     "trusted_compose_hashes: {}",
@@ -442,7 +475,7 @@ async fn cmd_account_show() -> Result<(), String> {
         .basic_auth(id, Some(secret))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -478,7 +511,7 @@ async fn cmd_account_create() -> Result<(), String> {
         .post(format!("{base_url}/v1/account"))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -537,7 +570,7 @@ async fn cmd_account_prices() -> Result<(), String> {
         .get(format!("{base_url}/v1/prices"))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -596,7 +629,7 @@ async fn cmd_account_checkout(price_id: &str, no_browser: bool) -> Result<(), St
         .json(&serde_json::json!({ "price_id": price_id }))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -631,7 +664,7 @@ async fn cmd_account_balances() -> Result<(), String> {
         .basic_auth(id, Some(secret))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -671,7 +704,7 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
         .get(format!("{base_url}/v1/keys"))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -779,7 +812,7 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
         }))
         .send()
         .await
-        .map_err(|e| format!("credential issuance request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -842,7 +875,7 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
         .get(format!("{base_url}/v1/models"))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -947,7 +980,7 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
         }))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     let status = resp.status();
     let body: serde_json::Value = resp

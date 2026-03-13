@@ -7,9 +7,18 @@ use sha2::{Digest, Sha512};
 use x509_parser::oid_registry::Oid;
 use x509_parser::prelude::*;
 
-/// OID for the PHALA_RATLS_ATTESTATION X.509 extension.
+/// OID for the PHALA_RATLS_ATTESTATION X.509 extension (newer format).
+/// Contains the SCALE-encoded `VersionedAttestation`.
 /// 1.3.6.1.4.1.62397.1.8
 const ATTESTATION_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 62397, 1, 8];
+
+/// OID for the legacy TDX quote extension.
+/// 1.3.6.1.4.1.62397.1.1
+const TDX_QUOTE_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 62397, 1, 1];
+
+/// OID for the legacy TDX event log extension (JSON-encoded).
+/// 1.3.6.1.4.1.62397.1.2
+const EVENT_LOG_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 62397, 1, 2];
 
 /// Custom TLS certificate verifier that checks:
 /// 1. Standard WebPKI chain validation against a pinned CA
@@ -59,10 +68,9 @@ impl ServerCertVerifier for AttestationVerifier {
             TlsError::General(format!("failed to parse leaf certificate: {e}"))
         })?;
 
-        let attestation_bytes = extract_attestation_bytes(&cert)?;
-
-        // 3. SCALE-decode the VersionedAttestation.
-        let attestation = decode_attestation(&attestation_bytes)?;
+        // 3. Extract attestation — try the newer .1.8 OID first, fall back to
+        //    legacy .1.1 (TDX quote) + .1.2 (event log) for backward compat.
+        let attestation = extract_attestation(&cert)?;
 
         // 4. Verify report_data binds the attestation to this TLS key.
         //    report_data == SHA-512("ratls-cert:" || leaf_public_key_der)
@@ -124,26 +132,49 @@ impl ServerCertVerifier for AttestationVerifier {
 // Attestation extraction helpers
 // ---------------------------------------------------------------------------
 
-/// Extract the raw attestation bytes from the PHALA_RATLS_ATTESTATION extension.
+/// Extract and decode attestation from the certificate.
 ///
-/// The extension value in x509-parser is the content of the extnValue OCTET
-/// STRING. Inside that, dstack stores a DER-encoded OCTET STRING wrapping the
-/// SCALE-encoded `VersionedAttestation`.
-fn extract_attestation_bytes(cert: &X509Certificate<'_>) -> Result<Vec<u8>, TlsError> {
-    let oid = Oid::from(ATTESTATION_OID)
+/// Tries the newer PHALA_RATLS_ATTESTATION extension (.1.8) first. If absent,
+/// falls back to the legacy TDX quote (.1.1) + event log (.1.2) extensions,
+/// matching the backward-compat path in dstack's `ra-tls` crate.
+fn extract_attestation(cert: &X509Certificate<'_>) -> Result<Attestation, TlsError> {
+    // Try newer .1.8 extension first.
+    let att_oid = Oid::from(ATTESTATION_OID)
         .map_err(|_| TlsError::General("invalid attestation OID".into()))?;
-
-    let ext = cert
-        .get_extension_unique(&oid)
+    if let Some(ext) = cert
+        .get_extension_unique(&att_oid)
         .map_err(|e| TlsError::General(format!("error reading attestation extension: {e}")))?
-        .ok_or_else(|| {
-            TlsError::General("leaf certificate missing PHALA_RATLS_ATTESTATION extension".into())
-        })?;
+    {
+        let bytes = parse_der_octet_string(ext.value)?;
+        return decode_attestation(&bytes);
+    }
 
-    // The extension value is DER: an OCTET STRING wrapping the payload.
-    // Parse the outer OCTET STRING to get the raw SCALE bytes.
-    let value = ext.value;
-    parse_der_octet_string(value)
+    // Legacy fallback: build Attestation from TDX quote + JSON event log.
+    let quote_oid = Oid::from(TDX_QUOTE_OID)
+        .map_err(|_| TlsError::General("invalid TDX quote OID".into()))?;
+    let quote_ext = cert
+        .get_extension_unique(&quote_oid)
+        .map_err(|e| TlsError::General(format!("error reading TDX quote extension: {e}")))?
+        .ok_or_else(|| {
+            TlsError::General(
+                "leaf certificate has no attestation: missing both \
+                 PHALA_RATLS_ATTESTATION (.1.8) and PHALA_RATLS_TDX_QUOTE (.1.1)"
+                    .into(),
+            )
+        })?;
+    let tdx_quote_bytes = parse_der_octet_string(quote_ext.value)?;
+
+    let log_oid = Oid::from(EVENT_LOG_OID)
+        .map_err(|_| TlsError::General("invalid event log OID".into()))?;
+    let log_ext = cert
+        .get_extension_unique(&log_oid)
+        .map_err(|e| TlsError::General(format!("error reading event log extension: {e}")))?
+        .ok_or_else(|| {
+            TlsError::General("TDX quote present but event log extension (.1.2) missing".into())
+        })?;
+    let log_bytes = parse_der_octet_string(log_ext.value)?;
+
+    attestation_from_legacy(&tdx_quote_bytes, &log_bytes)
 }
 
 /// Minimal DER OCTET STRING parser (tag 0x04).
@@ -266,6 +297,71 @@ fn decode_attestation(scale_bytes: &[u8]) -> Result<Attestation, TlsError> {
     Ok(attestation)
 }
 
+/// Event type constant for dstack runtime events (matches cc-eventlog).
+const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x08000001;
+
+/// Byte offset of report_data within a raw TDX quote (version 4/5).
+/// Header (48 bytes) + report body fields before report_data (520 bytes).
+const TDX_QUOTE_REPORT_DATA_OFFSET: usize = 568;
+const TDX_QUOTE_REPORT_DATA_LEN: usize = 64;
+
+/// JSON representation of a TDX event log entry, matching the dstack
+/// `cc-eventlog` crate's `TdxEvent` (with `serde_human_bytes` hex encoding).
+#[derive(serde::Deserialize)]
+struct JsonTdxEvent {
+    event_type: u32,
+    event: String,
+    /// Hex-encoded bytes (serde_human_bytes uses hex for human-readable).
+    event_payload: String,
+}
+
+/// Build an `Attestation` from legacy cert extensions (TDX quote + JSON event log).
+fn attestation_from_legacy(
+    tdx_quote_bytes: &[u8],
+    event_log_json: &[u8],
+) -> Result<Attestation, TlsError> {
+    // Extract report_data from the raw TDX quote at a fixed offset.
+    let rd_end = TDX_QUOTE_REPORT_DATA_OFFSET + TDX_QUOTE_REPORT_DATA_LEN;
+    if tdx_quote_bytes.len() < rd_end {
+        return Err(TlsError::General(format!(
+            "TDX quote too short ({} bytes, need at least {rd_end})",
+            tdx_quote_bytes.len()
+        )));
+    }
+    let mut report_data = [0u8; 64];
+    report_data
+        .copy_from_slice(&tdx_quote_bytes[TDX_QUOTE_REPORT_DATA_OFFSET..rd_end]);
+
+    // Parse JSON event log and filter for runtime events.
+    let tdx_events: Vec<JsonTdxEvent> =
+        serde_json::from_slice(event_log_json).map_err(|e| {
+            TlsError::General(format!("failed to parse TDX event log JSON: {e}"))
+        })?;
+
+    let runtime_events: Vec<RuntimeEvent> = tdx_events
+        .into_iter()
+        .filter(|ev| ev.event_type == DSTACK_RUNTIME_EVENT_TYPE)
+        .map(|ev| {
+            let payload = hex_decode(&ev.event_payload)?;
+            Ok(RuntimeEvent {
+                event: ev.event,
+                payload,
+            })
+        })
+        .collect::<Result<Vec<_>, TlsError>>()?;
+
+    Ok(Attestation {
+        quote: AttestationQuote::DstackTdx(TdxQuote {
+            quote: tdx_quote_bytes.to_vec(),
+            event_log: vec![],
+        }),
+        runtime_events,
+        report_data,
+        config: String::new(),
+        report: (),
+    })
+}
+
 fn find_compose_hash(events: &[RuntimeEvent]) -> Result<Vec<u8>, TlsError> {
     for event in events {
         if event.event == "system-ready" {
@@ -282,4 +378,17 @@ fn find_compose_hash(events: &[RuntimeEvent]) -> Result<Vec<u8>, TlsError> {
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, TlsError> {
+    if s.len() % 2 != 0 {
+        return Err(TlsError::General("odd-length hex string".into()));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|e| TlsError::General(format!("invalid hex in event payload: {e}")))
+        })
+        .collect()
 }
