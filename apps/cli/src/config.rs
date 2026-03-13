@@ -31,6 +31,13 @@ pub struct Config {
     /// When set, only this CA is trusted (no public WebPKI roots).
     #[serde(alias = "root_ca", skip_serializing_if = "Option::is_none")]
     pub ca_cert: Option<String>,
+    /// Trusted compose hashes for RA-TLS attestation verification.
+    /// When non-empty (and `ca_cert` is set), the CLI verifies the server's
+    /// attestation certificate contains a compose_hash in this set before
+    /// sending any application data. When empty/absent, attestation is not
+    /// checked (dev-friendly default).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_compose_hashes: Vec<String>,
 }
 
 impl Config {

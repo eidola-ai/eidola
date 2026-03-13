@@ -2013,9 +2013,11 @@ dependencies = [
  "clap",
  "dirs",
  "open",
+ "parity-scale-codec",
  "rand_core 0.6.4",
  "reqwest",
  "rustls",
+ "rustls-pemfile",
  "rustls-rustcrypto",
  "serde",
  "serde_json",
@@ -2024,6 +2026,7 @@ dependencies = [
  "toml 0.8.23",
  "turso",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

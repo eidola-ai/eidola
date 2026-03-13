@@ -1,3 +1,4 @@
+mod attestation;
 mod config;
 mod db;
 
@@ -269,8 +270,45 @@ fn now_iso() -> String {
 
 /// Build a reqwest client. When `ca_cert` is configured, only that CA is
 /// trusted (no public WebPKI roots). Otherwise falls back to bundled roots.
+///
+/// When `ca_cert` is set AND `trusted_compose_hashes` is non-empty, a custom
+/// `ServerCertVerifier` is installed that additionally checks the RA-TLS
+/// attestation extension on the leaf certificate before sending any data.
 fn build_client(config: &Config) -> Result<reqwest::Client, String> {
     match config.ca_cert.as_deref() {
+        Some(pem) if !config.trusted_compose_hashes.is_empty() => {
+            // Build a WebPKI verifier with the pinned CA, then wrap it in
+            // our attestation verifier.
+            let mut ca_store = rustls::RootCertStore::empty();
+            let certs = rustls_pemfile::certs(&mut pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("invalid ca_cert PEM: {e}"))?;
+            for cert in certs {
+                ca_store
+                    .add(cert)
+                    .map_err(|e| format!("failed to add CA cert: {e}"))?;
+            }
+
+            let webpki_verifier =
+                rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(ca_store))
+                    .build()
+                    .map_err(|e| format!("failed to build WebPKI verifier: {e}"))?;
+
+            let attest_verifier = std::sync::Arc::new(attestation::AttestationVerifier::new(
+                webpki_verifier,
+                config.trusted_compose_hashes.clone(),
+            ));
+
+            let tls_config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(attest_verifier)
+                .with_no_client_auth();
+
+            reqwest::Client::builder()
+                .use_preconfigured_tls(tls_config)
+                .build()
+                .map_err(|e| format!("failed to build HTTP client: {e}"))
+        }
         Some(pem) => {
             let cert = reqwest::tls::Certificate::from_pem(pem.as_bytes())
                 .map_err(|e| format!("invalid ca_cert PEM in config: {e}"))?;
@@ -340,6 +378,14 @@ async fn run(cli: Cli) -> Result<(), String> {
                     "<not set>"
                 }
             );
+            if config.trusted_compose_hashes.is_empty() {
+                println!("trusted_compose_hashes: <none>");
+            } else {
+                println!(
+                    "trusted_compose_hashes: {}",
+                    config.trusted_compose_hashes.join(", ")
+                );
+            }
             Ok(())
         }
         Some(Command::Configure { base_url, ca_cert }) => {
