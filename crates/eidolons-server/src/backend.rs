@@ -260,12 +260,22 @@ pub struct TinfoilBackend {
     models: Vec<Model>,
 }
 
-impl TinfoilBackend {
-    pub fn new(api_key: String, base_url: Option<String>, pricing_markup: Option<f64>) -> Self {
-        let client = reqwest::Client::builder()
-            .build()
-            .expect("failed to build HTTP client");
+/// Expected code measurements for Tinfoil's inference enclave (hex-encoded).
+///
+/// At least two entries for rolling deploys: the current and previous deployment.
+/// These are placeholder values until real measurements are obtained from Tinfoil.
+pub const ALLOWED_MEASUREMENTS: &[&str] = &[
+    "placeholder_current_deployment_measurement",
+    "placeholder_previous_deployment_measurement",
+];
 
+impl TinfoilBackend {
+    pub fn new(
+        client: reqwest::Client,
+        api_key: String,
+        base_url: Option<String>,
+        pricing_markup: Option<f64>,
+    ) -> Self {
         let markup = pricing_markup.unwrap_or(DEFAULT_PRICING_MARKUP);
         let overrides = Self::parse_pricing_overrides();
         let models = Self::build_model_list(markup, &overrides);
@@ -654,14 +664,12 @@ mod tests {
 
     #[test]
     fn test_lookup_model() {
-        let overrides = HashMap::new();
-        let models = TinfoilBackend::build_model_list(1.5, &overrides);
-        let backend = TinfoilBackend {
-            client: reqwest::Client::new(),
-            api_key: String::new(),
-            base_url: String::new(),
-            models,
-        };
+        let backend = TinfoilBackend::new(
+            reqwest::Client::new(),
+            String::new(),
+            None,
+            Some(1.5),
+        );
 
         assert!(backend.lookup_model("kimi-k2-5").is_some());
         assert!(backend.lookup_model("nonexistent").is_none());

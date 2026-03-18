@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 use dstack_sdk::dstack_client::DstackClient;
 
 use eidolons_server::AppState;
-use eidolons_server::backend::TinfoilBackend;
+use eidolons_server::backend::{self, TinfoilBackend};
 use eidolons_server::credentials;
 use eidolons_server::helpers::EpochConfig;
 use eidolons_server::stripe::StripeClient;
@@ -150,9 +150,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let credential_key_cache: credentials::KeyCache = Default::default();
     let epoch_config = EpochConfig::default();
 
+    // Verify Tinfoil enclave attestation and build a TLS-pinned client.
+    info!("Verifying Tinfoil enclave attestation...");
+    let (pinned_client, verification) = tinfoil_verifier::verify_and_pin(
+        backend::ALLOWED_MEASUREMENTS,
+        None, // use default ATC endpoint
+    )
+    .await
+    .map_err(|e| {
+        error!("Tinfoil attestation verification failed: {e}");
+        e
+    })?;
+    info!(
+        "Tinfoil attestation verified — measurement: {}, TLS fingerprint: {}",
+        verification.measurement, verification.tls_fingerprint
+    );
+
     // Create shared state
     let state = AppState::new(
         TinfoilBackend::new(
+            pinned_client,
             config.tinfoil_api_key.clone(),
             config.tinfoil_base_url.clone(),
             config.pricing_markup,

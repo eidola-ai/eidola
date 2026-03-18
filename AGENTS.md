@@ -19,6 +19,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 **Key design decisions:**
 - Axum-based HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration
 - RA-TLS termination via `rustls-rustcrypto` + `tokio-rustls` (no C dependencies); attestation-bearing certs from dstack
+- Tinfoil attestation verification via `tinfoil-verifier` crate — verifies SEV-SNP hardware attestation and pins TLS to the attested enclave certificate before proxying any requests
 - Statically linked musl binaries for Linux deployment
 - StageX-based OCI images (reproducible, `FROM scratch`, runs as non-root)
 - Request-based (no sessions/caching in the proxy layer)
@@ -46,6 +47,20 @@ The credential master key (AES-256, used to encrypt issuer private keys at rest 
 The server performs its own TLS termination using RA-TLS (Remote Attestation TLS). On startup it calls `get_tls_key()` with `usage_ra_tls: true` to obtain a private key and certificate chain from the dstack guest agent. The certificate embeds an attestation quote in an X.509 extension, allowing clients to cryptographically verify they are communicating with code running inside a TEE. Certificates are regenerated every ~12 hours (with jitter) via a background task, since attestation quotes expire. Each server instance independently obtains its own RA-TLS certificate — no cross-instance coordination is needed. The cert resolver uses lock-free `ArcSwap` for zero-contention hot-swapping on the TLS handshake path.
 
 In local dev (both containerised and host-side), the server connects to the simulator over HTTP via `DSTACK_SIMULATOR_ENDPOINT=http://simulator:8090` (set in `compose.yaml`) or `http://localhost:8090` (set in `.env` for `cargo run`). In production, the SDK auto-discovers the CVM-provided socket at `/var/run/dstack/dstack.sock`.
+
+**Tinfoil attestation verification (`crates/tinfoil-verifier/`):**
+
+On startup the server verifies the Tinfoil inference enclave's hardware attestation before sending any traffic. The `tinfoil-verifier` crate handles this in a single `verify_and_pin()` call:
+
+1. Fetches the attestation bundle from the Tinfoil ATC service (`https://atc.tinfoil.sh/attestation`)
+2. Verifies the AMD VCEK certificate chain (embedded Genoa ARK → ASK → VCEK from bundle) using RSA-PSS(SHA-384)
+3. Verifies the SEV-SNP attestation report's ECDSA-P384 signature against the VCEK public key
+4. Validates TCB policy (minimum firmware versions: bl≥0x07, snp≥0x0e, ucode≥0x48)
+5. Checks the report measurement against `ALLOWED_MEASUREMENTS` in `backend.rs`
+6. Cross-checks the enclave TLS certificate's SPKI fingerprint against `report_data[0..32]`
+7. Returns a `reqwest::Client` pinned to the attested TLS public key via a custom rustls `ServerCertVerifier`
+
+The pinned client is injected into `TinfoilBackend`, ensuring all inference traffic goes only to the verified enclave. Pure Rust dependencies (`p384`, `ecdsa`, `rsa`, `x509-parser`) — no OpenSSL.
 
 **dstack simulator:** Built from source (`docker/simulator/`) because the upstream Docker image is stale. A custom `dstack.toml` binds the internal RPC endpoint (GetKey, GetQuote, etc.) to TCP :8090 — the upstream default only uses Unix sockets. Builds natively for the host platform (no cross-compilation). First build takes ~10 min; subsequent builds use the cargo cache layer.
 
