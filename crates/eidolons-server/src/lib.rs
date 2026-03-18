@@ -9,7 +9,6 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub mod account;
 pub mod api_doc;
-pub mod attestation;
 pub mod auth;
 pub mod backend;
 pub mod credentials;
@@ -30,8 +29,7 @@ pub struct AppState {
 }
 
 pub struct AppStateInner {
-    pub backend: backend::RedPillBackend,
-    pub attestation: attestation::AttestationClient,
+    pub backend: backend::TinfoilBackend,
     pub db_pool: deadpool_postgres::Pool,
     pub stripe: Option<stripe::StripeClient>,
     pub stripe_webhook_secret: Option<String>,
@@ -43,8 +41,7 @@ pub struct AppStateInner {
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        backend: backend::RedPillBackend,
-        attestation: attestation::AttestationClient,
+        backend: backend::TinfoilBackend,
         db_pool: deadpool_postgres::Pool,
         stripe: Option<stripe::StripeClient>,
         stripe_webhook_secret: Option<String>,
@@ -55,7 +52,6 @@ impl AppState {
         Self {
             inner: Arc::new(AppStateInner {
                 backend,
-                attestation,
                 db_pool,
                 stripe,
                 stripe_webhook_secret,

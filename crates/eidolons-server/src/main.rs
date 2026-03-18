@@ -1,8 +1,8 @@
 //! Eidolons Server - A privacy-transparent AI proxy.
 //!
 //! This server accepts requests in OpenAI Chat Completions API format and
-//! proxies them to upstream AI providers via RedPill.ai, enriching responses
-//! with inline privacy metadata and cryptographic verification.
+//! proxies them to Tinfoil's confidential inference enclaves, enriching
+//! responses with inline privacy metadata and cryptographic verification.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,8 +17,7 @@ use tracing::{debug, error, info, warn};
 use dstack_sdk::dstack_client::DstackClient;
 
 use eidolons_server::AppState;
-use eidolons_server::attestation::AttestationClient;
-use eidolons_server::backend::RedPillBackend;
+use eidolons_server::backend::TinfoilBackend;
 use eidolons_server::credentials;
 use eidolons_server::helpers::EpochConfig;
 use eidolons_server::stripe::StripeClient;
@@ -27,8 +26,8 @@ use eidolons_server::tls;
 /// Server configuration.
 struct Config {
     bind_addr: SocketAddr,
-    redpill_api_key: String,
-    redpill_base_url: Option<String>,
+    tinfoil_api_key: String,
+    tinfoil_base_url: Option<String>,
     database_url: String,
     stripe_api_key: Option<String>,
     stripe_webhook_secret: Option<String>,
@@ -45,10 +44,10 @@ impl Config {
             .parse()
             .map_err(|e| format!("invalid BIND_ADDR: {}", e))?;
 
-        let redpill_api_key = std::env::var("REDPILL_API_KEY")
-            .map_err(|_| "REDPILL_API_KEY environment variable is required")?;
+        let tinfoil_api_key = std::env::var("TINFOIL_API_KEY")
+            .map_err(|_| "TINFOIL_API_KEY environment variable is required")?;
 
-        let redpill_base_url = std::env::var("REDPILL_BASE_URL").ok();
+        let tinfoil_base_url = std::env::var("TINFOIL_BASE_URL").ok();
 
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
@@ -96,8 +95,8 @@ impl Config {
 
         Ok(Config {
             bind_addr,
-            redpill_api_key,
-            redpill_base_url,
+            tinfoil_api_key,
+            tinfoil_base_url,
             database_url,
             stripe_api_key,
             stripe_webhook_secret,
@@ -153,12 +152,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Create shared state
     let state = AppState::new(
-        RedPillBackend::new(
-            config.redpill_api_key.clone(),
-            config.redpill_base_url.clone(),
+        TinfoilBackend::new(
+            config.tinfoil_api_key.clone(),
+            config.tinfoil_base_url.clone(),
             config.pricing_markup,
         ),
-        AttestationClient::new(config.redpill_api_key, config.redpill_base_url),
         db_pool,
         stripe,
         config.stripe_webhook_secret,

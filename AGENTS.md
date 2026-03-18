@@ -6,11 +6,11 @@ Guidance for AI coding agents working in this repository.
 
 The server is an OpenAI-compatible proxy that translates requests to upstream AI providers. It includes a billing system with anonymous credentials for privacy-preserving usage tracking.
 
-**Current upstream:** RedPill.ai (OpenAI-compatible, routes to various model providers)
+**Current upstream:** Tinfoil (inference.tinfoil.sh) — OpenAI-compatible, all models run in confidential enclaves (AMD SEV-SNP / Intel TDX / NVIDIA CC)
 
 **Database:** PostgreSQL 17+ (see `crates/eidolons-server/schema/schema.sql`)
 
-**Deployment:** Phala dstack — all services run inside a single Confidential VM (CVM) with encrypted disk backed by Intel TDX.
+**Deployment:** Tinfoil Containers (planned) — all services run inside confidential enclaves. dstack is used locally for key derivation and RA-TLS certificate provisioning via the simulator.
 
 **CI:** Two workflows — `ci.yml` (self-hosted Mac: Nix checks, Swift builds/tests) and `oci.yml` (ubuntu-latest: OCI image builds, manifest verification, GHCR publishing).
 
@@ -28,13 +28,16 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 **API endpoints:** Defined in `crates/eidolons-server/openapi.json` (generated from utoipa annotations — see Conventions).
 
 **Environment variables:**
-- `REDPILL_API_KEY` (required) - RedPill API key
+- `TINFOIL_API_KEY` (required) - Tinfoil inference API key
 - `DATABASE_URL` (required) - PostgreSQL connection string
 - `BIND_ADDR` (default: `127.0.0.1:8443`) - Address to bind (HTTPS)
 - `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
 - `STRIPE_WEBHOOK_SECRET` (optional) - Stripe webhook signing secret; webhook endpoint returns 503 without it
 - `DSTACK_SIMULATOR_ENDPOINT` (optional) - dstack simulator HTTP endpoint (e.g. `http://localhost:8090`) for host-side dev on macOS; omit in containers and production where the SDK auto-discovers the Unix socket
-- `TLS_SANS` (optional) - Comma-separated TLS Subject Alternative Names (default: `localhost,server`); set to the CVM's DNS name or IP in production
+- `TLS_SANS` (optional) - Comma-separated TLS Subject Alternative Names (default: `localhost,server`); set to the enclave's DNS name or IP in production
+- `TINFOIL_BASE_URL` (optional) - Override the default Tinfoil API base URL (`https://inference.tinfoil.sh/v1`)
+- `TINFOIL_PRICING_OVERRIDES` (optional) - JSON object overriding per-model pricing; e.g. `{"kimi-k2-5":{"input":2.0,"output":6.0}}`. Token-based models accept `input`/`output` ($/M tokens); per-request models accept `request` ($/request). See `backend.rs` `MODEL_CATALOG` for defaults
+- `PRICING_MARKUP` (optional) - Pricing markup factor applied to all model prices (default: `1.5`)
 
 **dstack / TEE integration:**
 
@@ -48,7 +51,6 @@ In local dev (both containerised and host-side), the server connects to the simu
 
 **Compose files:**
 - `compose.yaml` — local development: simulator + postgres + server + stripe-cli
-- `compose.prod.yaml` — Phala CVM deployment artifact: postgres + server (pinned image tags). Committed and versioned like `artifact-manifest.json`. External secrets (`REDPILL_API_KEY`, etc.) are configured as Encrypted Secrets in Phala Cloud.
 
 ## Crux Architecture
 

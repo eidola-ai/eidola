@@ -1530,7 +1530,7 @@
       },
       "ModelPricing": {
         "type": "object",
-        "description": "Pricing for a model in scaled integer credits per token.",
+        "description": "Pricing for a model in scaled integer credits per token (or per request).",
         "required": [
           "per_prompt_token",
           "per_completion_token"
@@ -1541,6 +1541,17 @@
           },
           "per_prompt_token": {
             "$ref": "#/components/schemas/ScaledPrice"
+          },
+          "per_request": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScaledPrice",
+                "description": "Per-request pricing (for models like Whisper or TTS that charge per request\nrather than per token). When present, `per_prompt_token` and\n`per_completion_token` are zero."
+              }
+            ]
           }
         }
       },

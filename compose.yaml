@@ -38,7 +38,7 @@ services:
       dockerfile: crates/eidolons-server/Containerfile
     environment:
       DATABASE_URL: postgres://eidolons@postgres/eidolons
-      REDPILL_API_KEY: ${REDPILL_API_KEY}
+      TINFOIL_API_KEY: ${TINFOIL_API_KEY}
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       BIND_ADDR: 0.0.0.0:8443

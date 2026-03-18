@@ -304,11 +304,16 @@ pub struct Model {
     pub pricing: ModelPricing,
 }
 
-/// Pricing for a model in scaled integer credits per token.
+/// Pricing for a model in scaled integer credits per token (or per request).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelPricing {
     pub per_prompt_token: ScaledPrice,
     pub per_completion_token: ScaledPrice,
+    /// Per-request pricing (for models like Whisper or TTS that charge per request
+    /// rather than per token). When present, `per_prompt_token` and
+    /// `per_completion_token` are zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_request: Option<ScaledPrice>,
 }
 
 /// A price expressed as an integer value with a fixed scale factor.
