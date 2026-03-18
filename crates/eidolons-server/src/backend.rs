@@ -260,15 +260,6 @@ pub struct TinfoilBackend {
     models: Vec<Model>,
 }
 
-/// Expected code measurements for Tinfoil's inference enclave (hex-encoded).
-///
-/// At least two entries for rolling deploys: the current and previous deployment.
-/// These are placeholder values until real measurements are obtained from Tinfoil.
-pub const ALLOWED_MEASUREMENTS: &[&str] = &[
-    "placeholder_current_deployment_measurement",
-    "placeholder_previous_deployment_measurement",
-];
-
 impl TinfoilBackend {
     pub fn new(
         client: reqwest::Client,
@@ -304,19 +295,14 @@ impl TinfoilBackend {
         }
     }
 
-    fn build_model_list(
-        markup: f64,
-        overrides: &HashMap<String, PricingOverride>,
-    ) -> Vec<Model> {
+    fn build_model_list(markup: f64, overrides: &HashMap<String, PricingOverride>) -> Vec<Model> {
         MODEL_CATALOG
             .iter()
             .map(|entry| {
                 let ovr = overrides.get(entry.id);
 
                 let pricing = if entry.per_request_usd > 0.0 {
-                    let per_req = ovr
-                        .and_then(|o| o.request)
-                        .unwrap_or(entry.per_request_usd);
+                    let per_req = ovr.and_then(|o| o.request).unwrap_or(entry.per_request_usd);
                     ModelPricing {
                         per_prompt_token: ScaledPrice {
                             value: 0,
@@ -664,12 +650,7 @@ mod tests {
 
     #[test]
     fn test_lookup_model() {
-        let backend = TinfoilBackend::new(
-            reqwest::Client::new(),
-            String::new(),
-            None,
-            Some(1.5),
-        );
+        let backend = TinfoilBackend::new(reqwest::Client::new(), String::new(), None, Some(1.5));
 
         assert!(backend.lookup_model("kimi-k2-5").is_some());
         assert!(backend.lookup_model("nonexistent").is_none());

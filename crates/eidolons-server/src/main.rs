@@ -17,9 +17,10 @@ use tracing::{debug, error, info, warn};
 use dstack_sdk::dstack_client::DstackClient;
 
 use eidolons_server::AppState;
-use eidolons_server::backend::{self, TinfoilBackend};
+use eidolons_server::backend::TinfoilBackend;
 use eidolons_server::credentials;
 use eidolons_server::helpers::EpochConfig;
+use eidolons_server::measurements;
 use eidolons_server::stripe::StripeClient;
 use eidolons_server::tls;
 
@@ -75,11 +76,7 @@ impl Config {
         // The SDK auto-discovers the socket at /var/run/dstack/dstack.sock (containers
         // and production). For host-side dev on macOS, DSTACK_SIMULATOR_ENDPOINT can
         // point at the simulator's HTTP port (e.g. http://localhost:8090).
-        let dstack = DstackClient::new(
-            std::env::var("DSTACK_SIMULATOR_ENDPOINT")
-                .ok()
-                .as_deref(),
-        );
+        let dstack = DstackClient::new(std::env::var("DSTACK_SIMULATOR_ENDPOINT").ok().as_deref());
         info!("Deriving credential master key from dstack...");
         let key_response = dstack
             .get_key(Some("eidolons/credential-master-key/v1".to_string()), None)
@@ -153,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Verify Tinfoil enclave attestation and build a TLS-pinned client.
     info!("Verifying Tinfoil enclave attestation...");
     let (pinned_client, verification) = tinfoil_verifier::verify_and_pin(
-        backend::ALLOWED_MEASUREMENTS,
+        measurements::ALLOWED,
         None, // use default ATC endpoint
     )
     .await
