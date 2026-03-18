@@ -11,9 +11,8 @@
 #[tokio::test]
 #[ignore = "requires network access to atc.tinfoil.sh"]
 async fn live_attestation_verification() {
-    let _ = rustls::crypto::CryptoProvider::install_default(
-        rustls::crypto::ring::default_provider(),
-    );
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     // Fetch the attestation bundle
     let bundle = tinfoil_verifier::bundle::fetch_bundle(None)
@@ -23,11 +22,8 @@ async fn live_attestation_verification() {
     eprintln!("Domain: {}", bundle.domain);
 
     // Decode VCEK and report
-    let vcek_der = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &bundle.vcek,
-    )
-    .expect("failed to decode VCEK");
+    let vcek_der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &bundle.vcek)
+        .expect("failed to decode VCEK");
 
     let report_bytes =
         tinfoil_verifier::bundle::decode_report(&bundle.enclave_attestation_report.body)
@@ -40,19 +36,15 @@ async fn live_attestation_verification() {
         .expect("attestation verification failed");
 
     // Verify TCB policy
-    tinfoil_verifier::sevsnp::verify_tcb_policy(&report)
-        .expect("TCB policy verification failed");
+    tinfoil_verifier::sevsnp::verify_tcb_policy(&report).expect("TCB policy verification failed");
 
     let measurement = hex::encode(report.measurement);
     eprintln!("Measurement: {measurement}");
 
     // Verify enclave cert binding
     let tls_fingerprint = &report.report_data[..32];
-    tinfoil_verifier::sevsnp::verify_enclave_cert_binding(
-        &bundle.enclave_cert,
-        tls_fingerprint,
-    )
-    .expect("enclave cert binding verification failed");
+    tinfoil_verifier::sevsnp::verify_enclave_cert_binding(&bundle.enclave_cert, tls_fingerprint)
+        .expect("enclave cert binding verification failed");
 
     eprintln!("TLS fingerprint: {}", hex::encode(tls_fingerprint));
 }

@@ -7,7 +7,7 @@
 use std::io::Cursor;
 
 use der::{Decode, DecodePem, Encode};
-use sev::certs::snp::{builtin::genoa, ca, Certificate, Chain, Verifiable};
+use sev::certs::snp::{Certificate, Chain, Verifiable, builtin::genoa, ca};
 use sev::firmware::guest::AttestationReport;
 use sev::parser::Decoder;
 use sha2::{Digest, Sha256};

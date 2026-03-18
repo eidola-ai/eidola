@@ -210,12 +210,13 @@ async fn authorize_spend(
     }
 
     // Look up the model and validate pricing.
-    let model = state
-        .backend
-        .lookup_model(&request.model)
-        .ok_or_else(|| ServerError::BadRequest {
-            message: format!("unknown model: {}", request.model),
-        })?;
+    let model =
+        state
+            .backend
+            .lookup_model(&request.model)
+            .ok_or_else(|| ServerError::BadRequest {
+                message: format!("unknown model: {}", request.model),
+            })?;
 
     // Decode the charge amount from the spend proof.
     let charge_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).map_err(|_| {

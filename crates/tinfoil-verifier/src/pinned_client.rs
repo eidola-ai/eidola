@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
+use rustls::crypto::{
+    CryptoProvider, WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
+};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
@@ -35,9 +37,8 @@ impl ServerCertVerifier for FingerprintVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
-        let actual = sevsnp::sha256_spki_from_der(end_entity.as_ref()).map_err(|e| {
-            TlsError::General(format!("failed to compute SPKI fingerprint: {e}"))
-        })?;
+        let actual = sevsnp::sha256_spki_from_der(end_entity.as_ref())
+            .map_err(|e| TlsError::General(format!("failed to compute SPKI fingerprint: {e}")))?;
         if actual != self.expected_fingerprint {
             return Err(TlsError::General(format!(
                 "TLS public key fingerprint mismatch: expected {}, got {}",
@@ -72,7 +73,9 @@ impl ServerCertVerifier for FingerprintVerifier {
 }
 
 /// Build a `reqwest::Client` that pins TLS connections to the given SPKI fingerprint.
-pub fn build_pinned_client(expected_fingerprint: [u8; 32]) -> Result<reqwest::Client, crate::Error> {
+pub fn build_pinned_client(
+    expected_fingerprint: [u8; 32],
+) -> Result<reqwest::Client, crate::Error> {
     let provider = rustls::crypto::CryptoProvider::get_default()
         .ok_or_else(|| crate::Error::Tls("no rustls CryptoProvider installed".into()))?;
 

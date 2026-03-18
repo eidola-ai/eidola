@@ -54,8 +54,7 @@ pub async fn verify_and_pin(
     )?;
 
     // Decode the attestation report (base64 → gzip → raw bytes)
-    let report_bytes =
-        bundle::decode_report(&attestation_bundle.enclave_attestation_report.body)?;
+    let report_bytes = bundle::decode_report(&attestation_bundle.enclave_attestation_report.body)?;
 
     // Verify chain + report signature (delegated to sev crate)
     tracing::info!("Verifying VCEK certificate chain and report signature...");

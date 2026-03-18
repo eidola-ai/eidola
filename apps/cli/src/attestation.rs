@@ -31,10 +31,7 @@ pub struct AttestationVerifier {
 }
 
 impl AttestationVerifier {
-    pub fn new(
-        inner: Arc<dyn ServerCertVerifier>,
-        trusted_compose_hashes: Vec<String>,
-    ) -> Self {
+    pub fn new(inner: Arc<dyn ServerCertVerifier>, trusted_compose_hashes: Vec<String>) -> Self {
         Self {
             inner,
             trusted_compose_hashes,
@@ -60,13 +57,17 @@ impl ServerCertVerifier for AttestationVerifier {
         now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
         // 1. Delegate chain validation to the inner (WebPKI) verifier.
-        self.inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
 
         // 2. Parse the leaf certificate and extract attestation.
-        let (_, cert) = X509Certificate::from_der(end_entity.as_ref()).map_err(|e| {
-            TlsError::General(format!("failed to parse leaf certificate: {e}"))
-        })?;
+        let (_, cert) = X509Certificate::from_der(end_entity.as_ref())
+            .map_err(|e| TlsError::General(format!("failed to parse leaf certificate: {e}")))?;
 
         // 3. Extract attestation — try the newer .1.8 OID first, fall back to
         //    legacy .1.1 (TDX quote) + .1.2 (event log) for backward compat.
@@ -150,8 +151,8 @@ fn extract_attestation(cert: &X509Certificate<'_>) -> Result<Attestation, TlsErr
     }
 
     // Legacy fallback: build Attestation from TDX quote + JSON event log.
-    let quote_oid = Oid::from(TDX_QUOTE_OID)
-        .map_err(|_| TlsError::General("invalid TDX quote OID".into()))?;
+    let quote_oid =
+        Oid::from(TDX_QUOTE_OID).map_err(|_| TlsError::General("invalid TDX quote OID".into()))?;
     let quote_ext = cert
         .get_extension_unique(&quote_oid)
         .map_err(|e| TlsError::General(format!("error reading TDX quote extension: {e}")))?
@@ -164,8 +165,8 @@ fn extract_attestation(cert: &X509Certificate<'_>) -> Result<Attestation, TlsErr
         })?;
     let tdx_quote_bytes = parse_der_octet_string(quote_ext.value)?;
 
-    let log_oid = Oid::from(EVENT_LOG_OID)
-        .map_err(|_| TlsError::General("invalid event log OID".into()))?;
+    let log_oid =
+        Oid::from(EVENT_LOG_OID).map_err(|_| TlsError::General("invalid event log OID".into()))?;
     let log_ext = cert
         .get_extension_unique(&log_oid)
         .map_err(|e| TlsError::General(format!("error reading event log extension: {e}")))?
@@ -289,10 +290,9 @@ struct RuntimeEvent {
 }
 
 fn decode_attestation(scale_bytes: &[u8]) -> Result<Attestation, TlsError> {
-    let versioned =
-        VersionedAttestation::decode(&mut &scale_bytes[..]).map_err(|e| {
-            TlsError::General(format!("failed to SCALE-decode VersionedAttestation: {e}"))
-        })?;
+    let versioned = VersionedAttestation::decode(&mut &scale_bytes[..]).map_err(|e| {
+        TlsError::General(format!("failed to SCALE-decode VersionedAttestation: {e}"))
+    })?;
     let VersionedAttestation::V0 { attestation } = versioned;
     Ok(attestation)
 }
@@ -329,14 +329,11 @@ fn attestation_from_legacy(
         )));
     }
     let mut report_data = [0u8; 64];
-    report_data
-        .copy_from_slice(&tdx_quote_bytes[TDX_QUOTE_REPORT_DATA_OFFSET..rd_end]);
+    report_data.copy_from_slice(&tdx_quote_bytes[TDX_QUOTE_REPORT_DATA_OFFSET..rd_end]);
 
     // Parse JSON event log and filter for runtime events.
-    let tdx_events: Vec<JsonTdxEvent> =
-        serde_json::from_slice(event_log_json).map_err(|e| {
-            TlsError::General(format!("failed to parse TDX event log JSON: {e}"))
-        })?;
+    let tdx_events: Vec<JsonTdxEvent> = serde_json::from_slice(event_log_json)
+        .map_err(|e| TlsError::General(format!("failed to parse TDX event log JSON: {e}")))?;
 
     let runtime_events: Vec<RuntimeEvent> = tdx_events
         .into_iter()

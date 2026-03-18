@@ -434,7 +434,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                 let pem = std::fs::read_to_string(path)
                     .map_err(|e| format!("failed to read {path}: {e}"))?;
                 if !pem.contains("-----BEGIN CERTIFICATE-----") {
-                    return Err(format!("{path} does not appear to contain a PEM certificate"));
+                    return Err(format!(
+                        "{path} does not appear to contain a PEM certificate"
+                    ));
                 }
                 config.ca_cert = Some(pem);
                 println!("ca_cert set from {path}");
