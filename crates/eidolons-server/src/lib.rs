@@ -19,7 +19,6 @@ pub mod helpers;
 pub mod measurements;
 pub mod response;
 pub mod stripe;
-pub mod tls;
 pub mod types;
 pub mod webhook;
 

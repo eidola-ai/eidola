@@ -650,6 +650,7 @@ mod tests {
 
     #[test]
     fn test_lookup_model() {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let backend = TinfoilBackend::new(reqwest::Client::new(), String::new(), None, Some(1.5));
 
         assert!(backend.lookup_model("kimi-k2-5").is_some());

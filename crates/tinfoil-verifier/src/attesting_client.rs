@@ -253,7 +253,7 @@ pub fn build_attesting_client(
         vcek_cache,
         allowed_measurements,
         attestation_url,
-        supported_algs: provider.signature_verification_algorithms.clone(),
+        supported_algs: provider.signature_verification_algorithms,
     };
 
     let tls_config = rustls::ClientConfig::builder()

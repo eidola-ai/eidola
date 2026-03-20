@@ -5,16 +5,10 @@
 //! responses with inline privacy metadata and cryptographic verification.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use axum::http::StatusCode;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::net::TcpListener;
-use tower_service::Service;
-use tracing::{debug, error, info, warn};
-
-use dstack_sdk::dstack_client::DstackClient;
+use tracing::{error, info, warn};
 
 use eidolons_server::AppState;
 use eidolons_server::backend::TinfoilBackend;
@@ -22,7 +16,6 @@ use eidolons_server::credentials;
 use eidolons_server::helpers::EpochConfig;
 use eidolons_server::measurements;
 use eidolons_server::stripe::StripeClient;
-use eidolons_server::tls;
 
 /// Server configuration.
 struct Config {
@@ -34,8 +27,6 @@ struct Config {
     stripe_webhook_secret: Option<String>,
     credential_master_key: [u8; 32],
     pricing_markup: Option<f64>,
-    dstack: DstackClient,
-    tls_sans: Vec<String>,
 }
 
 impl Config {
@@ -70,25 +61,27 @@ impl Config {
             })
             .transpose()?;
 
-        let tls_sans = tls::parse_sans();
+        let credential_master_key_hex = std::env::var("CREDENTIAL_MASTER_KEY")
+            .map_err(|_| "CREDENTIAL_MASTER_KEY environment variable is required")?;
+        let key_bytes = hex::decode(&credential_master_key_hex)
+            .map_err(|e| format!("invalid CREDENTIAL_MASTER_KEY hex: {e}"))?;
+        let credential_master_key: [u8; 32] = key_bytes.try_into().map_err(|_| {
+            "CREDENTIAL_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string()
+        })?;
 
-        // Derive the credential master key from dstack KMS.
-        // The SDK auto-discovers the socket at /var/run/dstack/dstack.sock (containers
-        // and production). For host-side dev on macOS, DSTACK_SIMULATOR_ENDPOINT can
-        // point at the simulator's HTTP port (e.g. http://localhost:8090).
-        let dstack = DstackClient::new(std::env::var("DSTACK_SIMULATOR_ENDPOINT").ok().as_deref());
-        info!("Deriving credential master key from dstack...");
-        let key_response = dstack
-            .get_key(Some("eidolons/credential-master-key/v1".to_string()), None)
-            .await
-            .map_err(|e| format!("failed to derive credential master key: {e}"))?;
-        let key_bytes = hex::decode(&key_response.key)
-            .map_err(|e| format!("invalid hex in dstack key: {e}"))?;
-        let credential_master_key: [u8; 32] = key_bytes
-            .get(..32)
-            .and_then(|s| <[u8; 32]>::try_from(s).ok())
-            .ok_or("dstack key too short (need >= 32 bytes)")?;
-        info!("Credential master key derived successfully");
+        // Verify measured secret hashes: if *_HASH env vars are set (committed in
+        // tinfoil-config.yml and thus included in the enclave measurement), verify
+        // that the corresponding runtime secret matches the hash. This binds
+        // injected secrets to the measurement without exposing them in the config.
+        verify_measured_secrets(&[
+            ("CREDENTIAL_MASTER_KEY", &credential_master_key_hex),
+            ("TINFOIL_API_KEY", &tinfoil_api_key),
+            ("STRIPE_API_KEY", stripe_api_key.as_deref().unwrap_or("")),
+            (
+                "STRIPE_WEBHOOK_SECRET",
+                stripe_webhook_secret.as_deref().unwrap_or(""),
+            ),
+        ])?;
 
         Ok(Config {
             bind_addr,
@@ -99,10 +92,51 @@ impl Config {
             stripe_webhook_secret,
             credential_master_key,
             pricing_markup,
-            dstack,
-            tls_sans,
         })
     }
+}
+
+/// Verify that runtime secrets match their measured hashes.
+///
+/// For each `(name, value)` pair, checks if `{name}_HASH` is set as an env var.
+/// If present, verifies the Argon2id hash matches `value`. If absent, the secret
+/// is not measured and no check is performed.
+///
+/// The `_HASH` env vars should be hardcoded in `tinfoil-config.yml` so they are
+/// included in the enclave measurement. This cryptographically binds injected
+/// secrets to the measurement without exposing their plaintext in the config.
+fn verify_measured_secrets(secrets: &[(&str, &str)]) -> Result<(), String> {
+    use argon2::PasswordVerifier;
+
+    for (name, value) in secrets {
+        if value.is_empty() {
+            continue;
+        }
+        let hash_var = format!("{name}_HASH");
+        let Ok(expected_hash) = std::env::var(&hash_var) else {
+            continue;
+        };
+        if expected_hash.is_empty() {
+            continue;
+        }
+
+        let parsed = argon2::PasswordHash::new(&expected_hash)
+            .map_err(|e| format!("{hash_var}: invalid Argon2 hash: {e}"))?;
+
+        argon2::Argon2::default()
+            .verify_password(value.as_bytes(), &parsed)
+            .map_err(|_| {
+                format!(
+                    "{name} does not match measured hash in {hash_var}.\n\
+                     The injected secret differs from what was committed in the \
+                     enclave configuration. Refusing to start."
+                )
+            })?;
+
+        tracing::info!("{name} verified against measured hash");
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -120,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    // Load configuration (includes dstack key derivation)
+    // Load configuration
     let config = Config::load().await.map_err(|e| {
         error!("Configuration error: {}", e);
         e
@@ -221,54 +255,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
     );
 
-    // Fetch initial RA-TLS certificate from dstack (fatal on failure).
-    info!("Fetching RA-TLS certificate from dstack...");
-    let initial_cert = tls::fetch_ra_tls_cert(&config.dstack, &config.tls_sans)
-        .await
-        .map_err(|e| {
-            error!("Failed to fetch RA-TLS certificate: {e}");
-            e
-        })?;
-    info!("RA-TLS certificate obtained");
-
-    let resolver = tls::RaTlsCertResolver::new(initial_cert);
-    let tls_acceptor = tls::build_tls_acceptor(Arc::clone(&resolver));
-
-    // Spawn background cert rotation (attestation quotes expire).
-    tls::spawn_cert_rotation_task(Arc::clone(&resolver), config.dstack, config.tls_sans);
-
-    // Bind and serve with RA-TLS.
     let listener = TcpListener::bind(config.bind_addr).await?;
-    info!("Listening on https://{}", config.bind_addr);
-
-    loop {
-        let (tcp_stream, remote_addr) = listener.accept().await?;
-        let tls_acceptor = tls_acceptor.clone();
-        let app = app.clone();
-
-        tokio::spawn(async move {
-            let tls_stream = match tls_acceptor.accept(tcp_stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!("TLS handshake failed from {remote_addr}: {e}");
-                    return;
-                }
-            };
-
-            let io = TokioIo::new(tls_stream);
-            let service = hyper::service::service_fn(move |req| {
-                let mut app = app.clone();
-                async move { app.call(req).await }
-            });
-
-            if let Err(e) = AutoBuilder::new(TokioExecutor::new())
-                .serve_connection(io, service)
-                .await
-            {
-                debug!("Connection error from {remote_addr}: {e}");
-            }
-        });
-    }
+    info!("Listening on http://{}", config.bind_addr);
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 #[cfg(test)]

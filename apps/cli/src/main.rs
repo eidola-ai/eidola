@@ -1,4 +1,3 @@
-mod attestation;
 mod config;
 mod db;
 
@@ -32,9 +31,9 @@ enum Command {
     Configure {
         #[arg(long)]
         base_url: Option<String>,
-        /// Path to a PEM file containing the CA certificate to trust
+        /// URL for attestation verification (defaults to Tinfoil ATC)
         #[arg(long)]
-        ca_cert: Option<String>,
+        attestation_url: Option<String>,
     },
     /// Manage account
     Account {
@@ -268,47 +267,40 @@ fn now_iso() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
-/// Build a reqwest client. When `ca_cert` is configured, only that CA is
-/// trusted (no public WebPKI roots) and the RA-TLS attestation verifier is
-/// always active — the server's compose_hash must appear in
-/// `trusted_compose_hashes` or the connection is refused.
-fn build_client(config: &Config) -> Result<reqwest::Client, String> {
-    match config.ca_cert.as_deref() {
-        Some(pem) => {
-            // Build a WebPKI verifier with the pinned CA, then wrap it in
-            // our attestation verifier.
-            let mut ca_store = rustls::RootCertStore::empty();
-            let certs = rustls_pemfile::certs(&mut pem.as_bytes())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("invalid ca_cert PEM: {e}"))?;
-            for cert in certs {
-                ca_store
-                    .add(cert)
-                    .map_err(|e| format!("failed to add CA cert: {e}"))?;
-            }
-
-            let webpki_verifier =
-                rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(ca_store))
-                    .build()
-                    .map_err(|e| format!("failed to build WebPKI verifier: {e}"))?;
-
-            let attest_verifier = std::sync::Arc::new(attestation::AttestationVerifier::new(
-                webpki_verifier,
-                config.trusted_compose_hashes.clone(),
-            ));
-
-            let tls_config = rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(attest_verifier)
-                .with_no_client_auth();
-
-            reqwest::Client::builder()
-                .use_preconfigured_tls(tls_config)
-                .build()
-                .map_err(|e| format!("failed to build HTTP client: {e}"))
-        }
-        None => Ok(reqwest::Client::new()),
+/// Build a reqwest client. When `trusted_measurements` is configured, the
+/// client verifies Tinfoil enclave attestation on each new TLS connection,
+/// ensuring the server is running expected code inside a TEE.
+async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
+    if config.trusted_measurements.is_empty() {
+        return Ok(reqwest::Client::new());
     }
+
+    let base_url = config
+        .base_url
+        .as_deref()
+        .ok_or("base_url is required when trusted_measurements is set")?;
+
+    let measurements: Vec<&str> = config
+        .trusted_measurements
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+
+    let (client, verification) =
+        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
+            allowed_measurements: &measurements,
+            inference_base_url: base_url,
+            atc_url: config.attestation_url.as_deref(),
+        })
+        .await
+        .map_err(|e| format!("attestation verification failed: {e}"))?;
+
+    eprintln!(
+        "attestation verified — measurement: {}, tls: {}",
+        verification.measurement, verification.tls_fingerprint
+    );
+
+    Ok(client)
 }
 
 /// Map a reqwest send error to a human-readable message.
@@ -316,8 +308,6 @@ fn build_client(config: &Config) -> Result<reqwest::Client, String> {
 /// surfaces them explicitly instead of printing a generic "error sending
 /// request" wrapper.
 fn describe_request_error(e: reqwest::Error) -> String {
-    // Walk the full error chain so we can detect messages from inner layers
-    // (rustls → our AttestationVerifier) that reqwest's Display may truncate.
     let mut chain = format!("{e}");
     {
         let mut source = std::error::Error::source(&e);
@@ -327,28 +317,25 @@ fn describe_request_error(e: reqwest::Error) -> String {
             source = err.source();
         }
     }
-    if chain.contains("compose_hash") && chain.contains("not in the trusted set") {
+    if chain.contains("measurement") && chain.contains("allowed") {
         return format!(
-            "attestation failed: the server's compose_hash is not in your \
-             trusted_compose_hashes list.\n\
+            "attestation failed: the server's enclave measurement is not in your \
+             trusted_measurements list.\n\
              The running server version is not trusted by this client.\n\
-             Update trusted_compose_hashes in your config, or verify you are \
+             Update trusted_measurements in your config, or verify you are \
              connecting to the correct server.\n\
              (inner: {chain})"
         );
     }
-    if chain.contains("missing PHALA_RATLS_ATTESTATION") {
+    if chain.contains("fingerprint") && chain.contains("mismatch") {
         return format!(
-            "attestation failed: the server's TLS certificate does not contain \
-             an RA-TLS attestation extension.\n\
-             The server may not be running inside a Confidential VM, or the \
-             dstack simulator may not support attestation certificates.\n\
+            "attestation failed: TLS certificate does not match the attested enclave.\n\
              (inner: {chain})"
         );
     }
     if chain.contains("attestation") {
         return format!(
-            "attestation failed: could not verify the server's RA-TLS certificate.\n\
+            "attestation failed: could not verify the server's enclave attestation.\n\
              (inner: {chain})"
         );
     }
@@ -403,43 +390,35 @@ async fn run(cli: Cli) -> Result<(), String> {
                     "<not set>"
                 }
             );
-            println!(
-                "ca_cert: {}",
-                if config.ca_cert.is_some() {
-                    "<set>"
-                } else {
-                    "<not set>"
-                }
-            );
-            if config.trusted_compose_hashes.is_empty() {
-                println!("trusted_compose_hashes: <none> (all connections will be refused)");
+            if config.trusted_measurements.is_empty() {
+                println!("trusted_measurements: <none> (attestation disabled)");
             } else {
                 println!(
-                    "trusted_compose_hashes: {}",
-                    config.trusted_compose_hashes.join(", ")
+                    "trusted_measurements: {}",
+                    config.trusted_measurements.join(", ")
                 );
             }
+            println!(
+                "attestation_url: {}",
+                config.attestation_url.as_deref().unwrap_or("<default ATC>")
+            );
             Ok(())
         }
-        Some(Command::Configure { base_url, ca_cert }) => {
-            if base_url.is_none() && ca_cert.is_none() {
-                return Err("specify at least one of --base_url or --ca_cert".into());
+        Some(Command::Configure {
+            base_url,
+            attestation_url,
+        }) => {
+            if base_url.is_none() && attestation_url.is_none() {
+                return Err("specify at least one of --base-url or --attestation-url".into());
             }
             let mut config = Config::load();
             if let Some(url) = &base_url {
                 config.base_url = Some(url.clone());
                 println!("base_url set to {url}");
             }
-            if let Some(path) = &ca_cert {
-                let pem = std::fs::read_to_string(path)
-                    .map_err(|e| format!("failed to read {path}: {e}"))?;
-                if !pem.contains("-----BEGIN CERTIFICATE-----") {
-                    return Err(format!(
-                        "{path} does not appear to contain a PEM certificate"
-                    ));
-                }
-                config.ca_cert = Some(pem);
-                println!("ca_cert set from {path}");
+            if let Some(url) = &attestation_url {
+                config.attestation_url = Some(url.clone());
+                println!("attestation_url set to {url}");
             }
             config.save()?;
             Ok(())
@@ -471,7 +450,7 @@ async fn cmd_account_show() -> Result<(), String> {
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = build_client(&config)?;
+    let client = build_client(&config).await?;
     let resp = client
         .get(format!("{base_url}/v1/account"))
         .basic_auth(id, Some(secret))
@@ -508,7 +487,7 @@ async fn cmd_account_create() -> Result<(), String> {
         );
     }
 
-    let client = build_client(&config)?;
+    let client = build_client(&config).await?;
     let resp = client
         .post(format!("{base_url}/v1/account"))
         .send()
@@ -567,7 +546,7 @@ async fn cmd_account_prices() -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
 
-    let client = build_client(&config)?;
+    let client = build_client(&config).await?;
     let resp = client
         .get(format!("{base_url}/v1/prices"))
         .send()
@@ -624,7 +603,7 @@ async fn cmd_account_checkout(price_id: &str, no_browser: bool) -> Result<(), St
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = build_client(&config)?;
+    let client = build_client(&config).await?;
     let resp = client
         .post(format!("{base_url}/v1/account/checkout"))
         .basic_auth(id, Some(secret))
@@ -660,7 +639,7 @@ async fn cmd_account_balances() -> Result<(), String> {
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = build_client(&config)?;
+    let client = build_client(&config).await?;
     let resp = client
         .get(format!("{base_url}/v1/account/balances"))
         .basic_auth(id, Some(secret))
@@ -699,7 +678,7 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
     let (account_id, secret) = require_credentials(&config)?;
-    let client = build_client(&config)?;
+    let client = build_client(&config).await?;
 
     // 1. Fetch issuer keys from server
     let resp = client
@@ -869,8 +848,8 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
 async fn cmd_chat(prompt: &str) -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
-    let client = build_client(&config)?;
-    let model_id = "phala/qwen3-vl-30b-a3b-instruct";
+    let client = build_client(&config).await?;
+    let model_id = "kimi-k2-5";
 
     // 1. Fetch model info for pricing
     let resp = client

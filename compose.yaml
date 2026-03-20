@@ -1,17 +1,4 @@
 services:
-  simulator:
-    image: dstack-simulator:dev
-    build:
-      context: .
-      dockerfile: docker/simulator/Containerfile
-    ports:
-      - "8090:8090"
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "-o", "/dev/null", "-w", "", "-X", "POST", "-H", "Content-Type: application/json", "-d", "{}", "http://localhost:8090/GetKey"]
-      interval: 2s
-      retries: 15
-      start_period: 5s
-
   postgres:
     image: eidolons-postgres:dev
     build:
@@ -39,17 +26,14 @@ services:
     environment:
       DATABASE_URL: postgres://eidolons@postgres/eidolons
       TINFOIL_API_KEY: ${TINFOIL_API_KEY}
+      CREDENTIAL_MASTER_KEY: ${CREDENTIAL_MASTER_KEY}
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
-      BIND_ADDR: 0.0.0.0:8443
-      DSTACK_SIMULATOR_ENDPOINT: http://simulator:8090
-      TLS_SANS: localhost,server
+      BIND_ADDR: 0.0.0.0:8080
     ports:
-      - "8443:8443"
+      - "8080:8080"
     depends_on:
       postgres:
-        condition: service_healthy
-      simulator:
         condition: service_healthy
 
   stripe-cli:
@@ -60,7 +44,7 @@ services:
     profiles: ["test"]
     environment:
       STRIPE_API_KEY: ${STRIPE_API_KEY}
-    command: ["listen", "--forward-to", "https://server:8443/v1/webhooks/stripe", "--skip-verify"]
+    command: ["listen", "--forward-to", "http://server:8080/v1/webhooks/stripe"]
 
 volumes:
   pgdata:

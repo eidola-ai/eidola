@@ -61,24 +61,8 @@ hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
 
-# TEE integration
-dstack-sdk = { git = "https://github.com/Dstack-TEE/dstack.git", default-features = false }
-
-# Tinfoil attestation verification and TLS pinning
+# Tinfoil attestation verification
 tinfoil-verifier = { path = "../tinfoil-verifier" }
-
-# TLS termination (RA-TLS)
-tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
-rustls-pemfile = "2"
-hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
-arc-swap = "1"
-
-# Service trait for hyper integration
-tower-service = "0.3"
-
-# Error handling
-anyhow = "1"
 
 # Utilities
 futures-util = "0.3"

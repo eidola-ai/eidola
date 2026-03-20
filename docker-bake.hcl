@@ -44,16 +44,6 @@ target "postgres" {
   tags     = ["eidolons-postgres:dev"]
 }
 
-# dstack simulator — local dev only, never pushed to a registry.
-# Built from source because the upstream Docker image (phalanetwork/tappd-simulator)
-# is stale. Platform is omitted so it builds natively (no Rosetta needed).
-target "simulator" {
-  context    = "."
-  dockerfile = "docker/simulator/Containerfile"
-  tags       = ["dstack-simulator:dev"]
-  attest     = []
-}
-
 # Stripe CLI — pins the upstream image by digest so dependabot can propose
 # updates via the Containerfile, rather than silently pulling :latest.
 target "stripe-cli" {

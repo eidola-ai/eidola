@@ -40,12 +40,7 @@ updates:
       interval: "weekly"
 
   - package-ecosystem: "docker"
-    directory: "/docker/simulator"
-    schedule:
-      interval: "weekly"
-
-  - package-ecosystem: "stripe-cli"
-    directory: "/docker/postgresql"
+    directory: "/docker/stripe-cli"
     schedule:
       interval: "weekly"
 

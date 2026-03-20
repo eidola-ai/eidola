@@ -10,7 +10,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 
 **Database:** PostgreSQL 17+ (see `crates/eidolons-server/schema/schema.sql`)
 
-**Deployment:** Tinfoil Containers (planned) — all services run inside confidential enclaves. dstack is used locally for key derivation and RA-TLS certificate provisioning via the simulator.
+**Deployment:** Tinfoil Containers — all services run inside confidential enclaves (AMD SEV-SNP). The Tinfoil shim handles TLS termination with attestation-bearing certificates; the server runs plain HTTP behind it.
 
 **CI:** Two workflows — `ci.yml` (self-hosted Mac: Nix checks, Swift builds/tests) and `oci.yml` (ubuntu-latest: OCI image builds, manifest verification, GHCR publishing).
 
@@ -18,8 +18,8 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 
 **Key design decisions:**
 - Axum-based HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration
-- RA-TLS termination via `rustls-rustcrypto` + `tokio-rustls` (no C dependencies); attestation-bearing certs from dstack
-- Tinfoil attestation verification via `tinfoil-verifier` crate — verifies SEV-SNP hardware attestation and pins TLS to the attested enclave certificate before proxying any requests
+- Plain HTTP internally; TLS terminated by Tinfoil Container shim with attestation-bearing certificates (attestation hash + HPKE key encoded in SANs, issued by public CA)
+- Tinfoil attestation verification via `tinfoil-verifier` crate — verifies SEV-SNP hardware attestation per-connection, caching verified fingerprints for fast reconnections; handles load-balanced deployments
 - Statically linked musl binaries for Linux deployment
 - StageX-based OCI images (reproducible, `FROM scratch`, runs as non-root)
 - Request-based (no sessions/caching in the proxy layer)
@@ -31,41 +31,38 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 **Environment variables:**
 - `TINFOIL_API_KEY` (required) - Tinfoil inference API key
 - `DATABASE_URL` (required) - PostgreSQL connection string
-- `BIND_ADDR` (default: `127.0.0.1:8443`) - Address to bind (HTTPS)
+- `CREDENTIAL_MASTER_KEY` (required) - Hex-encoded 32-byte AES-256 key for encrypting issuer private keys at rest in Postgres; in production, injected as a Tinfoil secret; in local dev, use the all-zeros key from `.env.example`
+- `BIND_ADDR` (default: `127.0.0.1:8443`) - Address to bind (HTTP); Containerfile overrides to `0.0.0.0:8080`
 - `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
 - `STRIPE_WEBHOOK_SECRET` (optional) - Stripe webhook signing secret; webhook endpoint returns 503 without it
-- `DSTACK_SIMULATOR_ENDPOINT` (optional) - dstack simulator HTTP endpoint (e.g. `http://localhost:8090`) for host-side dev on macOS; omit in containers and production where the SDK auto-discovers the Unix socket
-- `TLS_SANS` (optional) - Comma-separated TLS Subject Alternative Names (default: `localhost,server`); set to the enclave's DNS name or IP in production
 - `TINFOIL_BASE_URL` (optional) - Override the default Tinfoil API base URL (`https://inference.tinfoil.sh/v1`)
 - `TINFOIL_PRICING_OVERRIDES` (optional) - JSON object overriding per-model pricing; e.g. `{"kimi-k2-5":{"input":2.0,"output":6.0}}`. Token-based models accept `input`/`output` ($/M tokens); per-request models accept `request` ($/request). See `backend.rs` `MODEL_CATALOG` for defaults
 - `PRICING_MARKUP` (optional) - Pricing markup factor applied to all model prices (default: `1.5`)
 
-**dstack / TEE integration:**
+**Tinfoil Containers / TEE integration:**
 
-The credential master key (AES-256, used to encrypt issuer private keys at rest in Postgres) is derived deterministically from the dstack KMS via `get_key("eidolons/credential-master-key/v1")` using the `dstack-sdk` crate directly. It is never configured manually — the dstack guest agent (real TEE) or simulator (local dev) provides it. The key is bound to the application's `app_id`, which persists across upgrades, so encrypted issuer keys in the database remain accessible after redeployment.
+The server runs as plain HTTP inside a Tinfoil Container. The Tinfoil shim handles TLS termination externally, generating attestation-bearing certificates (attestation hash and HPKE key encoded in SANs, issued by a public CA via ACME). The shim serves `/.well-known/tinfoil-attestation` for client-side verification.
 
-The server performs its own TLS termination using RA-TLS (Remote Attestation TLS). On startup it calls `get_tls_key()` with `usage_ra_tls: true` to obtain a private key and certificate chain from the dstack guest agent. The certificate embeds an attestation quote in an X.509 extension, allowing clients to cryptographically verify they are communicating with code running inside a TEE. Certificates are regenerated every ~12 hours (with jitter) via a background task, since attestation quotes expire. Each server instance independently obtains its own RA-TLS certificate — no cross-instance coordination is needed. The cert resolver uses lock-free `ArcSwap` for zero-contention hot-swapping on the TLS handshake path.
+The credential master key (`CREDENTIAL_MASTER_KEY`, AES-256, hex-encoded) encrypts issuer private keys at rest in Postgres. In production, it is injected as a Tinfoil secret (environment variable, encrypted, only accessible inside the enclave). In local dev, use the all-zeros dev key from `.env.example`. The key must remain stable across upgrades so encrypted issuer keys in the database remain accessible.
 
-In local dev (both containerised and host-side), the server connects to the simulator over HTTP via `DSTACK_SIMULATOR_ENDPOINT=http://simulator:8090` (set in `compose.yaml`) or `http://localhost:8090` (set in `.env` for `cargo run`). In production, the SDK auto-discovers the CVM-provided socket at `/var/run/dstack/dstack.sock`.
+The container has access to `/dev/sev-guest` (via the undocumented `devices` field in `tinfoil-config.yml`) for requesting SEV-SNP attestation reports. The pre-generated attestation document and TLS key material are also available at `/tinfoil/` inside the container.
 
 **Tinfoil attestation verification (`crates/tinfoil-verifier/`):**
 
-On startup the server verifies the Tinfoil inference enclave's hardware attestation before sending any traffic. The `tinfoil-verifier` crate handles this in a single `verify_and_pin()` call:
+On startup the server verifies the Tinfoil inference enclave's hardware attestation before sending any traffic. The `tinfoil-verifier` crate handles this via `attesting_client()`:
 
-1. Fetches the attestation bundle from the Tinfoil ATC service (`https://atc.tinfoil.sh/attestation`)
-2. Verifies the AMD VCEK certificate chain (embedded Genoa ARK → ASK → VCEK from bundle) using RSA-PSS(SHA-384)
+1. Fetches the attestation bundle from the Tinfoil ATC service for initial bootstrap verification
+2. Verifies the AMD VCEK certificate chain (embedded Genoa ARK → ASK → VCEK) using RSA-PSS(SHA-384)
 3. Verifies the SEV-SNP attestation report's ECDSA-P384 signature against the VCEK public key
 4. Validates TCB policy (minimum firmware versions: bl≥0x07, snp≥0x0e, ucode≥0x48)
-5. Checks the report measurement against `ALLOWED_MEASUREMENTS` in `backend.rs`
+5. Checks the report measurement against `ALLOWED_MEASUREMENTS` in `measurements.rs`
 6. Cross-checks the enclave TLS certificate's SPKI fingerprint against `report_data[0..32]`
-7. Returns a `reqwest::Client` pinned to the attested TLS public key via a custom rustls `ServerCertVerifier`
+7. Returns a `reqwest::Client` with a custom `ServerCertVerifier` that verifies attestation per-connection
 
-The pinned client is injected into `TinfoilBackend`, ensuring all inference traffic goes only to the verified enclave. Pure Rust dependencies (`p384`, `ecdsa`, `rsa`, `x509-parser`) — no OpenSSL.
-
-**dstack simulator:** Built from source (`docker/simulator/`) because the upstream Docker image is stale. A custom `dstack.toml` binds the internal RPC endpoint (GetKey, GetQuote, etc.) to TCP :8090 — the upstream default only uses Unix sockets. Builds natively for the host platform (no cross-compilation). First build takes ~10 min; subsequent builds use the cargo cache layer.
+Unlike static cert pinning, verified SPKI fingerprints are cached so reconnections to already-attested instances are instant. New connections fetch `/.well-known/tinfoil-attestation` from the connected instance, verify the SEV-SNP report, and cache the result. VCEKs are cached per chip ID and fetched from AMD KDS when encountering a new chip. This handles load-balanced deployments where each instance has its own TLS key. Pure Rust dependencies (`sev`, `x509-cert`, `der`) — no OpenSSL.
 
 **Compose files:**
-- `compose.yaml` — local development: simulator + postgres + server + stripe-cli
+- `compose.yaml` — local development: postgres + server + stripe-cli
 
 ## Crux Architecture
 

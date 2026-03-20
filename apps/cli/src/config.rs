@@ -25,18 +25,16 @@ pub struct Config {
     pub account_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain_separator: Option<String>,
-    /// PEM-encoded CA certificate for RA-TLS verification.
-    /// Typically the dstack App CA (per-app trust anchor), not the
-    /// infrastructure Root CA (which would trust all dstack apps).
-    /// When set, only this CA is trusted (no public WebPKI roots).
-    #[serde(alias = "root_ca", skip_serializing_if = "Option::is_none")]
-    pub ca_cert: Option<String>,
-    /// Trusted compose hashes for RA-TLS attestation verification.
-    /// When `ca_cert` is set, the CLI always verifies the server's attestation
-    /// certificate contains a compose_hash in this set. If the list is empty,
-    /// no compose_hash can match and every connection is refused.
+    /// Trusted enclave measurements (hex-encoded, SEV-SNP).
+    /// When non-empty, the CLI verifies the server's Tinfoil attestation
+    /// before sending any confidential requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub trusted_compose_hashes: Vec<String>,
+    pub trusted_measurements: Vec<String>,
+    /// URL to fetch the server's attestation bundle for verification.
+    /// Defaults to the Tinfoil ATC endpoint. Only used when
+    /// `trusted_measurements` is non-empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_url: Option<String>,
 }
 
 impl Config {

@@ -30,12 +30,11 @@ fi
 
 echo "==> Building images (docker-dev profile)..."
 CARGO_PROFILE=docker-dev docker buildx bake
-docker buildx bake simulator
 
 # ── Start postgres, wait healthy, apply schema ───────────────────────────────
 
-echo "==> Starting simulator and postgres..."
-docker compose up -d simulator postgres
+echo "==> Starting postgres..."
+docker compose up -d postgres
 echo "==> Waiting for postgres to be healthy..."
 for i in $(seq 1 30); do
     if docker compose exec postgres pg_isready -U eidolons >/dev/null 2>&1; then
