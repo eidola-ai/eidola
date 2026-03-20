@@ -147,17 +147,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let credential_key_cache: credentials::KeyCache = Default::default();
     let epoch_config = EpochConfig::default();
 
-    // Verify Tinfoil enclave attestation and build a TLS-pinned client.
+    // Verify Tinfoil enclave attestation and build an attesting client.
     info!("Verifying Tinfoil enclave attestation...");
-    let (pinned_client, verification) = tinfoil_verifier::verify_and_pin(
-        measurements::ALLOWED,
-        None, // use default ATC endpoint
-    )
-    .await
-    .map_err(|e| {
-        error!("Tinfoil attestation verification failed: {e}");
-        e
-    })?;
+    let default_base_url = "https://inference.tinfoil.sh/v1".to_string();
+    let inference_base_url = config
+        .tinfoil_base_url
+        .as_deref()
+        .unwrap_or(&default_base_url);
+    let (attesting_client, verification) =
+        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
+            allowed_measurements: measurements::ALLOWED,
+            inference_base_url,
+            atc_url: None,
+        })
+        .await
+        .map_err(|e| {
+            error!("Tinfoil attestation verification failed: {e}");
+            e
+        })?;
     info!(
         "Tinfoil attestation verified — measurement: {}, TLS fingerprint: {}",
         verification.measurement, verification.tls_fingerprint
@@ -166,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create shared state
     let state = AppState::new(
         TinfoilBackend::new(
-            pinned_client,
+            attesting_client,
             config.tinfoil_api_key.clone(),
             config.tinfoil_base_url.clone(),
             config.pricing_markup,

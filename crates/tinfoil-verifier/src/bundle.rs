@@ -22,6 +22,7 @@ pub struct AttestationBundle {
     pub sigstore_bundle: Option<serde_json::Value>,
 }
 
+/// Attestation document (used in both ATC bundles and `/.well-known/tinfoil-attestation`).
 #[derive(Debug, Deserialize)]
 pub struct AttestationDocument {
     pub format: String,

@@ -19,18 +19,18 @@ const MIN_BL_SPL: u8 = 0x07;
 const MIN_SNP_SPL: u8 = 0x0E;
 const MIN_UCODE_SPL: u8 = 0x48;
 
-/// Verify the VCEK certificate chain and attestation report signature.
+/// Parse a raw attestation report without verifying its signature.
+pub fn parse_report(report_bytes: &[u8]) -> Result<AttestationReport, Error> {
+    AttestationReport::decode(&mut Cursor::new(report_bytes), ())
+        .map_err(|e| Error::Report(format!("failed to parse attestation report: {e}")))
+}
+
+/// Verify a VCEK certificate chain and an already-parsed report's signature.
 ///
-/// 1. Builds the chain: embedded Genoa ARK → ASK → VCEK (from bundle)
+/// 1. Builds the chain: embedded Genoa ARK → ASK → VCEK
 /// 2. Verifies the chain (ARK self-signed, ARK signs ASK, ASK signs VCEK)
-/// 3. Parses the raw attestation report
-/// 4. Verifies the report's ECDSA-P384 signature against the VCEK
-///
-/// Returns the parsed [`AttestationReport`] on success.
-pub fn verify_attestation(
-    vcek_der: &[u8],
-    report_bytes: &[u8],
-) -> Result<AttestationReport, Error> {
+/// 3. Verifies the report's ECDSA-P384 signature against the VCEK
+pub fn verify_report(vcek_der: &[u8], report: &AttestationReport) -> Result<(), Error> {
     let chain = Chain {
         ca: ca::Chain {
             ark: genoa::ark()
@@ -47,15 +47,37 @@ pub fn verify_attestation(
         .verify()
         .map_err(|e| Error::CertChain(format!("certificate chain verification failed: {e}")))?;
 
-    let report = AttestationReport::decode(&mut Cursor::new(report_bytes), ())
-        .map_err(|e| Error::Report(format!("failed to parse attestation report: {e}")))?;
-
     tracing::debug!("Verifying attestation report signature...");
-    (verified_vek, &report)
+    (verified_vek, report)
         .verify()
         .map_err(|e| Error::Signature(format!("report signature verification failed: {e}")))?;
 
+    Ok(())
+}
+
+/// Verify the VCEK certificate chain and attestation report signature.
+///
+/// Convenience wrapper that parses the report and verifies in one call.
+/// Returns the parsed [`AttestationReport`] on success.
+pub fn verify_attestation(
+    vcek_der: &[u8],
+    report_bytes: &[u8],
+) -> Result<AttestationReport, Error> {
+    let report = parse_report(report_bytes)?;
+    verify_report(vcek_der, &report)?;
     Ok(report)
+}
+
+/// Build the AMD KDS URL for fetching a VCEK certificate.
+///
+/// URL format: `https://kdsintf.amd.com/vcek/v1/Genoa/{chip_id}?blSPL={bl}&teeSPL={tee}&snpSPL={snp}&ucodeSPL={ucode}`
+pub fn kds_vcek_url(report: &AttestationReport) -> String {
+    let chip_id = hex::encode(report.chip_id);
+    let tcb = &report.reported_tcb;
+    format!(
+        "https://kdsintf.amd.com/vcek/v1/Genoa/{chip_id}?blSPL={}&teeSPL={}&snpSPL={}&ucodeSPL={}",
+        tcb.bootloader, tcb.tee, tcb.snp, tcb.microcode
+    )
 }
 
 /// Validate TCB version against minimum policy.
