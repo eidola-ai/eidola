@@ -75,11 +75,11 @@ update-manifest:
     BUILDER="eidolons"
     if ! docker buildx inspect "$BUILDER" &>/dev/null; then
       echo "Creating docker-container builder '$BUILDER'..."
-      docker buildx create --name "$BUILDER" --driver docker-container
+      docker buildx create --name "$BUILDER" --driver docker-container --driver-opt image=moby/buildkit:v0.28.0
     fi
     docker buildx bake \
       --builder "$BUILDER" \
-      --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true' \
+      --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip' \
       --metadata-file /tmp/bake-metadata.json
     jq -n \
       --arg server "$(jq -r '."server"."containerimage.digest"' /tmp/bake-metadata.json)" \

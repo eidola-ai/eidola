@@ -24,8 +24,11 @@ target "_common" {
     SOURCE_DATE_EPOCH = "${SOURCE_DATE_EPOCH}"
     CARGO_PROFILE     = "${CARGO_PROFILE}"
   }
-  # Disable provenance attestations (non-deterministic metadata)
-  attest = []
+  # Disable default inline provenance (contains non-deterministic metadata
+  # like builder ID and timestamps that break cross-environment reproducibility).
+  # An empty attest list is not enough — buildx still injects mode=min,inline-only
+  # provenance unless explicitly disabled.
+  attest = ["type=provenance,disabled=true"]
 }
 
 # ── Local dev targets (compose.yaml overlay) ──────────────────────────────────
@@ -70,7 +73,7 @@ group "default" {
 # (used by CI via setup-buildx-action).
 target "_ci" {
   inherits = ["_common"]
-  output   = ["type=image,push=true,rewrite-timestamp=true,force-compression=true"]
+  output   = ["type=image,push=true,rewrite-timestamp=true,force-compression=true,compression=gzip"]
 }
 
 target "ci-server" {

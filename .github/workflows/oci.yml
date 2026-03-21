@@ -26,6 +26,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          driver-opts: image=moby/buildkit:v0.28.0
 
       - name: Build OCI images
         run: |
@@ -33,7 +35,7 @@ jobs:
           # supports rewrite-timestamp and force-compression for full
           # reproducibility. Override the default output to enable them.
           docker buildx bake \
-            --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true' \
+            --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip' \
             --metadata-file /tmp/bake-metadata.json
 
       - name: Extract digests
@@ -81,20 +83,17 @@ jobs:
           SERVER_DIGEST: ${{ steps.digests.outputs.server }}
           POSTGRES_DIGEST: ${{ steps.digests.outputs.postgres }}
         run: |
-          TOTAL_LINES=$(wc -l < artifact-manifest.json | tr -d ' ')
-
           jq -n \
             --arg server "$SERVER_DIGEST" \
             --arg postgres "$POSTGRES_DIGEST" \
-            --arg total_lines "$TOTAL_LINES" \
             '{
               event: "REQUEST_CHANGES",
               body: "**Artifact Manifest Update Required**\n\nThe OCI images built from this PR produce different digests than what is committed in `artifact-manifest.json`. Accept the suggestion below to update it.\n\n| Image | Digest |\n|-------|---------|\n| eidolons-server | `\($server[0:19])...` |\n| eidolons-postgres | `\($postgres[0:19])...` |",
               comments: [{
                 path: "artifact-manifest.json",
-                line: ($total_lines | tonumber),
-                start_line: 1,
-                body: "The OCI build produced different digests than what is committed. Please accept this suggestion to update the manifest:\n```suggestion\n{\n  \"eidolons-server\": \"\($server)\",\n  \"eidolons-postgres\": \"\($postgres)\"\n}\n```"
+                line: 3,
+                start_line: 2,
+                body: "```suggestion\n  \"eidolons-server\": \"\($server)\",\n  \"eidolons-postgres\": \"\($postgres)\"\n```"
               }]
             }' | gh api --silent -X POST \
               "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
