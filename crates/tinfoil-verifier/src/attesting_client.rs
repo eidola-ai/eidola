@@ -31,6 +31,10 @@ struct AttestingVerifier {
     verified: DashSet<[u8; 32]>,
     /// Cached VCEK DER bytes keyed by chip_id.
     vcek_cache: DashMap<[u8; 64], Vec<u8>>,
+    /// Optional custom trusted ARK (Root CA) DER bytes.
+    trusted_ark_der: Option<Vec<u8>>,
+    /// Optional custom trusted ASK DER bytes.
+    trusted_ask_der: Option<Vec<u8>>,
     /// Allowed code measurements (hex-encoded).
     allowed_measurements: Vec<String>,
     /// URL to fetch attestation from (`/.well-known/tinfoil-attestation`).
@@ -75,11 +79,16 @@ impl AttestingVerifier {
             .await?
             .to_vec();
 
-        // Verify the fetched VCEK chains to hardcoded ARK/ASK before trusting it.
+        // Verify the fetched VCEK chains to trusted/hardcoded ARK/ASK before trusting it.
         // verify_report builds the full chain and checks ARK → ASK → VCEK signatures.
         // We pass the report to also verify the report signature, but the chain
         // verification is what validates the VCEK itself.
-        sevsnp::verify_report(&vcek_der, report)?;
+        sevsnp::verify_report(
+            &vcek_der,
+            report,
+            self.trusted_ark_der.as_deref(),
+            self.trusted_ask_der.as_deref(),
+        )?;
 
         // Cache for future use
         self.vcek_cache.insert(report.chip_id, vcek_der.clone());
@@ -95,33 +104,46 @@ impl AttestingVerifier {
     /// `target_fp`. Adds any successfully-verified fingerprint to the cache
     /// (even if it's not the target — it's still a valid attested instance).
     async fn verify_new_fingerprint(&self, target_fp: [u8; 32]) -> Result<(), crate::Error> {
-        // Ephemeral client with standard webpki roots — the attestation response
-        // is self-authenticating (SEV-SNP chain), so this transport doesn't need
-        // our custom verifier.
-        let fetch_client = reqwest::Client::builder()
+        // Ephemeral client for fetching attestation documents. When a custom
+        // trusted root is configured (dev shim), it's added so TLS works with
+        // the dev shim's self-signed cert chain.
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(30));
+        if let Some(ark_der) = &self.trusted_ark_der {
+            if let Ok(cert) = reqwest::Certificate::from_der(ark_der) {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        let fetch_client = builder
             .build()
             .map_err(|e| crate::Error::Tls(format!("ephemeral client: {e}")))?;
 
         for attempt in 0..MAX_VERIFY_ATTEMPTS {
-            let doc: bundle::AttestationDocument = fetch_client
-                .get(&self.attestation_url)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
+            // Fetch attestation (tries v3 with embedded VCEK, falls back to v2)
+            let resolved = bundle::fetch_well_known(&fetch_client, &self.attestation_url).await?;
 
-            // Parse the report first (without signature verification) to get chip_id
-            let report_bytes = bundle::decode_report(&doc.body)?;
-            let report = sevsnp::parse_report(&report_bytes)?;
+            let report_bytes = &resolved.report_bytes;
+            let report = sevsnp::parse_report(report_bytes)?;
 
-            // Resolve VCEK for this chip (cached or fetched from AMD KDS)
-            let vcek_der = self.resolve_vcek(&report, &fetch_client).await?;
+            // Resolve VCEK: prefer embedded (v3), fall back to cache/AMD KDS
+            let vcek_der = match resolved.vcek_der {
+                Some(vcek) => vcek,
+                None => self.resolve_vcek(&report, &fetch_client).await?,
+            };
+
+            // Resolve ARK/ASK: prefer trusted config, fall back to doc
+            let ark_der = self
+                .trusted_ark_der
+                .as_deref()
+                .or(resolved.ark_der.as_deref());
+            let ask_der = self
+                .trusted_ask_der
+                .as_deref()
+                .or(resolved.ask_der.as_deref());
 
             // Verify report signature against the VCEK
-            sevsnp::verify_report(&vcek_der, &report)?;
+            sevsnp::verify_report(&vcek_der, &report, ark_der, ask_der)?;
             sevsnp::verify_tcb_policy(&report)?;
 
             // Check measurement
@@ -193,7 +215,8 @@ impl ServerCertVerifier for AttestingVerifier {
 
         // Slow path: fetch and verify attestation (blocks the handshake)
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.verify_new_fingerprint(fingerprint))
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(self.verify_new_fingerprint(fingerprint))
         });
 
         match result {
@@ -236,6 +259,8 @@ pub fn build_attesting_client(
     initial_fingerprint: [u8; 32],
     initial_chip_id: [u8; 64],
     initial_vcek_der: Vec<u8>,
+    trusted_ark_der: Option<Vec<u8>>,
+    trusted_ask_der: Option<Vec<u8>>,
     allowed_measurements: Vec<String>,
     attestation_url: String,
 ) -> Result<reqwest::Client, crate::Error> {
@@ -251,6 +276,8 @@ pub fn build_attesting_client(
     let verifier = AttestingVerifier {
         verified,
         vcek_cache,
+        trusted_ark_der,
+        trusted_ask_der,
         allowed_measurements,
         attestation_url,
         supported_algs: provider.signature_verification_algorithms,

@@ -44,6 +44,11 @@ target "postgres" {
   tags     = ["eidolons-postgres:dev"]
 }
 
+target "shim" {
+  inherits = ["_common"]
+  tags     = ["dev-shim:dev"]
+}
+
 # Stripe CLI — pins the upstream image by digest so dependabot can propose
 # updates via the Containerfile, rather than silently pulling :latest.
 target "stripe-cli" {
@@ -54,7 +59,7 @@ target "stripe-cli" {
 }
 
 group "default" {
-  targets = ["server", "postgres"]
+  targets = ["server", "postgres", "shim"]
 }
 
 # ── CI targets (registry push) ────────────────────────────────────────────────

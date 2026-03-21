@@ -68,4 +68,4 @@ echo "    secret: ${STRIPE_WEBHOOK_SECRET:0:12}..."
 # ── Start everything in foreground ───────────────────────────────────────────
 
 echo "==> Starting server and stripe-cli (Ctrl-C to stop)..."
-docker compose --profile test up server stripe-cli
+docker compose --profile test up server stripe-cli shim

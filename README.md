@@ -27,13 +27,38 @@ set -a; source .env; set +a
 
 # Run the server on the host machine with cargo
 cargo run -p eidolons-server
-
+```rust
 # -- OR --
 
 # Run and automatically recompile/reload the server on 
 # the host machine with bacon
 bacon run-long -- -p eidolons-server
 ```
+
+### CLI
+
+To run the CLI against a local development stack:
+
+1. **Start the stack:** `just dev` (starts Postgres, Server, and the Hardware Shim).
+2. **Trust the Mock Root CA:**
+   - The shim generates a persistent Root CA in `./.dev-certs/ark.pem`.
+   - **macOS:** Open Keychain Access, drag `ark.pem` into "System", double-click it, and set Trust to "Always Trust".
+   - **Linux:** `sudo cp .dev-certs/ark.pem /usr/local/share/ca-certificates/eidolons-dev.crt && sudo update-ca-certificates`
+3. **Configure the CLI:**
+   ```bash
+   # Set the base origin (API and attestation are derived automatically)
+   cargo run -p eidolons-cli -- configure --base-url https://localhost:8443
+   ```
+4. **Add the Hardware Root to `config.toml`:**
+   Open `~/Library/Application Support/eidolons/config.toml` (or equivalent) and paste the contents of `.dev-certs/ark.pem` into the `hardware_root_ca` field:
+   ```toml
+   base_url = "https://localhost:8443"
+   hardware_root_ca = """
+   -----BEGIN CERTIFICATE-----
+   ... (contents of .dev-certs/ark.pem) ...
+   -----END CERTIFICATE-----
+   """
+   ```
 
 Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) for convenience.
 

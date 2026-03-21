@@ -28,3 +28,4 @@ core/target/
 .DS_Store
 
 .buildx-cache
+.dev-certs/

@@ -35,6 +35,14 @@ pub struct Config {
     /// `trusted_measurements` is non-empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attestation_url: Option<String>,
+    /// Optional PEM-encoded SEV-SNP ARK (Root CA) to use for verification.
+    /// If provided, this overrides the built-in AMD Genoa ARK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware_root_ca: Option<String>,
+    /// Optional PEM-encoded SEV-SNP ASK (Intermediate CA) to use for verification.
+    /// If provided, this overrides the built-in AMD Genoa ASK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware_intermediate_ca: Option<String>,
 }
 
 impl Config {

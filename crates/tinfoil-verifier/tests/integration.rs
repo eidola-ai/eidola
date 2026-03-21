@@ -26,13 +26,13 @@ async fn live_attestation_verification() {
         .expect("failed to decode VCEK");
 
     let report_bytes =
-        tinfoil_verifier::bundle::decode_report(&bundle.enclave_attestation_report.body)
+        tinfoil_verifier::bundle::decode_report_gzipped(&bundle.enclave_attestation_report.body)
             .expect("failed to decode report");
 
     eprintln!("Report size: {} bytes", report_bytes.len());
 
     // Verify chain + report signature
-    let report = tinfoil_verifier::sevsnp::verify_attestation(&vcek_der, &report_bytes)
+    let report = tinfoil_verifier::sevsnp::verify_attestation(&vcek_der, &report_bytes, None, None)
         .expect("attestation verification failed");
 
     // Verify TCB policy
@@ -65,9 +65,9 @@ async fn live_attesting_client() {
     let vcek_der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &bundle.vcek)
         .expect("failed to decode VCEK");
     let report_bytes =
-        tinfoil_verifier::bundle::decode_report(&bundle.enclave_attestation_report.body)
+        tinfoil_verifier::bundle::decode_report_gzipped(&bundle.enclave_attestation_report.body)
             .expect("failed to decode report");
-    let report = tinfoil_verifier::sevsnp::verify_attestation(&vcek_der, &report_bytes)
+    let report = tinfoil_verifier::sevsnp::verify_attestation(&vcek_der, &report_bytes, None, None)
         .expect("attestation verification failed");
     let measurement = hex::encode(report.measurement);
 
@@ -79,6 +79,8 @@ async fn live_attesting_client() {
             allowed_measurements: &[measurement.as_str()],
             inference_base_url: "https://inference.tinfoil.sh/v1",
             atc_url: None,
+            trusted_ark_der: None,
+            trusted_ask_der: None,
         })
         .await
         .expect("attesting_client failed");

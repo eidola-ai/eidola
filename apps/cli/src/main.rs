@@ -271,14 +271,14 @@ fn now_iso() -> String {
 /// client verifies Tinfoil enclave attestation on each new TLS connection,
 /// ensuring the server is running expected code inside a TEE.
 async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
-    if config.trusted_measurements.is_empty() {
+    if config.trusted_measurements.is_empty() && config.hardware_root_ca.is_none() {
         return Ok(reqwest::Client::new());
     }
 
-    let base_url = config
+    let origin = config
         .base_url
         .as_deref()
-        .ok_or("base_url is required when trusted_measurements is set")?;
+        .ok_or("base_url is required when attestation is enabled")?;
 
     let measurements: Vec<&str> = config
         .trusted_measurements
@@ -286,11 +286,20 @@ async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
         .map(|s| s.as_str())
         .collect();
 
+    let hardware_root_der =
+        parse_cert_config(config.hardware_root_ca.as_deref(), "hardware_root_ca")?;
+    let hardware_intermediate_der = parse_cert_config(
+        config.hardware_intermediate_ca.as_deref(),
+        "hardware_intermediate_ca",
+    )?;
+
     let (client, verification) =
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
             allowed_measurements: &measurements,
-            inference_base_url: base_url,
+            inference_base_url: origin,
             atc_url: config.attestation_url.as_deref(),
+            trusted_ark_der: hardware_root_der.as_deref(),
+            trusted_ask_der: hardware_intermediate_der.as_deref(),
         })
         .await
         .map_err(|e| format!("attestation verification failed: {e}"))?;
@@ -340,6 +349,30 @@ fn describe_request_error(e: reqwest::Error) -> String {
         );
     }
     format!("request failed: {chain}")
+}
+
+/// Parse a PEM or raw base64 DER certificate from a config value.
+fn parse_cert_config(value: Option<&str>, field_name: &str) -> Result<Option<Vec<u8>>, String> {
+    let Some(value) = value else { return Ok(None) };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.starts_with("-----BEGIN") {
+        use der::DecodePem;
+        let cert = x509_cert::Certificate::from_pem(trimmed)
+            .map_err(|e| format!("failed to parse {field_name} PEM: {e}"))?;
+        Ok(Some(der::Encode::to_der(&cert).map_err(|e| {
+            format!("failed to encode {field_name}: {e}")
+        })?))
+    } else {
+        let b64: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+        Ok(Some(
+            base64::engine::general_purpose::STANDARD
+                .decode(&b64)
+                .map_err(|e| format!("failed to decode {field_name} base64: {e}"))?,
+        ))
+    }
 }
 
 fn require_base_url(config: &Config) -> Result<&str, String> {

@@ -193,6 +193,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             allowed_measurements: measurements::ALLOWED,
             inference_base_url,
             atc_url: None,
+            trusted_ark_der: None,
+            trusted_ask_der: None,
         })
         .await
         .map_err(|e| {

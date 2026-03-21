@@ -37,6 +37,12 @@ pub struct AttestingClientConfig<'a> {
     pub inference_base_url: &'a str,
     /// Optional ATC URL override for initial bootstrap verification.
     pub atc_url: Option<&'a str>,
+    /// Optional custom trusted ARK (Root CA) DER bytes.
+    /// When set, this overrides the built-in AMD Genoa ARK for chain verification
+    /// and is also added as a TLS root certificate for bootstrap connections.
+    pub trusted_ark_der: Option<&'a [u8]>,
+    /// Optional custom trusted ASK DER bytes.
+    pub trusted_ask_der: Option<&'a [u8]>,
 }
 
 /// Build an attesting HTTP client that verifies enclave attestation per-connection.
@@ -52,22 +58,61 @@ pub struct AttestingClientConfig<'a> {
 pub async fn attesting_client(
     config: AttestingClientConfig<'_>,
 ) -> Result<(reqwest::Client, Verification), Error> {
-    let display_url = config.atc_url.unwrap_or("atc.tinfoil.sh");
-    tracing::info!("Fetching attestation bundle from {display_url} for bootstrap...");
-    let attestation_bundle = bundle::fetch_bundle(config.atc_url).await?;
+    let attestation_url = well_known_url(config.inference_base_url);
+    let allowed: Vec<String> = config
+        .allowed_measurements
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
-    // Decode the VCEK certificate from the bundle
-    let vcek_der = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &attestation_bundle.vcek,
-    )?;
+    // Determine whether to fetch from ATC or the server's own well-known endpoint.
+    // When a custom root CA is configured (dev shim), always fetch directly from
+    // the server — ATC only knows about the production Tinfoil enclave.
+    // Also use direct fetch when atc_url explicitly matches the well-known URL.
+    let use_direct = config.trusted_ark_der.is_some()
+        || config
+            .atc_url
+            .map(|url| url == attestation_url)
+            .unwrap_or(false);
 
-    // Decode the attestation report (base64 → gzip → raw bytes)
-    let report_bytes = bundle::decode_report(&attestation_bundle.enclave_attestation_report.body)?;
+    // Fetch attestation: direct (v3 → v2 fallback) or ATC bundle
+    let resolved = if use_direct {
+        let client = build_bootstrap_client(config.trusted_ark_der)?;
+        tracing::info!("Fetching attestation from {attestation_url} (direct)...");
+        bundle::fetch_well_known(&client, &attestation_url).await?
+    } else {
+        let display_url = config.atc_url.unwrap_or(bundle::DEFAULT_ATC_URL);
+        tracing::info!("Fetching attestation bundle from {display_url} for bootstrap...");
+        let atc_bundle = bundle::fetch_bundle(config.atc_url).await?;
+        bundle::ResolvedAttestation {
+            report_bytes: bundle::decode_report_gzipped(
+                &atc_bundle.enclave_attestation_report.body,
+            )?,
+            vcek_der: Some(sevsnp::decode_base64(&atc_bundle.vcek)?),
+            ark_der: atc_bundle
+                .ark
+                .as_ref()
+                .and_then(|s| sevsnp::decode_base64(s).ok()),
+            ask_der: atc_bundle
+                .ask
+                .as_ref()
+                .and_then(|s| sevsnp::decode_base64(s).ok()),
+            enclave_cert: Some(atc_bundle.enclave_cert),
+        }
+    };
+
+    // Resolve VCEK: from attestation doc, or fail
+    let vcek_der = resolved
+        .vcek_der
+        .ok_or_else(|| Error::Bundle("no VCEK in attestation (v3 endpoint may not include it yet — set attestation_url to ATC as fallback)".to_string()))?;
+
+    // Resolve ARK/ASK: prefer trusted config, fall back to doc, then built-in Genoa
+    let ark_der = config.trusted_ark_der.or(resolved.ark_der.as_deref());
+    let ask_der = config.trusted_ask_der.or(resolved.ask_der.as_deref());
 
     // Verify chain + report signature (delegated to sev crate)
     tracing::info!("Verifying VCEK certificate chain and report signature...");
-    let report = sevsnp::verify_attestation(&vcek_der, &report_bytes)?;
+    let report = sevsnp::verify_attestation(&vcek_der, &resolved.report_bytes, ark_der, ask_der)?;
 
     // Validate TCB policy
     sevsnp::verify_tcb_policy(&report)?;
@@ -90,31 +135,28 @@ pub async fn attesting_client(
     }
     tracing::info!("Measurement verified: {measurement_hex}");
 
-    // Cross-check enclave certificate against report_data
+    // Cross-check enclave certificate against report_data (if available)
     let tls_fingerprint = &report.report_data[..32];
-    sevsnp::verify_enclave_cert_binding(&attestation_bundle.enclave_cert, tls_fingerprint)?;
+    if let Some(enclave_cert) = &resolved.enclave_cert {
+        sevsnp::verify_enclave_cert_binding(enclave_cert, tls_fingerprint)?;
+    }
 
     let tls_fingerprint_hex = hex::encode(tls_fingerprint);
     tracing::info!("TLS fingerprint verified: {tls_fingerprint_hex}");
 
     // Derive the well-known attestation URL from the inference base URL
-    let attestation_url = well_known_url(config.inference_base_url);
     tracing::info!("Per-connection attestation URL: {attestation_url}");
 
     // Build the attesting client, seeded with the initial verified fingerprint and VCEK
     let mut initial_fp = [0u8; 32];
     initial_fp.copy_from_slice(tls_fingerprint);
 
-    let allowed = config
-        .allowed_measurements
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
     let client = attesting_client::build_attesting_client(
         initial_fp,
         report.chip_id,
         vcek_der,
+        config.trusted_ark_der.map(|d| d.to_vec()),
+        config.trusted_ask_der.map(|d| d.to_vec()),
         allowed,
         attestation_url,
     )?;
@@ -126,6 +168,27 @@ pub async fn attesting_client(
             tls_fingerprint: tls_fingerprint_hex,
         },
     ))
+}
+
+/// Build a reqwest client for bootstrap attestation fetches.
+///
+/// When a custom trusted ARK is provided, it's added as a TLS root certificate
+/// so the client can connect to servers using certs signed by that root (e.g.
+/// the dev shim). Without a custom root, standard WebPKI roots are used.
+fn build_bootstrap_client(trusted_ark_der: Option<&[u8]>) -> Result<reqwest::Client, Error> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30));
+
+    if let Some(ark_der) = trusted_ark_der {
+        let cert = reqwest::Certificate::from_der(ark_der)
+            .map_err(|e| Error::Tls(format!("invalid ARK cert for TLS root: {e}")))?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    builder
+        .build()
+        .map_err(|e| Error::Tls(format!("failed to build bootstrap client: {e}")))
 }
 
 /// Derive `/.well-known/tinfoil-attestation` URL from an inference base URL.

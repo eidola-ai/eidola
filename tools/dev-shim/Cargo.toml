@@ -1,0 +1,65 @@
+[package]
+name = "dev-shim"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "dev-shim"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server
+axum = "0.8"
+
+# TLS
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+
+# Certificate generation (TLS leaf only — mock CA chain is built manually)
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+
+# Mock SEV-SNP certificate chain (RSA-PSS SHA-384)
+rsa = { version = "0.9", features = ["pem"] }
+x509-cert = "0.2"
+der = { version = "0.7", features = ["alloc", "pem"] }
+spki = "0.7"
+
+# Attestation chain self-verification (same crate the verifier uses)
+sev = { version = "7", default-features = false, features = ["snp", "crypto_nossl"] }
+
+# Mock attestation report (ECDSA P-384)
+p384 = { version = "0.13", features = ["ecdsa", "arithmetic", "pkcs8"] }
+
+# Connection handling
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+tower-service = "0.3"
+
+# HTTP client for proxying
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Crypto
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Encoding
+base64 = "0.22"
+hex = "0.4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+arc-swap = "1"

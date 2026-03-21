@@ -36,6 +36,23 @@ services:
       postgres:
         condition: service_healthy
 
+  shim:
+    image: dev-shim:dev
+    build:
+      context: .
+      dockerfile: tools/dev-shim/Containerfile
+    environment:
+      UPSTREAM_URL: http://server:8080
+      LISTEN_ADDR: 0.0.0.0:8443
+      CERT_DIR: /src/.dev-certs
+    ports:
+      - "8443:8443"
+    volumes:
+      - .dev-certs:/src/.dev-certs
+    depends_on:
+      server:
+        condition: service_started
+
   stripe-cli:
     image: stripe-cli:dev
     build:
@@ -44,7 +61,7 @@ services:
     profiles: ["test"]
     environment:
       STRIPE_API_KEY: ${STRIPE_API_KEY}
-    command: ["listen", "--forward-to", "http://server:8080/v1/webhooks/stripe"]
+    command: ["listen", "--forward-to", "https://shim:8443/v1/webhooks/stripe", "--skip-verify"]
 
 volumes:
   pgdata:
