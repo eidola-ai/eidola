@@ -67,14 +67,26 @@ build:
     # TODO: Build apps
 
 # Update artifact-manifest.json with current build digests
+# Uses a docker-container builder for rewrite-timestamp + force-compression
+# (the default docker driver does not support these reproducibility options).
 update-manifest:
-    docker buildx bake --metadata-file /tmp/bake-metadata.json
-    @jq -n \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BUILDER="eidolons"
+    if ! docker buildx inspect "$BUILDER" &>/dev/null; then
+      echo "Creating docker-container builder '$BUILDER'..."
+      docker buildx create --name "$BUILDER" --driver docker-container
+    fi
+    docker buildx bake \
+      --builder "$BUILDER" \
+      --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true' \
+      --metadata-file /tmp/bake-metadata.json
+    jq -n \
       --arg server "$(jq -r '."server"."containerimage.digest"' /tmp/bake-metadata.json)" \
       --arg postgres "$(jq -r '."postgres"."containerimage.digest"' /tmp/bake-metadata.json)" \
       '{"eidolons-server": $server, "eidolons-postgres": $postgres}' \
       > artifact-manifest.json
-    @echo "Updated artifact-manifest.json"
+    echo "Updated artifact-manifest.json"
 
 # Run all Nix checks (formatting, linting, tests, artifact freshness)
 ci-check:

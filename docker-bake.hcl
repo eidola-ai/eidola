@@ -30,9 +30,9 @@ target "_common" {
 
 # ── Local dev targets (compose.yaml overlay) ──────────────────────────────────
 # context and dockerfile come from compose.yaml; not repeated here.
-# The docker driver does not support rewrite-timestamp or force-compression,
-# so local builds omit them. Once all base images are published to a registry,
-# switch to a docker-container builder to enable full local reproducibility.
+# For reproducible builds, use a docker-container builder and pass
+# --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true'
+# (the default docker driver does not support these options).
 
 target "server" {
   inherits = ["_common"]
