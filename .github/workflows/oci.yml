@@ -81,35 +81,24 @@ jobs:
           SERVER_DIGEST: ${{ steps.digests.outputs.server }}
           POSTGRES_DIGEST: ${{ steps.digests.outputs.postgres }}
         run: |
-          # Count total lines in the manifest file for the suggestion range
           TOTAL_LINES=$(wc -l < artifact-manifest.json | tr -d ' ')
 
-          SUGGESTION_BODY="The OCI build produced different digests than what is committed. Please accept this suggestion to update the manifest:
-          \`\`\`suggestion
-          {
-            \"eidolons-server\": \"${SERVER_DIGEST}\",
-            \"eidolons-postgres\": \"${POSTGRES_DIGEST}\"
-          }
-          \`\`\`"
-
-          REVIEW_BODY="**Artifact Manifest Update Required**
-
-          The OCI images built from this PR produce different digests than what is committed in \`artifact-manifest.json\`. Accept the suggestion below to update it.
-
-          | Image | Digest |
-          |-------|--------|
-          | eidolons-server | \`${SERVER_DIGEST:0:19}...\` |
-          | eidolons-postgres | \`${POSTGRES_DIGEST:0:19}...\` |"
-
-          gh api --silent \
-            -X POST \
-            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
-            -f event='REQUEST_CHANGES' \
-            -f body="$REVIEW_BODY" \
-            --field "comments[0][path]=artifact-manifest.json" \
-            --field "comments[0][line]=${TOTAL_LINES}" \
-            --field "comments[0][start_line]=1" \
-            --field "comments[0][body]=${SUGGESTION_BODY}"
+          jq -n \
+            --arg server "$SERVER_DIGEST" \
+            --arg postgres "$POSTGRES_DIGEST" \
+            --arg total_lines "$TOTAL_LINES" \
+            '{
+              event: "REQUEST_CHANGES",
+              body: "**Artifact Manifest Update Required**\n\nThe OCI images built from this PR produce different digests than what is committed in `artifact-manifest.json`. Accept the suggestion below to update it.\n\n| Image | Digest |\n|-------|---------|\n| eidolons-server | `\($server[0:19])...` |\n| eidolons-postgres | `\($postgres[0:19])...` |",
+              comments: [{
+                path: "artifact-manifest.json",
+                line: ($total_lines | tonumber),
+                start_line: 1,
+                body: "The OCI build produced different digests than what is committed. Please accept this suggestion to update the manifest:\n```suggestion\n{\n  \"eidolons-server\": \"\($server)\",\n  \"eidolons-postgres\": \"\($postgres)\"\n}\n```"
+              }]
+            }' | gh api --silent -X POST \
+              "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+              --input -
 
       - name: Fail on manifest mismatch
         if: steps.verify.outputs.match == 'false'
