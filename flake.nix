@@ -344,7 +344,7 @@
             }
           );
 
-        # Build the generate-openapi binary (native only, used for spec generation)
+        # Build the generate-openapi binary crate (native only, used for spec generation)
         generateOpenapiBin = mkPackage {
           pname = "generate-openapi";
           rustTarget = nativeRustTarget;
@@ -363,14 +363,14 @@
               generate-openapi > $out/openapi.json
             '';
 
-        # Build the uniffi-bindgen-swift tool (native only)
+        # Build the uniffi-bindgen-swift binary crate (native only)
         uniffiBindgenSwift = mkPackage {
           pname = "uniffi-bindgen-swift";
           rustTarget = nativeRustTarget;
           nixCrossSystem = null;
         };
 
-        # Build the shared-typegen tool (native only)
+        # Build the shared-typegen binary crate (native only)
         sharedTypegen = mkPackage {
           pname = "shared-typegen";
           rustTarget = nativeRustTarget;

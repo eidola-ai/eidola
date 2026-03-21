@@ -21,7 +21,6 @@ FROM base AS fetch
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY apps/ ./apps/
 COPY crates/ ./crates/
-COPY tools/ ./tools/
 
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \

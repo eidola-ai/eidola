@@ -70,10 +70,10 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 
 **Key pattern:** The core never performs side-effects directly. It emits Effects that the shell handles, then the shell sends responses back via `handleResponse()`.
 
-**Capability implementations:** Pure Rust crates in `crates/` implement capability logic. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
+**Capability implementations:** Pure Rust crates in `crates/` implement capability logic. The same `crates/` tree also contains the Rust code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) plus operational utilities such as `dev-shim` and `hash-secret`. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
 
 **Two codegen pipelines:**
-- `uniffi-bindgen-swift` → FFI bridge (`processEvent`, `handleResponse`, `view`)
+- `uniffi-bindgen-swift` (workspace crate under `crates/`) → FFI bridge (`processEvent`, `handleResponse`, `view`)
 - `crux_core::typegen` → Domain types (`Event`, `Effect`, `ViewModel`) with bincode serialization
 
 ## CLI Database & Migrations
@@ -103,6 +103,7 @@ The `justfile` is the primary development interface. Run `just` to see all avail
 ## Conventions
 
 - Pure Rust dependencies preferred (for cross-compilation)
+- Keep Rust workspace packages under `crates/`; do not add a separate top-level `tools/` tree
 - `just` is the task runner — wrap scripts and common commands as recipes
 - Server OCI images are built with StageX (reproducible, `FROM scratch`, runs as non-root)
 - Nix is used for CI quality gates and Swift/XCFramework builds, not daily Rust development

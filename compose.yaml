@@ -40,7 +40,7 @@ services:
     image: dev-shim:dev
     build:
       context: .
-      dockerfile: tools/dev-shim/Containerfile
+      dockerfile: crates/dev-shim/Containerfile
     environment:
       UPSTREAM_URL: http://server:8080
       LISTEN_ADDR: 0.0.0.0:8443

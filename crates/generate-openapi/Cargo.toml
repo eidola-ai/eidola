@@ -11,6 +11,6 @@ name = "generate-openapi"
 path = "src/main.rs"
 
 [dependencies]
-eidolons-server = { path = "../../crates/eidolons-server" }
+eidolons-server = { path = "../eidolons-server" }
 rustls = { version = "0.23", default-features = false }
 rustls-rustcrypto = "0.0.2-alpha"
