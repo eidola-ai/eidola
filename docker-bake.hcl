@@ -65,6 +65,10 @@ group "default" {
   targets = ["server", "postgres", "shim"]
 }
 
+group "manifest" {
+  targets = ["server", "postgres"]
+}
+
 # ── CI targets (registry push) ────────────────────────────────────────────────
 # These repeat context/dockerfile because they need a different output type
 # (push to registry vs load to local daemon).

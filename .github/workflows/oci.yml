@@ -37,7 +37,7 @@ jobs:
           # setup-buildx-action provides a docker-container driver, which
           # supports rewrite-timestamp and force-compression for full
           # reproducibility. Override the default output to enable them.
-          docker buildx bake \
+          docker buildx bake manifest \
             --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip' \
             --metadata-file /tmp/bake-metadata.json
 

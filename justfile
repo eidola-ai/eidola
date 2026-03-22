@@ -95,7 +95,7 @@ update-manifest:
         >/dev/null
     fi
     docker buildx inspect "$BUILDER" --bootstrap >/dev/null
-    docker buildx bake \
+    docker buildx bake manifest \
       --builder "$BUILDER" \
       --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip' \
       --metadata-file /tmp/bake-metadata.json
