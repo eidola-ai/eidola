@@ -14,7 +14,7 @@ default = []
 typegen = ["crux_core/typegen"]
 
 [dependencies]
-crux_core = "0.16"
+crux_core = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 uniffi = "0.31.0"
 

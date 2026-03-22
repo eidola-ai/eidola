@@ -836,15 +836,14 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crux_core"
-version = "0.16.2"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e75b020328d2102fcd46443cd2f93014680b03dc59bb0cdb3edcacf7a13521bb"
+checksum = "68328a703adba9b705c7b2de3e0fe434f4a310974fc6944c280cd4d15651485c"
 dependencies = [
  "anyhow",
  "bincode",
  "crossbeam-channel",
  "crux_macros",
- "erased-serde",
  "facet",
  "futures",
  "serde",
@@ -857,9 +856,9 @@ dependencies = [
 
 [[package]]
 name = "crux_macros"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ceee550b136afd8b746e5fd91167ce9b9142661f283c86f423d0fd170f5addb6"
+checksum = "23c2549bcdfd872810d0c6a704ce1bd0e7b2007a8078370f02aa7f45ccade686"
 dependencies = [
  "darling",
  "heck 0.5.0",
@@ -933,9 +932,9 @@ dependencies = [
 
 [[package]]
 name = "darling"
-version = "0.21.3"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cdf337090841a411e2a7f3deb9187445851f91b309c0c0a29e05f74a00a48c0"
+checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
 dependencies = [
  "darling_core",
  "darling_macro",
@@ -943,11 +942,10 @@ dependencies = [
 
 [[package]]
 name = "darling_core"
-version = "0.21.3"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1247195ecd7e3c85f83c8d2a366e4210d588e802133e1e355180a9870b517ea4"
+checksum = "9865a50f7c335f53564bb694ef660825eb8610e0a53d3e11bf1b0d3df31e03b0"
 dependencies = [
- "fnv",
  "ident_case",
  "proc-macro2",
  "quote",
@@ -957,9 +955,9 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
-version = "0.21.3"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
+checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
 dependencies = [
  "darling_core",
  "quote",
@@ -1289,17 +1287,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
-name = "erased-serde"
-version = "0.4.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2add8a07dd6a8d93ff627029c51de145e12686fbc36ecb298ac22e74cf02dec"
-dependencies = [
- "serde",
- "serde_core",
- "typeid",
-]
-
-[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1311,9 +1298,9 @@ dependencies = [
 
 [[package]]
 name = "facet"
-version = "0.28.3"
+version = "0.31.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa721ef7c3d28dad0a82f12b58ed06f8d55ded9fff60cca2bdd26eea8ef0b23e"
+checksum = "4d643309d7c46d073b6c51e29901ed9bc3d858dc09aa21f5b32b424491e1bbef"
 dependencies = [
  "facet-core",
  "facet-macros",
@@ -1322,9 +1309,9 @@ dependencies = [
 
 [[package]]
 name = "facet-core"
-version = "0.28.3"
+version = "0.31.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d53f437ef568ab97c56f53561b21facc5999fe97eb4b4360c932a110d00a2a9"
+checksum = "ac27076d75388bffb6c5e5118078dcbb46f2090b35256c45372ff1c1910b1aaf"
 dependencies = [
  "bitflags",
  "impls",
@@ -1332,9 +1319,9 @@ dependencies = [
 
 [[package]]
 name = "facet-macros"
-version = "0.28.3"
+version = "0.31.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b50ab132d5eb441268c9a838aafa4fd0f98ed7250af72b83ae5f8bcaffe03252"
+checksum = "391fcf43b68a76ba4a494710629a7b6fb430345a5623a6a87f7c263bfadb1643"
 dependencies = [
  "facet-core",
  "facet-macros-emit",
@@ -1342,9 +1329,9 @@ dependencies = [
 
 [[package]]
 name = "facet-macros-emit"
-version = "0.28.3"
+version = "0.31.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46b24923c18ba3e49a574839946c77dce37f67b3fc2d78d0aa7c342382bd7599"
+checksum = "e81e536ccafa7d5ef71822c9a67a28a0b29fe0170eaf2d134c36854a3d56ee9a"
 dependencies = [
  "facet-macros-parse",
  "quote",
@@ -1352,9 +1339,9 @@ dependencies = [
 
 [[package]]
 name = "facet-macros-parse"
-version = "0.28.3"
+version = "0.31.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2919451ef356233d910b5c7b127721ea254062b0043a43d5643e0a750cfd9da9"
+checksum = "8da5d4ded1874033bdef5000712d80d28feefe2abb48bb6f31b6fe59b7e9792f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1557,15 +1544,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "fxhash"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c31b6d751ae2c7f11320402d34e41349dd1016f8d5d45e48c4312bc8625af50c"
-dependencies = [
- "byteorder",
 ]
 
 [[package]]
@@ -3606,12 +3584,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shadow_counted"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65da48d447333cebe1aadbdd3662f3ba56e76e67f53bc46f3dd5f67c74629d6b"
-
-[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4524,12 +4496,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "typeid"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
-
-[[package]]
 name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4741,14 +4707,13 @@ dependencies = [
 
 [[package]]
 name = "unsynn"
-version = "0.1.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7940603a9e25cf11211cc43b81f4fcad2b8ab4df291ca855f32c40e1ac22d5bc"
+checksum = "501a7adf1a4bd9951501e5c66621e972ef8874d787628b7f90e64f936ef7ec0a"
 dependencies = [
- "fxhash",
  "mutants",
  "proc-macro2",
- "shadow_counted",
+ "rustc-hash 2.1.1",
 ]
 
 [[package]]
