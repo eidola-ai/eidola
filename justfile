@@ -73,10 +73,28 @@ update-manifest:
     #!/usr/bin/env bash
     set -euo pipefail
     BUILDER="eidolons"
-    if ! docker buildx inspect "$BUILDER" &>/dev/null; then
-      echo "Creating docker-container builder '$BUILDER'..."
-      docker buildx create --name "$BUILDER" --driver docker-container --driver-opt image=moby/buildkit:v0.28.0
+    BUILDKIT_IMAGE="moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b"
+    NEEDS_RECREATE=0
+    if ! INSPECT_OUTPUT="$(docker buildx inspect "$BUILDER" 2>/dev/null)"; then
+      NEEDS_RECREATE=1
+    elif ! grep -Fq "image=\"${BUILDKIT_IMAGE}\"" <<<"$INSPECT_OUTPUT"; then
+      NEEDS_RECREATE=1
+    elif ! grep -Fq "linux/amd64*" <<<"$INSPECT_OUTPUT"; then
+      NEEDS_RECREATE=1
     fi
+    if [ "$NEEDS_RECREATE" -eq 1 ]; then
+      if docker buildx inspect "$BUILDER" &>/dev/null; then
+        docker buildx rm "$BUILDER" >/dev/null
+      fi
+      echo "Creating docker-container builder '$BUILDER'..."
+      docker buildx create \
+        --name "$BUILDER" \
+        --driver docker-container \
+        --platform linux/amd64 \
+        --driver-opt "image=${BUILDKIT_IMAGE}" \
+        >/dev/null
+    fi
+    docker buildx inspect "$BUILDER" --bootstrap >/dev/null
     docker buildx bake \
       --builder "$BUILDER" \
       --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip' \

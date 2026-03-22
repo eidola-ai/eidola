@@ -75,3 +75,11 @@ just update-bindings      # UniFFI Swift bindings + Crux types
 just update-openapi       # OpenAPI spec
 just update-xcframework   # XCFramework (dev, native arch only)
 ```
+
+To refresh `artifact-manifest.json` for the OCI images, run:
+
+```bash
+just update-manifest
+```
+
+This uses the pinned amd64 BuildKit builder configuration that CI uses for reproducible digest verification.

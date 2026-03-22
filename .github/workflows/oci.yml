@@ -13,7 +13,7 @@ on:
 jobs:
   oci:
     name: Build and verify OCI images
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: read
@@ -27,7 +27,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
         with:
-          driver-opts: image=moby/buildkit:v0.28.0
+          version: v0.31.1
+          platforms: linux/amd64
+          driver-opts: |
+            image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
 
       - name: Build OCI images
         run: |

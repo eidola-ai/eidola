@@ -2,10 +2,16 @@
 .github
 .claude
 .env
+.DS_Store
+.dev-certs
 result
 result-*
 apps/macos/
 docs/
 target/
+**/target/
+**/.build/
+**/.swiftpm/
+**/*.xcframework/
 *.md
 .buildx-cache
