@@ -20,7 +20,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 rustls-rustcrypto = "0.0.2-alpha"
 
 # Certificate generation (TLS leaf only — mock CA chain is built manually)
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 
 # Mock SEV-SNP certificate chain (RSA-PSS SHA-384)
 rsa = { version = "0.9", features = ["pem"] }
