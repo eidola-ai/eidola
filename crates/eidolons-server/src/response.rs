@@ -360,7 +360,7 @@ mod tests {
         let auth = crate::auth::AuthContext {
             method: AuthMethod::AnonymousCredential,
         };
-        let privacy = build_privacy_metadata(&auth, true, "redpill");
+        let privacy = build_privacy_metadata(&auth, true, "tinfoil");
         assert_eq!(privacy.data_exposure.len(), 2);
         assert_eq!(privacy.data_exposure[1].confidentiality, "tee");
     }
@@ -370,7 +370,7 @@ mod tests {
         let auth = crate::auth::AuthContext {
             method: AuthMethod::None,
         };
-        let privacy = build_privacy_metadata(&auth, false, "anthropic");
+        let privacy = build_privacy_metadata(&auth, false, "tinfoil");
         assert_eq!(privacy.data_exposure.len(), 2);
         assert_eq!(privacy.data_exposure[1].confidentiality, "provider-policy");
         assert_eq!(privacy.data_exposure[1].logged, "unknown");

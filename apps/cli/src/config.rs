@@ -25,6 +25,24 @@ pub struct Config {
     pub account_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain_separator: Option<String>,
+    /// Trusted enclave measurements (hex-encoded, SEV-SNP).
+    /// When non-empty, the CLI verifies the server's Tinfoil attestation
+    /// before sending any confidential requests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_measurements: Vec<String>,
+    /// URL to fetch the server's attestation bundle for verification.
+    /// Defaults to the Tinfoil ATC endpoint. Only used when
+    /// `trusted_measurements` is non-empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_url: Option<String>,
+    /// Optional PEM-encoded SEV-SNP ARK (Root CA) to use for verification.
+    /// If provided, this overrides the built-in AMD Genoa ARK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware_root_ca: Option<String>,
+    /// Optional PEM-encoded SEV-SNP ASK (Intermediate CA) to use for verification.
+    /// If provided, this overrides the built-in AMD Genoa ASK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware_intermediate_ca: Option<String>,
 }
 
 impl Config {

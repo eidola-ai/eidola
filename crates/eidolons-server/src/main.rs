@@ -1,8 +1,8 @@
 //! Eidolons Server - A privacy-transparent AI proxy.
 //!
 //! This server accepts requests in OpenAI Chat Completions API format and
-//! proxies them to upstream AI providers via RedPill.ai, enriching responses
-//! with inline privacy metadata and cryptographic verification.
+//! proxies them to Tinfoil's confidential inference enclaves, enriching
+//! responses with inline privacy metadata and cryptographic verification.
 
 use std::net::SocketAddr;
 
@@ -11,35 +11,35 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use eidolons_server::AppState;
-use eidolons_server::attestation::AttestationClient;
-use eidolons_server::backend::RedPillBackend;
+use eidolons_server::backend::TinfoilBackend;
 use eidolons_server::credentials;
 use eidolons_server::helpers::EpochConfig;
+use eidolons_server::measurements;
 use eidolons_server::stripe::StripeClient;
 
 /// Server configuration.
 struct Config {
     bind_addr: SocketAddr,
-    redpill_api_key: String,
-    redpill_base_url: Option<String>,
+    tinfoil_api_key: String,
+    tinfoil_base_url: Option<String>,
     database_url: String,
     stripe_api_key: Option<String>,
     stripe_webhook_secret: Option<String>,
-    credential_master_key: Option<[u8; 32]>,
+    credential_master_key: [u8; 32],
     pricing_markup: Option<f64>,
 }
 
 impl Config {
-    fn from_env() -> Result<Self, String> {
+    async fn load() -> Result<Self, String> {
         let bind_addr = std::env::var("BIND_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+            .unwrap_or_else(|_| "127.0.0.1:8443".to_string())
             .parse()
             .map_err(|e| format!("invalid BIND_ADDR: {}", e))?;
 
-        let redpill_api_key = std::env::var("REDPILL_API_KEY")
-            .map_err(|_| "REDPILL_API_KEY environment variable is required")?;
+        let tinfoil_api_key = std::env::var("TINFOIL_API_KEY")
+            .map_err(|_| "TINFOIL_API_KEY environment variable is required")?;
 
-        let redpill_base_url = std::env::var("REDPILL_BASE_URL").ok();
+        let tinfoil_base_url = std::env::var("TINFOIL_BASE_URL").ok();
 
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
@@ -52,23 +52,6 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
-        let credential_master_key = std::env::var("CREDENTIAL_MASTER_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                let bytes = hex::decode(&s)
-                    .map_err(|_| "CREDENTIAL_MASTER_KEY must be valid hex".to_string())?;
-                if bytes.len() != 32 {
-                    return Err(
-                        "CREDENTIAL_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string(),
-                    );
-                }
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&bytes);
-                Ok(key)
-            })
-            .transpose()?;
-
         let pricing_markup = std::env::var("PRICING_MARKUP")
             .ok()
             .filter(|s| !s.is_empty())
@@ -78,10 +61,32 @@ impl Config {
             })
             .transpose()?;
 
+        let credential_master_key_hex = std::env::var("CREDENTIAL_MASTER_KEY")
+            .map_err(|_| "CREDENTIAL_MASTER_KEY environment variable is required")?;
+        let key_bytes = hex::decode(&credential_master_key_hex)
+            .map_err(|e| format!("invalid CREDENTIAL_MASTER_KEY hex: {e}"))?;
+        let credential_master_key: [u8; 32] = key_bytes.try_into().map_err(|_| {
+            "CREDENTIAL_MASTER_KEY must be exactly 32 bytes (64 hex chars)".to_string()
+        })?;
+
+        // Verify measured secret hashes: if *_HASH env vars are set (committed in
+        // tinfoil-config.yml and thus included in the enclave measurement), verify
+        // that the corresponding runtime secret matches the hash. This binds
+        // injected secrets to the measurement without exposing them in the config.
+        verify_measured_secrets(&[
+            ("CREDENTIAL_MASTER_KEY", &credential_master_key_hex),
+            ("TINFOIL_API_KEY", &tinfoil_api_key),
+            ("STRIPE_API_KEY", stripe_api_key.as_deref().unwrap_or("")),
+            (
+                "STRIPE_WEBHOOK_SECRET",
+                stripe_webhook_secret.as_deref().unwrap_or(""),
+            ),
+        ])?;
+
         Ok(Config {
             bind_addr,
-            redpill_api_key,
-            redpill_base_url,
+            tinfoil_api_key,
+            tinfoil_base_url,
             database_url,
             stripe_api_key,
             stripe_webhook_secret,
@@ -89,6 +94,49 @@ impl Config {
             pricing_markup,
         })
     }
+}
+
+/// Verify that runtime secrets match their measured hashes.
+///
+/// For each `(name, value)` pair, checks if `{name}_HASH` is set as an env var.
+/// If present, verifies the Argon2id hash matches `value`. If absent, the secret
+/// is not measured and no check is performed.
+///
+/// The `_HASH` env vars should be hardcoded in `tinfoil-config.yml` so they are
+/// included in the enclave measurement. This cryptographically binds injected
+/// secrets to the measurement without exposing their plaintext in the config.
+fn verify_measured_secrets(secrets: &[(&str, &str)]) -> Result<(), String> {
+    use argon2::PasswordVerifier;
+
+    for (name, value) in secrets {
+        if value.is_empty() {
+            continue;
+        }
+        let hash_var = format!("{name}_HASH");
+        let Ok(expected_hash) = std::env::var(&hash_var) else {
+            continue;
+        };
+        if expected_hash.is_empty() {
+            continue;
+        }
+
+        let parsed = argon2::PasswordHash::new(&expected_hash)
+            .map_err(|e| format!("{hash_var}: invalid Argon2 hash: {e}"))?;
+
+        argon2::Argon2::default()
+            .verify_password(value.as_bytes(), &parsed)
+            .map_err(|_| {
+                format!(
+                    "{name} does not match measured hash in {hash_var}.\n\
+                     The injected secret differs from what was committed in the \
+                     enclave configuration. Refusing to start."
+                )
+            })?;
+
+        tracing::info!("{name} verified against measured hash");
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -107,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     // Load configuration
-    let config = Config::from_env().map_err(|e| {
+    let config = Config::load().await.map_err(|e| {
         error!("Configuration error: {}", e);
         e
     })?;
@@ -132,18 +180,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Credential key cache and epoch configuration
     let credential_key_cache: credentials::KeyCache = Default::default();
     let epoch_config = EpochConfig::default();
-    if config.credential_master_key.is_none() {
-        warn!("CREDENTIAL_MASTER_KEY not set — credential issuance endpoints will return 503");
-    }
+
+    // Verify Tinfoil enclave attestation and build an attesting client.
+    info!("Verifying Tinfoil enclave attestation...");
+    let default_base_url = "https://inference.tinfoil.sh/v1".to_string();
+    let inference_base_url = config
+        .tinfoil_base_url
+        .as_deref()
+        .unwrap_or(&default_base_url);
+    let (attesting_client, verification) =
+        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
+            allowed_measurements: measurements::ALLOWED,
+            inference_base_url,
+            atc_url: None,
+            trusted_ark_der: None,
+            trusted_ask_der: None,
+        })
+        .await
+        .map_err(|e| {
+            error!("Tinfoil attestation verification failed: {e}");
+            e
+        })?;
+    info!(
+        "Tinfoil attestation verified — measurement: {}, TLS fingerprint: {}",
+        verification.measurement, verification.tls_fingerprint
+    );
 
     // Create shared state
     let state = AppState::new(
-        RedPillBackend::new(
-            config.redpill_api_key.clone(),
-            config.redpill_base_url.clone(),
+        TinfoilBackend::new(
+            attesting_client,
+            config.tinfoil_api_key.clone(),
+            config.tinfoil_base_url.clone(),
             config.pricing_markup,
         ),
-        AttestationClient::new(config.redpill_api_key, config.redpill_base_url),
         db_pool,
         stripe,
         config.stripe_webhook_secret,
@@ -153,26 +223,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Provision issuer keys on boot and start periodic rotation task.
-    if let Some(ref mk) = state.credential_master_key {
-        match credentials::ensure_keys(
-            &state.credential_key_cache,
-            mk,
-            &state.db_pool,
-            &state.epoch_config,
-        )
-        .await
-        {
-            Ok(key_hash) => info!("Issuer key ready: {}", hex::encode(key_hash)),
-            Err(e) => warn!("Failed to provision issuer keys on boot: {}", e),
-        }
-
-        credentials::spawn_key_rotation_task(
-            state.credential_key_cache.clone(),
-            *mk,
-            state.db_pool.clone(),
-            state.epoch_config.clone(),
-        );
+    match credentials::ensure_keys(
+        &state.credential_key_cache,
+        &state.credential_master_key,
+        &state.db_pool,
+        &state.epoch_config,
+    )
+    .await
+    {
+        Ok(key_hash) => info!("Issuer key ready: {}", hex::encode(key_hash)),
+        Err(e) => warn!("Failed to provision issuer keys on boot: {}", e),
     }
+
+    credentials::spawn_key_rotation_task(
+        state.credential_key_cache.clone(),
+        state.credential_master_key,
+        state.db_pool.clone(),
+        state.epoch_config.clone(),
+    );
 
     // Build the router with OpenAPI integration
     let (router, api) = eidolons_server::build_router()
@@ -189,11 +257,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
     );
 
-    // Bind and serve
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!("Listening on http://{}", config.bind_addr);
     axum::serve(listener, app).await?;
-
     Ok(())
 }
 

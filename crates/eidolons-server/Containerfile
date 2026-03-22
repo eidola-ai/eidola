@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
 
 # ── base ───────────────────────────────────────────────────────────────────────
 # Environment variables, pinned toolchain digest.
@@ -7,7 +7,10 @@ FROM stagex/pallet-rust@sha256:4062550919db682ebaeea07661551b5b89b3921e3f3a2b0bc
 ARG CARGO_PROFILE=release
 
 ENV TARGET=x86_64-unknown-linux-musl
-ENV RUSTFLAGS="-C target-feature=+crt-static"
+ENV SOURCE_DATE_EPOCH=1
+ENV CARGO_INCREMENTAL=0
+ENV ZERO_AR_DATE=1
+ENV RUSTFLAGS="-C target-feature=+crt-static -C debuginfo=0 -C target-cpu=generic"
 
 WORKDIR /src
 

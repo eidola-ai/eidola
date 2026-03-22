@@ -13,7 +13,7 @@ on:
 jobs:
   oci:
     name: Build and verify OCI images
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: read
@@ -26,14 +26,19 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          version: v0.31.1
+          platforms: linux/amd64
+          driver-opts: |
+            image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
 
       - name: Build OCI images
         run: |
           # setup-buildx-action provides a docker-container driver, which
           # supports rewrite-timestamp and force-compression for full
           # reproducibility. Override the default output to enable them.
-          docker buildx bake \
-            --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true' \
+          docker buildx bake manifest \
+            --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true' \
             --metadata-file /tmp/bake-metadata.json
 
       - name: Extract digests
@@ -81,35 +86,61 @@ jobs:
           SERVER_DIGEST: ${{ steps.digests.outputs.server }}
           POSTGRES_DIGEST: ${{ steps.digests.outputs.postgres }}
         run: |
-          # Count total lines in the manifest file for the suggestion range
-          TOTAL_LINES=$(wc -l < artifact-manifest.json | tr -d ' ')
+          jq -n \
+            --arg server "$SERVER_DIGEST" \
+            --arg postgres "$POSTGRES_DIGEST" \
+            '{
+              event: "REQUEST_CHANGES",
+              body: "**Artifact Manifest Update Required**\n\nThe OCI images built from this PR produce different digests than what is committed in `artifact-manifest.json`. Accept the suggestion below to update it.\n\n| Image | Digest |\n|-------|---------|\n| eidolons-server | `\($server[0:19])...` |\n| eidolons-postgres | `\($postgres[0:19])...` |",
+              comments: [{
+                path: "artifact-manifest.json",
+                line: 3,
+                start_line: 2,
+                body: "```suggestion\n  \"eidolons-server\": \"\($server)\",\n  \"eidolons-postgres\": \"\($postgres)\"\n```"
+              }]
+            }' | gh api --silent -X POST \
+              "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+              --input -
 
-          SUGGESTION_BODY="The OCI build produced different digests than what is committed. Please accept this suggestion to update the manifest:
-          \`\`\`suggestion
-          {
-            \"eidolons-server\": \"${SERVER_DIGEST}\",
-            \"eidolons-postgres\": \"${POSTGRES_DIGEST}\"
-          }
-          \`\`\`"
+      - name: Debug image structure
+        if: steps.verify.outputs.match == 'false'
+        run: |
+          echo "=== Builder info ==="
+          docker buildx version
+          docker buildx inspect --bootstrap 2>/dev/null | head -20
 
-          REVIEW_BODY="**Artifact Manifest Update Required**
+          for IMAGE in eidolons-postgres eidolons-server; do
+            echo ""
+            echo "=============== $IMAGE ==============="
+            DIR="/tmp/${IMAGE}-debug"
+            mkdir -p "$DIR"
+            docker save "${IMAGE}:dev" | tar -xf - -C "$DIR"
 
-          The OCI images built from this PR produce different digests than what is committed in \`artifact-manifest.json\`. Accept the suggestion below to update it.
+            MANIFEST_DIGEST=$(jq -r '.manifests[0].digest' "$DIR/index.json" | cut -d: -f2)
 
-          | Image | Digest |
-          |-------|--------|
-          | eidolons-server | \`${SERVER_DIGEST:0:19}...\` |
-          | eidolons-postgres | \`${POSTGRES_DIGEST:0:19}...\` |"
+            echo "=== Index ==="
+            jq . "$DIR/index.json"
 
-          gh api --silent \
-            -X POST \
-            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
-            -f event='REQUEST_CHANGES' \
-            -f body="$REVIEW_BODY" \
-            --field "comments[0][path]=artifact-manifest.json" \
-            --field "comments[0][line]=${TOTAL_LINES}" \
-            --field "comments[0][start_line]=1" \
-            --field "comments[0][body]=${SUGGESTION_BODY}"
+            echo "=== Manifest (sha256:${MANIFEST_DIGEST:0:12}...) ==="
+            jq . "$DIR/blobs/sha256/$MANIFEST_DIGEST"
+
+            CONFIG_DIGEST=$(jq -r '.config.digest' "$DIR/blobs/sha256/$MANIFEST_DIGEST" | cut -d: -f2)
+            echo "=== Config (sha256:${CONFIG_DIGEST:0:12}...) ==="
+            jq . "$DIR/blobs/sha256/$CONFIG_DIGEST"
+
+            echo "=== Layer listing ==="
+            jq -r '.layers[] | "\(.digest) \(.mediaType)"' "$DIR/blobs/sha256/$MANIFEST_DIGEST" | while read -r LAYER MEDIA; do
+              HASH="${LAYER#sha256:}"
+              SIZE=$(stat -c%s "$DIR/blobs/sha256/$HASH" 2>/dev/null || stat -f%z "$DIR/blobs/sha256/$HASH")
+              echo "  $LAYER  size=$SIZE  type=$MEDIA"
+              echo "  First 20 tar entries:"
+              if echo "$MEDIA" | grep -q gzip; then
+                gzip -dc "$DIR/blobs/sha256/$HASH" | tar -tf - 2>/dev/null | head -20 | sed 's/^/    /'
+              else
+                tar -tf "$DIR/blobs/sha256/$HASH" 2>/dev/null | head -20 | sed 's/^/    /'
+              fi
+            done
+          done
 
       - name: Fail on manifest mismatch
         if: steps.verify.outputs.match == 'false'

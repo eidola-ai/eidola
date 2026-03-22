@@ -1,9 +1,9 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
 
 # ── base ───────────────────────────────────────────────────────────────────────
 # Pin digests for all StageX package dependencies.
 
-FROM stagex/user-postgresql@sha256:a62d900301404dfb16aafea70edd3ab5c2beb9dd191432a3a97f1073d43994eb AS pkg-postgresql
+FROM stagex/user-postgresql@sha256:c116458b105157e43eb33bef199495714a83dd1ed905596ce63bac8781dc1fc7 AS pkg-postgresql
 FROM stagex/busybox@sha256:3d128909dbc8e7b6c4b8c3c31f4583f01a307907ea179934bb42c4ef056c7efd AS pkg-busybox
 FROM stagex/musl@sha256:d7f6c365f5724c65cadb2b96d9f594e46132ceb366174c89dbf7554897f2bc53 AS pkg-musl
 FROM stagex/zlib@sha256:09d63654e27decb6147f1b23005d539e30db8e53eb2d284e824bcf4d4e7c3c11 AS pkg-zlib
@@ -41,15 +41,24 @@ COPY --from=pkg-libxml2 . /
 COPY --from=pkg-postgresql . /
 COPY --chmod=755 docker/postgresql/entrypoint.sh /entrypoint.sh
 
+# ── dirs ──────────────────────────────────────────────────────────────────────
+# Create runtime directories owned by uid 1000 using a disposable stage.
+# We COPY the resulting directory tree into the final image instead of using
+# RUN, because RUN layers capture the full overlayfs diff which can include
+# host-specific artifacts (e.g. Rosetta translation caches on Docker Desktop)
+# that break cross-environment reproducibility.
+
+FROM install AS dirs
+
+RUN --network=none mkdir -p /dirs/var/lib/postgresql/data /dirs/run/postgresql /dirs/docker-entrypoint-initdb.d && \
+    chown -R 1000:1000 /dirs
+
 # ── package ────────────────────────────────────────────────────────────────────
-# Create runtime directories and set ownership.
 
 FROM scratch AS package
 
 COPY --from=install / /
-
-RUN --network=none mkdir -p /var/lib/postgresql/data /run/postgresql /docker-entrypoint-initdb.d && \
-    chown -R 1000:1000 /var/lib/postgresql /run/postgresql /docker-entrypoint-initdb.d
+COPY --from=dirs /dirs/ /
 
 # StageX core-readline is missing a DT_NEEDED for ncurses, so termcap symbols
 # (tputs, tgetent, etc.) aren't found by the dynamic linker.

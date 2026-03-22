@@ -563,9 +563,7 @@ pub async fn issue_credentials(
     State(state): State<AppState>,
     Json(request): Json<IssueCredentialsRequest>,
 ) -> Result<Json<IssueCredentialsResponse>, ServerError> {
-    let master_key = state.credential_master_key.as_ref().ok_or_else(|| {
-        ServerError::ServiceUnavailable("credential issuance is not configured".to_string())
-    })?;
+    let master_key = &state.credential_master_key;
 
     if request.credits <= 0 {
         return Err(ServerError::BadRequest {

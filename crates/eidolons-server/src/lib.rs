@@ -9,7 +9,6 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub mod account;
 pub mod api_doc;
-pub mod attestation;
 pub mod auth;
 pub mod backend;
 pub mod credentials;
@@ -17,6 +16,7 @@ pub mod db;
 pub mod error;
 pub mod handlers;
 pub mod helpers;
+pub mod measurements;
 pub mod response;
 pub mod stripe;
 pub mod types;
@@ -29,12 +29,11 @@ pub struct AppState {
 }
 
 pub struct AppStateInner {
-    pub backend: backend::RedPillBackend,
-    pub attestation: attestation::AttestationClient,
+    pub backend: backend::TinfoilBackend,
     pub db_pool: deadpool_postgres::Pool,
     pub stripe: Option<stripe::StripeClient>,
     pub stripe_webhook_secret: Option<String>,
-    pub credential_master_key: Option<[u8; 32]>,
+    pub credential_master_key: [u8; 32],
     pub credential_key_cache: credentials::KeyCache,
     pub epoch_config: helpers::EpochConfig,
 }
@@ -42,19 +41,17 @@ pub struct AppStateInner {
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        backend: backend::RedPillBackend,
-        attestation: attestation::AttestationClient,
+        backend: backend::TinfoilBackend,
         db_pool: deadpool_postgres::Pool,
         stripe: Option<stripe::StripeClient>,
         stripe_webhook_secret: Option<String>,
-        credential_master_key: Option<[u8; 32]>,
+        credential_master_key: [u8; 32],
         credential_key_cache: credentials::KeyCache,
         epoch_config: helpers::EpochConfig,
     ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
                 backend,
-                attestation,
                 db_pool,
                 stripe,
                 stripe_webhook_secret,

@@ -24,15 +24,18 @@ target "_common" {
     SOURCE_DATE_EPOCH = "${SOURCE_DATE_EPOCH}"
     CARGO_PROFILE     = "${CARGO_PROFILE}"
   }
-  # Disable provenance attestations (non-deterministic metadata)
-  attest = []
+  # Disable default inline provenance (contains non-deterministic metadata
+  # like builder ID and timestamps that break cross-environment reproducibility).
+  # An empty attest list is not enough — buildx still injects mode=min,inline-only
+  # provenance unless explicitly disabled.
+  attest = ["type=provenance,disabled=true"]
 }
 
 # ── Local dev targets (compose.yaml overlay) ──────────────────────────────────
 # context and dockerfile come from compose.yaml; not repeated here.
-# The docker driver does not support rewrite-timestamp or force-compression,
-# so local builds omit them. Once all base images are published to a registry,
-# switch to a docker-container builder to enable full local reproducibility.
+# For reproducible builds, use a docker-container builder and pass
+# --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true'
+# (the default docker driver does not support these options).
 
 target "server" {
   inherits = ["_common"]
@@ -44,7 +47,25 @@ target "postgres" {
   tags     = ["eidolons-postgres:dev"]
 }
 
+target "shim" {
+  inherits = ["_common"]
+  tags     = ["dev-shim:dev"]
+}
+
+# Stripe CLI — pins the upstream image by digest so dependabot can propose
+# updates via the Containerfile, rather than silently pulling :latest.
+target "stripe-cli" {
+  context    = "."
+  dockerfile = "docker/stripe-cli/Containerfile"
+  tags       = ["stripe-cli:dev"]
+  attest     = []
+}
+
 group "default" {
+  targets = ["server", "postgres", "shim"]
+}
+
+group "manifest" {
   targets = ["server", "postgres"]
 }
 
@@ -56,7 +77,7 @@ group "default" {
 # (used by CI via setup-buildx-action).
 target "_ci" {
   inherits = ["_common"]
-  output   = ["type=image,push=true,rewrite-timestamp=true,force-compression=true"]
+  output   = ["type=image,push=true,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true"]
 }
 
 target "ci-server" {

@@ -30,7 +30,10 @@ enum Command {
     /// Set the server base URL
     Configure {
         #[arg(long)]
-        base_url: String,
+        base_url: Option<String>,
+        /// URL for attestation verification (defaults to Tinfoil ATC)
+        #[arg(long)]
+        attestation_url: Option<String>,
     },
     /// Manage account
     Account {
@@ -264,6 +267,114 @@ fn now_iso() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
+/// Build a reqwest client. When `trusted_measurements` is configured, the
+/// client verifies Tinfoil enclave attestation on each new TLS connection,
+/// ensuring the server is running expected code inside a TEE.
+async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
+    if config.trusted_measurements.is_empty() && config.hardware_root_ca.is_none() {
+        return Ok(reqwest::Client::new());
+    }
+
+    let origin = config
+        .base_url
+        .as_deref()
+        .ok_or("base_url is required when attestation is enabled")?;
+
+    let measurements: Vec<&str> = config
+        .trusted_measurements
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+
+    let hardware_root_der =
+        parse_cert_config(config.hardware_root_ca.as_deref(), "hardware_root_ca")?;
+    let hardware_intermediate_der = parse_cert_config(
+        config.hardware_intermediate_ca.as_deref(),
+        "hardware_intermediate_ca",
+    )?;
+
+    let (client, verification) =
+        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
+            allowed_measurements: &measurements,
+            inference_base_url: origin,
+            atc_url: config.attestation_url.as_deref(),
+            trusted_ark_der: hardware_root_der.as_deref(),
+            trusted_ask_der: hardware_intermediate_der.as_deref(),
+        })
+        .await
+        .map_err(|e| format!("attestation verification failed: {e}"))?;
+
+    eprintln!(
+        "attestation verified — measurement: {}, tls: {}",
+        verification.measurement, verification.tls_fingerprint
+    );
+
+    Ok(client)
+}
+
+/// Map a reqwest send error to a human-readable message.
+/// Detects RA-TLS attestation failures buried inside the TLS layer and
+/// surfaces them explicitly instead of printing a generic "error sending
+/// request" wrapper.
+fn describe_request_error(e: reqwest::Error) -> String {
+    let mut chain = format!("{e}");
+    {
+        let mut source = std::error::Error::source(&e);
+        while let Some(err) = source {
+            use std::fmt::Write;
+            let _ = write!(chain, ": {err}");
+            source = err.source();
+        }
+    }
+    if chain.contains("measurement") && chain.contains("allowed") {
+        return format!(
+            "attestation failed: the server's enclave measurement is not in your \
+             trusted_measurements list.\n\
+             The running server version is not trusted by this client.\n\
+             Update trusted_measurements in your config, or verify you are \
+             connecting to the correct server.\n\
+             (inner: {chain})"
+        );
+    }
+    if chain.contains("fingerprint") && chain.contains("mismatch") {
+        return format!(
+            "attestation failed: TLS certificate does not match the attested enclave.\n\
+             (inner: {chain})"
+        );
+    }
+    if chain.contains("attestation") {
+        return format!(
+            "attestation failed: could not verify the server's enclave attestation.\n\
+             (inner: {chain})"
+        );
+    }
+    format!("request failed: {chain}")
+}
+
+/// Parse a PEM or raw base64 DER certificate from a config value.
+fn parse_cert_config(value: Option<&str>, field_name: &str) -> Result<Option<Vec<u8>>, String> {
+    let Some(value) = value else { return Ok(None) };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.starts_with("-----BEGIN") {
+        use der::DecodePem;
+        let cert = x509_cert::Certificate::from_pem(trimmed)
+            .map_err(|e| format!("failed to parse {field_name} PEM: {e}"))?;
+        Ok(Some(der::Encode::to_der(&cert).map_err(|e| {
+            format!("failed to encode {field_name}: {e}")
+        })?))
+    } else {
+        let b64: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+        Ok(Some(
+            base64::engine::general_purpose::STANDARD
+                .decode(&b64)
+                .map_err(|e| format!("failed to decode {field_name} base64: {e}"))?,
+        ))
+    }
+}
+
 fn require_base_url(config: &Config) -> Result<&str, String> {
     config
         .base_url
@@ -312,13 +423,37 @@ async fn run(cli: Cli) -> Result<(), String> {
                     "<not set>"
                 }
             );
+            if config.trusted_measurements.is_empty() {
+                println!("trusted_measurements: <none> (attestation disabled)");
+            } else {
+                println!(
+                    "trusted_measurements: {}",
+                    config.trusted_measurements.join(", ")
+                );
+            }
+            println!(
+                "attestation_url: {}",
+                config.attestation_url.as_deref().unwrap_or("<default ATC>")
+            );
             Ok(())
         }
-        Some(Command::Configure { base_url }) => {
+        Some(Command::Configure {
+            base_url,
+            attestation_url,
+        }) => {
+            if base_url.is_none() && attestation_url.is_none() {
+                return Err("specify at least one of --base-url or --attestation-url".into());
+            }
             let mut config = Config::load();
-            config.base_url = Some(base_url.clone());
+            if let Some(url) = &base_url {
+                config.base_url = Some(url.clone());
+                println!("base_url set to {url}");
+            }
+            if let Some(url) = &attestation_url {
+                config.attestation_url = Some(url.clone());
+                println!("attestation_url set to {url}");
+            }
             config.save()?;
-            println!("base_url set to {base_url}");
             Ok(())
         }
         Some(Command::Account { command }) => match command {
@@ -348,13 +483,13 @@ async fn cmd_account_show() -> Result<(), String> {
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = reqwest::Client::new();
+    let client = build_client(&config).await?;
     let resp = client
         .get(format!("{base_url}/v1/account"))
         .basic_auth(id, Some(secret))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -385,12 +520,12 @@ async fn cmd_account_create() -> Result<(), String> {
         );
     }
 
-    let client = reqwest::Client::new();
+    let client = build_client(&config).await?;
     let resp = client
         .post(format!("{base_url}/v1/account"))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -444,12 +579,12 @@ async fn cmd_account_prices() -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
 
-    let client = reqwest::Client::new();
+    let client = build_client(&config).await?;
     let resp = client
         .get(format!("{base_url}/v1/prices"))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -501,14 +636,14 @@ async fn cmd_account_checkout(price_id: &str, no_browser: bool) -> Result<(), St
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = reqwest::Client::new();
+    let client = build_client(&config).await?;
     let resp = client
         .post(format!("{base_url}/v1/account/checkout"))
         .basic_auth(id, Some(secret))
         .json(&serde_json::json!({ "price_id": price_id }))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -537,13 +672,13 @@ async fn cmd_account_balances() -> Result<(), String> {
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = reqwest::Client::new();
+    let client = build_client(&config).await?;
     let resp = client
         .get(format!("{base_url}/v1/account/balances"))
         .basic_auth(id, Some(secret))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -576,14 +711,14 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
     let (account_id, secret) = require_credentials(&config)?;
-    let client = reqwest::Client::new();
+    let client = build_client(&config).await?;
 
     // 1. Fetch issuer keys from server
     let resp = client
         .get(format!("{base_url}/v1/keys"))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -691,7 +826,7 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
         }))
         .send()
         .await
-        .map_err(|e| format!("credential issuance request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -746,15 +881,15 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
 async fn cmd_chat(prompt: &str) -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
-    let client = reqwest::Client::new();
-    let model_id = "phala/qwen3-vl-30b-a3b-instruct";
+    let client = build_client(&config).await?;
+    let model_id = "kimi-k2-5";
 
     // 1. Fetch model info for pricing
     let resp = client
         .get(format!("{base_url}/v1/models"))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -859,7 +994,7 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
         }))
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(describe_request_error)?;
 
     let status = resp.status();
     let body: serde_json::Value = resp

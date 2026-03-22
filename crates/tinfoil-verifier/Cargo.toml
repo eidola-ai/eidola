@@ -1,0 +1,49 @@
+[package]
+name = "tinfoil-verifier"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# SEV-SNP attestation report parsing and certificate chain verification
+sev = { version = "7", default-features = false, features = ["snp", "crypto_nossl"] }
+
+# DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
+x509-cert = "0.2"
+der = { version = "0.7", features = ["alloc"] }
+
+# HTTP client for fetching attestation bundle
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json"] }
+
+# TLS verification
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+
+# Concurrent verified-fingerprint cache
+dashmap = "6"
+
+# Async runtime (for block_in_place in TLS verifier)
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+
+# Hashing
+sha2 = "0.10"
+
+# Encoding
+base64 = "0.22"
+hex = "0.4"
+flate2 = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rustls = { version = "0.23", features = ["ring"] }

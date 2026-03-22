@@ -1,0 +1,1 @@
+FROM stripe/stripe-cli@sha256:c7b88bef6658b125953a35c894b37636e8b1aa8956f017de2ce6a1f15c77314d

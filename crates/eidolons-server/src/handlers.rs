@@ -66,9 +66,15 @@ pub async fn list_models(
 
 /// Compute the worst-case cost in credits for a request.
 ///
-/// Uses 1-byte-per-token estimate for prompt size plus `max_completion_tokens`
-/// (or context_length) for completion, each at their respective per-token rate.
+/// For per-request models (e.g., Whisper, TTS), returns the flat per-request price.
+/// For token-based models, uses 1-byte-per-token estimate for prompt size plus
+/// `max_completion_tokens` (or context_length) for completion.
 fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> u128 {
+    // Per-request pricing: flat cost regardless of token count.
+    if let Some(ref per_req) = model.pricing.per_request {
+        return (per_req.value as u128).div_ceil(per_req.scale_factor as u128);
+    }
+
     let sf = PRICING_SCALE_FACTOR as u128;
 
     // Prompt: estimate 1 token per byte of message content.
@@ -89,6 +95,11 @@ fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> u128 {
 
 /// Compute the actual cost in credits from usage data.
 fn actual_cost(usage: &Usage, model: &Model) -> u128 {
+    // Per-request pricing: flat cost regardless of actual token usage.
+    if let Some(ref per_req) = model.pricing.per_request {
+        return (per_req.value as u128).div_ceil(per_req.scale_factor as u128);
+    }
+
     let sf = PRICING_SCALE_FACTOR as u128;
     let prompt_cost = usage.prompt_tokens as u128 * model.pricing.per_prompt_token.value as u128;
     let completion_cost =
@@ -157,9 +168,7 @@ async fn authorize_spend(
     act: &ActSpend,
     request: &ChatCompletionRequest,
 ) -> Result<(Model, u128), ServerError> {
-    let master_key = state.credential_master_key.as_ref().ok_or_else(|| {
-        ServerError::ServiceUnavailable("credential verification is not configured".to_string())
-    })?;
+    let master_key = &state.credential_master_key;
 
     // Verify the challenge_digest matches our expected TokenChallenge.
     let expected_digest = credentials::compute_challenge_digest();
@@ -201,13 +210,13 @@ async fn authorize_spend(
     }
 
     // Look up the model and validate pricing.
-    let model = state
-        .backend
-        .lookup_model(&request.model)
-        .await?
-        .ok_or_else(|| ServerError::BadRequest {
-            message: format!("unknown model: {}", request.model),
-        })?;
+    let model =
+        state
+            .backend
+            .lookup_model(&request.model)
+            .ok_or_else(|| ServerError::BadRequest {
+                message: format!("unknown model: {}", request.model),
+            })?;
 
     // Decode the charge amount from the spend proof.
     let charge_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).map_err(|_| {
@@ -341,21 +350,8 @@ async fn handle_non_streaming_request(
     let meta = &backend_response.meta;
     let is_tee = meta.tee_type.is_some();
 
-    let backend_attestation = if is_tee {
-        if let Some(chat_id) = &meta.chat_id {
-            state
-                .attestation
-                .fetch_signature(chat_id, &meta.backend_model)
-                .await
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     let privacy = build_privacy_metadata(&auth_context, is_tee, &meta.provider);
-    let verification = build_verification_metadata(backend_attestation);
+    let verification = build_verification_metadata(None);
 
     let eidolons_response = EidolonsResponse::from_completion(
         backend_response.response,
@@ -492,21 +488,8 @@ async fn handle_streaming_request(
                         final_usage = meta.usage.clone();
                     }
 
-                    let backend_attestation = if is_tee {
-                        if let Some(chat_id) = &meta.chat_id {
-                            state
-                                .attestation
-                                .fetch_signature(chat_id, &meta.backend_model)
-                                .await
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
                     let privacy = build_privacy_metadata(&auth_context, is_tee, &meta.provider);
-                    let verification = build_verification_metadata(backend_attestation);
+                    let verification = build_verification_metadata(None);
 
                     // Compute refund based on usage.
                     let cost = final_usage
@@ -542,7 +525,7 @@ async fn handle_streaming_request(
                     error!("Stream error, issuing zero refund: {}", e);
                     let refund_info =
                         try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
-                    let privacy = build_privacy_metadata(&auth_context, false, "redpill");
+                    let privacy = build_privacy_metadata(&auth_context, true, "tinfoil");
                     let verification = build_verification_metadata(None);
                     send_metadata_event(&tx, refund_info, privacy, verification, String::new())
                         .await;
@@ -555,7 +538,7 @@ async fn handle_streaming_request(
         // have been delivered and billed; we don't know the cost. Refund 0.
         warn!("Upstream channel closed without Done event, issuing zero refund");
         let refund_info = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
-        let privacy = build_privacy_metadata(&auth_context, false, "redpill");
+        let privacy = build_privacy_metadata(&auth_context, true, "tinfoil");
         let verification = build_verification_metadata(None);
         send_metadata_event(&tx, refund_info, privacy, verification, String::new()).await;
     });

@@ -6,19 +6,20 @@ Guidance for AI coding agents working in this repository.
 
 The server is an OpenAI-compatible proxy that translates requests to upstream AI providers. It includes a billing system with anonymous credentials for privacy-preserving usage tracking.
 
-**Current upstream:** RedPill.ai (OpenAI-compatible, routes to various model providers)
+**Current upstream:** Tinfoil (inference.tinfoil.sh) — OpenAI-compatible, all models run in confidential enclaves (AMD SEV-SNP / Intel TDX / NVIDIA CC)
 
 **Database:** PostgreSQL 17+ (see `crates/eidolons-server/schema/schema.sql`)
 
-**Deployment:** Phala dstack — all services run inside a single Confidential VM (CVM) with encrypted disk backed by Intel TDX.
+**Deployment:** Tinfoil Containers — all services run inside confidential enclaves (AMD SEV-SNP). The Tinfoil shim handles TLS termination with attestation-bearing certificates; the server runs plain HTTP behind it.
 
-**CI:** Two workflows — `ci.yml` (self-hosted Mac: Nix checks, Swift builds/tests) and `oci.yml` (ubuntu-latest: OCI image builds, manifest verification, GHCR publishing).
+**CI:** Two workflows — `ci.yml` (self-hosted Mac: Nix checks, Swift builds/tests) and `oci.yml` (ubuntu-24.04: OCI image builds, manifest verification, GHCR publishing).
 
 **Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidolons-server` and `ghcr.io/<owner>/eidolons-postgres`.
 
 **Key design decisions:**
 - Axum-based HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration
-- Pure Rust TLS via `rustls-rustcrypto` (no C dependencies)
+- Plain HTTP internally; TLS terminated by Tinfoil Container shim with attestation-bearing certificates (attestation hash + HPKE key encoded in SANs, issued by public CA)
+- Tinfoil attestation verification via `tinfoil-verifier` crate — verifies SEV-SNP hardware attestation per-connection, caching verified fingerprints for fast reconnections; handles load-balanced deployments
 - Statically linked musl binaries for Linux deployment
 - StageX-based OCI images (reproducible, `FROM scratch`, runs as non-root)
 - Request-based (no sessions/caching in the proxy layer)
@@ -28,12 +29,40 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 **API endpoints:** Defined in `crates/eidolons-server/openapi.json` (generated from utoipa annotations — see Conventions).
 
 **Environment variables:**
-- `REDPILL_API_KEY` (required) - RedPill API key
+- `TINFOIL_API_KEY` (required) - Tinfoil inference API key
 - `DATABASE_URL` (required) - PostgreSQL connection string
-- `BIND_ADDR` (default: `127.0.0.1:8080`) - Address to bind
+- `CREDENTIAL_MASTER_KEY` (required) - Hex-encoded 32-byte AES-256 key for encrypting issuer private keys at rest in Postgres; in production, injected as a Tinfoil secret; in local dev, use the all-zeros key from `.env.example`
+- `BIND_ADDR` (default: `127.0.0.1:8443`) - Address to bind (HTTP); Containerfile overrides to `0.0.0.0:8080`
 - `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
 - `STRIPE_WEBHOOK_SECRET` (optional) - Stripe webhook signing secret; webhook endpoint returns 503 without it
-- `CREDENTIAL_MASTER_KEY` (optional) - Hex-encoded 32-byte AES-256 master key for issuer key encryption; credential issuance endpoints return 503 without it
+- `TINFOIL_BASE_URL` (optional) - Override the default Tinfoil API base URL (`https://inference.tinfoil.sh/v1`)
+- `TINFOIL_PRICING_OVERRIDES` (optional) - JSON object overriding per-model pricing; e.g. `{"kimi-k2-5":{"input":2.0,"output":6.0}}`. Token-based models accept `input`/`output` ($/M tokens); per-request models accept `request` ($/request). See `backend.rs` `MODEL_CATALOG` for defaults
+- `PRICING_MARKUP` (optional) - Pricing markup factor applied to all model prices (default: `1.5`)
+
+**Tinfoil Containers / TEE integration:**
+
+The server runs as plain HTTP inside a Tinfoil Container. The Tinfoil shim handles TLS termination externally, generating attestation-bearing certificates (attestation hash and HPKE key encoded in SANs, issued by a public CA via ACME). The shim serves `/.well-known/tinfoil-attestation` for client-side verification.
+
+The credential master key (`CREDENTIAL_MASTER_KEY`, AES-256, hex-encoded) encrypts issuer private keys at rest in Postgres. In production, it is injected as a Tinfoil secret (environment variable, encrypted, only accessible inside the enclave). In local dev, use the all-zeros dev key from `.env.example`. The key must remain stable across upgrades so encrypted issuer keys in the database remain accessible.
+
+The container has access to `/dev/sev-guest` (via the undocumented `devices` field in `tinfoil-config.yml`) for requesting SEV-SNP attestation reports. The pre-generated attestation document and TLS key material are also available at `/tinfoil/` inside the container.
+
+**Tinfoil attestation verification (`crates/tinfoil-verifier/`):**
+
+On startup the server verifies the Tinfoil inference enclave's hardware attestation before sending any traffic. The `tinfoil-verifier` crate handles this via `attesting_client()`:
+
+1. Fetches the attestation bundle from the Tinfoil ATC service for initial bootstrap verification
+2. Verifies the AMD VCEK certificate chain (embedded Genoa ARK → ASK → VCEK) using RSA-PSS(SHA-384)
+3. Verifies the SEV-SNP attestation report's ECDSA-P384 signature against the VCEK public key
+4. Validates TCB policy (minimum firmware versions: bl≥0x07, snp≥0x0e, ucode≥0x48)
+5. Checks the report measurement against `ALLOWED_MEASUREMENTS` in `measurements.rs`
+6. Cross-checks the enclave TLS certificate's SPKI fingerprint against `report_data[0..32]`
+7. Returns a `reqwest::Client` with a custom `ServerCertVerifier` that verifies attestation per-connection
+
+Unlike static cert pinning, verified SPKI fingerprints are cached so reconnections to already-attested instances are instant. New connections fetch `/.well-known/tinfoil-attestation` from the connected instance, verify the SEV-SNP report, and cache the result. VCEKs are cached per chip ID and fetched from AMD KDS when encountering a new chip. This handles load-balanced deployments where each instance has its own TLS key. Pure Rust dependencies (`sev`, `x509-cert`, `der`) — no OpenSSL.
+
+**Compose files:**
+- `compose.yaml` — local development: postgres + server + stripe-cli
 
 ## Crux Architecture
 
@@ -80,6 +109,6 @@ The `justfile` is the primary development interface. Run `just` to see all avail
 - `rustup` + `rust-toolchain.toml` manages the Rust toolchain for development
 - OpenAI API format as the canonical interface
 - Server API is documented via utoipa `#[utoipa::path]` annotations on handler functions and `ToSchema` derives on request/response types. `OpenApiRouter` (in `lib.rs::build_router()`) collects paths and recursively discovers schemas automatically — only SSE streaming types that aren't referenced from path annotations are listed manually in `api_doc.rs`. When adding or changing server endpoints, add the annotation on the handler and register it in `build_router()` via `routes!()`, then run `just update-openapi` to regenerate the committed `openapi.json`
-- `artifact-manifest.json` records expected OCI digests; CI verifies builds match and suggests updates on PRs
+- `artifact-manifest.json` records expected OCI digests; CI verifies builds match and suggests updates on PRs. Use `just update-manifest` to regenerate it with the pinned amd64 BuildKit builder used for reproducible local verification
 - Before committing, ensure `README.md` and `AGENTS.md` are updated to reflect any changes (new files, endpoints, env vars, build commands, etc.)
 - Omit any tool-specific "co-authored by" lines from commit messages

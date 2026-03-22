@@ -6,12 +6,12 @@ default:
 
 # --- Development ---
 
-# Start postgres + server (full stack in containers, fast dev build)
+# Start postgres + server (full stack in containers)
 dev:
     ./scripts/dev.sh
 
-# Start just postgres (for running the server on the host with cargo)
-db:
+# Start backing services (postgres) for running the server on the host with cargo
+services:
     docker buildx bake postgres
     docker compose up -d --no-build postgres
 
@@ -32,9 +32,9 @@ check:
 test:
     cargo test
 
-# Run integration tests (requires: just db && just db-reset)
+# Run integration tests (requires: just services && just db-reset)
 test-integration:
-    DATABASE_URL="${DATABASE_URL:-postgres://eidolons@localhost/eidolons}" cargo test -p eidolons-server -- --ignored
+    DATABASE_URL="${DATABASE_URL:-postgres://eidolons@localhost/eidolons}" CREDENTIAL_MASTER_KEY="${CREDENTIAL_MASTER_KEY:-0000000000000000000000000000000000000000000000000000000000000000}" cargo test -p eidolons-server -- --ignored
 
 # Run E2E webhook smoke tests (requires STRIPE_API_KEY)
 test-webhook-smoke:
@@ -67,14 +67,44 @@ build:
     # TODO: Build apps
 
 # Update artifact-manifest.json with current build digests
+# Uses a docker-container builder for rewrite-timestamp + force-compression
+# (the default docker driver does not support these reproducibility options).
 update-manifest:
-    docker buildx bake --metadata-file /tmp/bake-metadata.json
-    @jq -n \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BUILDER="eidolons"
+    BUILDKIT_IMAGE="moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b"
+    NEEDS_RECREATE=0
+    if ! INSPECT_OUTPUT="$(docker buildx inspect "$BUILDER" 2>/dev/null)"; then
+      NEEDS_RECREATE=1
+    elif ! grep -Fq "image=\"${BUILDKIT_IMAGE}\"" <<<"$INSPECT_OUTPUT"; then
+      NEEDS_RECREATE=1
+    elif ! grep -Fq "linux/amd64*" <<<"$INSPECT_OUTPUT"; then
+      NEEDS_RECREATE=1
+    fi
+    if [ "$NEEDS_RECREATE" -eq 1 ]; then
+      if docker buildx inspect "$BUILDER" &>/dev/null; then
+        docker buildx rm "$BUILDER" >/dev/null
+      fi
+      echo "Creating docker-container builder '$BUILDER'..."
+      docker buildx create \
+        --name "$BUILDER" \
+        --driver docker-container \
+        --platform linux/amd64 \
+        --driver-opt "image=${BUILDKIT_IMAGE}" \
+        >/dev/null
+    fi
+    docker buildx inspect "$BUILDER" --bootstrap >/dev/null
+    docker buildx bake manifest \
+      --builder "$BUILDER" \
+      --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true' \
+      --metadata-file /tmp/bake-metadata.json
+    jq -n \
       --arg server "$(jq -r '."server"."containerimage.digest"' /tmp/bake-metadata.json)" \
       --arg postgres "$(jq -r '."postgres"."containerimage.digest"' /tmp/bake-metadata.json)" \
       '{"eidolons-server": $server, "eidolons-postgres": $postgres}' \
       > artifact-manifest.json
-    @echo "Updated artifact-manifest.json"
+    echo "Updated artifact-manifest.json"
 
 # Run all Nix checks (formatting, linting, tests, artifact freshness)
 ci-check:

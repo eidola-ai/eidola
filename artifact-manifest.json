@@ -1,4 +1,4 @@
 {
-  "eidolons-server": "sha256:e46b71a36194722650670dc6f2c3b2b66259d7518c7f61288a0fdf90ac7b8fc4",
-  "eidolons-postgres": "sha256:6d4559f7861cecacdca3b59e851aab866d5354a0c749143847a11714e8ec9acf"
+  "eidolons-server": "sha256:ddbd9ee10916ce5728da7037155ca0abe93b7342f9dd2f4918b24945bed75848",
+  "eidolons-postgres": "sha256:93bf8ab9776fd94d3cd16d68b784f338b9b063927936767df0a22f594ab28603"
 }
