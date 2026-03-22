@@ -77,7 +77,7 @@ group "manifest" {
 # (used by CI via setup-buildx-action).
 target "_ci" {
   inherits = ["_common"]
-  output   = ["type=image,push=true,rewrite-timestamp=true,force-compression=true,compression=gzip"]
+  output   = ["type=image,push=true,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true"]
 }
 
 target "ci-server" {

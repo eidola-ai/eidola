@@ -97,7 +97,7 @@ update-manifest:
     docker buildx inspect "$BUILDER" --bootstrap >/dev/null
     docker buildx bake manifest \
       --builder "$BUILDER" \
-      --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip' \
+      --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true' \
       --metadata-file /tmp/bake-metadata.json
     jq -n \
       --arg server "$(jq -r '."server"."containerimage.digest"' /tmp/bake-metadata.json)" \

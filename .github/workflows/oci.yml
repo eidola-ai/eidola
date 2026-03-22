@@ -38,7 +38,7 @@ jobs:
           # supports rewrite-timestamp and force-compression for full
           # reproducibility. Override the default output to enable them.
           docker buildx bake manifest \
-            --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip' \
+            --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true' \
             --metadata-file /tmp/bake-metadata.json
 
       - name: Extract digests
