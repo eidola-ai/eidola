@@ -39,7 +39,7 @@ pub struct AttestationDocumentV2 {
 /// V3 attestation document (`/.well-known/tinfoil-attestation?v=3`).
 /// CPU report is base64-encoded raw bytes (not gzipped). VCEK is included
 /// when the server self-verifies at boot. ARK/ASK are included for custom
-/// chains (dev shim); production uses built-in AMD Genoa certs.
+/// chains (tinfoil shim mock); production uses built-in AMD Genoa certs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationDocumentV3 {
     pub format: String,

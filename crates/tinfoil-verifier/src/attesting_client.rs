@@ -105,8 +105,8 @@ impl AttestingVerifier {
     /// (even if it's not the target — it's still a valid attested instance).
     async fn verify_new_fingerprint(&self, target_fp: [u8; 32]) -> Result<(), crate::Error> {
         // Ephemeral client for fetching attestation documents. When a custom
-        // trusted root is configured (dev shim), it's added so TLS works with
-        // the dev shim's self-signed cert chain.
+        // trusted root is configured (tinfoil shim mock), it's added so TLS works with
+        // the mock shim's self-signed cert chain.
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30));

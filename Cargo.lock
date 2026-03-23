@@ -1132,38 +1132,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dev-shim"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "axum",
- "base64",
- "der",
- "hex",
- "hyper",
- "hyper-util",
- "p384",
- "rand_core 0.6.4",
- "rcgen",
- "reqwest",
- "rsa",
- "rustls",
- "rustls-rustcrypto",
- "serde",
- "serde_json",
- "sev",
- "sha2",
- "spki",
- "tokio",
- "tokio-rustls",
- "tower-service",
- "tracing",
- "tracing-subscriber",
- "webpki-roots",
- "x509-cert",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4166,6 +4134,38 @@ checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "tinfoil-shim-mock"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "axum",
+ "base64",
+ "der",
+ "hex",
+ "hyper",
+ "hyper-util",
+ "p384",
+ "rand_core 0.6.4",
+ "rcgen",
+ "reqwest",
+ "rsa",
+ "rustls",
+ "rustls-rustcrypto",
+ "serde",
+ "serde_json",
+ "sev",
+ "sha2",
+ "spki",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots",
+ "x509-cert",
 ]
 
 [[package]]

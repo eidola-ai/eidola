@@ -1,4 +1,4 @@
-//! Dev shim — emulates the Tinfoil Container shim for local development.
+//! Tinfoil shim mock — emulates the Tinfoil Container shim for local development.
 //!
 //! Generates a mock SEV-SNP attestation chain using the exact same algorithms
 //! as production hardware:
@@ -279,7 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("dev_shim=info".parse().unwrap()),
+                .add_directive("tinfoil_shim_mock=info".parse().unwrap()),
         )
         .init();
 

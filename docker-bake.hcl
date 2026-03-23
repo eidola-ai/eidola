@@ -49,7 +49,7 @@ target "postgres" {
 
 target "shim" {
   inherits = ["_common"]
-  tags     = ["dev-shim:dev"]
+  tags     = ["tinfoil-shim-mock:dev"]
 }
 
 # Stripe CLI — pins the upstream image by digest so dependabot can propose

@@ -37,10 +37,10 @@ services:
         condition: service_healthy
 
   shim:
-    image: dev-shim:dev
+    image: tinfoil-shim-mock:dev
     build:
       context: .
-      dockerfile: crates/dev-shim/Containerfile
+      dockerfile: crates/tinfoil-shim-mock/Containerfile
     environment:
       UPSTREAM_URL: http://server:8080
       LISTEN_ADDR: 0.0.0.0:8443

@@ -70,7 +70,7 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 
 **Key pattern:** The core never performs side-effects directly. It emits Effects that the shell handles, then the shell sends responses back via `handleResponse()`.
 
-**Capability implementations:** Pure Rust crates in `crates/` implement capability logic. The same `crates/` tree also contains the Rust code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) plus operational utilities such as `dev-shim` and `hash-secret`. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
+**Capability implementations:** Pure Rust crates in `crates/` implement capability logic. The same `crates/` tree also contains the Rust code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) plus operational utilities such as `tinfoil-shim-mock` and `hash-secret`. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
 
 **Two codegen pipelines:**
 - `uniffi-bindgen-swift` (workspace crate under `crates/`) → FFI bridge (`processEvent`, `handleResponse`, `view`)

@@ -1,5 +1,5 @@
 [package]
-name = "dev-shim"
+name = "tinfoil-shim-mock"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,7 +7,7 @@ repository.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "dev-shim"
+name = "tinfoil-shim-mock"
 path = "src/main.rs"
 
 [dependencies]

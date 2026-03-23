@@ -8,11 +8,11 @@ COPY crates/ ./crates/
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p dev-shim \
-    && install -D target/release/dev-shim /out/dev-shim
+    cargo build --release -p tinfoil-shim-mock \
+    && install -D target/release/tinfoil-shim-mock /out/tinfoil-shim-mock
 
 FROM debian:bookworm-slim
 WORKDIR /src
-COPY --from=build /out/dev-shim /usr/local/bin/
+COPY --from=build /out/tinfoil-shim-mock /usr/local/bin/
 EXPOSE 8443
-ENTRYPOINT ["dev-shim"]
+ENTRYPOINT ["tinfoil-shim-mock"]

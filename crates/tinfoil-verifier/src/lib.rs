@@ -66,7 +66,7 @@ pub async fn attesting_client(
         .collect();
 
     // Determine whether to fetch from ATC or the server's own well-known endpoint.
-    // When a custom root CA is configured (dev shim), always fetch directly from
+    // When a custom root CA is configured (tinfoil shim mock), always fetch directly from
     // the server — ATC only knows about the production Tinfoil enclave.
     // Also use direct fetch when atc_url explicitly matches the well-known URL.
     let use_direct = config.trusted_ark_der.is_some()
@@ -174,7 +174,7 @@ pub async fn attesting_client(
 ///
 /// When a custom trusted ARK is provided, it's added as a TLS root certificate
 /// so the client can connect to servers using certs signed by that root (e.g.
-/// the dev shim). Without a custom root, standard WebPKI roots are used.
+/// the tinfoil shim mock). Without a custom root, standard WebPKI roots are used.
 fn build_bootstrap_client(trusted_ark_der: Option<&[u8]>) -> Result<reqwest::Client, Error> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
