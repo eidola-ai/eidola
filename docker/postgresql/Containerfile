@@ -3,18 +3,18 @@
 # ── base ───────────────────────────────────────────────────────────────────────
 # Pin digests for all StageX package dependencies.
 
-FROM stagex/user-postgresql@sha256:c116458b105157e43eb33bef199495714a83dd1ed905596ce63bac8781dc1fc7 AS pkg-postgresql
-FROM stagex/busybox@sha256:3d128909dbc8e7b6c4b8c3c31f4583f01a307907ea179934bb42c4ef056c7efd AS pkg-busybox
-FROM stagex/musl@sha256:d7f6c365f5724c65cadb2b96d9f594e46132ceb366174c89dbf7554897f2bc53 AS pkg-musl
-FROM stagex/zlib@sha256:09d63654e27decb6147f1b23005d539e30db8e53eb2d284e824bcf4d4e7c3c11 AS pkg-zlib
-FROM stagex/core-openssl@sha256:4ecf4f42ad958a25d4622b246aacdbccd523aacbb8ce036f387d39e8a17b9840 AS pkg-openssl
-FROM stagex/core-libcxx@sha256:b14076c9a20cd59210804c6cc774f9af08e513e1b18e35211124f23c6a2afbc5 AS pkg-libcxx
-FROM stagex/core-libcxxabi@sha256:654f762dde9c819bcc32cc781059d42458205c66ab764ef9a20a7f8dff734806 AS pkg-libcxxabi
-FROM stagex/core-libunwind@sha256:b6915f100585cf071af2652843e23c7365be48043afc61d0154b6ef1eb626c0b AS pkg-libunwind
-FROM stagex/core-icu@sha256:68248a0eb064ff1e73998a2d8618ab7a8d3092beae2819e14d32e3e7ef2782f0 AS pkg-icu
-FROM stagex/core-ncurses@sha256:35d72c3b114e43b754efaa7888b4998bc1871aa8fac9bad5c085e9c30689419f AS pkg-ncurses
-FROM stagex/core-readline@sha256:b1df192ced05d70c2d8f0dcf2dc398a9dec0b5be752e6ba23fdfaf0d13a52d9d AS pkg-readline
-FROM stagex/core-libxml2@sha256:e7e5c0b1eb8554575dddf7b92adb920f7d0e0448221f0ddddf68d2852d0cc1e5 AS pkg-libxml2
+FROM stagex/user-postgresql@sha256:4b6d68746a0896735331c4688d2890c2418e6a187e4c01936491dd40dfc747c1 AS pkg-postgresql
+FROM stagex/core-busybox@sha256:d608daa946e4799cf28b105aba461db00187657bd55ea7c2935ff11dac237e27 AS pkg-busybox
+FROM stagex/core-musl@sha256:816a6e097544c23386c95c8614e358ace7c5026c3f53b7b9353b84cbb4ed0096 AS pkg-musl
+FROM stagex/core-zlib@sha256:130afab57ac8e9a9eb1e0c6e2c91758a67f731634d3cdb45ae04ea0534cc3930 AS pkg-zlib
+FROM stagex/core-openssl@sha256:decacae13674bebbeaef3ce79c5d1159ae8495f272f8fa7e5db660c84ab37d1d AS pkg-openssl
+FROM stagex/core-libcxx@sha256:733ddf3bf6a47ba39578bec31d30804db134fa72482e8dbf4fcf288788d8a5b4 AS pkg-libcxx
+FROM stagex/core-libcxxabi@sha256:88e66348a0eb2b1c0a321aaac138aef4ccc4bbd13a16ffd1de0231d5506f66b3 AS pkg-libcxxabi
+FROM stagex/core-libunwind@sha256:c76fcc66148b19230247b7cdba06040dbe2f47aa19d7a4be4d430db15d47e4b8 AS pkg-libunwind
+FROM stagex/core-icu@sha256:7ebe433368a5a520a3676021c49311dedc0bb055dc22fb65b9bcb09cc7efce88 AS pkg-icu
+FROM stagex/core-ncurses@sha256:080694dbb4da85bb43e0772f3d42dc4a396e77b8e047a5020b9c266e9bd18212 AS pkg-ncurses
+FROM stagex/core-readline@sha256:3578d7ddb18577b28dd7af029033265fd2e7b0b5cd6c700e38311f3b6cec482f AS pkg-readline
+FROM stagex/core-libxml2@sha256:b5a12ac859b6bde54c4b7d9b620abe19d1471d500be06c9b446741e56d98638d AS pkg-libxml2
 
 # ── fetch ──────────────────────────────────────────────────────────────────────
 # (no-op: all dependencies are pre-built StageX packages pinned above)
