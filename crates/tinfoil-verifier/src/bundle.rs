@@ -78,9 +78,16 @@ pub const DEFAULT_ATC_URL: &str = "https://atc.tinfoil.sh/attestation";
 /// TLS certificate — everything needed for verification.
 pub async fn fetch_bundle(atc_url: Option<&str>) -> Result<AttestationBundle, Error> {
     let url = atc_url.unwrap_or(DEFAULT_ATC_URL);
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
+        .tls_backend_preconfigured(tls_config)
         .build()
         .map_err(|e| Error::Bundle(format!("failed to build HTTP client: {e}")))?;
     let bundle: AttestationBundle = client

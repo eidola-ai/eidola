@@ -19,6 +19,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 
 # TLS verification
 rustls = { version = "0.23", default-features = false, features = ["std"] }
+webpki-roots = "1"
 
 # Concurrent verified-fingerprint cache
 dashmap = "6"

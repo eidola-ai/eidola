@@ -176,17 +176,23 @@ pub async fn attesting_client(
 /// so the client can connect to servers using certs signed by that root (e.g.
 /// the dev shim). Without a custom root, standard WebPKI roots are used.
 fn build_bootstrap_client(trusted_ark_der: Option<&[u8]>) -> Result<reqwest::Client, Error> {
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30));
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     if let Some(ark_der) = trusted_ark_der {
-        let cert = reqwest::Certificate::from_der(ark_der)
+        root_store
+            .add(ark_der.into())
             .map_err(|e| Error::Tls(format!("invalid ARK cert for TLS root: {e}")))?;
-        builder = builder.add_root_certificate(cert);
     }
 
-    builder
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .tls_backend_preconfigured(tls_config)
         .build()
         .map_err(|e| Error::Tls(format!("failed to build bootstrap client: {e}")))
 }

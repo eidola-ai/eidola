@@ -24,6 +24,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # Pure Rust TLS crypto provider (no C/assembly dependencies)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

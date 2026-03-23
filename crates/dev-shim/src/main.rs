@@ -71,6 +71,14 @@ const OFF_LAUNCH_TCB: usize = 0x1F0; // 8 bytes
 const OFF_SIGNATURE: usize = 0x2A0; // 512 bytes (72 R + 72 S + 368 reserved)
 const REPORT_SIZE: usize = 0x4A0; // 1184 bytes
 
+fn tls_config() -> rustls::ClientConfig {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
+}
+
 #[derive(Clone)]
 struct AppState {
     attestation_json: String,
@@ -437,6 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         upstream_url: upstream_url.clone(),
         proxy_client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .tls_backend_preconfigured(tls_config())
             .build()?,
     };
 
