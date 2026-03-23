@@ -112,15 +112,14 @@ pub async fn fetch_well_known(
 ) -> Result<ResolvedAttestation, Error> {
     // Try v3 first
     let v3_url = format!("{attestation_url}?v=3");
-    if let Ok(resp) = client.get(&v3_url).send().await {
-        if resp.status().is_success() {
-            if let Ok(doc) = resp.json::<AttestationDocumentV3>().await {
-                if doc.format == V3_FORMAT && doc.cpu.platform == "sev-snp" {
-                    tracing::info!("Using v3 attestation document");
-                    return resolve_v3(&doc);
-                }
-            }
-        }
+    if let Ok(resp) = client.get(&v3_url).send().await
+        && resp.status().is_success()
+        && let Ok(doc) = resp.json::<AttestationDocumentV3>().await
+        && doc.format == V3_FORMAT
+        && doc.cpu.platform == "sev-snp"
+    {
+        tracing::info!("Using v3 attestation document");
+        return resolve_v3(&doc);
     }
 
     // Fall back to v2

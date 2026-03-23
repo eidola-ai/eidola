@@ -110,10 +110,10 @@ impl AttestingVerifier {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30));
-        if let Some(ark_der) = &self.trusted_ark_der {
-            if let Ok(cert) = reqwest::Certificate::from_der(ark_der) {
-                builder = builder.add_root_certificate(cert);
-            }
+        if let Some(ark_der) = &self.trusted_ark_der
+            && let Ok(cert) = reqwest::Certificate::from_der(ark_der)
+        {
+            builder = builder.add_root_certificate(cert);
         }
         let fetch_client = builder
             .build()

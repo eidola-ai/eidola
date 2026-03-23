@@ -7,7 +7,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-crux_core = { version = "0.16", features = ["typegen"] }
+crux_core = { version = "0.17", features = ["typegen"] }
 eidolons-shared = { path = "../eidolons-shared", default-features = false, features = ["typegen"] }
 anyhow = "1.0"
 

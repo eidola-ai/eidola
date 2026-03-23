@@ -310,10 +310,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut ark_rcgen_params =
         rcgen::CertificateParams::new(vec!["Local Dev Root CA".to_string()])?;
     ark_rcgen_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ark_rcgen_cert = ark_rcgen_params.self_signed(&ark_rcgen_key)?;
+    let ark_rcgen_issuer = rcgen::CertifiedIssuer::self_signed(ark_rcgen_params, ark_rcgen_key)?;
 
     // Extract subject and SPKI from the rcgen cert to ensure matching names
-    let parsed_rcgen_ark = x509_cert::Certificate::from_der(ark_rcgen_cert.der().as_ref())?;
+    let parsed_rcgen_ark = x509_cert::Certificate::from_der(ark_rcgen_issuer.der().as_ref())?;
     let ark_subject = parsed_rcgen_ark.tbs_certificate.subject.clone();
     let ark_spki = parsed_rcgen_ark
         .tbs_certificate
@@ -393,7 +393,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "server".to_string(),
         "shim".to_string(),
     ])?;
-    let tls_cert = tls_params.signed_by(&tls_key, &ark_rcgen_cert, &ark_rcgen_key)?;
+    let tls_cert = tls_params.signed_by(&tls_key, &ark_rcgen_issuer)?;
 
     let cert_der = rustls::pki_types::CertificateDer::from(tls_cert.der().to_vec());
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(tls_key.serialize_der())
@@ -425,7 +425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "format": "https://tinfoil.sh/predicate/attestation/v3",
         "cpu": {
             "platform": "sev-snp",
-            "report": b64.encode(&report),
+            "report": b64.encode(report),
         },
         "vcek": b64.encode(&vcek_der),
     }))?;
