@@ -113,3 +113,7 @@ ci-check:
 # Build XCFramework via Nix
 ci-build-xcframework:
     nix run '.#update-eidolons-shared-swift-xcframework'
+
+# Build macOS app via Nix (reproducible, open-source Swift 6.2 toolchain)
+build-macos-app:
+    nix build '.#eidolons-macos-app' --show-trace
