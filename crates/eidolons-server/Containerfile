@@ -2,7 +2,7 @@
 
 # ── base ───────────────────────────────────────────────────────────────────────
 # Environment variables, pinned toolchain digest.
-FROM stagex/pallet-rust@sha256:4062550919db682ebaeea07661551b5b89b3921e3f3a2b0bc665ddea7f6af1ca AS base
+FROM stagex/pallet-rust@sha256:2fbe7b164dd92edb9c1096152f6d27592d8a69b1b8eb2fc907b5fadea7d11668 AS base
 
 ARG CARGO_PROFILE=release
 
