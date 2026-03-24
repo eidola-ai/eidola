@@ -28,7 +28,7 @@ sha2 = "0.10"
 tinfoil-verifier = { path = "../../crates/tinfoil-verifier" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 toml = "1"
-turso = "0.5"
+turso = { version = "0.5", default-features = false }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 x509-cert = "0.2"
 der = { version = "0.7", features = ["pem", "alloc"] }

@@ -39,7 +39,7 @@ COPY --from=pkg-ncurses . /
 COPY --from=pkg-readline . /
 COPY --from=pkg-libxml2 . /
 COPY --from=pkg-postgresql . /
-COPY --chmod=755 docker/postgresql/entrypoint.sh /entrypoint.sh
+COPY --chmod=755 oci/postgresql/entrypoint.sh /entrypoint.sh
 
 # ── dirs ──────────────────────────────────────────────────────────────────────
 # Create runtime directories owned by uid 1000 using a disposable stage.

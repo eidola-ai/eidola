@@ -4,17 +4,17 @@
     "eidolons-server": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      "digest": "sha256:aee595e4ed97921485d156514ae10e7e0861ce9ad0810bd2395cc14f1aff35df"
     },
     "eidolons-cli": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      "digest": "sha256:381a837a154180d39b0d6666c2ec0e8845e46d734baa1c4b9faeb1cc575d5728"
     },
     "eidolons-postgres": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      "digest": "sha256:6909e5659a451eb30862654cf6a902e4600a8fb389a1f9c5c190b0d35d3e8029"
     }
   }
 }
