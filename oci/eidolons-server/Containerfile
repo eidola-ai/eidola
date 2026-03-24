@@ -7,7 +7,7 @@ FROM stagex/pallet-rust@sha256:2fbe7b164dd92edb9c1096152f6d27592d8a69b1b8eb2fc90
 ARG CARGO_PROFILE=release
 
 ENV TARGET=x86_64-unknown-linux-musl
-ENV SOURCE_DATE_EPOCH=1
+ENV SOURCE_DATE_EPOCH=0
 ENV CARGO_INCREMENTAL=0
 ENV ZERO_AR_DATE=1
 ENV RUSTFLAGS="-C target-feature=+crt-static -C debuginfo=0 -C target-cpu=generic"

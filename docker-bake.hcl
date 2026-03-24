@@ -1,5 +1,5 @@
 variable "SOURCE_DATE_EPOCH" {
-  default = "1"
+  default = "0"
 }
 
 variable "REGISTRY" {
