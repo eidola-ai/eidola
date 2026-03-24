@@ -30,17 +30,22 @@ updates:
 
   # Maintain dependencies for Docker (Containerfiles).
   - package-ecosystem: "docker"
-    directory: "/crates/eidolons-server"
+    directory: "/oci/eidolons-server"
     schedule:
       interval: "weekly"
 
   - package-ecosystem: "docker"
-    directory: "/docker/postgresql"
+    directory: "/oci/postgresql"
     schedule:
       interval: "weekly"
 
   - package-ecosystem: "docker"
-    directory: "/docker/stripe-cli"
+    directory: "/oci/tinfoil-shim-mock"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker"
+    directory: "/oci/stripe-cli"
     schedule:
       interval: "weekly"
 

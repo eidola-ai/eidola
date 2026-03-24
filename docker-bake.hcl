@@ -56,7 +56,7 @@ target "shim" {
 # updates via the Containerfile, rather than silently pulling :latest.
 target "stripe-cli" {
   context    = "."
-  dockerfile = "docker/stripe-cli/Containerfile"
+  dockerfile = "oci/stripe-cli/Containerfile"
   tags       = ["stripe-cli:dev"]
   attest     = []
 }
@@ -83,14 +83,14 @@ target "_ci" {
 target "ci-server" {
   inherits   = ["_ci"]
   context    = "."
-  dockerfile = "crates/eidolons-server/Containerfile"
+  dockerfile = "oci/eidolons-server/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidolons-server:${t}"]
 }
 
 target "ci-postgres" {
   inherits   = ["_ci"]
   context    = "."
-  dockerfile = "docker/postgresql/Containerfile"
+  dockerfile = "oci/postgresql/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidolons-postgres:${t}"]
 }
 
