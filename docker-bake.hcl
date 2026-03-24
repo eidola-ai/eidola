@@ -42,6 +42,13 @@ target "server" {
   tags     = ["eidolons-server:dev"]
 }
 
+target "cli" {
+  inherits   = ["_common"]
+  context    = "."
+  dockerfile = "oci/eidolons-cli/Containerfile"
+  tags       = ["eidolons-cli:dev"]
+}
+
 target "postgres" {
   inherits = ["_common"]
   tags     = ["eidolons-postgres:dev"]
@@ -62,11 +69,11 @@ target "stripe-cli" {
 }
 
 group "default" {
-  targets = ["server", "postgres", "shim"]
+  targets = ["server", "cli", "postgres", "shim"]
 }
 
 group "manifest" {
-  targets = ["server", "postgres"]
+  targets = ["server", "cli", "postgres"]
 }
 
 # ── CI targets (registry push) ────────────────────────────────────────────────
@@ -87,6 +94,13 @@ target "ci-server" {
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidolons-server:${t}"]
 }
 
+target "ci-cli" {
+  inherits   = ["_ci"]
+  context    = "."
+  dockerfile = "oci/eidolons-cli/Containerfile"
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidolons-cli:${t}"]
+}
+
 target "ci-postgres" {
   inherits   = ["_ci"]
   context    = "."
@@ -95,5 +109,5 @@ target "ci-postgres" {
 }
 
 group "ci" {
-  targets = ["ci-server", "ci-postgres"]
+  targets = ["ci-server", "ci-cli", "ci-postgres"]
 }

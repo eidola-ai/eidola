@@ -563,6 +563,51 @@
           '';
         };
 
+        # Build the CLI as a macOS universal binary (Darwin only)
+        eidolonsCliMacosUniversal =
+          if !pkgs.stdenv.isDarwin then
+            null
+          else
+            pkgs.stdenv.mkDerivation {
+              pname = "eidolons-cli-macos-universal";
+              version = "1.0";
+
+              nativeBuildInputs = [ pkgs.darwin.cctools ];
+
+              SOURCE_DATE_EPOCH = "0";
+
+              dontUnpack = true;
+
+              arm64 = mkPackage {
+                pname = "eidolons-cli";
+                rustTarget = "aarch64-apple-darwin";
+                nixCrossSystem = null;
+              };
+              x86_64 = mkPackage {
+                pname = "eidolons-cli";
+                rustTarget = "x86_64-apple-darwin";
+                nixCrossSystem = null;
+              };
+
+              buildPhase = ''
+                mkdir -p $out/bin
+                lipo -create \
+                  "$arm64/bin/eidolons" \
+                  "$x86_64/bin/eidolons" \
+                  -output "$out/bin/eidolons"
+              '';
+
+              installPhase = ''
+                echo "Universal binary:"
+                lipo -info "$out/bin/eidolons"
+              '';
+
+              meta = {
+                description = "Eidolons CLI (macOS universal binary)";
+                platforms = [ "aarch64-darwin" "x86_64-darwin" ];
+              };
+            };
+
         # Build the macOS app with Swift 6.2 (Darwin only)
         # Uses swiftc directly (not SPM) to avoid xcrun/Xcode dependency.
         # Modules are compiled in dependency order, then linked into the final executable.
@@ -699,6 +744,8 @@
           eidolons-shared-swift-types = eidolonsSharedSwiftTypes;
           eidolons-shared-swift-bindings = eidolonsSharedSwiftBindings;
           eidolons-shared-swift-xcframework = eidolonsSharedSwiftXCFramework;
+        } // pkgs.lib.optionalAttrs (eidolonsCliMacosUniversal != null) {
+          eidolons-cli-macos-universal = eidolonsCliMacosUniversal;
         } // pkgs.lib.optionalAttrs (eidolonsMacosApp != null) {
           eidolons-macos-app = eidolonsMacosApp;
         };

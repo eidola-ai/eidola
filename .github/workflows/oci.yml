@@ -45,16 +45,26 @@ jobs:
         id: digests
         run: |
           SERVER_DIGEST=$(jq -r '."server"."containerimage.digest"' /tmp/bake-metadata.json)
+          CLI_DIGEST=$(jq -r '."cli"."containerimage.digest"' /tmp/bake-metadata.json)
           POSTGRES_DIGEST=$(jq -r '."postgres"."containerimage.digest"' /tmp/bake-metadata.json)
 
           echo "server=${SERVER_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "cli=${CLI_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "postgres=${POSTGRES_DIGEST}" >> "$GITHUB_OUTPUT"
 
           # Build the expected manifest content
           ACTUAL=$(jq -n \
             --arg server "$SERVER_DIGEST" \
+            --arg cli "$CLI_DIGEST" \
             --arg postgres "$POSTGRES_DIGEST" \
-            '{"eidolons-server": $server, "eidolons-postgres": $postgres}')
+            '{
+              version: 1,
+              artifacts: {
+                "eidolons-server": { type: "oci", platform: "linux/amd64", digest: $server },
+                "eidolons-cli": { type: "oci", platform: "linux/amd64", digest: $cli },
+                "eidolons-postgres": { type: "oci", platform: "linux/amd64", digest: $postgres }
+              }
+            }')
           echo "actual<<EOF" >> "$GITHUB_OUTPUT"
           echo "$ACTUAL" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
@@ -64,17 +74,19 @@ jobs:
         env:
           ACTUAL: ${{ steps.digests.outputs.actual }}
         run: |
-          COMMITTED=$(cat artifact-manifest.json)
+          # Normalize both through jq to ignore whitespace differences
+          ACTUAL_NORM=$(echo "$ACTUAL" | jq -cS .)
+          COMMITTED_NORM=$(jq -cS . artifact-manifest.json)
 
-          if [ "$ACTUAL" = "$COMMITTED" ]; then
+          if [ "$ACTUAL_NORM" = "$COMMITTED_NORM" ]; then
             echo "Artifact manifest matches build output."
             echo "match=true" >> "$GITHUB_OUTPUT"
           else
             echo "::error::Artifact manifest does not match build output."
             echo "Committed:"
-            echo "$COMMITTED"
+            echo "$COMMITTED_NORM" | jq .
             echo "Actual:"
-            echo "$ACTUAL"
+            echo "$ACTUAL_NORM" | jq .
             echo "match=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -83,20 +95,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          SERVER_DIGEST: ${{ steps.digests.outputs.server }}
-          POSTGRES_DIGEST: ${{ steps.digests.outputs.postgres }}
+          ACTUAL: ${{ steps.digests.outputs.actual }}
         run: |
+          # Write the actual manifest to a temp file for the suggestion
+          SUGGESTION=$(echo "$ACTUAL" | jq '.')
+
           jq -n \
-            --arg server "$SERVER_DIGEST" \
-            --arg postgres "$POSTGRES_DIGEST" \
+            --arg actual "$SUGGESTION" \
             '{
               event: "REQUEST_CHANGES",
-              body: "**Artifact Manifest Update Required**\n\nThe OCI images built from this PR produce different digests than what is committed in `artifact-manifest.json`. Accept the suggestion below to update it.\n\n| Image | Digest |\n|-------|---------|\n| eidolons-server | `\($server[0:19])...` |\n| eidolons-postgres | `\($postgres[0:19])...` |",
+              body: "**Artifact Manifest Update Required**\n\nThe OCI images built from this PR produce different digests than what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` to regenerate it.",
               comments: [{
                 path: "artifact-manifest.json",
-                line: 3,
-                start_line: 2,
-                body: "```suggestion\n  \"eidolons-server\": \"\($server)\",\n  \"eidolons-postgres\": \"\($postgres)\"\n```"
+                line: 1,
+                body: "Artifact manifest is out of date. Run `just update-manifest` to update."
               }]
             }' | gh api --silent -X POST \
               "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
@@ -109,7 +121,7 @@ jobs:
           docker buildx version
           docker buildx inspect --bootstrap 2>/dev/null | head -20
 
-          for IMAGE in eidolons-postgres eidolons-server; do
+          for IMAGE in eidolons-server eidolons-cli eidolons-postgres; do
             echo ""
             echo "=============== $IMAGE ==============="
             DIR="/tmp/${IMAGE}-debug"
@@ -187,7 +199,7 @@ jobs:
           set -euo pipefail
           IFS=',' read -ra TAG_LIST <<< "${TAGS}"
 
-          for IMAGE in eidolons-server eidolons-postgres; do
+          for IMAGE in eidolons-server eidolons-cli eidolons-postgres; do
             for TAG in "${TAG_LIST[@]}"; do
               docker tag "${IMAGE}:dev" "${REGISTRY}/${IMAGE}:${TAG}"
               docker push "${REGISTRY}/${IMAGE}:${TAG}"

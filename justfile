@@ -61,10 +61,8 @@ update-xcframework-release:
 # --- CI / Release ---
 
 build:
-    # Build OCI images (server, postgresql)
+    # Build OCI images (server, cli, postgresql)
     docker buildx bake
-
-    # TODO: Build apps
 
 # Update artifact-manifest.json with current build digests
 # Uses a docker-container builder for rewrite-timestamp + force-compression
@@ -101,8 +99,16 @@ update-manifest:
       --metadata-file /tmp/bake-metadata.json
     jq -n \
       --arg server "$(jq -r '."server"."containerimage.digest"' /tmp/bake-metadata.json)" \
+      --arg cli "$(jq -r '."cli"."containerimage.digest"' /tmp/bake-metadata.json)" \
       --arg postgres "$(jq -r '."postgres"."containerimage.digest"' /tmp/bake-metadata.json)" \
-      '{"eidolons-server": $server, "eidolons-postgres": $postgres}' \
+      '{
+        version: 1,
+        artifacts: {
+          "eidolons-server": { type: "oci", platform: "linux/amd64", digest: $server },
+          "eidolons-cli": { type: "oci", platform: "linux/amd64", digest: $cli },
+          "eidolons-postgres": { type: "oci", platform: "linux/amd64", digest: $postgres }
+        }
+      }' \
       > artifact-manifest.json
     echo "Updated artifact-manifest.json"
 

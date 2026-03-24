@@ -1,4 +1,20 @@
 {
-  "eidolons-server": "sha256:66338a4eb61a253c6ea7f3b5970d95b650c655a8d42d57c6205cb30da83e9685",
-  "eidolons-postgres": "sha256:6909e5659a451eb30862654cf6a902e4600a8fb389a1f9c5c190b0d35d3e8029"
+  "version": 1,
+  "artifacts": {
+    "eidolons-server": {
+      "type": "oci",
+      "platform": "linux/amd64",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "eidolons-cli": {
+      "type": "oci",
+      "platform": "linux/amd64",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "eidolons-postgres": {
+      "type": "oci",
+      "platform": "linux/amd64",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
 }
