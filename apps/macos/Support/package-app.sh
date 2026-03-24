@@ -53,7 +53,6 @@ if [[ -d "${RESOURCE_BUNDLE}" ]]; then
         --platform macosx \
         --minimum-deployment-target 26.0 \
         --app-icon AppIcon \
-        --accent-color AccentColor \
         --output-partial-info-plist /dev/null \
         >/dev/null 2>&1 || echo "Warning: actool failed, assets may be incomplete"
     else

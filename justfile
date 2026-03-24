@@ -46,6 +46,10 @@ test-webhook-smoke:
 update-bindings:
     ./scripts/update-shared-bindings.sh
 
+# Regenerate AppIcon.icns from xcassets (requires iconutil, no Xcode needed)
+update-app-icon:
+    ./scripts/update-app-icon.sh
+
 # Regenerate OpenAPI spec
 update-openapi:
     ./scripts/update-server-openapi.sh
