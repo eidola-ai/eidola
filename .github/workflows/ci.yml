@@ -78,59 +78,18 @@ jobs:
 
       - name: Build OCI images
         run: |
-          # setup-buildx-action provides a docker-container driver, which
-          # supports rewrite-timestamp and force-compression for full
-          # reproducibility. Override the default output to enable them.
-          docker buildx bake manifest \
-            --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true' \
-            --metadata-file /tmp/bake-metadata.json
-
-      - name: Extract digests
-        id: digests
-        run: |
-          SERVER_DIGEST=$(jq -r '."server"."containerimage.digest"' /tmp/bake-metadata.json)
-          CLI_DIGEST=$(jq -r '."cli"."containerimage.digest"' /tmp/bake-metadata.json)
-          POSTGRES_DIGEST=$(jq -r '."postgres"."containerimage.digest"' /tmp/bake-metadata.json)
-
-          echo "server=${SERVER_DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "cli=${CLI_DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "postgres=${POSTGRES_DIGEST}" >> "$GITHUB_OUTPUT"
-
-          # Build the expected manifest content
-          ACTUAL=$(jq -n \
-            --arg server "$SERVER_DIGEST" \
-            --arg cli "$CLI_DIGEST" \
-            --arg postgres "$POSTGRES_DIGEST" \
-            '{
-              version: 1,
-              artifacts: {
-                "eidolons-server": { type: "oci", platform: "linux/amd64", digest: $server },
-                "eidolons-cli": { type: "oci", platform: "linux/amd64", digest: $cli },
-                "eidolons-postgres": { type: "oci", platform: "linux/amd64", digest: $postgres }
-              }
-            }')
-          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$ACTUAL" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          ./scripts/artifact-manifest.sh build --metadata-file /tmp/bake-metadata.json
 
       - name: Verify artifact manifest
         id: verify
-        env:
-          ACTUAL: ${{ steps.digests.outputs.actual }}
         run: |
-          # Normalize both through jq to ignore whitespace differences
-          ACTUAL_NORM=$(echo "$ACTUAL" | jq -cS .)
-          COMMITTED_NORM=$(jq -cS . artifact-manifest.json)
+          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
+          ./scripts/artifact-manifest.sh print --metadata-file /tmp/bake-metadata.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
-          if [ "$ACTUAL_NORM" = "$COMMITTED_NORM" ]; then
-            echo "Artifact manifest matches build output."
+          if ./scripts/artifact-manifest.sh verify --metadata-file /tmp/bake-metadata.json --manifest artifact-manifest.json; then
             echo "match=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::Artifact manifest does not match build output."
-            echo "Committed:"
-            echo "$COMMITTED_NORM" | jq .
-            echo "Actual:"
-            echo "$ACTUAL_NORM" | jq .
             echo "match=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -139,7 +98,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          ACTUAL: ${{ steps.digests.outputs.actual }}
+          ACTUAL: ${{ steps.verify.outputs.actual }}
         run: |
           # Write the actual manifest to a temp file for the suggestion
           SUGGESTION=$(echo "$ACTUAL" | jq '.')
