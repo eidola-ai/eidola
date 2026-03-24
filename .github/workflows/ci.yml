@@ -59,6 +59,8 @@ jobs:
     needs: rust-checks
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      artifact_manifest: ${{ steps.partial.outputs.actual }}
     permissions:
       contents: read
       packages: write
@@ -80,42 +82,21 @@ jobs:
         run: |
           ./scripts/artifact-manifest.sh build --metadata-file /tmp/bake-metadata.json
 
-      - name: Verify artifact manifest
-        id: verify
+      - name: Record OCI artifact manifest
+        id: partial
         run: |
           echo "actual<<EOF" >> "$GITHUB_OUTPUT"
           ./scripts/artifact-manifest.sh print --metadata-file /tmp/bake-metadata.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
+      - name: Verify OCI artifact subset
+        id: verify
+        run: |
           if ./scripts/artifact-manifest.sh verify --metadata-file /tmp/bake-metadata.json --manifest artifact-manifest.json; then
             echo "match=true" >> "$GITHUB_OUTPUT"
           else
             echo "match=false" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Suggest manifest update (PR only)
-        if: steps.verify.outputs.match == 'false' && github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          ACTUAL: ${{ steps.verify.outputs.actual }}
-        run: |
-          # Write the actual manifest to a temp file for the suggestion
-          SUGGESTION=$(echo "$ACTUAL" | jq '.')
-
-          jq -n \
-            --arg actual "$SUGGESTION" \
-            '{
-              event: "REQUEST_CHANGES",
-              body: "**Artifact Manifest Update Required**\n\nThe OCI images built from this PR produce different digests than what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` to regenerate it.",
-              comments: [{
-                path: "artifact-manifest.json",
-                line: 1,
-                body: "Artifact manifest is out of date. Run `just update-manifest` to update."
-              }]
-            }' | gh api --silent -X POST \
-              "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
-              --input -
 
       - name: Debug image structure
         if: steps.verify.outputs.match == 'false'
@@ -156,10 +137,6 @@ jobs:
               fi
             done
           done
-
-      - name: Fail on manifest mismatch
-        if: steps.verify.outputs.match == 'false'
-        run: exit 1
 
       - name: Log in to GHCR
         if: steps.verify.outputs.match == 'true' && github.event_name == 'push'
@@ -215,6 +192,8 @@ jobs:
     needs: rust-checks
     runs-on: self-hosted
     timeout-minutes: 30
+    outputs:
+      artifact_manifest: ${{ steps.partial.outputs.actual }}
     permissions:
       id-token: write
       contents: read
@@ -240,11 +219,16 @@ jobs:
       - name: Check Swift bindings freshness
         run: nix build '.#checks.aarch64-darwin.swift-bindings-current' --show-trace
 
-      - name: Build macOS app
-        run: nix build '.#eidolons-macos-app' --show-trace
+      - name: Build macOS artifacts
+        id: partial
+        run: |
+          ./scripts/artifact-manifest.sh build-macos \
+            --macos-paths-file /tmp/macos-artifacts.json \
+            --output /tmp/macos-artifact-manifest.json
 
-      - name: Build macOS CLI (universal binary)
-        run: nix build '.#eidolons-cli-macos-universal' --show-trace
+          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/macos-artifact-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Run Swift tests
         run: |
@@ -256,3 +240,76 @@ jobs:
 
           # Run Swift tests for macOS app
           ( cd apps/macos && swift test )
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - oci
+      - apple
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Combine partial manifests
+        run: |
+          cat > /tmp/oci-artifact-manifest.json <<'EOF'
+          ${{ needs.oci.outputs.artifact_manifest }}
+          EOF
+
+          cat > /tmp/apple-artifact-manifest.json <<'EOF'
+          ${{ needs.apple.outputs.artifact_manifest }}
+          EOF
+
+          ./scripts/artifact-manifest.sh merge \
+            --partial /tmp/oci-artifact-manifest.json \
+            --partial /tmp/apple-artifact-manifest.json \
+            --output /tmp/artifact-manifest-actual.json
+
+      - name: Verify full artifact manifest
+        id: verify
+        run: |
+          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/artifact-manifest-actual.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          if ./scripts/artifact-manifest.sh verify-full \
+            --partial /tmp/oci-artifact-manifest.json \
+            --partial /tmp/apple-artifact-manifest.json \
+            --manifest artifact-manifest.json; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "match=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Suggest manifest update (PR only)
+        if: steps.verify.outputs.match == 'false' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ACTUAL: ${{ steps.verify.outputs.actual }}
+        run: |
+          SUGGESTION=$(echo "$ACTUAL" | jq '.')
+
+          jq -n \
+            --arg actual "$SUGGESTION" \
+            '{
+              event: "REQUEST_CHANGES",
+              body: "**Artifact Manifest Update Required**\n\nThe built OCI and macOS artifacts produce different digests than what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` on macOS to regenerate it.",
+              comments: [{
+                path: "artifact-manifest.json",
+                line: 1,
+                body: "Artifact manifest is out of date. Run `just update-manifest` on macOS to update."
+              }]
+            }' | gh api --silent -X POST \
+              "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+              --input -
+
+      - name: Fail on manifest mismatch
+        if: steps.verify.outputs.match == 'false'
+        run: exit 1

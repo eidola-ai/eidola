@@ -7,7 +7,11 @@ Usage:
   scripts/artifact-manifest.sh build [--metadata-file PATH] [--builder NAME] [--ensure-builder]
   scripts/artifact-manifest.sh print [--metadata-file PATH]
   scripts/artifact-manifest.sh verify [--metadata-file PATH] [--manifest PATH]
-  scripts/artifact-manifest.sh update [--metadata-file PATH] [--output PATH] [--builder NAME] [--ensure-builder]
+  scripts/artifact-manifest.sh build-macos [--output PATH] [--macos-paths-file PATH]
+  scripts/artifact-manifest.sh print-macos [--macos-paths-file PATH | --app-path PATH --cli-path PATH]
+  scripts/artifact-manifest.sh merge [--partial PATH ...] [--output PATH]
+  scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH]
+  scripts/artifact-manifest.sh update [--output PATH] [--metadata-file PATH] [--builder NAME] [--ensure-builder]
 EOF
 }
 
@@ -32,10 +36,14 @@ fi
 shift
 
 METADATA_FILE="/tmp/bake-metadata.json"
-OUTPUT_FILE="$REPO_ROOT/artifact-manifest.json"
+OUTPUT_FILE=""
 MANIFEST_FILE="$REPO_ROOT/artifact-manifest.json"
 BUILDER_NAME="eidolons"
 ENSURE_BUILDER=0
+MACOS_PATHS_FILE=""
+APP_PATH=""
+CLI_PATH=""
+PARTIAL_FILES=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,6 +66,22 @@ while [[ $# -gt 0 ]]; do
     --ensure-builder)
       ENSURE_BUILDER=1
       shift
+      ;;
+    --macos-paths-file)
+      MACOS_PATHS_FILE="$2"
+      shift 2
+      ;;
+    --app-path)
+      APP_PATH="$2"
+      shift 2
+      ;;
+    --cli-path)
+      CLI_PATH="$2"
+      shift 2
+      ;;
+    --partial)
+      PARTIAL_FILES+=("$2")
+      shift 2
       ;;
     -h|--help)
       usage
@@ -115,7 +139,7 @@ build_metadata() {
     --metadata-file "$METADATA_FILE"
 }
 
-render_manifest() {
+print_oci_manifest() {
   local server cli postgres
 
   server="$(jq -er '."server"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
@@ -136,19 +160,121 @@ render_manifest() {
     }'
 }
 
-write_manifest() {
+build_macos_artifacts() {
+  local -a out_paths
+  local path
+
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "error: macOS artifact builds require a Darwin host" >&2
+    exit 1
+  fi
+
+  out_paths=()
+  while IFS= read -r path; do
+    out_paths+=("$path")
+  done < <(
+    nix build \
+      '.#eidolons-macos-app' \
+      '.#eidolons-cli-macos-universal' \
+      --no-link \
+      --print-out-paths \
+      --show-trace
+  )
+
+  if [[ "${#out_paths[@]}" -ne 2 ]]; then
+    echo "error: expected 2 macOS output paths, got ${#out_paths[@]}" >&2
+    exit 1
+  fi
+
+  APP_PATH="${out_paths[0]}"
+  CLI_PATH="${out_paths[1]}"
+
+  if [[ -n "$MACOS_PATHS_FILE" ]]; then
+    jq -n \
+      --arg app_path "$APP_PATH" \
+      --arg cli_path "$CLI_PATH" \
+      '{app_path: $app_path, cli_path: $cli_path}' \
+      > "$MACOS_PATHS_FILE"
+  fi
+}
+
+load_macos_paths() {
+  if [[ -n "$MACOS_PATHS_FILE" ]]; then
+    APP_PATH="$(jq -er '.app_path | select(type == "string" and length > 0)' "$MACOS_PATHS_FILE")"
+    CLI_PATH="$(jq -er '.cli_path | select(type == "string" and length > 0)' "$MACOS_PATHS_FILE")"
+  fi
+
+  if [[ -z "$APP_PATH" || -z "$CLI_PATH" ]]; then
+    echo "error: provide --macos-paths-file or both --app-path and --cli-path" >&2
+    exit 1
+  fi
+}
+
+nix_nar_hash() {
+  local store_path="$1"
+
+  nix path-info --json "$store_path" \
+    | jq -er --arg path "$store_path" '.[$path].narHash | select(type == "string" and startswith("sha256-"))'
+}
+
+print_macos_manifest() {
+  local app_hash cli_hash
+
+  load_macos_paths
+
+  app_hash="$(nix_nar_hash "$APP_PATH")"
+  cli_hash="$(nix_nar_hash "$CLI_PATH")"
+
+  jq -n \
+    --arg app_hash "$app_hash" \
+    --arg cli_hash "$cli_hash" \
+    '{
+      version: 1,
+      artifacts: {
+        "eidolons-macos-app": { type: "nix", platform: "darwin/universal", narHash: $app_hash },
+        "eidolons-cli-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $cli_hash }
+      }
+    }'
+}
+
+write_output() {
+  local content="$1"
+
+  if [[ -n "$OUTPUT_FILE" ]]; then
+    printf '%s\n' "$content" > "$OUTPUT_FILE"
+  else
+    printf '%s\n' "$content"
+  fi
+}
+
+write_temp_file() {
+  local content="$1"
   local tmp_file
 
   tmp_file="$(mktemp "${TMPDIR:-/tmp}/artifact-manifest.XXXXXX")"
-  render_manifest > "$tmp_file"
-  mv "$tmp_file" "$OUTPUT_FILE"
-  echo "Updated $OUTPUT_FILE"
+  printf '%s\n' "$content" > "$tmp_file"
+  printf '%s\n' "$tmp_file"
 }
 
-verify_manifest() {
-  local actual_norm committed_norm
+merge_partials() {
+  if [[ "${#PARTIAL_FILES[@]}" -eq 0 ]]; then
+    echo "error: provide at least one --partial file" >&2
+    exit 1
+  fi
 
-  actual_norm="$(render_manifest | jq -cS .)"
+  jq -s '
+    {
+      version: 1,
+      artifacts: (reduce .[] as $partial ({}; . + ($partial.artifacts // {})))
+    }
+  ' "${PARTIAL_FILES[@]}"
+}
+
+verify_full_manifest() {
+  local actual_norm committed_norm actual_manifest
+
+  actual_manifest="$(merge_partials)"
+  actual_norm="$(printf '%s\n' "$actual_manifest" | jq -cS .)"
   committed_norm="$(jq -cS . "$MANIFEST_FILE")"
 
   if [[ "$actual_norm" = "$committed_norm" ]]; then
@@ -164,19 +290,92 @@ verify_manifest() {
   return 1
 }
 
+verify_oci_manifest() {
+  local actual_norm committed_subset
+  local tmp_partial
+
+  tmp_partial="$(write_temp_file "$(print_oci_manifest)")"
+  PARTIAL_FILES=("$tmp_partial")
+
+  actual_norm="$(merge_partials | jq -cS .)"
+  committed_subset="$(jq -cS '
+    {
+      version: 1,
+      artifacts: {
+        "eidolons-server": .artifacts["eidolons-server"],
+        "eidolons-cli": .artifacts["eidolons-cli"],
+        "eidolons-postgres": .artifacts["eidolons-postgres"]
+      }
+    }
+  ' "$MANIFEST_FILE")"
+
+  rm -f "$tmp_partial"
+
+  if [[ "$actual_norm" = "$committed_subset" ]]; then
+    echo "Artifact manifest matches OCI build output."
+    return 0
+  fi
+
+  echo "::error::Artifact manifest does not match OCI build output."
+  echo "Committed OCI subset:"
+  echo "$committed_subset" | jq .
+  echo "Actual OCI subset:"
+  echo "$actual_norm" | jq .
+  return 1
+}
+
+update_manifest() {
+  local oci_partial macos_partial actual_manifest
+  local oci_partial_file macos_partial_file
+
+  if [[ -z "$OUTPUT_FILE" ]]; then
+    OUTPUT_FILE="$REPO_ROOT/artifact-manifest.json"
+  fi
+
+  build_metadata
+  build_macos_artifacts
+
+  oci_partial="$(print_oci_manifest)"
+  macos_partial="$(print_macos_manifest)"
+
+  oci_partial_file="$(write_temp_file "$oci_partial")"
+  macos_partial_file="$(write_temp_file "$macos_partial")"
+  PARTIAL_FILES=("$oci_partial_file" "$macos_partial_file")
+
+  actual_manifest="$(merge_partials)"
+  rm -f "$oci_partial_file" "$macos_partial_file"
+
+  write_output "$actual_manifest"
+  if [[ -n "$OUTPUT_FILE" ]]; then
+    echo "Updated $OUTPUT_FILE"
+  fi
+}
+
 case "$COMMAND" in
   build)
     build_metadata
     ;;
   print)
-    render_manifest
+    print_oci_manifest
     ;;
   verify)
-    verify_manifest
+    verify_oci_manifest
+    ;;
+  build-macos)
+    build_macos_artifacts
+    write_output "$(print_macos_manifest)"
+    ;;
+  print-macos)
+    print_macos_manifest
+    ;;
+  merge)
+    write_output "$(merge_partials)"
+    ;;
+  verify-full)
+    verify_full_manifest
     ;;
   update)
-    build_metadata
-    write_manifest
+    update_manifest
     ;;
   *)
     echo "error: unknown command: $COMMAND" >&2

@@ -65,8 +65,8 @@ build:
     docker buildx bake
 
 # Update artifact-manifest.json with current build digests
-# Uses a docker-container builder for rewrite-timestamp + force-compression
-# (the default docker driver does not support these reproducibility options).
+# Builds the OCI images plus the macOS app/CLI, then records their digests.
+# Requires macOS for the Nix-built app and CLI artifacts.
 update-manifest:
     ./scripts/artifact-manifest.sh update --ensure-builder
 

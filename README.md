@@ -78,10 +78,10 @@ just update-openapi       # OpenAPI spec
 just update-xcframework   # XCFramework (dev, native arch only)
 ```
 
-To refresh `artifact-manifest.json` for the OCI images, run:
+To refresh `artifact-manifest.json` for the OCI images plus the macOS app and CLI, run:
 
 ```bash
 just update-manifest
 ```
 
-This uses the pinned amd64 BuildKit builder configuration that CI uses for reproducible digest verification.
+This uses the pinned amd64 BuildKit builder configuration for the OCI images plus the local Nix macOS builds for the app and CLI, so it currently needs to run on macOS.
