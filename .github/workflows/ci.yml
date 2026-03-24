@@ -59,6 +59,10 @@ jobs:
     needs: rust-checks
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      BAKE_METADATA_FILE: ${{ github.workspace }}/.bake-metadata.json
+      BUILDX_CACHE_DIR: ${{ github.workspace }}/.buildx-cache
+      BUILDX_CACHE_DIR_NEW: ${{ github.workspace }}/.buildx-cache-new
     outputs:
       artifact_manifest: ${{ steps.partial.outputs.actual }}
     permissions:
@@ -74,7 +78,7 @@ jobs:
         id: buildx-cache
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: /tmp/.buildx-cache
+          path: ${{ env.BUILDX_CACHE_DIR }}
           key: buildx-oci-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml', 'rust-toolchain.toml', 'docker-bake.hcl', 'compose.yaml', 'oci/**/Containerfile') }}
           restore-keys: |
             buildx-oci-${{ runner.os }}-
@@ -91,44 +95,44 @@ jobs:
         run: |
           CACHE_ARGS=()
 
-          if [ -d /tmp/.buildx-cache ]; then
-            CACHE_ARGS+=(--set '*.cache-from=type=local,src=/tmp/.buildx-cache')
+          if [ -d "${BUILDX_CACHE_DIR}" ]; then
+            CACHE_ARGS+=(--set "*.cache-from=type=local,src=${BUILDX_CACHE_DIR}")
           fi
 
-          CACHE_ARGS+=(--set '*.cache-to=type=local,dest=/tmp/.buildx-cache-new,mode=max')
+          CACHE_ARGS+=(--set "*.cache-to=type=local,dest=${BUILDX_CACHE_DIR_NEW},mode=max")
 
           ./scripts/artifact-manifest.sh build \
-            --metadata-file /tmp/bake-metadata.json \
+            --metadata-file "${BAKE_METADATA_FILE}" \
             "${CACHE_ARGS[@]}"
 
       - name: Rotate OCI Buildx cache
         if: always()
         run: |
-          rm -rf /tmp/.buildx-cache
-          if [ -d /tmp/.buildx-cache-new ]; then
-            mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+          rm -rf "${BUILDX_CACHE_DIR}"
+          if [ -d "${BUILDX_CACHE_DIR_NEW}" ]; then
+            mv "${BUILDX_CACHE_DIR_NEW}" "${BUILDX_CACHE_DIR}"
           else
-            mkdir -p /tmp/.buildx-cache
+            mkdir -p "${BUILDX_CACHE_DIR}"
           fi
 
       - name: Save OCI Buildx cache
         if: always()
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: /tmp/.buildx-cache
+          path: ${{ env.BUILDX_CACHE_DIR }}
           key: ${{ steps.buildx-cache.outputs.cache-primary-key }}
 
       - name: Record OCI artifact manifest
         id: partial
         run: |
           echo "actual<<EOF" >> "$GITHUB_OUTPUT"
-          ./scripts/artifact-manifest.sh print --metadata-file /tmp/bake-metadata.json >> "$GITHUB_OUTPUT"
+          ./scripts/artifact-manifest.sh print --metadata-file "${BAKE_METADATA_FILE}" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Verify OCI artifact subset
         id: verify
         run: |
-          if ./scripts/artifact-manifest.sh verify --metadata-file /tmp/bake-metadata.json --manifest artifact-manifest.json; then
+          if ./scripts/artifact-manifest.sh verify --metadata-file "${BAKE_METADATA_FILE}" --manifest artifact-manifest.json; then
             echo "match=true" >> "$GITHUB_OUTPUT"
           else
             echo "match=false" >> "$GITHUB_OUTPUT"
