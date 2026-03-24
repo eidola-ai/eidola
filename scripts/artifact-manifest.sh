@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/artifact-manifest.sh build [--metadata-file PATH] [--builder NAME] [--ensure-builder]
+  scripts/artifact-manifest.sh build [--metadata-file PATH] [--builder NAME] [--ensure-builder] [--set PATTERN=VALUE ...]
   scripts/artifact-manifest.sh print [--metadata-file PATH]
   scripts/artifact-manifest.sh verify [--metadata-file PATH] [--manifest PATH]
   scripts/artifact-manifest.sh build-macos [--output PATH] [--macos-paths-file PATH]
@@ -44,6 +44,7 @@ MACOS_PATHS_FILE=""
 APP_PATH=""
 CLI_PATH=""
 PARTIAL_FILES=()
+BUILDX_SET_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -81,6 +82,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --partial)
       PARTIAL_FILES+=("$2")
+      shift 2
+      ;;
+    --set)
+      BUILDX_SET_ARGS+=("$2")
       shift 2
       ;;
     -h|--help)
@@ -125,16 +130,22 @@ ensure_builder() {
 }
 
 build_metadata() {
-  local -a builder_args
+  local -a builder_args buildx_set_args
   builder_args=()
+  buildx_set_args=()
 
   if [[ "$ENSURE_BUILDER" -eq 1 ]]; then
     ensure_builder
     builder_args=(--builder "$BUILDER_NAME")
   fi
 
+  for buildx_set in "${BUILDX_SET_ARGS[@]}"; do
+    buildx_set_args+=(--set "$buildx_set")
+  done
+
   docker buildx bake manifest \
     "${builder_args[@]}" \
+    "${buildx_set_args[@]}" \
     --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true' \
     --metadata-file "$METADATA_FILE"
 }
