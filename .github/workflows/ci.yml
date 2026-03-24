@@ -4,14 +4,256 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
     branches:
       - main
 
 jobs:
-  build-all-platforms:
-    name: Build all platforms
-    # runs-on: macos-26 # Apple Silicon for native macOS + cross-compile to Linux
+  # ── Rust checks (cheap ubuntu runner) ────────────────────────────────────────
+  rust-checks:
+    name: Rust checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: rust-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Check OpenAPI spec freshness
+        run: |
+          cargo run -q -p generate-openapi > /tmp/openapi-generated.json
+          if ! diff /tmp/openapi-generated.json crates/eidolons-server/openapi.json; then
+            echo ""
+            echo "ERROR: Committed OpenAPI spec doesn't match generated one!"
+            echo "Run: just update-openapi"
+            exit 1
+          fi
+
+  # ── OCI images (cheap ubuntu runner) ─────────────────────────────────────────
+  oci:
+    name: Build and verify OCI images
+    needs: rust-checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          version: v0.31.1
+          platforms: linux/amd64
+          driver-opts: |
+            image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
+
+      - name: Build OCI images
+        run: |
+          # setup-buildx-action provides a docker-container driver, which
+          # supports rewrite-timestamp and force-compression for full
+          # reproducibility. Override the default output to enable them.
+          docker buildx bake manifest \
+            --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true' \
+            --metadata-file /tmp/bake-metadata.json
+
+      - name: Extract digests
+        id: digests
+        run: |
+          SERVER_DIGEST=$(jq -r '."server"."containerimage.digest"' /tmp/bake-metadata.json)
+          CLI_DIGEST=$(jq -r '."cli"."containerimage.digest"' /tmp/bake-metadata.json)
+          POSTGRES_DIGEST=$(jq -r '."postgres"."containerimage.digest"' /tmp/bake-metadata.json)
+
+          echo "server=${SERVER_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "cli=${CLI_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "postgres=${POSTGRES_DIGEST}" >> "$GITHUB_OUTPUT"
+
+          # Build the expected manifest content
+          ACTUAL=$(jq -n \
+            --arg server "$SERVER_DIGEST" \
+            --arg cli "$CLI_DIGEST" \
+            --arg postgres "$POSTGRES_DIGEST" \
+            '{
+              version: 1,
+              artifacts: {
+                "eidolons-server": { type: "oci", platform: "linux/amd64", digest: $server },
+                "eidolons-cli": { type: "oci", platform: "linux/amd64", digest: $cli },
+                "eidolons-postgres": { type: "oci", platform: "linux/amd64", digest: $postgres }
+              }
+            }')
+          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$ACTUAL" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Verify artifact manifest
+        id: verify
+        env:
+          ACTUAL: ${{ steps.digests.outputs.actual }}
+        run: |
+          # Normalize both through jq to ignore whitespace differences
+          ACTUAL_NORM=$(echo "$ACTUAL" | jq -cS .)
+          COMMITTED_NORM=$(jq -cS . artifact-manifest.json)
+
+          if [ "$ACTUAL_NORM" = "$COMMITTED_NORM" ]; then
+            echo "Artifact manifest matches build output."
+            echo "match=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Artifact manifest does not match build output."
+            echo "Committed:"
+            echo "$COMMITTED_NORM" | jq .
+            echo "Actual:"
+            echo "$ACTUAL_NORM" | jq .
+            echo "match=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Suggest manifest update (PR only)
+        if: steps.verify.outputs.match == 'false' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ACTUAL: ${{ steps.digests.outputs.actual }}
+        run: |
+          # Write the actual manifest to a temp file for the suggestion
+          SUGGESTION=$(echo "$ACTUAL" | jq '.')
+
+          jq -n \
+            --arg actual "$SUGGESTION" \
+            '{
+              event: "REQUEST_CHANGES",
+              body: "**Artifact Manifest Update Required**\n\nThe OCI images built from this PR produce different digests than what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` to regenerate it.",
+              comments: [{
+                path: "artifact-manifest.json",
+                line: 1,
+                body: "Artifact manifest is out of date. Run `just update-manifest` to update."
+              }]
+            }' | gh api --silent -X POST \
+              "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+              --input -
+
+      - name: Debug image structure
+        if: steps.verify.outputs.match == 'false'
+        run: |
+          echo "=== Builder info ==="
+          docker buildx version
+          docker buildx inspect --bootstrap 2>/dev/null | head -20
+
+          for IMAGE in eidolons-server eidolons-cli eidolons-postgres; do
+            echo ""
+            echo "=============== $IMAGE ==============="
+            DIR="/tmp/${IMAGE}-debug"
+            mkdir -p "$DIR"
+            docker save "${IMAGE}:dev" | tar -xf - -C "$DIR"
+
+            MANIFEST_DIGEST=$(jq -r '.manifests[0].digest' "$DIR/index.json" | cut -d: -f2)
+
+            echo "=== Index ==="
+            jq . "$DIR/index.json"
+
+            echo "=== Manifest (sha256:${MANIFEST_DIGEST:0:12}...) ==="
+            jq . "$DIR/blobs/sha256/$MANIFEST_DIGEST"
+
+            CONFIG_DIGEST=$(jq -r '.config.digest' "$DIR/blobs/sha256/$MANIFEST_DIGEST" | cut -d: -f2)
+            echo "=== Config (sha256:${CONFIG_DIGEST:0:12}...) ==="
+            jq . "$DIR/blobs/sha256/$CONFIG_DIGEST"
+
+            echo "=== Layer listing ==="
+            jq -r '.layers[] | "\(.digest) \(.mediaType)"' "$DIR/blobs/sha256/$MANIFEST_DIGEST" | while read -r LAYER MEDIA; do
+              HASH="${LAYER#sha256:}"
+              SIZE=$(stat -c%s "$DIR/blobs/sha256/$HASH" 2>/dev/null || stat -f%z "$DIR/blobs/sha256/$HASH")
+              echo "  $LAYER  size=$SIZE  type=$MEDIA"
+              echo "  First 20 tar entries:"
+              if echo "$MEDIA" | grep -q gzip; then
+                gzip -dc "$DIR/blobs/sha256/$HASH" | tar -tf - 2>/dev/null | head -20 | sed 's/^/    /'
+              else
+                tar -tf "$DIR/blobs/sha256/$HASH" 2>/dev/null | head -20 | sed 's/^/    /'
+              fi
+            done
+          done
+
+      - name: Fail on manifest mismatch
+        if: steps.verify.outputs.match == 'false'
+        run: exit 1
+
+      - name: Log in to GHCR
+        if: steps.verify.outputs.match == 'true' && github.event_name == 'push'
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine tags
+        if: steps.verify.outputs.match == 'true' && github.event_name == 'push'
+        id: tags
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          COMMIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          OWNER=$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')
+          REGISTRY="ghcr.io/${OWNER}"
+          SHORT_SHA=$(echo "${COMMIT_SHA}" | cut -c1-7)
+
+          TAGS="sha-${SHORT_SHA}"
+
+          if [ "${GIT_REF}" = "refs/heads/main" ]; then
+            TAGS="${TAGS},main"
+          elif [[ "${GIT_REF}" == refs/tags/v* ]]; then
+            VERSION="${GIT_REF#refs/tags/}"
+            TAGS="${TAGS},${VERSION}"
+          fi
+
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Push images to GHCR
+        if: steps.verify.outputs.match == 'true' && github.event_name == 'push'
+        env:
+          REGISTRY: ${{ steps.tags.outputs.registry }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra TAG_LIST <<< "${TAGS}"
+
+          for IMAGE in eidolons-server eidolons-cli eidolons-postgres; do
+            for TAG in "${TAG_LIST[@]}"; do
+              docker tag "${IMAGE}:dev" "${REGISTRY}/${IMAGE}:${TAG}"
+              docker push "${REGISTRY}/${IMAGE}:${TAG}"
+            done
+          done
+
+  # ── Apple (expensive macOS runner) ───────────────────────────────────────────
+  apple:
+    name: Apple builds
+    needs: rust-checks
     runs-on: self-hosted
     timeout-minutes: 30
     permissions:
@@ -33,23 +275,23 @@ jobs:
           use-flakehub: false
           source-url: https://github.com/mike-marcacci/magic-nix-cache/releases/download/v0.0.1-skip-upstream-test/magic-nix-cache-closure-ARM64-macOS.xz
 
-      - name: Show flake info
-        run: nix flake show
+      - name: Check Swift formatting
+        run: nix build '.#checks.aarch64-darwin.swift-formatting' --show-trace
 
-      - name: Run all checks
-        run: nix flake check --show-trace --max-jobs auto
+      - name: Check Swift bindings freshness
+        run: nix build '.#checks.aarch64-darwin.swift-bindings-current' --show-trace
 
-      - name: Build Swift packages
-        run: |
-          # Build the XCFramework via Nix and update the local path
-          nix run '.#update-eidolons-shared-swift-xcframework'
+      - name: Build macOS app
+        run: nix build '.#eidolons-macos-app' --show-trace
 
-          # Build native apps
-          # Note that we *cannot* use nix until Swift 6 is available in nixpkgs
-          ( cd apps/macos && Support/package-app.sh )
+      - name: Build macOS CLI (universal binary)
+        run: nix build '.#eidolons-cli-macos-universal' --show-trace
 
       - name: Run Swift tests
         run: |
+          # Build the XCFramework and update the local path for SPM
+          nix run '.#update-eidolons-shared-swift-xcframework'
+
           # Run Swift tests for shared core
           ( cd crates/eidolons-shared && swift test )
 
