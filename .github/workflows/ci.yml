@@ -327,17 +327,21 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           ACTUAL: ${{ steps.verify.outputs.actual }}
         run: |
-          SUGGESTION=$(echo "$ACTUAL" | jq '.')
+          FORMATTED=$(echo "$ACTUAL" | jq '.')
+          LINE_COUNT=$(wc -l < artifact-manifest.json | tr -d ' ')
+          SUGGESTION_BODY=$(printf '```suggestion\n%s\n```' "$FORMATTED")
 
           jq -n \
-            --arg actual "$SUGGESTION" \
+            --arg body "$SUGGESTION_BODY" \
+            --argjson line_count "$LINE_COUNT" \
             '{
               event: "REQUEST_CHANGES",
-              body: "**Artifact Manifest Update Required**\n\nThe built OCI and macOS artifacts produce different digests than what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` on macOS to regenerate it.",
+              body: "**Artifact Manifest Update Required**\n\nThe built OCI and macOS artifacts produce different digests than what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` on macOS to regenerate it, or apply the suggestion below.",
               comments: [{
                 path: "artifact-manifest.json",
-                line: 1,
-                body: "Artifact manifest is out of date. Run `just update-manifest` on macOS to update."
+                start_line: 1,
+                line: $line_count,
+                body: $body
               }]
             }' | gh api --silent -X POST \
               "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \

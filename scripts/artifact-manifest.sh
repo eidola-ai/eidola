@@ -139,13 +139,13 @@ build_metadata() {
     builder_args=(--builder "$BUILDER_NAME")
   fi
 
-  for buildx_set in "${BUILDX_SET_ARGS[@]}"; do
+  for buildx_set in ${BUILDX_SET_ARGS[@]+"${BUILDX_SET_ARGS[@]}"}; do
     buildx_set_args+=(--set "$buildx_set")
   done
 
   docker buildx bake manifest \
-    "${builder_args[@]}" \
-    "${buildx_set_args[@]}" \
+    ${builder_args[@]+"${builder_args[@]}"} \
+    ${buildx_set_args[@]+"${buildx_set_args[@]}"} \
     --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true' \
     --metadata-file "$METADATA_FILE"
 }
