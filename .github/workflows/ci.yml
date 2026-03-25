@@ -329,18 +329,24 @@ jobs:
         run: |
           FORMATTED=$(echo "$ACTUAL" | jq '.')
           LINE_COUNT=$(wc -l < artifact-manifest.json | tr -d ' ')
-          SUGGESTION_BODY=$(printf '```suggestion\n%s\n```' "$FORMATTED")
+
+          # Strip the outer braces from the suggestion so lines 1 ({) and N (})
+          # remain as unchanged context. This avoids GitHub's "applying suggestions
+          # on deleted lines is not supported" error and produces a cleaner diff.
+          INNER=$(echo "$FORMATTED" | sed '1d;$d')
+          SUGGESTION_BODY=$(printf '```suggestion\n%s\n```' "$INNER")
+          LAST=$((LINE_COUNT - 1))
 
           jq -n \
             --arg body "$SUGGESTION_BODY" \
-            --argjson line_count "$LINE_COUNT" \
+            --argjson last "$LAST" \
             '{
               event: "REQUEST_CHANGES",
               body: "**Artifact Manifest Update Required**\n\nThe built OCI and macOS artifacts produce different digests than what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` on macOS to regenerate it, or apply the suggestion below.",
               comments: [{
                 path: "artifact-manifest.json",
-                start_line: 1,
-                line: $line_count,
+                start_line: 2,
+                line: $last,
                 body: $body
               }]
             }' | gh api --silent -X POST \
