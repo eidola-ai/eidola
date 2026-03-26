@@ -37,7 +37,7 @@ echo "==> Starting postgres..."
 docker compose up -d postgres
 echo "==> Waiting for postgres to be healthy..."
 for i in $(seq 1 30); do
-    if docker compose exec postgres pg_isready -U eidolons >/dev/null 2>&1; then
+    if docker compose exec postgres pg_isready -U eidola >/dev/null 2>&1; then
         break
     fi
     if [ "$i" -eq 30 ]; then
@@ -48,7 +48,7 @@ for i in $(seq 1 30); do
 done
 
 echo "==> Applying schema..."
-docker compose exec postgres psql -U eidolons -d eidolons -f /docker-entrypoint-initdb.d/schema.sql -q
+docker compose exec postgres psql -U eidola -d eidola -f /docker-entrypoint-initdb.d/schema.sql -q
 
 # ── Capture webhook secret ───────────────────────────────────────────────────
 

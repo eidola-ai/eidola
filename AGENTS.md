@@ -8,13 +8,13 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 
 **Current upstream:** Tinfoil (inference.tinfoil.sh) — OpenAI-compatible, all models run in confidential enclaves (AMD SEV-SNP / Intel TDX / NVIDIA CC)
 
-**Database:** PostgreSQL 17+ (see `crates/eidolons-server/schema/schema.sql`)
+**Database:** PostgreSQL 17+ (see `crates/eidola-server/schema/schema.sql`)
 
 **Deployment:** Tinfoil Containers — all services run inside confidential enclaves (AMD SEV-SNP). The Tinfoil shim handles TLS termination with attestation-bearing certificates; the server runs plain HTTP behind it.
 
 **CI:** Single `ci.yml` workflow with four jobs — `rust-checks` (ubuntu-24.04: cargo fmt/clippy/test, OpenAPI freshness), `oci` (ubuntu-24.04: OCI image builds, OCI subset verification, GHCR publishing), `apple` (self-hosted Mac: Swift formatting/bindings freshness, Nix-based macOS app and CLI universal binary builds, Swift tests), and `artifact-manifest` (ubuntu-24.04: merges the OCI and macOS artifact digests and verifies the committed manifest). The `oci` and `apple` jobs gate on `rust-checks` to avoid wasting resources on failing PRs.
 
-**Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidolons-server`, `ghcr.io/<owner>/eidolons-cli`, and `ghcr.io/<owner>/eidolons-postgres`.
+**Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidola-server`, `ghcr.io/<owner>/eidola-cli`, and `ghcr.io/<owner>/eidola-postgres`.
 
 **Key design decisions:**
 - Axum-based HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration
@@ -26,7 +26,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - Account auth (Basic + Argon2id) via `BasicAuth` extractor, chat completions auth via `TokenAuth` extractor
 - Stripe integration via thin `reqwest` wrapper (no `async-stripe` dependency)
 
-**API endpoints:** Defined in `crates/eidolons-server/openapi.json` (generated from utoipa annotations — see Conventions).
+**API endpoints:** Defined in `crates/eidola-server/openapi.json` (generated from utoipa annotations — see Conventions).
 
 **Environment variables:**
 - `TINFOIL_API_KEY` (required) - Tinfoil inference API key
@@ -70,7 +70,7 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 
 **Key pattern:** The core never performs side-effects directly. It emits Effects that the shell handles, then the shell sends responses back via `handleResponse()`.
 
-**Capability implementations:** Pure Rust crates in `crates/` implement capability logic. The same `crates/` tree also contains the Rust code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) plus operational utilities such as `tinfoil-shim-mock` and `hash-secret`. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
+**Capability implementations:** Pure Rust crates in `crates/` implement capability logic. The same `crates/` tree also contains the Rust code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) plus operational utilities such as `tinfoil-shim-mock` and `hash-secret`. These are compiled into `eidola-shared` and exposed via UniFFI, so the Swift shell can call them directly.
 
 **Two codegen pipelines:**
 - `uniffi-bindgen-swift` (workspace crate under `crates/`) → FFI bridge (`processEvent`, `handleResponse`, `view`)
@@ -78,7 +78,7 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 
 ## CLI Database & Migrations
 
-The CLI uses an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidolons/eidolons.db` for local app data (wallet credentials, conversation history, etc.).
+The CLI uses an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidola/eidola.db` for local app data (wallet credentials, conversation history, etc.).
 
 **Schema management:**
 - `apps/cli/schema/schema.sql` is the canonical schema — always reflects the current desired state
@@ -90,7 +90,7 @@ The CLI uses an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libS
 2. Add a `MIGRATION_N` constant in `db.rs` with the ALTER/CREATE statements
 3. Add an `if current_version < N` block in `migrate()` that runs the migration and sets `user_version`
 4. Bump `LATEST_VERSION`
-5. Run `cargo test -p eidolons-cli` — the `migrations_match_schema` test structurally compares a fresh-from-schema database against a fully-migrated database (via `PRAGMA table_info`, `PRAGMA index_info`, and view SQL)
+5. Run `cargo test -p eidola-cli` — the `migrations_match_schema` test structurally compares a fresh-from-schema database against a fully-migrated database (via `PRAGMA table_info`, `PRAGMA index_info`, and view SQL)
 
 **Limitations:** The `turso` crate does not support `ALTER TABLE ALTER COLUMN` (a libSQL C extension). To add `NOT NULL` columns, use `ADD COLUMN ... DEFAULT <value>` — the default persists and must also be declared in `schema.sql` so both paths match.
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crux_core::typegen::TypeGen;
-use eidolons_shared::EidolonsApp;
+use eidola_shared::EidolaApp;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
@@ -14,7 +14,7 @@ fn main() -> Result<()> {
     let mut typegen = TypeGen::new();
 
     // Register the app to generate types for Event, Effect, ViewModel, etc.
-    typegen.register_app::<EidolonsApp>()?;
+    typegen.register_app::<EidolaApp>()?;
 
     // Generate Swift types
     typegen.swift("SharedTypes", &output_dir)?;

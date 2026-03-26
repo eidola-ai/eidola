@@ -1,6 +1,6 @@
 # tinfoil-verifier
 
-Verifies [Tinfoil](https://tinfoil.sh) enclave attestation and pins TLS connections to the attested certificate. This ensures the eidolons server only sends inference traffic to a genuine AMD SEV-SNP enclave running expected code.
+Verifies [Tinfoil](https://tinfoil.sh) enclave attestation and pins TLS connections to the attested certificate. This ensures the eidola server only sends inference traffic to a genuine AMD SEV-SNP enclave running expected code.
 
 ## What it does
 

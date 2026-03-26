@@ -61,7 +61,7 @@ jobs:
         id: check
         run: |
           MEASUREMENT="${{ steps.release.outputs.measurement }}"
-          if grep -qF "${MEASUREMENT}" crates/eidolons-server/src/measurements.rs; then
+          if grep -qF "${MEASUREMENT}" crates/eidola-server/src/measurements.rs; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Measurement already present"
           else
@@ -78,7 +78,7 @@ jobs:
           ARTIFACT_HASH: ${{ steps.release.outputs.artifact_hash }}
           LOG_INDEX: ${{ steps.sigstore.outputs.log_index }}
         run: |
-          FILE="crates/eidolons-server/src/measurements.rs"
+          FILE="crates/eidola-server/src/measurements.rs"
 
           # Extract current CURRENT measurement before overwriting
           PREV=$(git show HEAD:"${FILE}" | grep -oP '[a-f0-9]{96}' | head -1 || true)
@@ -154,7 +154,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git checkout -b "${BRANCH}"
-          git add crates/eidolons-server/src/measurements.rs
+          git add crates/eidola-server/src/measurements.rs
           git commit -m "Update Tinfoil enclave measurement to ${TAG}"
           git push -u origin "${BRANCH}"
 

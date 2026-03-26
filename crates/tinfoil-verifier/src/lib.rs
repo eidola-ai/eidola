@@ -10,7 +10,7 @@
 //! # Prerequisites
 //!
 //! A rustls `CryptoProvider` must be installed before calling [`attesting_client`].
-//! The eidolons server does this in `main.rs` via `rustls_rustcrypto::provider()`.
+//! The eidola server does this in `main.rs` via `rustls_rustcrypto::provider()`.
 
 mod attesting_client;
 pub mod bundle;

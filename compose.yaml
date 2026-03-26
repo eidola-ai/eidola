@@ -1,30 +1,30 @@
 services:
   postgres:
-    image: eidolons-postgres:dev
+    image: eidola-postgres:dev
     build:
       context: .
       dockerfile: oci/postgresql/Containerfile
     environment:
-      POSTGRES_USER: eidolons
-      POSTGRES_DB: eidolons
+      POSTGRES_USER: eidola
+      POSTGRES_DB: eidola
       POSTGRES_HOST_AUTH_METHOD: trust
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./crates/eidolons-server/schema:/docker-entrypoint-initdb.d:ro
+      - ./crates/eidola-server/schema:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "eidolons"]
+      test: ["CMD", "pg_isready", "-U", "eidola"]
       interval: 5s
       retries: 5
 
   server:
-    image: eidolons-server:dev
+    image: eidola-server:dev
     build:
       context: .
-      dockerfile: oci/eidolons-server/Containerfile
+      dockerfile: oci/eidola-server/Containerfile
     environment:
-      DATABASE_URL: postgres://eidolons@postgres/eidolons
+      DATABASE_URL: postgres://eidola@postgres/eidola
       TINFOIL_API_KEY: ${TINFOIL_API_KEY}
       CREDENTIAL_MASTER_KEY: ${CREDENTIAL_MASTER_KEY}
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}

@@ -30,7 +30,7 @@ updates:
 
   # Maintain dependencies for Docker (Containerfiles).
   - package-ecosystem: "docker"
-    directory: "/oci/eidolons-server"
+    directory: "/oci/eidola-server"
     schedule:
       interval: "weekly"
 

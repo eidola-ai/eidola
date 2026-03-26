@@ -19,7 +19,7 @@ use uuid::Uuid;
 use config::Config;
 
 #[derive(Parser)]
-#[command(name = "eidolons", about = "Eidolons CLI")]
+#[command(name = "eidola", about = "Eidola CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -222,7 +222,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 
 /// ACT token type (draft-schlesinger-privacypass-act-01).
 const ACT_TOKEN_TYPE: u16 = 0xE5AD;
-const ISSUER_NAME: &str = "eidolons";
+const ISSUER_NAME: &str = "eidola";
 const ORIGIN_INFO: &str = "inference";
 
 /// Serialize TokenChallenge per draft-schlesinger-privacypass-act-01 Section 7.
@@ -389,13 +389,13 @@ fn require_base_url(config: &Config) -> Result<&str, String> {
     config
         .base_url
         .as_deref()
-        .ok_or_else(|| "base_url not configured. Run: eidolons configure --base_url=<url>".into())
+        .ok_or_else(|| "base_url not configured. Run: eidola configure --base_url=<url>".into())
 }
 
 fn require_credentials(config: &Config) -> Result<(&str, &str), String> {
     match (&config.account_id, &config.account_secret) {
         (Some(id), Some(secret)) => Ok((id, secret)),
-        _ => Err("account not configured. Run: eidolons account create".into()),
+        _ => Err("account not configured. Run: eidola account create".into()),
     }
 }
 
@@ -526,7 +526,7 @@ async fn cmd_account_create() -> Result<(), String> {
 
     if config.account_id.is_some() || config.account_secret.is_some() {
         return Err(
-            "account credentials already configured. Run 'eidolons account reset' first.".into(),
+            "account credentials already configured. Run 'eidola account reset' first.".into(),
         );
     }
 
@@ -573,7 +573,7 @@ fn cmd_account_configure(id: &str, secret: &str) -> Result<(), String> {
 
     if config.account_id.is_some() || config.account_secret.is_some() {
         return Err(
-            "account credentials already configured. Run 'eidolons account reset' first.".into(),
+            "account credentials already configured. Run 'eidola account reset' first.".into(),
         );
     }
 

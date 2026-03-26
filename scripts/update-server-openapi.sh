@@ -23,7 +23,7 @@ if [[ -z "$SOURCE_SPEC" ]]; then
   SOURCE_SPEC="$TARGET_FILE"
 fi
 
-DEST="$REPO_ROOT/crates/eidolons-server/openapi.json"
+DEST="$REPO_ROOT/crates/eidola-server/openapi.json"
 
 echo "Copying OpenAPI spec..."
 echo "  Source: $SOURCE_SPEC"

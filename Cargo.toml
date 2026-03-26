@@ -10,7 +10,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 authors = ["Mike Marcacci"]
-repository = "https://github.com/eidolons-ai/eidolons"
+repository = "https://github.com/eidola-ai/eidola"
 publish = false
 
 [profile.docker-dev]

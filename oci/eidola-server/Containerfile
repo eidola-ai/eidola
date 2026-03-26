@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
+
+# ── base ───────────────────────────────────────────────────────────────────────
+# Environment variables, pinned toolchain digest.
+FROM stagex/pallet-rust@sha256:2fbe7b164dd92edb9c1096152f6d27592d8a69b1b8eb2fc907b5fadea7d11668 AS base
+
+ARG CARGO_PROFILE=release
+
+ENV TARGET=x86_64-unknown-linux-musl
+ENV SOURCE_DATE_EPOCH=0
+ENV CARGO_INCREMENTAL=0
+ENV ZERO_AR_DATE=1
+ENV RUSTFLAGS="-C target-feature=+crt-static -C debuginfo=0 -C target-cpu=generic"
+
+WORKDIR /src
+
+# ── fetch ──────────────────────────────────────────────────────────────────────
+# Copy source and download dependencies (network access required).
+FROM base AS fetch
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY apps/ ./apps/
+COPY crates/ ./crates/
+
+RUN --mount=type=cache,id=eidola-cargo-registry,target=/root/.cargo/registry \
+    --mount=type=cache,id=eidola-cargo-git,target=/root/.cargo/git \
+    cargo fetch --locked --target ${TARGET}
+
+# ── build ──────────────────────────────────────────────────────────────────────
+# Compile sources (no network access).
+# Cache mounts persist the cargo registry and target dir across builds without
+# affecting the final image. The binary is copied to /out because cache mounts
+# are only available during RUN, not COPY.
+FROM fetch AS build
+
+ARG CARGO_PROFILE=release
+
+RUN --mount=type=cache,id=eidola-cargo-registry,target=/root/.cargo/registry \
+    --mount=type=cache,id=eidola-cargo-git,target=/root/.cargo/git \
+    --mount=type=cache,id=eidola-target-x86_64-unknown-linux-musl,target=/src/target,sharing=locked \
+    --network=none \
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-server \
+    && install -D target/${TARGET}/${CARGO_PROFILE}/eidola-server /out/eidola-server
+
+# ── install ────────────────────────────────────────────────────────────────────
+# Place binary into /rootfs.
+FROM scratch AS install
+
+COPY --from=build /out/eidola-server /rootfs/eidola-server
+
+# ── package ────────────────────────────────────────────────────────────────────
+# Final minimal image.
+FROM scratch AS package
+
+COPY --from=install /rootfs/ /
+ENV BIND_ADDR=0.0.0.0:8080
+EXPOSE 8080
+USER 65534:65534
+ENTRYPOINT ["/eidola-server"]

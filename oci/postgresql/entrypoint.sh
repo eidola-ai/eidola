@@ -2,8 +2,8 @@
 set -e
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data}"
-POSTGRES_USER="${POSTGRES_USER:-eidolons}"
-POSTGRES_DB="${POSTGRES_DB:-eidolons}"
+POSTGRES_USER="${POSTGRES_USER:-eidola}"
+POSTGRES_DB="${POSTGRES_DB:-eidola}"
 
 # Initialize data directory if not already initialized
 if [ ! -s "$PGDATA/PG_VERSION" ]; then

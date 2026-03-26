@@ -39,19 +39,19 @@ target "_common" {
 
 target "server" {
   inherits = ["_common"]
-  tags     = ["eidolons-server:dev"]
+  tags     = ["eidola-server:dev"]
 }
 
 target "cli" {
   inherits   = ["_common"]
   context    = "."
-  dockerfile = "oci/eidolons-cli/Containerfile"
-  tags       = ["eidolons-cli:dev"]
+  dockerfile = "oci/eidola-cli/Containerfile"
+  tags       = ["eidola-cli:dev"]
 }
 
 target "postgres" {
   inherits = ["_common"]
-  tags     = ["eidolons-postgres:dev"]
+  tags     = ["eidola-postgres:dev"]
 }
 
 target "shim" {
@@ -90,22 +90,22 @@ target "_ci" {
 target "ci-server" {
   inherits   = ["_ci"]
   context    = "."
-  dockerfile = "oci/eidolons-server/Containerfile"
-  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidolons-server:${t}"]
+  dockerfile = "oci/eidola-server/Containerfile"
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server:${t}"]
 }
 
 target "ci-cli" {
   inherits   = ["_ci"]
   context    = "."
-  dockerfile = "oci/eidolons-cli/Containerfile"
-  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidolons-cli:${t}"]
+  dockerfile = "oci/eidola-cli/Containerfile"
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-cli:${t}"]
 }
 
 target "ci-postgres" {
   inherits   = ["_ci"]
   context    = "."
   dockerfile = "oci/postgresql/Containerfile"
-  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidolons-postgres:${t}"]
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-postgres:${t}"]
 }
 
 group "ci" {

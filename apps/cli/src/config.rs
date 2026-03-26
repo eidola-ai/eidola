@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// under different domain separators are cryptographically unlinkable).
 /// By hardcoding the expected value in the client and rejecting mismatches,
 /// the operator cannot use the domain separator as a covert linking channel.
-pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidolons:inference:production:2026-03-05";
+pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidola:inference:production:2026-03-05";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -56,7 +56,7 @@ impl Config {
 
 impl Config {
     pub fn path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("eidolons").join("config.toml"))
+        dirs::config_dir().map(|d| d.join("eidola").join("config.toml"))
     }
 
     pub fn load() -> Config {

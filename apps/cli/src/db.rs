@@ -7,7 +7,7 @@ const LATEST_VERSION: i64 = 1;
 
 /// Returns the path to the CLI database file.
 fn db_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("eidolons").join("eidolons.db"))
+    dirs::data_dir().map(|d| d.join("eidola").join("eidola.db"))
 }
 
 /// Opens (or creates) the local database and runs any pending migrations.

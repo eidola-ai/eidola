@@ -46,7 +46,7 @@ jobs:
       - name: Check OpenAPI spec freshness
         run: |
           cargo run -q -p generate-openapi > /tmp/openapi-generated.json
-          if ! diff /tmp/openapi-generated.json crates/eidolons-server/openapi.json; then
+          if ! diff /tmp/openapi-generated.json crates/eidola-server/openapi.json; then
             echo ""
             echo "ERROR: Committed OpenAPI spec doesn't match generated one!"
             echo "Run: just update-openapi"
@@ -145,7 +145,7 @@ jobs:
           docker buildx version
           docker buildx inspect --bootstrap 2>/dev/null | head -20
 
-          for IMAGE in eidolons-server eidolons-cli eidolons-postgres; do
+          for IMAGE in eidola-server eidola-cli eidola-postgres; do
             echo ""
             echo "=============== $IMAGE ==============="
             DIR="/tmp/${IMAGE}-debug"
@@ -219,7 +219,7 @@ jobs:
           set -euo pipefail
           IFS=',' read -ra TAG_LIST <<< "${TAGS}"
 
-          for IMAGE in eidolons-server eidolons-cli eidolons-postgres; do
+          for IMAGE in eidola-server eidola-cli eidola-postgres; do
             for TAG in "${TAG_LIST[@]}"; do
               docker tag "${IMAGE}:dev" "${REGISTRY}/${IMAGE}:${TAG}"
               docker push "${REGISTRY}/${IMAGE}:${TAG}"
@@ -266,10 +266,10 @@ jobs:
       - name: Run Swift tests
         run: |
           # Build the XCFramework and update the local path for SPM
-          nix run '.#update-eidolons-shared-swift-xcframework'
+          nix run '.#update-eidola-shared-swift-xcframework'
 
           # Run Swift tests for shared core
-          ( cd crates/eidolons-shared && swift test )
+          ( cd crates/eidola-shared && swift test )
 
           # Run Swift tests for macOS app
           ( cd apps/macos && swift test )
