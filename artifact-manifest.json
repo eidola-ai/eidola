@@ -9,7 +9,7 @@
     "eidolons-cli": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:95e5f21c98852b8839e93138fafd2ee981a9ae004d1fb4d5a49b8fea095d2b84"
+      "digest": "sha256:a580f1480a1b1c596bde3a423c2f07a3d356d476a4a76fda8ca662ee3759bbef"
     },
     "eidolons-postgres": {
       "type": "oci",
@@ -24,7 +24,7 @@
     "eidolons-cli-macos-universal": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-+qol/Z13i3W/vi8axGftnyIbgp5+I7NrM7/y/2cSIbk="
+      "narHash": "sha256-5fcRQH5tJIfFKs1cuW11ILRQyoHl6597PXfpyf7tC+s="
     }
   }
 }

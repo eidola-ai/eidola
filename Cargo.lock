@@ -763,9 +763,9 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cmake"
-version = "0.1.57"
+version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75443c44cd6b379beb8c5b45d85d0773baf31cce901fe7bb252f4eff3008ef7d"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
 dependencies = [
  "cc",
 ]
@@ -1340,7 +1340,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2328,9 +2328,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libredox"
-version = "0.1.14"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1744e39d1d6a9948f4f388969627434e31128196de472883b39f148769bfe30a"
+checksum = "7ddbf48fd451246b1f8c2610bd3b4ac0cc6e149d89832867093ab69a17194f08"
 dependencies = [
  "libc",
 ]
@@ -2549,9 +2549,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
+checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
 
 [[package]]
 name = "num-integer"
@@ -3374,7 +3374,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3387,7 +3387,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3445,7 +3445,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4012,7 +4012,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4494,7 +4494,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turso"
 version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#de8afa6c6833954b91c6c327bfb35017dd0ee3ba"
+source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
 dependencies = [
  "thiserror 2.0.18",
  "tracing",
@@ -4506,7 +4506,7 @@ dependencies = [
 [[package]]
 name = "turso_core"
 version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#de8afa6c6833954b91c6c327bfb35017dd0ee3ba"
+source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
 dependencies = [
  "aegis",
  "aes",
@@ -4569,7 +4569,7 @@ dependencies = [
 [[package]]
 name = "turso_ext"
 version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#de8afa6c6833954b91c6c327bfb35017dd0ee3ba"
+source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -4579,7 +4579,7 @@ dependencies = [
 [[package]]
 name = "turso_macros"
 version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#de8afa6c6833954b91c6c327bfb35017dd0ee3ba"
+source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4589,7 +4589,7 @@ dependencies = [
 [[package]]
 name = "turso_parser"
 version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#de8afa6c6833954b91c6c327bfb35017dd0ee3ba"
+source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
 dependencies = [
  "bitflags",
  "memchr",
@@ -4603,7 +4603,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit"
 version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#de8afa6c6833954b91c6c327bfb35017dd0ee3ba"
+source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -4618,7 +4618,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit_macros"
 version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#de8afa6c6833954b91c6c327bfb35017dd0ee3ba"
+source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4628,7 +4628,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_engine"
 version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#de8afa6c6833954b91c6c327bfb35017dd0ee3ba"
+source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
 dependencies = [
  "base64",
  "bytes",
@@ -4649,7 +4649,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_sdk_kit"
 version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#de8afa6c6833954b91c6c327bfb35017dd0ee3ba"
+source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -4717,9 +4717,9 @@ checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
 name = "unicode-segmentation"
-version = "1.12.0"
+version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
+checksum = "9629274872b2bfaf8d66f5f15725007f635594914870f65218920345aa11aa8c"
 
 [[package]]
 name = "unicode-width"
@@ -5221,7 +5221,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5297,6 +5297,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]
