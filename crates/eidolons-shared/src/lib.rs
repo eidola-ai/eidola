@@ -3,7 +3,10 @@ pub mod app;
 use std::sync::LazyLock;
 
 pub use app::{Effect, EffectFfi, EidolonsApp, Event, Model, ViewModel};
-pub use crux_core::{Core, bridge::Bridge};
+pub use crux_core::{
+    Core,
+    bridge::{Bridge, EffectId},
+};
 
 uniffi::setup_scaffolding!();
 
@@ -16,8 +19,10 @@ static CORE: LazyLock<Bridge<EidolonsApp>> = LazyLock::new(|| Bridge::new(Core::
 /// The shell should deserialize the response to get the list of effects to handle.
 #[uniffi::export]
 pub fn process_event(data: &[u8]) -> Vec<u8> {
-    CORE.process_event(data)
-        .unwrap_or_else(|e| panic!("process_event failed: {e}"))
+    let mut requests = Vec::new();
+    CORE.update(data, &mut requests)
+        .unwrap_or_else(|e| panic!("process_event failed: {e}"));
+    requests
 }
 
 /// Handle a response from the shell
@@ -26,8 +31,10 @@ pub fn process_event(data: &[u8]) -> Vec<u8> {
 /// Returns bincode-serialized effects (requests) for any follow-up operations.
 #[uniffi::export]
 pub fn handle_response(id: u32, data: &[u8]) -> Vec<u8> {
-    CORE.handle_response(id, data)
-        .unwrap_or_else(|e| panic!("handle_response failed: {e}"))
+    let mut requests = Vec::new();
+    CORE.resolve(EffectId(id), data, &mut requests)
+        .unwrap_or_else(|e| panic!("handle_response failed: {e}"));
+    requests
 }
 
 /// Get the current view model
@@ -35,5 +42,8 @@ pub fn handle_response(id: u32, data: &[u8]) -> Vec<u8> {
 /// Returns the bincode-serialized ViewModel representing the current UI state.
 #[uniffi::export]
 pub fn view() -> Vec<u8> {
-    CORE.view().unwrap_or_else(|e| panic!("view failed: {e}"))
+    let mut view = Vec::new();
+    CORE.view(&mut view)
+        .unwrap_or_else(|e| panic!("view failed: {e}"));
+    view
 }

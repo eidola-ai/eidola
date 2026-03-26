@@ -15,6 +15,9 @@
 
     # Efficient Rust builds with incremental caching
     crane.url = "github:ipetkov/crane";
+
+    # Hermetic Swift 6.2 toolchain (macOS ARM64)
+    swift.url = "path:./nix/swift";
   };
 
   outputs =
@@ -24,6 +27,7 @@
       flake-utils,
       fenix,
       crane,
+      swift,
       ...
     }:
     flake-utils.lib.eachSystem [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ] (
@@ -32,7 +36,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
 
         # SHA256 for rust-toolchain.toml (single source of truth)
-        rustToolchainSha256 = "sha256-SBKjxhC6zHTu0SyJwxLlQHItzMzYZ71VCWQC2hOzpRY=";
+        rustToolchainSha256 = "sha256-qqF33vNuAdU5vua96VKVIwuc43j4EFeEXbjQ6+l4mO4=";
 
         # Get the exact Rust toolchain specified in rust-toolchain.toml
         rustToolchain = fenix.packages.${system}.fromToolchainFile {
@@ -81,10 +85,10 @@
         # Get all workspace member paths (e.g., ["crates/foo", "crates/bar"])
         workspaceMemberPaths = builtins.concatMap expandMemberPattern memberPatterns;
 
-        # Map from crate name to its path
+        # Map from Cargo package name to its path
         cratePaths = builtins.listToAttrs (
           map (path: {
-            name = builtins.baseNameOf path;
+            name = (builtins.fromTOML (builtins.readFile ./${path}/Cargo.toml)).package.name;
             value = path;
           }) workspaceMemberPaths
         );
@@ -168,6 +172,9 @@
                   true
                 # Keep directories that are parents of crate paths
                 else if type == "directory" && isParentOfCrate relPath then
+                  true
+                # Include .sql files (used by include_str! in the CLI)
+                else if type == "regular" && pkgs.lib.hasSuffix ".sql" path then
                   true
                 # For everything else, use crane's filter (which handles .rs, Cargo.toml, etc.)
                 else
@@ -344,7 +351,7 @@
             }
           );
 
-        # Build the generate-openapi binary (native only, used for spec generation)
+        # Build the generate-openapi binary crate (native only, used for spec generation)
         generateOpenapiBin = mkPackage {
           pname = "generate-openapi";
           rustTarget = nativeRustTarget;
@@ -363,14 +370,14 @@
               generate-openapi > $out/openapi.json
             '';
 
-        # Build the uniffi-bindgen-swift tool (native only)
+        # Build the uniffi-bindgen-swift binary crate (native only)
         uniffiBindgenSwift = mkPackage {
           pname = "uniffi-bindgen-swift";
           rustTarget = nativeRustTarget;
           nixCrossSystem = null;
         };
 
-        # Build the shared-typegen tool (native only)
+        # Build the shared-typegen binary crate (native only)
         sharedTypegen = mkPackage {
           pname = "shared-typegen";
           rustTarget = nativeRustTarget;
@@ -559,6 +566,217 @@
           '';
         };
 
+        # Build the CLI as a macOS universal binary (Darwin only)
+        eidolonsCliMacosUniversal =
+          if !pkgs.stdenv.isDarwin then
+            null
+          else
+            pkgs.stdenv.mkDerivation {
+              pname = "eidolons-cli-macos-universal";
+              version = "1.0";
+
+              nativeBuildInputs = [ pkgs.darwin.cctools ];
+
+              SOURCE_DATE_EPOCH = "0";
+
+              dontUnpack = true;
+
+              arm64 = mkPackage {
+                pname = "eidolons-cli";
+                rustTarget = "aarch64-apple-darwin";
+                nixCrossSystem = null;
+              };
+              x86_64 = mkPackage {
+                pname = "eidolons-cli";
+                rustTarget = "x86_64-apple-darwin";
+                nixCrossSystem = null;
+              };
+
+              buildPhase = ''
+                mkdir -p $out/bin
+                lipo -create \
+                  "$arm64/bin/eidolons" \
+                  "$x86_64/bin/eidolons" \
+                  -output "$out/bin/eidolons"
+              '';
+
+              installPhase = ''
+                echo "Universal binary:"
+                lipo -info "$out/bin/eidolons"
+              '';
+
+              meta = {
+                description = "Eidolons CLI (macOS universal binary)";
+                platforms = [ "aarch64-darwin" "x86_64-darwin" ];
+              };
+            };
+
+        # Generate AppIcon.icns from the xcassets appiconset PNGs using libicns.
+        # Returns null if no icon images are present (all slots empty).
+        appIcon =
+          let
+            appiconset = ./apps/macos/Sources/EidolonsEntrypoint/Assets.xcassets/AppIcon.appiconset;
+            contentsJson = builtins.fromJSON (builtins.readFile (appiconset + "/Contents.json"));
+            # An image entry has a "filename" key when a PNG is assigned
+            hasImages = builtins.any (img: img ? filename) contentsJson.images;
+          in
+          if !hasImages then
+            null
+          else
+            pkgs.runCommand "app-icon"
+              {
+                nativeBuildInputs = [ pkgs.libicns ];
+                SOURCE_DATE_EPOCH = "0";
+              }
+              ''
+                mkdir -p $out
+
+                # Map xcassets size+scale to the pixel sizes png2icns expects.
+                # png2icns auto-detects icon type from PNG dimensions.
+                ${builtins.concatStringsSep "\n" (
+                  builtins.filter (s: s != "") (
+                    map (
+                      img:
+                      if img ? filename then
+                        "cp ${appiconset}/${img.filename} $TMPDIR/${img.filename}"
+                      else
+                        ""
+                    ) contentsJson.images
+                  )
+                )}
+
+                png2icns $out/AppIcon.icns $TMPDIR/*.png
+              '';
+
+        # Build the macOS app with Swift 6.2 (Darwin only)
+        # Uses swiftc directly (not SPM) to avoid xcrun/Xcode dependency.
+        # Modules are compiled in dependency order, then linked into the final executable.
+        eidolonsMacosApp =
+          let
+            isDarwin = pkgs.stdenv.isDarwin;
+            swiftPkg = swift.packages.${system}.swift or null;
+          in
+          if !isDarwin || swiftPkg == null then
+            null
+          else
+            pkgs.stdenv.mkDerivation {
+              pname = "eidolons-macos";
+              version = "1.0";
+
+              src = pkgs.lib.fileset.toSource {
+                root = ./.;
+                fileset = pkgs.lib.fileset.unions [
+                  ./apps/macos/Sources
+                  ./apps/macos/Support/Info.plist
+                  ./crates/eidolons-shared/swift
+                ];
+              };
+
+              nativeBuildInputs = [ swiftPkg ];
+              buildInputs = [ pkgs.apple-sdk_26 ];
+
+              SOURCE_DATE_EPOCH = "0";
+
+              # XCFramework static library (nix-built)
+              xcframework = eidolonsSharedSwiftXCFramework;
+
+              buildPhase = ''
+                export HOME=$TMPDIR
+                export XDG_CACHE_HOME=$TMPDIR
+
+                SHARED="crates/eidolons-shared/swift"
+                XCFW_LIB="$xcframework/libeidolons_shared-rs.xcframework/macos-arm64_x86_64"
+                FFI_HEADERS="$SHARED/Sources/EidolonsSharedFFI"
+                MODULEMAP="$FFI_HEADERS/module.modulemap"
+
+                MODULES="$TMPDIR/modules"
+                OBJS="$TMPDIR/objs"
+                mkdir -p "$MODULES" "$OBJS"
+
+                COMMON_FLAGS=(
+                  -whole-module-optimization -parse-as-library
+                  -enable-upcoming-feature MemberImportVisibility
+                  -Xfrontend -no-serialize-debugging-options
+                )
+
+                echo "Building Serde module..."
+                swiftc -c "''${COMMON_FLAGS[@]}" \
+                  -module-name Serde \
+                  -emit-module-path "$MODULES/Serde.swiftmodule" \
+                  -o "$OBJS/Serde.o" \
+                  $(find "$SHARED/generated/SharedTypes/Sources/Serde" -name '*.swift' | sort)
+
+                echo "Building SharedTypes module..."
+                swiftc -c "''${COMMON_FLAGS[@]}" \
+                  -module-name SharedTypes \
+                  -emit-module-path "$MODULES/SharedTypes.swiftmodule" \
+                  -I "$MODULES" \
+                  -o "$OBJS/SharedTypes.o" \
+                  $(find "$SHARED/generated/SharedTypes/Sources/SharedTypes" -name '*.swift' | sort)
+
+                echo "Building EidolonsShared module..."
+                swiftc -c "''${COMMON_FLAGS[@]}" \
+                  -module-name EidolonsShared \
+                  -emit-module-path "$MODULES/EidolonsShared.swiftmodule" \
+                  -I "$MODULES" \
+                  -I "$FFI_HEADERS" \
+                  -Xcc -fmodule-map-file="$MODULEMAP" \
+                  -o "$OBJS/EidolonsShared.o" \
+                  $(find "$SHARED/Sources/EidolonsShared" -name '*.swift' | sort)
+
+                echo "Building EidolonsApp module..."
+                swiftc -c "''${COMMON_FLAGS[@]}" \
+                  -module-name EidolonsApp \
+                  -emit-module-path "$MODULES/EidolonsApp.swiftmodule" \
+                  -I "$MODULES" \
+                  -I "$FFI_HEADERS" \
+                  -Xcc -fmodule-map-file="$MODULEMAP" \
+                  -o "$OBJS/EidolonsApp.o" \
+                  $(find "apps/macos/Sources/Eidolons" -name '*.swift' | sort)
+
+                echo "Linking Eidolons..."
+                swiftc \
+                  -o Eidolons \
+                  -module-name EidolonsEntrypoint \
+                  -I "$MODULES" \
+                  -I "$FFI_HEADERS" \
+                  -Xcc -fmodule-map-file="$MODULEMAP" \
+                  -L "$XCFW_LIB" -leidolons_shared \
+                  -framework SwiftUI -framework AppKit -framework Foundation \
+                  -framework SystemConfiguration \
+                  -Xfrontend -no-serialize-debugging-options \
+                  -Xlinker -reproducible \
+                  -enable-upcoming-feature MemberImportVisibility \
+                  "$OBJS/Serde.o" "$OBJS/SharedTypes.o" \
+                  "$OBJS/EidolonsShared.o" "$OBJS/EidolonsApp.o" \
+                  apps/macos/Sources/EidolonsEntrypoint/main.swift
+              '';
+
+              installPhase = ''
+                APP="$out/Applications/Eidolons.app"
+                mkdir -p "$APP/Contents/MacOS"
+                mkdir -p "$APP/Contents/Resources"
+
+                cp Eidolons "$APP/Contents/MacOS/Eidolons"
+                cp apps/macos/Support/Info.plist "$APP/Contents/"
+
+                ${
+                  if appIcon != null then
+                    ''cp ${appIcon}/AppIcon.icns "$APP/Contents/Resources/"''
+                  else
+                    ""
+                }
+
+                mkdir -p $out/bin
+                ln -s "$APP/Contents/MacOS/Eidolons" $out/bin/Eidolons
+              '';
+
+              meta = {
+                description = "Eidolons macOS application";
+                platforms = [ "aarch64-darwin" "x86_64-darwin" ];
+              };
+            };
+
       in
       {
         packages = {
@@ -573,6 +791,10 @@
           eidolons-shared-swift-types = eidolonsSharedSwiftTypes;
           eidolons-shared-swift-bindings = eidolonsSharedSwiftBindings;
           eidolons-shared-swift-xcframework = eidolonsSharedSwiftXCFramework;
+        } // pkgs.lib.optionalAttrs (eidolonsCliMacosUniversal != null) {
+          eidolons-cli-macos-universal = eidolonsCliMacosUniversal;
+        } // pkgs.lib.optionalAttrs (eidolonsMacosApp != null) {
+          eidolons-macos-app = eidolonsMacosApp;
         };
 
         # Development shell (lightweight — daily Rust dev uses rustup)
@@ -881,6 +1103,16 @@
                 '';
               }
             }/bin/format-swift";
+          };
+        } // pkgs.lib.optionalAttrs (eidolonsMacosApp != null) {
+          run-eidolons = {
+            type = "app";
+            meta.description = "Build and launch the Eidolons macOS app";
+            program = "${
+              pkgs.writeShellScript "run-eidolons" ''
+                open "${eidolonsMacosApp}/Applications/Eidolons.app"
+              ''
+            }";
           };
         };
       }

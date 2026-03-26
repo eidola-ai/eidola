@@ -15,10 +15,11 @@ x509-cert = "0.2"
 der = { version = "0.7", features = ["alloc"] }
 
 # HTTP client for fetching attestation bundle
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 
 # TLS verification
 rustls = { version = "0.23", default-features = false, features = ["std"] }
+webpki-roots = "1"
 
 # Concurrent verified-fingerprint cache
 dashmap = "6"

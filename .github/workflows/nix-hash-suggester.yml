@@ -43,9 +43,9 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           # Get the ID of the 'Build all platforms' job from the failed workflow
-          JOB_ID=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" -q '.jobs[] | select(.name == "Build all platforms") | .id')
+          JOB_ID=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" -q '.jobs[] | select(.name == "Apple builds") | .id')
           if [[ -z "$JOB_ID" ]]; then
-            echo "Could not find 'Build all platforms' job in the failed workflow."
+            echo "Could not find 'Apple builds' job in the failed workflow."
             exit 0
           fi
 

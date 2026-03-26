@@ -3,7 +3,7 @@ services:
     image: eidolons-postgres:dev
     build:
       context: .
-      dockerfile: docker/postgresql/Containerfile
+      dockerfile: oci/postgresql/Containerfile
     environment:
       POSTGRES_USER: eidolons
       POSTGRES_DB: eidolons
@@ -22,7 +22,7 @@ services:
     image: eidolons-server:dev
     build:
       context: .
-      dockerfile: crates/eidolons-server/Containerfile
+      dockerfile: oci/eidolons-server/Containerfile
     environment:
       DATABASE_URL: postgres://eidolons@postgres/eidolons
       TINFOIL_API_KEY: ${TINFOIL_API_KEY}
@@ -37,10 +37,10 @@ services:
         condition: service_healthy
 
   shim:
-    image: dev-shim:dev
+    image: tinfoil-shim-mock:dev
     build:
       context: .
-      dockerfile: tools/dev-shim/Containerfile
+      dockerfile: oci/tinfoil-shim-mock/Containerfile
     environment:
       UPSTREAM_URL: http://server:8080
       LISTEN_ADDR: 0.0.0.0:8443
@@ -57,7 +57,7 @@ services:
     image: stripe-cli:dev
     build:
       context: .
-      dockerfile: docker/stripe-cli/Containerfile
+      dockerfile: oci/stripe-cli/Containerfile
     profiles: ["test"]
     environment:
       STRIPE_API_KEY: ${STRIPE_API_KEY}

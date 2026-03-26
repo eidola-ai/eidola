@@ -19,11 +19,12 @@ axum = "0.8"
 utoipa-axum = "0.2"
 
 # HTTP client for upstream requests (using rustls with pure-Rust crypto for cross-compilation)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream", "form", "query"] }
 
 # Pure Rust TLS crypto provider (no C/assembly dependencies)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

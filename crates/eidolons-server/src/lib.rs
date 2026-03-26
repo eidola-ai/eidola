@@ -22,6 +22,18 @@ pub mod stripe;
 pub mod types;
 pub mod webhook;
 
+/// Build a `rustls::ClientConfig` with Mozilla root CA certificates.
+///
+/// Used to configure reqwest clients when using `rustls-no-provider` (which
+/// does not bundle any root certificates).
+pub fn tls_config() -> rustls::ClientConfig {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
+}
+
 /// Shared application state (Clone via inner Arc).
 #[derive(Clone)]
 pub struct AppState {

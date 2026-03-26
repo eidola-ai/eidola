@@ -18,16 +18,17 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 open = "5"
 rand_core = { version = "0.6", features = ["getrandom"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
+rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tinfoil-verifier = { path = "../../crates/tinfoil-verifier" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-toml = "0.8"
-turso = "0.5"
+toml = "1"
+turso = { git = "https://github.com/eidola-ai/turso", branch = "reproducible-builds", default-features = false, features = ["pure-rust-crypto"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 x509-cert = "0.2"
 der = { version = "0.7", features = ["pem", "alloc"] }

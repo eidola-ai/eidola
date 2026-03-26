@@ -12,9 +12,9 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 
 **Deployment:** Tinfoil Containers — all services run inside confidential enclaves (AMD SEV-SNP). The Tinfoil shim handles TLS termination with attestation-bearing certificates; the server runs plain HTTP behind it.
 
-**CI:** Two workflows — `ci.yml` (self-hosted Mac: Nix checks, Swift builds/tests) and `oci.yml` (ubuntu-24.04: OCI image builds, manifest verification, GHCR publishing).
+**CI:** Single `ci.yml` workflow with four jobs — `rust-checks` (ubuntu-24.04: cargo fmt/clippy/test, OpenAPI freshness), `oci` (ubuntu-24.04: OCI image builds, OCI subset verification, GHCR publishing), `apple` (self-hosted Mac: Swift formatting/bindings freshness, Nix-based macOS app and CLI universal binary builds, Swift tests), and `artifact-manifest` (ubuntu-24.04: merges the OCI and macOS artifact digests and verifies the committed manifest). The `oci` and `apple` jobs gate on `rust-checks` to avoid wasting resources on failing PRs.
 
-**Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidolons-server` and `ghcr.io/<owner>/eidolons-postgres`.
+**Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidolons-server`, `ghcr.io/<owner>/eidolons-cli`, and `ghcr.io/<owner>/eidolons-postgres`.
 
 **Key design decisions:**
 - Axum-based HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration
@@ -70,10 +70,10 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 
 **Key pattern:** The core never performs side-effects directly. It emits Effects that the shell handles, then the shell sends responses back via `handleResponse()`.
 
-**Capability implementations:** Pure Rust crates in `crates/` implement capability logic. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
+**Capability implementations:** Pure Rust crates in `crates/` implement capability logic. The same `crates/` tree also contains the Rust code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) plus operational utilities such as `tinfoil-shim-mock` and `hash-secret`. These are compiled into `eidolons-shared` and exposed via UniFFI, so the Swift shell can call them directly.
 
 **Two codegen pipelines:**
-- `uniffi-bindgen-swift` → FFI bridge (`processEvent`, `handleResponse`, `view`)
+- `uniffi-bindgen-swift` (workspace crate under `crates/`) → FFI bridge (`processEvent`, `handleResponse`, `view`)
 - `crux_core::typegen` → Domain types (`Event`, `Effect`, `ViewModel`) with bincode serialization
 
 ## CLI Database & Migrations
@@ -103,12 +103,13 @@ The `justfile` is the primary development interface. Run `just` to see all avail
 ## Conventions
 
 - Pure Rust dependencies preferred (for cross-compilation)
+- Keep Rust workspace packages under `crates/`; do not add a separate top-level `tools/` tree
 - `just` is the task runner — wrap scripts and common commands as recipes
-- Server OCI images are built with StageX (reproducible, `FROM scratch`, runs as non-root)
+- Server and CLI OCI images are built with StageX (reproducible, `FROM scratch`, runs as non-root)
 - Nix is used for CI quality gates and Swift/XCFramework builds, not daily Rust development
 - `rustup` + `rust-toolchain.toml` manages the Rust toolchain for development
 - OpenAI API format as the canonical interface
 - Server API is documented via utoipa `#[utoipa::path]` annotations on handler functions and `ToSchema` derives on request/response types. `OpenApiRouter` (in `lib.rs::build_router()`) collects paths and recursively discovers schemas automatically — only SSE streaming types that aren't referenced from path annotations are listed manually in `api_doc.rs`. When adding or changing server endpoints, add the annotation on the handler and register it in `build_router()` via `routes!()`, then run `just update-openapi` to regenerate the committed `openapi.json`
-- `artifact-manifest.json` records expected OCI digests; CI verifies builds match and suggests updates on PRs. Use `just update-manifest` to regenerate it with the pinned amd64 BuildKit builder used for reproducible local verification
+- `artifact-manifest.json` (v1 format) records expected OCI digests plus the macOS app/CLI Nix `narHash` values with type/platform metadata; CI verifies the full file by merging digests captured from the real OCI and macOS build jobs. Use `just update-manifest` to regenerate it on macOS with the pinned amd64 BuildKit builder plus the local Nix macOS builds
 - Before committing, ensure `README.md` and `AGENTS.md` are updated to reflect any changes (new files, endpoints, env vars, build commands, etc.)
 - Omit any tool-specific "co-authored by" lines from commit messages

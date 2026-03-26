@@ -39,7 +39,7 @@ pub struct AttestationDocumentV2 {
 /// V3 attestation document (`/.well-known/tinfoil-attestation?v=3`).
 /// CPU report is base64-encoded raw bytes (not gzipped). VCEK is included
 /// when the server self-verifies at boot. ARK/ASK are included for custom
-/// chains (dev shim); production uses built-in AMD Genoa certs.
+/// chains (tinfoil shim mock); production uses built-in AMD Genoa certs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationDocumentV3 {
     pub format: String,
@@ -78,9 +78,16 @@ pub const DEFAULT_ATC_URL: &str = "https://atc.tinfoil.sh/attestation";
 /// TLS certificate — everything needed for verification.
 pub async fn fetch_bundle(atc_url: Option<&str>) -> Result<AttestationBundle, Error> {
     let url = atc_url.unwrap_or(DEFAULT_ATC_URL);
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
+        .tls_backend_preconfigured(tls_config)
         .build()
         .map_err(|e| Error::Bundle(format!("failed to build HTTP client: {e}")))?;
     let bundle: AttestationBundle = client
@@ -112,15 +119,14 @@ pub async fn fetch_well_known(
 ) -> Result<ResolvedAttestation, Error> {
     // Try v3 first
     let v3_url = format!("{attestation_url}?v=3");
-    if let Ok(resp) = client.get(&v3_url).send().await {
-        if resp.status().is_success() {
-            if let Ok(doc) = resp.json::<AttestationDocumentV3>().await {
-                if doc.format == V3_FORMAT && doc.cpu.platform == "sev-snp" {
-                    tracing::info!("Using v3 attestation document");
-                    return resolve_v3(&doc);
-                }
-            }
-        }
+    if let Ok(resp) = client.get(&v3_url).send().await
+        && resp.status().is_success()
+        && let Ok(doc) = resp.json::<AttestationDocumentV3>().await
+        && doc.format == V3_FORMAT
+        && doc.cpu.platform == "sev-snp"
+    {
+        tracing::info!("Using v3 attestation document");
+        return resolve_v3(&doc);
     }
 
     // Fall back to v2

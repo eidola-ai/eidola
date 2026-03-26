@@ -127,6 +127,7 @@ pub struct StripeClient {
 impl StripeClient {
     pub fn new(api_key: String) -> Self {
         let client = reqwest::Client::builder()
+            .tls_backend_preconfigured(crate::tls_config())
             .build()
             .expect("failed to build HTTP client");
 

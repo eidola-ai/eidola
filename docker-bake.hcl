@@ -1,5 +1,5 @@
 variable "SOURCE_DATE_EPOCH" {
-  default = "1"
+  default = "0"
 }
 
 variable "REGISTRY" {
@@ -42,6 +42,13 @@ target "server" {
   tags     = ["eidolons-server:dev"]
 }
 
+target "cli" {
+  inherits   = ["_common"]
+  context    = "."
+  dockerfile = "oci/eidolons-cli/Containerfile"
+  tags       = ["eidolons-cli:dev"]
+}
+
 target "postgres" {
   inherits = ["_common"]
   tags     = ["eidolons-postgres:dev"]
@@ -49,24 +56,24 @@ target "postgres" {
 
 target "shim" {
   inherits = ["_common"]
-  tags     = ["dev-shim:dev"]
+  tags     = ["tinfoil-shim-mock:dev"]
 }
 
 # Stripe CLI — pins the upstream image by digest so dependabot can propose
 # updates via the Containerfile, rather than silently pulling :latest.
 target "stripe-cli" {
   context    = "."
-  dockerfile = "docker/stripe-cli/Containerfile"
+  dockerfile = "oci/stripe-cli/Containerfile"
   tags       = ["stripe-cli:dev"]
   attest     = []
 }
 
 group "default" {
-  targets = ["server", "postgres", "shim"]
+  targets = ["server", "cli", "postgres", "shim"]
 }
 
 group "manifest" {
-  targets = ["server", "postgres"]
+  targets = ["server", "cli", "postgres"]
 }
 
 # ── CI targets (registry push) ────────────────────────────────────────────────
@@ -83,17 +90,24 @@ target "_ci" {
 target "ci-server" {
   inherits   = ["_ci"]
   context    = "."
-  dockerfile = "crates/eidolons-server/Containerfile"
+  dockerfile = "oci/eidolons-server/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidolons-server:${t}"]
+}
+
+target "ci-cli" {
+  inherits   = ["_ci"]
+  context    = "."
+  dockerfile = "oci/eidolons-cli/Containerfile"
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidolons-cli:${t}"]
 }
 
 target "ci-postgres" {
   inherits   = ["_ci"]
   context    = "."
-  dockerfile = "docker/postgresql/Containerfile"
+  dockerfile = "oci/postgresql/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidolons-postgres:${t}"]
 }
 
 group "ci" {
-  targets = ["ci-server", "ci-postgres"]
+  targets = ["ci-server", "ci-cli", "ci-postgres"]
 }

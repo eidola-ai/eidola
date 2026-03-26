@@ -2,12 +2,12 @@
 
 # ── base ───────────────────────────────────────────────────────────────────────
 # Environment variables, pinned toolchain digest.
-FROM stagex/pallet-rust@sha256:4062550919db682ebaeea07661551b5b89b3921e3f3a2b0bc665ddea7f6af1ca AS base
+FROM stagex/pallet-rust@sha256:2fbe7b164dd92edb9c1096152f6d27592d8a69b1b8eb2fc907b5fadea7d11668 AS base
 
 ARG CARGO_PROFILE=release
 
 ENV TARGET=x86_64-unknown-linux-musl
-ENV SOURCE_DATE_EPOCH=1
+ENV SOURCE_DATE_EPOCH=0
 ENV CARGO_INCREMENTAL=0
 ENV ZERO_AR_DATE=1
 ENV RUSTFLAGS="-C target-feature=+crt-static -C debuginfo=0 -C target-cpu=generic"
@@ -21,10 +21,9 @@ FROM base AS fetch
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY apps/ ./apps/
 COPY crates/ ./crates/
-COPY tools/ ./tools/
 
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,id=eidolons-cargo-registry,target=/root/.cargo/registry \
+    --mount=type=cache,id=eidolons-cargo-git,target=/root/.cargo/git \
     cargo fetch --locked --target ${TARGET}
 
 # ── build ──────────────────────────────────────────────────────────────────────
@@ -36,25 +35,23 @@ FROM fetch AS build
 
 ARG CARGO_PROFILE=release
 
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,id=eidolons-cargo-registry,target=/root/.cargo/registry \
+    --mount=type=cache,id=eidolons-cargo-git,target=/root/.cargo/git \
+    --mount=type=cache,id=eidolons-target-x86_64-unknown-linux-musl,target=/src/target,sharing=locked \
     --network=none \
-    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidolons-server \
-    && install -D target/${TARGET}/${CARGO_PROFILE}/eidolons-server /out/eidolons-server
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidolons-cli \
+    && install -D target/${TARGET}/${CARGO_PROFILE}/eidolons /out/eidolons
 
 # ── install ────────────────────────────────────────────────────────────────────
 # Place binary into /rootfs.
 FROM scratch AS install
 
-COPY --from=build /out/eidolons-server /rootfs/eidolons-server
+COPY --from=build /out/eidolons /rootfs/eidolons
 
 # ── package ────────────────────────────────────────────────────────────────────
 # Final minimal image.
 FROM scratch AS package
 
 COPY --from=install /rootfs/ /
-ENV BIND_ADDR=0.0.0.0:8080
-EXPOSE 8080
 USER 65534:65534
-ENTRYPOINT ["/eidolons-server"]
+ENTRYPOINT ["/eidolons"]

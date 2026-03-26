@@ -272,7 +272,17 @@ fn now_iso() -> String {
 /// ensuring the server is running expected code inside a TEE.
 async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
     if config.trusted_measurements.is_empty() && config.hardware_root_ca.is_none() {
-        return Ok(reqwest::Client::new());
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let _ = root_store.add(cert);
+        }
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        return reqwest::Client::builder()
+            .tls_backend_preconfigured(tls_config)
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"));
     }
 
     let origin = config

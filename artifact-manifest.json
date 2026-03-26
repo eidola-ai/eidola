@@ -1,4 +1,30 @@
 {
-  "eidolons-server": "sha256:ddbd9ee10916ce5728da7037155ca0abe93b7342f9dd2f4918b24945bed75848",
-  "eidolons-postgres": "sha256:93bf8ab9776fd94d3cd16d68b784f338b9b063927936767df0a22f594ab28603"
+  "version": 1,
+  "artifacts": {
+    "eidolons-server": {
+      "type": "oci",
+      "platform": "linux/amd64",
+      "digest": "sha256:69da95f52452db076169c949918f8fad674d29e44b7319ec16c3991c8dd334d7"
+    },
+    "eidolons-cli": {
+      "type": "oci",
+      "platform": "linux/amd64",
+      "digest": "sha256:a580f1480a1b1c596bde3a423c2f07a3d356d476a4a76fda8ca662ee3759bbef"
+    },
+    "eidolons-postgres": {
+      "type": "oci",
+      "platform": "linux/amd64",
+      "digest": "sha256:4bafb66a047d5840aec2953ff5029b164db3dd376970cd88a7a6f9972b066b0e"
+    },
+    "eidolons-macos-app": {
+      "type": "nix",
+      "platform": "darwin/universal",
+      "narHash": "sha256-shcwkf1FTPikef4HiwpYDFi1WFDNGGW7NSe749F/8es="
+    },
+    "eidolons-cli-macos-universal": {
+      "type": "nix",
+      "platform": "darwin/universal",
+      "narHash": "sha256-5fcRQH5tJIfFKs1cuW11ILRQyoHl6597PXfpyf7tC+s="
+    }
+  }
 }

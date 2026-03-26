@@ -6,8 +6,8 @@ import Testing
 
 @Suite struct EidolonsSharedTests {
   @Test func processEventReturnsData() {
-    // Create a simple SubmitMessage event and serialize it
-    let event = Event.submitMessage("Hello")
+    // Create a simple Greet event and serialize it
+    let event = Event.greet
     let eventBytes = try! event.bincodeSerialize()
 
     // Process through the Crux core

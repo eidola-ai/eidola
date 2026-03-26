@@ -1,5 +1,5 @@
 [package]
-name = "dev-shim"
+name = "tinfoil-shim-mock"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,7 +7,7 @@ repository.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "dev-shim"
+name = "tinfoil-shim-mock"
 path = "src/main.rs"
 
 [dependencies]
@@ -20,7 +20,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 rustls-rustcrypto = "0.0.2-alpha"
 
 # Certificate generation (TLS leaf only — mock CA chain is built manually)
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 
 # Mock SEV-SNP certificate chain (RSA-PSS SHA-384)
 rsa = { version = "0.9", features = ["pem"] }
@@ -40,7 +40,8 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "ht
 tower-service = "0.3"
 
 # HTTP client for proxying
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+webpki-roots = "1"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

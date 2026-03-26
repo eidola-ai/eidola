@@ -1,4 +1,4 @@
-//! Dev shim — emulates the Tinfoil Container shim for local development.
+//! Tinfoil shim mock — emulates the Tinfoil Container shim for local development.
 //!
 //! Generates a mock SEV-SNP attestation chain using the exact same algorithms
 //! as production hardware:
@@ -70,6 +70,14 @@ const OFF_COMMITTED_TCB: usize = 0x1E0; // 8 bytes
 const OFF_LAUNCH_TCB: usize = 0x1F0; // 8 bytes
 const OFF_SIGNATURE: usize = 0x2A0; // 512 bytes (72 R + 72 S + 368 reserved)
 const REPORT_SIZE: usize = 0x4A0; // 1184 bytes
+
+fn tls_config() -> rustls::ClientConfig {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -271,7 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("dev_shim=info".parse().unwrap()),
+                .add_directive("tinfoil_shim_mock=info".parse().unwrap()),
         )
         .init();
 
@@ -310,10 +318,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut ark_rcgen_params =
         rcgen::CertificateParams::new(vec!["Local Dev Root CA".to_string()])?;
     ark_rcgen_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ark_rcgen_cert = ark_rcgen_params.self_signed(&ark_rcgen_key)?;
+    let ark_rcgen_issuer = rcgen::CertifiedIssuer::self_signed(ark_rcgen_params, ark_rcgen_key)?;
 
     // Extract subject and SPKI from the rcgen cert to ensure matching names
-    let parsed_rcgen_ark = x509_cert::Certificate::from_der(ark_rcgen_cert.der().as_ref())?;
+    let parsed_rcgen_ark = x509_cert::Certificate::from_der(ark_rcgen_issuer.der().as_ref())?;
     let ark_subject = parsed_rcgen_ark.tbs_certificate.subject.clone();
     let ark_spki = parsed_rcgen_ark
         .tbs_certificate
@@ -393,7 +401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "server".to_string(),
         "shim".to_string(),
     ])?;
-    let tls_cert = tls_params.signed_by(&tls_key, &ark_rcgen_cert, &ark_rcgen_key)?;
+    let tls_cert = tls_params.signed_by(&tls_key, &ark_rcgen_issuer)?;
 
     let cert_der = rustls::pki_types::CertificateDer::from(tls_cert.der().to_vec());
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(tls_key.serialize_der())
@@ -425,7 +433,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "format": "https://tinfoil.sh/predicate/attestation/v3",
         "cpu": {
             "platform": "sev-snp",
-            "report": b64.encode(&report),
+            "report": b64.encode(report),
         },
         "vcek": b64.encode(&vcek_der),
     }))?;
@@ -437,6 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         upstream_url: upstream_url.clone(),
         proxy_client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .tls_backend_preconfigured(tls_config())
             .build()?,
     };
 

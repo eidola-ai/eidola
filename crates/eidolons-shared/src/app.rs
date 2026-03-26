@@ -39,14 +39,12 @@ impl App for EidolonsApp {
     type Event = Event;
     type Model = Model;
     type ViewModel = ViewModel;
-    type Capabilities = ();
     type Effect = Effect;
 
     fn update(
         &self,
         event: Self::Event,
         model: &mut Self::Model,
-        _caps: &Self::Capabilities,
     ) -> Command<Self::Effect, Self::Event> {
         match event {
             Event::Greet => {
@@ -66,18 +64,17 @@ impl App for EidolonsApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crux_core::testing::AppTester;
 
     #[test]
     fn test_greet_sets_greeting() {
-        let app = AppTester::<EidolonsApp>::default();
+        let app = EidolonsApp;
         let mut model = Model::default();
 
-        let cmd = app.update(Event::Greet, &mut model);
+        let mut cmd = app.update(Event::Greet, &mut model);
 
         assert_eq!(model.greeting, "Hello, World!");
 
-        let effect = cmd.expect_one_effect();
+        let effect = cmd.effects().next().expect("expected one effect");
         assert!(matches!(effect, Effect::Render(_)));
     }
 
