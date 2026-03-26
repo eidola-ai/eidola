@@ -25,7 +25,7 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "rin
 # Mock SEV-SNP certificate chain (RSA-PSS SHA-384)
 rsa = { version = "0.9", features = ["pem"] }
 x509-cert = "0.2"
-der = { version = "0.7", features = ["alloc", "pem"] }
+der = { version = "0.8", features = ["alloc", "pem"] }
 spki = "0.7"
 
 # Attestation chain self-verification (same crate the verifier uses)

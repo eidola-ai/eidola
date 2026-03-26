@@ -12,7 +12,7 @@ sev = { version = "7", default-features = false, features = ["snp", "crypto_noss
 
 # DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
 x509-cert = "0.2"
-der = { version = "0.7", features = ["alloc"] }
+der = { version = "0.8", features = ["alloc"] }
 
 # HTTP client for fetching attestation bundle
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
