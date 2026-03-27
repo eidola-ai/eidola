@@ -33,7 +33,7 @@ case "$ARCH" in
 esac
 
 echo "Building for $TARGET (debug)..."
-(cd "$REPO_ROOT" && cargo build -p eidolons-shared --target "$TARGET")
+(cd "$REPO_ROOT" && cargo build -p eidola-shared --target "$TARGET")
 
 # Prepare temp XCFramework structure
 TARGET_DIR="$REPO_ROOT/target"
@@ -41,13 +41,13 @@ TEMP_ROOT="$TARGET_DIR/generated-xcframework"
 rm -rf "$TEMP_ROOT"
 mkdir -p "$TEMP_ROOT"
 
-XCFW_NAME="libeidolons_shared-rs.xcframework"
+XCFW_NAME="libeidola_shared-rs.xcframework"
 XCFW_PATH="$TEMP_ROOT/$XCFW_NAME"
 MACOS_DIR="$XCFW_PATH/macos-arm64_x86_64"
 
 mkdir -p "$MACOS_DIR"
 
-LIB_PATH="$TARGET_DIR/$TARGET/debug/libeidolons_shared.a"
+LIB_PATH="$TARGET_DIR/$TARGET/debug/libeidola_shared.a"
 
 if [[ ! -f "$LIB_PATH" ]]; then
   echo "Error: Static library not found after build."
@@ -56,7 +56,7 @@ if [[ ! -f "$LIB_PATH" ]]; then
 fi
 
 echo "Copying library..."
-cp "$LIB_PATH" "$MACOS_DIR/libeidolons_shared.a"
+cp "$LIB_PATH" "$MACOS_DIR/libeidola_shared.a"
 
 echo "Creating Info.plist..."
 cat > "$XCFW_PATH/Info.plist" << 'EOF'
@@ -70,7 +70,7 @@ cat > "$XCFW_PATH/Info.plist" << 'EOF'
       <key>LibraryIdentifier</key>
       <string>macos-arm64_x86_64</string>
       <key>LibraryPath</key>
-      <string>libeidolons_shared.a</string>
+      <string>libeidola_shared.a</string>
       <key>SupportedArchitectures</key>
       <array>
         <string>arm64</string>
@@ -88,7 +88,7 @@ cat > "$XCFW_PATH/Info.plist" << 'EOF'
 </plist>
 EOF
 
-DEST="$REPO_ROOT/crates/eidolons-shared/target/apple/libeidolons_shared-rs.xcframework"
+DEST="$REPO_ROOT/crates/eidola-shared/target/apple/libeidola_shared-rs.xcframework"
 
 echo "Copying shared core XCframework..."
 echo "  Source: $TEMP_ROOT"

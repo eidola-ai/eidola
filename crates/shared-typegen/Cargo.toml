@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 crux_core = { version = "0.17", features = ["typegen"] }
-eidolons-shared = { path = "../eidolons-shared", default-features = false, features = ["typegen"] }
+eidola-shared = { path = "../eidola-shared", default-features = false, features = ["typegen"] }
 anyhow = "1.0"
 
 [[bin]]

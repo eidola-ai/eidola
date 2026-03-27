@@ -14,18 +14,18 @@ if [[ -z "$SOURCE_BINDINGS" || -z "$SOURCE_TYPES" ]]; then
   echo "No inputs provided. Generating locally..."
 
   # Build the shared library first to get the dylib
-  echo "Building eidolons-shared..."
-  (cd "$REPO_ROOT" && cargo build -p eidolons-shared)
+  echo "Building eidola-shared..."
+  (cd "$REPO_ROOT" && cargo build -p eidola-shared)
 
   # Locate the dylib (heuristic for macOS/Linux)
   # TODO: Handle release builds if needed, defaulting to debug for dev
-  DYLIB="$REPO_ROOT/target/debug/libeidolons_shared.dylib"
+  DYLIB="$REPO_ROOT/target/debug/libeidola_shared.dylib"
   if [[ ! -f "$DYLIB" ]]; then
-    DYLIB="$REPO_ROOT/target/debug/libeidolons_shared.so"
+    DYLIB="$REPO_ROOT/target/debug/libeidola_shared.so"
   fi
   
   if [[ ! -f "$DYLIB" ]]; then
-     echo "Error: Could not find built dylib at $REPO_ROOT/target/debug/libeidolons_shared.{dylib,so}"
+     echo "Error: Could not find built dylib at $REPO_ROOT/target/debug/libeidola_shared.{dylib,so}"
      exit 1
   fi
 
@@ -39,15 +39,15 @@ if [[ -z "$SOURCE_BINDINGS" || -z "$SOURCE_TYPES" ]]; then
     --metadata-no-deps \
     "$DYLIB" \
     "$TEMP_OUT" \
-    --module-name eidolons_sharedFFI \
+    --module-name eidola_sharedFFI \
     --modulemap-filename module.modulemap)
 
   # Create the stub C file that Flake creates
-  cat > "$TEMP_OUT/eidolons_sharedFFI.c" << 'STUB'
-// This file exists so Swift Package Manager has something to compile for the eidolons_sharedFFI module.
-// The actual implementation is in the XCFramework (libeidolons_shared.a).
+  cat > "$TEMP_OUT/eidola_sharedFFI.c" << 'STUB'
+// This file exists so Swift Package Manager has something to compile for the eidola_sharedFFI module.
+// The actual implementation is in the XCFramework (libeidola_shared.a).
 // This module just exposes the C header interface to Swift.
-#include "eidolons_sharedFFI.h"
+#include "eidola_sharedFFI.h"
 STUB
 
   echo "Generating Crux types..."
@@ -63,38 +63,38 @@ STUB
 fi
 
 # Update UniFFI bindings
-DEST="$REPO_ROOT/crates/eidolons-shared/swift/Sources"
+DEST="$REPO_ROOT/crates/eidola-shared/swift/Sources"
 echo "Syncing Swift bindings..."
 echo "  Source: $SOURCE_BINDINGS"
 echo "  Dest:   $DEST"
 
-mkdir -p "$DEST/EidolonsShared"
-mkdir -p "$DEST/EidolonsSharedFFI"
+mkdir -p "$DEST/EidolaShared"
+mkdir -p "$DEST/EidolaSharedFFI"
 
 # Clean old files
-rm -f "$DEST/EidolonsShared/"*.swift
-rm -f "$DEST/EidolonsSharedFFI/"*.{h,c,modulemap}
+rm -f "$DEST/EidolaShared/"*.swift
+rm -f "$DEST/EidolaSharedFFI/"*.{h,c,modulemap}
 
 # Copy new files
-# Handle both flat outputs (local temp dir) and Nix outputs (Sources/EidolonsShared, Sources/EidolonsSharedFFI)
-if [[ -d "$SOURCE_BINDINGS/EidolonsShared" && -d "$SOURCE_BINDINGS/EidolonsSharedFFI" ]]; then
-  BINDINGS_SWIFT_DIR="$SOURCE_BINDINGS/EidolonsShared"
-  BINDINGS_FFI_DIR="$SOURCE_BINDINGS/EidolonsSharedFFI"
-elif [[ -d "$SOURCE_BINDINGS/Sources/EidolonsShared" && -d "$SOURCE_BINDINGS/Sources/EidolonsSharedFFI" ]]; then
-  BINDINGS_SWIFT_DIR="$SOURCE_BINDINGS/Sources/EidolonsShared"
-  BINDINGS_FFI_DIR="$SOURCE_BINDINGS/Sources/EidolonsSharedFFI"
+# Handle both flat outputs (local temp dir) and Nix outputs (Sources/EidolaShared, Sources/EidolaSharedFFI)
+if [[ -d "$SOURCE_BINDINGS/EidolaShared" && -d "$SOURCE_BINDINGS/EidolaSharedFFI" ]]; then
+  BINDINGS_SWIFT_DIR="$SOURCE_BINDINGS/EidolaShared"
+  BINDINGS_FFI_DIR="$SOURCE_BINDINGS/EidolaSharedFFI"
+elif [[ -d "$SOURCE_BINDINGS/Sources/EidolaShared" && -d "$SOURCE_BINDINGS/Sources/EidolaSharedFFI" ]]; then
+  BINDINGS_SWIFT_DIR="$SOURCE_BINDINGS/Sources/EidolaShared"
+  BINDINGS_FFI_DIR="$SOURCE_BINDINGS/Sources/EidolaSharedFFI"
 else
   BINDINGS_SWIFT_DIR="$SOURCE_BINDINGS"
   BINDINGS_FFI_DIR="$SOURCE_BINDINGS"
 fi
 
-cp "$BINDINGS_SWIFT_DIR/"*.swift "$DEST/EidolonsShared/"
-cp "$BINDINGS_FFI_DIR/"*.h "$DEST/EidolonsSharedFFI/"
-cp "$BINDINGS_FFI_DIR/module.modulemap" "$DEST/EidolonsSharedFFI/"
-cp "$BINDINGS_FFI_DIR/eidolons_sharedFFI.c" "$DEST/EidolonsSharedFFI/"
+cp "$BINDINGS_SWIFT_DIR/"*.swift "$DEST/EidolaShared/"
+cp "$BINDINGS_FFI_DIR/"*.h "$DEST/EidolaSharedFFI/"
+cp "$BINDINGS_FFI_DIR/module.modulemap" "$DEST/EidolaSharedFFI/"
+cp "$BINDINGS_FFI_DIR/eidola_sharedFFI.c" "$DEST/EidolaSharedFFI/"
 
 # Update Crux typegen types
-TYPES_DEST="$REPO_ROOT/crates/eidolons-shared/swift/generated"
+TYPES_DEST="$REPO_ROOT/crates/eidola-shared/swift/generated"
 echo "Syncing Crux typegen Swift types..."
 echo "  Source: $SOURCE_TYPES"
 echo "  Dest:   $TYPES_DEST"

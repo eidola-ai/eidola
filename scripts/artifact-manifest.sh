@@ -38,7 +38,7 @@ shift
 METADATA_FILE="/tmp/bake-metadata.json"
 OUTPUT_FILE=""
 MANIFEST_FILE="$REPO_ROOT/artifact-manifest.json"
-BUILDER_NAME="eidolons"
+BUILDER_NAME="eidola"
 ENSURE_BUILDER=0
 MACOS_PATHS_FILE=""
 APP_PATH=""
@@ -164,9 +164,9 @@ print_oci_manifest() {
     '{
       version: 1,
       artifacts: {
-        "eidolons-server": { type: "oci", platform: "linux/amd64", digest: $server },
-        "eidolons-cli": { type: "oci", platform: "linux/amd64", digest: $cli },
-        "eidolons-postgres": { type: "oci", platform: "linux/amd64", digest: $postgres }
+        "eidola-server": { type: "oci", platform: "linux/amd64", digest: $server },
+        "eidola-cli": { type: "oci", platform: "linux/amd64", digest: $cli },
+        "eidola-postgres": { type: "oci", platform: "linux/amd64", digest: $postgres }
       }
     }'
 }
@@ -185,8 +185,8 @@ build_macos_artifacts() {
     out_paths+=("$path")
   done < <(
     nix build \
-      '.#eidolons-macos-app' \
-      '.#eidolons-cli-macos-universal' \
+      '.#eidola-macos-app' \
+      '.#eidola-cli-macos-universal' \
       --no-link \
       --print-out-paths \
       --show-trace
@@ -242,8 +242,8 @@ print_macos_manifest() {
     '{
       version: 1,
       artifacts: {
-        "eidolons-macos-app": { type: "nix", platform: "darwin/universal", narHash: $app_hash },
-        "eidolons-cli-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $cli_hash }
+        "eidola-macos-app": { type: "nix", platform: "darwin/universal", narHash: $app_hash },
+        "eidola-cli-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $cli_hash }
       }
     }'
 }
@@ -313,9 +313,9 @@ verify_oci_manifest() {
     {
       version: 1,
       artifacts: {
-        "eidolons-server": .artifacts["eidolons-server"],
-        "eidolons-cli": .artifacts["eidolons-cli"],
-        "eidolons-postgres": .artifacts["eidolons-postgres"]
+        "eidola-server": .artifacts["eidola-server"],
+        "eidola-cli": .artifacts["eidola-cli"],
+        "eidola-postgres": .artifacts["eidola-postgres"]
       }
     }
   ' "$MANIFEST_FILE")"

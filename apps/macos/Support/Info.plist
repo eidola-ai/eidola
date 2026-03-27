@@ -5,13 +5,13 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>Eidolons</string>
+	<string>Eidola</string>
 	<key>CFBundleIdentifier</key>
-	<string>tech.m6i.eidolons</string>
+	<string>tech.m6i.eidola</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Eidolons</string>
+	<string>Eidola</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

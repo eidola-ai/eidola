@@ -1,4 +1,4 @@
-# Eidolons macOS
+# Eidola macOS
 
 The reproducibility story for Apple targets is complicated. Xcode and its toolchain are actively hostile towards this goal, making publicly verifiable, reproducible iOS builds legally dubious and practically untenable. For macOS targets, Apple's continued investment into open source Swift and less restrictive policies for non-Xcode toolchain components make this more achievable. While it is possible to build and package macOS apps without Xcode, as of writing, Xcode treats all SwiftPM projects as "build only".
 
@@ -6,10 +6,10 @@ The reproducibility story for Apple targets is complicated. Xcode and its toolch
 
 The app is split into two targets to support both build systems:
 
-- **EidolonsApp** (`Sources/Eidolons/`) - A library containing the SwiftUI views and app logic
-- **EidolonsEntrypoint** (`Sources/EidolonsEntrypoint/`) - The executable that calls `EidolonsAppMain.main()`
+- **EidolaApp** (`Sources/Eidola/`) - A library containing the SwiftUI views and app logic
+- **EidolaEntrypoint** (`Sources/EidolaEntrypoint/`) - The executable that calls `EidolaAppMain.main()`
 
-This separation allows Xcode to link against `EidolonsApp` as a package dependency while maintaining `Package.swift` as the source of truth.
+This separation allows Xcode to link against `EidolaApp` as a package dependency while maintaining `Package.swift` as the source of truth.
 
 ## Command Line (Open Source Swift)
 

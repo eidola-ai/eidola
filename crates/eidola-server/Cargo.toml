@@ -1,0 +1,71 @@
+[package]
+name = "eidola-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "eidola-server"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = "0.8"
+utoipa-axum = "0.2"
+
+# HTTP client for upstream requests (using rustls with pure-Rust crypto for cross-compilation)
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream", "form", "query"] }
+
+# Pure Rust TLS crypto provider (no C/assembly dependencies)
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# OpenAPI documentation
+utoipa = { version = "5", features = ["uuid"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Anonymous credentials (Privacy Pass)
+anonymous-credit-tokens = "0.4"
+aes-gcm = "0.10"
+hkdf = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Database
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+deadpool-postgres = "0.14"
+
+# Authentication
+argon2 = "0.5"
+
+# Identifiers
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Encoding
+base64 = "0.22"
+hex = "0.4"
+
+# Webhook signature verification
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+
+# Tinfoil attestation verification
+tinfoil-verifier = { path = "../tinfoil-verifier" }
+
+# Utilities
+futures-util = "0.3"
+bytes = "1"
+tokio-stream = "0.1"

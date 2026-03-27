@@ -1,30 +1,30 @@
 {
   "version": 1,
   "artifacts": {
-    "eidolons-server": {
+    "eidola-server": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:69da95f52452db076169c949918f8fad674d29e44b7319ec16c3991c8dd334d7"
+      "digest": "sha256:5a234ff205fb90a744352e881713559d006f4e3b1ba702cca349dbe1ddb747e2"
     },
-    "eidolons-cli": {
+    "eidola-cli": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:a580f1480a1b1c596bde3a423c2f07a3d356d476a4a76fda8ca662ee3759bbef"
+      "digest": "sha256:0a1a5468838d56669c5f6ed313f886f29fa8af0d729baa91aadb8b1c332bf9c2"
     },
-    "eidolons-postgres": {
+    "eidola-postgres": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:4bafb66a047d5840aec2953ff5029b164db3dd376970cd88a7a6f9972b066b0e"
+      "digest": "sha256:8304b0d793eeea7a4ea7df85015ede1299c4c361eb1316bcb60fe37c366fa626"
     },
-    "eidolons-macos-app": {
+    "eidola-macos-app": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-shcwkf1FTPikef4HiwpYDFi1WFDNGGW7NSe749F/8es="
+      "narHash": "sha256-JGBLibQAKovA+6+YO0hF+4F6MpoeWVxoIlbWvoqo5mc="
     },
-    "eidolons-cli-macos-universal": {
+    "eidola-cli-macos-universal": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-5fcRQH5tJIfFKs1cuW11ILRQyoHl6597PXfpyf7tC+s="
+      "narHash": "sha256-6F055dH7yQRLZApK5uiZThNilVf/rtnkex+MqlS1A44="
     }
   }
 }

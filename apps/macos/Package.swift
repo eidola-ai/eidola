@@ -8,38 +8,38 @@ let swiftSettings: [SwiftSetting] = [
 ]
 
 let package = Package(
-  name: "EidolonsApp",
+  name: "EidolaApp",
   defaultLocalization: "en",
   platforms: [
     .macOS(.v26)
   ],
   products: [
     .library(
-      name: "EidolonsApp",
-      targets: ["EidolonsApp"]
+      name: "EidolaApp",
+      targets: ["EidolaApp"]
     )
   ],
   dependencies: [
     .package(url: "https://github.com/swiftlang/swift-testing.git", from: "6.2.3"),
-    .package(path: "../../crates/eidolons-shared"),
+    .package(path: "../../crates/eidola-shared"),
   ],
   targets: [
     .target(
-      name: "EidolonsApp",
+      name: "EidolaApp",
       dependencies: [
-        .product(name: "EidolonsShared", package: "eidolons-shared"),
-        .product(name: "SharedTypes", package: "eidolons-shared"),
-        .product(name: "Serde", package: "eidolons-shared"),
+        .product(name: "EidolaShared", package: "eidola-shared"),
+        .product(name: "SharedTypes", package: "eidola-shared"),
+        .product(name: "Serde", package: "eidola-shared"),
       ],
-      path: "Sources/Eidolons",
+      path: "Sources/Eidola",
       swiftSettings: swiftSettings
     ),
     .executableTarget(
-      name: "EidolonsEntrypoint",
+      name: "EidolaEntrypoint",
       dependencies: [
-        "EidolonsApp"
+        "EidolaApp"
       ],
-      path: "Sources/EidolonsEntrypoint",
+      path: "Sources/EidolaEntrypoint",
       resources: [
         .process("Assets.xcassets")
       ],
@@ -49,12 +49,12 @@ let package = Package(
       ]
     ),
     .testTarget(
-      name: "EidolonsTests",
+      name: "EidolaTests",
       dependencies: [
-        "EidolonsApp",
+        "EidolaApp",
         .product(name: "Testing", package: "swift-testing"),
       ],
-      path: "Tests/EidolonsTests",
+      path: "Tests/EidolaTests",
       swiftSettings: swiftSettings
     ),
   ]

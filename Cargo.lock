@@ -1211,7 +1211,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "eidolons-cli"
+name = "eidola-cli"
 version = "0.1.0"
 dependencies = [
  "anonymous-credit-tokens",
@@ -1238,7 +1238,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "eidolons-server"
+name = "eidola-server"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -1273,7 +1273,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "eidolons-shared"
+name = "eidola-shared"
 version = "0.1.0"
 dependencies = [
  "crux_core",
@@ -1612,7 +1612,7 @@ checksum = "0b32dfe1fdfc0bbde1f22a5da25355514b5e450c33a6af6770884c8750aedfbc"
 name = "generate-openapi"
 version = "0.1.0"
 dependencies = [
- "eidolons-server",
+ "eidola-server",
  "rustls",
  "rustls-rustcrypto",
 ]
@@ -3771,7 +3771,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crux_core",
- "eidolons-shared",
+ "eidola-shared",
 ]
 
 [[package]]

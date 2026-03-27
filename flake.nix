@@ -1,5 +1,5 @@
 {
-  description = "Eidolons";
+  description = "Eidola";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -360,7 +360,7 @@
 
         # Generate OpenAPI specification from the server code
         serverOpenApiSpec =
-          pkgs.runCommand "eidolons-openapi-spec"
+          pkgs.runCommand "eidola-openapi-spec"
             {
               nativeBuildInputs = [ generateOpenapiBin ];
               SOURCE_DATE_EPOCH = "0";
@@ -385,8 +385,8 @@
         };
 
         # Generate Swift types from the shared core using Crux typegen
-        eidolonsSharedSwiftTypes = pkgs.stdenv.mkDerivation {
-          name = "eidolons-shared-swift-types";
+        eidolaSharedSwiftTypes = pkgs.stdenv.mkDerivation {
+          name = "eidola-shared-swift-types";
 
           nativeBuildInputs = [ sharedTypegen ];
 
@@ -427,8 +427,8 @@
         };
 
         # Generate Swift bindings from the shared core library (UniFFI)
-        eidolonsSharedSwiftBindings = pkgs.stdenv.mkDerivation {
-          name = "eidolons-shared-swift-bindings";
+        eidolaSharedSwiftBindings = pkgs.stdenv.mkDerivation {
+          name = "eidola-shared-swift-bindings";
 
           nativeBuildInputs = [
             uniffiBindgenSwift
@@ -441,24 +441,24 @@
 
           buildPhase = ''
             # Create output directories
-            mkdir -p $out/Sources/EidolonsShared
-            mkdir -p $out/Sources/EidolonsSharedFFI
+            mkdir -p $out/Sources/EidolaShared
+            mkdir -p $out/Sources/EidolaSharedFFI
 
             # uniffi-bindgen-swift needs access to Cargo.toml for metadata
-            cp -r ${mkFilteredSrc ([ "eidolons-shared" ] ++ packageDeps.eidolons-shared or [ ])}/* .
+            cp -r ${mkFilteredSrc ([ "eidola-shared" ] ++ packageDeps.eidola-shared or [ ])}/* .
             chmod -R +w .
 
             # Find the dylib (native build, cdylib for uniffi-bindgen-swift)
             # Built without default features (MLX) since bindings only need the FFI interface
             DYLIB="${
               mkPackage {
-                pname = "eidolons-shared";
+                pname = "eidola-shared";
                 rustTarget = nativeRustTarget;
                 nixCrossSystem = null;
                 crateType = "cdylib";
                 extraCargoArgs = "--no-default-features";
               }
-            }/lib/libeidolons_shared.dylib"
+            }/lib/libeidola_shared.dylib"
 
             # Generate Swift bindings to a temp directory
             TEMP_OUT=$(mktemp -d)
@@ -467,35 +467,35 @@
                 --metadata-no-deps \
                 "$DYLIB" \
                 "$TEMP_OUT" \
-                --module-name eidolons_sharedFFI \
+                --module-name eidola_sharedFFI \
                 --modulemap-filename module.modulemap
 
             # Move files to their proper locations
-            mv "$TEMP_OUT"/*.swift $out/Sources/EidolonsShared/
-            mv "$TEMP_OUT"/*.h $out/Sources/EidolonsSharedFFI/
-            mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolonsSharedFFI/
+            mv "$TEMP_OUT"/*.swift $out/Sources/EidolaShared/
+            mv "$TEMP_OUT"/*.h $out/Sources/EidolaSharedFFI/
+            mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolaSharedFFI/
 
             # Create stub C file for SPM
-            cat > $out/Sources/EidolonsSharedFFI/eidolons_sharedFFI.c << 'STUB'
-            // This file exists so Swift Package Manager has something to compile for the eidolons_sharedFFI module.
-            // The actual implementation is in the XCFramework (libeidolons_shared.a).
+            cat > $out/Sources/EidolaSharedFFI/eidola_sharedFFI.c << 'STUB'
+            // This file exists so Swift Package Manager has something to compile for the eidola_sharedFFI module.
+            // The actual implementation is in the XCFramework (libeidola_shared.a).
             // This module just exposes the C header interface to Swift.
-            #include "eidolons_sharedFFI.h"
+            #include "eidola_sharedFFI.h"
             STUB
           '';
 
           installPhase = ''
             echo "Generated Swift bindings:"
-            echo "EidolonsShared (Swift):"
-            ls -la $out/Sources/EidolonsShared/
-            echo "EidolonsSharedFFI (C headers):"
-            ls -la $out/Sources/EidolonsSharedFFI/
+            echo "EidolaShared (Swift):"
+            ls -la $out/Sources/EidolaShared/
+            echo "EidolaSharedFFI (C headers):"
+            ls -la $out/Sources/EidolaSharedFFI/
           '';
         };
 
-        # Build XCFramework for eidolons-shared
-        eidolonsSharedSwiftXCFramework = pkgs.stdenv.mkDerivation {
-          name = "eidolons-shared-xcframework";
+        # Build XCFramework for eidola-shared
+        eidolaSharedSwiftXCFramework = pkgs.stdenv.mkDerivation {
+          name = "eidola-shared-xcframework";
 
           nativeBuildInputs = [ pkgs.darwin.cctools ];
 
@@ -505,27 +505,27 @@
           dontUnpack = true;
 
           macosArm64 = mkPackage {
-            pname = "eidolons-shared";
+            pname = "eidola-shared";
             rustTarget = "aarch64-apple-darwin";
             nixCrossSystem = null;
             crateType = "staticlib";
           };
           macosX86_64 = mkPackage {
-            pname = "eidolons-shared";
+            pname = "eidola-shared";
             rustTarget = "x86_64-apple-darwin";
             nixCrossSystem = null;
             crateType = "staticlib";
           };
 
           buildPhase = ''
-            XCFW="$out/libeidolons_shared-rs.xcframework"
+            XCFW="$out/libeidola_shared-rs.xcframework"
             MACOS_DIR="$XCFW/macos-arm64_x86_64"
             mkdir -p "$MACOS_DIR"
 
             lipo -create \
-              "$macosArm64/lib/libeidolons_shared.a" \
-              "$macosX86_64/lib/libeidolons_shared.a" \
-              -output "$MACOS_DIR/libeidolons_shared.a"
+              "$macosArm64/lib/libeidola_shared.a" \
+              "$macosX86_64/lib/libeidola_shared.a" \
+              -output "$MACOS_DIR/libeidola_shared.a"
 
             cat > "$XCFW/Info.plist" << 'EOF'
             <?xml version="1.0" encoding="UTF-8"?>
@@ -538,7 +538,7 @@
                   <key>LibraryIdentifier</key>
                   <string>macos-arm64_x86_64</string>
                   <key>LibraryPath</key>
-                  <string>libeidolons_shared.a</string>
+                  <string>libeidola_shared.a</string>
                   <key>SupportedArchitectures</key>
                   <array>
                     <string>arm64</string>
@@ -562,17 +562,17 @@
             find "$out" -type f -exec ls -lh {} \;
             echo ""
             echo "Architecture info:"
-            lipo -info "$out/libeidolons_shared-rs.xcframework/macos-arm64_x86_64/libeidolons_shared.a"
+            lipo -info "$out/libeidola_shared-rs.xcframework/macos-arm64_x86_64/libeidola_shared.a"
           '';
         };
 
         # Build the CLI as a macOS universal binary (Darwin only)
-        eidolonsCliMacosUniversal =
+        eidolaCliMacosUniversal =
           if !pkgs.stdenv.isDarwin then
             null
           else
             pkgs.stdenv.mkDerivation {
-              pname = "eidolons-cli-macos-universal";
+              pname = "eidola-cli-macos-universal";
               version = "1.0";
 
               nativeBuildInputs = [ pkgs.darwin.cctools ];
@@ -582,12 +582,12 @@
               dontUnpack = true;
 
               arm64 = mkPackage {
-                pname = "eidolons-cli";
+                pname = "eidola-cli";
                 rustTarget = "aarch64-apple-darwin";
                 nixCrossSystem = null;
               };
               x86_64 = mkPackage {
-                pname = "eidolons-cli";
+                pname = "eidola-cli";
                 rustTarget = "x86_64-apple-darwin";
                 nixCrossSystem = null;
               };
@@ -595,18 +595,18 @@
               buildPhase = ''
                 mkdir -p $out/bin
                 lipo -create \
-                  "$arm64/bin/eidolons" \
-                  "$x86_64/bin/eidolons" \
-                  -output "$out/bin/eidolons"
+                  "$arm64/bin/eidola" \
+                  "$x86_64/bin/eidola" \
+                  -output "$out/bin/eidola"
               '';
 
               installPhase = ''
                 echo "Universal binary:"
-                lipo -info "$out/bin/eidolons"
+                lipo -info "$out/bin/eidola"
               '';
 
               meta = {
-                description = "Eidolons CLI (macOS universal binary)";
+                description = "Eidola CLI (macOS universal binary)";
                 platforms = [ "aarch64-darwin" "x86_64-darwin" ];
               };
             };
@@ -615,7 +615,7 @@
         # Returns null if no icon images are present (all slots empty).
         appIcon =
           let
-            appiconset = ./apps/macos/Sources/EidolonsEntrypoint/Assets.xcassets/AppIcon.appiconset;
+            appiconset = ./apps/macos/Sources/EidolaEntrypoint/Assets.xcassets/AppIcon.appiconset;
             contentsJson = builtins.fromJSON (builtins.readFile (appiconset + "/Contents.json"));
             # An image entry has a "filename" key when a PNG is assigned
             hasImages = builtins.any (img: img ? filename) contentsJson.images;
@@ -651,7 +651,7 @@
         # Build the macOS app with Swift 6.2 (Darwin only)
         # Uses swiftc directly (not SPM) to avoid xcrun/Xcode dependency.
         # Modules are compiled in dependency order, then linked into the final executable.
-        eidolonsMacosApp =
+        eidolaMacosApp =
           let
             isDarwin = pkgs.stdenv.isDarwin;
             swiftPkg = swift.packages.${system}.swift or null;
@@ -660,7 +660,7 @@
             null
           else
             pkgs.stdenv.mkDerivation {
-              pname = "eidolons-macos";
+              pname = "eidola-macos";
               version = "1.0";
 
               src = pkgs.lib.fileset.toSource {
@@ -668,7 +668,7 @@
                 fileset = pkgs.lib.fileset.unions [
                   ./apps/macos/Sources
                   ./apps/macos/Support/Info.plist
-                  ./crates/eidolons-shared/swift
+                  ./crates/eidola-shared/swift
                 ];
               };
 
@@ -678,15 +678,15 @@
               SOURCE_DATE_EPOCH = "0";
 
               # XCFramework static library (nix-built)
-              xcframework = eidolonsSharedSwiftXCFramework;
+              xcframework = eidolaSharedSwiftXCFramework;
 
               buildPhase = ''
                 export HOME=$TMPDIR
                 export XDG_CACHE_HOME=$TMPDIR
 
-                SHARED="crates/eidolons-shared/swift"
-                XCFW_LIB="$xcframework/libeidolons_shared-rs.xcframework/macos-arm64_x86_64"
-                FFI_HEADERS="$SHARED/Sources/EidolonsSharedFFI"
+                SHARED="crates/eidola-shared/swift"
+                XCFW_LIB="$xcframework/libeidola_shared-rs.xcframework/macos-arm64_x86_64"
+                FFI_HEADERS="$SHARED/Sources/EidolaSharedFFI"
                 MODULEMAP="$FFI_HEADERS/module.modulemap"
 
                 MODULES="$TMPDIR/modules"
@@ -714,50 +714,50 @@
                   -o "$OBJS/SharedTypes.o" \
                   $(find "$SHARED/generated/SharedTypes/Sources/SharedTypes" -name '*.swift' | sort)
 
-                echo "Building EidolonsShared module..."
+                echo "Building EidolaShared module..."
                 swiftc -c "''${COMMON_FLAGS[@]}" \
-                  -module-name EidolonsShared \
-                  -emit-module-path "$MODULES/EidolonsShared.swiftmodule" \
+                  -module-name EidolaShared \
+                  -emit-module-path "$MODULES/EidolaShared.swiftmodule" \
                   -I "$MODULES" \
                   -I "$FFI_HEADERS" \
                   -Xcc -fmodule-map-file="$MODULEMAP" \
-                  -o "$OBJS/EidolonsShared.o" \
-                  $(find "$SHARED/Sources/EidolonsShared" -name '*.swift' | sort)
+                  -o "$OBJS/EidolaShared.o" \
+                  $(find "$SHARED/Sources/EidolaShared" -name '*.swift' | sort)
 
-                echo "Building EidolonsApp module..."
+                echo "Building EidolaApp module..."
                 swiftc -c "''${COMMON_FLAGS[@]}" \
-                  -module-name EidolonsApp \
-                  -emit-module-path "$MODULES/EidolonsApp.swiftmodule" \
+                  -module-name EidolaApp \
+                  -emit-module-path "$MODULES/EidolaApp.swiftmodule" \
                   -I "$MODULES" \
                   -I "$FFI_HEADERS" \
                   -Xcc -fmodule-map-file="$MODULEMAP" \
-                  -o "$OBJS/EidolonsApp.o" \
-                  $(find "apps/macos/Sources/Eidolons" -name '*.swift' | sort)
+                  -o "$OBJS/EidolaApp.o" \
+                  $(find "apps/macos/Sources/Eidola" -name '*.swift' | sort)
 
-                echo "Linking Eidolons..."
+                echo "Linking Eidola..."
                 swiftc \
-                  -o Eidolons \
-                  -module-name EidolonsEntrypoint \
+                  -o Eidola \
+                  -module-name EidolaEntrypoint \
                   -I "$MODULES" \
                   -I "$FFI_HEADERS" \
                   -Xcc -fmodule-map-file="$MODULEMAP" \
-                  -L "$XCFW_LIB" -leidolons_shared \
+                  -L "$XCFW_LIB" -leidola_shared \
                   -framework SwiftUI -framework AppKit -framework Foundation \
                   -framework SystemConfiguration \
                   -Xfrontend -no-serialize-debugging-options \
                   -Xlinker -reproducible \
                   -enable-upcoming-feature MemberImportVisibility \
                   "$OBJS/Serde.o" "$OBJS/SharedTypes.o" \
-                  "$OBJS/EidolonsShared.o" "$OBJS/EidolonsApp.o" \
-                  apps/macos/Sources/EidolonsEntrypoint/main.swift
+                  "$OBJS/EidolaShared.o" "$OBJS/EidolaApp.o" \
+                  apps/macos/Sources/EidolaEntrypoint/main.swift
               '';
 
               installPhase = ''
-                APP="$out/Applications/Eidolons.app"
+                APP="$out/Applications/Eidola.app"
                 mkdir -p "$APP/Contents/MacOS"
                 mkdir -p "$APP/Contents/Resources"
 
-                cp Eidolons "$APP/Contents/MacOS/Eidolons"
+                cp Eidola "$APP/Contents/MacOS/Eidola"
                 cp apps/macos/Support/Info.plist "$APP/Contents/"
 
                 ${
@@ -768,11 +768,11 @@
                 }
 
                 mkdir -p $out/bin
-                ln -s "$APP/Contents/MacOS/Eidolons" $out/bin/Eidolons
+                ln -s "$APP/Contents/MacOS/Eidola" $out/bin/Eidola
               '';
 
               meta = {
-                description = "Eidolons macOS application";
+                description = "Eidola macOS application";
                 platforms = [ "aarch64-darwin" "x86_64-darwin" ];
               };
             };
@@ -781,20 +781,20 @@
       {
         packages = {
           server = mkPackage {
-            pname = "eidolons-server";
+            pname = "eidola-server";
             rustTarget = nativeRustTarget;
             nixCrossSystem = null;
           };
           server-openapi-spec = serverOpenApiSpec;
 
           # Shared core Swift binding generation
-          eidolons-shared-swift-types = eidolonsSharedSwiftTypes;
-          eidolons-shared-swift-bindings = eidolonsSharedSwiftBindings;
-          eidolons-shared-swift-xcframework = eidolonsSharedSwiftXCFramework;
-        } // pkgs.lib.optionalAttrs (eidolonsCliMacosUniversal != null) {
-          eidolons-cli-macos-universal = eidolonsCliMacosUniversal;
-        } // pkgs.lib.optionalAttrs (eidolonsMacosApp != null) {
-          eidolons-macos-app = eidolonsMacosApp;
+          eidola-shared-swift-types = eidolaSharedSwiftTypes;
+          eidola-shared-swift-bindings = eidolaSharedSwiftBindings;
+          eidola-shared-swift-xcframework = eidolaSharedSwiftXCFramework;
+        } // pkgs.lib.optionalAttrs (eidolaCliMacosUniversal != null) {
+          eidola-cli-macos-universal = eidolaCliMacosUniversal;
+        } // pkgs.lib.optionalAttrs (eidolaMacosApp != null) {
+          eidola-macos-app = eidolaMacosApp;
         };
 
         # Development shell (lightweight — daily Rust dev uses rustup)
@@ -844,10 +844,10 @@
                 echo "Checking if committed OpenAPI spec matches generated one..."
 
                 GENERATED="${self.packages.${system}.server-openapi-spec}/openapi.json"
-                COMMITTED="${repoSrc}/crates/eidolons-server/openapi.json"
+                COMMITTED="${repoSrc}/crates/eidola-server/openapi.json"
 
                 if [ ! -f "$COMMITTED" ]; then
-                  echo "ERROR: No committed OpenAPI spec found at crates/eidolons-server/openapi.json"
+                  echo "ERROR: No committed OpenAPI spec found at crates/eidola-server/openapi.json"
                   echo "Run: nix run '.#update-server-openapi'"
                   echo "Then commit the generated file."
                   exit 1
@@ -878,46 +878,46 @@
               ''
                 echo "Checking if committed Swift bindings match generated ones..."
 
-                # Check EidolonsShared Swift files
-                GENERATED_SWIFT="${self.packages.${system}.eidolons-shared-swift-bindings}/Sources/EidolonsShared"
-                COMMITTED_SWIFT="${repoSrc}/crates/eidolons-shared/swift/Sources/EidolonsShared"
+                # Check EidolaShared Swift files
+                GENERATED_SWIFT="${self.packages.${system}.eidola-shared-swift-bindings}/Sources/EidolaShared"
+                COMMITTED_SWIFT="${repoSrc}/crates/eidola-shared/swift/Sources/EidolaShared"
 
                 if [ ! -d "$COMMITTED_SWIFT" ]; then
-                  echo "ERROR: No committed Swift bindings found at crates/eidolons-shared/swift/Sources/EidolonsShared"
-                  echo "Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "ERROR: No committed Swift bindings found at crates/eidola-shared/swift/Sources/EidolaShared"
+                  echo "Run: nix run '.#update-eidola-shared-swift-bindings'"
                   echo "Then commit the generated files."
                   exit 1
                 fi
 
                 if ! diff -r "$GENERATED_SWIFT" "$COMMITTED_SWIFT"; then
                   echo ""
-                  echo "ERROR: Committed EidolonsShared Swift bindings don't match generated ones!"
+                  echo "ERROR: Committed EidolaShared Swift bindings don't match generated ones!"
                   echo ""
                   echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "  1. Run: nix run '.#update-eidola-shared-swift-bindings'"
                   echo "  2. Review the changes"
                   echo "  3. Commit the updated bindings"
                   echo ""
                   exit 1
                 fi
 
-                # Check EidolonsSharedFFI C headers
-                GENERATED_FFI="${self.packages.${system}.eidolons-shared-swift-bindings}/Sources/EidolonsSharedFFI"
-                COMMITTED_FFI="${repoSrc}/crates/eidolons-shared/swift/Sources/EidolonsSharedFFI"
+                # Check EidolaSharedFFI C headers
+                GENERATED_FFI="${self.packages.${system}.eidola-shared-swift-bindings}/Sources/EidolaSharedFFI"
+                COMMITTED_FFI="${repoSrc}/crates/eidola-shared/swift/Sources/EidolaSharedFFI"
 
                 if [ ! -d "$COMMITTED_FFI" ]; then
-                  echo "ERROR: No committed FFI headers found at crates/eidolons-shared/swift/Sources/EidolonsSharedFFI"
-                  echo "Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "ERROR: No committed FFI headers found at crates/eidola-shared/swift/Sources/EidolaSharedFFI"
+                  echo "Run: nix run '.#update-eidola-shared-swift-bindings'"
                   echo "Then commit the generated files."
                   exit 1
                 fi
 
                 if ! diff -r "$GENERATED_FFI" "$COMMITTED_FFI"; then
                   echo ""
-                  echo "ERROR: Committed EidolonsSharedFFI headers don't match generated ones!"
+                  echo "ERROR: Committed EidolaSharedFFI headers don't match generated ones!"
                   echo ""
                   echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "  1. Run: nix run '.#update-eidola-shared-swift-bindings'"
                   echo "  2. Review the changes"
                   echo "  3. Commit the updated headers"
                   echo ""
@@ -925,12 +925,12 @@
                 fi
 
                 # Check SharedTypes (Crux typegen)
-                GENERATED_TYPES="${self.packages.${system}.eidolons-shared-swift-types}/SharedTypes"
-                COMMITTED_TYPES="${repoSrc}/crates/eidolons-shared/swift/generated/SharedTypes"
+                GENERATED_TYPES="${self.packages.${system}.eidola-shared-swift-types}/SharedTypes"
+                COMMITTED_TYPES="${repoSrc}/crates/eidola-shared/swift/generated/SharedTypes"
 
                 if [ ! -d "$COMMITTED_TYPES" ]; then
-                  echo "ERROR: No committed SharedTypes found at crates/eidolons-shared/swift/generated/SharedTypes"
-                  echo "Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "ERROR: No committed SharedTypes found at crates/eidola-shared/swift/generated/SharedTypes"
+                  echo "Run: nix run '.#update-eidola-shared-swift-bindings'"
                   echo "Then commit the generated files."
                   exit 1
                 fi
@@ -940,7 +940,7 @@
                   echo "ERROR: Committed SharedTypes don't match generated ones!"
                   echo ""
                   echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-eidolons-shared-swift-bindings'"
+                  echo "  1. Run: nix run '.#update-eidola-shared-swift-bindings'"
                   echo "  2. Review the changes"
                   echo "  3. Commit the updated types"
                   echo ""
@@ -961,13 +961,13 @@
                 echo "Checking Swift formatting..."
 
                 # Find all Swift files, excluding:
-                # - crates/eidolons-shared/swift/Sources/EidolonsShared (auto-generated bindings)
-                # - crates/eidolons-shared/swift/generated (auto-generated Crux types)
+                # - crates/eidola-shared/swift/Sources/EidolaShared (auto-generated bindings)
+                # - crates/eidola-shared/swift/generated (auto-generated Crux types)
                 # - Any .build directories (SwiftPM build artifacts)
                 # Note: .git is already excluded by crane's source filtering
                 find ${repoSrc} \
-                  -path '*/crates/eidolons-shared/swift/Sources/EidolonsShared' -prune -o \
-                  -path '*/crates/eidolons-shared/swift/generated' -prune -o \
+                  -path '*/crates/eidola-shared/swift/Sources/EidolaShared' -prune -o \
+                  -path '*/crates/eidola-shared/swift/generated' -prune -o \
                   -path '*/.build' -prune -o \
                   -name '*.swift' -print0 \
                   | xargs -0 -r swift-format lint --strict
@@ -996,12 +996,12 @@
             }/bin/update-server-openapi";
           };
 
-          update-eidolons-shared-swift-bindings = {
+          update-eidola-shared-swift-bindings = {
             type = "app";
             meta.description = "Update committed Swift bindings for shared core";
             program = "${
               pkgs.writeShellApplication {
-                name = "update-eidolons-shared-swift-bindings";
+                name = "update-eidola-shared-swift-bindings";
                 runtimeInputs = [
                   pkgs.coreutils
                   pkgs.git
@@ -1009,29 +1009,29 @@
 
                 text = ''
                   ${./scripts/update-shared-bindings.sh} \
-                    "${self.packages.${system}.eidolons-shared-swift-bindings}/Sources" \
-                    "${self.packages.${system}.eidolons-shared-swift-types}"
+                    "${self.packages.${system}.eidola-shared-swift-bindings}/Sources" \
+                    "${self.packages.${system}.eidola-shared-swift-types}"
                 '';
               }
-            }/bin/update-eidolons-shared-swift-bindings";
+            }/bin/update-eidola-shared-swift-bindings";
           };
 
-          update-eidolons-shared-swift-xcframework = {
+          update-eidola-shared-swift-xcframework = {
             type = "app";
             meta.description = "Update XCFramework for shared core";
             program = "${
               pkgs.writeShellApplication {
-                name = "update-eidolons-shared-swift-xcframework";
+                name = "update-eidola-shared-swift-xcframework";
                 runtimeInputs = [
                   pkgs.coreutils
                   pkgs.git
                 ];
 
                 text = ''
-                  ${./scripts/update-shared-xcframework.sh} "${self.packages.${system}.eidolons-shared-swift-xcframework}"
+                  ${./scripts/update-shared-xcframework.sh} "${self.packages.${system}.eidola-shared-swift-xcframework}"
                 '';
               }
-            }/bin/update-eidolons-shared-swift-xcframework";
+            }/bin/update-eidola-shared-swift-xcframework";
           };
 
           format-rust = {
@@ -1094,8 +1094,8 @@
 
                   # Use git ls-files to respect .gitignore, exclude auto-generated bindings
                   git ls-files '*.swift' \
-                    | grep -v '^crates/eidolons-shared/swift/Sources/EidolonsShared/' \
-                    | grep -v '^crates/eidolons-shared/swift/generated/' \
+                    | grep -v '^crates/eidola-shared/swift/Sources/EidolaShared/' \
+                    | grep -v '^crates/eidola-shared/swift/generated/' \
                     | xargs -r swift-format format --in-place
 
                   echo "Done. Review changes and commit:"
@@ -1104,13 +1104,13 @@
               }
             }/bin/format-swift";
           };
-        } // pkgs.lib.optionalAttrs (eidolonsMacosApp != null) {
-          run-eidolons = {
+        } // pkgs.lib.optionalAttrs (eidolaMacosApp != null) {
+          run-eidola = {
             type = "app";
-            meta.description = "Build and launch the Eidolons macOS app";
+            meta.description = "Build and launch the Eidola macOS app";
             program = "${
-              pkgs.writeShellScript "run-eidolons" ''
-                open "${eidolonsMacosApp}/Applications/Eidolons.app"
+              pkgs.writeShellScript "run-eidola" ''
+                open "${eidolaMacosApp}/Applications/Eidola.app"
               ''
             }";
           };

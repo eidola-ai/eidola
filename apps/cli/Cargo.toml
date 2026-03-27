@@ -1,5 +1,5 @@
 [package]
-name = "eidolons-cli"
+name = "eidola-cli"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,7 +7,7 @@ repository.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "eidolons"
+name = "eidola"
 path = "src/main.rs"
 
 [dependencies]

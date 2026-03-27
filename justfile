@@ -15,11 +15,11 @@ services:
     docker buildx bake postgres
     docker compose up -d --no-build postgres
 
-# Drop and recreate the eidolons database, then apply schema.sql
+# Drop and recreate the eidola database, then apply schema.sql
 db-reset:
-    docker compose exec postgres dropdb -U eidolons --if-exists eidolons
-    docker compose exec postgres createdb -U eidolons eidolons
-    docker compose exec postgres psql -U eidolons -d eidolons -f /docker-entrypoint-initdb.d/schema.sql
+    docker compose exec postgres dropdb -U eidola --if-exists eidola
+    docker compose exec postgres createdb -U eidola eidola
+    docker compose exec postgres psql -U eidola -d eidola -f /docker-entrypoint-initdb.d/schema.sql
 
 # --- Rust (inner loop, runs on host) ---
 
@@ -34,7 +34,7 @@ test:
 
 # Run integration tests (requires: just services && just db-reset)
 test-integration:
-    DATABASE_URL="${DATABASE_URL:-postgres://eidolons@localhost/eidolons}" CREDENTIAL_MASTER_KEY="${CREDENTIAL_MASTER_KEY:-0000000000000000000000000000000000000000000000000000000000000000}" cargo test -p eidolons-server -- --ignored
+    DATABASE_URL="${DATABASE_URL:-postgres://eidola@localhost/eidola}" CREDENTIAL_MASTER_KEY="${CREDENTIAL_MASTER_KEY:-0000000000000000000000000000000000000000000000000000000000000000}" cargo test -p eidola-server -- --ignored
 
 # Run E2E webhook smoke tests (requires STRIPE_API_KEY)
 test-webhook-smoke:
@@ -76,8 +76,8 @@ ci-check:
 
 # Build XCFramework via Nix
 ci-build-xcframework:
-    nix run '.#update-eidolons-shared-swift-xcframework'
+    nix run '.#update-eidola-shared-swift-xcframework'
 
 # Build macOS app via Nix (reproducible, open-source Swift 6.2 toolchain)
 build-macos-app:
-    nix build '.#eidolons-macos-app' --show-trace
+    nix build '.#eidola-macos-app' --show-trace
