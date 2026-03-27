@@ -125,6 +125,11 @@ jobs:
           echo "Updated ${FILE}:"
           cat "${FILE}"
 
+      - name: Format measurements.rs
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          cargo fmt --manifest-path crates/eidola-server/Cargo.toml
+
       - name: Check for existing PR
         if: steps.check.outputs.changed == 'true'
         id: existing
