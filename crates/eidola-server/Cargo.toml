@@ -59,7 +59,7 @@ hex = "0.4"
 
 # Webhook signature verification
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2"
 
 # Tinfoil attestation verification
