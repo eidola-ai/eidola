@@ -25,7 +25,7 @@ jobs:
         run: rustup show
 
       - name: Cache cargo registry and build artifacts
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry
@@ -76,7 +76,7 @@ jobs:
 
       - name: Restore OCI Buildx cache
         id: buildx-cache
-        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ${{ env.BUILDX_CACHE_DIR }}
           key: buildx-oci-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', '**/Cargo.toml', 'rust-toolchain.toml', 'docker-bake.hcl', 'compose.yaml', 'oci/**/Containerfile') }}
@@ -117,7 +117,7 @@ jobs:
 
       - name: Save OCI Buildx cache
         if: always()
-        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ${{ env.BUILDX_CACHE_DIR }}
           key: ${{ steps.buildx-cache.outputs.cache-primary-key }}
