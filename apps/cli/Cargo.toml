@@ -31,4 +31,4 @@ toml = "1"
 turso = { git = "https://github.com/eidola-ai/turso", branch = "reproducible-builds", default-features = false, features = ["pure-rust-crypto"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 x509-cert = "0.2"
-der = { version = "0.8", features = ["pem", "alloc"] }
+der = { version = "0.7", features = ["pem", "alloc"] }
