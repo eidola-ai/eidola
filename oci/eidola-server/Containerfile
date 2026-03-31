@@ -15,29 +15,49 @@ ENV RUSTFLAGS="-C target-feature=+crt-static -C debuginfo=0 -C target-cpu=generi
 WORKDIR /src
 
 # ── fetch ──────────────────────────────────────────────────────────────────────
-# Copy source and download dependencies (network access required).
+# Copy only manifests and create stub source files so cargo can resolve the
+# workspace. This layer is only invalidated when dependencies change, not on
+# every source edit. Dependencies are baked into the layer (no cache mounts)
+# so they survive BuildKit GC between builds.
 FROM base AS fetch
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY apps/ ./apps/
-COPY crates/ ./crates/
+COPY apps/cli/Cargo.toml ./apps/cli/
+COPY crates/eidola-server/Cargo.toml ./crates/eidola-server/
+COPY crates/eidola-shared/Cargo.toml ./crates/eidola-shared/
+COPY crates/generate-openapi/Cargo.toml ./crates/generate-openapi/
+COPY crates/hash-secret/Cargo.toml ./crates/hash-secret/
+COPY crates/shared-typegen/Cargo.toml ./crates/shared-typegen/
+COPY crates/tinfoil-shim-mock/Cargo.toml ./crates/tinfoil-shim-mock/
+COPY crates/tinfoil-verifier/Cargo.toml ./crates/tinfoil-verifier/
+COPY crates/uniffi-bindgen-swift/Cargo.toml ./crates/uniffi-bindgen-swift/
 
-RUN --mount=type=cache,id=eidola-cargo-registry,target=/root/.cargo/registry \
-    --mount=type=cache,id=eidola-cargo-git,target=/root/.cargo/git \
-    cargo fetch --locked --target ${TARGET}
+# Stub source files so cargo can resolve all workspace members.
+RUN mkdir -p apps/cli/src && echo 'fn main(){}' > apps/cli/src/main.rs \
+    && mkdir -p crates/eidola-server/src && echo 'fn main(){}' > crates/eidola-server/src/main.rs && touch crates/eidola-server/src/lib.rs \
+    && mkdir -p crates/eidola-shared/src && touch crates/eidola-shared/src/lib.rs \
+    && mkdir -p crates/generate-openapi/src && echo 'fn main(){}' > crates/generate-openapi/src/main.rs \
+    && mkdir -p crates/hash-secret/src && echo 'fn main(){}' > crates/hash-secret/src/main.rs \
+    && mkdir -p crates/shared-typegen/src && echo 'fn main(){}' > crates/shared-typegen/src/main.rs \
+    && mkdir -p crates/tinfoil-shim-mock/src && echo 'fn main(){}' > crates/tinfoil-shim-mock/src/main.rs \
+    && mkdir -p crates/tinfoil-verifier/src && touch crates/tinfoil-verifier/src/lib.rs \
+    && mkdir -p crates/uniffi-bindgen-swift/src && echo 'fn main(){}' > crates/uniffi-bindgen-swift/src/main.rs
+
+RUN cargo fetch --locked --target ${TARGET}
 
 # ── build ──────────────────────────────────────────────────────────────────────
-# Compile sources (no network access).
-# Cache mounts persist the cargo registry and target dir across builds without
+# Copy real source over the stubs and compile (no network access).
+# The target dir uses a cache mount to speed up incremental builds without
 # affecting the final image. The binary is copied to /out because cache mounts
 # are only available during RUN, not COPY.
 FROM fetch AS build
 
 ARG CARGO_PROFILE=release
 
-RUN --mount=type=cache,id=eidola-cargo-registry,target=/root/.cargo/registry \
-    --mount=type=cache,id=eidola-cargo-git,target=/root/.cargo/git \
-    --mount=type=cache,id=eidola-target-x86_64-unknown-linux-musl,target=/src/target,sharing=locked \
+COPY apps/ ./apps/
+COPY crates/ ./crates/
+
+RUN --mount=type=cache,id=eidola-target-x86_64-unknown-linux-musl,target=/src/target,sharing=locked \
     --network=none \
     cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-server \
     && install -D target/${TARGET}/${CARGO_PROFILE}/eidola-server /out/eidola-server

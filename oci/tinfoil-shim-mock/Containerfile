@@ -1,13 +1,32 @@
 # syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
 
-FROM rust:1-slim AS build
+FROM rust:1-slim AS fetch
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY apps/cli/Cargo.toml ./apps/cli/
+COPY crates/eidola-server/Cargo.toml ./crates/eidola-server/
+COPY crates/eidola-shared/Cargo.toml ./crates/eidola-shared/
+COPY crates/generate-openapi/Cargo.toml ./crates/generate-openapi/
+COPY crates/hash-secret/Cargo.toml ./crates/hash-secret/
+COPY crates/shared-typegen/Cargo.toml ./crates/shared-typegen/
+COPY crates/tinfoil-shim-mock/Cargo.toml ./crates/tinfoil-shim-mock/
+COPY crates/tinfoil-verifier/Cargo.toml ./crates/tinfoil-verifier/
+COPY crates/uniffi-bindgen-swift/Cargo.toml ./crates/uniffi-bindgen-swift/
+RUN mkdir -p apps/cli/src && echo 'fn main(){}' > apps/cli/src/main.rs \
+    && mkdir -p crates/eidola-server/src && echo 'fn main(){}' > crates/eidola-server/src/main.rs && touch crates/eidola-server/src/lib.rs \
+    && mkdir -p crates/eidola-shared/src && touch crates/eidola-shared/src/lib.rs \
+    && mkdir -p crates/generate-openapi/src && echo 'fn main(){}' > crates/generate-openapi/src/main.rs \
+    && mkdir -p crates/hash-secret/src && echo 'fn main(){}' > crates/hash-secret/src/main.rs \
+    && mkdir -p crates/shared-typegen/src && echo 'fn main(){}' > crates/shared-typegen/src/main.rs \
+    && mkdir -p crates/tinfoil-shim-mock/src && echo 'fn main(){}' > crates/tinfoil-shim-mock/src/main.rs \
+    && mkdir -p crates/tinfoil-verifier/src && touch crates/tinfoil-verifier/src/lib.rs \
+    && mkdir -p crates/uniffi-bindgen-swift/src && echo 'fn main(){}' > crates/uniffi-bindgen-swift/src/main.rs
+RUN cargo fetch --locked
+
+FROM fetch AS build
 COPY apps/ ./apps/
 COPY crates/ ./crates/
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,target=/src/target \
     cargo build --release -p tinfoil-shim-mock \
     && install -D target/release/tinfoil-shim-mock /out/tinfoil-shim-mock
 
