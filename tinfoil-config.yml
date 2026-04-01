@@ -1,0 +1,45 @@
+# Tinfoil Container configuration for eidola-server.
+#
+# The SHA-256 of this file is embedded in the kernel command line and bound
+# into the enclave measurement. Any change — image digest, secret hash,
+# resource allocation — produces a different measurement.
+#
+# Image digests below must match artifact-manifest.json.  After building,
+# run `just update-manifest` to stamp in the current digests and recompute
+# the enclave measurement.
+#
+# Secret hashes are generated with:
+#   cargo run -p hash-secret -- "<secret>"
+# and verified at server startup via verify_measured_secrets().
+
+cvm-version: 0.7.3
+cpus: 2
+memory: 8192
+
+containers:
+  - name: "eidola-postgres"
+    image: "ghcr.io/eidola-ai/eidola-postgres@sha256:8304b0d793eeea7a4ea7df85015ede1299c4c361eb1316bcb60fe37c366fa626"
+    env:
+      - POSTGRES_USER: "eidola"
+      - POSTGRES_DB: "eidola"
+
+  - name: "eidola-server"
+    image: "ghcr.io/eidola-ai/eidola-server@sha256:6bf2524414f55f771f70c1f47a9e780625228b760cb5a346688cc91b2ab996cc"
+    devices:
+      - /dev/sev-guest
+    env:
+      - BIND_ADDR: "0.0.0.0:8080"
+      - DATABASE_URL: "postgres://eidola@localhost/eidola"
+      # Measured secret hashes — Argon2id hashes of the actual secrets.
+      # The server verifies these at startup; the hashes are bound into
+      # the enclave measurement via this config file's SHA-256.
+      - CREDENTIAL_MASTER_KEY_HASH: ""
+      - TINFOIL_API_KEY_HASH: ""
+      - STRIPE_API_KEY_HASH: ""
+      - STRIPE_WEBHOOK_SECRET_HASH: ""
+    network_mode: "host"
+
+shim:
+  upstream-port: 8080
+  paths:
+    - /*

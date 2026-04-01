@@ -26,5 +26,10 @@
       "platform": "darwin/universal",
       "narHash": "sha256-9iodSKu7lgeUV7JiIMpQlD+aEZRBMZMi8yHfKdCqIEs="
     }
+  },
+  "enclave": {
+    "snp_measurement": "3712077572d97a69b4e27d78fe4351b387dbe8194fcee84105ce75d09730e39e3c207e48eaf560ab4bac23a627acb201",
+    "tdx_rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
+    "tdx_rtmr2": "d923eb76523522f43bc39b6081d4cd5c19c7a5f8a3303d3e4437664dbaa373ac6a97d662799af078e0147af4cacfd0c0"
   }
 }

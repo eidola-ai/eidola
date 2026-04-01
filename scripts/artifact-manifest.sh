@@ -9,6 +9,7 @@ Usage:
   scripts/artifact-manifest.sh verify [--metadata-file PATH] [--manifest PATH]
   scripts/artifact-manifest.sh build-macos [--output PATH] [--macos-paths-file PATH]
   scripts/artifact-manifest.sh print-macos [--macos-paths-file PATH | --app-path PATH --cli-path PATH]
+  scripts/artifact-manifest.sh measure [--config PATH]
   scripts/artifact-manifest.sh merge [--partial PATH ...] [--output PATH]
   scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH]
   scripts/artifact-manifest.sh update [--output PATH] [--metadata-file PATH] [--builder NAME] [--ensure-builder]
@@ -22,6 +23,12 @@ fi
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 BUILDKIT_IMAGE="moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b"
+
+# CVM image artifacts for enclave measurement computation.
+# The OVMF firmware version is pinned to match tinfoilsh/measure-image-action.
+CVM_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/eidola/cvm"
+OVMF_VERSION="v0.0.3"
+OVMF_URL="https://github.com/tinfoilsh/edk2/releases/download/${OVMF_VERSION}/OVMF.fd"
 
 COMMAND="${1:-}"
 if [[ "$COMMAND" = "-h" || "$COMMAND" = "--help" ]]; then
@@ -43,6 +50,7 @@ ENSURE_BUILDER=0
 MACOS_PATHS_FILE=""
 APP_PATH=""
 CLI_PATH=""
+CONFIG_FILE="$REPO_ROOT/tinfoil-config.yml"
 PARTIAL_FILES=()
 BUILDX_SET_ARGS=()
 
@@ -84,6 +92,10 @@ while [[ $# -gt 0 ]]; do
       PARTIAL_FILES+=("$2")
       shift 2
       ;;
+    --config)
+      CONFIG_FILE="$2"
+      shift 2
+      ;;
     --set)
       BUILDX_SET_ARGS+=("$2")
       shift 2
@@ -99,6 +111,123 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# ── CVM artifact fetching ─────────────────────────────────────────────────────
+
+# Read the cvm-version field from tinfoil-config.yml.
+read_cvm_version() {
+  grep -E '^cvm-version:' "$CONFIG_FILE" | sed 's/^cvm-version:[[:space:]]*//'
+}
+
+# Download a URL to a local cache path, skipping if already present.
+cached_download() {
+  local url="$1" dest="$2"
+  if [[ -f "$dest" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  echo "Downloading $(basename "$dest")..."
+  curl -fsSL --retry 3 -o "$dest" "$url"
+}
+
+# Fetch CVM image artifacts (OVMF, kernel, initrd, manifest) and verify
+# kernel/initrd hashes against the CVM manifest.
+fetch_cvm_artifacts() {
+  local cvm_version cache_dir manifest_url manifest_file
+  local kernel_url kernel_file kernel_hash
+  local initrd_url initrd_file initrd_hash
+  local ovmf_file
+
+  cvm_version="$(read_cvm_version)"
+  cache_dir="${CVM_CACHE_DIR}/${cvm_version}"
+
+  # Fetch CVM manifest
+  manifest_url="https://github.com/tinfoilsh/cvmimage/releases/download/v${cvm_version}/tinfoil-inference-v${cvm_version}-manifest.json"
+  manifest_file="${cache_dir}/manifest.json"
+  cached_download "$manifest_url" "$manifest_file"
+
+  # Extract expected hashes
+  kernel_hash="$(jq -er '.kernel' "$manifest_file")"
+  initrd_hash="$(jq -er '.initrd' "$manifest_file")"
+
+  # Fetch kernel
+  kernel_url="https://images.tinfoil.sh/cvm/tinfoil-inference-v${cvm_version}.vmlinuz"
+  kernel_file="${cache_dir}/vmlinuz"
+  cached_download "$kernel_url" "$kernel_file"
+
+  # Fetch initrd
+  initrd_url="https://images.tinfoil.sh/cvm/tinfoil-inference-v${cvm_version}.initrd"
+  initrd_file="${cache_dir}/initrd"
+  cached_download "$initrd_url" "$initrd_file"
+
+  # Fetch OVMF (version-independent, cached by OVMF version)
+  ovmf_file="${CVM_CACHE_DIR}/OVMF-${OVMF_VERSION}.fd"
+  cached_download "$OVMF_URL" "$ovmf_file"
+
+  # Verify kernel and initrd against manifest hashes
+  local actual_kernel_hash actual_initrd_hash
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_kernel_hash="$(sha256sum "$kernel_file" | cut -d' ' -f1)"
+    actual_initrd_hash="$(sha256sum "$initrd_file" | cut -d' ' -f1)"
+  else
+    actual_kernel_hash="$(shasum -a 256 "$kernel_file" | cut -d' ' -f1)"
+    actual_initrd_hash="$(shasum -a 256 "$initrd_file" | cut -d' ' -f1)"
+  fi
+
+  if [[ "$actual_kernel_hash" != "$kernel_hash" ]]; then
+    echo "error: kernel hash mismatch" >&2
+    echo "  expected: $kernel_hash" >&2
+    echo "  actual:   $actual_kernel_hash" >&2
+    rm -f "$kernel_file"
+    exit 1
+  fi
+
+  if [[ "$actual_initrd_hash" != "$initrd_hash" ]]; then
+    echo "error: initrd hash mismatch" >&2
+    echo "  expected: $initrd_hash" >&2
+    echo "  actual:   $actual_initrd_hash" >&2
+    rm -f "$initrd_file"
+    exit 1
+  fi
+
+  # Export paths for use by compute_measurements
+  CVM_OVMF="$ovmf_file"
+  CVM_KERNEL="$kernel_file"
+  CVM_INITRD="$initrd_file"
+  CVM_ROOTHASH="$(jq -er '.root' "$manifest_file")"
+}
+
+# ── Enclave measurement ──────────────────────────────────────────────────────
+
+# Update image digests in tinfoil-config.yml from build metadata.
+stamp_config_digests() {
+  local server_digest postgres_digest
+
+  server_digest="$(jq -er '."server"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
+  postgres_digest="$(jq -er '."postgres"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
+
+  # Strip the sha256: prefix for the image reference
+  sed -i.bak \
+    -e "s|ghcr.io/eidola-ai/eidola-server@sha256:[a-f0-9]*|ghcr.io/eidola-ai/eidola-server@${server_digest}|" \
+    -e "s|ghcr.io/eidola-ai/eidola-postgres@sha256:[a-f0-9]*|ghcr.io/eidola-ai/eidola-postgres@${postgres_digest}|" \
+    "$CONFIG_FILE"
+  rm -f "${CONFIG_FILE}.bak"
+}
+
+# Compute enclave measurements using the measure-enclave binary.
+# Requires CVM artifacts to be fetched first (sets CVM_* variables).
+compute_measurements() {
+  fetch_cvm_artifacts
+
+  cargo run -q -p measure-enclave -- \
+    --config "$CONFIG_FILE" \
+    --ovmf "$CVM_OVMF" \
+    --kernel "$CVM_KERNEL" \
+    --initrd "$CVM_INITRD" \
+    --roothash "$CVM_ROOTHASH"
+}
+
+# ── Builder management ────────────────────────────────────────────────────────
 
 ensure_builder() {
   local inspect_output needs_recreate
@@ -273,16 +402,31 @@ merge_partials() {
     exit 1
   fi
 
-  jq -s '
+  local merged
+  merged="$(jq -s '
     {
       version: 1,
       artifacts: (reduce .[] as $partial ({}; . + ($partial.artifacts // {})))
     }
-  ' "${PARTIAL_FILES[@]}"
+  ' "${PARTIAL_FILES[@]}")"
+
+  # If enclave measurements were computed, merge them in
+  if [[ -n "${ENCLAVE_MEASUREMENTS:-}" ]]; then
+    merged="$(printf '%s\n' "$merged" | jq \
+      --argjson enclave "$ENCLAVE_MEASUREMENTS" \
+      '. + {enclave: $enclave}')"
+  fi
+
+  printf '%s\n' "$merged"
 }
 
 verify_full_manifest() {
   local actual_norm committed_norm actual_manifest
+
+  # Recompute enclave measurements from committed config if not already set
+  if [[ -z "${ENCLAVE_MEASUREMENTS:-}" ]]; then
+    ENCLAVE_MEASUREMENTS="$(compute_measurements)"
+  fi
 
   actual_manifest="$(merge_partials)"
   actual_norm="$(printf '%s\n' "$actual_manifest" | jq -cS .)"
@@ -346,6 +490,12 @@ update_manifest() {
   build_metadata
   build_macos_artifacts
 
+  # Stamp new OCI digests into tinfoil-config.yml before measuring
+  stamp_config_digests
+
+  # Compute enclave measurements from the updated config
+  ENCLAVE_MEASUREMENTS="$(compute_measurements)"
+
   oci_partial="$(print_oci_manifest)"
   macos_partial="$(print_macos_manifest)"
 
@@ -378,6 +528,9 @@ case "$COMMAND" in
     ;;
   print-macos)
     print_macos_manifest
+    ;;
+  measure)
+    compute_measurements
     ;;
   merge)
     write_output "$(merge_partials)"

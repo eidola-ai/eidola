@@ -12,7 +12,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 
 **Deployment:** Tinfoil Containers — all services run inside confidential enclaves (AMD SEV-SNP). The Tinfoil shim handles TLS termination with attestation-bearing certificates; the server runs plain HTTP behind it.
 
-**CI:** Single `ci.yml` workflow with four jobs — `rust-checks` (ubuntu-24.04: cargo fmt/clippy/test, OpenAPI freshness), `oci` (ubuntu-24.04: OCI image builds, OCI subset verification, GHCR publishing), `apple` (self-hosted Mac: Swift formatting/bindings freshness, Nix-based macOS app and CLI universal binary builds, Swift tests), and `artifact-manifest` (ubuntu-24.04: merges the OCI and macOS artifact digests and verifies the committed manifest). The `oci` and `apple` jobs gate on `rust-checks` to avoid wasting resources on failing PRs.
+**CI:** Single `ci.yml` workflow with four jobs — `rust-checks` (ubuntu-24.04: cargo fmt/clippy/test, OpenAPI freshness), `oci` (ubuntu-24.04: OCI image builds, OCI subset verification, GHCR publishing), `apple` (self-hosted Mac: Swift formatting/bindings freshness, Nix-based macOS app and CLI universal binary builds, Swift tests), and `artifact-manifest` (ubuntu-24.04: merges the OCI and macOS artifact digests, recomputes enclave measurements from `tinfoil-config.yml` + CVM artifacts, and verifies the full committed manifest). The `oci` and `apple` jobs gate on `rust-checks` to avoid wasting resources on failing PRs.
 
 **Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidola-server`, `ghcr.io/<owner>/eidola-cli`, and `ghcr.io/<owner>/eidola-postgres`.
 
@@ -20,6 +20,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - Axum-based HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration
 - Plain HTTP internally; TLS terminated by Tinfoil Container shim with attestation-bearing certificates (attestation hash + HPKE key encoded in SANs, issued by public CA)
 - Tinfoil attestation verification via `tinfoil-verifier` crate — verifies SEV-SNP hardware attestation per-connection, caching verified fingerprints for fast reconnections; handles load-balanced deployments
+- Deterministic enclave measurement via `measure-enclave` crate — pre-computes SEV-SNP and TDX measurements from source, committed in `artifact-manifest.json`
 - Statically linked musl binaries for Linux deployment
 - StageX-based OCI images (reproducible, `FROM scratch`, runs as non-root)
 - Request-based (no sessions/caching in the proxy layer)
@@ -47,6 +48,21 @@ The credential master key (`CREDENTIAL_MASTER_KEY`, AES-256, hex-encoded) encryp
 
 The container has access to `/dev/sev-guest` (via the undocumented `devices` field in `tinfoil-config.yml`) for requesting SEV-SNP attestation reports. The pre-generated attestation document and TLS key material are also available at `/tinfoil/` inside the container.
 
+**Enclave measurement (`crates/measure-enclave/`):**
+
+The `measure-enclave` binary pre-computes the hardware attestation measurements that a legitimate Tinfoil Container will produce. The measurement is a deterministic function of:
+
+1. OVMF firmware (pinned from `tinfoilsh/edk2`)
+2. CVM kernel + initrd (versioned from `tinfoilsh/cvmimage`, hash-verified)
+3. Kernel command line (embeds dm-verity roothash + SHA-256 of `tinfoil-config.yml`)
+4. vCPU count and type
+
+The binary uses `sev` (with `crypto_nossl` feature — pure Rust, no OpenSSL) for SEV-SNP launch digest computation and `tdx-measure` for TDX RTMR1/RTMR2 runtime measurements. Both work natively on macOS.
+
+`tinfoil-config.yml` is the Tinfoil Container configuration. It references container images by digest (from `artifact-manifest.json`), declares `_HASH` env vars for measured secrets (Argon2id hashes generated via `cargo run -p hash-secret`), and specifies CVM resources (cpus, memory). The SHA-256 of this file is embedded in the kernel command line and bound into the enclave measurement, so any change to the config produces a different measurement.
+
+The measurement flow: `source → deterministic OCI build → digest → tinfoil-config.yml (with digest) → cmdline (with config hash) → measurement`. All values are committed in `artifact-manifest.json` and verified by CI. CVM artifacts are cached locally at `~/.cache/eidola/cvm/`.
+
 **Tinfoil attestation verification (`crates/tinfoil-verifier/`):**
 
 On startup the server verifies the Tinfoil inference enclave's hardware attestation before sending any traffic. The `tinfoil-verifier` crate handles this via `attesting_client()`:
@@ -70,7 +86,7 @@ The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform 
 
 **Key pattern:** The core never performs side-effects directly. It emits Effects that the shell handles, then the shell sends responses back via `handleResponse()`.
 
-**Capability implementations:** Pure Rust crates in `crates/` implement capability logic. The same `crates/` tree also contains the Rust code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) plus operational utilities such as `tinfoil-shim-mock` and `hash-secret`. These are compiled into `eidola-shared` and exposed via UniFFI, so the Swift shell can call them directly.
+**Capability implementations:** Pure Rust crates in `crates/` implement capability logic. The same `crates/` tree also contains the Rust code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) plus operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`. These are compiled into `eidola-shared` and exposed via UniFFI, so the Swift shell can call them directly.
 
 **Two codegen pipelines:**
 - `uniffi-bindgen-swift` (workspace crate under `crates/`) → FFI bridge (`processEvent`, `handleResponse`, `view`)
@@ -110,6 +126,6 @@ The `justfile` is the primary development interface. Run `just` to see all avail
 - `rustup` + `rust-toolchain.toml` manages the Rust toolchain for development
 - OpenAI API format as the canonical interface
 - Server API is documented via utoipa `#[utoipa::path]` annotations on handler functions and `ToSchema` derives on request/response types. `OpenApiRouter` (in `lib.rs::build_router()`) collects paths and recursively discovers schemas automatically — only SSE streaming types that aren't referenced from path annotations are listed manually in `api_doc.rs`. When adding or changing server endpoints, add the annotation on the handler and register it in `build_router()` via `routes!()`, then run `just update-openapi` to regenerate the committed `openapi.json`
-- `artifact-manifest.json` (v1 format) records expected OCI digests plus the macOS app/CLI Nix `narHash` values with type/platform metadata; CI verifies the full file by merging digests captured from the real OCI and macOS build jobs. Use `just update-manifest` to regenerate it on macOS with the pinned amd64 BuildKit builder plus the local Nix macOS builds
+- `artifact-manifest.json` (v1 format) records expected OCI digests, macOS app/CLI Nix `narHash` values, and enclave measurements (SEV-SNP + TDX) with type/platform metadata; CI verifies the full file by merging digests captured from the real OCI and macOS build jobs and recomputing enclave measurements from `tinfoil-config.yml`. Use `just update-manifest` to regenerate it on macOS with the pinned amd64 BuildKit builder plus the local Nix macOS builds
 - Before committing, ensure `README.md` and `AGENTS.md` are updated to reflect any changes (new files, endpoints, env vars, build commands, etc.)
 - Omit any tool-specific "co-authored by" lines from commit messages

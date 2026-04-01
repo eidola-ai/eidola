@@ -13,6 +13,11 @@ authors = ["Mike Marcacci"]
 repository = "https://github.com/eidola-ai/eidola"
 publish = false
 
+# Override sev crate with crypto_nossl measurement support (snp_calc_launch_digest).
+# Switch to crates.io once https://github.com/virtee/sev merges the upstream PR.
+[patch.crates-io]
+sev = { git = "https://github.com/eidola-ai/sev", branch = "crypto_nossl_measurement" }
+
 [profile.docker-dev]
 inherits = "dev"
 opt-level = 1
