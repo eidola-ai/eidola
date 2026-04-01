@@ -4,12 +4,12 @@
     "eidola-server": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:5a234ff205fb90a744352e881713559d006f4e3b1ba702cca349dbe1ddb747e2"
+      "digest": "sha256:6bf2524414f55f771f70c1f47a9e780625228b760cb5a346688cc91b2ab996cc"
     },
     "eidola-cli": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:0a1a5468838d56669c5f6ed313f886f29fa8af0d729baa91aadb8b1c332bf9c2"
+      "digest": "sha256:21c772f28cc9ba2def146461bd8dc739ba2c0362b80d8826d917cde9e6d341e2"
     },
     "eidola-postgres": {
       "type": "oci",
@@ -19,12 +19,12 @@
     "eidola-macos-app": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-JGBLibQAKovA+6+YO0hF+4F6MpoeWVxoIlbWvoqo5mc="
+      "narHash": "sha256-HG2DM3A05HktBf38ePmp7ALYbRnuP9EF3YklRnf/0f8="
     },
     "eidola-cli-macos-universal": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-6F055dH7yQRLZApK5uiZThNilVf/rtnkex+MqlS1A44="
+      "narHash": "sha256-9iodSKu7lgeUV7JiIMpQlD+aEZRBMZMi8yHfKdCqIEs="
     }
   }
 }
