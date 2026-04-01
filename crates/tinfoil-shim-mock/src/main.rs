@@ -37,6 +37,7 @@ use der::{Decode, Encode, asn1::BitString};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use rcgen::KeyPair;
+use rsa::sha2 as rsa_sha2;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -106,7 +107,7 @@ fn build_rsa_pss_cert(
     issuer: &x509_cert::name::Name,
     subject: &x509_cert::name::Name,
     spki: SubjectPublicKeyInfoOwned,
-    signer: &rsa::pss::SigningKey<sha2::Sha384>,
+    signer: &rsa::pss::SigningKey<rsa_sha2::Sha384>,
     extensions: Option<x509_cert::ext::Extensions>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let sig_alg = rsa_pss_alg_id();
@@ -210,11 +211,9 @@ fn build_report(measurement: &[u8], tls_fingerprint: &[u8; 32]) -> [u8; REPORT_S
 /// at offset 0x2A0. The `sev` crate expects 72-byte R and S fields containing
 /// 48-byte little-endian scalars, zero-padded to 72 bytes.
 fn sign_report(report: &mut [u8; REPORT_SIZE], key: &p384::ecdsa::SigningKey) {
-    use p384::ecdsa::signature::DigestSigner;
-    use sha2::Sha384;
+    use p384::ecdsa::signature::Signer;
 
-    let digest = Sha384::new_with_prefix(&report[..OFF_SIGNATURE]);
-    let sig: p384::ecdsa::Signature = key.sign_digest(digest);
+    let sig: p384::ecdsa::Signature = key.sign(&report[..OFF_SIGNATURE]);
     let (r, s) = sig.split_bytes();
 
     // R: 48 bytes big-endian → little-endian in first 48 bytes of 72-byte field
@@ -300,8 +299,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ark_rsa_key = load_or_generate_rsa_key(Path::new(&cert_dir).join("ark.key"), "ARK")?;
     let ask_rsa_key = load_or_generate_rsa_key(Path::new(&cert_dir).join("ask.key"), "ASK")?;
 
-    let ark_pss_signer = rsa::pss::SigningKey::<sha2::Sha384>::new(ark_rsa_key.clone());
-    let ask_pss_signer = rsa::pss::SigningKey::<sha2::Sha384>::new(ask_rsa_key.clone());
+    let ark_pss_signer = rsa::pss::SigningKey::<rsa_sha2::Sha384>::new(ark_rsa_key.clone());
+    let ask_pss_signer = rsa::pss::SigningKey::<rsa_sha2::Sha384>::new(ask_rsa_key.clone());
 
     // ── 2. Build ARK + ASK certs (regenerated from persistent keys) ─────
     //

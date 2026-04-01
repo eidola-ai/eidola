@@ -320,7 +320,7 @@ jobs:
             echo "match=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Suggest manifest update (PR only)
+      - name: Request manifest update (PR only)
         if: steps.verify.outputs.match == 'false' && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -328,27 +328,18 @@ jobs:
           ACTUAL: ${{ steps.verify.outputs.actual }}
         run: |
           FORMATTED=$(echo "$ACTUAL" | jq '.')
-          LINE_COUNT=$(wc -l < artifact-manifest.json | tr -d ' ')
 
-          # Strip the outer braces from the suggestion so lines 1 ({) and N (})
-          # remain as unchanged context. This avoids GitHub's "applying suggestions
-          # on deleted lines is not supported" error and produces a cleaner diff.
-          INNER=$(echo "$FORMATTED" | sed '1d;$d')
-          SUGGESTION_BODY=$(printf '```suggestion\n%s\n```' "$INNER")
-          LAST=$((LINE_COUNT - 1))
+          # Post a REQUEST_CHANGES review with the expected manifest in the
+          # body. We avoid line-level suggestions because GitHub's UI cannot
+          # apply them when the diff contains deleted-and-replaced lines,
+          # which happens on virtually every manifest update.
+          BODY=$(printf '**Artifact Manifest Update Required**\n\nThe built OCI and macOS artifacts produce different digests than what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` on macOS to regenerate it, or replace the file contents with:\n\n```json\n%s\n```' "$FORMATTED")
 
           jq -n \
-            --arg body "$SUGGESTION_BODY" \
-            --argjson last "$LAST" \
+            --arg body "$BODY" \
             '{
               event: "REQUEST_CHANGES",
-              body: "**Artifact Manifest Update Required**\n\nThe built OCI and macOS artifacts produce different digests than what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` on macOS to regenerate it, or apply the suggestion below.",
-              comments: [{
-                path: "artifact-manifest.json",
-                start_line: 2,
-                line: $last,
-                body: $body
-              }]
+              body: $body
             }' | gh api --silent -X POST \
               "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
               --input -

@@ -40,7 +40,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Anonymous credentials (Privacy Pass)
 anonymous-credit-tokens = "0.4"
 aes-gcm = "0.10"
-hkdf = "0.12"
+hkdf = "0.13"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Database
@@ -58,8 +58,8 @@ base64 = "0.22"
 hex = "0.4"
 
 # Webhook signature verification
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 subtle = "2"
 
 # Tinfoil attestation verification
