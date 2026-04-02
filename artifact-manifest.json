@@ -4,12 +4,12 @@
     "eidola-server": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:3b232fa817533ce34df3298d51f9375022af07e6fdd2b3692e24a6e88118aad1"
+      "digest": "sha256:835ef9158dea994da5bda97dd3789ae4857ae991fd3bded86c12bdf01a7cd755"
     },
     "eidola-cli": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:a173c55d425afe987b18dcf9420bf394e10fd50f009da637f702fc30faf8a1ef"
+      "digest": "sha256:ac3a842fe1fd34b0dc4bf489403e87097a4b50f98d5f9f02b7667cc6d8e3645f"
     },
     "eidola-postgres": {
       "type": "oci",
@@ -24,7 +24,7 @@
     "eidola-cli-macos-universal": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-dsxEI6zcMyhaIVWNlX2cAoMfUJZlEzAZCIxaFyfb40M="
+      "narHash": "sha256-hZ3fKmAw0+nnKw9JTXQsPTtGLJWIV7sx7DPboobOAcs="
     }
   },
   "enclave": {
