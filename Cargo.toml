@@ -27,8 +27,8 @@ opt-level = 1
 incremental = false
 # Codegen units are set to 1 to avoid potential non-determinism.
 codegen-units = 1
-# Enable link-time optimization for better determinism
-lto = true
+# Explicit thin link-time optimization
+lto = "thin"
 # Explicit optimization level
 opt-level = 3
 # Strip symbols for determinism
