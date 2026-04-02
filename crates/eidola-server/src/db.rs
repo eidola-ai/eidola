@@ -83,16 +83,6 @@ fn build_tls_config(database_ssl_cert: Option<&str>) -> Result<rustls::ClientCon
         .with_no_client_auth())
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn normalizes_verify_full_sslmode() {
-        let normalized = "postgres://user@db.example.com/postgres?sslmode=verify-full"
-            .replace("sslmode=verify-full", "sslmode=require");
-        assert!(normalized.contains("sslmode=require"));
-    }
-}
-
 /// Insert a new account and return its `created_at` timestamp.
 pub async fn insert_account(
     pool: &Pool,
@@ -577,4 +567,14 @@ pub async fn get_ledger_entries(
             credential_credits: row.get("credential_credits"),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn normalizes_verify_full_sslmode() {
+        let normalized = "postgres://user@db.example.com/postgres?sslmode=verify-full"
+            .replace("sslmode=verify-full", "sslmode=require");
+        assert!(normalized.contains("sslmode=require"));
+    }
 }
