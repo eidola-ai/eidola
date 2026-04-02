@@ -3,6 +3,11 @@
 //! Updated by CI when Tinfoil publishes new enclave builds.
 //! At least two entries for rolling deploys (current + previous).
 //!
+//! SEV-SNP measurements are 96-char hex strings (48 bytes, single launch digest).
+//! TDX measurements are 192-char hex strings (RTMR1 || RTMR2 concatenated, 96 bytes).
+//! Both types coexist in the same ALLOWED list — the verifier dispatches based on
+//! the attestation document's platform field, not the measurement format.
+//!
 //! Source repo: tinfoilsh/confidential-model-router
 
 /// Tinfoil inference enclave v0.0.79

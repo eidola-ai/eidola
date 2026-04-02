@@ -55,10 +55,18 @@ pub struct AttestationCPU {
     pub report: String, // base64-encoded raw report (NOT gzipped)
 }
 
+/// TEE platform identified from the attestation document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    SevSnp,
+    Tdx,
+}
+
 /// Unified attestation data extracted from either v2 or v3 documents.
 /// Used by the verification pipeline so the rest of the code doesn't
 /// need to care which format was fetched.
 pub struct ResolvedAttestation {
+    pub platform: Platform,
     pub report_bytes: Vec<u8>,
     pub vcek_der: Option<Vec<u8>>,
     pub ark_der: Option<Vec<u8>>,
@@ -66,8 +74,20 @@ pub struct ResolvedAttestation {
     pub enclave_cert: Option<String>,
 }
 
-const V2_FORMAT: &str = "https://tinfoil.sh/predicate/sev-snp-guest/v2";
+const V2_SNP_FORMAT: &str = "https://tinfoil.sh/predicate/sev-snp-guest/v2";
+const V2_TDX_FORMAT: &str = "https://tinfoil.sh/predicate/tdx-guest/v2";
 const V3_FORMAT: &str = "https://tinfoil.sh/predicate/attestation/v3";
+
+/// Determine the platform from a V2 format string.
+pub fn platform_from_format(format: &str) -> Result<Platform, Error> {
+    match format {
+        V2_SNP_FORMAT => Ok(Platform::SevSnp),
+        V2_TDX_FORMAT => Ok(Platform::Tdx),
+        _ => Err(Error::Bundle(format!(
+            "unsupported attestation format: {format}"
+        ))),
+    }
+}
 
 /// Default Tinfoil attestation transparency service URL.
 pub const DEFAULT_ATC_URL: &str = "https://atc.tinfoil.sh/attestation";
@@ -98,10 +118,10 @@ pub async fn fetch_bundle(atc_url: Option<&str>) -> Result<AttestationBundle, Er
         .json()
         .await?;
 
-    if bundle.enclave_attestation_report.format != V2_FORMAT {
+    let format = &bundle.enclave_attestation_report.format;
+    if format != V2_SNP_FORMAT && format != V2_TDX_FORMAT {
         return Err(Error::Bundle(format!(
-            "unsupported attestation format: {}",
-            bundle.enclave_attestation_report.format,
+            "unsupported attestation format: {format}",
         )));
     }
 
@@ -123,9 +143,12 @@ pub async fn fetch_well_known(
         && resp.status().is_success()
         && let Ok(doc) = resp.json::<AttestationDocumentV3>().await
         && doc.format == V3_FORMAT
-        && doc.cpu.platform == "sev-snp"
+        && (doc.cpu.platform == "sev-snp" || doc.cpu.platform == "tdx")
     {
-        tracing::info!("Using v3 attestation document");
+        tracing::info!(
+            "Using v3 attestation document (platform: {})",
+            doc.cpu.platform
+        );
         return resolve_v3(&doc);
     }
 
@@ -143,7 +166,9 @@ pub async fn fetch_well_known(
 
 /// Resolve a v2 attestation document into unified format.
 pub fn resolve_v2(doc: &AttestationDocumentV2) -> Result<ResolvedAttestation, Error> {
+    let platform = platform_from_format(&doc.format)?;
     Ok(ResolvedAttestation {
+        platform,
         report_bytes: decode_report_gzipped(&doc.body)?,
         vcek_der: doc
             .vcek
@@ -157,8 +182,18 @@ pub fn resolve_v2(doc: &AttestationDocumentV2) -> Result<ResolvedAttestation, Er
 
 /// Resolve a v3 attestation document into unified format.
 pub fn resolve_v3(doc: &AttestationDocumentV3) -> Result<ResolvedAttestation, Error> {
+    let platform = match doc.cpu.platform.as_str() {
+        "tdx" => Platform::Tdx,
+        "sev-snp" => Platform::SevSnp,
+        other => {
+            return Err(Error::Bundle(format!(
+                "unsupported attestation platform: {other}"
+            )));
+        }
+    };
     let report_bytes = sevsnp::decode_base64(&doc.cpu.report)?;
     Ok(ResolvedAttestation {
+        platform,
         report_bytes,
         vcek_der: doc
             .vcek

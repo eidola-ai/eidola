@@ -1,20 +1,30 @@
 # tinfoil-verifier
 
-Verifies [Tinfoil](https://tinfoil.sh) enclave attestation and pins TLS connections to the attested certificate. This ensures the eidola server only sends inference traffic to a genuine AMD SEV-SNP enclave running expected code.
+Verifies [Tinfoil](https://tinfoil.sh) enclave attestation and pins TLS connections to the attested certificate. This ensures the eidola server only sends inference traffic to a genuine TEE enclave running expected code.
+
+Supports both **AMD SEV-SNP** and **Intel TDX** enclaves.
 
 ## What it does
 
-`verify_and_pin()` performs a single end-to-end verification on startup:
+`attesting_client()` performs a single end-to-end verification on startup and returns a client that re-verifies attestation on each new TLS connection:
 
-1. **Fetch** the attestation bundle from Tinfoil's ATC service
+### AMD SEV-SNP
+1. **Fetch** the attestation bundle from Tinfoil's ATC service or the server's well-known endpoint
 2. **Verify the VCEK certificate chain** (embedded AMD Genoa ARK → ASK → VCEK) via RSA-PSS(SHA-384)
 3. **Verify the attestation report signature** (ECDSA-P384) against the VCEK public key
 4. **Validate TCB policy** — minimum firmware versions (`bl >= 0x07`, `snp >= 0x0e`, `ucode >= 0x48`)
-5. **Check the code measurement** against a hardcoded allowlist
+5. **Check the code measurement** (48-byte launch digest) against the allowlist
 6. **Cross-check the enclave TLS certificate** against `report_data[0..32]` (SHA-256 of SPKI)
-7. **Return a pinned `reqwest::Client`** that rejects any server whose public key fingerprint doesn't match
 
-Steps 2–3 are delegated to the [`sev`](https://crates.io/crates/sev) crate (virtee/sev) with the `crypto_nossl` feature for pure-Rust cryptography.
+### Intel TDX
+1. **Fetch** the attestation document from Tinfoil's ATC service or the server's well-known endpoint
+2. **Fetch collateral** (TCB info, QE identity, CRLs) from Intel's Provisioning Certification Service
+3. **Verify the TDX Quote V4** signature against Intel's SGX Provisioning Root CA
+4. **Validate TCB policy** and TDX module identity via Intel-signed collateral
+5. **Check the code measurement** (RTMR1 || RTMR2, 96 bytes concatenated) against the allowlist
+6. **Cross-check the enclave TLS certificate** against `report_data[0..32]` (SHA-256 of SPKI)
+
+SEV-SNP verification is delegated to the [`sev`](https://crates.io/crates/sev) crate (virtee/sev) with the `crypto_nossl` feature. TDX verification is delegated to [`dcap-qvl`](https://crates.io/crates/dcap-qvl) with the `rustcrypto` backend. Both are pure Rust — no OpenSSL.
 
 ## Usage
 
