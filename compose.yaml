@@ -24,7 +24,7 @@ services:
       context: .
       dockerfile: oci/eidola-server/Containerfile
     environment:
-      DATABASE_URL: postgres://eidola@postgres/eidola
+      DATABASE_URL: postgres://eidola@postgres/eidola?options=-csearch_path%3Deidola
       TINFOIL_API_KEY: ${TINFOIL_API_KEY}
       CREDENTIAL_MASTER_KEY: ${CREDENTIAL_MASTER_KEY}
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}

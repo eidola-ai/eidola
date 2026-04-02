@@ -40,7 +40,7 @@ containers:
       - DATABASE_PASSWORD
     env:
       - BIND_ADDR: "0.0.0.0:8080"
-      - DATABASE_URL: "postgres://gateway@db.rpadyfspzqiwmoytihmg.supabase.co:5432/postgres?sslmode=require"
+      - DATABASE_URL: "postgres://gateway@db.rpadyfspzqiwmoytihmg.supabase.co:5432/postgres?sslmode=require&options=-csearch_path%3Deidola"
       # Public root CA certificate for the external Postgres instance.
       - DATABASE_SSL_CERT: |
           -----BEGIN CERTIFICATE-----
