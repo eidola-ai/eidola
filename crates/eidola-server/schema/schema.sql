@@ -62,7 +62,7 @@ CREATE TABLE issuer_key (
     accept_until    TIMESTAMPTZ NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    CONSTRAINT id_is_key_hash CHECK (id = encode(digest(public_key, 'sha256'), 'hex')),
+    CONSTRAINT id_is_key_hash CHECK (id = encode(sha256(public_key), 'hex')),
     CONSTRAINT issue_window CHECK (issue_from < issue_until),
     CONSTRAINT grace_window CHECK (issue_until <= accept_until)
 );

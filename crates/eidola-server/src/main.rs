@@ -23,6 +23,8 @@ struct Config {
     tinfoil_api_key: String,
     tinfoil_base_url: Option<String>,
     database_url: String,
+    database_password: Option<String>,
+    database_ssl_cert: Option<String>,
     stripe_api_key: Option<String>,
     stripe_webhook_secret: Option<String>,
     credential_master_key: [u8; 32],
@@ -43,6 +45,14 @@ impl Config {
 
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
+
+        let database_password = std::env::var("DATABASE_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let database_ssl_cert = std::env::var("DATABASE_SSL_CERT")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         let stripe_api_key = std::env::var("STRIPE_API_KEY")
             .ok()
@@ -76,6 +86,10 @@ impl Config {
         verify_measured_secrets(&[
             ("CREDENTIAL_MASTER_KEY", &credential_master_key_hex),
             ("TINFOIL_API_KEY", &tinfoil_api_key),
+            (
+                "DATABASE_PASSWORD",
+                database_password.as_deref().unwrap_or(""),
+            ),
             ("STRIPE_API_KEY", stripe_api_key.as_deref().unwrap_or("")),
             (
                 "STRIPE_WEBHOOK_SECRET",
@@ -88,6 +102,8 @@ impl Config {
             tinfoil_api_key,
             tinfoil_base_url,
             database_url,
+            database_password,
+            database_ssl_cert,
             stripe_api_key,
             stripe_webhook_secret,
             credential_master_key,
@@ -163,7 +179,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Starting Eidola server on {}", config.bind_addr);
 
     // Create database connection pool
-    let db_pool = eidola_server::db::create_pool(&config.database_url).map_err(|e| {
+    let db_pool = eidola_server::db::create_pool(
+        &config.database_url,
+        config.database_password.as_deref(),
+        config.database_ssl_cert.as_deref(),
+    )
+    .map_err(|e| {
         error!("Database pool error: {}", e);
         e
     })?;

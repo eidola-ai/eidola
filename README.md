@@ -6,11 +6,15 @@
 
 The Rust toolchain version is pinned in `rust-toolchain.toml` and installed automatically by rustup. Run `just` to see all available recipes.
 
-All Rust workspace packages now live under `crates/`, including the code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) and operational utilities such as `tinfoil-shim-mock` and `hash-secret`.
+All Rust workspace packages now live under `crates/`, including the code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`.
 
 ### Server
 
 The server requires environment variables to work correctly. See .env.example.
+For local development, `DATABASE_URL=postgres://eidola@localhost/eidola` uses the plain Postgres
+container from `compose.yaml`. For production, you can point `DATABASE_URL` at an external Postgres,
+set `DATABASE_PASSWORD` as a secret, and optionally provide `DATABASE_SSL_CERT` with the PEM-encoded
+root CA certificate if the database does not chain to the default WebPKI roots.
 
 For a complete postgres, server, and stripe webhook forwarding run:
 
@@ -78,10 +82,16 @@ just update-openapi       # OpenAPI spec
 just update-xcframework   # XCFramework (dev, native arch only)
 ```
 
-To refresh `artifact-manifest.json` for the OCI images plus the macOS app and CLI, run:
+To refresh `artifact-manifest.json` for the OCI images, macOS app/CLI, and enclave measurements, run:
 
 ```bash
 just update-manifest
 ```
 
-This uses the pinned amd64 BuildKit builder configuration for the OCI images plus the local Nix macOS builds for the app and CLI, so it currently needs to run on macOS.
+This uses the pinned amd64 BuildKit builder configuration for the OCI images, the local Nix macOS builds for the app and CLI, and the `measure-enclave` binary to compute SEV-SNP and TDX measurements from `tinfoil-config.yml`. It currently needs to run on macOS.
+
+To compute enclave measurements independently (without rebuilding images):
+
+```bash
+just measure
+```

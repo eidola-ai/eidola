@@ -46,6 +46,8 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # Database
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 deadpool-postgres = "0.14"
+tokio-postgres-rustls = "0.13.0"
+rustls-pemfile = "2.2.0"
 
 # Authentication
 argon2 = "0.5"

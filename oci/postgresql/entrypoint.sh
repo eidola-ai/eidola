@@ -25,11 +25,12 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
     createdb -U "$POSTGRES_USER" "$POSTGRES_DB"
   fi
 
-  # Run any init scripts
+  # Create the eidola schema and run init scripts within it
+  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE SCHEMA IF NOT EXISTS eidola;"
   for f in /docker-entrypoint-initdb.d/*.sql; do
     if [ -f "$f" ]; then
       echo "Running init script: $f"
-      psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f "$f"
+      PGOPTIONS="-c search_path=eidola" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f "$f"
     fi
   done
 

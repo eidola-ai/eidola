@@ -64,9 +64,14 @@ build:
     # Build OCI images (server, cli, postgresql)
     docker buildx bake
 
-# Update artifact-manifest.json with current build digests
+# Compute enclave measurements from tinfoil-config.yml and CVM artifacts
+measure:
+    ./scripts/artifact-manifest.sh measure
+
+# Update artifact-manifest.json with current build digests and measurements
 # Builds the OCI images plus the macOS app/CLI, then records their digests.
-# Requires macOS for the Nix-built app and CLI artifacts.
+# Also stamps image digests into tinfoil-config.yml and computes enclave
+# measurements. Requires macOS for the Nix-built app and CLI artifacts.
 update-manifest:
     ./scripts/artifact-manifest.sh update --ensure-builder
 
