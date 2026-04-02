@@ -126,7 +126,7 @@ cached_download() {
     return 0
   fi
   mkdir -p "$(dirname "$dest")"
-  echo "Downloading $(basename "$dest")..."
+  echo "Downloading $(basename "$dest")..." >&2
   curl -fsSL --retry 3 -o "$dest" "$url"
 }
 
