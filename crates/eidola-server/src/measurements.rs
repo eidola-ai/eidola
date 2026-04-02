@@ -3,18 +3,17 @@
 //! Updated by CI when Tinfoil publishes new enclave builds.
 //! At least two entries for rolling deploys (current + previous).
 //!
-//!
 //! Source repo: tinfoilsh/confidential-model-router
 
-/// Tinfoil inference enclave v0.0.77
+/// Tinfoil inference enclave v0.0.79
 /// Built: 2026-03-16T23:01:15Z
-/// Artifact digest: sha256:616af84f7483699b0d08aeb0e31bff42bc38c1b84280045e306b3775f7df175b
-/// Rekor log index: 1203584482
-/// Sigstore: https://search.sigstore.dev/?logIndex=1203584482
-/// GitHub: https://github.com/tinfoilsh/confidential-model-router/releases/tag/v0.0.77
-const CURRENT: &str = "0fd23214514ef717881179b954dc06618f6abe13b15cd372e040047e2a28cb7b56d3bb482ededfd12f0f5caf7880ccb4";
+/// Artifact digest: sha256:52be78d7a7fbbff988f252d77006e07c6874e7431c4752c01a56e6e9b8e2f853
+/// Rekor log index: 1211200183
+/// Sigstore: https://search.sigstore.dev/?logIndex=1211200183
+/// GitHub: https://github.com/tinfoilsh/confidential-model-router/releases/tag/v0.0.79
+const CURRENT: &str = "2b24e7d18c2c6de912cfe32218bfb1a66d961cc3b06d623651114905bf617de95035ed47330ffa12cfb3847c3a369b37";
 
-/// Previous: v0.0.70
-const PREVIOUS: &str = "630af778a62ccb543893f27e9669d8b52c73e3829d75fb7efa626af5c108c56a367b5734a62a93ec347111ee064011bd";
+/// Previous: v0.0.77
+const PREVIOUS: &str = "0fd23214514ef717881179b954dc06618f6abe13b15cd372e040047e2a28cb7b56d3bb482ededfd12f0f5caf7880ccb4";
 
 pub const ALLOWED: &[&str] = &[CURRENT, PREVIOUS];
