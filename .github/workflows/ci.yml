@@ -308,7 +308,7 @@ jobs:
           path: ~/.cache/eidola/cvm
           key: cvm-${{ hashFiles('tinfoil-config.yml') }}
 
-      - name: Combine partial manifests
+      - name: Materialize partial manifests
         run: |
           cat > /tmp/oci-artifact-manifest.json <<'EOF'
           ${{ needs.oci.outputs.artifact_manifest }}
@@ -318,26 +318,22 @@ jobs:
           ${{ needs.apple.outputs.artifact_manifest }}
           EOF
 
-          ./scripts/artifact-manifest.sh merge \
-            --partial /tmp/oci-artifact-manifest.json \
-            --partial /tmp/apple-artifact-manifest.json \
-            --output /tmp/artifact-manifest-actual.json
-
       - name: Verify full artifact manifest
         id: verify
         run: |
-          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
-          cat /tmp/artifact-manifest-actual.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
           if ./scripts/artifact-manifest.sh verify-full \
             --partial /tmp/oci-artifact-manifest.json \
             --partial /tmp/apple-artifact-manifest.json \
-            --manifest artifact-manifest.json; then
+            --manifest artifact-manifest.json \
+            --output /tmp/artifact-manifest-actual.json; then
             echo "match=true" >> "$GITHUB_OUTPUT"
           else
             echo "match=false" >> "$GITHUB_OUTPUT"
           fi
+
+          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/artifact-manifest-actual.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Request manifest update (PR only)
         if: steps.verify.outputs.match == 'false' && github.event_name == 'pull_request'
@@ -352,7 +348,7 @@ jobs:
           # body. We avoid line-level suggestions because GitHub's UI cannot
           # apply them when the diff contains deleted-and-replaced lines,
           # which happens on virtually every manifest update.
-          BODY=$(printf '**Artifact Manifest Update Required**\n\nThe built OCI and macOS artifacts produce different digests than what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` on macOS to regenerate it, or replace the file contents with:\n\n```json\n%s\n```' "$FORMATTED")
+          BODY=$(printf '**Artifact Manifest Update Required**\n\nThe built OCI and macOS artifacts or recomputed enclave measurements differ from what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` on macOS to regenerate it, or replace the file contents with:\n\n```json\n%s\n```' "$FORMATTED")
 
           jq -n \
             --arg body "$BODY" \

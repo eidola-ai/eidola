@@ -11,7 +11,7 @@ Usage:
   scripts/artifact-manifest.sh print-macos [--macos-paths-file PATH | --app-path PATH --cli-path PATH]
   scripts/artifact-manifest.sh measure [--config PATH]
   scripts/artifact-manifest.sh merge [--partial PATH ...] [--output PATH]
-  scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH]
+  scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--output PATH]
   scripts/artifact-manifest.sh update [--output PATH] [--metadata-file PATH] [--builder NAME] [--ensure-builder]
 EOF
 }
@@ -429,6 +429,9 @@ verify_full_manifest() {
   fi
 
   actual_manifest="$(merge_partials)"
+  if [[ -n "$OUTPUT_FILE" ]]; then
+    write_output "$actual_manifest"
+  fi
   actual_norm="$(printf '%s\n' "$actual_manifest" | jq -cS .)"
   committed_norm="$(jq -cS . "$MANIFEST_FILE")"
 

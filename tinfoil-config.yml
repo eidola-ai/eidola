@@ -21,7 +21,7 @@ containers:
   # TODO: how do I expose a port that's NOT behind the shim?
   # TODO: mount initial schema?
   # - name: "eidola-postgres"
-  #   image: "ghcr.io/eidola-ai/eidola-postgres@sha256:8304b0d793eeea7a4ea7df85015ede1299c4c361eb1316bcb60fe37c366fa626"
+  #   image: "ghcr.io/eidola-ai/eidola-postgres@sha256:a2838b26834655ee4b9527c699252ec8de63de4ceb4ccad7dd4f754c1abab8e9"
   #   env:
   #     - POSTGRES_USER: "eidola"
   #     - POSTGRES_DB: "eidola"
@@ -29,7 +29,7 @@ containers:
   #     - /mnt/ramdisk/data:/var/lib/postgresql/data
 
   - name: "eidola-server"
-    image: "ghcr.io/eidola-ai/eidola-server@sha256:dae9a1e84f80b17922e4b310370cf6f0b0375b3109a16fc4fea3796fac3f6a7e"
+    image: "ghcr.io/eidola-ai/eidola-server@sha256:34e8b1cd82265f1453a28d656497ecc084f21880dab9211d6bc548e0f18a0238"
     devices:
       - /dev/sev-guest
     secrets:
