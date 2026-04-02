@@ -670,6 +670,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "cfg_aliases"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
 name = "cfg_block"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3559,7 +3565,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3946,7 +3952,7 @@ dependencies = [
 [[package]]
 name = "sev"
 version = "7.1.0"
-source = "git+https://github.com/eidola-ai/sev?branch=crypto_nossl_measurement#fdd2fcd36cdb996fbcae766a1a22025a4c96faa3"
+source = "git+https://github.com/eidola-ai/sev?rev=fdd2fcd36cdb996fbcae766a1a22025a4c96faa3#fdd2fcd36cdb996fbcae766a1a22025a4c96faa3"
 dependencies = [
  "base64 0.22.1",
  "bitfield",
@@ -4764,8 +4770,8 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turso"
-version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
+version = "0.6.0-pre.15"
+source = "git+https://github.com/eidola-ai/turso?rev=57f08f4c7675ab865cd025bf7fab12c8bf6b4be1#57f08f4c7675ab865cd025bf7fab12c8bf6b4be1"
 dependencies = [
  "thiserror 2.0.18",
  "tracing",
@@ -4776,8 +4782,8 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
+version = "0.6.0-pre.15"
+source = "git+https://github.com/eidola-ai/turso?rev=57f08f4c7675ab865cd025bf7fab12c8bf6b4be1#57f08f4c7675ab865cd025bf7fab12c8bf6b4be1"
 dependencies = [
  "aegis",
  "aes",
@@ -4789,6 +4795,7 @@ dependencies = [
  "branches",
  "bumpalo",
  "bytemuck",
+ "cfg_aliases",
  "cfg_block",
  "chrono",
  "crc32c",
@@ -4839,8 +4846,8 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
+version = "0.6.0-pre.15"
+source = "git+https://github.com/eidola-ai/turso?rev=57f08f4c7675ab865cd025bf7fab12c8bf6b4be1#57f08f4c7675ab865cd025bf7fab12c8bf6b4be1"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -4849,8 +4856,8 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
+version = "0.6.0-pre.15"
+source = "git+https://github.com/eidola-ai/turso?rev=57f08f4c7675ab865cd025bf7fab12c8bf6b4be1#57f08f4c7675ab865cd025bf7fab12c8bf6b4be1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4859,8 +4866,8 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
+version = "0.6.0-pre.15"
+source = "git+https://github.com/eidola-ai/turso?rev=57f08f4c7675ab865cd025bf7fab12c8bf6b4be1#57f08f4c7675ab865cd025bf7fab12c8bf6b4be1"
 dependencies = [
  "bitflags",
  "memchr",
@@ -4873,8 +4880,8 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
+version = "0.6.0-pre.15"
+source = "git+https://github.com/eidola-ai/turso?rev=57f08f4c7675ab865cd025bf7fab12c8bf6b4be1#57f08f4c7675ab865cd025bf7fab12c8bf6b4be1"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -4888,8 +4895,8 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
+version = "0.6.0-pre.15"
+source = "git+https://github.com/eidola-ai/turso?rev=57f08f4c7675ab865cd025bf7fab12c8bf6b4be1#57f08f4c7675ab865cd025bf7fab12c8bf6b4be1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4898,8 +4905,8 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
+version = "0.6.0-pre.15"
+source = "git+https://github.com/eidola-ai/turso?rev=57f08f4c7675ab865cd025bf7fab12c8bf6b4be1#57f08f4c7675ab865cd025bf7fab12c8bf6b4be1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4919,8 +4926,8 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.6.0-pre.7"
-source = "git+https://github.com/eidola-ai/turso?branch=reproducible-builds#79824d7e410d1363ab516be560332b67994b4980"
+version = "0.6.0-pre.15"
+source = "git+https://github.com/eidola-ai/turso?rev=57f08f4c7675ab865cd025bf7fab12c8bf6b4be1#57f08f4c7675ab865cd025bf7fab12c8bf6b4be1"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -5570,15 +5577,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]

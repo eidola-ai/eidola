@@ -28,7 +28,7 @@ sha2 = "0.11"
 tinfoil-verifier = { path = "../../crates/tinfoil-verifier" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 toml = "1"
-turso = { git = "https://github.com/eidola-ai/turso", branch = "reproducible-builds", default-features = false, features = ["pure-rust-crypto"] }
+turso = { git = "https://github.com/eidola-ai/turso", rev = "57f08f4c7675ab865cd025bf7fab12c8bf6b4be1", default-features = false, features = ["pure-rust-crypto"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 x509-cert = "0.2"
 der = { version = "0.7", features = ["pem", "alloc"] }
