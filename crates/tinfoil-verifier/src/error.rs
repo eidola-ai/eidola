@@ -17,6 +17,9 @@ pub enum Error {
     #[error("invalid SEV-SNP report: {0}")]
     Report(String),
 
+    #[error("TDX verification error: {0}")]
+    Tdx(String),
+
     #[error("VCEK certificate chain verification failed: {0}")]
     CertChain(String),
 

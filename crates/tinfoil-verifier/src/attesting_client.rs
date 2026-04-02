@@ -20,7 +20,7 @@ use rustls::crypto::{
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
-use crate::{bundle, sevsnp};
+use crate::{bundle, sevsnp, tdx};
 
 /// A rustls `ServerCertVerifier` that verifies attestation for each new TLS
 /// connection. Fingerprints of previously-attested instances are cached so
@@ -104,9 +104,9 @@ impl AttestingVerifier {
     /// `target_fp`. Adds any successfully-verified fingerprint to the cache
     /// (even if it's not the target — it's still a valid attested instance).
     async fn verify_new_fingerprint(&self, target_fp: [u8; 32]) -> Result<(), crate::Error> {
-        // Ephemeral client for fetching attestation documents. When a custom
-        // trusted root is configured (tinfoil shim mock), it's added so TLS works with
-        // the mock shim's self-signed cert chain.
+        // Ephemeral client for fetching attestation documents and collateral.
+        // When a custom trusted root is configured (tinfoil shim mock), it's added
+        // so TLS works with the mock shim's self-signed cert chain.
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30));
@@ -120,55 +120,26 @@ impl AttestingVerifier {
             .map_err(|e| crate::Error::Tls(format!("ephemeral client: {e}")))?;
 
         for attempt in 0..MAX_VERIFY_ATTEMPTS {
-            // Fetch attestation (tries v3 with embedded VCEK, falls back to v2)
+            // Fetch attestation (tries v3, falls back to v2)
             let resolved = bundle::fetch_well_known(&fetch_client, &self.attestation_url).await?;
 
-            let report_bytes = &resolved.report_bytes;
-            let report = sevsnp::parse_report(report_bytes)?;
-
-            // Resolve VCEK: prefer embedded (v3), fall back to cache/AMD KDS
-            let vcek_der = match resolved.vcek_der {
-                Some(vcek) => vcek,
-                None => self.resolve_vcek(&report, &fetch_client).await?,
+            let (measurement_hex, attested_fp) = match resolved.platform {
+                bundle::Platform::SevSnp => {
+                    self.verify_snp_attestation(&resolved, &fetch_client)
+                        .await?
+                }
+                bundle::Platform::Tdx => {
+                    self.verify_tdx_attestation(&resolved, &fetch_client)
+                        .await?
+                }
             };
-
-            // Resolve ARK/ASK: prefer trusted config, fall back to doc
-            let ark_der = self
-                .trusted_ark_der
-                .as_deref()
-                .or(resolved.ark_der.as_deref());
-            let ask_der = self
-                .trusted_ask_der
-                .as_deref()
-                .or(resolved.ask_der.as_deref());
-
-            // Verify report signature against the VCEK
-            sevsnp::verify_report(&vcek_der, &report, ark_der, ask_der)?;
-            sevsnp::verify_tcb_policy(&report)?;
-
-            // Check measurement
-            let measurement_hex = hex::encode(report.measurement);
-            let matched = self
-                .allowed_measurements
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(&measurement_hex));
-            if !matched {
-                return Err(crate::Error::MeasurementMismatch {
-                    measurement: measurement_hex,
-                    allowed: self.allowed_measurements.clone(),
-                });
-            }
-
-            // Extract the attested fingerprint from report_data[0..32]
-            let attested_fp: [u8; 32] = report.report_data[..32]
-                .try_into()
-                .expect("report_data is 64 bytes");
 
             // Cache this verified fingerprint
             self.verified.insert(attested_fp);
             tracing::info!(
                 fingerprint = hex::encode(attested_fp),
                 measurement = measurement_hex,
+                platform = ?resolved.platform,
                 attempt,
                 "verified enclave instance"
             );
@@ -193,6 +164,82 @@ impl AttestingVerifier {
             "could not verify fingerprint {} after {MAX_VERIFY_ATTEMPTS} attempts",
             hex::encode(target_fp)
         )))
+    }
+
+    /// Verify a SEV-SNP attestation and return (measurement_hex, fingerprint).
+    async fn verify_snp_attestation(
+        &self,
+        resolved: &bundle::ResolvedAttestation,
+        fetch_client: &reqwest::Client,
+    ) -> Result<(String, [u8; 32]), crate::Error> {
+        let report = sevsnp::parse_report(&resolved.report_bytes)?;
+
+        // Resolve VCEK: prefer embedded (v3), fall back to cache/AMD KDS
+        let vcek_der = match &resolved.vcek_der {
+            Some(vcek) => vcek.clone(),
+            None => self.resolve_vcek(&report, fetch_client).await?,
+        };
+
+        // Resolve ARK/ASK: prefer trusted config, fall back to doc
+        let ark_der = self
+            .trusted_ark_der
+            .as_deref()
+            .or(resolved.ark_der.as_deref());
+        let ask_der = self
+            .trusted_ask_der
+            .as_deref()
+            .or(resolved.ask_der.as_deref());
+
+        // Verify report signature against the VCEK
+        sevsnp::verify_report(&vcek_der, &report, ark_der, ask_der)?;
+        sevsnp::verify_tcb_policy(&report)?;
+
+        // Check measurement
+        let measurement_hex = hex::encode(report.measurement);
+        self.check_measurement(&measurement_hex)?;
+
+        let attested_fp: [u8; 32] = report.report_data[..32]
+            .try_into()
+            .expect("report_data is 64 bytes");
+
+        Ok((measurement_hex, attested_fp))
+    }
+
+    /// Verify a TDX attestation and return (measurement_hex, fingerprint).
+    async fn verify_tdx_attestation(
+        &self,
+        resolved: &bundle::ResolvedAttestation,
+        fetch_client: &reqwest::Client,
+    ) -> Result<(String, [u8; 32]), crate::Error> {
+        // Fetch collateral from Intel PCS
+        let collateral = tdx::fetch_collateral(fetch_client, &resolved.report_bytes).await?;
+
+        // Verify the TDX quote
+        let tdx_result = tdx::verify_quote(&resolved.report_bytes, &collateral)?;
+
+        // Check measurement (RTMR1||RTMR2)
+        let measurement_hex = tdx::measurement_hex(&tdx_result.rtmr1, &tdx_result.rtmr2);
+        self.check_measurement(&measurement_hex)?;
+
+        let attested_fp: [u8; 32] = tdx_result.report_data[..32]
+            .try_into()
+            .expect("report_data is 64 bytes");
+
+        Ok((measurement_hex, attested_fp))
+    }
+
+    fn check_measurement(&self, measurement_hex: &str) -> Result<(), crate::Error> {
+        let matched = self
+            .allowed_measurements
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(measurement_hex));
+        if !matched {
+            return Err(crate::Error::MeasurementMismatch {
+                measurement: measurement_hex.to_string(),
+                allowed: self.allowed_measurements.clone(),
+            });
+        }
+        Ok(())
     }
 }
 

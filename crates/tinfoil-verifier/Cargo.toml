@@ -10,6 +10,9 @@ publish.workspace = true
 # SEV-SNP attestation report parsing and certificate chain verification
 sev = { version = "7", default-features = false, features = ["snp", "crypto_nossl"] }
 
+# TDX Quote V4 parsing and verification (pure Rust, rustcrypto backend)
+dcap-qvl = { version = "0.3", default-features = false, features = ["std", "rustcrypto"] }
+
 # DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
 x509-cert = "0.2"
 der = { version = "0.7", features = ["alloc"] }
@@ -25,7 +28,7 @@ webpki-roots = "1"
 dashmap = "6"
 
 # Async runtime (for block_in_place in TLS verifier)
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 
 # Hashing
 sha2 = "0.11"
@@ -34,6 +37,7 @@ sha2 = "0.11"
 base64 = "0.22"
 hex = "0.4"
 flate2 = "1"
+urlencoding = "2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
