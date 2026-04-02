@@ -17,27 +17,62 @@ cpus: 2
 memory: 8192
 
 containers:
-  - name: "eidola-postgres"
-    image: "ghcr.io/eidola-ai/eidola-postgres@sha256:8304b0d793eeea7a4ea7df85015ede1299c4c361eb1316bcb60fe37c366fa626"
-    env:
-      - POSTGRES_USER: "eidola"
-      - POSTGRES_DB: "eidola"
+  # TEMPORARY: this does *not* have a persistent disk and will need to be replaced with a real database.
+  # TODO: how do I expose a port that's NOT behind the shim?
+  # TODO: mount initial schema?
+  # - name: "eidola-postgres"
+  #   image: "ghcr.io/eidola-ai/eidola-postgres@sha256:8304b0d793eeea7a4ea7df85015ede1299c4c361eb1316bcb60fe37c366fa626"
+  #   env:
+  #     - POSTGRES_USER: "eidola"
+  #     - POSTGRES_DB: "eidola"
+  #   volumes:
+  #     - /mnt/ramdisk/data:/var/lib/postgresql/data
 
   - name: "eidola-server"
     image: "ghcr.io/eidola-ai/eidola-server@sha256:6bf2524414f55f771f70c1f47a9e780625228b760cb5a346688cc91b2ab996cc"
     devices:
       - /dev/sev-guest
+    secrets:
+      - CREDENTIAL_MASTER_KEY
+      - TINFOIL_API_KEY
+      - STRIPE_API_KEY
+      - STRIPE_WEBHOOK_SECRET
+      - DATABASE_PASSWORD
     env:
       - BIND_ADDR: "0.0.0.0:8080"
-      - DATABASE_URL: "postgres://eidola@localhost/eidola"
+      - DATABASE_URL: "postgres://gateway@db.rpadyfspzqiwmoytihmg.supabase.co:5432/postgres?sslmode=require"
+      # Public root CA certificate for the external Postgres instance.
+      - DATABASE_SSL_CERT: |
+        -----BEGIN CERTIFICATE-----
+        MIIDxDCCAqygAwIBAgIUbLxMod62P2ktCiAkxnKJwtE9VPYwDQYJKoZIhvcNAQEL
+        BQAwazELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5l
+        dyBDYXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJh
+        c2UgUm9vdCAyMDIxIENBMB4XDTIxMDQyODEwNTY1M1oXDTMxMDQyNjEwNTY1M1ow
+        azELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5ldyBD
+        YXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJhc2Ug
+        Um9vdCAyMDIxIENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqQXW
+        QyHOB+qR2GJobCq/CBmQ40G0oDmCC3mzVnn8sv4XNeWtE5XcEL0uVih7Jo4Dkx1Q
+        DmGHBH1zDfgs2qXiLb6xpw/CKQPypZW1JssOTMIfQppNQ87K75Ya0p25Y3ePS2t2
+        GtvHxNjUV6kjOZjEn2yWEcBdpOVCUYBVFBNMB4YBHkNRDa/+S4uywAoaTWnCJLUi
+        cvTlHmMw6xSQQn1UfRQHk50DMCEJ7Cy1RxrZJrkXXRP3LqQL2ijJ6F4yMfh+Gyb4
+        O4XajoVj/+R4GwywKYrrS8PrSNtwxr5StlQO8zIQUSMiq26wM8mgELFlS/32Uclt
+        NaQ1xBRizkzpZct9DwIDAQABo2AwXjALBgNVHQ8EBAMCAQYwHQYDVR0OBBYEFKjX
+        uXY32CztkhImng4yJNUtaUYsMB8GA1UdIwQYMBaAFKjXuXY32CztkhImng4yJNUt
+        aUYsMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAB8spzNn+4VU
+        tVxbdMaX+39Z50sc7uATmus16jmmHjhIHz+l/9GlJ5KqAMOx26mPZgfzG7oneL2b
+        VW+WgYUkTT3XEPFWnTp2RJwQao8/tYPXWEJDc0WVQHrpmnWOFKU/d3MqBgBm5y+6
+        jB81TU/RG2rVerPDWP+1MMcNNy0491CTL5XQZ7JfDJJ9CCmXSdtTl4uUQnSuv/Qx
+        Cea13BX2ZgJc7Au30vihLhub52De4P/4gonKsNHYdbWjg7OWKwNv/zitGDVDB9Y2
+        CMTyZKG3XEu5Ghl1LEnI3QmEKsqaCLv12BnVjbkSeZsMnevJPs1Ye6TjjJwdik5P
+        o/bKiIz+Fq8=
+        -----END CERTIFICATE-----
+
       # Measured secret hashes — Argon2id hashes of the actual secrets.
-      # The server verifies these at startup; the hashes are bound into
-      # the enclave measurement via this config file's SHA-256.
-      - CREDENTIAL_MASTER_KEY_HASH: ""
-      - TINFOIL_API_KEY_HASH: ""
-      - STRIPE_API_KEY_HASH: ""
-      - STRIPE_WEBHOOK_SECRET_HASH: ""
-    network_mode: "host"
+      - CREDENTIAL_MASTER_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$QA6ZPLR29CAPeushQ+ujFA$cOkF1JJdZoKDDzei5pyDrcsfiDBCuqUDoJaYwXG1G5k"
+      - TINFOIL_API_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$d8t7z4mWAjPzjoANx9fJFQ$+kN/8qNToSPgq7GIknW7PTCF38asH6vs1v9eegE1RbQ"
+      - STRIPE_API_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$qucRiGbS8rYcqJINDlHDcw$qdu/tD4Ymq1by0uPVawIFFneCq757OzZ3/5EPeyFQ4Q"
+      - STRIPE_WEBHOOK_SECRET_HASH: "$argon2id$v=19$m=19456,t=2,p=1$4j33RHeU39z3dQiVU/k2rw$NryykMC9uwJGIQYLG5WeYkP3FHD/Sb8uPlAS2qzsLDc"
+      - DATABASE_PASSWORD_HASH: "$argon2id$v=19$m=19456,t=2,p=1$cysXhP6SVPuB83IC4iD4yw$ygvRvdmSVfH5zq5+8P/Fgnyz6q93VwCuiZxU0GfjtLs"
 
 shim:
   upstream-port: 8080

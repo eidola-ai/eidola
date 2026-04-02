@@ -11,6 +11,10 @@ All Rust workspace packages now live under `crates/`, including the code generat
 ### Server
 
 The server requires environment variables to work correctly. See .env.example.
+For local development, `DATABASE_URL=postgres://eidola@localhost/eidola` uses the plain Postgres
+container from `compose.yaml`. For production, you can point `DATABASE_URL` at an external Postgres,
+set `DATABASE_PASSWORD` as a secret, and optionally provide `DATABASE_SSL_CERT` with the PEM-encoded
+root CA certificate if the database does not chain to the default WebPKI roots.
 
 For a complete postgres, server, and stripe webhook forwarding run:
 

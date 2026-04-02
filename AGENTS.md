@@ -32,6 +32,8 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 **Environment variables:**
 - `TINFOIL_API_KEY` (required) - Tinfoil inference API key
 - `DATABASE_URL` (required) - PostgreSQL connection string
+- `DATABASE_PASSWORD` (optional) - PostgreSQL password; in production with an external database, inject this as a Tinfoil secret instead of embedding it in `DATABASE_URL`
+- `DATABASE_SSL_CERT` (optional) - PEM-encoded root CA certificate for PostgreSQL TLS verification; public material, so this can be passed as a normal env var
 - `CREDENTIAL_MASTER_KEY` (required) - Hex-encoded 32-byte AES-256 key for encrypting issuer private keys at rest in Postgres; in production, injected as a Tinfoil secret; in local dev, use the all-zeros key from `.env.example`
 - `BIND_ADDR` (default: `127.0.0.1:8443`) - Address to bind (HTTP); Containerfile overrides to `0.0.0.0:8080`
 - `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
@@ -45,6 +47,8 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 The server runs as plain HTTP inside a Tinfoil Container. The Tinfoil shim handles TLS termination externally, generating attestation-bearing certificates (attestation hash and HPKE key encoded in SANs, issued by a public CA via ACME). The shim serves `/.well-known/tinfoil-attestation` for client-side verification.
 
 The credential master key (`CREDENTIAL_MASTER_KEY`, AES-256, hex-encoded) encrypts issuer private keys at rest in Postgres. In production, it is injected as a Tinfoil secret (environment variable, encrypted, only accessible inside the enclave). In local dev, use the all-zeros dev key from `.env.example`. The key must remain stable across upgrades so encrypted issuer keys in the database remain accessible.
+
+When using an external PostgreSQL instance until Tinfoil supports persistent disks, keep connection metadata in `DATABASE_URL`, inject `DATABASE_PASSWORD` as a Tinfoil secret, and pass the PEM-encoded server root CA in `DATABASE_SSL_CERT` if the server certificate does not chain to a default WebPKI root. The root CA certificate is public material; only the password and private keys need to be kept secret.
 
 The container has access to `/dev/sev-guest` (via the undocumented `devices` field in `tinfoil-config.yml`) for requesting SEV-SNP attestation reports. The pre-generated attestation document and TLS key material are also available at `/tinfoil/` inside the container.
 

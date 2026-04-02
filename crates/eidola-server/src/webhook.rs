@@ -772,7 +772,7 @@ mod tests {
 
     fn test_pool() -> Pool {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-        db::create_pool(&url).expect("failed to create test pool")
+        db::create_pool(&url, None, None).expect("failed to create test pool")
     }
 
     async fn create_test_account(pool: &Pool, customer_id: &str) -> uuid::Uuid {
