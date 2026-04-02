@@ -22,26 +22,16 @@ WORKDIR /src
 FROM base AS fetch
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY apps/cli/Cargo.toml ./apps/cli/
-COPY crates/eidola-server/Cargo.toml ./crates/eidola-server/
-COPY crates/eidola-shared/Cargo.toml ./crates/eidola-shared/
-COPY crates/generate-openapi/Cargo.toml ./crates/generate-openapi/
-COPY crates/hash-secret/Cargo.toml ./crates/hash-secret/
-COPY crates/shared-typegen/Cargo.toml ./crates/shared-typegen/
-COPY crates/tinfoil-shim-mock/Cargo.toml ./crates/tinfoil-shim-mock/
-COPY crates/tinfoil-verifier/Cargo.toml ./crates/tinfoil-verifier/
-COPY crates/uniffi-bindgen-swift/Cargo.toml ./crates/uniffi-bindgen-swift/
+COPY --parents apps/*/Cargo.toml crates/*/Cargo.toml ./
 
 # Stub source files so cargo can resolve all workspace members.
-RUN mkdir -p apps/cli/src && echo 'fn main(){}' > apps/cli/src/main.rs \
-    && mkdir -p crates/eidola-server/src && echo 'fn main(){}' > crates/eidola-server/src/main.rs && touch crates/eidola-server/src/lib.rs \
-    && mkdir -p crates/eidola-shared/src && touch crates/eidola-shared/src/lib.rs \
-    && mkdir -p crates/generate-openapi/src && echo 'fn main(){}' > crates/generate-openapi/src/main.rs \
-    && mkdir -p crates/hash-secret/src && echo 'fn main(){}' > crates/hash-secret/src/main.rs \
-    && mkdir -p crates/shared-typegen/src && echo 'fn main(){}' > crates/shared-typegen/src/main.rs \
-    && mkdir -p crates/tinfoil-shim-mock/src && echo 'fn main(){}' > crates/tinfoil-shim-mock/src/main.rs \
-    && mkdir -p crates/tinfoil-verifier/src && touch crates/tinfoil-verifier/src/lib.rs \
-    && mkdir -p crates/uniffi-bindgen-swift/src && echo 'fn main(){}' > crates/uniffi-bindgen-swift/src/main.rs
+# Creates both lib.rs and main.rs (for [[bin]] crates) so that cargo can
+# resolve intra-workspace library dependencies during fetch.
+RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do \
+      dir="$(dirname "$manifest")/src"; mkdir -p "$dir"; \
+      touch "$dir/lib.rs"; \
+      if grep -q '^\[\[bin\]\]' "$manifest"; then echo 'fn main(){}' > "$dir/main.rs"; fi; \
+    done
 
 RUN cargo fetch --locked --target ${TARGET}
 
