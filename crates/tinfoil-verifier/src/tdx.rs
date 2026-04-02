@@ -276,6 +276,38 @@ fn extract_root_ca_cdp(pem_chain: &str) -> Result<String, Error> {
     ))
 }
 
+/// Extract a URL-decoded header value from an HTTP response.
+fn extract_header(resp: &reqwest::Response, name: &str) -> Option<String> {
+    resp.headers()
+        .get(name)?
+        .to_str()
+        .ok()
+        .and_then(|v| urlencoding::decode(v).ok())
+        .map(|v| v.into_owned())
+}
+
+/// Extract the inner JSON object and hex-decoded signature from an Intel PCS
+/// signed JSON wrapper (e.g. `{"tcbInfo": {...}, "signature": "hex"}`).
+fn extract_signed_json(
+    body: &serde_json::Value,
+    inner_key: &str,
+) -> Result<(String, Vec<u8>), Error> {
+    let inner = body
+        .get(inner_key)
+        .ok_or_else(|| Error::Tdx(format!("missing '{inner_key}' in PCS response")))?;
+    let inner_json = serde_json::to_string(inner)
+        .map_err(|e| Error::Tdx(format!("failed to serialize '{inner_key}': {e}")))?;
+
+    let sig_hex = body
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Tdx("missing 'signature' in PCS response".to_string()))?;
+    let signature = hex::decode(sig_hex)
+        .map_err(|e| Error::Tdx(format!("failed to decode signature hex: {e}")))?;
+
+    Ok((inner_json, signature))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,36 +372,4 @@ AiEA4J0lrHoMs+Xo5o/sX6O9QWxHRAvZUGOdRQ7cvqRXaqI=
         assert!(hex.starts_with(&"aa".repeat(48)));
         assert!(hex.ends_with(&"bb".repeat(48)));
     }
-}
-
-/// Extract a URL-decoded header value from an HTTP response.
-fn extract_header(resp: &reqwest::Response, name: &str) -> Option<String> {
-    resp.headers()
-        .get(name)?
-        .to_str()
-        .ok()
-        .and_then(|v| urlencoding::decode(v).ok())
-        .map(|v| v.into_owned())
-}
-
-/// Extract the inner JSON object and hex-decoded signature from an Intel PCS
-/// signed JSON wrapper (e.g. `{"tcbInfo": {...}, "signature": "hex"}`).
-fn extract_signed_json(
-    body: &serde_json::Value,
-    inner_key: &str,
-) -> Result<(String, Vec<u8>), Error> {
-    let inner = body
-        .get(inner_key)
-        .ok_or_else(|| Error::Tdx(format!("missing '{inner_key}' in PCS response")))?;
-    let inner_json = serde_json::to_string(inner)
-        .map_err(|e| Error::Tdx(format!("failed to serialize '{inner_key}': {e}")))?;
-
-    let sig_hex = body
-        .get("signature")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Tdx("missing 'signature' in PCS response".to_string()))?;
-    let signature = hex::decode(sig_hex)
-        .map_err(|e| Error::Tdx(format!("failed to decode signature hex: {e}")))?;
-
-    Ok((inner_json, signature))
 }
