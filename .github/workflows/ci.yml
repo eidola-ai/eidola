@@ -51,7 +51,6 @@ jobs:
   # ── OCI images (cheap ubuntu runner) ─────────────────────────────────────────
   oci:
     name: Build and verify OCI images
-    needs: rust-checks
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -224,7 +223,6 @@ jobs:
   # ── Apple (expensive macOS runner) ───────────────────────────────────────────
   apple:
     name: Apple builds
-    needs: rust-checks
     runs-on: self-hosted
     timeout-minutes: 30
     outputs:
@@ -272,6 +270,7 @@ jobs:
   artifact-manifest:
     name: Verify artifact manifest
     needs:
+      - rust-checks
       - oci
       - apple
     runs-on: ubuntu-24.04

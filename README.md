@@ -1,5 +1,11 @@
 # Eidola
 
+This is an early work in progress. This repository is intended as a monorepo for [Eidola](https://www.eidola.ai), and will include many different kinds of files, from functional code to configuration to documentation.
+
+Over the coming months, its shape will change substantially as we port several external proofs-of-concept into a coherent, maintainable single source of truth.
+
+We plan to release the functional components of this repo under appropriate open source licenses, but have not finalized the details.
+
 ## Developing
 
 **Prerequisites:** `rustup`, `just`, `docker`

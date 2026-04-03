@@ -4186,7 +4186,7 @@ dependencies = [
 [[package]]
 name = "sev"
 version = "7.1.0"
-source = "git+https://github.com/eidola-ai/sev?rev=fdd2fcd36cdb996fbcae766a1a22025a4c96faa3#fdd2fcd36cdb996fbcae766a1a22025a4c96faa3"
+source = "git+https://github.com/eidola-ai/sev?rev=2d9c9ad23f32b53892159274beabffdf00a8835d#2d9c9ad23f32b53892159274beabffdf00a8835d"
 dependencies = [
  "base64 0.22.1",
  "bitfield",
