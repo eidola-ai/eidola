@@ -1,5 +1,5 @@
-module eidola_sharedFFI {
-    header "eidola_sharedFFI.h"
+module eidola_app_coreFFI {
+    header "eidola_app_coreFFI.h"
     export *
     use "Darwin"
     use "_Builtin_stdbool"

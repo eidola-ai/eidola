@@ -1,5 +1,5 @@
 [package]
-name = "eidola-shared"
+name = "eidola-app-core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,13 +9,7 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "staticlib", "lib"]
 
-[features]
-default = []
-typegen = ["crux_core/typegen"]
-
 [dependencies]
-crux_core = "0.17"
-serde = { version = "1.0", features = ["derive"] }
 uniffi = "0.31.0"
 
 [build-dependencies]

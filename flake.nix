@@ -377,58 +377,9 @@
           nixCrossSystem = null;
         };
 
-        # Build the shared-typegen binary crate (native only)
-        sharedTypegen = mkPackage {
-          pname = "shared-typegen";
-          rustTarget = nativeRustTarget;
-          nixCrossSystem = null;
-        };
-
-        # Generate Swift types from the shared core using Crux typegen
-        eidolaSharedSwiftTypes = pkgs.stdenv.mkDerivation {
-          name = "eidola-shared-swift-types";
-
-          nativeBuildInputs = [ sharedTypegen ];
-
-          SOURCE_DATE_EPOCH = "0";
-
-          dontUnpack = true;
-
-          buildPhase = ''
-            # Use NIX_BUILD_TOP as temp directory
-            TEMP_OUT="$NIX_BUILD_TOP/typegen-output"
-            mkdir -p "$TEMP_OUT"
-
-            # Run typegen - ignore errors about Package.swift, we'll create our own
-            export RUST_BACKTRACE=1
-            shared-typegen "$TEMP_OUT" 2>&1 || true
-
-            # Check if the Swift types were generated
-            if [ ! -f "$TEMP_OUT/SharedTypes/Sources/SharedTypes/SharedTypes.swift" ]; then
-              echo "Failed to generate Swift types"
-              find "$TEMP_OUT" -type f 2>/dev/null || true
-              exit 1
-            fi
-
-            # The typegen might fail trying to write Package.swift but we don't need it
-            # since we embed the types directly in our package
-            # Remove the generated Package.swift if it exists (we use our own)
-            rm -f "$TEMP_OUT/SharedTypes/Package.swift"
-
-            # Move to $out
-            mkdir -p $out
-            cp -r "$TEMP_OUT"/* $out/
-          '';
-
-          installPhase = ''
-            echo "Generated Swift types:"
-            find $out -type f -name "*.swift" | head -20
-          '';
-        };
-
-        # Generate Swift bindings from the shared core library (UniFFI)
-        eidolaSharedSwiftBindings = pkgs.stdenv.mkDerivation {
-          name = "eidola-shared-swift-bindings";
+        # Generate Swift bindings from the app core library (UniFFI)
+        eidolaAppCoreSwiftBindings = pkgs.stdenv.mkDerivation {
+          name = "eidola-app-core-swift-bindings";
 
           nativeBuildInputs = [
             uniffiBindgenSwift
@@ -441,24 +392,23 @@
 
           buildPhase = ''
             # Create output directories
-            mkdir -p $out/Sources/EidolaShared
-            mkdir -p $out/Sources/EidolaSharedFFI
+            mkdir -p $out/Sources/EidolaAppCore
+            mkdir -p $out/Sources/EidolaAppCoreFFI
 
             # uniffi-bindgen-swift needs access to Cargo.toml for metadata
-            cp -r ${mkFilteredSrc ([ "eidola-shared" ] ++ packageDeps.eidola-shared or [ ])}/* .
+            cp -r ${mkFilteredSrc ([ "eidola-app-core" ] ++ packageDeps.eidola-app-core or [ ])}/* .
             chmod -R +w .
 
             # Find the dylib (native build, cdylib for uniffi-bindgen-swift)
-            # Built without default features (MLX) since bindings only need the FFI interface
             DYLIB="${
               mkPackage {
-                pname = "eidola-shared";
+                pname = "eidola-app-core";
                 rustTarget = nativeRustTarget;
                 nixCrossSystem = null;
                 crateType = "cdylib";
                 extraCargoArgs = "--no-default-features";
               }
-            }/lib/libeidola_shared.dylib"
+            }/lib/libeidola_app_core.dylib"
 
             # Generate Swift bindings to a temp directory
             TEMP_OUT=$(mktemp -d)
@@ -467,35 +417,35 @@
                 --metadata-no-deps \
                 "$DYLIB" \
                 "$TEMP_OUT" \
-                --module-name eidola_sharedFFI \
+                --module-name eidola_app_coreFFI \
                 --modulemap-filename module.modulemap
 
             # Move files to their proper locations
-            mv "$TEMP_OUT"/*.swift $out/Sources/EidolaShared/
-            mv "$TEMP_OUT"/*.h $out/Sources/EidolaSharedFFI/
-            mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolaSharedFFI/
+            mv "$TEMP_OUT"/*.swift $out/Sources/EidolaAppCore/
+            mv "$TEMP_OUT"/*.h $out/Sources/EidolaAppCoreFFI/
+            mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolaAppCoreFFI/
 
             # Create stub C file for SPM
-            cat > $out/Sources/EidolaSharedFFI/eidola_sharedFFI.c << 'STUB'
-            // This file exists so Swift Package Manager has something to compile for the eidola_sharedFFI module.
-            // The actual implementation is in the XCFramework (libeidola_shared.a).
+            cat > $out/Sources/EidolaAppCoreFFI/eidola_app_coreFFI.c << 'STUB'
+            // This file exists so Swift Package Manager has something to compile for the eidola_app_coreFFI module.
+            // The actual implementation is in the XCFramework (libeidola_app_core.a).
             // This module just exposes the C header interface to Swift.
-            #include "eidola_sharedFFI.h"
+            #include "eidola_app_coreFFI.h"
             STUB
           '';
 
           installPhase = ''
             echo "Generated Swift bindings:"
-            echo "EidolaShared (Swift):"
-            ls -la $out/Sources/EidolaShared/
-            echo "EidolaSharedFFI (C headers):"
-            ls -la $out/Sources/EidolaSharedFFI/
+            echo "EidolaAppCore (Swift):"
+            ls -la $out/Sources/EidolaAppCore/
+            echo "EidolaAppCoreFFI (C headers):"
+            ls -la $out/Sources/EidolaAppCoreFFI/
           '';
         };
 
-        # Build XCFramework for eidola-shared
-        eidolaSharedSwiftXCFramework = pkgs.stdenv.mkDerivation {
-          name = "eidola-shared-xcframework";
+        # Build XCFramework for eidola-app-core
+        eidolaAppCoreSwiftXCFramework = pkgs.stdenv.mkDerivation {
+          name = "eidola-app-core-xcframework";
 
           nativeBuildInputs = [ pkgs.darwin.cctools ];
 
@@ -505,27 +455,27 @@
           dontUnpack = true;
 
           macosArm64 = mkPackage {
-            pname = "eidola-shared";
+            pname = "eidola-app-core";
             rustTarget = "aarch64-apple-darwin";
             nixCrossSystem = null;
             crateType = "staticlib";
           };
           macosX86_64 = mkPackage {
-            pname = "eidola-shared";
+            pname = "eidola-app-core";
             rustTarget = "x86_64-apple-darwin";
             nixCrossSystem = null;
             crateType = "staticlib";
           };
 
           buildPhase = ''
-            XCFW="$out/libeidola_shared-rs.xcframework"
+            XCFW="$out/libeidola_app_core-rs.xcframework"
             MACOS_DIR="$XCFW/macos-arm64_x86_64"
             mkdir -p "$MACOS_DIR"
 
             lipo -create \
-              "$macosArm64/lib/libeidola_shared.a" \
-              "$macosX86_64/lib/libeidola_shared.a" \
-              -output "$MACOS_DIR/libeidola_shared.a"
+              "$macosArm64/lib/libeidola_app_core.a" \
+              "$macosX86_64/lib/libeidola_app_core.a" \
+              -output "$MACOS_DIR/libeidola_app_core.a"
 
             cat > "$XCFW/Info.plist" << 'EOF'
             <?xml version="1.0" encoding="UTF-8"?>
@@ -538,7 +488,7 @@
                   <key>LibraryIdentifier</key>
                   <string>macos-arm64_x86_64</string>
                   <key>LibraryPath</key>
-                  <string>libeidola_shared.a</string>
+                  <string>libeidola_app_core.a</string>
                   <key>SupportedArchitectures</key>
                   <array>
                     <string>arm64</string>
@@ -562,7 +512,7 @@
             find "$out" -type f -exec ls -lh {} \;
             echo ""
             echo "Architecture info:"
-            lipo -info "$out/libeidola_shared-rs.xcframework/macos-arm64_x86_64/libeidola_shared.a"
+            lipo -info "$out/libeidola_app_core-rs.xcframework/macos-arm64_x86_64/libeidola_app_core.a"
           '';
         };
 
@@ -668,7 +618,7 @@
                 fileset = pkgs.lib.fileset.unions [
                   ./apps/macos/Sources
                   ./apps/macos/Support/Info.plist
-                  ./crates/eidola-shared/swift
+                  ./crates/eidola-app-core/swift
                 ];
               };
 
@@ -678,15 +628,15 @@
               SOURCE_DATE_EPOCH = "0";
 
               # XCFramework static library (nix-built)
-              xcframework = eidolaSharedSwiftXCFramework;
+              xcframework = eidolaAppCoreSwiftXCFramework;
 
               buildPhase = ''
                 export HOME=$TMPDIR
                 export XDG_CACHE_HOME=$TMPDIR
 
-                SHARED="crates/eidola-shared/swift"
-                XCFW_LIB="$xcframework/libeidola_shared-rs.xcframework/macos-arm64_x86_64"
-                FFI_HEADERS="$SHARED/Sources/EidolaSharedFFI"
+                SHARED="crates/eidola-app-core/swift"
+                XCFW_LIB="$xcframework/libeidola_app_core-rs.xcframework/macos-arm64_x86_64"
+                FFI_HEADERS="$SHARED/Sources/EidolaAppCoreFFI"
                 MODULEMAP="$FFI_HEADERS/module.modulemap"
 
                 MODULES="$TMPDIR/modules"
@@ -699,30 +649,15 @@
                   -Xfrontend -no-serialize-debugging-options
                 )
 
-                echo "Building Serde module..."
+                echo "Building EidolaAppCore module..."
                 swiftc -c "''${COMMON_FLAGS[@]}" \
-                  -module-name Serde \
-                  -emit-module-path "$MODULES/Serde.swiftmodule" \
-                  -o "$OBJS/Serde.o" \
-                  $(find "$SHARED/generated/SharedTypes/Sources/Serde" -name '*.swift' | sort)
-
-                echo "Building SharedTypes module..."
-                swiftc -c "''${COMMON_FLAGS[@]}" \
-                  -module-name SharedTypes \
-                  -emit-module-path "$MODULES/SharedTypes.swiftmodule" \
-                  -I "$MODULES" \
-                  -o "$OBJS/SharedTypes.o" \
-                  $(find "$SHARED/generated/SharedTypes/Sources/SharedTypes" -name '*.swift' | sort)
-
-                echo "Building EidolaShared module..."
-                swiftc -c "''${COMMON_FLAGS[@]}" \
-                  -module-name EidolaShared \
-                  -emit-module-path "$MODULES/EidolaShared.swiftmodule" \
+                  -module-name EidolaAppCore \
+                  -emit-module-path "$MODULES/EidolaAppCore.swiftmodule" \
                   -I "$MODULES" \
                   -I "$FFI_HEADERS" \
                   -Xcc -fmodule-map-file="$MODULEMAP" \
-                  -o "$OBJS/EidolaShared.o" \
-                  $(find "$SHARED/Sources/EidolaShared" -name '*.swift' | sort)
+                  -o "$OBJS/EidolaAppCore.o" \
+                  $(find "$SHARED/Sources/EidolaAppCore" -name '*.swift' | sort)
 
                 echo "Building EidolaApp module..."
                 swiftc -c "''${COMMON_FLAGS[@]}" \
@@ -741,14 +676,13 @@
                   -I "$MODULES" \
                   -I "$FFI_HEADERS" \
                   -Xcc -fmodule-map-file="$MODULEMAP" \
-                  -L "$XCFW_LIB" -leidola_shared \
+                  -L "$XCFW_LIB" -leidola_app_core \
                   -framework SwiftUI -framework AppKit -framework Foundation \
                   -framework SystemConfiguration \
                   -Xfrontend -no-serialize-debugging-options \
                   -Xlinker -reproducible \
                   -enable-upcoming-feature MemberImportVisibility \
-                  "$OBJS/Serde.o" "$OBJS/SharedTypes.o" \
-                  "$OBJS/EidolaShared.o" "$OBJS/EidolaApp.o" \
+                  "$OBJS/EidolaAppCore.o" "$OBJS/EidolaApp.o" \
                   apps/macos/Sources/EidolaEntrypoint/main.swift
               '';
 
@@ -787,10 +721,9 @@
           };
           server-openapi-spec = serverOpenApiSpec;
 
-          # Shared core Swift binding generation
-          eidola-shared-swift-types = eidolaSharedSwiftTypes;
-          eidola-shared-swift-bindings = eidolaSharedSwiftBindings;
-          eidola-shared-swift-xcframework = eidolaSharedSwiftXCFramework;
+          # App core Swift binding generation
+          eidola-app-core-swift-bindings = eidolaAppCoreSwiftBindings;
+          eidola-app-core-swift-xcframework = eidolaAppCoreSwiftXCFramework;
         } // pkgs.lib.optionalAttrs (eidolaCliMacosUniversal != null) {
           eidola-cli-macos-universal = eidolaCliMacosUniversal;
         } // pkgs.lib.optionalAttrs (eidolaMacosApp != null) {
@@ -878,71 +811,48 @@
               ''
                 echo "Checking if committed Swift bindings match generated ones..."
 
-                # Check EidolaShared Swift files
-                GENERATED_SWIFT="${self.packages.${system}.eidola-shared-swift-bindings}/Sources/EidolaShared"
-                COMMITTED_SWIFT="${repoSrc}/crates/eidola-shared/swift/Sources/EidolaShared"
+                # Check EidolaAppCore Swift files
+                GENERATED_SWIFT="${self.packages.${system}.eidola-app-core-swift-bindings}/Sources/EidolaAppCore"
+                COMMITTED_SWIFT="${repoSrc}/crates/eidola-app-core/swift/Sources/EidolaAppCore"
 
                 if [ ! -d "$COMMITTED_SWIFT" ]; then
-                  echo "ERROR: No committed Swift bindings found at crates/eidola-shared/swift/Sources/EidolaShared"
-                  echo "Run: nix run '.#update-eidola-shared-swift-bindings'"
+                  echo "ERROR: No committed Swift bindings found at crates/eidola-app-core/swift/Sources/EidolaAppCore"
+                  echo "Run: nix run '.#update-eidola-app-core-swift-bindings'"
                   echo "Then commit the generated files."
                   exit 1
                 fi
 
                 if ! diff -r "$GENERATED_SWIFT" "$COMMITTED_SWIFT"; then
                   echo ""
-                  echo "ERROR: Committed EidolaShared Swift bindings don't match generated ones!"
+                  echo "ERROR: Committed EidolaAppCore Swift bindings don't match generated ones!"
                   echo ""
                   echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-eidola-shared-swift-bindings'"
+                  echo "  1. Run: nix run '.#update-eidola-app-core-swift-bindings'"
                   echo "  2. Review the changes"
                   echo "  3. Commit the updated bindings"
                   echo ""
                   exit 1
                 fi
 
-                # Check EidolaSharedFFI C headers
-                GENERATED_FFI="${self.packages.${system}.eidola-shared-swift-bindings}/Sources/EidolaSharedFFI"
-                COMMITTED_FFI="${repoSrc}/crates/eidola-shared/swift/Sources/EidolaSharedFFI"
+                # Check EidolaAppCoreFFI C headers
+                GENERATED_FFI="${self.packages.${system}.eidola-app-core-swift-bindings}/Sources/EidolaAppCoreFFI"
+                COMMITTED_FFI="${repoSrc}/crates/eidola-app-core/swift/Sources/EidolaAppCoreFFI"
 
                 if [ ! -d "$COMMITTED_FFI" ]; then
-                  echo "ERROR: No committed FFI headers found at crates/eidola-shared/swift/Sources/EidolaSharedFFI"
-                  echo "Run: nix run '.#update-eidola-shared-swift-bindings'"
+                  echo "ERROR: No committed FFI headers found at crates/eidola-app-core/swift/Sources/EidolaAppCoreFFI"
+                  echo "Run: nix run '.#update-eidola-app-core-swift-bindings'"
                   echo "Then commit the generated files."
                   exit 1
                 fi
 
                 if ! diff -r "$GENERATED_FFI" "$COMMITTED_FFI"; then
                   echo ""
-                  echo "ERROR: Committed EidolaSharedFFI headers don't match generated ones!"
+                  echo "ERROR: Committed EidolaAppCoreFFI headers don't match generated ones!"
                   echo ""
                   echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-eidola-shared-swift-bindings'"
+                  echo "  1. Run: nix run '.#update-eidola-app-core-swift-bindings'"
                   echo "  2. Review the changes"
                   echo "  3. Commit the updated headers"
-                  echo ""
-                  exit 1
-                fi
-
-                # Check SharedTypes (Crux typegen)
-                GENERATED_TYPES="${self.packages.${system}.eidola-shared-swift-types}/SharedTypes"
-                COMMITTED_TYPES="${repoSrc}/crates/eidola-shared/swift/generated/SharedTypes"
-
-                if [ ! -d "$COMMITTED_TYPES" ]; then
-                  echo "ERROR: No committed SharedTypes found at crates/eidola-shared/swift/generated/SharedTypes"
-                  echo "Run: nix run '.#update-eidola-shared-swift-bindings'"
-                  echo "Then commit the generated files."
-                  exit 1
-                fi
-
-                if ! diff -r "$GENERATED_TYPES" "$COMMITTED_TYPES"; then
-                  echo ""
-                  echo "ERROR: Committed SharedTypes don't match generated ones!"
-                  echo ""
-                  echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-eidola-shared-swift-bindings'"
-                  echo "  2. Review the changes"
-                  echo "  3. Commit the updated types"
                   echo ""
                   exit 1
                 fi
@@ -961,13 +871,11 @@
                 echo "Checking Swift formatting..."
 
                 # Find all Swift files, excluding:
-                # - crates/eidola-shared/swift/Sources/EidolaShared (auto-generated bindings)
-                # - crates/eidola-shared/swift/generated (auto-generated Crux types)
+                # - crates/eidola-app-core/swift/Sources/EidolaAppCore (auto-generated bindings)
                 # - Any .build directories (SwiftPM build artifacts)
                 # Note: .git is already excluded by crane's source filtering
                 find ${repoSrc} \
-                  -path '*/crates/eidola-shared/swift/Sources/EidolaShared' -prune -o \
-                  -path '*/crates/eidola-shared/swift/generated' -prune -o \
+                  -path '*/crates/eidola-app-core/swift/Sources/EidolaAppCore' -prune -o \
                   -path '*/.build' -prune -o \
                   -name '*.swift' -print0 \
                   | xargs -0 -r swift-format lint --strict
@@ -996,12 +904,12 @@
             }/bin/update-server-openapi";
           };
 
-          update-eidola-shared-swift-bindings = {
+          update-eidola-app-core-swift-bindings = {
             type = "app";
-            meta.description = "Update committed Swift bindings for shared core";
+            meta.description = "Update committed Swift bindings for app core";
             program = "${
               pkgs.writeShellApplication {
-                name = "update-eidola-shared-swift-bindings";
+                name = "update-eidola-app-core-swift-bindings";
                 runtimeInputs = [
                   pkgs.coreutils
                   pkgs.git
@@ -1009,29 +917,28 @@
 
                 text = ''
                   ${./scripts/update-shared-bindings.sh} \
-                    "${self.packages.${system}.eidola-shared-swift-bindings}/Sources" \
-                    "${self.packages.${system}.eidola-shared-swift-types}"
+                    "${self.packages.${system}.eidola-app-core-swift-bindings}/Sources"
                 '';
               }
-            }/bin/update-eidola-shared-swift-bindings";
+            }/bin/update-eidola-app-core-swift-bindings";
           };
 
-          update-eidola-shared-swift-xcframework = {
+          update-eidola-app-core-swift-xcframework = {
             type = "app";
-            meta.description = "Update XCFramework for shared core";
+            meta.description = "Update XCFramework for app core";
             program = "${
               pkgs.writeShellApplication {
-                name = "update-eidola-shared-swift-xcframework";
+                name = "update-eidola-app-core-swift-xcframework";
                 runtimeInputs = [
                   pkgs.coreutils
                   pkgs.git
                 ];
 
                 text = ''
-                  ${./scripts/update-shared-xcframework.sh} "${self.packages.${system}.eidola-shared-swift-xcframework}"
+                  ${./scripts/update-shared-xcframework.sh} "${self.packages.${system}.eidola-app-core-swift-xcframework}"
                 '';
               }
-            }/bin/update-eidola-shared-swift-xcframework";
+            }/bin/update-eidola-app-core-swift-xcframework";
           };
 
           format-rust = {
@@ -1094,8 +1001,7 @@
 
                   # Use git ls-files to respect .gitignore, exclude auto-generated bindings
                   git ls-files '*.swift' \
-                    | grep -v '^crates/eidola-shared/swift/Sources/EidolaShared/' \
-                    | grep -v '^crates/eidola-shared/swift/generated/' \
+                    | grep -v '^crates/eidola-app-core/swift/Sources/EidolaAppCore/' \
                     | xargs -r swift-format format --in-place
 
                   echo "Done. Review changes and commit:"

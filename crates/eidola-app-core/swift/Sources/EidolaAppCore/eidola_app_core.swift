@@ -7,8 +7,8 @@ import Foundation
 // Depending on the consumer's build setup, the low-level FFI code
 // might be in a separate module, or it might be compiled inline into
 // this module. This is a bit of light hackery to work with both.
-#if canImport(eidola_sharedFFI)
-import eidola_sharedFFI
+#if canImport(eidola_app_coreFFI)
+import eidola_app_coreFFI
 #endif
 
 fileprivate extension RustBuffer {
@@ -25,13 +25,13 @@ fileprivate extension RustBuffer {
     }
 
     static func from(_ ptr: UnsafeBufferPointer<UInt8>) -> RustBuffer {
-        try! rustCall { ffi_eidola_shared_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
+        try! rustCall { ffi_eidola_app_core_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
     }
 
     // Frees the buffer in place.
     // The buffer must not be used after this is called.
     func deallocate() {
-        try! rustCall { ffi_eidola_shared_rustbuffer_free(self, $0) }
+        try! rustCall { ffi_eidola_app_core_rustbuffer_free(self, $0) }
     }
 }
 
@@ -281,7 +281,7 @@ private func makeRustCall<T, E: Swift.Error>(
     _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
     errorHandler: ((RustBuffer) throws -> E)?
 ) throws -> T {
-    uniffiEnsureEidolaSharedInitialized()
+    uniffiEnsureEidolaAppCoreInitialized()
     var callStatus = RustCallStatus.init()
     let returnedVal = callback(&callStatus)
     try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
@@ -419,22 +419,6 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
-    typealias FfiType = UInt32
-    typealias SwiftType = UInt32
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
-        return try lift(readInt(&buf))
-    }
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        writeInt(&buf, lower(value))
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -472,59 +456,12 @@ fileprivate struct FfiConverterString: FfiConverter {
         writeBytes(&buf, value.utf8)
     }
 }
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterData: FfiConverterRustBuffer {
-    typealias SwiftType = Data
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
-        let len: Int32 = try readInt(&buf)
-        return Data(try readBytes(&buf, count: Int(len)))
-    }
-
-    public static func write(_ value: Data, into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        writeBytes(&buf, value)
-    }
-}
 /**
- * Handle a response from the shell
- *
- * Takes a request ID and bincode-serialized response data.
- * Returns bincode-serialized effects (requests) for any follow-up operations.
+ * A simple greeting as a smoke test for the UniFFI bridge.
  */
-public func handleResponse(id: UInt32, data: Data) -> Data  {
-    return try!  FfiConverterData.lift(try! rustCall() {
-    uniffi_eidola_shared_fn_func_handle_response(
-        FfiConverterUInt32.lower(id),
-        FfiConverterData.lower(data),$0
-    )
-})
-}
-/**
- * Process an event from the shell
- *
- * Takes a bincode-serialized Event and returns bincode-serialized effects (requests).
- * The shell should deserialize the response to get the list of effects to handle.
- */
-public func processEvent(data: Data) -> Data  {
-    return try!  FfiConverterData.lift(try! rustCall() {
-    uniffi_eidola_shared_fn_func_process_event(
-        FfiConverterData.lower(data),$0
-    )
-})
-}
-/**
- * Get the current view model
- *
- * Returns the bincode-serialized ViewModel representing the current UI state.
- */
-public func view() -> Data  {
-    return try!  FfiConverterData.lift(try! rustCall() {
-    uniffi_eidola_shared_fn_func_view($0
+public func greet() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_eidola_app_core_fn_func_greet($0
     )
 })
 }
@@ -540,17 +477,11 @@ private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
     let bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
-    let scaffolding_contract_version = ffi_eidola_shared_uniffi_contract_version()
+    let scaffolding_contract_version = ffi_eidola_app_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_eidola_shared_checksum_func_handle_response() != 44037) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_eidola_shared_checksum_func_process_event() != 1707) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_eidola_shared_checksum_func_view() != 7960) {
+    if (uniffi_eidola_app_core_checksum_func_greet() != 18885) {
         return InitializationResult.apiChecksumMismatch
     }
 
@@ -559,7 +490,7 @@ private let initializationResult: InitializationResult = {
 
 // Make the ensure init function public so that other modules which have external type references to
 // our types can call it.
-public func uniffiEnsureEidolaSharedInitialized() {
+public func uniffiEnsureEidolaAppCoreInitialized() {
     switch initializationResult {
     case .ok:
         break

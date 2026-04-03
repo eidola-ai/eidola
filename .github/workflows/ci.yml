@@ -221,6 +221,8 @@ jobs:
           done
 
   # ── Apple (expensive macOS runner) ───────────────────────────────────────────
+  # This uses https://github.com/khoi/sand to provision a runner from a known image:
+  # ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:751c514771f2a637e974124b242ea777fd93f82f057b67e718af4d39895a7cc1
   apple:
     name: Apple builds
     runs-on: self-hosted
@@ -259,10 +261,10 @@ jobs:
       - name: Run Swift tests
         run: |
           # Build the XCFramework and update the local path for SPM
-          nix run '.#update-eidola-shared-swift-xcframework'
+          nix run '.#update-eidola-app-core-swift-xcframework'
 
-          # Run Swift tests for shared core
-          ( cd crates/eidola-shared && swift test )
+          # Run Swift tests for app core
+          ( cd crates/eidola-app-core && swift test )
 
           # Run Swift tests for macOS app
           ( cd apps/macos && swift test )

@@ -21,15 +21,13 @@ let package = Package(
   ],
   dependencies: [
     .package(url: "https://github.com/swiftlang/swift-testing.git", from: "6.2.3"),
-    .package(path: "../../crates/eidola-shared"),
+    .package(path: "../../crates/eidola-app-core"),
   ],
   targets: [
     .target(
       name: "EidolaApp",
       dependencies: [
-        .product(name: "EidolaShared", package: "eidola-shared"),
-        .product(name: "SharedTypes", package: "eidola-shared"),
-        .product(name: "Serde", package: "eidola-shared"),
+        .product(name: "EidolaAppCore", package: "eidola-app-core"),
       ],
       path: "Sources/Eidola",
       swiftSettings: swiftSettings

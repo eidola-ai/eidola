@@ -84,17 +84,14 @@ Unlike static cert pinning, verified SPKI fingerprints are cached so reconnectio
 **Compose files:**
 - `compose.yaml` — local development: postgres + server + stripe-cli
 
-## Crux Architecture
+## App Core Architecture
 
-The macOS app uses [Crux](https://redbadger.github.io/crux/) for cross-platform state management. The CLI (`apps/cli/`) is a standalone clap/tokio app and does not use Crux.
+The macOS app and CLI share a common Rust core (`crates/eidola-app-core/`) exposed to Swift via direct [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings. Rust functions and types are exported with `#[uniffi::export]`, `#[derive(uniffi::Object)]`, `#[derive(uniffi::Record)]`, and `#[derive(uniffi::Enum)]`. Async operations use `#[uniffi::export(async)]` to bridge Rust futures to Swift async/await. No serialization layer, event/effect pattern, or Crux dependency — Swift calls Rust functions directly and gets native Swift types back.
 
-**Key pattern:** The core never performs side-effects directly. It emits Effects that the shell handles, then the shell sends responses back via `handleResponse()`.
+**Crate layout:** Pure Rust crates in `crates/` implement capability logic. The `crates/` tree also contains the Rust code generation binary (`uniffi-bindgen-swift`) plus operational utilities such as `generate-openapi`, `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`.
 
-**Capability implementations:** Pure Rust crates in `crates/` implement capability logic. The same `crates/` tree also contains the Rust code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) plus operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`. These are compiled into `eidola-shared` and exposed via UniFFI, so the Swift shell can call them directly.
-
-**Two codegen pipelines:**
-- `uniffi-bindgen-swift` (workspace crate under `crates/`) → FFI bridge (`processEvent`, `handleResponse`, `view`)
-- `crux_core::typegen` → Domain types (`Event`, `Effect`, `ViewModel`) with bincode serialization
+**Codegen pipeline:**
+- `uniffi-bindgen-swift` (workspace crate under `crates/`) → FFI bridge (Swift bindings + C headers)
 
 ## CLI Database & Migrations
 

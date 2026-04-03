@@ -42,7 +42,7 @@ test-webhook-smoke:
 
 # --- Codegen ---
 
-# Regenerate UniFFI Swift bindings and Crux types
+# Regenerate UniFFI Swift bindings
 update-bindings:
     ./scripts/update-shared-bindings.sh
 
@@ -81,7 +81,7 @@ ci-check:
 
 # Build XCFramework via Nix
 ci-build-xcframework:
-    nix run '.#update-eidola-shared-swift-xcframework'
+    nix run '.#update-eidola-app-core-swift-xcframework'
 
 # Build macOS app via Nix (reproducible, open-source Swift 6.2 toolchain)
 build-macos-app:
