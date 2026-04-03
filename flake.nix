@@ -392,7 +392,6 @@
           nativeBuildInputs = [
             uniffiBindgenSwift
             rustToolchain
-            swiftPkg
           ];
 
           SOURCE_DATE_EPOCH = "0";
@@ -435,7 +434,7 @@
             mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolaAppCoreFFI/
 
             # Format generated Swift so it passes lint checks
-            swift format --in-place $out/Sources/EidolaAppCore/*.swift
+            ${swiftPkg}/bin/swift format --in-place $out/Sources/EidolaAppCore/*.swift
 
             # Create stub C file for SPM
             cat > $out/Sources/EidolaAppCoreFFI/eidola_app_coreFFI.c << 'STUB'
@@ -875,10 +874,7 @@
           swift-formatting =
             pkgs.runCommand "check-swift-formatting"
               {
-                nativeBuildInputs = [
-                  swiftPkg
-                  pkgs.findutils
-                ];
+                nativeBuildInputs = [ pkgs.findutils ];
               }
               ''
                 echo "Checking Swift formatting..."
@@ -889,7 +885,7 @@
                 find ${repoSrc} \
                   -path '*/.build' -prune -o \
                   -name '*.swift' -print0 \
-                  | xargs -0 -r swift format lint --strict
+                  | xargs -0 -r ${swiftPkg}/bin/swift format lint --strict
 
                 echo "✓ Swift files are properly formatted"
                 touch $out
@@ -992,7 +988,6 @@
               pkgs.writeShellApplication {
                 name = "format-swift";
                 runtimeInputs = [
-                  swiftPkg
                   pkgs.git
                 ];
 
@@ -1013,7 +1008,7 @@
                   # Use git ls-files to respect .gitignore
                   # Generated bindings are pre-formatted during generation, so no exclusions needed
                   git ls-files '*.swift' \
-                    | xargs -r swift format --in-place
+                    | xargs -r ${swiftPkg}/bin/swift format --in-place
 
                   echo "Done. Review changes and commit:"
                   echo "  git status"
