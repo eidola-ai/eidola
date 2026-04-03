@@ -19,12 +19,12 @@
     "eidola-macos-app": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-RfHhZE6ZK1G4OvKR53Pmi3tpuijHN3LDN59Fk0MdfEA="
+      "narHash": "sha256-9PTQQi0tx5gGuvneJfA5GW+GBqr2hSOqFJEhwcNkwVY="
     },
     "eidola-cli-macos-universal": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-yVFJfRBOqbiv4NSAWpt03jy6+B6sqzWMR9mDqQcdems="
+      "narHash": "sha256-4jVbE1aaxQMRbuERH52DuI3UrR2RTg/fZqaQ6v5SaeQ="
     }
   },
   "enclave": {
