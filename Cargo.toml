@@ -16,7 +16,7 @@ publish = false
 # Override sev crate with crypto_nossl measurement support (snp_calc_launch_digest).
 # Switch to crates.io once https://github.com/virtee/sev merges the upstream PR.
 [patch.crates-io]
-sev = { git = "https://github.com/eidola-ai/sev", rev = "fdd2fcd36cdb996fbcae766a1a22025a4c96faa3" }
+sev = { git = "https://github.com/eidola-ai/sev", rev = "2d9c9ad23f32b53892159274beabffdf00a8835d" }
 
 [profile.docker-dev]
 inherits = "dev"
@@ -27,8 +27,8 @@ opt-level = 1
 incremental = false
 # Codegen units are set to 1 to avoid potential non-determinism.
 codegen-units = 1
-# Enable link-time optimization for better determinism
-lto = true
+# Explicit thin link-time optimization
+lto = "thin"
 # Explicit optimization level
 opt-level = 3
 # Strip symbols for determinism

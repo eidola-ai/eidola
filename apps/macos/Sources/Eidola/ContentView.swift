@@ -3,7 +3,6 @@
 //  Eidola
 //
 
-import SharedTypes
 import SwiftUI
 
 struct ContentView: View {
@@ -11,12 +10,12 @@ struct ContentView: View {
 
   var body: some View {
     VStack {
-      Text(core.viewModel.greeting.isEmpty ? "Welcome" : core.viewModel.greeting)
+      Text(core.greeting.isEmpty ? "Welcome" : core.greeting)
         .font(.largeTitle)
         .padding()
 
       Button("Greet") {
-        core.update(event: .greet)
+        core.greet()
       }
       .padding()
     }

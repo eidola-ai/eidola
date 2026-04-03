@@ -1,0 +1,18 @@
+[package]
+name = "eidola-app-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+uniffi = "0.31.0"
+
+[build-dependencies]
+uniffi = { version = "0.31.0", features = ["build"] }
+
+[dev-dependencies]

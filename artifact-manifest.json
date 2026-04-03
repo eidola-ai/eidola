@@ -4,12 +4,12 @@
     "eidola-server": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:835ef9158dea994da5bda97dd3789ae4857ae991fd3bded86c12bdf01a7cd755"
+      "digest": "sha256:830314fe6b6f9b453f98b885b32e31cc175266241277c4aa087876725a1ce122"
     },
     "eidola-cli": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:ac3a842fe1fd34b0dc4bf489403e87097a4b50f98d5f9f02b7667cc6d8e3645f"
+      "digest": "sha256:c92b93c754f06c56ef52012a0f037bc9baa67e97d40767d09be915b96b6499b8"
     },
     "eidola-postgres": {
       "type": "oci",
@@ -19,17 +19,17 @@
     "eidola-macos-app": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-HG2DM3A05HktBf38ePmp7ALYbRnuP9EF3YklRnf/0f8="
+      "narHash": "sha256-UHlEw0RY+kar49j16xx0L1iPHXG2kmkk1ts9OOuYqus="
     },
     "eidola-cli-macos-universal": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-hZ3fKmAw0+nnKw9JTXQsPTtGLJWIV7sx7DPboobOAcs="
+      "narHash": "sha256-hT/iZ6GhCvb3mHlr3fjzXAVp/5zdR8d2MROn2wowE4o="
     }
   },
   "enclave": {
-    "snp_measurement": "513615ed3576079576075a625351b52a61e543a5ec90d3b7217499e37933365f8cb082f19fbbce1451c61ad10477c43d",
+    "snp_measurement": "f9ec3f14a935397a39cd329f981a204a7e3922089f01951f86c2d000d9724608fa9677dff150a1c608be265d166ec9e9",
     "tdx_rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-    "tdx_rtmr2": "311ccdbd62502a9d497cceb38465f78083af3abbdecc5f66a029a116770138e6b35e38af2b982396fbf37a3c31dbb4fa"
+    "tdx_rtmr2": "0c066b88ed7991b84efac5f451a0a918d24abfe14848d7d80ddfc91ae449e1e7a9811f6ef3facf4ff48009d56c16812d"
   }
 }
