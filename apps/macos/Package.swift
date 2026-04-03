@@ -27,7 +27,7 @@ let package = Package(
     .target(
       name: "EidolaApp",
       dependencies: [
-        .product(name: "EidolaAppCore", package: "eidola-app-core"),
+        .product(name: "EidolaAppCore", package: "eidola-app-core")
       ],
       path: "Sources/Eidola",
       swiftSettings: swiftSettings

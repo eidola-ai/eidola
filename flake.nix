@@ -286,6 +286,9 @@
           }
         );
 
+        # Swift toolchain (from the swift flake input) — used for formatting and compilation
+        swiftPkg = swift.packages.${system}.swift or null;
+
         # Build per-package dependencies (only compiles deps that package needs)
         mkPackageDeps =
           {
@@ -326,7 +329,12 @@
             relevantCrates = [ pname ] ++ deps;
             filteredSrc = mkFilteredSrc relevantCrates;
             packageCargoArtifacts = mkPackageDeps {
-              inherit pname rustTarget nixCrossSystem extraCargoArgs;
+              inherit
+                pname
+                rustTarget
+                nixCrossSystem
+                extraCargoArgs
+                ;
             };
             cratePath = cratePaths.${pname};
             crateTypeSetup =
@@ -384,6 +392,7 @@
           nativeBuildInputs = [
             uniffiBindgenSwift
             rustToolchain
+            swiftPkg
           ];
 
           SOURCE_DATE_EPOCH = "0";
@@ -424,6 +433,9 @@
             mv "$TEMP_OUT"/*.swift $out/Sources/EidolaAppCore/
             mv "$TEMP_OUT"/*.h $out/Sources/EidolaAppCoreFFI/
             mv "$TEMP_OUT"/module.modulemap $out/Sources/EidolaAppCoreFFI/
+
+            # Format generated Swift so it passes lint checks
+            swift format --in-place $out/Sources/EidolaAppCore/*.swift
 
             # Create stub C file for SPM
             cat > $out/Sources/EidolaAppCoreFFI/eidola_app_coreFFI.c << 'STUB'
@@ -557,7 +569,10 @@
 
               meta = {
                 description = "Eidola CLI (macOS universal binary)";
-                platforms = [ "aarch64-darwin" "x86_64-darwin" ];
+                platforms = [
+                  "aarch64-darwin"
+                  "x86_64-darwin"
+                ];
               };
             };
 
@@ -586,11 +601,7 @@
                 ${builtins.concatStringsSep "\n" (
                   builtins.filter (s: s != "") (
                     map (
-                      img:
-                      if img ? filename then
-                        "cp ${appiconset}/${img.filename} $TMPDIR/${img.filename}"
-                      else
-                        ""
+                      img: if img ? filename then "cp ${appiconset}/${img.filename} $TMPDIR/${img.filename}" else ""
                     ) contentsJson.images
                   )
                 )}
@@ -604,7 +615,6 @@
         eidolaMacosApp =
           let
             isDarwin = pkgs.stdenv.isDarwin;
-            swiftPkg = swift.packages.${system}.swift or null;
           in
           if !isDarwin || swiftPkg == null then
             null
@@ -694,12 +704,7 @@
                 cp Eidola "$APP/Contents/MacOS/Eidola"
                 cp apps/macos/Support/Info.plist "$APP/Contents/"
 
-                ${
-                  if appIcon != null then
-                    ''cp ${appIcon}/AppIcon.icns "$APP/Contents/Resources/"''
-                  else
-                    ""
-                }
+                ${if appIcon != null then ''cp ${appIcon}/AppIcon.icns "$APP/Contents/Resources/"'' else ""}
 
                 mkdir -p $out/bin
                 ln -s "$APP/Contents/MacOS/Eidola" $out/bin/Eidola
@@ -707,7 +712,10 @@
 
               meta = {
                 description = "Eidola macOS application";
-                platforms = [ "aarch64-darwin" "x86_64-darwin" ];
+                platforms = [
+                  "aarch64-darwin"
+                  "x86_64-darwin"
+                ];
               };
             };
 
@@ -724,9 +732,11 @@
           # App core Swift binding generation
           eidola-app-core-swift-bindings = eidolaAppCoreSwiftBindings;
           eidola-app-core-swift-xcframework = eidolaAppCoreSwiftXCFramework;
-        } // pkgs.lib.optionalAttrs (eidolaCliMacosUniversal != null) {
+        }
+        // pkgs.lib.optionalAttrs (eidolaCliMacosUniversal != null) {
           eidola-cli-macos-universal = eidolaCliMacosUniversal;
-        } // pkgs.lib.optionalAttrs (eidolaMacosApp != null) {
+        }
+        // pkgs.lib.optionalAttrs (eidolaMacosApp != null) {
           eidola-macos-app = eidolaMacosApp;
         };
 
@@ -865,20 +875,21 @@
           swift-formatting =
             pkgs.runCommand "check-swift-formatting"
               {
-                nativeBuildInputs = [ pkgs.swift-format pkgs.findutils ];
+                nativeBuildInputs = [
+                  swiftPkg
+                  pkgs.findutils
+                ];
               }
               ''
                 echo "Checking Swift formatting..."
 
-                # Find all Swift files, excluding:
-                # - crates/eidola-app-core/swift/Sources/EidolaAppCore (auto-generated bindings)
-                # - Any .build directories (SwiftPM build artifacts)
+                # Find all Swift files, excluding .build directories (SwiftPM build artifacts)
+                # Generated bindings are pre-formatted during generation, so no exclusions needed
                 # Note: .git is already excluded by crane's source filtering
                 find ${repoSrc} \
-                  -path '*/crates/eidola-app-core/swift/Sources/EidolaAppCore' -prune -o \
                   -path '*/.build' -prune -o \
                   -name '*.swift' -print0 \
-                  | xargs -0 -r swift-format lint --strict
+                  | xargs -0 -r swift format lint --strict
 
                 echo "✓ Swift files are properly formatted"
                 touch $out
@@ -935,7 +946,7 @@
                 ];
 
                 text = ''
-                  ${./scripts/update-shared-xcframework.sh} "${self.packages.${system}.eidola-app-core-swift-xcframework}"
+                  ${./scripts/update-xcframework.sh} "${self.packages.${system}.eidola-app-core-swift-xcframework}"
                 '';
               }
             }/bin/update-eidola-app-core-swift-xcframework";
@@ -981,7 +992,7 @@
               pkgs.writeShellApplication {
                 name = "format-swift";
                 runtimeInputs = [
-                  pkgs.swift-format
+                  swiftPkg
                   pkgs.git
                 ];
 
@@ -997,12 +1008,12 @@
                   repo_root="$(git rev-parse --show-toplevel)"
                   cd "$repo_root"
 
-                  echo "Formatting Swift files (excluding auto-generated bindings)..."
+                  echo "Formatting Swift files..."
 
-                  # Use git ls-files to respect .gitignore, exclude auto-generated bindings
+                  # Use git ls-files to respect .gitignore
+                  # Generated bindings are pre-formatted during generation, so no exclusions needed
                   git ls-files '*.swift' \
-                    | grep -v '^crates/eidola-app-core/swift/Sources/EidolaAppCore/' \
-                    | xargs -r swift-format format --in-place
+                    | xargs -r swift format --in-place
 
                   echo "Done. Review changes and commit:"
                   echo "  git status"
@@ -1010,15 +1021,14 @@
               }
             }/bin/format-swift";
           };
-        } // pkgs.lib.optionalAttrs (eidolaMacosApp != null) {
+        }
+        // pkgs.lib.optionalAttrs (eidolaMacosApp != null) {
           run-eidola = {
             type = "app";
             meta.description = "Build and launch the Eidola macOS app";
-            program = "${
-              pkgs.writeShellScript "run-eidola" ''
-                open "${eidolaMacosApp}/Applications/Eidola.app"
-              ''
-            }";
+            program = "${pkgs.writeShellScript "run-eidola" ''
+              open "${eidolaMacosApp}/Applications/Eidola.app"
+            ''}";
           };
         };
       }

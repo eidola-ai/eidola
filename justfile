@@ -27,6 +27,7 @@ db-reset:
 check:
     cargo clippy --all-targets -- -D warnings
     cargo fmt --check
+    git ls-files '*.swift' | xargs swift format lint --strict
 
 # Run all tests
 test:
@@ -44,7 +45,7 @@ test-webhook-smoke:
 
 # Regenerate UniFFI Swift bindings
 update-bindings:
-    ./scripts/update-shared-bindings.sh
+    ./scripts/update-bindings.sh
 
 # Regenerate OpenAPI spec
 update-openapi:
@@ -52,11 +53,11 @@ update-openapi:
 
 # Rebuild XCFramework (dev, native arch only)
 update-xcframework:
-    ./scripts/update-shared-xcframework-dev.sh
+    ./scripts/update-xcframework-dev.sh
 
 # Rebuild XCFramework (release, universal binary)
 update-xcframework-release:
-    ./scripts/update-shared-xcframework.sh
+    ./scripts/update-xcframework.sh
 
 # --- CI / Release ---
 
@@ -71,6 +72,7 @@ measure:
 # Update artifact-manifest.json with current build digests and measurements
 # Builds the OCI images plus the macOS app/CLI, then records their digests.
 # Also stamps image digests into tinfoil-config.yml and computes enclave
+
 # measurements. Requires macOS for the Nix-built app and CLI artifacts.
 update-manifest:
     ./scripts/artifact-manifest.sh update --ensure-builder

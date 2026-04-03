@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Development version of update-shared-xcframework.sh
+# Development version of update-xcframework.sh
 # - Only compiles for native architecture (no universal binary)
 # - Uses debug build (no --release flag)
 

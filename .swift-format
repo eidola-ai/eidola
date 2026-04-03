@@ -1,0 +1,10 @@
+{
+  "indentation" : {
+    "spaces" : 2
+  },
+  "lineLength" : 100,
+  "version" : 1,
+  "rules" : {
+    "AlwaysUseLowerCamelCase" : false
+  }
+}

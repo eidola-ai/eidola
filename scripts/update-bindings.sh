@@ -82,5 +82,9 @@ cp "$BINDINGS_FFI_DIR/"*.h "$DEST/EidolaAppCoreFFI/"
 cp "$BINDINGS_FFI_DIR/module.modulemap" "$DEST/EidolaAppCoreFFI/"
 cp "$BINDINGS_FFI_DIR/eidola_app_coreFFI.c" "$DEST/EidolaAppCoreFFI/"
 
+# Format generated Swift so it passes lint checks
+echo "Formatting generated Swift..."
+swift format --in-place "$DEST/EidolaAppCore/"*.swift
+
 echo "Done. Review changes and commit:"
 echo "  git status"
