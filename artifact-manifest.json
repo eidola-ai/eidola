@@ -19,7 +19,7 @@
     "eidola-macos-app": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-ggYdWqXs9HnqoUVchvwhhDs1jbSbB0XN3FEDlJc5aEw="
+      "narHash": "sha256-UHlEw0RY+kar49j16xx0L1iPHXG2kmkk1ts9OOuYqus="
     },
     "eidola-cli-macos-universal": {
       "type": "nix",
