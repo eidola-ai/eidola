@@ -4,12 +4,12 @@
     "eidola-server": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:825842d916f9e31e675301eec701ac20a2567e7fbaa22fbd26cf6bf623931f06"
+      "digest": "sha256:58d21ae38b8a338fe2d700fc20b5b4a32cf47ea494b861bd31fe303d16e22f58"
     },
     "eidola-cli": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:c92b93c754f06c56ef52012a0f037bc9baa67e97d40767d09be915b96b6499b8"
+      "digest": "sha256:f7f07924ee716bb0d33a8a4f706ae3ef8bc36ec96d25bf2e4a220989b6d8f551"
     },
     "eidola-postgres": {
       "type": "oci",
@@ -19,20 +19,20 @@
     "eidola-macos-app": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-UHlEw0RY+kar49j16xx0L1iPHXG2kmkk1ts9OOuYqus="
+      "narHash": "sha256-TzV9vhIFvQao96lOQT+mQqtVwhVCSGG9lEGuacz2wfg="
     },
     "eidola-cli-macos-universal": {
       "type": "nix",
       "platform": "darwin/universal",
-      "narHash": "sha256-hT/iZ6GhCvb3mHlr3fjzXAVp/5zdR8d2MROn2wowE4o="
+      "narHash": "sha256-jrR+zkpS0zzyf/DMpWdm8rVt/U+kFTeUfy3Yo2JyeRY="
     }
   },
   "enclave": {
-    "snp_measurement": "f8227cce490564a6c73e71530dbd4df3198fc3e6dc0ecb72250469925a1db5ab6768ad6125b7f15367bb45bc2670af0a",
+    "snp_measurement": "244dfa145ff7c85587c58fa47ff4be16f698262acb9c5798f383c1dd4db495e6241cd76eb626c60af98c8fec27c6ccd3",
     "tdx_measurement": {
       "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-      "rtmr2": "8a5b7bb3d6c9c60e9975d092104a37151a3159d7d9f69f35075a6a08241a97b57a04734e3282ead505675e91b7822e92"
+      "rtmr2": "8eca0ef4a714ec9ca4076d2438f67474b66623e0d10e632984596cf9e98d45f31501e527e0e1efd878d477d519ab3a16"
     },
-    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=b82eaa25276fbc8843224a82f0a04fc93a1b2993e37511dfc4da9783a82ab991"
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=3c43df07abc2dafbb63a18eb35f4a3a24bb4d4ca9fc1472417c451f11a9a96b2"
   }
 }
