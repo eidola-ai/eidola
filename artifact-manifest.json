@@ -29,7 +29,10 @@
   },
   "enclave": {
     "snp_measurement": "f8227cce490564a6c73e71530dbd4df3198fc3e6dc0ecb72250469925a1db5ab6768ad6125b7f15367bb45bc2670af0a",
-    "tdx_rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-    "tdx_rtmr2": "8a5b7bb3d6c9c60e9975d092104a37151a3159d7d9f69f35075a6a08241a97b57a04734e3282ead505675e91b7822e92"
+    "tdx_measurement": {
+      "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
+      "rtmr2": "8a5b7bb3d6c9c60e9975d092104a37151a3159d7d9f69f35075a6a08241a97b57a04734e3282ead505675e91b7822e92"
+    },
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=b82eaa25276fbc8843224a82f0a04fc93a1b2993e37511dfc4da9783a82ab991"
   }
 }
