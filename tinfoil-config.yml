@@ -29,7 +29,7 @@ containers:
   #     - /mnt/ramdisk/data:/var/lib/postgresql/data
 
   - name: "eidola-server"
-    image: "ghcr.io/eidola-ai/eidola-server@sha256:830314fe6b6f9b453f98b885b32e31cc175266241277c4aa087876725a1ce122"
+    image: "ghcr.io/eidola-ai/eidola-server@sha256:825842d916f9e31e675301eec701ac20a2567e7fbaa22fbd26cf6bf623931f06"
     devices:
       - /dev/sev-guest
     secrets:

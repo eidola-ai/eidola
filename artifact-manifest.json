@@ -4,7 +4,7 @@
     "eidola-server": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:830314fe6b6f9b453f98b885b32e31cc175266241277c4aa087876725a1ce122"
+      "digest": "sha256:825842d916f9e31e675301eec701ac20a2567e7fbaa22fbd26cf6bf623931f06"
     },
     "eidola-cli": {
       "type": "oci",
@@ -28,8 +28,8 @@
     }
   },
   "enclave": {
-    "snp_measurement": "f9ec3f14a935397a39cd329f981a204a7e3922089f01951f86c2d000d9724608fa9677dff150a1c608be265d166ec9e9",
+    "snp_measurement": "f8227cce490564a6c73e71530dbd4df3198fc3e6dc0ecb72250469925a1db5ab6768ad6125b7f15367bb45bc2670af0a",
     "tdx_rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-    "tdx_rtmr2": "0c066b88ed7991b84efac5f451a0a918d24abfe14848d7d80ddfc91ae449e1e7a9811f6ef3facf4ff48009d56c16812d"
+    "tdx_rtmr2": "8a5b7bb3d6c9c60e9975d092104a37151a3159d7d9f69f35075a6a08241a97b57a04734e3282ead505675e91b7822e92"
   }
 }
