@@ -10,12 +10,16 @@ on:
     branches:
       - main
 
+permissions: {}
+
 jobs:
   # ── Rust checks (cheap ubuntu runner) ────────────────────────────────────────
   rust-checks:
     name: Rust checks
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout code
@@ -33,7 +37,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          echo "::add-matcher::.github/rust-problem-matcher.json"
+          cargo clippy --all-targets -- -D warnings
+          echo "::remove-matcher owner=rust::"
 
       - name: Run tests
         run: cargo test
@@ -222,7 +229,7 @@ jobs:
 
   # ── Apple (expensive macOS runner) ───────────────────────────────────────────
   # This uses https://github.com/khoi/sand to provision a runner from a known image:
-  # ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:751c514771f2a637e974124b242ea777fd93f82f057b67e718af4d39895a7cc1
+  # ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:a914e5b3fc1197d61832009778a77ca30717314fd32702cfdf90a42f2c279ea3
   apple:
     name: Apple builds
     runs-on: self-hosted
@@ -231,6 +238,8 @@ jobs:
       artifact_manifest: ${{ steps.partial.outputs.actual }}
     permissions:
       contents: read
+      security-events: write
+      actions: read
 
     steps:
       - name: Checkout code
@@ -258,6 +267,13 @@ jobs:
           cat /tmp/macos-artifact-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
+        with:
+          languages: swift
+          build-mode: manual
+          config-file: .github/codeql/codeql-config-swift.yml
+
       - name: Run Swift tests
         run: |
           # Build the XCFramework and update the local path for SPM
@@ -268,6 +284,11 @@ jobs:
 
           # Run Swift tests for macOS app
           ( cd apps/macos && swift test )
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
+        with:
+          category: "/language:swift"
 
   artifact-manifest:
     name: Verify artifact manifest
