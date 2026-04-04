@@ -1,0 +1,100 @@
+# Generate and attest the Tinfoil deployment manifest.
+#
+# Tinfoil's verification chain works as follows:
+#   1. This workflow generates tinfoil-deployment.json from the already-verified
+#      artifact-manifest.json (measurements are computed deterministically by
+#      measure-enclave and verified by CI on every push to main).
+#   2. The deployment manifest is attested to Sigstore via actions/attest,
+#      producing a transparency log entry on Rekor.
+#   3. A GitHub release is created with the manifest + its SHA-256 hash.
+#   4. Tinfoil's verifier (tinfoil-go) fetches tinfoil.hash from the release,
+#      retrieves the Sigstore bundle from the GitHub Attestations API, verifies
+#      the OIDC identity + artifact digest, then extracts the measurements and
+#      compares them against the live enclave's hardware attestation report.
+#
+# This workflow does NOT recompute measurements — it transforms our
+# artifact-manifest.json (source of truth) into Tinfoil's expected format.
+
+name: Tinfoil Build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Attest and release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write      # gh release create
+      id-token: write      # Sigstore OIDC token
+      attestations: write  # actions/attest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Generate tinfoil-deployment.json
+        run: |
+          mkdir -p output
+
+          # Read CVM version from config for the hashes block
+          CVM_VERSION=$(grep -E '^cvm-version:' tinfoil-config.yml | sed 's/^cvm-version:[[:space:]]*//')
+
+          # Fetch CVM manifest to include hashes
+          CVM_MANIFEST_URL="https://github.com/tinfoilsh/cvmimage/releases/download/v${CVM_VERSION}/tinfoil-inference-v${CVM_VERSION}-manifest.json"
+          curl -fsSL --retry 3 -o /tmp/cvm-manifest.json "$CVM_MANIFEST_URL"
+
+          # Transform artifact-manifest.json + tinfoil-config.yml into
+          # tinfoil-deployment.json (Tinfoil's expected predicate format)
+          jq -n \
+            --argjson manifest "$(cat artifact-manifest.json)" \
+            --argjson cvm "$(cat /tmp/cvm-manifest.json)" \
+            --arg config "$(base64 -w0 tinfoil-config.yml)" \
+            '{
+              snp_measurement: $manifest.enclave.snp_measurement,
+              tdx_measurement: $manifest.enclave.tdx_measurement,
+              cmdline: $manifest.enclave.cmdline,
+              hashes: $cvm,
+              config: $config
+            }' > output/tinfoil-deployment.json
+
+      - name: Hash deployment manifest
+        id: hash
+        run: |
+          HASH=$(sha256sum output/tinfoil-deployment.json | cut -d ' ' -f 1)
+          echo "$HASH" > output/tinfoil.hash
+          echo "digest=sha256:${HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest deployment manifest
+        uses: actions/attest@7667f588f2f73a90cea6c7ac70e78266c4f76616 # v3.1.0
+        with:
+          subject-name: tinfoil-deployment.json
+          subject-digest: ${{ steps.hash.outputs.digest }}
+          predicate-type: https://tinfoil.sh/predicate/snp-tdx-multiplatform/v1
+          predicate-path: output/tinfoil-deployment.json
+
+      - name: Generate release notes
+        run: |
+          HASH=$(cat output/tinfoil.hash)
+          SNP=$(jq -r '.enclave.snp_measurement' artifact-manifest.json)
+          RTMR1=$(jq -r '.enclave.tdx_measurement.rtmr1' artifact-manifest.json)
+          RTMR2=$(jq -r '.enclave.tdx_measurement.rtmr2' artifact-manifest.json)
+
+          printf 'SEV-SNP Measurement: `%s`\nTDX RTMR1: `%s`\nTDX RTMR2: `%s`\n\nDigest: `%s`\nSigstore Link: https://search.sigstore.dev/?hash=%s\n' \
+            "$SNP" "$RTMR1" "$RTMR2" "$HASH" "$HASH" \
+            > output/release-notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --verify-tag \
+            --title "${{ github.ref_name }}" \
+            --notes-file output/release-notes.md \
+            --latest=false \
+            output/tinfoil-deployment.json \
+            output/tinfoil.hash

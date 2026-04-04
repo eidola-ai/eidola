@@ -190,6 +190,21 @@ fetch_cvm_artifacts() {
     exit 1
   fi
 
+  # Verify CVM manifest provenance via Sigstore attestation when gh is available
+  # (CI environment). This checks that the manifest was built on GitHub-hosted
+  # runners in the tinfoilsh/cvmimage repo. Skipped in local dev where gh may
+  # not be authenticated.
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    echo "Verifying CVM manifest attestation..." >&2
+    if gh attestation verify "$manifest_file" -R tinfoilsh/cvmimage --deny-self-hosted-runners; then
+      echo "CVM manifest attestation verified." >&2
+    else
+      echo "warning: CVM manifest attestation verification failed" >&2
+      echo "  The manifest hash checks passed, but Sigstore provenance could not be verified." >&2
+      echo "  This may indicate the release was not built on GitHub-hosted runners." >&2
+    fi
+  fi
+
   # Export paths for use by compute_measurements
   CVM_OVMF="$ovmf_file"
   CVM_KERNEL="$kernel_file"

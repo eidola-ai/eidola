@@ -68,12 +68,19 @@ struct TinfoilConfig {
     memory: u64,
 }
 
-/// Output format — matches what we store in artifact-manifest.json.
+/// Output format — matches the enclave block in artifact-manifest.json and the
+/// Tinfoil deployment manifest predicate (`snp-tdx-multiplatform/v1`).
 #[derive(Serialize)]
 struct MeasurementOutput {
     snp_measurement: String,
-    tdx_rtmr1: String,
-    tdx_rtmr2: String,
+    tdx_measurement: TdxMeasurement,
+    cmdline: String,
+}
+
+#[derive(Serialize)]
+struct TdxMeasurement {
+    rtmr1: String,
+    rtmr2: String,
 }
 
 /// Build the kernel command line exactly as the Tinfoil CVM does.
@@ -161,8 +168,11 @@ fn main() -> Result<()> {
 
     let output = MeasurementOutput {
         snp_measurement: snp,
-        tdx_rtmr1: hex::encode(&tdx.rtmr1),
-        tdx_rtmr2: hex::encode(&tdx.rtmr2),
+        tdx_measurement: TdxMeasurement {
+            rtmr1: hex::encode(&tdx.rtmr1),
+            rtmr2: hex::encode(&tdx.rtmr2),
+        },
+        cmdline,
     };
 
     println!("{}", serde_json::to_string_pretty(&output)?);
