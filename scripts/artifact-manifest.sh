@@ -9,10 +9,14 @@ Usage:
   scripts/artifact-manifest.sh verify [--metadata-file PATH] [--manifest PATH]
   scripts/artifact-manifest.sh build-macos [--output PATH] [--macos-paths-file PATH]
   scripts/artifact-manifest.sh print-macos [--macos-paths-file PATH | --app-path PATH --cli-path PATH]
-  scripts/artifact-manifest.sh measure [--config PATH]
+  scripts/artifact-manifest.sh measure [--config PATH] [--verify-attestations]
   scripts/artifact-manifest.sh merge [--partial PATH ...] [--output PATH]
-  scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--output PATH]
+  scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--output PATH] [--verify-attestations]
   scripts/artifact-manifest.sh update [--output PATH] [--metadata-file PATH] [--builder NAME] [--ensure-builder]
+
+Options:
+  --verify-attestations   Verify CVM manifest provenance via Sigstore (requires gh CLI).
+                          Fails the command if attestation verification fails.
 EOF
 }
 
@@ -51,6 +55,7 @@ MACOS_PATHS_FILE=""
 APP_PATH=""
 CLI_PATH=""
 CONFIG_FILE="$REPO_ROOT/tinfoil-config.yml"
+VERIFY_ATTESTATIONS=0
 PARTIAL_FILES=()
 BUILDX_SET_ARGS=()
 
@@ -99,6 +104,10 @@ while [[ $# -gt 0 ]]; do
     --set)
       BUILDX_SET_ARGS+=("$2")
       shift 2
+      ;;
+    --verify-attestations)
+      VERIFY_ATTESTATIONS=1
+      shift
       ;;
     -h|--help)
       usage
@@ -190,19 +199,18 @@ fetch_cvm_artifacts() {
     exit 1
   fi
 
-  # Verify CVM manifest provenance via Sigstore attestation when gh is available
-  # (CI environment). This checks that the manifest was built on GitHub-hosted
-  # runners in the tinfoilsh/cvmimage repo. Skipped in local dev where gh may
-  # not be authenticated.
-  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  # When --verify-attestations is set, verify CVM manifest provenance via
+  # Sigstore. This checks that the manifest was built on GitHub-hosted runners
+  # in the tinfoilsh/cvmimage repo. Fails hard if verification fails.
+  if [[ "$VERIFY_ATTESTATIONS" -eq 1 ]]; then
     echo "Verifying CVM manifest attestation..." >&2
-    if gh attestation verify "$manifest_file" -R tinfoilsh/cvmimage --deny-self-hosted-runners; then
-      echo "CVM manifest attestation verified." >&2
-    else
-      echo "warning: CVM manifest attestation verification failed" >&2
+    if ! gh attestation verify "$manifest_file" -R tinfoilsh/cvmimage --deny-self-hosted-runners; then
+      echo "error: CVM manifest attestation verification failed" >&2
       echo "  The manifest hash checks passed, but Sigstore provenance could not be verified." >&2
       echo "  This may indicate the release was not built on GitHub-hosted runners." >&2
+      exit 1
     fi
+    echo "CVM manifest attestation verified." >&2
   fi
 
   # Export paths for use by compute_measurements

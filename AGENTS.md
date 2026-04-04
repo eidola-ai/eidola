@@ -65,7 +65,7 @@ The binary uses `sev` (with `crypto_nossl` feature ��� pure Rust, no OpenS
 
 `tinfoil-config.yml` is the Tinfoil Container configuration. It references container images by digest (from `artifact-manifest.json`), declares `_HASH` env vars for measured secrets (Argon2id hashes generated via `cargo run -p hash-secret`), and specifies CVM resources (cpus, memory). The SHA-256 of this file is embedded in the kernel command line and bound into the enclave measurement, so any change to the config produces a different measurement.
 
-The measurement flow: `source → deterministic OCI build → digest → tinfoil-config.yml (with digest) → cmdline (with config hash) → measurement`. All values are committed in `artifact-manifest.json` and verified by CI. CVM artifacts are cached locally at `~/.cache/eidola/cvm/`. CVM manifest provenance is additionally verified via Sigstore attestation (`gh attestation verify`) when running in CI.
+The measurement flow: `source → deterministic OCI build → digest → tinfoil-config.yml (with digest) → cmdline (with config hash) → measurement`. All values are committed in `artifact-manifest.json` and verified by CI. CVM artifacts are cached locally at `~/.cache/eidola/cvm/`. Pass `--verify-attestations` to `artifact-manifest.sh` (used by CI) to additionally verify CVM manifest provenance via Sigstore (`gh attestation verify --deny-self-hosted-runners`); this fails hard if verification fails.
 
 **Tinfoil attestation verification (`crates/tinfoil-verifier/`):**
 

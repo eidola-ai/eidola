@@ -311,12 +311,15 @@ jobs:
 
       - name: Verify full artifact manifest
         id: verify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if ./scripts/artifact-manifest.sh verify-full \
             --partial /tmp/oci-artifact-manifest.json \
             --partial /tmp/apple-artifact-manifest.json \
             --manifest artifact-manifest.json \
-            --output /tmp/artifact-manifest-actual.json; then
+            --output /tmp/artifact-manifest-actual.json \
+            --verify-attestations; then
             echo "match=true" >> "$GITHUB_OUTPUT"
           else
             echo "match=false" >> "$GITHUB_OUTPUT"
