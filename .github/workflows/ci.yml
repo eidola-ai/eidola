@@ -245,9 +245,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install Nix
-        uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
-        with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+        uses: DeterminateSystems/determinate-nix-action@1361e7900eb437fb341f0f226e8fbd9a0d8284fa # v3.17.2
 
       - name: Enable Nix binary cache
         uses: DeterminateSystems/magic-nix-cache@c2f46a0afa5f95fd4c184a533afd280c68cf63ff # v0.1.6
