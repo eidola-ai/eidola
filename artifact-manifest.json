@@ -4,12 +4,12 @@
     "eidola-server": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:58d21ae38b8a338fe2d700fc20b5b4a32cf47ea494b861bd31fe303d16e22f58"
+      "digest": "sha256:ce3b39af6fc0f06fd31112b8cfe44a214fcdaebb4b194d3671d55f93b277774b"
     },
     "eidola-cli": {
       "type": "oci",
       "platform": "linux/amd64",
-      "digest": "sha256:f7f07924ee716bb0d33a8a4f706ae3ef8bc36ec96d25bf2e4a220989b6d8f551"
+      "digest": "sha256:e1249a62a63be564cdb5b0c7e5efb55312fd0d6302c1700c984420e629ceb801"
     },
     "eidola-postgres": {
       "type": "oci",
@@ -28,11 +28,11 @@
     }
   },
   "enclave": {
-    "snp_measurement": "244dfa145ff7c85587c58fa47ff4be16f698262acb9c5798f383c1dd4db495e6241cd76eb626c60af98c8fec27c6ccd3",
+    "snp_measurement": "b943b7d8ad68767e9a2b22e277e4c25a009e34a678c34b5d843450818bf3d614d8d4066f7bb015ba0b6d6ee3669c6252",
     "tdx_measurement": {
       "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-      "rtmr2": "8eca0ef4a714ec9ca4076d2438f67474b66623e0d10e632984596cf9e98d45f31501e527e0e1efd878d477d519ab3a16"
+      "rtmr2": "7d0dc3240c566f973dfa2325cb68ddc417bfae901b368a36c3ab1225a6ce36f32eaab8939b048b61fd66ea7fb8970cc8"
     },
-    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=3c43df07abc2dafbb63a18eb35f4a3a24bb4d4ca9fc1472417c451f11a9a96b2"
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=9f31ffaad5799d2bc5b9073e24d63b5c72348d39c7571731174c055546c23864"
   }
 }

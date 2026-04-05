@@ -17,8 +17,9 @@ WORKDIR /src
 # ── fetch ──────────────────────────────────────────────────────────────────────
 # Copy only manifests and create stub source files so cargo can resolve the
 # workspace. This layer is only invalidated when dependencies change, not on
-# every source edit. Dependencies are baked into the layer (no cache mounts)
-# so they survive BuildKit GC between builds.
+# every source edit. Dependencies are fetched and pre-compiled, with all
+# artifacts baked into the layer (no cache mounts) so they persist via
+# BuildKit's layer cache across CI runs.
 FROM base AS fetch
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -33,22 +34,29 @@ RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do
       if grep -q '^\[\[bin\]\]' "$manifest"; then echo 'fn main(){}' > "$dir/main.rs"; fi; \
     done
 
+ARG CARGO_PROFILE=release
+
 RUN cargo fetch --locked --target ${TARGET}
+
+# Pre-compile dependencies using stub sources. Compiled rlibs are baked into
+# the layer so they persist via BuildKit's layer cache. Cache mounts (the
+# previous approach) don't survive across CI runs because each run creates a
+# fresh BuildKit daemon; layer caching does survive via type=local export.
+RUN --network=none \
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-cli
 
 # ── build ──────────────────────────────────────────────────────────────────────
 # Copy real source over the stubs and compile (no network access).
-# The target dir uses a cache mount to speed up incremental builds without
-# affecting the final image. The binary is copied to /out because cache mounts
-# are only available during RUN, not COPY.
+# Cargo detects that external dependency rlibs are unchanged and only
+# recompiles workspace crates.
 FROM fetch AS build
 
 ARG CARGO_PROFILE=release
 
-COPY apps/ ./apps/
+COPY apps/cli ./apps/cli
 COPY crates/ ./crates/
 
-RUN --mount=type=cache,id=eidola-target-x86_64-unknown-linux-musl,target=/src/target,sharing=locked \
-    --network=none \
+RUN --network=none \
     cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-cli \
     && install -D target/${TARGET}/${CARGO_PROFILE}/eidola /out/eidola
 

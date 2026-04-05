@@ -132,6 +132,10 @@
         mkFilteredSrc =
           crates:
           let
+            rootBuildFiles = {
+              "Cargo.lock" = true;
+              "rust-toolchain.toml" = true;
+            };
             crateSet = builtins.listToAttrs (
               map (c: {
                 name = c;
@@ -159,6 +163,7 @@
                 path: type:
                 let
                   relPath = pkgs.lib.removePrefix (toString ./.) (toString path);
+                  baseName = builtins.baseNameOf path;
                   # Which crate does this path belong to?
                   matchingCrate = getCrateForPath relPath;
                   # Is this an irrelevant crate? (in a crate dir but not in our set)
@@ -167,9 +172,11 @@
                 # Exclude irrelevant crate directories entirely
                 if isIrrelevantCrate then
                   false
-                # Keep root-level files (except Cargo.toml which we'll replace)
+                # Keep only root-level files that affect Cargo resolution/builds.
+                # This avoids generated files like artifact-manifest.json from
+                # perturbing package hashes for unrelated Nix builds.
                 else if type == "regular" && builtins.match "/[^/]+" relPath != null then
-                  true
+                  builtins.hasAttr baseName rootBuildFiles
                 # Keep directories that are parents of crate paths
                 else if type == "directory" && isParentOfCrate relPath then
                   true
