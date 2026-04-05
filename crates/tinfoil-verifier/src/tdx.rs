@@ -53,7 +53,11 @@ pub fn verify_quote(
 ) -> Result<TdxVerification, Error> {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::Tdx(format!("system time error: {e}")))?
+        .map_err(|e| {
+            Error::Tdx(format!(
+                "system clock is earlier than UNIX_EPOCH; TDX quote verification requires a correctly configured system clock: {e}"
+            ))
+        })?
         .as_secs();
 
     let verified = dcap_verify(raw_quote, collateral, now_secs)
