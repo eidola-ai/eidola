@@ -30,7 +30,7 @@
       swift,
       ...
     }:
-    flake-utils.lib.eachSystem [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ] (
+    flake-utils.lib.eachSystem [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ] (
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -51,7 +51,6 @@
         nativeRustTarget =
           {
             "aarch64-darwin" = "aarch64-apple-darwin";
-            "x86_64-darwin" = "x86_64-apple-darwin";
             "aarch64-linux" = "aarch64-unknown-linux-musl";
             "x86_64-linux" = "x86_64-unknown-linux-musl";
           }
@@ -132,6 +131,10 @@
         mkFilteredSrc =
           crates:
           let
+            rootBuildFiles = {
+              "Cargo.lock" = true;
+              "rust-toolchain.toml" = true;
+            };
             crateSet = builtins.listToAttrs (
               map (c: {
                 name = c;
@@ -159,6 +162,7 @@
                 path: type:
                 let
                   relPath = pkgs.lib.removePrefix (toString ./.) (toString path);
+                  baseName = builtins.baseNameOf path;
                   # Which crate does this path belong to?
                   matchingCrate = getCrateForPath relPath;
                   # Is this an irrelevant crate? (in a crate dir but not in our set)
@@ -167,9 +171,11 @@
                 # Exclude irrelevant crate directories entirely
                 if isIrrelevantCrate then
                   false
-                # Keep root-level files (except Cargo.toml which we'll replace)
+                # Keep only root-level files that affect Cargo resolution/builds.
+                # This avoids generated files like artifact-manifest.json from
+                # perturbing package hashes for unrelated Nix builds.
                 else if type == "regular" && builtins.match "/[^/]+" relPath != null then
-                  true
+                  builtins.hasAttr baseName rootBuildFiles
                 # Keep directories that are parents of crate paths
                 else if type == "directory" && isParentOfCrate relPath then
                   true
@@ -204,6 +210,9 @@
         # Full source for workspace-wide operations
         fullSrc = craneLib.cleanCargoSource ./.;
 
+        # Base RUSTFLAGS for deterministic builds (extended per-target in mkTargetConfig)
+        baseRustFlags = "-C debuginfo=0 -C target-cpu=generic";
+
         # Common arguments for all Rust builds - ensures determinism
         # Note: src is NOT included here; add it per-derivation
         commonArgs = {
@@ -227,9 +236,7 @@
           # Network isolation during build
           CARGO_NET_OFFLINE = "true";
 
-          # Rust flags for deterministic builds
-          # Note: Nix automatically handles path remapping via build sandbox
-          RUSTFLAGS = "-C debuginfo=0 -C target-cpu=generic";
+          RUSTFLAGS = baseRustFlags;
         };
 
         # Target configuration helper
@@ -240,6 +247,7 @@
           rustTarget: nixCrossSystem:
           let
             isNative = rustTarget == nativeRustTarget;
+            isDarwin = builtins.match ".*-apple-darwin" rustTarget != null;
             isLinuxMusl = builtins.match ".*-linux-musl" rustTarget != null;
 
             # Use pkgsCross if specified, otherwise native pkgs
@@ -253,11 +261,32 @@
               pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] rustTarget)
             }_LINKER";
 
+            # Use rust-lld (bundled with the Rust toolchain) for Darwin targets.
+            # The system ld64 (from cctools) produces nondeterministic Mach-O output
+            # depending on which macOS version's framework stubs are visible in the
+            # build sandbox. rust-lld resolves symbols solely from the Nix-provided
+            # apple-sdk, making builds reproducible across macOS environments.
+            rustLld = "${rustToolchain}/lib/rustlib/${nativeRustTarget}/bin/rust-lld";
+            darwinRustFlags = builtins.concatStringsSep " " [
+              baseRustFlags
+              "-C linker-flavor=ld64.lld"
+              "-C linker=${rustLld}"
+              "-C link-arg=-L${pkgs.libiconv}/lib"
+            ];
+
             # Cross-compilation needs CARGO_BUILD_TARGET set.
             # For Linux musl targets without pkgsCross, use rust-lld (bundled with Rust).
+            # For Darwin targets, use rust-lld with ld64.lld flavor for reproducibility.
             targetArgs =
-              if isNative then
-                { }
+              if isDarwin && isNative then
+                {
+                  RUSTFLAGS = darwinRustFlags;
+                }
+              else if isDarwin then
+                {
+                  CARGO_BUILD_TARGET = rustTarget;
+                  RUSTFLAGS = darwinRustFlags;
+                }
               else if isLinuxMusl && nixCrossSystem == null then
                 {
                   CARGO_BUILD_TARGET = rustTarget;
@@ -536,7 +565,11 @@
               pname = "eidola-cli-macos-universal";
               version = "1.0";
 
-              nativeBuildInputs = [ pkgs.darwin.cctools ];
+              nativeBuildInputs = [
+                pkgs.darwin.cctools
+                pkgs.darwin.autoSignDarwinBinariesHook
+                pkgs.python3
+              ];
 
               SOURCE_DATE_EPOCH = "0";
 
@@ -559,6 +592,44 @@
                   "$arm64/bin/eidola" \
                   "$x86_64/bin/eidola" \
                   -output "$out/bin/eidola"
+
+                # Zero LC_UUID in each Mach-O slice for reproducibility.
+                # lld computes the UUID from a hash that includes nondeterministic
+                # linker state, producing different values across macOS environments
+                # even when the compiled code is byte-for-byte identical.
+                chmod +w "$out/bin/eidola"
+                python3 -c '
+import struct, sys
+def zero_uuid(data, offset):
+    magic = struct.unpack_from("<I", data, offset)[0]
+    assert magic == 0xFEEDFACF, f"bad Mach-O magic at {offset:#x}"
+    ncmds = struct.unpack_from("<I", data, offset + 16)[0]
+    pos = offset + 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, pos)
+        if cmd == 0x1B:
+            data[pos + 8 : pos + 24] = b"\x00" * 16
+            return
+        pos += cmdsize
+    sys.exit(f"LC_UUID not found at offset {offset:#x}")
+
+path = sys.argv[1]
+with open(path, "r+b") as f:
+    data = bytearray(f.read())
+magic = struct.unpack_from(">I", data, 0)[0]
+if magic == 0xCAFEBABE:
+    nfat = struct.unpack_from(">I", data, 4)[0]
+    for i in range(nfat):
+        offset = struct.unpack_from(">I", data, 8 + i * 20 + 8)[0]
+        zero_uuid(data, offset)
+else:
+    zero_uuid(data, 0)
+with open(path, "wb") as f:
+    f.write(data)
+' "$out/bin/eidola"
+
+                # autoSignDarwinBinariesHook re-signs in postFixup
+                chmod -w "$out/bin/eidola"
               '';
 
               installPhase = ''
@@ -568,10 +639,7 @@
 
               meta = {
                 description = "Eidola CLI (macOS universal binary)";
-                platforms = [
-                  "aarch64-darwin"
-                  "x86_64-darwin"
-                ];
+                platforms = [ "aarch64-darwin" ];
               };
             };
 
@@ -711,10 +779,7 @@
 
               meta = {
                 description = "Eidola macOS application";
-                platforms = [
-                  "aarch64-darwin"
-                  "x86_64-darwin"
-                ];
+                platforms = [ "aarch64-darwin" ];
               };
             };
 

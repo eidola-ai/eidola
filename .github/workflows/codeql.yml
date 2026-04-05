@@ -1,0 +1,54 @@
+name: "CodeQL"
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "26 17 * * 1"
+
+permissions: {}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.name }})
+    # Swift analysis runs in the CI workflow's apple job (needs pre-built XCFramework).
+    # C/C++ is excluded (all auto-generated UniFFI bindings).
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: actions
+            language: actions
+            build-mode: none
+          - name: rust
+            language: rust
+            build-mode: none
+            config-file: .github/codeql/codeql-config-rust.yml
+          - name: rust-apps
+            language: rust
+            build-mode: none
+            config-file: .github/codeql/codeql-config-rust-apps.yml
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ${{ matrix.config-file }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
+        with:
+          category: "/language:${{matrix.name}}"

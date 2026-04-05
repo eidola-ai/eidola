@@ -1,0 +1,8 @@
+paths:
+  - apps
+
+query-filters:
+  # CLI and macOS app print to the user's own terminal — this is intentional
+  # output, not cleartext logging of secrets.
+  - exclude:
+      id: rust/cleartext-logging

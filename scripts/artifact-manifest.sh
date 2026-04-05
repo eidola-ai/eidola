@@ -440,7 +440,8 @@ merge_partials() {
       '. + {enclave: $enclave}')"
   fi
 
-  printf '%s\n' "$merged"
+  # Sort keys for canonical output (matches the -cS normalization in verify)
+  printf '%s\n' "$merged" | jq -S .
 }
 
 verify_full_manifest() {

@@ -7,7 +7,7 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    with flake-utils.lib; eachSystem [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ]
+    with flake-utils.lib; eachSystem [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ]
       (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
@@ -17,13 +17,6 @@
           # Per-system source and build configuration
           swiftConfig = {
             "aarch64-darwin" = {
-              src = pkgs.fetchurl {
-                url = "https://download.swift.org/swift-6.2-release/xcode/swift-6.2-RELEASE/swift-6.2-RELEASE-osx.pkg";
-                sha256 = "0jynn925zgvhdfskf08m73y2xbqp3k9lz0chzpnnsyhca09lmb4y";
-              };
-              builder = ./build.nix;
-            };
-            "x86_64-darwin" = {
               src = pkgs.fetchurl {
                 url = "https://download.swift.org/swift-6.2-release/xcode/swift-6.2-RELEASE/swift-6.2-RELEASE-osx.pkg";
                 sha256 = "0jynn925zgvhdfskf08m73y2xbqp3k9lz0chzpnnsyhca09lmb4y";

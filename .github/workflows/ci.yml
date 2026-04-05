@@ -10,12 +10,16 @@ on:
     branches:
       - main
 
+permissions: {}
+
 jobs:
   # ── Rust checks (cheap ubuntu runner) ────────────────────────────────────────
   rust-checks:
     name: Rust checks
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout code
@@ -33,7 +37,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          echo "::add-matcher::.github/rust-problem-matcher.json"
+          cargo clippy --all-targets -- -D warnings
+          echo "::remove-matcher owner=rust::"
 
       - name: Run tests
         run: cargo test
@@ -110,7 +117,7 @@ jobs:
           fi
 
       - name: Save OCI Buildx cache
-        if: always()
+        if: always() && steps.buildx-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ${{ env.BUILDX_CACHE_DIR }}
@@ -222,7 +229,7 @@ jobs:
 
   # ── Apple (expensive macOS runner) ───────────────────────────────────────────
   # This uses https://github.com/khoi/sand to provision a runner from a known image:
-  # ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:751c514771f2a637e974124b242ea777fd93f82f057b67e718af4d39895a7cc1
+  # ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:a914e5b3fc1197d61832009778a77ca30717314fd32702cfdf90a42f2c279ea3
   apple:
     name: Apple builds
     runs-on: self-hosted
@@ -231,6 +238,7 @@ jobs:
       artifact_manifest: ${{ steps.partial.outputs.actual }}
     permissions:
       contents: read
+      id-token: write
 
     steps:
       - name: Checkout code
@@ -240,6 +248,15 @@ jobs:
         uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            sandbox = true
+            sandbox-fallback = false
+
+      - name: Configure Nix binary cache
+        uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+        with:
+          name: eidola
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
       - name: Check Swift formatting
         run: nix build '.#checks.aarch64-darwin.swift-formatting' --show-trace
@@ -336,7 +353,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           ACTUAL: ${{ steps.verify.outputs.actual }}
         run: |
-          FORMATTED=$(echo "$ACTUAL" | jq '.')
+          FORMATTED=$(echo "$ACTUAL" | jq -S '.')
 
           # Post a REQUEST_CHANGES review with the expected manifest in the
           # body. We avoid line-level suggestions because GitHub's UI cannot

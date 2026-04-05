@@ -73,8 +73,9 @@ jobs:
           PR_NUMBER: ${{ steps.get-pr-number.outputs.pr_number }}
           NEW_HASH: ${{ steps.parse-logs.outputs.new_hash }}
         run: |
-          # Check out the code from the PR branch to find the line to comment on
-          gh pr checkout "$PR_NUMBER"
+          # Fetch flake.nix content via API to avoid checking out untrusted code
+          gh api "repos/${{ github.repository }}/contents/flake.nix?ref=$(gh pr view "$PR_NUMBER" --json headRefName -q .headRefName)" \
+            -q '.content' | base64 -d > flake.nix
 
           # Find the line content and number of the first sha256 to be replaced
           LINE_TO_REPLACE=$(grep -m 1 'sha256 = "sha256' flake.nix)
