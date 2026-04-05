@@ -497,7 +497,11 @@ verify_oci_manifest() {
     echo "Artifact manifest matches OCI build output."
     return 0
   fi
-
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::error::Artifact manifest does not match OCI build output."
+  else
+    echo "Artifact manifest does not match OCI build output."
+  fi
   echo "::error::Artifact manifest does not match OCI build output."
   echo "Committed OCI subset:"
   echo "$committed_subset" | jq .
