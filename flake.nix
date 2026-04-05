@@ -210,6 +210,9 @@
         # Full source for workspace-wide operations
         fullSrc = craneLib.cleanCargoSource ./.;
 
+        # Base RUSTFLAGS for deterministic builds (extended per-target in mkTargetConfig)
+        baseRustFlags = "-C debuginfo=0 -C target-cpu=generic";
+
         # Common arguments for all Rust builds - ensures determinism
         # Note: src is NOT included here; add it per-derivation
         commonArgs = {
@@ -233,9 +236,7 @@
           # Network isolation during build
           CARGO_NET_OFFLINE = "true";
 
-          # Rust flags for deterministic builds
-          # Note: Nix automatically handles path remapping via build sandbox
-          RUSTFLAGS = "-C debuginfo=0 -C target-cpu=generic";
+          RUSTFLAGS = baseRustFlags;
         };
 
         # Target configuration helper
@@ -246,6 +247,7 @@
           rustTarget: nixCrossSystem:
           let
             isNative = rustTarget == nativeRustTarget;
+            isDarwin = builtins.match ".*-apple-darwin" rustTarget != null;
             isLinuxMusl = builtins.match ".*-linux-musl" rustTarget != null;
 
             # Use pkgsCross if specified, otherwise native pkgs
@@ -259,11 +261,32 @@
               pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] rustTarget)
             }_LINKER";
 
+            # Use rust-lld (bundled with the Rust toolchain) for Darwin targets.
+            # The system ld64 (from cctools) produces nondeterministic Mach-O output
+            # depending on which macOS version's framework stubs are visible in the
+            # build sandbox. rust-lld resolves symbols solely from the Nix-provided
+            # apple-sdk, making builds reproducible across macOS environments.
+            rustLld = "${rustToolchain}/lib/rustlib/${nativeRustTarget}/bin/rust-lld";
+            darwinRustFlags = builtins.concatStringsSep " " [
+              baseRustFlags
+              "-C linker-flavor=ld64.lld"
+              "-C linker=${rustLld}"
+              "-C link-arg=-L${pkgs.libiconv}/lib"
+            ];
+
             # Cross-compilation needs CARGO_BUILD_TARGET set.
             # For Linux musl targets without pkgsCross, use rust-lld (bundled with Rust).
+            # For Darwin targets, use rust-lld with ld64.lld flavor for reproducibility.
             targetArgs =
-              if isNative then
-                { }
+              if isDarwin && isNative then
+                {
+                  RUSTFLAGS = darwinRustFlags;
+                }
+              else if isDarwin then
+                {
+                  CARGO_BUILD_TARGET = rustTarget;
+                  RUSTFLAGS = darwinRustFlags;
+                }
               else if isLinuxMusl && nixCrossSystem == null then
                 {
                   CARGO_BUILD_TARGET = rustTarget;
