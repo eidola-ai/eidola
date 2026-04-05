@@ -151,7 +151,7 @@ async fn fetch_tcb_info(
 
     let issuer_chain = extract_header(&resp, "TCB-Info-Issuer-Chain")
         .or_else(|| extract_header(&resp, "SGX-TCB-Info-Issuer-Chain"))
-        .unwrap_or_default();
+        .ok_or_else(|| Error::from("missing TCB issuer chain headers in PCS response"))?;
 
     let body: serde_json::Value = resp.json().await?;
     extract_signed_json(&body, "tcbInfo").map(|(inner_json, signature)| SignedJsonResponse {
