@@ -117,7 +117,7 @@ jobs:
           fi
 
       - name: Save OCI Buildx cache
-        if: always()
+        if: always() && steps.buildx-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ${{ env.BUILDX_CACHE_DIR }}
@@ -248,6 +248,9 @@ jobs:
         uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            sandbox = true
+            sandbox-fallback = false
 
       - name: Configure Nix binary cache
         uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
