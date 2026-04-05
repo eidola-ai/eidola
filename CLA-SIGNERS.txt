@@ -11,7 +11,7 @@
 # - git-email-pattern: Exact email for individuals, @domain for corporate signers
 # - signer-email:      The email of the person who signed
 # - signer-name:       Full legal name of the signer
-# - corporation-name:  (Corporate CLA only) Full legal name of the Corporation, 
+# - corporation-name:  (Corporate CLA only) Full legal name of the Corporation,
 #                      separated by a pipe | from the signer name.
 #
 # If either CLA markdown file changes, its hash changes and a new signer entry is
@@ -22,3 +22,4 @@
 #
 # Corporate example (covers all @acme.com committers):
 #   def45678 @acme.com jane@acme.com Jane Doe | Acme Corp
+88583b75 mike.marcacci@gmail.com mike.marcacci@gmail.com Michael Thomas Marcacci
