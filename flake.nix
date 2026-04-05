@@ -565,7 +565,11 @@
               pname = "eidola-cli-macos-universal";
               version = "1.0";
 
-              nativeBuildInputs = [ pkgs.darwin.cctools ];
+              nativeBuildInputs = [
+                pkgs.darwin.cctools
+                pkgs.darwin.autoSignDarwinBinariesHook
+                pkgs.python3
+              ];
 
               SOURCE_DATE_EPOCH = "0";
 
@@ -588,6 +592,44 @@
                   "$arm64/bin/eidola" \
                   "$x86_64/bin/eidola" \
                   -output "$out/bin/eidola"
+
+                # Zero LC_UUID in each Mach-O slice for reproducibility.
+                # lld computes the UUID from a hash that includes nondeterministic
+                # linker state, producing different values across macOS environments
+                # even when the compiled code is byte-for-byte identical.
+                chmod +w "$out/bin/eidola"
+                python3 -c '
+import struct, sys
+def zero_uuid(data, offset):
+    magic = struct.unpack_from("<I", data, offset)[0]
+    assert magic == 0xFEEDFACF, f"bad Mach-O magic at {offset:#x}"
+    ncmds = struct.unpack_from("<I", data, offset + 16)[0]
+    pos = offset + 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, pos)
+        if cmd == 0x1B:
+            data[pos + 8 : pos + 24] = b"\x00" * 16
+            return
+        pos += cmdsize
+    sys.exit(f"LC_UUID not found at offset {offset:#x}")
+
+path = sys.argv[1]
+with open(path, "r+b") as f:
+    data = bytearray(f.read())
+magic = struct.unpack_from(">I", data, 0)[0]
+if magic == 0xCAFEBABE:
+    nfat = struct.unpack_from(">I", data, 4)[0]
+    for i in range(nfat):
+        offset = struct.unpack_from(">I", data, 8 + i * 20 + 8)[0]
+        zero_uuid(data, offset)
+else:
+    zero_uuid(data, 0)
+with open(path, "wb") as f:
+    f.write(data)
+' "$out/bin/eidola"
+
+                # autoSignDarwinBinariesHook re-signs in postFixup
+                chmod -w "$out/bin/eidola"
               '';
 
               installPhase = ''
