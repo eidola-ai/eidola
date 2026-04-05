@@ -291,8 +291,8 @@ build_metadata() {
     builder_args=(--builder "$BUILDER_NAME")
   fi
 
-  for buildx_set in ${BUILDX_SET_ARGS[@]+"${BUILDX_SET_ARGS[@]}"}; do
-    buildx_set_args+=(--set "$buildx_set")
+  for buildx_set_arg in ${BUILDX_SET_ARGS[@]+"${BUILDX_SET_ARGS[@]}"}; do
+    buildx_set_args+=(--set "$buildx_set_arg")
   done
 
   docker buildx bake manifest \
