@@ -4,13 +4,17 @@ on:
   pull_request:
     branches: [main]
 
+permissions: {}
+
 jobs:
   cla:
     name: Verify CLA signatures
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           # Fetch enough history to find the merge base with the target branch.
           fetch-depth: 0
