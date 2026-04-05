@@ -272,7 +272,6 @@ jobs:
         with:
           languages: swift
           build-mode: manual
-          config-file: .github/codeql/codeql-config-swift.yml
 
       - name: Run Swift tests
         run: |
