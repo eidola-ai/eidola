@@ -62,8 +62,7 @@ SELECT
     c.created_at,
     c.issuer_key_id,
     CASE
-        WHEN ik.expires_at IS NOT NULL
-             AND ik.expires_at < datetime('now')    THEN 'expired'
+        WHEN ik.expires_at < datetime('now')        THEN 'expired'
         WHEN pc_spend.id IS NULL                    THEN 'active'
         WHEN c_next.nonce IS NULL                   THEN 'spending'
         ELSE                                             'spent'
