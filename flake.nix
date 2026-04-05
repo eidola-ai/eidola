@@ -30,7 +30,7 @@
       swift,
       ...
     }:
-    flake-utils.lib.eachSystem [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ] (
+    flake-utils.lib.eachSystem [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ] (
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -51,7 +51,6 @@
         nativeRustTarget =
           {
             "aarch64-darwin" = "aarch64-apple-darwin";
-            "x86_64-darwin" = "x86_64-apple-darwin";
             "aarch64-linux" = "aarch64-unknown-linux-musl";
             "x86_64-linux" = "x86_64-unknown-linux-musl";
           }
@@ -575,10 +574,7 @@
 
               meta = {
                 description = "Eidola CLI (macOS universal binary)";
-                platforms = [
-                  "aarch64-darwin"
-                  "x86_64-darwin"
-                ];
+                platforms = [ "aarch64-darwin" ];
               };
             };
 
@@ -718,10 +714,7 @@
 
               meta = {
                 description = "Eidola macOS application";
-                platforms = [
-                  "aarch64-darwin"
-                  "x86_64-darwin"
-                ];
+                platforms = [ "aarch64-darwin" ];
               };
             };
 
