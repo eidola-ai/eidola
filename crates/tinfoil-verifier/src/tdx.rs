@@ -202,8 +202,16 @@ async fn fetch_root_ca_crl_endpoint(client: &reqwest::Client) -> Result<Vec<u8>,
         .text()
         .await?;
 
-    hex::decode(text.trim())
-        .map_err(|e| Error::Tdx(format!("failed to decode root CA CRL hex: {e}")))
+    let trimmed = text.trim();
+    let len = trimmed.len();
+    let preview_max = 64;
+    let preview: String = trimmed.chars().take(preview_max).collect();
+
+    hex::decode(trimmed).map_err(|e| {
+        Error::Tdx(format!(
+            "failed to decode root CA CRL hex (len={len}, preview=\"{preview}\"): {e}"
+        ))
+    })
 }
 
 /// Fetch root CA CRL via the CRL Distribution Point from the root certificate
