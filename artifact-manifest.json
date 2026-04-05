@@ -6,7 +6,7 @@
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
-      "narHash": "sha256-i0AVPj5Vwq5tZlDJG+6+mftZ2Vy75BCx8QZdVbW+Zh4=",
+      "narHash": "sha256-KT/TZTccHOx7fQamH21V5QuFmjHjxi1/kqnSg9GKvt0=",
       "platform": "darwin/universal",
       "type": "nix"
     },

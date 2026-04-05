@@ -175,13 +175,18 @@ fetch_cvm_artifacts() {
 
   # Verify kernel and initrd against manifest hashes
   local actual_kernel_hash actual_initrd_hash
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual_kernel_hash="$(sha256sum "$kernel_file" | cut -d' ' -f1)"
-    actual_initrd_hash="$(sha256sum "$initrd_file" | cut -d' ' -f1)"
-  else
-    actual_kernel_hash="$(shasum -a 256 "$kernel_file" | cut -d' ' -f1)"
-    actual_initrd_hash="$(shasum -a 256 "$initrd_file" | cut -d' ' -f1)"
-  fi
+
+  compute_sha256() {
+    local file="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "$file" | cut -d' ' -f1
+    else
+      shasum -a 256 "$file" | cut -d' ' -f1
+    fi
+  }
+
+  actual_kernel_hash="$(compute_sha256 "$kernel_file")"
+  actual_initrd_hash="$(compute_sha256 "$initrd_file")"
 
   if [[ "$actual_kernel_hash" != "$kernel_hash" ]]; then
     echo "error: kernel hash mismatch" >&2
@@ -291,8 +296,8 @@ build_metadata() {
     builder_args=(--builder "$BUILDER_NAME")
   fi
 
-  for buildx_set in ${BUILDX_SET_ARGS[@]+"${BUILDX_SET_ARGS[@]}"}; do
-    buildx_set_args+=(--set "$buildx_set")
+  for buildx_set_arg in ${BUILDX_SET_ARGS[@]+"${BUILDX_SET_ARGS[@]}"}; do
+    buildx_set_args+=(--set "$buildx_set_arg")
   done
 
   docker buildx bake manifest \
@@ -497,7 +502,11 @@ verify_oci_manifest() {
     echo "Artifact manifest matches OCI build output."
     return 0
   fi
-
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::error::Artifact manifest does not match OCI build output."
+  else
+    echo "Artifact manifest does not match OCI build output."
+  fi
   echo "::error::Artifact manifest does not match OCI build output."
   echo "Committed OCI subset:"
   echo "$committed_subset" | jq .

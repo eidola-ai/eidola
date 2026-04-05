@@ -6,6 +6,16 @@ Over the coming months, its shape will change substantially as we port several e
 
 We plan to release the functional components of this repo under appropriate open source licenses, but have not finalized the details.
 
+## Contributing
+
+Pull requests are checked for CLA coverage. Every Git author and committer
+email in a PR must match an entry in `CLA-SIGNERS.txt` for the current hash of
+`CLA-INDIVIDUAL.md` or `CLA-CORPORATE.md`.
+
+To sign, add the appropriate entry to `CLA-SIGNERS.txt` in a commit to this
+repository. The signer entry plus the relevant Git history are the signature
+record; there is no separate PDF or email flow.
+
 ## Developing
 
 **Prerequisites:** `rustup`, `just`, `docker`

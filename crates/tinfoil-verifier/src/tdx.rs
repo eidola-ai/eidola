@@ -53,7 +53,11 @@ pub fn verify_quote(
 ) -> Result<TdxVerification, Error> {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::Tdx(format!("system time error: {e}")))?
+        .map_err(|e| {
+            Error::Tdx(format!(
+                "system clock is earlier than UNIX_EPOCH; TDX quote verification requires a correctly configured system clock: {e}"
+            ))
+        })?
         .as_secs();
 
     let verified = dcap_verify(raw_quote, collateral, now_secs)
@@ -151,7 +155,7 @@ async fn fetch_tcb_info(
 
     let issuer_chain = extract_header(&resp, "TCB-Info-Issuer-Chain")
         .or_else(|| extract_header(&resp, "SGX-TCB-Info-Issuer-Chain"))
-        .unwrap_or_default();
+        .ok_or_else(|| Error::Tdx("missing TCB issuer chain headers in PCS response".into()))?;
 
     let body: serde_json::Value = resp.json().await?;
     extract_signed_json(&body, "tcbInfo").map(|(inner_json, signature)| SignedJsonResponse {
@@ -202,8 +206,16 @@ async fn fetch_root_ca_crl_endpoint(client: &reqwest::Client) -> Result<Vec<u8>,
         .text()
         .await?;
 
-    hex::decode(text.trim())
-        .map_err(|e| Error::Tdx(format!("failed to decode root CA CRL hex: {e}")))
+    let trimmed = text.trim();
+    let len = trimmed.len();
+    let preview_max = 64;
+    let preview: String = trimmed.chars().take(preview_max).collect();
+
+    hex::decode(trimmed).map_err(|e| {
+        Error::Tdx(format!(
+            "failed to decode root CA CRL hex (len={len}, preview=\"{preview}\"): {e}"
+        ))
+    })
 }
 
 /// Fetch root CA CRL via the CRL Distribution Point from the root certificate

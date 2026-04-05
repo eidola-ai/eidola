@@ -1,0 +1,27 @@
+name: CLA Check
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  cla:
+    name: Verify CLA signatures
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Fetch enough history to find the merge base with the target branch.
+          fetch-depth: 0
+
+      - name: Check CLA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: .github/scripts/check-cla.sh "origin/${{ github.base_ref }}"

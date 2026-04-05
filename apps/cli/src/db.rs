@@ -350,9 +350,15 @@ CREATE TABLE pre_credential (
     created_at      TEXT NOT NULL,
 
     CHECK (
-        (type = 'issuance' AND credential_nonce IS NULL AND spend_amount IS NULL)
+        (type = 'issuance'
+            AND credential_nonce IS NULL
+            AND spend_amount IS NULL
+            AND credits IS NOT NULL)
         OR
-        (type = 'refund'   AND credential_nonce IS NOT NULL AND spend_amount IS NOT NULL)
+        (type = 'refund'
+            AND credential_nonce IS NOT NULL
+            AND spend_amount IS NOT NULL
+            AND credits IS NULL)
     )
 );
 
@@ -382,8 +388,7 @@ SELECT
     c.created_at,
     c.issuer_key_id,
     CASE
-        WHEN ik.expires_at IS NOT NULL
-             AND ik.expires_at < datetime('now')    THEN 'expired'
+        WHEN ik.expires_at < datetime('now')        THEN 'expired'
         WHEN pc_spend.id IS NULL                    THEN 'active'
         WHEN c_next.nonce IS NULL                   THEN 'spending'
         ELSE                                             'spent'
