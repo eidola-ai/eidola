@@ -26,9 +26,15 @@ CREATE TABLE pre_credential (
     created_at      TEXT NOT NULL,
 
     CHECK (
-        (type = 'issuance' AND credential_nonce IS NULL AND spend_amount IS NULL)
+        (type = 'issuance'
+            AND credential_nonce IS NULL
+            AND spend_amount IS NULL
+            AND credits IS NOT NULL)
         OR
-        (type = 'refund'   AND credential_nonce IS NOT NULL AND spend_amount IS NOT NULL)
+        (type = 'refund'
+            AND credential_nonce IS NOT NULL
+            AND spend_amount IS NOT NULL
+            AND credits IS NULL)
     )
 );
 
