@@ -350,7 +350,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           ACTUAL: ${{ steps.verify.outputs.actual }}
         run: |
-          FORMATTED=$(echo "$ACTUAL" | jq '.')
+          FORMATTED=$(echo "$ACTUAL" | jq -S '.')
 
           # Post a REQUEST_CHANGES review with the expected manifest in the
           # body. We avoid line-level suggestions because GitHub's UI cannot
