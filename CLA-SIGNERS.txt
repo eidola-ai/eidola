@@ -5,7 +5,8 @@
 #
 # Format: <cla-hash> <git-email-pattern> <signer-email> <signer-name> [| <corporation-name>]
 #
-# - cla-hash:          SHA-256 of the CLA text (CLA-INDIVIDUAL.md or CLA-CORPORATE.md)
+# - cla-hash:          First 8 hex characters of the SHA-256 of the CLA text
+#                      (CLA-INDIVIDUAL.md or CLA-CORPORATE.md).
 #                      This binds the signer to an exact version of the agreement.
 # - git-email-pattern: Exact email for individuals, @domain for corporate signers
 # - signer-email:      The email of the person who signed
@@ -17,7 +18,7 @@
 # required for that new version.
 #
 # Individual example:
-#   abc123... alice@example.com alice@example.com Alice Smith
+#   abc12345 alice@example.com alice@example.com Alice Smith
 #
 # Corporate example (covers all @acme.com committers):
-#   def456... @acme.com jane@acme.com Jane Doe | Acme Corp
+#   def45678 @acme.com jane@acme.com Jane Doe | Acme Corp

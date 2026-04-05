@@ -15,6 +15,7 @@ BASE_REF="${1:-main}"
 # Emails that bypass the CLA check entirely.
 EXEMPT_BOTS="
 dependabot[bot]@users.noreply.github.com
+49699333+dependabot[bot]@users.noreply.github.com
 github-actions[bot]@users.noreply.github.com
 41898282+github-actions[bot]@users.noreply.github.com
 noreply@github.com
@@ -47,10 +48,12 @@ is_bot() {
 [[ -f "$SIGNERS_FILE" ]]   || die "$SIGNERS_FILE not found"
 
 HASH_INDIVIDUAL="$(sha256_file "$CLA_INDIVIDUAL")"
+HASH_INDIVIDUAL="${HASH_INDIVIDUAL:0:8}"
 HASH_CORPORATE="$(sha256_file "$CLA_CORPORATE")"
+HASH_CORPORATE="${HASH_CORPORATE:0:8}"
 
-info "CLA-INDIVIDUAL hash: ${HASH_INDIVIDUAL:0:16}…"
-info "CLA-CORPORATE  hash: ${HASH_CORPORATE:0:16}…"
+info "CLA-INDIVIDUAL hash: ${HASH_INDIVIDUAL}"
+info "CLA-CORPORATE  hash: ${HASH_CORPORATE}"
 
 # ── Extract unique commit emails ───────────────────────────────────────────────
 
@@ -107,32 +110,75 @@ for email in $EMAILS; do
   FAILED=1
 done
 
+# ── PR comment helper ─────────────────────────────────────────────────────────
+
+COMMENT_MARKER="<!-- cla-check -->"
+
+post_pr_comment() {
+  # Only post when running in a GitHub Actions PR context.
+  if [[ -z "${PR_NUMBER:-}" || -z "${GITHUB_REPOSITORY:-}" ]]; then
+    return
+  fi
+
+  local body="$1"
+  body="${COMMENT_MARKER}
+${body}"
+
+  # Minimize any previous CLA comments so the latest result is prominent.
+  local old_ids
+  old_ids="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+    --jq "[.[] | select(.body | startswith(\"${COMMENT_MARKER}\")) | .id] | .[]" \
+    2>/dev/null || true)"
+
+  for id in $old_ids; do
+    # Minimize via GraphQL — the REST API doesn't support hiding comments.
+    local node_id
+    node_id="$(gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" \
+      --jq '.node_id' 2>/dev/null || true)"
+    if [[ -n "$node_id" ]]; then
+      gh api graphql -f query='
+        mutation($id: ID!) {
+          minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) {
+            clientMutationId
+          }
+        }' -f id="$node_id" >/dev/null 2>&1 || true
+    fi
+  done
+
+  gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$body" >/dev/null 2>&1 || true
+}
+
 # ── Report ─────────────────────────────────────────────────────────────────────
 
 if [[ $FAILED -ne 0 ]]; then
-  echo ""
-  echo "══════════════════════════════════════════════════════════════"
-  echo " CLA CHECK FAILED"
-  echo "══════════════════════════════════════════════════════════════"
-  echo ""
-  echo "The following email(s) have not signed the current CLA:"
-  echo ""
-  for email in $MISSING_EMAILS; do
-    echo "  $email"
-  done
-  echo ""
-  echo "To sign, add the following line(s) to $SIGNERS_FILE in this"
-  echo "branch and push a new commit:"
-  echo ""
-  for email in $MISSING_EMAILS; do
-    echo "  ${HASH_INDIVIDUAL} ${email} ${email} Your Name"
-  done
-  echo ""
-  echo "Format: <cla-hash> <git-email-pattern> <signer-email> <signer-name>"
-  echo "See CLA-INDIVIDUAL.md (or CLA-CORPORATE.md for organizations)."
-  echo "══════════════════════════════════════════════════════════════"
+  MESSAGE="## CLA Check Failed
+
+The following commit email(s) have not signed the current CLA:
+
+$(for email in $MISSING_EMAILS; do echo "- \`$email\`"; done)
+
+**To sign the CLA as an individual,** add a line to \`$SIGNERS_FILE\` in this branch and push:
+
+\`\`\`
+$(for email in $MISSING_EMAILS; do echo "${HASH_INDIVIDUAL} ${email} ${email} Your Name"; done)
+\`\`\`
+
+**To sign the CLA for your company,** add a line with your corporate domain instead:
+
+\`\`\`
+$(for email in $MISSING_EMAILS; do domain="@${email#*@}"; echo "${HASH_CORPORATE} ${domain} ${email} Your Name | Company Name"; done)
+\`\`\`
+
+See [CLA-INDIVIDUAL.md](../blob/main/CLA-INDIVIDUAL.md) or [CLA-CORPORATE.md](../blob/main/CLA-CORPORATE.md) for full details."
+
+  echo "$MESSAGE"
+  post_pr_comment "$MESSAGE"
   exit 1
 fi
 
-echo ""
-pass "All commit emails have valid CLA signatures."
+MESSAGE="## CLA Check Passed
+
+All commit emails have valid CLA signatures."
+
+echo "$MESSAGE"
+post_pr_comment "$MESSAGE"
