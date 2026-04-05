@@ -175,13 +175,18 @@ fetch_cvm_artifacts() {
 
   # Verify kernel and initrd against manifest hashes
   local actual_kernel_hash actual_initrd_hash
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual_kernel_hash="$(sha256sum "$kernel_file" | cut -d' ' -f1)"
-    actual_initrd_hash="$(sha256sum "$initrd_file" | cut -d' ' -f1)"
-  else
-    actual_kernel_hash="$(shasum -a 256 "$kernel_file" | cut -d' ' -f1)"
-    actual_initrd_hash="$(shasum -a 256 "$initrd_file" | cut -d' ' -f1)"
-  fi
+
+  compute_sha256() {
+    local file="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "$file" | cut -d' ' -f1
+    else
+      shasum -a 256 "$file" | cut -d' ' -f1
+    fi
+  }
+
+  actual_kernel_hash="$(compute_sha256 "$kernel_file")"
+  actual_initrd_hash="$(compute_sha256 "$initrd_file")"
 
   if [[ "$actual_kernel_hash" != "$kernel_hash" ]]; then
     echo "error: kernel hash mismatch" >&2
