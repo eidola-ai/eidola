@@ -10,6 +10,7 @@ use axum::response::Sse;
 use axum::response::sse::{Event, KeepAlive};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use opentelemetry::KeyValue;
 use rand_core::OsRng;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -280,11 +281,23 @@ pub async fn chat_completions(
     // --- POINT OF NO RETURN: nullifier is recorded ---
     // From here on, we MUST issue a refund on any error.
 
-    if request.stream {
+    let result = if request.stream {
         handle_streaming_request(state, &request, &act, &model, charge_credits).await
     } else {
         handle_non_streaming_request(&state, &request, &act, &model, charge_credits).await
-    }
+    };
+
+    let status = if result.is_ok() { "ok" } else { "error" };
+    crate::telemetry::metrics::CHAT_REQUESTS.add(
+        1,
+        &[
+            KeyValue::new("model", request.model.clone()),
+            KeyValue::new("stream", if request.stream { "true" } else { "false" }),
+            KeyValue::new("status", status),
+        ],
+    );
+
+    result
 }
 
 /// Handle a non-streaming chat completion request.
@@ -315,6 +328,19 @@ async fn handle_non_streaming_request(
             return Ok(error_response_with_refund(&e, refund.ok()));
         }
     };
+
+    // Record token usage metrics (safe for unlinked layer: only model + counts).
+    if let Some(usage) = &backend_response.meta.usage {
+        let model_attr = KeyValue::new("model", model.id.clone());
+        crate::telemetry::metrics::CHAT_TOKENS.add(
+            usage.prompt_tokens as u64,
+            &[model_attr.clone(), KeyValue::new("type", "prompt")],
+        );
+        crate::telemetry::metrics::CHAT_TOKENS.add(
+            usage.completion_tokens as u64,
+            &[model_attr, KeyValue::new("type", "completion")],
+        );
+    }
 
     // Compute actual cost and refund.
     let cost = backend_response
@@ -412,6 +438,7 @@ async fn handle_streaming_request(
             return Ok(error_response_with_refund(&err, refund.ok()));
         }
     };
+    let model_id = model.id.clone();
     let model_pricing = model.pricing.clone();
 
     tokio::spawn(async move {
@@ -486,6 +513,19 @@ async fn handle_streaming_request(
                     // Prefer usage from the final chunk, then from meta.
                     if final_usage.is_none() {
                         final_usage = meta.usage.clone();
+                    }
+
+                    // Record token usage metrics (safe: only model + counts).
+                    if let Some(usage) = &final_usage {
+                        let model_attr = KeyValue::new("model", model_id.clone());
+                        crate::telemetry::metrics::CHAT_TOKENS.add(
+                            usage.prompt_tokens as u64,
+                            &[model_attr.clone(), KeyValue::new("type", "prompt")],
+                        );
+                        crate::telemetry::metrics::CHAT_TOKENS.add(
+                            usage.completion_tokens as u64,
+                            &[model_attr, KeyValue::new("type", "completion")],
+                        );
                     }
 
                     let privacy = build_privacy_metadata(&auth_context, is_tee, &meta.provider);

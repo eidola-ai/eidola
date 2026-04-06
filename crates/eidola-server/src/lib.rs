@@ -17,8 +17,10 @@ pub mod error;
 pub mod handlers;
 pub mod helpers;
 pub mod measurements;
+pub mod middleware;
 pub mod response;
 pub mod stripe;
+pub mod telemetry;
 pub mod types;
 pub mod webhook;
 

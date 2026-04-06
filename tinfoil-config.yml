@@ -17,31 +17,21 @@ cpus: 2
 memory: 8192
 
 containers:
-  # TEMPORARY: this does *not* have a persistent disk and will need to be replaced with a real database.
-  # TODO: how do I expose a port that's NOT behind the shim?
-  # TODO: mount initial schema?
-  # - name: "eidola-postgres"
-  #   image: "ghcr.io/eidola-ai/eidola-postgres@sha256:a2838b26834655ee4b9527c699252ec8de63de4ceb4ccad7dd4f754c1abab8e9"
-  #   env:
-  #     - POSTGRES_USER: "eidola"
-  #     - POSTGRES_DB: "eidola"
-  #   volumes:
-  #     - /mnt/ramdisk/data:/var/lib/postgresql/data
-
   - name: "eidola-server"
-    image: "ghcr.io/eidola-ai/eidola-server@sha256:ce3b39af6fc0f06fd31112b8cfe44a214fcdaebb4b194d3671d55f93b277774b"
+    image: "ghcr.io/eidola-ai/eidola-server@sha256:679f90b0af47d799a42d71dde9487be34eba554690befe55027aa608bc2333b0"
     devices:
       - /dev/sev-guest
     secrets:
       - CREDENTIAL_MASTER_KEY
-      - TINFOIL_API_KEY
+      - DATABASE_PASSWORD
+      - OTEL_EXPORTER_OTLP_HEADERS
       - STRIPE_API_KEY
       - STRIPE_WEBHOOK_SECRET
-      - DATABASE_PASSWORD
+      - TINFOIL_API_KEY
     env:
       - BIND_ADDR: "0.0.0.0:8080"
+      - OTEL_EXPORTER_OTLP_ENDPOINT: "https://otlp-gateway-prod-us-west-0.grafana.net/otlp"
       - DATABASE_URL: "postgres://gateway@db.rpadyfspzqiwmoytihmg.supabase.co:5432/postgres?sslmode=require&options=-csearch_path%3Deidola"
-      # Public root CA certificate for the external Postgres instance.
       - DATABASE_SSL_CERT: |
           -----BEGIN CERTIFICATE-----
           MIIDxDCCAqygAwIBAgIUbLxMod62P2ktCiAkxnKJwtE9VPYwDQYJKoZIhvcNAQEL
@@ -69,10 +59,11 @@ containers:
 
       # Measured secret hashes — Argon2id hashes of the actual secrets.
       - CREDENTIAL_MASTER_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$QA6ZPLR29CAPeushQ+ujFA$cOkF1JJdZoKDDzei5pyDrcsfiDBCuqUDoJaYwXG1G5k"
-      - TINFOIL_API_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$d8t7z4mWAjPzjoANx9fJFQ$+kN/8qNToSPgq7GIknW7PTCF38asH6vs1v9eegE1RbQ"
+      - DATABASE_PASSWORD_HASH: "$argon2id$v=19$m=19456,t=2,p=1$cysXhP6SVPuB83IC4iD4yw$ygvRvdmSVfH5zq5+8P/Fgnyz6q93VwCuiZxU0GfjtLs"
+      - OTEL_EXPORTER_OTLP_HEADERS_HASH: "$argon2id$v=19$m=19456,t=2,p=1$BU7g3wAtS+gxm9ADqglQrw$KPSjwJlNFppw1/JncRV9Oby1BCNc/53TRPdBv0j3uOw"
       - STRIPE_API_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$qucRiGbS8rYcqJINDlHDcw$qdu/tD4Ymq1by0uPVawIFFneCq757OzZ3/5EPeyFQ4Q"
       - STRIPE_WEBHOOK_SECRET_HASH: "$argon2id$v=19$m=19456,t=2,p=1$4j33RHeU39z3dQiVU/k2rw$NryykMC9uwJGIQYLG5WeYkP3FHD/Sb8uPlAS2qzsLDc"
-      - DATABASE_PASSWORD_HASH: "$argon2id$v=19$m=19456,t=2,p=1$cysXhP6SVPuB83IC4iD4yw$ygvRvdmSVfH5zq5+8P/Fgnyz6q93VwCuiZxU0GfjtLs"
+      - TINFOIL_API_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$d8t7z4mWAjPzjoANx9fJFQ$+kN/8qNToSPgq7GIknW7PTCF38asH6vs1v9eegE1RbQ"
 
 shim:
   upstream-port: 8080

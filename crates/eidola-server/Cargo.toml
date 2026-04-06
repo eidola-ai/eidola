@@ -33,9 +33,21 @@ serde_json = "1"
 # OpenAPI documentation
 utoipa = { version = "5", features = ["uuid"] }
 
-# Logging
+# Logging & telemetry
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# OpenTelemetry (enabled when OTEL_EXPORTER_OTLP_ENDPOINT is set)
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
+tracing-opentelemetry = "0.32"
+opentelemetry-appender-tracing = "0.31"
+# opentelemetry-otlp pulls in reqwest 0.12 for its HTTP exporter. That transitive
+# dep has no TLS by default, so HTTPS endpoints (like Grafana Cloud) fail. Adding
+# reqwest 0.12 here with rustls-tls-webpki-roots-no-provider enables TLS using
+# the process-global rustls-rustcrypto provider installed in main().
+reqwest-otel = { package = "reqwest", version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider"] }
 
 # Anonymous credentials (Privacy Pass)
 anonymous-credit-tokens = "0.4"
