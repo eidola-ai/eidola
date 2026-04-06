@@ -283,7 +283,7 @@ fn now_iso() -> String {
 /// client verifies Tinfoil enclave attestation on each new TLS connection,
 /// ensuring the server is running expected code inside a TEE.
 async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
-    if config.trusted_measurements.is_empty() && config.hardware_root_ca.is_none() {
+    if config.trusted_measurements.is_empty() {
         let mut root_store = rustls::RootCertStore::empty();
         for cert in rustls_native_certs::load_native_certs().certs {
             let _ = root_store.add(cert);
