@@ -4,9 +4,9 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/artifact-manifest.sh build [--metadata-file PATH] [--builder NAME] [--ensure-builder] [--set PATTERN=VALUE ...]
-  scripts/artifact-manifest.sh print [--metadata-file PATH]
-  scripts/artifact-manifest.sh verify [--metadata-file PATH] [--manifest PATH]
+  scripts/artifact-manifest.sh build [--push] [--metadata-file PATH] [--builder NAME] [--ensure-builder] [--set PATTERN=VALUE ...]
+  scripts/artifact-manifest.sh print [--push] [--metadata-file PATH]
+  scripts/artifact-manifest.sh verify [--push] [--metadata-file PATH] [--manifest PATH]
   scripts/artifact-manifest.sh build-macos [--output PATH] [--macos-paths-file PATH]
   scripts/artifact-manifest.sh print-macos [--macos-paths-file PATH | --app-path PATH --cli-path PATH]
   scripts/artifact-manifest.sh measure [--config PATH] [--verify-attestations]
@@ -15,6 +15,12 @@ Usage:
   scripts/artifact-manifest.sh update [--output PATH] [--metadata-file PATH] [--builder NAME] [--ensure-builder]
 
 Options:
+  --push                  Push images directly from BuildKit to the registry (uses ci
+                          bake group with type=image,push=true). Requires REGISTRY and
+                          TAGS env vars. Without this flag, images are built in BuildKit
+                          without push for digest computation (type=image,push=false).
+                          Requires a docker-container driver (--ensure-builder or
+                          setup-buildx-action).
   --verify-attestations   Verify CVM manifest provenance via Sigstore (requires gh CLI).
                           Fails the command if attestation verification fails.
 EOF
@@ -56,6 +62,7 @@ APP_PATH=""
 CLI_PATH=""
 CONFIG_FILE="$REPO_ROOT/tinfoil-config.yml"
 VERIFY_ATTESTATIONS=0
+PUSH_MODE=0
 PARTIAL_FILES=()
 BUILDX_SET_ARGS=()
 
@@ -100,6 +107,10 @@ while [[ $# -gt 0 ]]; do
     --config)
       CONFIG_FILE="$2"
       shift 2
+      ;;
+    --push)
+      PUSH_MODE=1
+      shift
       ;;
     --set)
       BUILDX_SET_ARGS+=("$2")
@@ -229,10 +240,13 @@ fetch_cvm_artifacts() {
 
 # Update image digests in tinfoil-config.yml from build metadata.
 stamp_config_digests() {
-  local server_digest postgres_digest
+  local server_digest postgres_digest tgt_server tgt_postgres
 
-  server_digest="$(jq -er '."server"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
-  postgres_digest="$(jq -er '."postgres"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
+  tgt_server="$(target_key server)"
+  tgt_postgres="$(target_key postgres)"
+
+  server_digest="$(jq -er '."'"$tgt_server"'"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
+  postgres_digest="$(jq -er '."'"$tgt_postgres"'"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
 
   # Strip the sha256: prefix for the image reference
   sed -i.bak \
@@ -286,8 +300,20 @@ ensure_builder() {
   docker buildx inspect "$BUILDER_NAME" --bootstrap >/dev/null
 }
 
+# Return the bake metadata key for a target name.
+# In push mode, the ci bake group prefixes targets with "ci-".
+target_key() {
+  local name="$1"
+  if [[ "$PUSH_MODE" -eq 1 ]]; then
+    echo "ci-${name}"
+  else
+    echo "$name"
+  fi
+}
+
 build_metadata() {
   local -a builder_args buildx_set_args
+  local bake_group
   builder_args=()
   buildx_set_args=()
 
@@ -300,19 +326,33 @@ build_metadata() {
     buildx_set_args+=(--set "$buildx_set_arg")
   done
 
-  docker buildx bake manifest \
+  if [[ "$PUSH_MODE" -eq 1 ]]; then
+    # Push directly from BuildKit to the registry using OCI media types.
+    # The ci targets already set type=image,push=true,oci-mediatypes=true.
+    bake_group="ci"
+  else
+    # Build OCI images locally for digest computation. No push, no daemon load.
+    # Requires a docker-container driver (--ensure-builder or setup-buildx-action).
+    bake_group="manifest"
+    buildx_set_args+=(--set '*.output=type=image,push=false,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true')
+  fi
+
+  docker buildx bake "$bake_group" \
     ${builder_args[@]+"${builder_args[@]}"} \
     ${buildx_set_args[@]+"${buildx_set_args[@]}"} \
-    --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true' \
     --metadata-file "$METADATA_FILE"
 }
 
 print_oci_manifest() {
-  local server cli postgres
+  local server cli postgres tgt_server tgt_cli tgt_postgres
 
-  server="$(jq -er '."server"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
-  cli="$(jq -er '."cli"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
-  postgres="$(jq -er '."postgres"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
+  tgt_server="$(target_key server)"
+  tgt_cli="$(target_key cli)"
+  tgt_postgres="$(target_key postgres)"
+
+  server="$(jq -er '."'"$tgt_server"'"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
+  cli="$(jq -er '."'"$tgt_cli"'"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
+  postgres="$(jq -er '."'"$tgt_postgres"'"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
 
   jq -n \
     --arg server "$server" \
@@ -507,7 +547,6 @@ verify_oci_manifest() {
   else
     echo "Artifact manifest does not match OCI build output."
   fi
-  echo "::error::Artifact manifest does not match OCI build output."
   echo "Committed OCI subset:"
   echo "$committed_subset" | jq .
   echo "Actual OCI subset:"

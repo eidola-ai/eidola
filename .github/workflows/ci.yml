@@ -81,71 +81,8 @@ jobs:
           driver-opts: |
             image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
 
-      - name: Build OCI images
-        run: |
-          ./scripts/artifact-manifest.sh build \
-            --metadata-file "${BAKE_METADATA_FILE}" \
-            --set "*.cache-from=type=gha" \
-            --set "*.cache-to=type=gha,mode=max"
-
-      - name: Record OCI artifact manifest
-        id: partial
-        run: |
-          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
-          ./scripts/artifact-manifest.sh print --metadata-file "${BAKE_METADATA_FILE}" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Verify OCI artifact subset
-        id: verify
-        run: |
-          if ./scripts/artifact-manifest.sh verify --metadata-file "${BAKE_METADATA_FILE}" --manifest artifact-manifest.json; then
-            echo "match=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "match=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Debug image structure
-        if: steps.verify.outputs.match == 'false'
-        run: |
-          echo "=== Builder info ==="
-          docker buildx version
-          docker buildx inspect --bootstrap 2>/dev/null | head -20
-
-          for IMAGE in eidola-server eidola-cli eidola-postgres; do
-            echo ""
-            echo "=============== $IMAGE ==============="
-            DIR="/tmp/${IMAGE}-debug"
-            mkdir -p "$DIR"
-            docker save "${IMAGE}:dev" | tar -xf - -C "$DIR"
-
-            MANIFEST_DIGEST=$(jq -r '.manifests[0].digest' "$DIR/index.json" | cut -d: -f2)
-
-            echo "=== Index ==="
-            jq . "$DIR/index.json"
-
-            echo "=== Manifest (sha256:${MANIFEST_DIGEST:0:12}...) ==="
-            jq . "$DIR/blobs/sha256/$MANIFEST_DIGEST"
-
-            CONFIG_DIGEST=$(jq -r '.config.digest' "$DIR/blobs/sha256/$MANIFEST_DIGEST" | cut -d: -f2)
-            echo "=== Config (sha256:${CONFIG_DIGEST:0:12}...) ==="
-            jq . "$DIR/blobs/sha256/$CONFIG_DIGEST"
-
-            echo "=== Layer listing ==="
-            jq -r '.layers[] | "\(.digest) \(.mediaType)"' "$DIR/blobs/sha256/$MANIFEST_DIGEST" | while read -r LAYER MEDIA; do
-              HASH="${LAYER#sha256:}"
-              SIZE=$(stat -c%s "$DIR/blobs/sha256/$HASH" 2>/dev/null || stat -f%z "$DIR/blobs/sha256/$HASH")
-              echo "  $LAYER  size=$SIZE  type=$MEDIA"
-              echo "  First 20 tar entries:"
-              if echo "$MEDIA" | grep -q gzip; then
-                gzip -dc "$DIR/blobs/sha256/$HASH" | tar -tf - 2>/dev/null | head -20 | sed 's/^/    /'
-              else
-                tar -tf "$DIR/blobs/sha256/$HASH" 2>/dev/null | head -20 | sed 's/^/    /'
-              fi
-            done
-          done
-
       - name: Log in to GHCR
-        if: steps.verify.outputs.match == 'true' && github.event_name == 'push'
+        if: github.event_name == 'push'
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
@@ -153,7 +90,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Determine tags
-        if: steps.verify.outputs.match == 'true' && github.event_name == 'push'
+        if: github.event_name == 'push'
         id: tags
         env:
           REPO_OWNER: ${{ github.repository_owner }}
@@ -176,21 +113,59 @@ jobs:
           echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
-      - name: Push images to GHCR
-        if: steps.verify.outputs.match == 'true' && github.event_name == 'push'
+      - name: Build OCI images
         env:
-          REGISTRY: ${{ steps.tags.outputs.registry }}
-          TAGS: ${{ steps.tags.outputs.tags }}
+          REGISTRY: ${{ steps.tags.outputs.registry || '' }}
+          TAGS: ${{ steps.tags.outputs.tags || 'dev' }}
         run: |
-          set -euo pipefail
-          IFS=',' read -ra TAG_LIST <<< "${TAGS}"
+          PUSH_FLAG=""
+          if [ "${{ github.event_name }}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+          ./scripts/artifact-manifest.sh build \
+            ${PUSH_FLAG} \
+            --metadata-file "${BAKE_METADATA_FILE}" \
+            --set "*.cache-from=type=gha" \
+            --set "*.cache-to=type=gha,mode=max"
 
-          for IMAGE in eidola-server eidola-cli eidola-postgres; do
-            for TAG in "${TAG_LIST[@]}"; do
-              docker tag "${IMAGE}:dev" "${REGISTRY}/${IMAGE}:${TAG}"
-              docker push "${REGISTRY}/${IMAGE}:${TAG}"
-            done
-          done
+      - name: Record OCI artifact manifest
+        run: |
+          PUSH_FLAG=""
+          if [ "${{ github.event_name }}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
+          ./scripts/artifact-manifest.sh print ${PUSH_FLAG} --metadata-file "${BAKE_METADATA_FILE}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+        id: partial
+
+      - name: Verify OCI artifact subset
+        id: verify
+        run: |
+          PUSH_FLAG=""
+          if [ "${{ github.event_name }}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+          if ./scripts/artifact-manifest.sh verify ${PUSH_FLAG} --metadata-file "${BAKE_METADATA_FILE}" --manifest artifact-manifest.json; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "match=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Debug build metadata
+        if: steps.verify.outputs.match == 'false'
+        run: |
+          echo "=== Builder info ==="
+          docker buildx version
+          docker buildx inspect --bootstrap 2>/dev/null | head -20
+
+          echo ""
+          echo "=== Bake metadata ==="
+          jq . "${BAKE_METADATA_FILE}"
+
+          echo ""
+          echo "=== Committed manifest ==="
+          jq . artifact-manifest.json
 
   # ── Apple (expensive macOS runner) ───────────────────────────────────────────
   # This uses https://github.com/khoi/sand to provision a runner from a known image:
