@@ -33,8 +33,8 @@ target "_common" {
 
 # ── Local dev targets (compose.yaml overlay) ──────────────────────────────────
 # context and dockerfile come from compose.yaml; not repeated here.
-# For reproducible builds, use a docker-container builder and pass
-# --set '*.output=type=docker,rewrite-timestamp=true,force-compression=true'
+# For reproducible builds, use a docker-container builder with OCI output and
+# --set '*.output=type=image,push=false,rewrite-timestamp=true,force-compression=true,oci-mediatypes=true'
 # (the default docker driver does not support these options).
 
 target "server" {
