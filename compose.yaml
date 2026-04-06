@@ -29,6 +29,8 @@ services:
       CREDENTIAL_MASTER_KEY: ${CREDENTIAL_MASTER_KEY}
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
       BIND_ADDR: 0.0.0.0:8080
     ports:
       - "8080:8080"
@@ -61,7 +63,13 @@ services:
     profiles: ["test"]
     environment:
       STRIPE_API_KEY: ${STRIPE_API_KEY}
-    command: ["listen", "--forward-to", "https://shim:8443/v1/webhooks/stripe", "--skip-verify"]
+    command:
+      [
+        "listen",
+        "--forward-to",
+        "https://shim:8443/v1/webhooks/stripe",
+        "--skip-verify",
+      ]
 
 volumes:
   pgdata:

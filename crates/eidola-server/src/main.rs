@@ -16,6 +16,7 @@ use eidola_server::credentials;
 use eidola_server::helpers::EpochConfig;
 use eidola_server::measurements;
 use eidola_server::stripe::StripeClient;
+use eidola_server::telemetry;
 
 /// Server configuration.
 struct Config {
@@ -161,14 +162,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider())
         .expect("failed to install rustls crypto provider");
 
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("eidola_server=info".parse().unwrap())
-                .add_directive("hyper=warn".parse().unwrap()),
-        )
-        .init();
+    // Initialize logging + optional OpenTelemetry (when OTEL_EXPORTER_OTLP_ENDPOINT is set).
+    let otel_guard = telemetry::init();
 
     // Load configuration
     let config = Config::load().await.map_err(|e| {
@@ -270,18 +265,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Store the generated OpenAPI spec for the /openapi.json endpoint
     let api_json = api.to_json().expect("OpenAPI spec serialization failed");
-    let app = router.route(
-        "/openapi.json",
-        axum::routing::get(move || {
-            let spec = api_json.clone();
-            async move { (StatusCode::OK, [("content-type", "application/json")], spec) }
-        }),
-    );
+    let app = router
+        .route(
+            "/openapi.json",
+            axum::routing::get(move || {
+                let spec = api_json.clone();
+                async move { (StatusCode::OK, [("content-type", "application/json")], spec) }
+            }),
+        )
+        .layer(axum::middleware::from_fn(
+            eidola_server::middleware::observe,
+        ));
 
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!("Listening on http://{}", config.bind_addr);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // Flush OTel data before exiting.
+    if let Some(guard) = otel_guard {
+        guard.shutdown();
+    }
+
     Ok(())
+}
+
+/// Wait for SIGINT or SIGTERM for graceful shutdown.
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received SIGINT, shutting down"),
+        _ = terminate => info!("received SIGTERM, shutting down"),
+    }
 }
 
 #[cfg(test)]

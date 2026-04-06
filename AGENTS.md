@@ -41,6 +41,13 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - `TINFOIL_BASE_URL` (optional) - Override the default Tinfoil API base URL (`https://inference.tinfoil.sh/v1`)
 - `TINFOIL_PRICING_OVERRIDES` (optional) - JSON object overriding per-model pricing; e.g. `{"kimi-k2-5":{"input":2.0,"output":6.0}}`. Token-based models accept `input`/`output` ($/M tokens); per-request models accept `request` ($/request). See `backend.rs` `MODEL_CATALOG` for defaults
 - `PRICING_MARKUP` (optional) - Pricing markup factor applied to all model prices (default: `1.5`)
+- `OTEL_EXPORTER_OTLP_ENDPOINT` (optional) - OTLP endpoint; enables OpenTelemetry export of traces, metrics, and logs when set (e.g. `https://otlp-gateway-prod-us-central-0.grafana.net/otlp`)
+- `OTEL_EXPORTER_OTLP_HEADERS` (optional) - OTLP auth headers (e.g. `Authorization=Basic <base64(instanceID:apiKey)>`)
+- `OTEL_SERVICE_NAME` (optional) - Override service name in telemetry (default: `eidola-server`)
+
+**Observability:**
+
+The server uses OpenTelemetry to ship traces, metrics, and logs directly to Grafana Cloud (or any OTLP endpoint) via HTTP/protobuf. Enabled when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; otherwise only stdout logging. Telemetry respects the privacy boundary between the "linked" account layer and the "unlinked" anonymous service layer: chat completion spans/metrics contain only model name, token counts, status, and latency — never account IDs, credential data, or message content. Account layer spans may include account_id. The middleware (`middleware.rs`) classifies routes and creates per-request spans; metric instruments are defined in `telemetry.rs`.
 
 **Tinfoil Containers / TEE integration:**
 

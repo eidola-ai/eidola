@@ -643,8 +643,9 @@ pub async fn issue_credentials(
         };
 
     info!(
-        "issued credential: account={}, credits={}, ledger_entry={}",
-        account_id, request.credits, ledger_entry_id
+        credits = request.credits,
+        ledger_entry = %ledger_entry_id,
+        "credential issued"
     );
 
     Ok(Json(IssueCredentialsResponse {

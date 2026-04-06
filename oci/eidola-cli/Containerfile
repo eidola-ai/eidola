@@ -56,6 +56,13 @@ ARG CARGO_PROFILE=release
 COPY apps/cli ./apps/cli
 COPY crates/ ./crates/
 
+# Ensure Cargo detects source changes over the fetch-stage stubs.
+# SOURCE_DATE_EPOCH=0 clamps COPY timestamps to epoch 0, matching the
+# stubs created in the fetch stage, so Cargo's fingerprint check sees
+# no mtime change and skips recompilation. Touching the real source
+# files gives them a current timestamp that differs from the stubs.
+RUN find crates/ apps/cli -name '*.rs' -exec touch {} +
+
 RUN --network=none \
     cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-cli \
     && install -D target/${TARGET}/${CARGO_PROFILE}/eidola /out/eidola

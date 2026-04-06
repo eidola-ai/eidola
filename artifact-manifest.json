@@ -1,12 +1,12 @@
 {
   "artifacts": {
     "eidola-cli": {
-      "digest": "sha256:e1249a62a63be564cdb5b0c7e5efb55312fd0d6302c1700c984420e629ceb801",
+      "digest": "sha256:d4d8d417aa48cbc81cda495af3683826e55516f4e08bf7463f45fa52fe59cb09",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
-      "narHash": "sha256-KT/TZTccHOx7fQamH21V5QuFmjHjxi1/kqnSg9GKvt0=",
+      "narHash": "sha256-rZ9vT3uRoo75+l2A5yOTNVAS37rGY3qoNyvyLVQ+sgs=",
       "platform": "darwin/universal",
       "type": "nix"
     },
@@ -21,17 +21,17 @@
       "type": "oci"
     },
     "eidola-server": {
-      "digest": "sha256:ce3b39af6fc0f06fd31112b8cfe44a214fcdaebb4b194d3671d55f93b277774b",
+      "digest": "sha256:679f90b0af47d799a42d71dde9487be34eba554690befe55027aa608bc2333b0",
       "platform": "linux/amd64",
       "type": "oci"
     }
   },
   "enclave": {
-    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=9f31ffaad5799d2bc5b9073e24d63b5c72348d39c7571731174c055546c23864",
-    "snp_measurement": "b943b7d8ad68767e9a2b22e277e4c25a009e34a678c34b5d843450818bf3d614d8d4066f7bb015ba0b6d6ee3669c6252",
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=7b2d41b59fad31900e72e6b8f34a1291c8d6f7950e8cdc4f4b5fe16f040fa7ba",
+    "snp_measurement": "fa0fde96f39558a7e1d413069310d4793e9b17617c5eed69dd2d3d0d193c968f892d68a2cadc5f3a4249916f5afdde42",
     "tdx_measurement": {
       "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-      "rtmr2": "7d0dc3240c566f973dfa2325cb68ddc417bfae901b368a36c3ab1225a6ce36f32eaab8939b048b61fd66ea7fb8970cc8"
+      "rtmr2": "6ebeb792902058bcd1b176b7188db5fc83676a20de83b80820a839f5a0b4e28b5e461cb16531019c31b56248f1ad429e"
     }
   },
   "version": 1

@@ -49,7 +49,7 @@ set -a; source .env; set +a
 
 # Run the server on the host machine with cargo
 cargo run -p eidola-server
-```rust
+
 # -- OR --
 
 # Run and automatically recompile/reload the server on 
@@ -63,24 +63,20 @@ To run the CLI against a local development stack:
 
 1. **Start the stack:** `just dev` (starts Postgres, Server, and the Hardware Shim).
 2. **Trust the Mock Root CA:**
-   - The shim generates a persistent Root CA in `./.dev-certs/ark.pem`.
-   - **macOS:** Open Keychain Access, drag `ark.pem` into "System", double-click it, and set Trust to "Always Trust".
+   The shim generates a persistent Root CA in `./.dev-certs/ark.pem`.
+   - **macOS (terminal):** `security add-trusted-cert -r trustAsRoot -p ssl -k ~/Library/Keychains/login.keychain-db .dev-certs/ark.pem`
+   - **macOS (UI):** Open Keychain Access, drag `ark.pem` into your login keychain, double-click it, and set Trust to "Always Trust".
    - **Linux:** `sudo cp .dev-certs/ark.pem /usr/local/share/ca-certificates/eidola-dev.crt && sudo update-ca-certificates`
 3. **Configure the CLI:**
    ```bash
-   # Set the base origin (API and attestation are derived automatically)
-   cargo run -p eidola-cli -- configure --base-url https://localhost:8443
+   cargo run -p eidola-cli -- configure \
+     --base-url https://localhost:8443 \
+     --hardware-root-ca .dev-certs/ark.pem \
+     --trust-measurement 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
    ```
-4. **Add the Hardware Root to `config.toml`:**
-   Open `~/Library/Application Support/eidola/config.toml` (or equivalent) and paste the contents of `.dev-certs/ark.pem` into the `hardware_root_ca` field:
-   ```toml
-   base_url = "https://localhost:8443"
-   hardware_root_ca = """
-   -----BEGIN CERTIFICATE-----
-   ... (contents of .dev-certs/ark.pem) ...
-   -----END CERTIFICATE-----
-   """
-   ```
+   The all-zeros measurement matches the mock shim's default. The shim includes its full certificate chain (ARK + ASK) in the attestation response, so only the root CA is needed in the client config.
+
+   On macOS, the CLI's configuration is stored in `~/Library/Application Support/eidola/config.toml`.
 
 Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) for convenience.
 
