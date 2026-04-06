@@ -34,6 +34,18 @@ enum Command {
         /// URL for attestation verification (defaults to Tinfoil ATC)
         #[arg(long)]
         attestation_url: Option<String>,
+        /// Path to PEM-encoded SEV-SNP ARK (Root CA) certificate
+        #[arg(long)]
+        hardware_root_ca: Option<String>,
+        /// Path to PEM-encoded SEV-SNP ASK (Intermediate CA) certificate
+        #[arg(long)]
+        hardware_intermediate_ca: Option<String>,
+        /// Add a trusted enclave measurement (hex-encoded, 96 chars)
+        #[arg(long)]
+        trust_measurement: Option<String>,
+        /// Remove a trusted enclave measurement
+        #[arg(long)]
+        untrust_measurement: Option<String>,
     },
     /// Manage account
     Account {
@@ -442,6 +454,22 @@ async fn run(cli: Cli) -> Result<(), String> {
                 );
             }
             println!(
+                "hardware_root_ca: {}",
+                if config.hardware_root_ca.is_some() {
+                    "<set>"
+                } else {
+                    "<not set>"
+                }
+            );
+            println!(
+                "hardware_intermediate_ca: {}",
+                if config.hardware_intermediate_ca.is_some() {
+                    "<set>"
+                } else {
+                    "<not set>"
+                }
+            );
+            println!(
                 "attestation_url: {}",
                 config.attestation_url.as_deref().unwrap_or("<default ATC>")
             );
@@ -450,9 +478,19 @@ async fn run(cli: Cli) -> Result<(), String> {
         Some(Command::Configure {
             base_url,
             attestation_url,
+            hardware_root_ca,
+            hardware_intermediate_ca,
+            trust_measurement,
+            untrust_measurement,
         }) => {
-            if base_url.is_none() && attestation_url.is_none() {
-                return Err("specify at least one of --base-url or --attestation-url".into());
+            if base_url.is_none()
+                && attestation_url.is_none()
+                && hardware_root_ca.is_none()
+                && hardware_intermediate_ca.is_none()
+                && trust_measurement.is_none()
+                && untrust_measurement.is_none()
+            {
+                return Err("specify at least one option (see --help)".into());
             }
             let mut config = Config::load();
             if let Some(url) = &base_url {
@@ -462,6 +500,37 @@ async fn run(cli: Cli) -> Result<(), String> {
             if let Some(url) = &attestation_url {
                 config.attestation_url = Some(url.clone());
                 println!("attestation_url set to {url}");
+            }
+            if let Some(path) = &hardware_root_ca {
+                let pem = std::fs::read_to_string(path)
+                    .map_err(|e| format!("failed to read {path}: {e}"))?;
+                config.hardware_root_ca = Some(pem.trim().to_string());
+                println!("hardware_root_ca set from {path}");
+            }
+            if let Some(path) = &hardware_intermediate_ca {
+                let pem = std::fs::read_to_string(path)
+                    .map_err(|e| format!("failed to read {path}: {e}"))?;
+                config.hardware_intermediate_ca = Some(pem.trim().to_string());
+                println!("hardware_intermediate_ca set from {path}");
+            }
+            if let Some(m) = &trust_measurement {
+                if m.len() != 96 || !m.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err("measurement must be 96 hex characters (48 bytes)".into());
+                }
+                if !config.trusted_measurements.contains(m) {
+                    config.trusted_measurements.push(m.clone());
+                    println!("added trusted measurement: {m}");
+                } else {
+                    println!("measurement already trusted: {m}");
+                }
+            }
+            if let Some(m) = &untrust_measurement {
+                if let Some(pos) = config.trusted_measurements.iter().position(|x| x == m) {
+                    config.trusted_measurements.remove(pos);
+                    println!("removed trusted measurement: {m}");
+                } else {
+                    println!("measurement not found: {m}");
+                }
             }
             config.save()?;
             Ok(())
