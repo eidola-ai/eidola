@@ -39,6 +39,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - `STRIPE_API_KEY` (optional) - Stripe secret key; account billing endpoints return 503 without it
 - `STRIPE_WEBHOOK_SECRET` (optional) - Stripe webhook signing secret; webhook endpoint returns 503 without it
 - `TINFOIL_BASE_URL` (optional) - Override the default Tinfoil API base URL (`https://inference.tinfoil.sh/v1`)
+- `TINFOIL_REPO` (optional) - Source repository the upstream enclave is attested against via the Tinfoil ATC `POST /attestation` endpoint (default: `tinfoilsh/confidential-model-router`); must match the GitHub repo whose signed measurements correspond to the running enclave
 - `TINFOIL_PRICING_OVERRIDES` (optional) - JSON object overriding per-model pricing; e.g. `{"kimi-k2-5":{"input":2.0,"output":6.0}}`. Token-based models accept `input`/`output` ($/M tokens); per-request models accept `request` ($/request). See `backend.rs` `MODEL_CATALOG` for defaults
 - `PRICING_MARKUP` (optional) - Pricing markup factor applied to all model prices (default: `1.5`)
 - `OTEL_EXPORTER_OTLP_ENDPOINT` (optional) - OTLP endpoint; enables OpenTelemetry export of traces, metrics, and logs when set (e.g. `https://otlp-gateway-prod-us-central-0.grafana.net/otlp`)
@@ -78,7 +79,7 @@ The measurement flow: `source → deterministic OCI build → digest → tinfoil
 
 On startup the server verifies the Tinfoil inference enclave's hardware attestation before sending any traffic. The `tinfoil-verifier` crate handles this via `attesting_client()`:
 
-1. Fetches the attestation bundle from the Tinfoil ATC service for initial bootstrap verification
+1. Fetches the attestation bundle from the Tinfoil ATC service via `POST /attestation` with `{enclaveUrl, repo}`, binding the bundle to the specific enclave host the server will connect to and the GitHub source repo it should match (set via `TINFOIL_REPO`)
 2. Verifies the AMD VCEK certificate chain (embedded Genoa ARK → ASK → VCEK) using RSA-PSS(SHA-384)
 3. Verifies the SEV-SNP attestation report's ECDSA-P384 signature against the VCEK public key
 4. Validates TCB policy (minimum firmware versions: bl≥0x07, snp≥0x0e, ucode≥0x48)

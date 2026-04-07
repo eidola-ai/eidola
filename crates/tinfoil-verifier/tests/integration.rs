@@ -2,6 +2,9 @@
 //!
 //! Run with: `cargo test --package tinfoil-verifier -- --ignored`
 
+const LIVE_ENCLAVE: &str = "inference.tinfoil.sh";
+const LIVE_REPO: &str = "tinfoilsh/confidential-model-router";
+
 /// Full verification flow against the live Tinfoil attestation endpoint.
 ///
 /// Fetches a real attestation bundle from the ATC service, verifies the VCEK
@@ -15,11 +18,15 @@ async fn live_attestation_verification() {
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     // Fetch the attestation bundle
-    let bundle = tinfoil_verifier::bundle::fetch_bundle(None)
+    let bundle = tinfoil_verifier::bundle::fetch_bundle(None, LIVE_ENCLAVE, LIVE_REPO)
         .await
         .expect("failed to fetch attestation bundle");
 
     eprintln!("Domain: {}", bundle.domain);
+    assert_eq!(
+        bundle.domain, LIVE_ENCLAVE,
+        "ATC POST should bind the bundle to the requested enclave"
+    );
 
     // Decode VCEK and report
     let vcek_der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &bundle.vcek)
@@ -58,7 +65,7 @@ async fn live_attesting_client() {
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     // First, get the current measurement from ATC (we don't hardcode it in tests)
-    let bundle = tinfoil_verifier::bundle::fetch_bundle(None)
+    let bundle = tinfoil_verifier::bundle::fetch_bundle(None, LIVE_ENCLAVE, LIVE_REPO)
         .await
         .expect("failed to fetch attestation bundle");
 
@@ -91,6 +98,7 @@ async fn live_attesting_client() {
             allowed_measurements: &allowed,
             inference_base_url: "https://inference.tinfoil.sh/v1",
             atc_url: None,
+            enclave_repo: Some(LIVE_REPO),
             trusted_ark_der: None,
             trusted_ask_der: None,
         })

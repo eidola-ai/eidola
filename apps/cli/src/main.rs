@@ -320,6 +320,7 @@ async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
             allowed_measurements: &config.trusted_measurements,
             inference_base_url: origin,
             atc_url: config.attestation_url.as_deref(),
+            enclave_repo: Some(config.attestation_repo()),
             trusted_ark_der: hardware_root_der.as_deref(),
             trusted_ask_der: hardware_intermediate_der.as_deref(),
         })

@@ -92,11 +92,29 @@ pub fn platform_from_format(format: &str) -> Result<Platform, Error> {
 /// Default Tinfoil attestation transparency service URL.
 pub const DEFAULT_ATC_URL: &str = "https://atc.tinfoil.sh/attestation";
 
+/// Request body for the ATC `POST /attestation` endpoint.
+#[derive(Debug, Serialize)]
+struct AtcRequest<'a> {
+    #[serde(rename = "enclaveUrl")]
+    enclave_url: &'a str,
+    repo: &'a str,
+}
+
 /// Fetch the full attestation bundle from the Tinfoil ATC service.
+///
+/// Issues a `POST /attestation` with `{enclaveUrl, repo}` so ATC returns an
+/// attestation bundle bound to the specific enclave the caller intends to
+/// connect to and the source repository it should match. (The legacy
+/// parameterless `GET /attestation` returns whatever the default router is
+/// pointing at, which is not necessarily the enclave we'll talk to.)
 ///
 /// The bundle contains the attestation report, VCEK certificate, and enclave
 /// TLS certificate — everything needed for verification.
-pub async fn fetch_bundle(atc_url: Option<&str>) -> Result<AttestationBundle, Error> {
+pub async fn fetch_bundle(
+    atc_url: Option<&str>,
+    enclave_url: &str,
+    repo: &str,
+) -> Result<AttestationBundle, Error> {
     let url = atc_url.unwrap_or(DEFAULT_ATC_URL);
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -111,7 +129,8 @@ pub async fn fetch_bundle(atc_url: Option<&str>) -> Result<AttestationBundle, Er
         .build()
         .map_err(|e| Error::Bundle(format!("failed to build HTTP client: {e}")))?;
     let bundle: AttestationBundle = client
-        .get(url)
+        .post(url)
+        .json(&AtcRequest { enclave_url, repo })
         .send()
         .await?
         .error_for_status()?

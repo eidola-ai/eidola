@@ -16,6 +16,12 @@ use tinfoil_verifier::EnclaveMeasurement;
 /// the operator cannot use the domain separator as a covert linking channel.
 pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidola:inference:production:2026-03-05";
 
+/// Default GitHub source repository the eidola server enclave is attested
+/// against. The CLI talks to an eidola-server running inside a Tinfoil
+/// Container built from this repo, so this is always the right default
+/// for the CLI's bootstrap attestation fetch.
+pub const DEFAULT_ATTESTATION_REPO: &str = "eidola-ai/eidola";
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,6 +58,14 @@ pub struct Config {
     /// `trusted_measurements` is non-empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attestation_url: Option<String>,
+    /// Source repository used to attest the enclave via the Tinfoil ATC
+    /// `POST /attestation` endpoint. Defaults to
+    /// [`DEFAULT_ATTESTATION_REPO`] (`eidola-ai/eidola`), since the CLI
+    /// always connects to an eidola-server enclave built from this repo.
+    /// Override only when pointing the CLI at a different attested
+    /// upstream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_repo: Option<String>,
     /// Optional PEM-encoded SEV-SNP ARK (Root CA) to use for verification.
     /// If provided, this overrides the built-in AMD Genoa ARK. Only consulted
     /// when verifying AMD SEV-SNP attestations; ignored for Intel TDX.
@@ -70,6 +84,14 @@ impl Config {
         self.domain_separator
             .as_deref()
             .unwrap_or(DEFAULT_DOMAIN_SEPARATOR)
+    }
+
+    /// Returns the source repo to attest the upstream enclave against,
+    /// falling back to the compiled-in default ([`DEFAULT_ATTESTATION_REPO`]).
+    pub fn attestation_repo(&self) -> &str {
+        self.attestation_repo
+            .as_deref()
+            .unwrap_or(DEFAULT_ATTESTATION_REPO)
     }
 }
 

@@ -23,6 +23,7 @@ struct Config {
     bind_addr: SocketAddr,
     tinfoil_api_key: String,
     tinfoil_base_url: Option<String>,
+    tinfoil_repo: String,
     database_url: String,
     database_password: Option<String>,
     database_ssl_cert: Option<String>,
@@ -43,6 +44,12 @@ impl Config {
             .map_err(|_| "TINFOIL_API_KEY environment variable is required")?;
 
         let tinfoil_base_url = std::env::var("TINFOIL_BASE_URL").ok();
+
+        // Source repo used to attest the upstream enclave via the ATC
+        // `POST /attestation` endpoint. Must match the GitHub repo whose
+        // signed measurements correspond to the running enclave.
+        let tinfoil_repo = std::env::var("TINFOIL_REPO")
+            .unwrap_or_else(|_| "tinfoilsh/confidential-model-router".to_string());
 
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
@@ -102,6 +109,7 @@ impl Config {
             bind_addr,
             tinfoil_api_key,
             tinfoil_base_url,
+            tinfoil_repo,
             database_url,
             database_password,
             database_ssl_cert,
@@ -209,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             allowed_measurements: measurements::ALLOWED.as_slice(),
             inference_base_url,
             atc_url: None,
+            enclave_repo: Some(&config.tinfoil_repo),
             trusted_ark_der: None,
             trusted_ask_der: None,
         })

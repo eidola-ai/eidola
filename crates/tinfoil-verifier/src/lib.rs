@@ -43,7 +43,18 @@ pub struct AttestingClientConfig<'a> {
     /// The `/.well-known/tinfoil-attestation` endpoint is derived from the origin.
     pub inference_base_url: &'a str,
     /// Optional ATC URL override for initial bootstrap verification.
+    /// When `None` (and `enclave_repo` is set), defaults to
+    /// [`bundle::DEFAULT_ATC_URL`]. When set to the well-known URL itself
+    /// (or when a `trusted_ark_der` is provided), the bootstrap fetch goes
+    /// directly to the enclave's well-known endpoint instead of ATC.
     pub atc_url: Option<&'a str>,
+    /// Source repository to attest against (e.g.
+    /// `tinfoilsh/confidential-model-router`). Required to use the ATC
+    /// `POST /attestation` endpoint, which binds the returned bundle to a
+    /// specific enclave URL and source repo. When `None`, the bootstrap
+    /// path falls back to fetching directly from the enclave's well-known
+    /// attestation endpoint.
+    pub enclave_repo: Option<&'a str>,
     /// Optional custom trusted ARK (Root CA) DER bytes.
     /// When set, this overrides the built-in AMD Genoa ARK for chain verification
     /// and is also added as a TLS root certificate for bootstrap connections.
@@ -71,8 +82,10 @@ pub async fn attesting_client(
     // Determine whether to fetch from ATC or the server's own well-known endpoint.
     // When a custom root CA is configured (tinfoil shim mock), always fetch directly from
     // the server — ATC only knows about the production Tinfoil enclave.
-    // Also use direct fetch when atc_url explicitly matches the well-known URL.
+    // Also use direct fetch when atc_url explicitly matches the well-known URL,
+    // or when no enclave_repo was supplied (the ATC POST endpoint requires one).
     let use_direct = config.trusted_ark_der.is_some()
+        || config.enclave_repo.is_none()
         || config
             .atc_url
             .map(|url| url == attestation_url)
@@ -85,8 +98,14 @@ pub async fn attesting_client(
         bundle::fetch_well_known(&client, &attestation_url).await?
     } else {
         let display_url = config.atc_url.unwrap_or(bundle::DEFAULT_ATC_URL);
-        tracing::info!("Fetching attestation bundle from {display_url} for bootstrap...");
-        let atc_bundle = bundle::fetch_bundle(config.atc_url).await?;
+        let enclave_host = enclave_host(config.inference_base_url);
+        let repo = config
+            .enclave_repo
+            .expect("enclave_repo presence checked above");
+        tracing::info!(
+            "Fetching attestation bundle from {display_url} for bootstrap (enclave={enclave_host}, repo={repo})..."
+        );
+        let atc_bundle = bundle::fetch_bundle(config.atc_url, &enclave_host, repo).await?;
         let platform = bundle::platform_from_format(&atc_bundle.enclave_attestation_report.format)?;
         bundle::ResolvedAttestation {
             platform,
@@ -300,6 +319,23 @@ fn well_known_url(inference_base_url: &str) -> String {
     }
 }
 
+/// Extract the bare host (no scheme, no port, no path) from an inference base URL.
+///
+/// Used as the `enclaveUrl` parameter in the ATC `POST /attestation` request.
+fn enclave_host(inference_base_url: &str) -> String {
+    let after_scheme = match inference_base_url.find("://") {
+        Some(scheme_end) => &inference_base_url[scheme_end + 3..],
+        None => inference_base_url,
+    };
+    let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    // Strip an optional port
+    match authority.rfind(':') {
+        Some(colon) => authority[..colon].to_string(),
+        None => authority.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +362,22 @@ mod tests {
             well_known_url("https://inference.tinfoil.sh/"),
             "https://inference.tinfoil.sh/.well-known/tinfoil-attestation"
         );
+    }
+
+    #[test]
+    fn enclave_host_strips_scheme_path_port() {
+        assert_eq!(
+            enclave_host("https://inference.tinfoil.sh/v1"),
+            "inference.tinfoil.sh"
+        );
+        assert_eq!(
+            enclave_host("https://inference.tinfoil.sh"),
+            "inference.tinfoil.sh"
+        );
+        assert_eq!(
+            enclave_host("https://inference.tinfoil.sh:8443/v1"),
+            "inference.tinfoil.sh"
+        );
+        assert_eq!(enclave_host("inference.tinfoil.sh"), "inference.tinfoil.sh");
     }
 }
