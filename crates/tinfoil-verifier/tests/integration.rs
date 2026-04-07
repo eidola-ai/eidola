@@ -73,10 +73,22 @@ async fn live_attesting_client() {
 
     eprintln!("Using measurement: {measurement}");
 
+    // The bootstrap path here is SEV-SNP (live ATC bundle), so populate the
+    // SNP field with the observed measurement and fill the TDX side with
+    // dummy values that will never match — the verifier picks the field that
+    // matches the observed platform.
+    let allowed = vec![tinfoil_verifier::EnclaveMeasurement {
+        snp_measurement: measurement.clone(),
+        tdx_measurement: tinfoil_verifier::TdxMeasurement {
+            rtmr1: "0".repeat(96),
+            rtmr2: "0".repeat(96),
+        },
+    }];
+
     // Build the attesting client
     let (client, verification) =
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &[measurement.as_str()],
+            allowed_measurements: &allowed,
             inference_base_url: "https://inference.tinfoil.sh/v1",
             atc_url: None,
             trusted_ark_der: None,

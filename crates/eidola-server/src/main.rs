@@ -206,7 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or(&default_base_url);
     let (attesting_client, verification) =
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: measurements::ALLOWED,
+            allowed_measurements: measurements::ALLOWED.as_slice(),
             inference_base_url,
             atc_url: None,
             trusted_ark_der: None,

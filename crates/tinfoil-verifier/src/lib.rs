@@ -15,25 +15,30 @@
 mod attesting_client;
 pub mod bundle;
 mod error;
+pub mod measurement;
 pub mod sevsnp;
 pub mod tdx;
 
 pub use bundle::Platform;
 pub use error::Error;
+pub use measurement::{EnclaveMeasurement, MatchedMeasurement, TdxMeasurement};
 
 /// Result of a successful attestation verification.
 #[derive(Debug, Clone)]
 pub struct Verification {
-    /// Hex-encoded measurement that matched an allowed value.
-    pub measurement: String,
+    /// The measurement that was observed and matched. Carries the platform
+    /// implicitly via the [`MatchedMeasurement`] variant.
+    pub measurement: MatchedMeasurement,
     /// Hex-encoded SHA-256 fingerprint of the enclave's TLS public key.
     pub tls_fingerprint: String,
 }
 
 /// Configuration for [`attesting_client`].
 pub struct AttestingClientConfig<'a> {
-    /// Hex-encoded allowed measurements.
-    pub allowed_measurements: &'a [&'a str],
+    /// Allowed enclave releases. Each entry pairs a SEV-SNP measurement with a
+    /// TDX measurement; the verifier picks the matching field based on the
+    /// platform observed in the attestation document.
+    pub allowed_measurements: &'a [EnclaveMeasurement],
     /// Base URL of the inference endpoint (e.g. `https://inference.tinfoil.sh/v1`).
     /// The `/.well-known/tinfoil-attestation` endpoint is derived from the origin.
     pub inference_base_url: &'a str,
@@ -61,11 +66,7 @@ pub async fn attesting_client(
     config: AttestingClientConfig<'_>,
 ) -> Result<(reqwest::Client, Verification), Error> {
     let attestation_url = well_known_url(config.inference_base_url);
-    let allowed: Vec<String> = config
-        .allowed_measurements
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let allowed: Vec<EnclaveMeasurement> = config.allowed_measurements.to_vec();
 
     // Determine whether to fetch from ATC or the server's own well-known endpoint.
     // When a custom root CA is configured (tinfoil shim mock), always fetch directly from
@@ -108,7 +109,7 @@ pub async fn attesting_client(
     tracing::info!("Platform: {:?}", resolved.platform);
 
     // Dispatch verification based on platform
-    let (measurement_hex, tls_fingerprint, chip_id, vcek_der) = match resolved.platform {
+    let (matched, tls_fingerprint, chip_id, vcek_der) = match resolved.platform {
         bundle::Platform::SevSnp => verify_snp_bootstrap(&config, &resolved)?,
         bundle::Platform::Tdx => {
             let bootstrap_client = build_bootstrap_client(config.trusted_ark_der)?;
@@ -144,14 +145,14 @@ pub async fn attesting_client(
     Ok((
         client,
         Verification {
-            measurement: measurement_hex,
+            measurement: matched,
             tls_fingerprint: tls_fingerprint_hex,
         },
     ))
 }
 
-/// Bootstrap verification result: (measurement_hex, tls_fingerprint, chip_id, vcek_der).
-type BootstrapResult = (String, [u8; 32], [u8; 64], Vec<u8>);
+/// Bootstrap verification result: (matched_measurement, tls_fingerprint, chip_id, vcek_der).
+type BootstrapResult = (MatchedMeasurement, [u8; 32], [u8; 64], Vec<u8>);
 
 /// SEV-SNP bootstrap verification.
 fn verify_snp_bootstrap(
@@ -177,13 +178,13 @@ fn verify_snp_bootstrap(
 
     // Check measurement against allowed values
     let measurement_hex = hex::encode(report.measurement);
-    check_measurement(config.allowed_measurements, &measurement_hex)?;
-    tracing::info!("Measurement verified: {measurement_hex}");
+    let matched = check_snp_measurement(config.allowed_measurements, &measurement_hex)?;
+    tracing::info!("Measurement verified: {matched}");
 
     let mut tls_fingerprint = [0u8; 32];
     tls_fingerprint.copy_from_slice(&report.report_data[..32]);
 
-    Ok((measurement_hex, tls_fingerprint, report.chip_id, vcek_der))
+    Ok((matched, tls_fingerprint, report.chip_id, vcek_der))
 }
 
 /// TDX bootstrap verification.
@@ -201,31 +202,59 @@ async fn verify_tdx_bootstrap(
     tracing::info!("Verifying TDX quote...");
     let tdx_result = tdx::verify_quote(&resolved.report_bytes, &collateral)?;
 
-    // Check measurement (RTMR1||RTMR2) against allowed values
-    let measurement_hex = tdx::measurement_hex(&tdx_result.rtmr1, &tdx_result.rtmr2);
-    check_measurement(config.allowed_measurements, &measurement_hex)?;
-    tracing::info!("Measurement verified: {measurement_hex}");
+    // Check RTMR1/RTMR2 against allowed values
+    let rtmr1_hex = hex::encode(tdx_result.rtmr1);
+    let rtmr2_hex = hex::encode(tdx_result.rtmr2);
+    let matched = check_tdx_measurement(config.allowed_measurements, &rtmr1_hex, &rtmr2_hex)?;
+    tracing::info!("Measurement verified: {matched}");
 
     let mut tls_fingerprint = [0u8; 32];
     tls_fingerprint.copy_from_slice(&tdx_result.report_data[..32]);
 
     // TDX doesn't use VCEK/chip_id — return empty placeholders.
     // The per-connection verifier detects TDX from the attestation doc platform field.
-    Ok((measurement_hex, tls_fingerprint, [0u8; 64], Vec::new()))
+    Ok((matched, tls_fingerprint, [0u8; 64], Vec::new()))
 }
 
-/// Check a measurement against the allowed list (case-insensitive).
-fn check_measurement(allowed: &[&str], measurement_hex: &str) -> Result<(), Error> {
-    let matched = allowed
+/// Check a SEV-SNP measurement against the allowed list (case-insensitive).
+/// Returns the matched [`MatchedMeasurement::SevSnp`] on success.
+pub(crate) fn check_snp_measurement(
+    allowed: &[EnclaveMeasurement],
+    measurement_hex: &str,
+) -> Result<MatchedMeasurement, Error> {
+    let hit = allowed
         .iter()
-        .any(|m| m.eq_ignore_ascii_case(measurement_hex));
-    if !matched {
-        return Err(Error::MeasurementMismatch {
-            measurement: measurement_hex.to_string(),
-            allowed: allowed.iter().map(|s| s.to_string()).collect(),
-        });
+        .find(|m| m.snp_measurement.eq_ignore_ascii_case(measurement_hex));
+    match hit {
+        Some(m) => Ok(MatchedMeasurement::SevSnp(m.snp_measurement.clone())),
+        None => Err(Error::MeasurementMismatch {
+            observed: MatchedMeasurement::SevSnp(measurement_hex.to_string()),
+            allowed_count: allowed.len(),
+        }),
     }
-    Ok(())
+}
+
+/// Check a TDX RTMR1+RTMR2 pair against the allowed list (case-insensitive).
+/// Returns the matched [`MatchedMeasurement::Tdx`] on success.
+pub(crate) fn check_tdx_measurement(
+    allowed: &[EnclaveMeasurement],
+    rtmr1_hex: &str,
+    rtmr2_hex: &str,
+) -> Result<MatchedMeasurement, Error> {
+    let hit = allowed.iter().find(|m| {
+        m.tdx_measurement.rtmr1.eq_ignore_ascii_case(rtmr1_hex)
+            && m.tdx_measurement.rtmr2.eq_ignore_ascii_case(rtmr2_hex)
+    });
+    match hit {
+        Some(m) => Ok(MatchedMeasurement::Tdx(m.tdx_measurement.clone())),
+        None => Err(Error::MeasurementMismatch {
+            observed: MatchedMeasurement::Tdx(TdxMeasurement {
+                rtmr1: rtmr1_hex.to_string(),
+                rtmr2: rtmr2_hex.to_string(),
+            }),
+            allowed_count: allowed.len(),
+        }),
+    }
 }
 
 /// Build a reqwest client for bootstrap attestation fetches.

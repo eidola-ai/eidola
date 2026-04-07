@@ -34,14 +34,6 @@ pub struct TdxVerification {
     pub report_data: [u8; 64],
 }
 
-/// Build a measurement string from RTMR1 and RTMR2.
-///
-/// Returns hex(RTMR1) + hex(RTMR2) — a 192-character hex string that naturally
-/// distinguishes from SEV-SNP measurements (96 characters).
-pub fn measurement_hex(rtmr1: &[u8; 48], rtmr2: &[u8; 48]) -> String {
-    format!("{}{}", hex::encode(rtmr1), hex::encode(rtmr2))
-}
-
 /// Verify a TDX Quote V4 against fetched collateral.
 ///
 /// 1. Verifies the quote's ECDSA signature against Intel's root CA
@@ -373,15 +365,5 @@ AiEA4J0lrHoMs+Xo5o/sX6O9QWxHRAvZUGOdRQ7cvqRXaqI=
             matches!(err, Error::Tdx(ref msg) if msg.contains("no certificate found")),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn measurement_hex_concatenates_rtmr1_rtmr2() {
-        let rtmr1 = [0xaa; 48];
-        let rtmr2 = [0xbb; 48];
-        let hex = measurement_hex(&rtmr1, &rtmr2);
-        assert_eq!(hex.len(), 192);
-        assert!(hex.starts_with(&"aa".repeat(48)));
-        assert!(hex.ends_with(&"bb".repeat(48)));
     }
 }

@@ -34,9 +34,21 @@ jobs:
             --pattern "tinfoil.hash" \
             --dir /tmp
 
-          MEASUREMENT=$(jq -r '.snp_measurement' /tmp/tinfoil-deployment.json)
-          echo "measurement=${MEASUREMENT}" >> "$GITHUB_OUTPUT"
-          echo "SNP measurement: ${MEASUREMENT}"
+          SNP=$(jq -r '.snp_measurement' /tmp/tinfoil-deployment.json)
+          RTMR1=$(jq -r '.tdx_measurement.rtmr1' /tmp/tinfoil-deployment.json)
+          RTMR2=$(jq -r '.tdx_measurement.rtmr2' /tmp/tinfoil-deployment.json)
+          if [ -z "${SNP}" ] || [ "${SNP}" = "null" ] \
+             || [ -z "${RTMR1}" ] || [ "${RTMR1}" = "null" ] \
+             || [ -z "${RTMR2}" ] || [ "${RTMR2}" = "null" ]; then
+            echo "tinfoil-deployment.json is missing snp_measurement or tdx_measurement" >&2
+            exit 1
+          fi
+          echo "snp=${SNP}" >> "$GITHUB_OUTPUT"
+          echo "rtmr1=${RTMR1}" >> "$GITHUB_OUTPUT"
+          echo "rtmr2=${RTMR2}" >> "$GITHUB_OUTPUT"
+          echo "SNP measurement: ${SNP}"
+          echo "TDX RTMR1: ${RTMR1}"
+          echo "TDX RTMR2: ${RTMR2}"
 
           BUILT_AT=$(jq -r '.hashes.built_at // empty' /tmp/tinfoil-deployment.json)
           echo "built_at=${BUILT_AT}" >> "$GITHUB_OUTPUT"
@@ -57,69 +69,102 @@ jobs:
           echo "log_index=${LOG_INDEX}" >> "$GITHUB_OUTPUT"
           echo "Rekor log index: ${LOG_INDEX}"
 
-      - name: Check if measurement is already known
+      - name: Check if measurements are already known
         id: check
         run: |
-          MEASUREMENT="${{ steps.release.outputs.measurement }}"
-          if grep -qF "${MEASUREMENT}" crates/eidola-server/src/measurements.rs; then
+          SNP="${{ steps.release.outputs.snp }}"
+          RTMR1="${{ steps.release.outputs.rtmr1 }}"
+          RTMR2="${{ steps.release.outputs.rtmr2 }}"
+          FILE="crates/eidola-server/src/measurements.rs"
+          if grep -qF "${SNP}" "${FILE}" \
+             && grep -qF "${RTMR1}" "${FILE}" \
+             && grep -qF "${RTMR2}" "${FILE}"; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Measurement already present"
+            echo "Measurements already present"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "New measurement detected"
+            echo "New measurements detected"
           fi
 
       - name: Update measurements.rs
         if: steps.check.outputs.changed == 'true'
         env:
           TAG: ${{ steps.release.outputs.tag }}
-          MEASUREMENT: ${{ steps.release.outputs.measurement }}
+          SNP: ${{ steps.release.outputs.snp }}
+          RTMR1: ${{ steps.release.outputs.rtmr1 }}
+          RTMR2: ${{ steps.release.outputs.rtmr2 }}
           BUILT_AT: ${{ steps.release.outputs.built_at }}
           ARTIFACT_HASH: ${{ steps.release.outputs.artifact_hash }}
           LOG_INDEX: ${{ steps.sigstore.outputs.log_index }}
         run: |
           FILE="crates/eidola-server/src/measurements.rs"
 
-          # Extract current CURRENT measurement before overwriting
-          PREV=$(git show HEAD:"${FILE}" | grep -oP '[a-f0-9]{96}' | head -1 || true)
+          # Extract the existing CURRENT block (header comments + struct
+          # literal) verbatim from the committed file, so we can re-emit it as
+          # the new PREVIOUS block with all build metadata preserved (built_at,
+          # artifact digest, Rekor log index, Sigstore + GitHub links). The
+          # block starts at `// === CURRENT:` and ends at the closing `},` of
+          # the EnclaveMeasurement literal.
+          PREV_BLOCK=$(git show HEAD:"${FILE}" | awk '
+            /\/\/ === CURRENT:/ { capture=1 }
+            capture { print }
+            capture && /^        \},[[:space:]]*$/ { exit }
+          ')
 
-          # Extract previous CURRENT's doc comments for demotion
-          PREV_TAG=$(git show HEAD:"${FILE}" | grep -oP '(?<=/// Tinfoil inference enclave ).*' | head -1 || true)
+          # The previous SNP measurement, used only to detect whether the
+          # CURRENT release actually changed.
+          PREV_SNP=$(printf '%s\n' "${PREV_BLOCK}" \
+            | grep -oP '(?<=snp_measurement:\s)"[a-f0-9]+"' | head -1 | tr -d '"' || true)
 
-          # Write the new file
+          HAS_PREV=false
+          if [ -n "${PREV_BLOCK}" ] && [ -n "${PREV_SNP}" ] && [ "${PREV_SNP}" != "${SNP}" ]; then
+            HAS_PREV=true
+          fi
+
           {
             echo '//! Allowed code measurements for Tinfoil'\''s inference enclave.'
             echo '//!'
             echo '//! Updated by CI when Tinfoil publishes new enclave builds.'
             echo '//! At least two entries for rolling deploys (current + previous).'
             echo '//!'
+            echo '//! Each `EnclaveMeasurement` entry pairs the AMD SEV-SNP launch digest with'
+            echo '//! the Intel TDX RTMR1/RTMR2 values for a single Tinfoil release. This mirrors'
+            echo '//! the shape used in Tinfoil'\''s `tinfoil-deployment.json` and our own'
+            echo '//! `artifact-manifest.json`. `tinfoil-verifier` picks the matching field at'
+            echo '//! verification time based on the platform that produced the attestation.'
+            echo '//!'
             echo '//! Source repo: tinfoilsh/confidential-model-router'
             echo ''
-            echo "/// Tinfoil inference enclave ${TAG}"
-            echo "/// Built: ${BUILT_AT}"
-            echo "/// Artifact digest: sha256:${ARTIFACT_HASH}"
-            echo "/// Rekor log index: ${LOG_INDEX}"
-            echo "/// Sigstore: https://search.sigstore.dev/?logIndex=${LOG_INDEX}"
-            echo "/// GitHub: https://github.com/tinfoilsh/confidential-model-router/releases/tag/${TAG}"
-            echo 'const CURRENT: &str ='
-            echo "    \"${MEASUREMENT}\";"
-
-            if [ -n "${PREV}" ] && [ "${PREV}" != "${MEASUREMENT}" ]; then
-              echo ''
-              if [ -n "${PREV_TAG}" ]; then
-                echo "/// Previous: ${PREV_TAG}"
-              fi
-              echo 'const PREVIOUS: &str ='
-              echo "    \"${PREV}\";"
-            fi
-
+            echo 'use std::sync::LazyLock;'
             echo ''
-            echo 'pub const ALLOWED: &[&str] = &['
-            echo '    CURRENT,'
-            if [ -n "${PREV}" ] && [ "${PREV}" != "${MEASUREMENT}" ]; then
-              echo '    PREVIOUS,'
+            echo 'use tinfoil_verifier::{EnclaveMeasurement, TdxMeasurement};'
+            echo ''
+            echo 'pub static ALLOWED: LazyLock<Vec<EnclaveMeasurement>> = LazyLock::new(|| {'
+            echo '    vec!['
+            echo "        // === CURRENT: ${TAG} ==="
+            echo "        // Built: ${BUILT_AT}"
+            echo "        // Artifact digest: sha256:${ARTIFACT_HASH}"
+            echo "        // Rekor log index: ${LOG_INDEX}"
+            echo "        // Sigstore: https://search.sigstore.dev/?logIndex=${LOG_INDEX}"
+            echo "        // GitHub: https://github.com/tinfoilsh/confidential-model-router/releases/tag/${TAG}"
+            echo '        EnclaveMeasurement {'
+            echo "            snp_measurement: \"${SNP}\".into(),"
+            echo '            tdx_measurement: TdxMeasurement {'
+            echo "                rtmr1: \"${RTMR1}\".into(),"
+            echo "                rtmr2: \"${RTMR2}\".into(),"
+            echo '            },'
+            echo '        },'
+
+            if [ "${HAS_PREV}" = "true" ]; then
+              # Re-emit the captured block with the CURRENT marker rewritten
+              # as PREVIOUS, preserving all build comments (Built / Artifact
+              # digest / Rekor / Sigstore / GitHub) verbatim.
+              printf '%s\n' "${PREV_BLOCK}" \
+                | sed 's|// === CURRENT:|// === PREVIOUS:|'
             fi
-            echo '];'
+
+            echo '    ]'
+            echo '});'
           } > "${FILE}"
 
           echo "Updated ${FILE}:"
@@ -150,7 +195,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.release.outputs.tag }}
-          MEASUREMENT: ${{ steps.release.outputs.measurement }}
+          SNP: ${{ steps.release.outputs.snp }}
+          RTMR1: ${{ steps.release.outputs.rtmr1 }}
+          RTMR2: ${{ steps.release.outputs.rtmr2 }}
           LOG_INDEX: ${{ steps.sigstore.outputs.log_index }}
         run: |
           BRANCH="measurements/${TAG}"
@@ -160,31 +207,35 @@ jobs:
 
           git checkout -b "${BRANCH}"
           git add crates/eidola-server/src/measurements.rs
-          git commit -m "Update Tinfoil enclave measurement to ${TAG}"
+          git commit -m "Update Tinfoil enclave measurements to ${TAG}"
           git push -u origin "${BRANCH}"
 
-          SHORT="${MEASUREMENT:0:16}…${MEASUREMENT: -16}"
+          SHORT_SNP="${SNP:0:16}…${SNP: -16}"
+          SHORT_RTMR1="${RTMR1:0:16}…${RTMR1: -16}"
+          SHORT_RTMR2="${RTMR2:0:16}…${RTMR2: -16}"
           RELEASE_URL="https://github.com/tinfoilsh/confidential-model-router/releases/tag/${TAG}"
           SIGSTORE_URL="https://search.sigstore.dev/?logIndex=${LOG_INDEX}"
 
           cat > /tmp/pr-body.md <<EOF
           ## Summary
 
-          Updates the allowed SNP measurement for the Tinfoil inference enclave to match release [\`${TAG}\`](${RELEASE_URL}).
+          Updates the allowed enclave measurements for the Tinfoil inference enclave to match release [\`${TAG}\`](${RELEASE_URL}). Each entry pairs SEV-SNP and TDX measurements per release.
 
-          **New measurement:** \`${SHORT}\`
-          **Rekor transparency log:** [${LOG_INDEX}](${SIGSTORE_URL})
+          - **SEV-SNP measurement:** \`${SHORT_SNP}\`
+          - **TDX RTMR1:** \`${SHORT_RTMR1}\`
+          - **TDX RTMR2:** \`${SHORT_RTMR2}\`
+          - **Rekor transparency log:** [${LOG_INDEX}](${SIGSTORE_URL})
 
           ## Verification
 
-          The measurement was extracted from \`tinfoil-deployment.json\` in the GitHub release.
+          The measurements were extracted from \`tinfoil-deployment.json\` in the GitHub release.
           The artifact's sigstore attestation was looked up via the GitHub attestation API.
 
-          - [ ] Confirm measurement matches [Tinfoil's published value](${RELEASE_URL})
+          - [ ] Confirm measurements match [Tinfoil's published values](${RELEASE_URL})
           - [ ] CI passes
           EOF
 
           gh pr create \
-            --title "Update Tinfoil enclave measurement to ${TAG}" \
+            --title "Update Tinfoil enclave measurements to ${TAG}" \
             --body-file /tmp/pr-body.md \
             --base main

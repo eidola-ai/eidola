@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::measurement::MatchedMeasurement;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("failed to fetch attestation bundle: {0}")]
@@ -29,10 +31,12 @@ pub enum Error {
     #[error("TCB policy violation: {0}")]
     TcbPolicy(String),
 
-    #[error("measurement mismatch: got {measurement}, allowed: {allowed:?}")]
+    #[error(
+        "measurement mismatch: observed {observed} is not in the allowed list ({allowed_count} entries)"
+    )]
     MeasurementMismatch {
-        measurement: String,
-        allowed: Vec<String>,
+        observed: MatchedMeasurement,
+        allowed_count: usize,
     },
 
     #[error("TLS fingerprint mismatch: report_data={report_data}, enclave_cert={enclave_cert}")]

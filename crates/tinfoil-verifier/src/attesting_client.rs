@@ -20,7 +20,8 @@ use rustls::crypto::{
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
-use crate::{bundle, sevsnp, tdx};
+use crate::measurement::{EnclaveMeasurement, MatchedMeasurement};
+use crate::{bundle, check_snp_measurement, check_tdx_measurement, sevsnp, tdx};
 
 /// A rustls `ServerCertVerifier` that verifies attestation for each new TLS
 /// connection. Fingerprints of previously-attested instances are cached so
@@ -35,8 +36,8 @@ struct AttestingVerifier {
     trusted_ark_der: Option<Vec<u8>>,
     /// Optional custom trusted ASK DER bytes.
     trusted_ask_der: Option<Vec<u8>>,
-    /// Allowed code measurements (hex-encoded).
-    allowed_measurements: Vec<String>,
+    /// Allowed enclave measurements (one entry per release, paired SNP+TDX).
+    allowed_measurements: Vec<EnclaveMeasurement>,
     /// URL to fetch attestation from (`/.well-known/tinfoil-attestation`).
     attestation_url: String,
     /// Supported TLS signature algorithms.
@@ -123,7 +124,7 @@ impl AttestingVerifier {
             // Fetch attestation (tries v3, falls back to v2)
             let resolved = bundle::fetch_well_known(&fetch_client, &self.attestation_url).await?;
 
-            let (measurement_hex, attested_fp) = match resolved.platform {
+            let (matched, attested_fp) = match resolved.platform {
                 bundle::Platform::SevSnp => {
                     self.verify_snp_attestation(&resolved, &fetch_client)
                         .await?
@@ -138,7 +139,7 @@ impl AttestingVerifier {
             self.verified.insert(attested_fp);
             tracing::info!(
                 fingerprint = hex::encode(attested_fp),
-                measurement = measurement_hex,
+                measurement = %matched,
                 platform = ?resolved.platform,
                 attempt,
                 "verified enclave instance"
@@ -166,12 +167,12 @@ impl AttestingVerifier {
         )))
     }
 
-    /// Verify a SEV-SNP attestation and return (measurement_hex, fingerprint).
+    /// Verify a SEV-SNP attestation and return (matched_measurement, fingerprint).
     async fn verify_snp_attestation(
         &self,
         resolved: &bundle::ResolvedAttestation,
         fetch_client: &reqwest::Client,
-    ) -> Result<(String, [u8; 32]), crate::Error> {
+    ) -> Result<(MatchedMeasurement, [u8; 32]), crate::Error> {
         let report = sevsnp::parse_report(&resolved.report_bytes)?;
 
         // Resolve VCEK: prefer embedded (v3), fall back to cache/AMD KDS
@@ -196,50 +197,37 @@ impl AttestingVerifier {
 
         // Check measurement
         let measurement_hex = hex::encode(report.measurement);
-        self.check_measurement(&measurement_hex)?;
+        let matched = check_snp_measurement(&self.allowed_measurements, &measurement_hex)?;
 
         let attested_fp: [u8; 32] = report.report_data[..32]
             .try_into()
             .expect("report_data is 64 bytes");
 
-        Ok((measurement_hex, attested_fp))
+        Ok((matched, attested_fp))
     }
 
-    /// Verify a TDX attestation and return (measurement_hex, fingerprint).
+    /// Verify a TDX attestation and return (matched_measurement, fingerprint).
     async fn verify_tdx_attestation(
         &self,
         resolved: &bundle::ResolvedAttestation,
         fetch_client: &reqwest::Client,
-    ) -> Result<(String, [u8; 32]), crate::Error> {
+    ) -> Result<(MatchedMeasurement, [u8; 32]), crate::Error> {
         // Fetch collateral from Intel PCS
         let collateral = tdx::fetch_collateral(fetch_client, &resolved.report_bytes).await?;
 
         // Verify the TDX quote
         let tdx_result = tdx::verify_quote(&resolved.report_bytes, &collateral)?;
 
-        // Check measurement (RTMR1||RTMR2)
-        let measurement_hex = tdx::measurement_hex(&tdx_result.rtmr1, &tdx_result.rtmr2);
-        self.check_measurement(&measurement_hex)?;
+        // Check RTMR1 / RTMR2 against the allowed list
+        let rtmr1_hex = hex::encode(tdx_result.rtmr1);
+        let rtmr2_hex = hex::encode(tdx_result.rtmr2);
+        let matched = check_tdx_measurement(&self.allowed_measurements, &rtmr1_hex, &rtmr2_hex)?;
 
         let attested_fp: [u8; 32] = tdx_result.report_data[..32]
             .try_into()
             .expect("report_data is 64 bytes");
 
-        Ok((measurement_hex, attested_fp))
-    }
-
-    fn check_measurement(&self, measurement_hex: &str) -> Result<(), crate::Error> {
-        let matched = self
-            .allowed_measurements
-            .iter()
-            .any(|m| m.eq_ignore_ascii_case(measurement_hex));
-        if !matched {
-            return Err(crate::Error::MeasurementMismatch {
-                measurement: measurement_hex.to_string(),
-                allowed: self.allowed_measurements.clone(),
-            });
-        }
-        Ok(())
+        Ok((matched, attested_fp))
     }
 }
 
@@ -308,7 +296,7 @@ pub fn build_attesting_client(
     initial_vcek_der: Vec<u8>,
     trusted_ark_der: Option<Vec<u8>>,
     trusted_ask_der: Option<Vec<u8>>,
-    allowed_measurements: Vec<String>,
+    allowed_measurements: Vec<EnclaveMeasurement>,
     attestation_url: String,
 ) -> Result<reqwest::Client, crate::Error> {
     let provider = CryptoProvider::get_default()

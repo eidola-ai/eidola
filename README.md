@@ -72,9 +72,9 @@ To run the CLI against a local development stack:
    cargo run -p eidola-cli -- configure \
      --base-url https://localhost:8443 \
      --hardware-root-ca .dev-certs/ark.pem \
-     --trust-measurement 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+     --trust-measurement 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000:000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000:000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
    ```
-   The all-zeros measurement matches the mock shim's default. The shim includes its full certificate chain (ARK + ASK) in the attestation response, so only the root CA is needed in the client config.
+   `--trust-measurement` takes a `<snp>:<rtmr1>:<rtmr2>` triple — three 96-char hex strings separated by colons — since each Tinfoil release ships paired AMD SEV-SNP and Intel TDX measurements. The mock shim advertises all-zeros for every field, so the dev triple is just three zero blocks. The shim includes its full certificate chain (ARK + ASK) in the attestation response, so only the root CA is needed in the client config.
 
    On macOS, the CLI's configuration is stored in `~/Library/Application Support/eidola/config.toml`.
 

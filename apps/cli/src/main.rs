@@ -40,10 +40,16 @@ enum Command {
         /// Path to PEM-encoded SEV-SNP ASK (Intermediate CA) certificate
         #[arg(long)]
         hardware_intermediate_ca: Option<String>,
-        /// Add a trusted enclave measurement (hex-encoded, 96 chars)
+        /// Add a trusted enclave release. Each release pairs an SEV-SNP
+        /// measurement with the matching TDX RTMR1/RTMR2 values, given as
+        /// `<snp>:<rtmr1>:<rtmr2>` (three 96-char hex strings separated by
+        /// colons). The values can be lifted directly from Tinfoil's
+        /// `tinfoil-deployment.json`.
         #[arg(long)]
         trust_measurement: Option<String>,
-        /// Remove a trusted enclave measurement
+        /// Remove a trusted enclave release. Match by the 96-char SNP
+        /// measurement, or by the same `<snp>:<rtmr1>:<rtmr2>` triple used
+        /// with --trust_measurement.
         #[arg(long)]
         untrust_measurement: Option<String>,
     },
@@ -302,12 +308,6 @@ async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
         .as_deref()
         .ok_or("base_url is required when attestation is enabled")?;
 
-    let measurements: Vec<&str> = config
-        .trusted_measurements
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-
     let hardware_root_der =
         parse_cert_config(config.hardware_root_ca.as_deref(), "hardware_root_ca")?;
     let hardware_intermediate_der = parse_cert_config(
@@ -317,7 +317,7 @@ async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
 
     let (client, verification) =
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &measurements,
+            allowed_measurements: &config.trusted_measurements,
             inference_base_url: origin,
             atc_url: config.attestation_url.as_deref(),
             trusted_ark_der: hardware_root_der.as_deref(),
@@ -397,6 +397,42 @@ fn parse_cert_config(value: Option<&str>, field_name: &str) -> Result<Option<Vec
     }
 }
 
+/// Parse a `<snp>:<rtmr1>:<rtmr2>` trust spec into an [`EnclaveMeasurement`].
+fn parse_trust_measurement(spec: &str) -> Result<tinfoil_verifier::EnclaveMeasurement, String> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() != 3 {
+        return Err(
+            "trust_measurement must be `<snp>:<rtmr1>:<rtmr2>` (three colon-separated 96-char hex strings)"
+                .into(),
+        );
+    }
+    let snp = validate_hex_field(parts[0], "snp_measurement")?;
+    let rtmr1 = validate_hex_field(parts[1], "tdx.rtmr1")?;
+    let rtmr2 = validate_hex_field(parts[2], "tdx.rtmr2")?;
+    Ok(tinfoil_verifier::EnclaveMeasurement {
+        snp_measurement: snp,
+        tdx_measurement: tinfoil_verifier::TdxMeasurement { rtmr1, rtmr2 },
+    })
+}
+
+/// Parse an `--untrust_measurement` argument into an SNP measurement key.
+/// Accepts either a bare 96-char SNP measurement or the full
+/// `<snp>:<rtmr1>:<rtmr2>` triple (for symmetry with --trust_measurement).
+fn parse_untrust_key(spec: &str) -> Result<String, String> {
+    let snp = match spec.split_once(':') {
+        Some((snp, _)) => snp,
+        None => spec,
+    };
+    validate_hex_field(snp, "snp_measurement")
+}
+
+fn validate_hex_field(value: &str, field: &str) -> Result<String, String> {
+    if value.len() != 96 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("{field} must be 96 hex characters (48 bytes)"));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
 fn require_base_url(config: &Config) -> Result<&str, String> {
     config
         .base_url
@@ -448,10 +484,12 @@ async fn run(cli: Cli) -> Result<(), String> {
             if config.trusted_measurements.is_empty() {
                 println!("trusted_measurements: <none> (attestation disabled)");
             } else {
-                println!(
-                    "trusted_measurements: {}",
-                    config.trusted_measurements.join(", ")
-                );
+                println!("trusted_measurements:");
+                for m in &config.trusted_measurements {
+                    println!("  - snp = {}", m.snp_measurement);
+                    println!("    tdx.rtmr1 = {}", m.tdx_measurement.rtmr1);
+                    println!("    tdx.rtmr2 = {}", m.tdx_measurement.rtmr2);
+                }
             }
             println!(
                 "hardware_root_ca: {}",
@@ -513,23 +551,40 @@ async fn run(cli: Cli) -> Result<(), String> {
                 config.hardware_intermediate_ca = Some(pem.trim().to_string());
                 println!("hardware_intermediate_ca set from {path}");
             }
-            if let Some(m) = &trust_measurement {
-                if m.len() != 96 || !m.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err("measurement must be 96 hex characters (48 bytes)".into());
-                }
-                if !config.trusted_measurements.contains(m) {
-                    config.trusted_measurements.push(m.clone());
-                    println!("added trusted measurement: {m}");
+            if let Some(spec) = &trust_measurement {
+                let entry = parse_trust_measurement(spec)?;
+                if config.trusted_measurements.iter().any(|m| {
+                    m.snp_measurement
+                        .eq_ignore_ascii_case(&entry.snp_measurement)
+                }) {
+                    println!(
+                        "measurement already trusted (snp={})",
+                        entry.snp_measurement
+                    );
                 } else {
-                    println!("measurement already trusted: {m}");
+                    println!(
+                        "added trusted measurement: snp={}, tdx.rtmr1={}, tdx.rtmr2={}",
+                        entry.snp_measurement,
+                        entry.tdx_measurement.rtmr1,
+                        entry.tdx_measurement.rtmr2,
+                    );
+                    config.trusted_measurements.push(entry);
                 }
             }
-            if let Some(m) = &untrust_measurement {
-                if let Some(pos) = config.trusted_measurements.iter().position(|x| x == m) {
-                    config.trusted_measurements.remove(pos);
-                    println!("removed trusted measurement: {m}");
+            if let Some(spec) = &untrust_measurement {
+                let key = parse_untrust_key(spec)?;
+                if let Some(pos) = config
+                    .trusted_measurements
+                    .iter()
+                    .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
+                {
+                    let removed = config.trusted_measurements.remove(pos);
+                    println!(
+                        "removed trusted measurement (snp={})",
+                        removed.snp_measurement
+                    );
                 } else {
-                    println!("measurement not found: {m}");
+                    println!("measurement not found (snp={key})");
                 }
             }
             config.save()?;
