@@ -31,6 +31,11 @@ chrono = { version = "0.4", default-features = false, features = ["alloc", "serd
 # DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
 x509-cert = "0.2"
 der = { version = "0.7", features = ["alloc"] }
+# RSA-PSS verification for AMD CRLs (the `sev` crate uses this same crate
+# internally for ARK→ASK signature verification when built with the
+# `crypto_nossl` feature; we pin it directly so we can verify CRLs the
+# `sev` crate doesn't handle).
+rsa = "0.9"
 
 # HTTP client for fetching attestation bundle
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
@@ -53,8 +58,11 @@ http = "1"
 # Async runtime
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"] }
 
-# Hashing
-sha2 = "0.11"
+# Hashing. Pinned to 0.10 because the rest of our dep tree (dcap-qvl,
+# rsa, p256, etc.) is on 0.10 and the rsa crate's `VerifyingKey<D>`
+# bounds require `D: rsa::sha2::Digest`, which only resolves when our
+# `Sha384` comes from the same `sha2` version rsa was compiled against.
+sha2 = "0.10"
 
 # Encoding
 base64 = "0.22"

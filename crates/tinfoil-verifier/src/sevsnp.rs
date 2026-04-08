@@ -130,6 +130,43 @@ pub fn verify_attestation(
     Ok(report)
 }
 
+/// Resolve ARK and ASK as raw DER bytes, falling back to the built-in
+/// AMD Genoa certs when no override is supplied.
+///
+/// Used by the per-handshake connector to obtain the DER bytes it needs
+/// for downstream operations the `sev` crate's `verify_report` doesn't
+/// itself return — specifically, parsing into `x509-cert::Certificate`
+/// for CRL signature verification and serial number extraction.
+pub fn resolve_chain_certs_der(
+    custom_ark: Option<&[u8]>,
+    custom_ask: Option<&[u8]>,
+) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let ark = match custom_ark {
+        Some(der) => der.to_vec(),
+        None => genoa::ark()
+            .map_err(|e| Error::CertChain(format!("failed to load Genoa ARK: {e}")))?
+            .to_der()
+            .map_err(|e| Error::CertChain(format!("failed to DER-encode Genoa ARK: {e}")))?,
+    };
+    let ask = match custom_ask {
+        Some(der) => der.to_vec(),
+        None => genoa::ask()
+            .map_err(|e| Error::CertChain(format!("failed to load Genoa ASK: {e}")))?
+            .to_der()
+            .map_err(|e| Error::CertChain(format!("failed to DER-encode Genoa ASK: {e}")))?,
+    };
+    Ok((ark, ask))
+}
+
+/// Extract the raw serial number bytes from a DER-encoded X.509
+/// certificate. The result is suitable for direct comparison against
+/// the serial numbers in an `x509_cert::crl::CertificateList`.
+pub fn cert_serial_from_der(cert_der: &[u8]) -> Result<Vec<u8>, Error> {
+    let cert = x509_cert::Certificate::from_der(cert_der)
+        .map_err(|e| Error::CertParse(format!("failed to parse cert DER: {e}")))?;
+    Ok(cert.tbs_certificate.serial_number.as_bytes().to_vec())
+}
+
 /// Per-component TCB SVNs extracted from a SEV-SNP attestation report.
 ///
 /// We re-define this rather than re-exporting [`sev::firmware::host::TcbVersion`]

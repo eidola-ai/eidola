@@ -36,6 +36,7 @@ pub mod bundle;
 mod error;
 pub mod measurement;
 pub mod sevsnp;
+pub mod sevsnp_crl;
 pub mod tdx;
 
 pub use bundle::Platform;

@@ -47,9 +47,12 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::{Layer, Service};
 
+use der::Decode;
+
 use crate::measurement::EnclaveMeasurement;
 use crate::{
-    AtcFallback, Error, bundle, check_snp_measurement, check_tdx_measurement, sevsnp, tdx,
+    AtcFallback, Error, bundle, check_snp_measurement, check_tdx_measurement, sevsnp, sevsnp_crl,
+    tdx,
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -122,6 +125,7 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         tdx_observer,
         snp_policy,
         snp_observer,
+        snp_crl_cache: sevsnp_crl::CrlCache::new(),
     });
 
     reqwest::Client::builder()
@@ -233,6 +237,10 @@ struct AttestationCheck {
     /// the policy then rejects). Same lifecycle and constraints as
     /// `tdx_observer`. Unused on TDX backends.
     snp_observer: Option<sevsnp::SevSnpObserver>,
+    /// Per-client cache of AMD KDS CRLs keyed by AMD platform generation.
+    /// Same stale-while-revalidate / single-flight semantics as the TDX
+    /// collateral cache. Unused on TDX backends.
+    snp_crl_cache: sevsnp_crl::CrlCache,
 }
 
 impl AttestationCheck {
@@ -337,11 +345,36 @@ impl AttestationCheck {
         // ARK/ASK come from exactly one of two trusted sources: the caller's
         // explicit `trusted_ark_der`/`trusted_ask_der` configuration (test
         // deployments using the tinfoil shim mock), or the built-in AMD Genoa
-        // certs in the `sev` crate (production).
-        let ark_der = self.trusted_ark_der.as_deref();
-        let ask_der = self.trusted_ask_der.as_deref();
+        // certs in the `sev` crate (production). We resolve to owned DER
+        // bytes once so the same material can be used for chain
+        // verification, CRL signature verification, and ASK/VCEK serial
+        // extraction without re-loading the built-in certs three times.
+        let (ark_der, ask_der) = sevsnp::resolve_chain_certs_der(
+            self.trusted_ark_der.as_deref(),
+            self.trusted_ask_der.as_deref(),
+        )?;
 
-        sevsnp::verify_report(&vcek_der, &report, ark_der, ask_der)?;
+        sevsnp::verify_report(&vcek_der, &report, Some(&ark_der), Some(&ask_der))?;
+
+        // Check the AMD KDS CRL for revocation of either intermediate
+        // (ASK) or leaf (VCEK). The chain verifies above by signature
+        // alone — `sev` does not consult any CRL — so we layer this on
+        // top here. The CRL is fetched directly from AMD KDS rather
+        // than through Tinfoil's well-known doc on purpose: it is a
+        // global signed object (no information leak about which chip
+        // we are verifying) and a compromised operator could otherwise
+        // serve a stale list to silently re-enable a revoked chip.
+        let ark_x509 = x509_cert::Certificate::from_der(&ark_der)
+            .map_err(|e| Error::CertParse(format!("failed to parse ARK DER: {e}")))?;
+        let vcek_serial = sevsnp::cert_serial_from_der(&vcek_der)?;
+        let ask_serial = sevsnp::cert_serial_from_der(&ask_der)?;
+        self.snp_crl_cache
+            .check_revocation(
+                sevsnp_crl::AmdGeneration::Genoa,
+                &ark_x509,
+                &[&vcek_serial, &ask_serial],
+            )
+            .await?;
 
         // Apply the operator-configured TCB policy. The observer fires
         // *before* we propagate the policy result so consumers see the
