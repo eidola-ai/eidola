@@ -32,30 +32,49 @@ container from `compose.yaml`. For production, you can point `DATABASE_URL` at a
 set `DATABASE_PASSWORD` as a secret, and optionally provide `DATABASE_SSL_CERT` with the PEM-encoded
 root CA certificate if the database does not chain to the default WebPKI roots.
 
-For a complete postgres, server, and stripe webhook forwarding run:
+There are two supported development workflows:
+
+**1. Full container stack** — postgres, server, shim, and stripe-cli all run
+inside docker (detached). Use this when you want a one-shot reproducible
+environment and don't mind rebuilding the server image:
 
 ```bash
 just dev
+docker compose logs -f       # follow logs
+just down                    # stop everything
 ```
 
-To iterate more quickly while building locally:
+**2. Host-mode server** — postgres, the tinfoil shim mock, and stripe-cli run
+in containers; the server runs on the host with cargo. The shim is configured
+to forward to `host.docker.internal:8080`, so requests from the shim and
+Stripe webhooks all flow into the cargo-built server. This is the recommended
+inner loop while iterating on `eidola-server`:
 
 ```bash
-# Start backing services (postgres + simulator)
+# Bring up postgres + shim + stripe-cli; captures the Stripe webhook secret
+# and writes .env.local. Stripe forwarding is enabled iff STRIPE_API_KEY is
+# set in your environment or .env.
 just services
 
-# Set environment variables
-set -a; source .env; set +a
+# Load env vars (the .env.local override sets BIND_ADDR=0.0.0.0:8080 and
+# STRIPE_WEBHOOK_SECRET so the host server is reachable from the shim).
+set -a; source .env; source .env.local; set +a
 
 # Run the server on the host machine with cargo
 cargo run -p eidola-server
 
 # -- OR --
 
-# Run and automatically recompile/reload the server on 
-# the host machine with bacon
+# Run and automatically recompile/reload the server on the host machine with bacon
 bacon run-long -- -p eidola-server
+
+# When you're done:
+just down
 ```
+
+Both modes expose the same endpoints externally: postgres on `localhost:5432`,
+the shim on `https://localhost:8443`, and (in container mode) the server on
+`http://localhost:8080`. CLI configuration is identical across the two modes.
 
 ### CLI
 

@@ -1,37 +1,66 @@
 #!/usr/bin/env bash
-# Start the full stack with Stripe webhook forwarding for manual testing.
+# Bring up the local dev stack.
 #
-# Captures the webhook signing secret from stripe-cli, then starts all
-# services in the foreground. Ctrl-C tears everything down.
+# Usage:
+#   scripts/dev.sh [--container|--host]
 #
-# Requires: STRIPE_API_KEY (sk_test_...) set in environment or .env.
+# Modes:
+#   --container  (default)  eidola-server runs inside docker. Shim forwards
+#                           to the in-network `server` container.
+#   --host                  eidola-server runs on the host with cargo. Shim
+#                           forwards to host.docker.internal:8080. The script
+#                           writes `.env.local` with BIND_ADDR (and the
+#                           captured Stripe webhook secret) for the host
+#                           server to source.
+#
+# In both modes the script:
+#   - builds the images it needs
+#   - starts postgres and applies schema.sql (idempotent — pass through
+#     `just db-reset` if you want a clean DB)
+#   - if STRIPE_API_KEY is set, captures the Stripe webhook secret and starts
+#     stripe-cli forwarding to the shim; otherwise stripe-cli is skipped
+#   - starts everything detached and prints next-step instructions
+#
+# Stop with `just down`.
 
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
-# ── Cleanup on exit ──────────────────────────────────────────────────────────
+# ── Parse args ───────────────────────────────────────────────────────────────
 
-cleanup() {
-    echo ""
-    echo "==> Cleaning up..."
-    # docker compose --profile test down --volumes --remove-orphans 2>/dev/null || true
-    docker compose --profile test down --remove-orphans 2>/dev/null || true
-}
-trap cleanup EXIT
-
-# ── Preflight ────────────────────────────────────────────────────────────────
-
-if [ -z "${STRIPE_API_KEY:-}" ]; then
-    echo "ERROR: STRIPE_API_KEY is not set." >&2
-    echo "Usage: STRIPE_API_KEY=sk_test_xxx just dev-stripe" >&2
-    exit 1
-fi
+MODE="container"
+case "${1:-}" in
+    --container | "") MODE="container" ;;
+    --host) MODE="host" ;;
+    -h | --help)
+        sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+    *)
+        echo "ERROR: unknown argument: $1" >&2
+        echo "Usage: $0 [--container|--host]" >&2
+        exit 1
+        ;;
+esac
 
 # ── Build images ─────────────────────────────────────────────────────────────
+#
+# Use bake (not `docker compose build`) so the amd64 platform pinning in
+# docker-bake.hcl is honored — that keeps the build silent on arm64 hosts,
+# whose only option for these images is amd64 emulation anyway.
 
-echo "==> Building images (docker-dev profile)..."
-CARGO_PROFILE=docker-dev docker buildx bake
+BAKE_TARGETS=(postgres shim)
+if [ "$MODE" = "container" ]; then
+    BAKE_TARGETS+=(server)
+fi
+if [ -n "${STRIPE_API_KEY:-}" ]; then
+    BAKE_TARGETS+=(stripe-cli)
+fi
 
-# ── Start postgres, wait healthy, apply schema ───────────────────────────────
+echo "==> Building images: ${BAKE_TARGETS[*]}..."
+CARGO_PROFILE="${CARGO_PROFILE:-docker-dev}" docker buildx bake "${BAKE_TARGETS[@]}"
+
+# ── Postgres + schema ────────────────────────────────────────────────────────
 
 echo "==> Starting postgres..."
 docker compose up -d postgres
@@ -47,25 +76,96 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-echo "==> Applying schema..."
-docker compose exec postgres psql -U eidola -d eidola -f /docker-entrypoint-initdb.d/schema.sql -q
-
-# ── Capture webhook secret ───────────────────────────────────────────────────
-
-echo "==> Capturing Stripe webhook secret..."
-STRIPE_WEBHOOK_SECRET=$(
-    docker compose run --rm --no-deps stripe-cli listen --print-secret 2>/dev/null
+echo "==> Applying schema (if not already present)..."
+SCHEMA_PRESENT=$(
+    docker compose exec -T postgres psql -U eidola -d eidola -tAc \
+        "SELECT 1 FROM information_schema.tables WHERE table_schema='eidola' AND table_name='account'" \
+        2>/dev/null || true
 )
-
-if [ -z "$STRIPE_WEBHOOK_SECRET" ]; then
-    echo "ERROR: failed to capture webhook secret" >&2
-    exit 1
+if [ -z "$SCHEMA_PRESENT" ]; then
+    docker compose exec -T postgres psql -U eidola -d eidola \
+        -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/schema.sql -q
+else
+    echo "    schema already applied; skipping (run \`just db-reset\` to recreate)"
 fi
 
-export STRIPE_WEBHOOK_SECRET
-echo "    secret: ${STRIPE_WEBHOOK_SECRET:0:12}..."
+# ── Stripe webhook secret (optional) ─────────────────────────────────────────
 
-# ── Start everything in foreground ───────────────────────────────────────────
+STRIPE_WEBHOOK_SECRET=""
+if [ -n "${STRIPE_API_KEY:-}" ]; then
+    echo "==> Capturing Stripe webhook secret..."
+    STRIPE_WEBHOOK_SECRET=$(
+        docker compose run --rm --no-deps stripe-cli listen --print-secret 2>/dev/null
+    )
+    if [ -z "$STRIPE_WEBHOOK_SECRET" ]; then
+        echo "ERROR: failed to capture webhook secret" >&2
+        exit 1
+    fi
+    echo "    secret: ${STRIPE_WEBHOOK_SECRET:0:12}..."
+else
+    echo "==> STRIPE_API_KEY not set; skipping stripe-cli."
+fi
 
-echo "==> Starting server and stripe-cli (Ctrl-C to stop)..."
-docker compose --profile test up server stripe-cli shim
+# ── Compute mode-specific config ─────────────────────────────────────────────
+
+UP_SERVICES=(shim)
+UP_PROFILES=()
+if [ "$MODE" = "container" ]; then
+    SHIM_UPSTREAM_URL="http://server:8080"
+    UP_SERVICES+=(server)
+    UP_PROFILES+=(--profile server)
+else
+    SHIM_UPSTREAM_URL="http://host.docker.internal:8080"
+fi
+if [ -n "$STRIPE_WEBHOOK_SECRET" ]; then
+    UP_SERVICES+=(stripe-cli)
+    UP_PROFILES+=(--profile stripe)
+fi
+
+# ── Bring up services (detached) ─────────────────────────────────────────────
+
+echo "==> Starting ${UP_SERVICES[*]} (mode: $MODE, detached)..."
+SHIM_UPSTREAM_URL="$SHIM_UPSTREAM_URL" \
+STRIPE_WEBHOOK_SECRET="$STRIPE_WEBHOOK_SECRET" \
+    docker compose "${UP_PROFILES[@]}" up -d "${UP_SERVICES[@]}"
+
+# ── Host-mode finalization: write .env.local for cargo ───────────────────────
+
+if [ "$MODE" = "host" ]; then
+    {
+        echo "# Generated by scripts/dev.sh --host — host-mode dev overrides."
+        echo "# Source after .env: \`set -a; source .env; source .env.local; set +a\`"
+        echo "BIND_ADDR=0.0.0.0:8080"
+        if [ -n "$STRIPE_WEBHOOK_SECRET" ]; then
+            echo "STRIPE_WEBHOOK_SECRET=$STRIPE_WEBHOOK_SECRET"
+        fi
+    } > .env.local
+fi
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+
+cat <<EOF
+
+==> Stack is running (detached).
+
+    postgres : localhost:5432
+    shim     : https://localhost:8443  (-> $SHIM_UPSTREAM_URL)
+EOF
+[ "$MODE" = "container" ] && echo "    server   : http://localhost:8080  (in docker)"
+[ -n "$STRIPE_WEBHOOK_SECRET" ] && echo "    stripe-cli: forwarding to https://shim:8443/v1/webhooks/stripe"
+echo ""
+
+if [ "$MODE" = "host" ]; then
+    cat <<EOF
+To run the server on the host:
+
+    set -a; source .env; source .env.local; set +a
+    cargo run -p eidola-server
+
+EOF
+fi
+
+cat <<EOF
+To follow logs:    docker compose logs -f
+To stop the stack: just down
+EOF

@@ -86,7 +86,11 @@ The enclave's own `/.well-known/tinfoil-attestation?v=3` document is the source 
 This still relies on Tinfoil's TLS private key being sealed inside the enclave: a static attestation document does not defeat an attacker who has somehow exfiltrated the long-lived TLS key. Closing that gap requires per-handshake nonces in `report_data`, which Tinfoil is adding upstream. Once that lands and v3 documents become fully self-contained, the ATC fallback path will go cold and can be removed entirely.
 
 **Compose files:**
-- `compose.yaml` — local development: postgres + server + stripe-cli
+- `compose.yaml` — local development. Two supported workflows share one file:
+  - **Full container stack** (`just dev`, → `scripts/dev.sh --container`) — postgres + server + shim + stripe-cli all in containers, detached. Server image is rebuilt each invocation.
+  - **Host mode** (`just services`, → `scripts/dev.sh --host`) — postgres + shim + stripe-cli in containers, with `SHIM_UPSTREAM_URL=http://host.docker.internal:8080` so the shim forwards to a cargo-built server running on the host. Writes `.env.local` (`STRIPE_WEBHOOK_SECRET` + `BIND_ADDR=0.0.0.0:8080`) for the host server to source.
+  - Both modes share `scripts/dev.sh`. Both build only the images they need, idempotently apply `schema.sql` to postgres, capture the Stripe webhook secret if `STRIPE_API_KEY` is set (otherwise skip stripe-cli), and start everything detached. `just down` tears down both modes.
+  - Profiles: `server` gates the eidola-server container; `stripe` gates stripe-cli. Postgres and shim have no profile (always available). The shim has `extra_hosts: host.docker.internal:host-gateway` so the host-gateway alias works on Linux too, and intentionally has no `depends_on: server` so it starts cleanly in host mode. `postgres`, `server`, and `shim` declare `platform: linux/amd64` so compose doesn't warn on arm64 hosts about the (intentional) amd64 base layers.
 
 ## App Core Architecture
 
