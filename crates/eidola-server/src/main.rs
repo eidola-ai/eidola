@@ -216,11 +216,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .tinfoil_base_url
         .as_deref()
         .unwrap_or(&default_base_url);
-    // Observer wired to the OTel TDX_ATTESTATIONS counter so every TDX
-    // attestation the verifier sees (including ones it rejects) is
-    // surfaced as a labeled metric. The closure runs on the TLS handshake
-    // hot path inside the connector layer, so we keep it to a single
-    // counter increment with no allocation in the steady state.
+    // Observers wired to the OTel TDX_ATTESTATIONS / SNP_ATTESTATIONS
+    // counters so every attestation the verifier sees (including ones
+    // it rejects) is surfaced as a labeled metric. The closures run on
+    // the TLS handshake hot path inside the connector layer, so we keep
+    // them to a single counter increment each with no allocation in the
+    // steady state.
     let tdx_observer: tinfoil_verifier::TdxObserver =
         std::sync::Arc::new(|observation: &tinfoil_verifier::TdxTcbObservation| {
             telemetry::metrics::TDX_ATTESTATIONS.add(
@@ -228,6 +229,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 &[opentelemetry::KeyValue::new(
                     "status",
                     observation.status.as_metric_label(),
+                )],
+            );
+        });
+    let snp_observer: tinfoil_verifier::SevSnpObserver =
+        std::sync::Arc::new(|observation: &tinfoil_verifier::SevSnpTcbObservation| {
+            telemetry::metrics::SNP_ATTESTATIONS.add(
+                1,
+                &[opentelemetry::KeyValue::new(
+                    "bucket",
+                    observation.as_metric_label(),
                 )],
             );
         });
@@ -241,6 +252,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             trusted_ask_der: None,
             tdx_advisory_allowlist: None,
             tdx_observer: Some(tdx_observer),
+            snp_min_tcb: None,
+            snp_observer: Some(snp_observer),
         })
         .await
         .map_err(|e| {

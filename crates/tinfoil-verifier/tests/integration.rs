@@ -42,8 +42,10 @@ async fn live_attestation_verification() {
     let report = tinfoil_verifier::sevsnp::verify_attestation(&vcek_der, &report_bytes, None, None)
         .expect("attestation verification failed");
 
-    // Verify TCB policy
-    tinfoil_verifier::sevsnp::verify_tcb_policy(&report).expect("TCB policy verification failed");
+    // Verify TCB policy (defaults: AMD recommended floor + rollback check)
+    let policy = tinfoil_verifier::SevSnpTcbPolicy::amd_recommended();
+    let (_observation, result) = policy.evaluate(&report);
+    result.expect("TCB policy verification failed");
 
     let measurement = hex::encode(report.measurement);
     eprintln!("Measurement: {measurement}");
@@ -103,6 +105,8 @@ async fn live_attesting_client() {
         trusted_ask_der: None,
         tdx_advisory_allowlist: None,
         tdx_observer: None,
+        snp_min_tcb: None,
+        snp_observer: None,
     })
     .await
     .expect("attesting_client failed");

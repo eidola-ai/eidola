@@ -41,6 +41,7 @@ pub mod tdx;
 pub use bundle::Platform;
 pub use error::Error;
 pub use measurement::{EnclaveMeasurement, MatchedMeasurement, TdxMeasurement};
+pub use sevsnp::{SevSnpObserver, SevSnpTcbObservation, SevSnpTcbPolicy, SevSnpTcbSvns};
 pub use tdx::{TcbPolicy as TdxTcbPolicy, TdxObserver, TdxTcbObservation, TdxTcbStatus};
 
 /// Configuration for [`attesting_client`].
@@ -96,6 +97,19 @@ pub struct AttestingClientConfig<'a> {
     /// (e.g. an OTel counter increment is fine; HTTP I/O is not).
     /// Unused on SEV-SNP backends.
     pub tdx_observer: Option<TdxObserver>,
+    /// Operator-supplied minimum TCB SVNs the SEV-SNP `reported_tcb`
+    /// must satisfy. When `None`, defaults to
+    /// [`SevSnpTcbPolicy::amd_recommended`] (`bootloader >= 0x07`,
+    /// `snp >= 0x0E`, `microcode >= 0x48`, no `tee` floor). The rollback
+    /// check (`reported_tcb >= committed_tcb`) is structural and always
+    /// applied regardless of this setting. Unrelated to TDX, which has
+    /// its own [`Self::tdx_advisory_allowlist`].
+    pub snp_min_tcb: Option<SevSnpTcbPolicy>,
+    /// Optional observer fired for every SEV-SNP attestation that
+    /// completes signature verification, **including ones the policy
+    /// rejects**. Same lifecycle and constraints as
+    /// [`Self::tdx_observer`]. Unused on TDX backends.
+    pub snp_observer: Option<SevSnpObserver>,
 }
 
 /// Build a `reqwest::Client` whose connector verifies enclave attestation on
@@ -133,15 +147,19 @@ pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwe
         _ => tdx::TcbPolicy::intel_recommended(),
     };
 
-    attesting_client::build_attesting_client(
-        config.inference_base_url,
-        config.trusted_ark_der.map(|d| d.to_vec()),
-        config.trusted_ask_der.map(|d| d.to_vec()),
-        config.allowed_measurements.to_vec(),
+    let snp_policy = config.snp_min_tcb.unwrap_or_default();
+
+    attesting_client::build_attesting_client(attesting_client::BuildParams {
+        inference_base_url: config.inference_base_url.to_string(),
+        trusted_ark_der: config.trusted_ark_der.map(|d| d.to_vec()),
+        trusted_ask_der: config.trusted_ask_der.map(|d| d.to_vec()),
+        allowed_measurements: config.allowed_measurements.to_vec(),
         atc_fallback,
         tdx_policy,
-        config.tdx_observer,
-    )
+        tdx_observer: config.tdx_observer,
+        snp_policy,
+        snp_observer: config.snp_observer,
+    })
 }
 
 /// Configuration for the ATC fallback path used by the per-handshake

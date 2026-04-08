@@ -66,16 +66,35 @@ const ATTESTATION_DEADLINE: Duration = Duration::from_secs(10);
 /// The returned client speaks HTTP/1.1 only (forced via ALPN) so that the
 /// inline attestation request and any subsequent application requests share
 /// a single connection lifecycle the connector layer can drive.
-pub(crate) fn build_attesting_client(
-    inference_base_url: &str,
-    trusted_ark_der: Option<Vec<u8>>,
-    trusted_ask_der: Option<Vec<u8>>,
-    allowed_measurements: Vec<EnclaveMeasurement>,
-    atc_fallback: AtcFallback,
-    tdx_policy: tdx::TcbPolicy,
-    tdx_observer: Option<tdx::TdxObserver>,
-) -> Result<reqwest::Client, Error> {
-    let host = crate::enclave_host(inference_base_url);
+/// Owned, plumbing-friendly mirror of [`crate::AttestingClientConfig`] used
+/// by [`build_attesting_client`]. We keep it crate-private so the public
+/// config can stay borrow-flavored (`&'a [...]`) without forcing every
+/// internal helper to carry a lifetime parameter.
+pub(crate) struct BuildParams {
+    pub inference_base_url: String,
+    pub trusted_ark_der: Option<Vec<u8>>,
+    pub trusted_ask_der: Option<Vec<u8>>,
+    pub allowed_measurements: Vec<EnclaveMeasurement>,
+    pub atc_fallback: AtcFallback,
+    pub tdx_policy: tdx::TcbPolicy,
+    pub tdx_observer: Option<tdx::TdxObserver>,
+    pub snp_policy: sevsnp::SevSnpTcbPolicy,
+    pub snp_observer: Option<sevsnp::SevSnpObserver>,
+}
+
+pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Client, Error> {
+    let BuildParams {
+        inference_base_url,
+        trusted_ark_der,
+        trusted_ask_der,
+        allowed_measurements,
+        atc_fallback,
+        tdx_policy,
+        tdx_observer,
+        snp_policy,
+        snp_observer,
+    } = params;
+    let host = crate::enclave_host(&inference_base_url);
 
     // Build a rustls config that pins ALPN to http/1.1 so the connection we
     // attest is the same connection hyper will use for the real request. The
@@ -101,6 +120,8 @@ pub(crate) fn build_attesting_client(
         tdx_collateral_cache: tdx::CollateralCache::new(),
         tdx_policy,
         tdx_observer,
+        snp_policy,
+        snp_observer,
     });
 
     reqwest::Client::builder()
@@ -203,6 +224,15 @@ struct AttestationCheck {
     /// metrics or alerts without `tinfoil-verifier` taking a dependency
     /// on a metrics framework. Unused on SEV-SNP backends.
     tdx_observer: Option<tdx::TdxObserver>,
+    /// Per-component minimum SVNs the SEV-SNP `reported_tcb` must satisfy.
+    /// Also drives the rollback check (`reported_tcb >= committed_tcb`),
+    /// which is structural and not configurable. Unused on TDX backends.
+    snp_policy: sevsnp::SevSnpTcbPolicy,
+    /// Optional consumer-provided observer fired for every SEV-SNP
+    /// attestation that completes signature verification (including ones
+    /// the policy then rejects). Same lifecycle and constraints as
+    /// `tdx_observer`. Unused on TDX backends.
+    snp_observer: Option<sevsnp::SevSnpObserver>,
 }
 
 impl AttestationCheck {
@@ -312,7 +342,16 @@ impl AttestationCheck {
         let ask_der = self.trusted_ask_der.as_deref();
 
         sevsnp::verify_report(&vcek_der, &report, ark_der, ask_der)?;
-        sevsnp::verify_tcb_policy(&report)?;
+
+        // Apply the operator-configured TCB policy. The observer fires
+        // *before* we propagate the policy result so consumers see the
+        // full population of observed TCB levels — including ones we
+        // will reject — for metrics and alerting.
+        let (snp_observation, policy_result) = self.snp_policy.evaluate(&report);
+        if let Some(observer) = &self.snp_observer {
+            observer(&snp_observation);
+        }
+        policy_result?;
 
         let measurement_hex = hex::encode(report.measurement);
         let matched = check_snp_measurement(&self.allowed_measurements, &measurement_hex)?;
@@ -327,6 +366,9 @@ impl AttestationCheck {
         tracing::info!(
             measurement = %matched,
             tls_fingerprint = hex::encode(peer_spki),
+            reported_tcb = %snp_observation.reported_tcb,
+            committed_tcb = %snp_observation.committed_tcb,
+            tcb_bucket = snp_observation.as_metric_label(),
             "SEV-SNP attestation verified for new connection",
         );
         Ok(())

@@ -186,4 +186,19 @@ pub mod metrics {
             .with_description("TDX attestations observed by the tinfoil verifier")
             .build()
     });
+
+    /// Total SEV-SNP attestations observed during outbound enclave
+    /// handshakes, labeled by a coarse TCB bucket: `meets_floor`,
+    /// `below_floor`, or `rollback_detected`. Includes attestations the
+    /// verifier ultimately rejects, so a non-zero `below_floor` rate
+    /// signals AMD has published a firmware update we haven't accepted
+    /// yet, and any `rollback_detected` is an immediate red flag (a
+    /// hypervisor is reporting a TCB lower than the firmware has
+    /// committed to).
+    pub static SNP_ATTESTATIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("tinfoil.snp.attestations")
+            .with_description("SEV-SNP attestations observed by the tinfoil verifier")
+            .build()
+    });
 }
