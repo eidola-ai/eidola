@@ -216,6 +216,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .tinfoil_base_url
         .as_deref()
         .unwrap_or(&default_base_url);
+    // Observer wired to the OTel TDX_ATTESTATIONS counter so every TDX
+    // attestation the verifier sees (including ones it rejects) is
+    // surfaced as a labeled metric. The closure runs on the TLS handshake
+    // hot path inside the connector layer, so we keep it to a single
+    // counter increment with no allocation in the steady state.
+    let tdx_observer: tinfoil_verifier::TdxObserver =
+        std::sync::Arc::new(|observation: &tinfoil_verifier::TdxTcbObservation| {
+            telemetry::metrics::TDX_ATTESTATIONS.add(
+                1,
+                &[opentelemetry::KeyValue::new(
+                    "status",
+                    observation.status.as_metric_label(),
+                )],
+            );
+        });
     let attesting_client =
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
             allowed_measurements: measurements::ALLOWED.as_slice(),
@@ -224,6 +239,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             enclave_repo: Some(&config.tinfoil_repo),
             trusted_ark_der: None,
             trusted_ask_der: None,
+            tdx_advisory_allowlist: None,
+            tdx_observer: Some(tdx_observer),
         })
         .await
         .map_err(|e| {

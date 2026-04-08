@@ -41,6 +41,7 @@ pub mod tdx;
 pub use bundle::Platform;
 pub use error::Error;
 pub use measurement::{EnclaveMeasurement, MatchedMeasurement, TdxMeasurement};
+pub use tdx::{TcbPolicy as TdxTcbPolicy, TdxObserver, TdxTcbObservation, TdxTcbStatus};
 
 /// Configuration for [`attesting_client`].
 pub struct AttestingClientConfig<'a> {
@@ -72,6 +73,29 @@ pub struct AttestingClientConfig<'a> {
     /// Optional custom trusted ASK DER bytes. Same caveats as
     /// [`Self::trusted_ark_der`].
     pub trusted_ask_der: Option<&'a [u8]>,
+    /// Optional allowlist of Intel advisory IDs (e.g. `INTEL-SA-00837`)
+    /// the operator has explicitly reviewed and accepted.
+    ///
+    /// When `None` or empty, TDX attestation follows Intel's recommended
+    /// verifier policy: `UpToDate` accepted silently; `*Needed` levels
+    /// accepted with a warning; `OutOfDate*` and `Revoked` rejected.
+    /// When non-empty, an `OutOfDate*` level is also accepted (with a
+    /// warning) iff every advisory ID associated with the matched TCB
+    /// level is contained in the allowlist. Unrelated to SEV-SNP, which
+    /// has its own minimum-firmware floor in
+    /// [`crate::sevsnp::verify_tcb_policy`].
+    pub tdx_advisory_allowlist: Option<&'a [&'a str]>,
+    /// Optional observer fired for every TDX attestation that completes
+    /// signature verification, **including ones the policy rejects**.
+    /// Lets the consuming application record metrics, traces, or alerts
+    /// without `tinfoil-verifier` taking a dependency on a metrics
+    /// framework.
+    ///
+    /// The callback runs synchronously inside the connector layer on the
+    /// TLS handshake hot path, so it must be cheap and non-blocking
+    /// (e.g. an OTel counter increment is fine; HTTP I/O is not).
+    /// Unused on SEV-SNP backends.
+    pub tdx_observer: Option<TdxObserver>,
 }
 
 /// Build a `reqwest::Client` whose connector verifies enclave attestation on
@@ -102,12 +126,21 @@ pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwe
         enclave_host: host,
     };
 
+    let tdx_policy = match config.tdx_advisory_allowlist {
+        Some(list) if !list.is_empty() => {
+            tdx::TcbPolicy::with_advisory_allowlist(list.iter().copied())
+        }
+        _ => tdx::TcbPolicy::intel_recommended(),
+    };
+
     attesting_client::build_attesting_client(
         config.inference_base_url,
         config.trusted_ark_der.map(|d| d.to_vec()),
         config.trusted_ask_der.map(|d| d.to_vec()),
         config.allowed_measurements.to_vec(),
         atc_fallback,
+        tdx_policy,
+        config.tdx_observer,
     )
 }
 

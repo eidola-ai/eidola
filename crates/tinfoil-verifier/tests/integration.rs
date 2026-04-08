@@ -101,6 +101,8 @@ async fn live_attesting_client() {
         enclave_repo: Some(LIVE_REPO),
         trusted_ark_der: None,
         trusted_ask_der: None,
+        tdx_advisory_allowlist: None,
+        tdx_observer: None,
     })
     .await
     .expect("attesting_client failed");

@@ -327,6 +327,8 @@ async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
         enclave_repo: Some(config.attestation_repo()),
         trusted_ark_der: hardware_root_der.as_deref(),
         trusted_ask_der: hardware_intermediate_der.as_deref(),
+        tdx_advisory_allowlist: None,
+        tdx_observer: None,
     })
     .await
     .map_err(|e| format!("attestation client build failed: {e}"))

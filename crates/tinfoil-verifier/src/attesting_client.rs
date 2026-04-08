@@ -72,6 +72,8 @@ pub(crate) fn build_attesting_client(
     trusted_ask_der: Option<Vec<u8>>,
     allowed_measurements: Vec<EnclaveMeasurement>,
     atc_fallback: AtcFallback,
+    tdx_policy: tdx::TcbPolicy,
+    tdx_observer: Option<tdx::TdxObserver>,
 ) -> Result<reqwest::Client, Error> {
     let host = crate::enclave_host(inference_base_url);
 
@@ -97,6 +99,8 @@ pub(crate) fn build_attesting_client(
         trusted_ask_der,
         atc_fallback,
         tdx_collateral_cache: tdx::CollateralCache::new(),
+        tdx_policy,
+        tdx_observer,
     });
 
     reqwest::Client::builder()
@@ -190,6 +194,15 @@ struct AttestationCheck {
     /// `(fmspc, ca)`. Bounds Intel PCS request volume to roughly one set of
     /// fetches per FMSPC per TCB advisory cycle. Unused on SEV-SNP backends.
     tdx_collateral_cache: tdx::CollateralCache,
+    /// Acceptance policy applied on top of `dcap_verify`'s built-in checks.
+    /// Unused on SEV-SNP backends.
+    tdx_policy: tdx::TcbPolicy,
+    /// Optional consumer-provided observer fired for every TDX
+    /// attestation that completes signature verification (including ones
+    /// the policy then rejects). Lets the consuming application record
+    /// metrics or alerts without `tinfoil-verifier` taking a dependency
+    /// on a metrics framework. Unused on SEV-SNP backends.
+    tdx_observer: Option<tdx::TdxObserver>,
 }
 
 impl AttestationCheck {
@@ -328,7 +341,12 @@ impl AttestationCheck {
             .tdx_collateral_cache
             .get_or_fetch(&resolved.report_bytes)
             .await?;
-        let result = tdx::verify_quote(&resolved.report_bytes, &collateral)?;
+        let result = tdx::verify_quote(
+            &resolved.report_bytes,
+            &collateral,
+            &self.tdx_policy,
+            self.tdx_observer.as_ref(),
+        )?;
 
         let rtmr1_hex = hex::encode(result.rtmr1);
         let rtmr2_hex = hex::encode(result.rtmr2);

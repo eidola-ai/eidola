@@ -33,6 +33,7 @@ use chrono::DateTime;
 use dcap_qvl::QuoteCollateralV3;
 use dcap_qvl::collateral::get_collateral_from_pcs;
 use dcap_qvl::quote::Quote;
+use dcap_qvl::tcb_info::TcbStatus;
 use dcap_qvl::verify::rustcrypto::verify as dcap_verify;
 use serde::Deserialize;
 
@@ -58,20 +59,125 @@ pub struct TdxVerification {
     pub report_data: [u8; 64],
 }
 
+/// TDX TCB status, mirroring `dcap_qvl::tcb_info::TcbStatus`.
+///
+/// We re-define the enum here so the public surface of `tinfoil-verifier`
+/// does not leak its dependency on dcap-qvl, and so adding a new variant
+/// upstream forces a compile-time decision in our `From` impl rather than
+/// silently mapping it to a default. The `Display` representation matches
+/// dcap-qvl exactly so log lines remain stable across the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TdxTcbStatus {
+    UpToDate,
+    SWHardeningNeeded,
+    ConfigurationNeeded,
+    ConfigurationAndSWHardeningNeeded,
+    OutOfDate,
+    OutOfDateConfigurationNeeded,
+    Revoked,
+}
+
+impl TdxTcbStatus {
+    /// Stable lowercase identifier suitable for use as a metric label.
+    pub fn as_metric_label(&self) -> &'static str {
+        match self {
+            Self::UpToDate => "up_to_date",
+            Self::SWHardeningNeeded => "sw_hardening_needed",
+            Self::ConfigurationNeeded => "configuration_needed",
+            Self::ConfigurationAndSWHardeningNeeded => "configuration_and_sw_hardening_needed",
+            Self::OutOfDate => "out_of_date",
+            Self::OutOfDateConfigurationNeeded => "out_of_date_configuration_needed",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+impl std::fmt::Display for TdxTcbStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UpToDate => "UpToDate",
+            Self::SWHardeningNeeded => "SWHardeningNeeded",
+            Self::ConfigurationNeeded => "ConfigurationNeeded",
+            Self::ConfigurationAndSWHardeningNeeded => "ConfigurationAndSWHardeningNeeded",
+            Self::OutOfDate => "OutOfDate",
+            Self::OutOfDateConfigurationNeeded => "OutOfDateConfigurationNeeded",
+            Self::Revoked => "Revoked",
+        })
+    }
+}
+
+impl From<TcbStatus> for TdxTcbStatus {
+    fn from(s: TcbStatus) -> Self {
+        match s {
+            TcbStatus::UpToDate => Self::UpToDate,
+            TcbStatus::SWHardeningNeeded => Self::SWHardeningNeeded,
+            TcbStatus::ConfigurationNeeded => Self::ConfigurationNeeded,
+            TcbStatus::ConfigurationAndSWHardeningNeeded => Self::ConfigurationAndSWHardeningNeeded,
+            TcbStatus::OutOfDate => Self::OutOfDate,
+            TcbStatus::OutOfDateConfigurationNeeded => Self::OutOfDateConfigurationNeeded,
+            TcbStatus::Revoked => Self::Revoked,
+        }
+    }
+}
+
+/// Merged platform + QE TCB status surfaced after a successful TDX
+/// signature verification, before [`TcbPolicy`] is applied.
+///
+/// Consumers receive this via the optional observer callback on
+/// [`crate::AttestingClientConfig`] and can use it to drive metrics or
+/// alerting. The observer fires for *every* attestation that completed
+/// signature verification, including those the policy subsequently
+/// rejects, so operators have full visibility into the population of
+/// observed TCB levels — not just the ones that made it through.
+#[derive(Debug, Clone)]
+pub struct TdxTcbObservation {
+    pub status: TdxTcbStatus,
+    pub advisory_ids: Vec<String>,
+}
+
+/// Observer callback type. Invoked synchronously inside the connector
+/// layer for every TDX attestation that completes signature verification,
+/// regardless of policy outcome. Implementations must be cheap and
+/// non-blocking — they run on the TLS handshake hot path.
+pub type TdxObserver = Arc<dyn Fn(&TdxTcbObservation) + Send + Sync>;
+
 /// Verify a TDX Quote V4 against pre-fetched collateral.
 ///
 /// 1. Verifies the quote's ECDSA signature against Intel's root CA
 /// 2. Validates TCB policy, TDX module identity, and the `nextUpdate`
 ///    freshness window on the supplied collateral
-/// 3. Extracts RTMR1, RTMR2, and report_data
+/// 3. Applies the caller's [`TcbPolicy`] to the merged platform + QE TCB
+///    status (`dcap_verify` itself only rejects `Revoked`; we layer Intel's
+///    recommended policy on top)
+/// 4. Extracts RTMR1, RTMR2, and report_data
 pub fn verify_quote(
     raw_quote: &[u8],
     collateral: &QuoteCollateralV3,
+    policy: &TcbPolicy,
+    observer: Option<&TdxObserver>,
 ) -> Result<TdxVerification, Error> {
     let now_secs = unix_now()?;
 
     let verified = dcap_verify(raw_quote, collateral, now_secs)
         .map_err(|e| Error::Tdx(format!("TDX quote verification failed: {e}")))?;
+
+    // Merge platform + QE statuses, then convert to our own typed
+    // observation. `verified.status` is the same value pre-stringified,
+    // but matching on a typed enum is sturdier than string comparison
+    // and surfaces new TcbStatus variants at compile time.
+    let merged = verified.platform_status.clone().merge(&verified.qe_status);
+    let observation = TdxTcbObservation {
+        status: merged.status.into(),
+        advisory_ids: merged.advisory_ids,
+    };
+
+    // Fire the observer *before* evaluating the policy so consumers see
+    // the full population of TCB levels, including ones we will reject.
+    if let Some(observer) = observer {
+        observer(&observation);
+    }
+
+    policy.evaluate(&observation)?;
 
     let td_report = verified
         .report
@@ -83,6 +189,98 @@ pub fn verify_quote(
         rtmr2: td_report.rt_mr2,
         report_data: td_report.report_data,
     })
+}
+
+/// Acceptance policy for the merged platform + QE TCB status returned by
+/// `dcap_verify`.
+///
+/// `dcap-qvl` only rejects `Revoked` itself; every other status — including
+/// `OutOfDate*` — is returned as `Ok(VerifiedReport)` for the caller to
+/// evaluate. This type encodes Intel's recommended verifier policy on top
+/// of that, with an optional escape hatch for advisories the operator has
+/// explicitly reviewed.
+///
+/// - `UpToDate` is accepted silently.
+/// - `SWHardeningNeeded`, `ConfigurationNeeded`, and
+///   `ConfigurationAndSWHardeningNeeded` are accepted with a `warn!` that
+///   logs the matched advisory IDs (relying parties are expected to apply
+///   the referenced mitigations out-of-band).
+/// - `OutOfDate` and `OutOfDateConfigurationNeeded` are rejected unless an
+///   `advisory_allowlist` is configured *and* every advisory ID on the
+///   matched TCB level is contained in it. This encodes explicit
+///   "we know about INTEL-SA-XXXXX and have decided it is not exploitable
+///   in our threat model" decisions; a *new* advisory will surface as
+///   "advisory not allowlisted" and fail closed.
+/// - `Revoked` is always rejected.
+#[derive(Default, Clone)]
+pub struct TcbPolicy {
+    advisory_allowlist: Vec<String>,
+}
+
+impl TcbPolicy {
+    /// Default policy: Intel's recommendations, no advisory tolerated past
+    /// `OutOfDate`.
+    pub fn intel_recommended() -> Self {
+        Self::default()
+    }
+
+    /// Intel's recommendations plus an explicit advisory-ID allowlist.
+    /// `OutOfDate*` levels whose entire advisory set is contained in
+    /// `allowlist` are accepted with a warning instead of rejected.
+    pub fn with_advisory_allowlist<I, S>(allowlist: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            advisory_allowlist: allowlist.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    fn allows_advisory(&self, id: &str) -> bool {
+        self.advisory_allowlist.iter().any(|a| a == id)
+    }
+
+    fn evaluate(&self, observation: &TdxTcbObservation) -> Result<(), Error> {
+        match observation.status {
+            TdxTcbStatus::UpToDate => Ok(()),
+            TdxTcbStatus::SWHardeningNeeded
+            | TdxTcbStatus::ConfigurationNeeded
+            | TdxTcbStatus::ConfigurationAndSWHardeningNeeded => {
+                tracing::warn!(
+                    status = %observation.status,
+                    advisory_ids = ?observation.advisory_ids,
+                    "TDX TCB level requires operator action; accepting per Intel recommendation",
+                );
+                Ok(())
+            }
+            TdxTcbStatus::OutOfDate | TdxTcbStatus::OutOfDateConfigurationNeeded => {
+                let unrecognized: Vec<&String> = observation
+                    .advisory_ids
+                    .iter()
+                    .filter(|a| !self.allows_advisory(a))
+                    .collect();
+                if !observation.advisory_ids.is_empty() && unrecognized.is_empty() {
+                    tracing::warn!(
+                        status = %observation.status,
+                        advisory_ids = ?observation.advisory_ids,
+                        "TDX TCB level is OutOfDate but every advisory is allowlisted; \
+                         accepting under operator policy",
+                    );
+                    Ok(())
+                } else {
+                    Err(Error::TcbPolicy(format!(
+                        "TDX TCB status is {} with advisory IDs {:?}; not in allowlist: {:?}",
+                        observation.status, observation.advisory_ids, unrecognized,
+                    )))
+                }
+            }
+            TdxTcbStatus::Revoked => Err(Error::TcbPolicy(format!(
+                "TDX TCB status is Revoked with advisory IDs {:?}",
+                observation.advisory_ids,
+            ))),
+        }
+    }
 }
 
 /// Per-client cache of TDX collateral fetched from Intel PCS, keyed by
@@ -372,5 +570,128 @@ mod tests {
         let now = 1_000_000;
         let deadline = compute_hard_expiry(&collateral, now);
         assert_eq!(deadline, now + MAX_CACHE_AGE.as_secs());
+    }
+
+    fn obs(status: TdxTcbStatus, advisories: &[&str]) -> TdxTcbObservation {
+        TdxTcbObservation {
+            status,
+            advisory_ids: advisories.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn policy_accepts_up_to_date() {
+        let policy = TcbPolicy::intel_recommended();
+        assert!(policy.evaluate(&obs(TdxTcbStatus::UpToDate, &[])).is_ok());
+    }
+
+    #[test]
+    fn policy_accepts_warning_levels() {
+        let policy = TcbPolicy::intel_recommended();
+        for status in [
+            TdxTcbStatus::SWHardeningNeeded,
+            TdxTcbStatus::ConfigurationNeeded,
+            TdxTcbStatus::ConfigurationAndSWHardeningNeeded,
+        ] {
+            assert!(
+                policy.evaluate(&obs(status, &["INTEL-SA-00001"])).is_ok(),
+                "expected {status:?} to be accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn policy_rejects_out_of_date_without_allowlist() {
+        let policy = TcbPolicy::intel_recommended();
+        let err = policy
+            .evaluate(&obs(TdxTcbStatus::OutOfDate, &["INTEL-SA-00837"]))
+            .unwrap_err();
+        assert!(matches!(err, Error::TcbPolicy(_)));
+    }
+
+    #[test]
+    fn policy_rejects_out_of_date_with_no_advisories() {
+        // OutOfDate with no advisories cannot be allowlisted: there's
+        // nothing for the operator to explicitly review.
+        let policy = TcbPolicy::with_advisory_allowlist(["INTEL-SA-00837"]);
+        let err = policy
+            .evaluate(&obs(TdxTcbStatus::OutOfDate, &[]))
+            .unwrap_err();
+        assert!(matches!(err, Error::TcbPolicy(_)));
+    }
+
+    #[test]
+    fn policy_accepts_out_of_date_when_all_advisories_allowlisted() {
+        let policy = TcbPolicy::with_advisory_allowlist(["INTEL-SA-00837", "INTEL-SA-00614"]);
+        assert!(
+            policy
+                .evaluate(&obs(TdxTcbStatus::OutOfDate, &["INTEL-SA-00837"]))
+                .is_ok()
+        );
+        assert!(
+            policy
+                .evaluate(&obs(
+                    TdxTcbStatus::OutOfDateConfigurationNeeded,
+                    &["INTEL-SA-00837", "INTEL-SA-00614"],
+                ))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn policy_rejects_out_of_date_when_any_advisory_unrecognized() {
+        let policy = TcbPolicy::with_advisory_allowlist(["INTEL-SA-00837"]);
+        let err = policy
+            .evaluate(&obs(
+                TdxTcbStatus::OutOfDate,
+                &["INTEL-SA-00837", "INTEL-SA-99999"],
+            ))
+            .unwrap_err();
+        let Error::TcbPolicy(msg) = err else {
+            panic!("expected TcbPolicy error");
+        };
+        assert!(msg.contains("INTEL-SA-99999"), "got: {msg}");
+    }
+
+    #[test]
+    fn policy_always_rejects_revoked() {
+        // Even with a maximally permissive allowlist, Revoked is rejected.
+        let policy = TcbPolicy::with_advisory_allowlist(["INTEL-SA-00837"]);
+        let err = policy
+            .evaluate(&obs(TdxTcbStatus::Revoked, &["INTEL-SA-00837"]))
+            .unwrap_err();
+        assert!(matches!(err, Error::TcbPolicy(_)));
+    }
+
+    #[test]
+    fn dcap_to_local_status_conversion_is_lossless() {
+        // Spot check every variant: if dcap-qvl ever adds a new variant,
+        // the From impl in this module will fail to compile.
+        for (dcap, local) in [
+            (TcbStatus::UpToDate, TdxTcbStatus::UpToDate),
+            (
+                TcbStatus::SWHardeningNeeded,
+                TdxTcbStatus::SWHardeningNeeded,
+            ),
+            (
+                TcbStatus::ConfigurationNeeded,
+                TdxTcbStatus::ConfigurationNeeded,
+            ),
+            (
+                TcbStatus::ConfigurationAndSWHardeningNeeded,
+                TdxTcbStatus::ConfigurationAndSWHardeningNeeded,
+            ),
+            (TcbStatus::OutOfDate, TdxTcbStatus::OutOfDate),
+            (
+                TcbStatus::OutOfDateConfigurationNeeded,
+                TdxTcbStatus::OutOfDateConfigurationNeeded,
+            ),
+            (TcbStatus::Revoked, TdxTcbStatus::Revoked),
+        ] {
+            assert_eq!(TdxTcbStatus::from(dcap), local);
+            // Display string must match dcap-qvl's exactly so log lines
+            // remain stable across the boundary.
+            assert_eq!(local.to_string(), dcap.to_string());
+        }
     }
 }
