@@ -24,11 +24,19 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 webpki-roots = "1"
 
-# Concurrent verified-fingerprint cache
-dashmap = "6"
+# Connector layer plumbing for the per-handshake attesting client.
+# `tower` gives us Layer/Service traits; `hyper` and `hyper-util` give us the
+# Read/Write/Connection traits and the TokioIo adapter that lets us drive an
+# inline HTTP/1.1 request on a freshly handshaked connection; `httparse`
+# parses the response head.
+tower = { version = "0.5", default-features = false }
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+httparse = "1"
+http = "1"
 
-# Async runtime (for block_in_place in TLS verifier)
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+# Async runtime
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util"] }
 
 # Hashing
 sha2 = "0.11"

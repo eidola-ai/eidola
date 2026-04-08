@@ -427,8 +427,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let b64 = &base64::engine::general_purpose::STANDARD;
 
-    // V3 attestation: raw report + VCEK + ARK + ASK so the client can verify
-    // the full chain without needing the intermediate CA in its config.
+    // V3 attestation: raw report + VCEK. The mock deliberately does not
+    // ship ARK/ASK in the attestation document — those are anchors of
+    // trust and must be configured out-of-band on the verifier (via
+    // `trusted_ark_der` / `trusted_ask_der`), never sourced from the
+    // attested endpoint itself. The on-disk ark.pem / ask.pem files
+    // generated above are what the developer feeds to their verifier
+    // configuration; this endpoint only emits the dynamic per-boot data.
     let attestation_json = serde_json::to_string(&serde_json::json!({
         "format": "https://tinfoil.sh/predicate/attestation/v3",
         "cpu": {
@@ -436,8 +441,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "report": b64.encode(report),
         },
         "vcek": b64.encode(&vcek_der),
-        "ark": b64.encode(&ark_pss_der),
-        "ask": b64.encode(&ask_der),
     }))?;
 
     // ── 10. Start HTTPS server ──────────────────────────────────────────

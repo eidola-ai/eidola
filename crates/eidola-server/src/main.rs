@@ -205,14 +205,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let credential_key_cache: credentials::KeyCache = Default::default();
     let epoch_config = EpochConfig::default();
 
-    // Verify Tinfoil enclave attestation and build an attesting client.
-    info!("Verifying Tinfoil enclave attestation...");
+    // Build the attesting client. Verification happens per-handshake inside
+    // the connector, so this call performs no network I/O — the first real
+    // request through the client is also the first attestation. We make a
+    // tiny smoke-test request immediately after construction to fail fast at
+    // startup if the upstream is misconfigured.
+    info!("Building Tinfoil attesting client...");
     let default_base_url = "https://inference.tinfoil.sh/v1".to_string();
     let inference_base_url = config
         .tinfoil_base_url
         .as_deref()
         .unwrap_or(&default_base_url);
-    let (attesting_client, verification) =
+    let attesting_client =
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
             allowed_measurements: measurements::ALLOWED.as_slice(),
             inference_base_url,
@@ -223,13 +227,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .await
         .map_err(|e| {
-            error!("Tinfoil attestation verification failed: {e}");
+            error!("Tinfoil attesting client build failed: {e}");
             e
         })?;
-    info!(
-        "Tinfoil attestation verified — measurement: {}, TLS fingerprint: {}",
-        verification.measurement, verification.tls_fingerprint
-    );
+
+    info!("Smoke-testing Tinfoil enclave attestation via {inference_base_url}/models...");
+    attesting_client
+        .get(format!("{inference_base_url}/models"))
+        .header(
+            "authorization",
+            format!("Bearer {}", config.tinfoil_api_key),
+        )
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Tinfoil attestation smoke test failed: {e}");
+            e
+        })?
+        .error_for_status()
+        .map_err(|e| {
+            error!("Tinfoil attestation smoke test returned non-success: {e}");
+            e
+        })?;
+    info!("Tinfoil attestation smoke test succeeded");
 
     // Create shared state
     let state = AppState::new(

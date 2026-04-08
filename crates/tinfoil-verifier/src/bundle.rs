@@ -6,47 +6,52 @@ use crate::{Error, sevsnp};
 
 /// Full attestation bundle containing report, VCEK, and enclave certificate.
 ///
-/// Fetched from the Tinfoil attestation transparency service (ATC).
+/// Fetched from the Tinfoil attestation transparency service (ATC). ATC is
+/// only consulted as a fallback when the enclave's own self-contained v3
+/// well-known document is missing required elements.
+///
+/// Note: this struct intentionally does **not** carry `ark` / `ask` fields
+/// even though the wire format includes them. AMD root and intermediate
+/// certificates are anchors of trust and must come from a statically known
+/// source (the built-in Genoa ARK/ASK in the `sev` crate, or an explicit
+/// `trusted_ark_der` / `trusted_ask_der` configured by the caller), never
+/// from a third-party service like ATC. Keeping unused-but-deserialized
+/// `ark` / `ask` fields here would be a foot-gun: they would sit in the
+/// struct waiting for someone to wire them into the trust chain in a later
+/// edit and silently re-introduce the very class of bug we're trying to
+/// rule out. Serde drops unknown fields silently, so simply omitting them
+/// from this struct is enough to make them unreachable from the verifier.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct AttestationBundle {
     pub domain: String,
     #[serde(rename = "enclaveAttestationReport")]
-    pub enclave_attestation_report: AttestationDocumentV2,
+    pub enclave_attestation_report: AtcReport,
     #[serde(rename = "enclaveCert")]
     pub enclave_cert: String,
     pub vcek: String,
-    pub ark: Option<String>,
-    pub ask: Option<String>,
     pub digest: String,
     #[serde(rename = "sigstoreBundle")]
     pub sigstore_bundle: Option<serde_json::Value>,
 }
 
-/// V2 attestation document (`/.well-known/tinfoil-attestation` default response).
-/// Body is base64-encoded gzip-compressed attestation report.
+/// Inner attestation report element of an ATC bundle. The body is base64-encoded
+/// gzip-compressed attestation report bytes; the format string identifies the
+/// platform.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttestationDocumentV2 {
+pub struct AtcReport {
     pub format: String,
     pub body: String,
-    pub vcek: Option<String>,
-    pub ark: Option<String>,
-    pub ask: Option<String>,
-    #[serde(rename = "enclaveCert")]
-    pub enclave_cert: Option<String>,
 }
 
 /// V3 attestation document (`/.well-known/tinfoil-attestation?v=3`).
 /// CPU report is base64-encoded raw bytes (not gzipped). VCEK is included
-/// when the server self-verifies at boot. ARK/ASK are included for custom
-/// chains (tinfoil shim mock); production uses built-in AMD Genoa certs.
+/// when the server self-verifies at boot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationDocumentV3 {
     pub format: String,
     pub cpu: AttestationCPU,
     pub vcek: Option<String>,
-    pub ark: Option<String>,
-    pub ask: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,32 +67,18 @@ pub enum Platform {
     Tdx,
 }
 
-/// Unified attestation data extracted from either v2 or v3 documents.
-/// Used by the verification pipeline so the rest of the code doesn't
-/// need to care which format was fetched.
+/// Unified attestation data extracted from a v3 well-known document.
 pub struct ResolvedAttestation {
     pub platform: Platform,
     pub report_bytes: Vec<u8>,
     pub vcek_der: Option<Vec<u8>>,
-    pub ark_der: Option<Vec<u8>>,
-    pub ask_der: Option<Vec<u8>>,
     pub enclave_cert: Option<String>,
 }
 
-const V2_SNP_FORMAT: &str = "https://tinfoil.sh/predicate/sev-snp-guest/v2";
-const V2_TDX_FORMAT: &str = "https://tinfoil.sh/predicate/tdx-guest/v2";
+/// ATC bundle format strings identifying the platform of the nested report.
+pub(crate) const ATC_SNP_FORMAT: &str = "https://tinfoil.sh/predicate/sev-snp-guest/v2";
+pub(crate) const ATC_TDX_FORMAT: &str = "https://tinfoil.sh/predicate/tdx-guest/v2";
 const V3_FORMAT: &str = "https://tinfoil.sh/predicate/attestation/v3";
-
-/// Determine the platform from a V2 format string.
-pub fn platform_from_format(format: &str) -> Result<Platform, Error> {
-    match format {
-        V2_SNP_FORMAT => Ok(Platform::SevSnp),
-        V2_TDX_FORMAT => Ok(Platform::Tdx),
-        _ => Err(Error::Bundle(format!(
-            "unsupported attestation format: {format}"
-        ))),
-    }
-}
 
 /// Default Tinfoil attestation transparency service URL.
 pub const DEFAULT_ATC_URL: &str = "https://atc.tinfoil.sh/attestation";
@@ -138,65 +129,39 @@ pub async fn fetch_bundle(
         .await?;
 
     let format = &bundle.enclave_attestation_report.format;
-    if format != V2_SNP_FORMAT && format != V2_TDX_FORMAT {
+    if format != ATC_SNP_FORMAT && format != ATC_TDX_FORMAT {
         return Err(Error::Bundle(format!(
-            "unsupported attestation format: {format}",
+            "unsupported ATC bundle format: {format}",
         )));
     }
 
     Ok(bundle)
 }
 
-/// Fetch and resolve attestation from a well-known endpoint.
-///
-/// Tries v3 first (`?v=3`), falls back to v2 if the server doesn't support v3.
-/// Returns a unified `ResolvedAttestation` with decoded report bytes and
-/// optional certificates.
+/// Fetch and resolve a v3 attestation document from a well-known endpoint.
 pub async fn fetch_well_known(
     client: &reqwest::Client,
     attestation_url: &str,
 ) -> Result<ResolvedAttestation, Error> {
-    // Try v3 first
     let v3_url = format!("{attestation_url}?v=3");
-    if let Ok(resp) = client.get(&v3_url).send().await
-        && resp.status().is_success()
-        && let Ok(doc) = resp.json::<AttestationDocumentV3>().await
-        && doc.format == V3_FORMAT
-        && (doc.cpu.platform == "sev-snp" || doc.cpu.platform == "tdx")
-    {
-        tracing::info!(
-            "Using v3 attestation document (platform: {})",
-            doc.cpu.platform
-        );
-        return resolve_v3(&doc);
-    }
-
-    // Fall back to v2
-    tracing::info!("Falling back to v2 attestation document");
-    let doc: AttestationDocumentV2 = client
-        .get(attestation_url)
+    let doc: AttestationDocumentV3 = client
+        .get(&v3_url)
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    resolve_v2(&doc)
-}
-
-/// Resolve a v2 attestation document into unified format.
-pub fn resolve_v2(doc: &AttestationDocumentV2) -> Result<ResolvedAttestation, Error> {
-    let platform = platform_from_format(&doc.format)?;
-    Ok(ResolvedAttestation {
-        platform,
-        report_bytes: decode_report_gzipped(&doc.body)?,
-        vcek_der: doc
-            .vcek
-            .as_ref()
-            .and_then(|s| sevsnp::decode_base64(s).ok()),
-        ark_der: doc.ark.as_ref().and_then(|s| sevsnp::decode_base64(s).ok()),
-        ask_der: doc.ask.as_ref().and_then(|s| sevsnp::decode_base64(s).ok()),
-        enclave_cert: doc.enclave_cert.clone(),
-    })
+    if doc.format != V3_FORMAT {
+        return Err(Error::Bundle(format!(
+            "unexpected attestation document format: {}",
+            doc.format
+        )));
+    }
+    tracing::info!(
+        "Fetched v3 attestation document (platform: {})",
+        doc.cpu.platform
+    );
+    resolve_v3(&doc)
 }
 
 /// Resolve a v3 attestation document into unified format.
@@ -218,8 +183,6 @@ pub fn resolve_v3(doc: &AttestationDocumentV3) -> Result<ResolvedAttestation, Er
             .vcek
             .as_ref()
             .and_then(|s| sevsnp::decode_base64(s).ok()),
-        ark_der: doc.ark.as_ref().and_then(|s| sevsnp::decode_base64(s).ok()),
-        ask_der: doc.ask.as_ref().and_then(|s| sevsnp::decode_base64(s).ok()),
         enclave_cert: None,
     })
 }

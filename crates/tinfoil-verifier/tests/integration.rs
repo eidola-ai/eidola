@@ -92,25 +92,21 @@ async fn live_attesting_client() {
         },
     }];
 
-    // Build the attesting client
-    let (client, verification) =
-        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &allowed,
-            inference_base_url: "https://inference.tinfoil.sh/v1",
-            atc_url: None,
-            enclave_repo: Some(LIVE_REPO),
-            trusted_ark_der: None,
-            trusted_ask_der: None,
-        })
-        .await
-        .expect("attesting_client failed");
+    // Build the attesting client. Verification happens lazily on the first
+    // real request.
+    let client = tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
+        allowed_measurements: &allowed,
+        inference_base_url: "https://inference.tinfoil.sh/v1",
+        atc_url: None,
+        enclave_repo: Some(LIVE_REPO),
+        trusted_ark_der: None,
+        trusted_ask_der: None,
+    })
+    .await
+    .expect("attesting_client failed");
 
-    eprintln!(
-        "Verification: measurement={}, fingerprint={}",
-        verification.measurement, verification.tls_fingerprint
-    );
-
-    // Make a request through the attesting client
+    // Make a request through the attesting client; this is what triggers
+    // per-handshake attestation.
     let resp = client
         .get("https://inference.tinfoil.sh/v1/models")
         .send()

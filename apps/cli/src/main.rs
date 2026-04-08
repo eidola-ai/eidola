@@ -315,24 +315,21 @@ async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
         "hardware_intermediate_ca",
     )?;
 
-    let (client, verification) =
-        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &config.trusted_measurements,
-            inference_base_url: origin,
-            atc_url: config.attestation_url.as_deref(),
-            enclave_repo: Some(config.attestation_repo()),
-            trusted_ark_der: hardware_root_der.as_deref(),
-            trusted_ask_der: hardware_intermediate_der.as_deref(),
-        })
-        .await
-        .map_err(|e| format!("attestation verification failed: {e}"))?;
-
-    eprintln!(
-        "attestation verified — measurement: {}, tls: {}",
-        verification.measurement, verification.tls_fingerprint
-    );
-
-    Ok(client)
+    // Attestation now happens inside the connector on the first real request
+    // (and on every subsequent new TLS handshake). The CLI is interactive, so
+    // we don't bother with a startup smoke test — failures will surface on the
+    // first command the user runs and are mapped to a human-readable error by
+    // `describe_request_error` below.
+    tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
+        allowed_measurements: &config.trusted_measurements,
+        inference_base_url: origin,
+        atc_url: config.attestation_url.as_deref(),
+        enclave_repo: Some(config.attestation_repo()),
+        trusted_ark_der: hardware_root_der.as_deref(),
+        trusted_ask_der: hardware_intermediate_der.as_deref(),
+    })
+    .await
+    .map_err(|e| format!("attestation client build failed: {e}"))
 }
 
 /// Map a reqwest send error to a human-readable message.

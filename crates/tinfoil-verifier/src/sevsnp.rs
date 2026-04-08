@@ -100,18 +100,6 @@ pub fn verify_attestation(
     Ok(report)
 }
 
-/// Build the AMD KDS URL for fetching a VCEK certificate.
-///
-/// URL format: `https://kdsintf.amd.com/vcek/v1/Genoa/{chip_id}?blSPL={bl}&teeSPL={tee}&snpSPL={snp}&ucodeSPL={ucode}`
-pub fn kds_vcek_url(report: &AttestationReport) -> String {
-    let chip_id = hex::encode(report.chip_id);
-    let tcb = &report.reported_tcb;
-    format!(
-        "https://kdsintf.amd.com/vcek/v1/Genoa/{chip_id}?blSPL={}&teeSPL={}&snpSPL={}&ucodeSPL={}",
-        tcb.bootloader, tcb.tee, tcb.snp, tcb.microcode
-    )
-}
-
 /// Validate TCB version against minimum policy.
 pub fn verify_tcb_policy(report: &AttestationReport) -> Result<(), Error> {
     let tcb = &report.reported_tcb;

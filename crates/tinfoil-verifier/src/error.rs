@@ -50,4 +50,18 @@ pub enum Error {
 
     #[error("TLS configuration error: {0}")]
     Tls(String),
+
+    /// Catch-all for failures that happen inside the per-handshake attesting
+    /// connector layer: HTTP/1.1 framing errors, EOF, missing TLS info on the
+    /// freshly-handshaken connection, JSON parse failures on the attestation
+    /// document body, and similar.
+    #[error("attestation connector error: {0}")]
+    Connector(String),
+
+    /// The inline attestation fetch did not complete within the configured
+    /// per-handshake deadline. The TLS handshake itself succeeded, but either
+    /// the upstream stalled before serving the well-known document or the
+    /// HTTP response was being streamed unusually slowly.
+    #[error("inline attestation fetch timed out after {seconds}s")]
+    AttestationTimeout { seconds: u64 },
 }
