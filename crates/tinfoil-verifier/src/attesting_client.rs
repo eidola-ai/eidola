@@ -96,6 +96,7 @@ pub(crate) fn build_attesting_client(
         trusted_ark_der,
         trusted_ask_der,
         atc_fallback,
+        tdx_collateral_cache: tdx::CollateralCache::new(),
     });
 
     reqwest::Client::builder()
@@ -185,6 +186,10 @@ struct AttestationCheck {
     /// document is missing required elements (today: the VCEK). The
     /// connector itself does not call AMD KDS — ATC is the single fallback.
     atc_fallback: AtcFallback,
+    /// Per-client cache of TDX collateral fetched from Intel PCS, keyed by
+    /// `(fmspc, ca)`. Bounds Intel PCS request volume to roughly one set of
+    /// fetches per FMSPC per TCB advisory cycle. Unused on SEV-SNP backends.
+    tdx_collateral_cache: tdx::CollateralCache,
 }
 
 impl AttestationCheck {
@@ -319,8 +324,10 @@ impl AttestationCheck {
         resolved: &bundle::ResolvedAttestation,
         peer_spki: &[u8; 32],
     ) -> Result<(), Error> {
-        let collateral_client = build_collateral_client()?;
-        let collateral = tdx::fetch_collateral(&collateral_client, &resolved.report_bytes).await?;
+        let collateral = self
+            .tdx_collateral_cache
+            .get_or_fetch(&resolved.report_bytes)
+            .await?;
         let result = tdx::verify_quote(&resolved.report_bytes, &collateral)?;
 
         let rtmr1_hex = hex::encode(result.rtmr1);
@@ -341,25 +348,6 @@ impl AttestationCheck {
         );
         Ok(())
     }
-}
-
-/// Build a side-channel reqwest client used for Intel PCS TDX collateral.
-///
-/// PCS uses public WebPKI; no custom trust roots are involved. (FIXME: this
-/// allocates a fresh client and connection pool per TDX handshake; cache the
-/// client on `AttestationCheck` once we touch the TDX path.)
-fn build_collateral_client() -> Result<reqwest::Client, Error> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| Error::Tls(format!("collateral client: {e}")))
 }
 
 /// Read a single HTTP/1.1 response from `io` and return its body bytes.

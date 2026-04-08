@@ -10,8 +10,16 @@ publish.workspace = true
 # SEV-SNP attestation report parsing and certificate chain verification
 sev = { version = "7", default-features = false, features = ["snp", "crypto_nossl"] }
 
-# TDX Quote V4 parsing and verification (pure Rust, rustcrypto backend)
-dcap-qvl = { version = "0.3", default-features = false, features = ["std", "rustcrypto"] }
+# TDX Quote V4 parsing and verification (pure Rust, rustcrypto backend).
+# The `report` feature pulls in `dcap_qvl::collateral::get_collateral_from_pcs`,
+# which we use to fetch Intel PCS collateral. It transitively enables a few
+# extra reqwest features (rustls-tls, blocking, hickory-dns); we accept that
+# cost in exchange for not maintaining a parallel collateral-fetch impl.
+dcap-qvl = { version = "0.3", default-features = false, features = ["std", "rustcrypto", "report"] }
+
+# Date parsing for TCB / QE identity nextUpdate fields driving the
+# collateral cache TTL. Already in the dep tree transitively via dcap-qvl.
+chrono = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
 
 # DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
 x509-cert = "0.2"
