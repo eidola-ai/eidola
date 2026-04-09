@@ -11,10 +11,18 @@ publish.workspace = true
 sev = { version = "7", default-features = false, features = ["snp", "crypto_nossl"] }
 
 # TDX Quote V4 parsing and verification (pure Rust, rustcrypto backend).
-# The `report` feature pulls in `dcap_qvl::collateral::get_collateral_from_pcs`,
-# which we use to fetch Intel PCS collateral. It transitively enables a few
-# extra reqwest features (rustls-tls, blocking, hickory-dns); we accept that
-# cost in exchange for not maintaining a parallel collateral-fetch impl.
+#
+# We deliberately do **not** enable the `report` feature: it pulls in an
+# optional `reqwest` dependency hardcoded to `["rustls-tls", "blocking",
+# "hickory-dns"]`, and `rustls-tls` activates `__rustls-ring` — which
+# unifies `ring` into the workspace's rustls build, breaking our
+# deterministic Nix release pipeline (ring's build script needs C/asm
+# that nix's wrapped clang can't cross-compile to `arm64-apple-macosx`).
+# We carry our own collateral fetcher in `tdx.rs::fetch_and_build_entry`
+# instead, reusing the verifier's existing reqwest stack
+# (`rustls-no-provider` + `rustls-rustcrypto`). The Tinfoil enclave only
+# emits cert_type 5 quotes (PCK chain embedded in the quote itself), so
+# we never need dcap-qvl's encrypted-PPID PCK fetch path.
 #
 # Pinned to upstream master past the published 0.3.12 release because we
 # need `pub mod tcb_info;` (added on master) so we can name `TcbStatus` /
@@ -22,7 +30,13 @@ sev = { version = "7", default-features = false, features = ["snp", "crypto_noss
 # includes a TCB-level sorting fix and TDX module identity verification
 # (PRs #137, #138) — both strict improvements over 0.3.12. Drop back to a
 # crates.io version once `tcb_info` lands in a release.
-dcap-qvl = { git = "https://github.com/Phala-Network/dcap-qvl", rev = "90c4c9ffd6fd1565b138df161ecdf6fe568a326c", default-features = false, features = ["std", "rustcrypto", "report"] }
+dcap-qvl = { git = "https://github.com/Phala-Network/dcap-qvl", rev = "90c4c9ffd6fd1565b138df161ecdf6fe568a326c", default-features = false, features = ["std", "rustcrypto"] }
+
+# PEM parsing for the Intel PCS issuer chains returned in `*-Issuer-Chain`
+# response headers. We only need to walk the certs to extract the root
+# CA's CRL distribution point URL; using a tiny dedicated crate keeps the
+# parsing surface honest. Already in our dep tree transitively via dcap-qvl.
+pem = "3"
 
 # Date parsing for TCB / QE identity nextUpdate fields driving the
 # collateral cache TTL. Already in the dep tree transitively via dcap-qvl.

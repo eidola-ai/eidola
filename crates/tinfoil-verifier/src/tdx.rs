@@ -1,7 +1,12 @@
 //! TDX attestation verification using the `dcap-qvl` crate.
 //!
-//! Quote V4 parsing, Intel PCS collateral fetching, and signature/TCB
-//! verification are all delegated to [`dcap_qvl`]. This module is a thin
+//! Quote V4 parsing and signature/TCB verification are delegated to
+//! [`dcap_qvl`]. We carry our own Intel PCS collateral fetcher (see
+//! [`fetch_and_build_entry`]) rather than enabling dcap-qvl's `report`
+//! feature, which pulls in `reqwest` hardcoded to `rustls-tls` and
+//! transitively forces `ring` into the workspace — breaking our
+//! deterministic Nix release pipeline. Verification itself still goes
+//! through `dcap_qvl::verify::rustcrypto::verify`. This module is a thin
 //! adapter that maps dcap-qvl's APIs onto our error type and adds a
 //! per-client cache of fetched collateral keyed by `(fmspc, ca)`.
 //!
@@ -31,11 +36,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::DateTime;
 use dcap_qvl::QuoteCollateralV3;
-use dcap_qvl::collateral::get_collateral_from_pcs;
 use dcap_qvl::quote::Quote;
 use dcap_qvl::tcb_info::TcbStatus;
 use dcap_qvl::verify::rustcrypto::verify as dcap_verify;
+use der::Decode as DerDecode;
 use serde::Deserialize;
+use x509_cert::Certificate;
+use x509_cert::ext::pkix::CrlDistributionPoints;
+use x509_cert::ext::pkix::name::{DistributionPointName, GeneralName};
 
 use crate::Error;
 
@@ -285,9 +293,14 @@ impl TcbPolicy {
 
 /// Per-client cache of TDX collateral fetched from Intel PCS, keyed by
 /// `(fmspc, ca)`. See the module-level docs for the cache state machine.
-#[derive(Default)]
 pub struct CollateralCache {
     slots: Mutex<HashMap<CacheKey, Arc<Slot>>>,
+    /// TLS root store used to validate Intel PCS' cert when the cache
+    /// fetches or refreshes collateral. Intel PCS uses a public WebPKI
+    /// cert, so callers populate this with the same root store they use
+    /// for the rest of the verifier (`webpki-roots` for the in-enclave
+    /// server, `rustls-native-certs` for the CLI / macOS app).
+    tls_roots: Arc<rustls::RootCertStore>,
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
@@ -323,8 +336,11 @@ struct SlotEntry {
 }
 
 impl CollateralCache {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(tls_roots: Arc<rustls::RootCertStore>) -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+            tls_roots,
+        }
     }
 
     /// Return cached collateral for `raw_quote`, fetching from Intel PCS if
@@ -406,7 +422,7 @@ impl CollateralCache {
             return Ok(entry.collateral);
         }
 
-        let entry = fetch_and_build_entry(raw_quote).await?;
+        let entry = fetch_and_build_entry(raw_quote, &self.tls_roots).await?;
         let collateral = entry.collateral.clone();
         *slot.state.lock().expect("collateral slot mutex poisoned") = Some(entry);
         tracing::debug!(
@@ -422,6 +438,7 @@ impl CollateralCache {
     /// failure but never propagates errors — the previous entry stays in
     /// place on failure and the next caller will try again.
     fn spawn_background_refresh(&self, key: CacheKey, slot: Arc<Slot>, raw_quote: Vec<u8>) {
+        let tls_roots = self.tls_roots.clone();
         tokio::spawn(async move {
             let Ok(_guard) = slot.fetch_lock.try_lock() else {
                 tracing::trace!(
@@ -431,7 +448,7 @@ impl CollateralCache {
                 );
                 return;
             };
-            match fetch_and_build_entry(&raw_quote).await {
+            match fetch_and_build_entry(&raw_quote, &tls_roots).await {
                 Ok(entry) => {
                     *slot.state.lock().expect("collateral slot mutex poisoned") = Some(entry);
                     tracing::debug!(
@@ -454,24 +471,181 @@ impl CollateralCache {
     }
 }
 
-async fn fetch_and_build_entry(raw_quote: &[u8]) -> Result<SlotEntry, Error> {
-    // dcap-qvl builds its own reqwest client internally; we accept that
-    // cost (one client per refresh, ~hourly per FMSPC in steady state) in
-    // exchange for not maintaining a parallel impl of collateral fetching.
-    let mut collateral = get_collateral_from_pcs(raw_quote)
-        .await
-        .map_err(|e| Error::Tdx(format!("failed to fetch collateral from Intel PCS: {e}")))?;
+/// Intel's official PCS (Provisioning Certification Service) base URL.
+const INTEL_PCS_URL: &str = "https://api.trustedservices.intel.com";
 
-    // Drop the per-CPU PCK certificate chain that `get_collateral_from_pcs`
-    // attaches from the *first* quote that populated this slot. PCK certs
-    // are per-chip, so reusing one CPU's chain to verify a different CPU's
-    // quote on the same FMSPC would make `dcap_verify` reject the QE
-    // report signature (it prefers `collateral.pck_certificate_chain` over
-    // the chain embedded in the quote when the field is set; see
-    // dcap-qvl's `verify_pck_cert_chain`). Setting it to `None` forces
-    // dcap-qvl to fall back to each quote's own embedded chain, which is
-    // exactly what we want for an FMSPC-scoped cache.
-    collateral.pck_certificate_chain = None;
+/// JSON envelope returned by Intel PCS' `tcb` endpoint.
+#[derive(Deserialize)]
+struct TcbInfoResponse {
+    #[serde(rename = "tcbInfo")]
+    tcb_info: serde_json::Value,
+    signature: String,
+}
+
+/// JSON envelope returned by Intel PCS' `qe/identity` endpoint.
+#[derive(Deserialize)]
+struct QeIdentityResponse {
+    #[serde(rename = "enclaveIdentity")]
+    enclave_identity: serde_json::Value,
+    signature: String,
+}
+
+/// Fetch a fresh collateral set for `raw_quote` from Intel PCS, parse it,
+/// and stamp it with cache freshness metadata.
+///
+/// We deliberately do not depend on dcap-qvl's `report` feature for this:
+/// see the crate-level note in `Cargo.toml`. The endpoints, header names,
+/// and response shapes here mirror dcap-qvl's `collateral.rs` exactly so
+/// that the resulting `QuoteCollateralV3` round-trips through
+/// `dcap_qvl::verify::rustcrypto::verify` byte-for-byte the same way as
+/// the upstream fetcher would have produced.
+///
+/// We never populate `pck_certificate_chain`: PCK certs are per-chip, and
+/// `dcap_verify` prefers `collateral.pck_certificate_chain` over the chain
+/// embedded in each individual quote when the field is set. Leaving it
+/// `None` forces dcap-qvl to fall back to each quote's own embedded chain,
+/// which is exactly what we want for an FMSPC-scoped cache.
+///
+/// A fresh reqwest client is built per fetch (mirrors `sevsnp_crl`'s
+/// pattern). In steady state this is one client per FMSPC per refresh
+/// cycle (~hourly), so the allocation is negligible.
+async fn fetch_and_build_entry(
+    raw_quote: &[u8],
+    tls_roots: &Arc<rustls::RootCertStore>,
+) -> Result<SlotEntry, Error> {
+    // Pull FMSPC and CA out of the quote's embedded PCK chain. The Tinfoil
+    // enclave only emits cert_type 5 quotes, so `Quote::raw_cert_chain` —
+    // which `fmspc()` and `ca()` both call — succeeds.
+    let quote = Quote::parse(raw_quote)
+        .map_err(|e| Error::Tdx(format!("failed to parse TDX quote: {e}")))?;
+    let fmspc = quote
+        .fmspc()
+        .map_err(|e| Error::Tdx(format!("failed to extract FMSPC: {e}")))?;
+    let ca = quote
+        .ca()
+        .map_err(|e| Error::Tdx(format!("failed to extract CA type: {e}")))?;
+    let fmspc_hex = hex::encode_upper(fmspc);
+
+    let client = build_pcs_client(tls_roots)?;
+
+    let pck_crl_url = format!("{INTEL_PCS_URL}/sgx/certification/v4/pckcrl?ca={ca}&encoding=der");
+    let tcb_url = format!("{INTEL_PCS_URL}/tdx/certification/v4/tcb?fmspc={fmspc_hex}");
+    let qe_identity_url =
+        format!("{INTEL_PCS_URL}/tdx/certification/v4/qe/identity?update=standard");
+
+    // Fan out the three independent endpoint fetches. The root CA CRL
+    // can't join this batch — its URL is extracted from the QE identity
+    // issuer chain — so it stays sequential after the join.
+    //
+    // PCK CRL body is DER, the issuer chain comes back in a header. TCB
+    // info and QE identity are JSON envelopes (`{tcbInfo|enclaveIdentity,
+    // signature}`) with their issuer chains also in headers. Intel has
+    // historically used both `SGX-TCB-Info-Issuer-Chain` and
+    // `TCB-Info-Issuer-Chain` for the TCB endpoint; accept either.
+    let pck_crl_fetch = async {
+        let resp = client
+            .get(&pck_crl_url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| Error::Tdx(format!("failed to fetch PCK CRL from {pck_crl_url}: {e}")))?;
+        let chain = get_url_decoded_header(&resp, "SGX-PCK-CRL-Issuer-Chain")?;
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Tdx(format!("failed to read PCK CRL body: {e}")))?
+            .to_vec();
+        Ok::<_, Error>((body, chain))
+    };
+
+    let tcb_fetch = async {
+        let resp = client
+            .get(&tcb_url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| Error::Tdx(format!("failed to fetch TCB info from {tcb_url}: {e}")))?;
+        let chain = get_url_decoded_header(&resp, "SGX-TCB-Info-Issuer-Chain")
+            .or_else(|_| get_url_decoded_header(&resp, "TCB-Info-Issuer-Chain"))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| Error::Tdx(format!("failed to read TCB info body: {e}")))?;
+        Ok::<_, Error>((body, chain))
+    };
+
+    let qe_identity_fetch = async {
+        let resp = client
+            .get(&qe_identity_url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| {
+                Error::Tdx(format!(
+                    "failed to fetch QE identity from {qe_identity_url}: {e}"
+                ))
+            })?;
+        let chain = get_url_decoded_header(&resp, "SGX-Enclave-Identity-Issuer-Chain")?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| Error::Tdx(format!("failed to read QE identity body: {e}")))?;
+        Ok::<_, Error>((body, chain))
+    };
+
+    let (
+        (pck_crl, pck_crl_issuer_chain),
+        (raw_tcb_info, tcb_info_issuer_chain),
+        (raw_qe_identity, qe_identity_issuer_chain),
+    ) = tokio::try_join!(pck_crl_fetch, tcb_fetch, qe_identity_fetch)?;
+
+    // Root CA CRL: Intel PCS does not serve `rootcacrl` directly, so we
+    // mirror dcap-qvl's PCS code path: extract the CRL distribution point
+    // URL from the root cert at the end of the QE identity issuer chain
+    // and fetch it from there.
+    let root_ca_crl = {
+        let root_der = last_cert_in_pem_chain(&qe_identity_issuer_chain)?;
+        let crl_url = extract_crl_url(&root_der)?
+            .ok_or_else(|| Error::Tdx("root cert has no CRL distribution point".to_string()))?;
+        let resp = client
+            .get(&crl_url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| Error::Tdx(format!("failed to fetch root CA CRL from {crl_url}: {e}")))?;
+        resp.bytes()
+            .await
+            .map_err(|e| Error::Tdx(format!("failed to read root CA CRL body: {e}")))?
+            .to_vec()
+    };
+
+    // Parse the TCB info / QE identity JSON envelopes. The `signature`
+    // fields are hex-encoded; the canonical inner JSON object is what
+    // dcap-qvl re-serializes for signature verification.
+    let tcb_info_resp: TcbInfoResponse = serde_json::from_str(&raw_tcb_info)
+        .map_err(|e| Error::Tdx(format!("TCB info is not valid JSON: {e}")))?;
+    let tcb_info = tcb_info_resp.tcb_info.to_string();
+    let tcb_info_signature = hex::decode(&tcb_info_resp.signature)
+        .map_err(|e| Error::Tdx(format!("TCB info signature is not valid hex: {e}")))?;
+
+    let qe_identity_resp: QeIdentityResponse = serde_json::from_str(&raw_qe_identity)
+        .map_err(|e| Error::Tdx(format!("QE identity is not valid JSON: {e}")))?;
+    let qe_identity = qe_identity_resp.enclave_identity.to_string();
+    let qe_identity_signature = hex::decode(&qe_identity_resp.signature)
+        .map_err(|e| Error::Tdx(format!("QE identity signature is not valid hex: {e}")))?;
+
+    let collateral = QuoteCollateralV3 {
+        pck_crl_issuer_chain,
+        root_ca_crl,
+        pck_crl,
+        tcb_info_issuer_chain,
+        tcb_info,
+        tcb_info_signature,
+        qe_identity_issuer_chain,
+        qe_identity,
+        qe_identity_signature,
+        pck_certificate_chain: None,
+    };
 
     let now = unix_now()?;
     let hard_expiry = compute_hard_expiry(&collateral, now);
@@ -480,6 +654,86 @@ async fn fetch_and_build_entry(raw_quote: &[u8]) -> Result<SlotEntry, Error> {
         fetched_at: now,
         hard_expiry,
     })
+}
+
+/// Build a fresh reqwest client wired to the verifier's TLS roots, with
+/// timeouts matched to dcap-qvl's old PCS client (3-minute total budget,
+/// 10-second connect). Intel PCS is generally fast but occasionally
+/// stalls; the budget is generous enough to ride that out without
+/// wedging the calling task forever.
+fn build_pcs_client(tls_roots: &Arc<rustls::RootCertStore>) -> Result<reqwest::Client, Error> {
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates((**tls_roots).clone())
+        .with_no_client_auth();
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(180))
+        .use_preconfigured_tls(tls_config)
+        .build()
+        .map_err(|e| Error::Tdx(format!("failed to build Intel PCS HTTP client: {e}")))
+}
+
+/// Fetch a header by name and percent-decode it. Intel PCS percent-encodes
+/// PEM newlines (`%0A`) in the issuer-chain headers; dcap-qvl decodes
+/// them before storing the chain, and we have to do the same so the bytes
+/// we hand back match what `dcap_verify` expects.
+fn get_url_decoded_header(resp: &reqwest::Response, name: &str) -> Result<String, Error> {
+    let value = resp
+        .headers()
+        .get(name)
+        .ok_or_else(|| Error::Tdx(format!("Intel PCS response missing {name} header")))?
+        .to_str()
+        .map_err(|e| Error::Tdx(format!("Intel PCS {name} header is not valid UTF-8: {e}")))?;
+    let decoded = urlencoding::decode(value).map_err(|e| {
+        Error::Tdx(format!(
+            "Intel PCS {name} header is not valid percent-encoding: {e}"
+        ))
+    })?;
+    Ok(decoded.into_owned())
+}
+
+/// Return the DER bytes of the last certificate in a PEM chain. Intel
+/// PCS issuer-chain headers are leaf-first, so the last entry is the
+/// root CA whose CRL distribution point we want.
+fn last_cert_in_pem_chain(pem_chain: &str) -> Result<Vec<u8>, Error> {
+    let pems = pem::parse_many(pem_chain.as_bytes())
+        .map_err(|e| Error::Tdx(format!("failed to parse PEM chain: {e}")))?;
+    let last = pems
+        .into_iter()
+        .rfind(|p| p.tag() == "CERTIFICATE")
+        .ok_or_else(|| Error::Tdx("PEM chain contains no certificates".to_string()))?;
+    Ok(last.into_contents())
+}
+
+/// Extract the first URI from a certificate's CRL Distribution Points
+/// extension (OID 2.5.29.31). Returns `Ok(None)` when the extension is
+/// absent or contains no URI; returns `Err` only on parse errors.
+fn extract_crl_url(cert_der: &[u8]) -> Result<Option<String>, Error> {
+    let cert = Certificate::from_der(cert_der)
+        .map_err(|e| Error::Tdx(format!("failed to parse root certificate DER: {e}")))?;
+    let Some(extensions) = &cert.tbs_certificate.extensions else {
+        return Ok(None);
+    };
+    for ext in extensions.iter() {
+        if ext.extn_id.to_string() != "2.5.29.31" {
+            continue;
+        }
+        let crl_dist_points = CrlDistributionPoints::from_der(ext.extn_value.as_bytes())
+            .map_err(|e| Error::Tdx(format!("failed to parse CRL distribution points: {e}")))?;
+        for dist_point in crl_dist_points.0.iter() {
+            let Some(DistributionPointName::FullName(general_names)) =
+                &dist_point.distribution_point
+            else {
+                continue;
+            };
+            for general_name in general_names.iter() {
+                if let GeneralName::UniformResourceIdentifier(uri) = general_name {
+                    return Ok(Some(uri.to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn quote_cache_key(raw_quote: &[u8]) -> Result<CacheKey, Error> {

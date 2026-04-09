@@ -121,7 +121,7 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         trusted_ark_der,
         trusted_ask_der,
         atc_fallback,
-        tdx_collateral_cache: tdx::CollateralCache::new(),
+        tdx_collateral_cache: tdx::CollateralCache::new(tls_roots.clone()),
         tdx_policy,
         tdx_observer,
         snp_policy,
