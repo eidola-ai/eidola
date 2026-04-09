@@ -1,12 +1,12 @@
 {
   "artifacts": {
     "eidola-cli": {
-      "digest": "sha256:d4d8d417aa48cbc81cda495af3683826e55516f4e08bf7463f45fa52fe59cb09",
+      "digest": "sha256:006b6c61026e888416aeccd5eb2530cbceb74009567afa7134d381e380e1b0d3",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
-      "narHash": "sha256-rZ9vT3uRoo75+l2A5yOTNVAS37rGY3qoNyvyLVQ+sgs=",
+      "narHash": "sha256-vYhYJ49kK1dUQmcJL4Wp0CVoLVx+WgX3BYWMcNrqX7c=",
       "platform": "darwin/universal",
       "type": "nix"
     },
@@ -21,17 +21,17 @@
       "type": "oci"
     },
     "eidola-server": {
-      "digest": "sha256:679f90b0af47d799a42d71dde9487be34eba554690befe55027aa608bc2333b0",
+      "digest": "sha256:0f6121528a83db2b564ee80182a1401120cb9eaaaa619f081297174167034479",
       "platform": "linux/amd64",
       "type": "oci"
     }
   },
   "enclave": {
-    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=7b2d41b59fad31900e72e6b8f34a1291c8d6f7950e8cdc4f4b5fe16f040fa7ba",
-    "snp_measurement": "fa0fde96f39558a7e1d413069310d4793e9b17617c5eed69dd2d3d0d193c968f892d68a2cadc5f3a4249916f5afdde42",
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=6d25d97ecbdf02376c9587f224a3e286bb2795ca2d855a1c40baefd76d27aa6d",
+    "snp_measurement": "7398485d6cb3f759b6a6927bae228ebef21af70a18e6e5c8279655fe768e0bc276b6d63f1a219f48ec0ca354fd72dde9",
     "tdx_measurement": {
       "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-      "rtmr2": "6ebeb792902058bcd1b176b7188db5fc83676a20de83b80820a839f5a0b4e28b5e461cb16531019c31b56248f1ad429e"
+      "rtmr2": "9944fe86a17fb6e074bbfc9320bba29da11f29758db7eeb11791d575d06453a7757ec89b1875418d02a9cbe42d17be8c"
     }
   },
   "version": 1
