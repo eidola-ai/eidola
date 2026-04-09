@@ -389,6 +389,13 @@ pub async fn ensure_keys(
     }
 
     // Load all valid keys from DB into cache and find the current one.
+    // Re-capture `now` here: the outer `now` was taken before the
+    // provisioning round-trips, and on a high-latency database link the
+    // freshly-inserted key's `issue_from` (captured inside the insert
+    // closure) can be strictly after the outer `now`, which would make
+    // the key look like a future key and trip the "no current issuer
+    // key found" error below.
+    let now = SystemTime::now();
     let rows = db::get_valid_issuer_keys(pool).await?;
     let mut cache = key_cache.write().await;
     let mut current_hash = None;
@@ -448,6 +455,16 @@ pub fn spawn_key_rotation_task(
             let jitter_secs = OsRng.next_u64() % KEY_CHECK_JITTER.as_secs();
             let sleep_dur = KEY_CHECK_INTERVAL + Duration::from_secs(jitter_secs);
             tokio::time::sleep(sleep_dur).await;
+
+            // Re-verify clock agreement before each rotation iteration.
+            // Drift can develop during a long process lifetime (NTP
+            // hiccups, hypervisor migration, etc.); skipping the
+            // iteration is safer than provisioning a key with a bogus
+            // issuance window. The next iteration will retry.
+            if let Err(e) = db::check_clock_skew(&pool, db::MAX_CLOCK_SKEW).await {
+                warn!("skipping key rotation iteration: {}", e);
+                continue;
+            }
 
             match ensure_keys(&key_cache, &master_key, &pool, &epoch_config).await {
                 Ok(key_hash) => {

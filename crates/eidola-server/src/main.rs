@@ -297,6 +297,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         epoch_config,
     );
 
+    // Verify that this server's clock agrees with the database clock
+    // before doing anything that writes time-anchored state. A skewed
+    // node would otherwise create issuer keys with bogus issuance
+    // windows that other (correctly-clocked) nodes would never
+    // produce, polluting shared state.
+    eidola_server::db::check_clock_skew(&state.db_pool, eidola_server::db::MAX_CLOCK_SKEW)
+        .await
+        .map_err(|e| {
+            error!("Database clock skew check failed: {}", e);
+            e.to_string()
+        })?;
+
     // Provision issuer keys on boot and start periodic rotation task.
     match credentials::ensure_keys(
         &state.credential_key_cache,
@@ -316,6 +328,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state.db_pool.clone(),
         state.epoch_config.clone(),
     );
+
+    // Keep the database connection pool warm and prevent serverless Postgres
+    // (e.g. Neon) from autosuspending the compute during quiet periods.
+    eidola_server::db::spawn_keepalive(state.db_pool.clone(), std::time::Duration::from_secs(60));
 
     // Build the router with OpenAPI integration
     let (router, api) = eidola_server::build_router()

@@ -87,6 +87,11 @@ struct StripeEvent {
     id: String,
     #[serde(rename = "type")]
     event_type: String,
+    /// Unix timestamp (seconds) Stripe stamped on the event when it was
+    /// created. Used to anchor any "X seconds from the event" expiry
+    /// calculations so the resulting timestamp is a deterministic function
+    /// of the event itself, independent of when our handler runs.
+    created: i64,
     data: StripeEventData,
 }
 
@@ -299,7 +304,13 @@ async fn handle_checkout_completed(
         }
     };
 
-    let expires_at = SystemTime::now() + Duration::from_secs(365 * 24 * 3600);
+    // Anchor the 1-year expiry to the Stripe event's `created` timestamp
+    // rather than wall-clock at handler time. This makes `expires_at` a
+    // deterministic function of the event (idempotent across redeliveries
+    // and consistent with what the customer's receipt implies) and matches
+    // the pattern used by `handle_invoice_paid` for subscription renewals.
+    let event_time = UNIX_EPOCH + Duration::from_secs(event.created.max(0) as u64);
+    let expires_at = event_time + Duration::from_secs(365 * 24 * 3600);
 
     match db::insert_credit_ledger(
         pool,
@@ -788,6 +799,7 @@ mod tests {
         StripeEvent {
             id: id.to_string(),
             event_type: event_type.to_string(),
+            created: now_secs() as i64,
             data: StripeEventData { object },
         }
     }

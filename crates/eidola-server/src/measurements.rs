@@ -17,7 +17,26 @@ use tinfoil_verifier::{EnclaveMeasurement, TdxMeasurement};
 
 pub static ALLOWED: LazyLock<Vec<EnclaveMeasurement>> = LazyLock::new(|| {
     vec![
-        // === CURRENT: v0.0.82 ===
+        // === CURRENT: v0.0.83 ===
+        // Built: 2026-04-03T16:16:04Z
+        // Artifact digest: sha256:9fab386e3e45627721d5303421e28bb66689780cf7ed477e7e22b26f5ff689b4
+        // Rekor log index: 1260499310
+        // Sigstore: https://search.sigstore.dev/?logIndex=1260499310
+        // GitHub: https://github.com/tinfoilsh/confidential-model-router/releases/tag/v0.0.83
+        EnclaveMeasurement {
+            snp_measurement:
+                "85fc3906b3e2bd2d10e4b3411016c13aec03ebe2e2777159e9abdc46f24d4e47146c92664971d0a38ffdae8276ba80bf"
+                    .into(),
+            tdx_measurement: TdxMeasurement {
+                rtmr1:
+                    "4f7be53273f4ed3114e7578574f98eec533d5a18484e4e8a5feef1672b4a94e17646e7ab9e1f3c722faea496bac4dc8d"
+                        .into(),
+                rtmr2:
+                    "e6bccb0314f2bd5db061625eab7fb0948baabdc2a795cb3503a93394de309d266485364c829cf811470c5c248e93fc56"
+                        .into(),
+            },
+        },
+        // === PREVIOUS: v0.0.82 ===
         // Built: 2026-04-03T16:16:04Z
         // Artifact digest: sha256:27e255a1834aee11feca4f13c86625dafb0b98f8395ffff4baf60e93005e704c
         // Rekor log index: 1258002931
@@ -33,25 +52,6 @@ pub static ALLOWED: LazyLock<Vec<EnclaveMeasurement>> = LazyLock::new(|| {
                         .into(),
                 rtmr2:
                     "3101fac8a5c95de61b6e6fe1647957374c3422f20da685086d0d71f510991f698dc80eeb4aeb2871b754d938f271a725"
-                        .into(),
-            },
-        },
-        // === PREVIOUS: v0.0.81 ===
-        // Built: 2026-04-03T16:16:04Z
-        // Artifact digest: sha256:c0275a148227e6efddf5bfc61052c188ae0bac984bf70e3f4cd75ef7c943203a
-        // Rekor log index: 1230171568
-        // Sigstore: https://search.sigstore.dev/?logIndex=1230171568
-        // GitHub: https://github.com/tinfoilsh/confidential-model-router/releases/tag/v0.0.81
-        EnclaveMeasurement {
-            snp_measurement:
-                "d6848e43be21b268536059930c717abb7004279e860cbbb8f88be8a48d250d972276d936c0896bd157984bbec77d4919"
-                    .into(),
-            tdx_measurement: TdxMeasurement {
-                rtmr1:
-                    "4f7be53273f4ed3114e7578574f98eec533d5a18484e4e8a5feef1672b4a94e17646e7ab9e1f3c722faea496bac4dc8d"
-                        .into(),
-                rtmr2:
-                    "34cd93a0c2ea0629323c09145636a25a0ac1ead868ff9337e315fb3ce846763eb5c5c97a4927c34b24bb513e8f74db70"
                         .into(),
             },
         },

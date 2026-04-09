@@ -36,8 +36,12 @@ pub fn create_pool(
         pg_config.password(database_password);
     }
 
+    // `Verified` issues a cheap liveness check before handing a connection
+    // out of the pool. This costs one extra round-trip per checkout but is
+    // required when the upstream is a serverless Postgres (e.g. Neon) whose
+    // compute can autosuspend and silently kill long-lived sockets.
     let manager_config = ManagerConfig {
-        recycling_method: RecyclingMethod::Fast,
+        recycling_method: RecyclingMethod::Verified,
     };
     let manager = match pg_config.get_ssl_mode() {
         SslMode::Disable => Manager::from_config(pg_config, NoTls, manager_config),
@@ -81,6 +85,105 @@ fn build_tls_config(database_ssl_cert: Option<&str>) -> Result<rustls::ClientCon
     Ok(rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth())
+}
+
+/// Maximum tolerated clock skew between this server and the database.
+/// Anything beyond this is treated as a misconfigured time source and
+/// causes time-sensitive operations to fail closed.
+pub const MAX_CLOCK_SKEW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Verify that this server's wall clock and the database's wall clock
+/// agree to within `max_skew`. Returns the measured absolute drift on
+/// success. Errors if the query fails or the drift exceeds `max_skew`.
+///
+/// The check brackets `SELECT clock_timestamp()` between two
+/// `SystemTime::now()` reads on the server and compares the database
+/// time against the *midpoint* of the bracket. This bounds the noise
+/// contributed by network latency to RTT/2, which is several orders
+/// of magnitude below any reasonable skew threshold even on
+/// transcontinental links.
+///
+/// Use this as a precondition for any code path that writes
+/// time-anchored state derived from the server's clock (e.g.,
+/// issuer key rotation). Per-request code paths that only consume
+/// already-stored validity windows do not need to call this.
+pub async fn check_clock_skew(
+    pool: &Pool,
+    max_skew: std::time::Duration,
+) -> Result<std::time::Duration, ServerError> {
+    use crate::telemetry::metrics;
+
+    let client = pool.get().await.map_err(|e| {
+        metrics::DB_CLOCK_SKEW_CHECK_FAILURES
+            .add(1, &[opentelemetry::KeyValue::new("reason", "pool")]);
+        ServerError::Internal(format!("db pool error: {e:?}"))
+    })?;
+
+    let t1 = SystemTime::now();
+    let row = client
+        .query_one("SELECT clock_timestamp()", &[])
+        .await
+        .map_err(|e| {
+            metrics::DB_CLOCK_SKEW_CHECK_FAILURES
+                .add(1, &[opentelemetry::KeyValue::new("reason", "query")]);
+            ServerError::Internal(format!("clock skew query failed: {e:?}"))
+        })?;
+    let t2 = SystemTime::now();
+
+    let db_time: SystemTime = row.get(0);
+    let half_rtt = t2.duration_since(t1).unwrap_or_default() / 2;
+    let server_mid = t1 + half_rtt;
+
+    // Compute the signed drift (positive = db ahead) for the gauge,
+    // and the unsigned magnitude for the threshold comparison.
+    let (drift, signed_secs, direction) = match db_time.duration_since(server_mid) {
+        Ok(d) => (d, d.as_secs_f64(), "ahead of"),
+        Err(e) => {
+            let d = e.duration();
+            (d, -d.as_secs_f64(), "behind")
+        }
+    };
+
+    metrics::DB_CLOCK_SKEW_SECONDS.record(signed_secs, &[]);
+
+    if drift > max_skew {
+        metrics::DB_CLOCK_SKEW_CHECK_FAILURES
+            .add(1, &[opentelemetry::KeyValue::new("reason", "exceeded")]);
+        return Err(ServerError::Internal(format!(
+            "database clock is {direction} server by {drift:?}, \
+             which exceeds the {max_skew:?} maximum tolerated skew. \
+             Check NTP/chrony on this host."
+        )));
+    }
+
+    tracing::debug!("db clock check: {direction} server by {drift:?}");
+    Ok(drift)
+}
+
+/// Spawn a background task that issues `SELECT 1` against the pool on a
+/// fixed interval. This serves two purposes when running against a
+/// serverless Postgres like Neon: it keeps the upstream compute from
+/// autosuspending during quiet periods, and it ensures `deadpool` always
+/// has at least one warm, recently-validated connection so the first
+/// real request after an idle stretch does not pay a cold-start penalty.
+pub fn spawn_keepalive(pool: Pool, interval: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick — startup already touches the pool.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match pool.get().await {
+                Ok(client) => {
+                    if let Err(e) = client.execute("SELECT 1", &[]).await {
+                        tracing::warn!("db keepalive query failed: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("db keepalive pool checkout failed: {e}"),
+            }
+        }
+    });
 }
 
 /// Insert a new account and return its `created_at` timestamp.
