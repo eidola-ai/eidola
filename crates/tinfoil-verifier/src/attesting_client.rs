@@ -83,6 +83,7 @@ pub(crate) struct BuildParams {
     pub tdx_observer: Option<tdx::TdxObserver>,
     pub snp_policy: sevsnp::SevSnpTcbPolicy,
     pub snp_observer: Option<sevsnp::SevSnpObserver>,
+    pub tls_roots: Arc<rustls::RootCertStore>,
 }
 
 pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Client, Error> {
@@ -96,20 +97,20 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         tdx_observer,
         snp_policy,
         snp_observer,
+        tls_roots,
     } = params;
     let host = crate::enclave_host(&inference_base_url);
 
     // Build a rustls config that pins ALPN to http/1.1 so the connection we
     // attest is the same connection hyper will use for the real request. The
-    // root store is the standard WebPKI bundle — Tinfoil's production cert
-    // chains under it. Test deployments using a custom CA (e.g. the tinfoil
-    // shim mock) are expected to install that CA in the system trust store;
-    // we deliberately do not inject the AMD attestation ARK as a TLS root.
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
+    // root store comes from the caller verbatim — we do not consult any
+    // bundled or OS source here. The server (running inside an enclave with
+    // no system trust store) supplies `webpki-roots`; the CLI / macOS app
+    // supply `rustls-native-certs` so developers can install local dev CAs
+    // in their keychain. We deliberately do not inject the AMD attestation
+    // ARK as a TLS root.
     let mut tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .with_root_certificates((*tls_roots).clone())
         .with_no_client_auth();
     tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
@@ -125,7 +126,7 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         tdx_observer,
         snp_policy,
         snp_observer,
-        snp_crl_cache: sevsnp_crl::CrlCache::new(),
+        snp_crl_cache: sevsnp_crl::CrlCache::new(tls_roots),
     });
 
     reqwest::Client::builder()
@@ -364,17 +365,26 @@ impl AttestationCheck {
         // global signed object (no information leak about which chip
         // we are verifying) and a compromised operator could otherwise
         // serve a stale list to silently re-enable a revoked chip.
-        let ark_x509 = x509_cert::Certificate::from_der(&ark_der)
-            .map_err(|e| Error::CertParse(format!("failed to parse ARK DER: {e}")))?;
-        let vcek_serial = sevsnp::cert_serial_from_der(&vcek_der)?;
-        let ask_serial = sevsnp::cert_serial_from_der(&ask_der)?;
-        self.snp_crl_cache
-            .check_revocation(
-                sevsnp_crl::AmdGeneration::Genoa,
-                &ark_x509,
-                &[&vcek_serial, &ask_serial],
-            )
-            .await?;
+        //
+        // The CRL is signed by AMD's real ARK, so this check only makes
+        // sense in production where the chain is rooted in the built-in
+        // Genoa ARK. Test deployments that supply a custom ARK (the
+        // tinfoil shim mock) would always fail CRL signature verification
+        // against their mock ARK and AMD KDS has no revocation entries
+        // for mock chips anyway, so we skip the check entirely there.
+        if self.trusted_ark_der.is_none() {
+            let ark_x509 = x509_cert::Certificate::from_der(&ark_der)
+                .map_err(|e| Error::CertParse(format!("failed to parse ARK DER: {e}")))?;
+            let vcek_serial = sevsnp::cert_serial_from_der(&vcek_der)?;
+            let ask_serial = sevsnp::cert_serial_from_der(&ask_der)?;
+            self.snp_crl_cache
+                .check_revocation(
+                    sevsnp_crl::AmdGeneration::Genoa,
+                    &ark_x509,
+                    &[&vcek_serial, &ask_serial],
+                )
+                .await?;
+        }
 
         // Apply the operator-configured TCB policy. The observer fires
         // *before* we propagate the policy result so consumers see the

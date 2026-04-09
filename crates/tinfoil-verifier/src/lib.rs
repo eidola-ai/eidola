@@ -21,7 +21,8 @@
 //! Tinfoil's ATC service is consulted only as a fallback for elements that
 //! a non-self-contained v3 document is missing (today: the VCEK certificate,
 //! until upstream ships fully self-contained reports). The verifier never
-//! talks to AMD KDS — ATC is the single fallback target.
+//! talks to AMD KDS for the chain itself — ATC is the single fallback target —
+//! though it does fetch AMD KDS CRLs in production mode for revocation checks.
 //!
 //! SEV-SNP verification is delegated to the [`sev`](https://crates.io/crates/sev)
 //! crate. TDX Quote V4 verification is delegated to [`dcap_qvl`].
@@ -30,6 +31,25 @@
 //!
 //! A rustls `CryptoProvider` must be installed before calling [`attesting_client`].
 //! The eidola server does this in `main.rs` via `rustls_rustcrypto::provider()`.
+//!
+//! # TLS root sourcing
+//!
+//! `tinfoil-verifier` is intentionally agnostic about where TLS trust roots
+//! come from. Callers populate [`AttestingClientConfig::tls_roots`] themselves
+//! and the same store is used for the attested inference endpoint, ATC
+//! fallback lookups, and AMD KDS CRL fetches. Each consumer picks the source
+//! that fits its environment:
+//!
+//! - **Server (in enclave):** `webpki-roots`. The server runs `FROM scratch`
+//!   inside an enclave with no system trust store, so it bundles the Mozilla
+//!   list. Tinfoil's production cert and the public services it talks to all
+//!   chain under it.
+//! - **CLI / macOS app:** `rustls-native-certs`. Picks up the developer's OS
+//!   keychain so locally-installed dev CAs (e.g. the tinfoil shim mock's
+//!   `tls-ca.pem`) work without recompilation.
+//!
+//! This crate deliberately does **not** depend on either source so neither
+//! gets dragged into the wrong consumer transitively.
 
 mod attesting_client;
 pub mod bundle;
@@ -54,6 +74,19 @@ pub struct AttestingClientConfig<'a> {
     /// Base URL of the inference endpoint (e.g. `https://inference.tinfoil.sh/v1`).
     /// The `/.well-known/tinfoil-attestation` endpoint is derived from the origin.
     pub inference_base_url: &'a str,
+    /// TLS root store used for **all** outbound HTTPS performed by the
+    /// resulting client: the attested inference endpoint, ATC fallback
+    /// lookups, and AMD KDS CRL fetches. The verifier is intentionally
+    /// agnostic about where these roots come from — the caller decides
+    /// whether to populate the store from `webpki-roots`, the OS keychain
+    /// via `rustls-native-certs`, a custom PEM, or some union. The server
+    /// (running inside an enclave with no system trust store) typically
+    /// uses `webpki-roots`; the CLI and macOS app use `rustls-native-certs`
+    /// so developers can install local dev CAs in their keychain. Custom
+    /// SEV-SNP attestation roots (`trusted_ark_der` / `trusted_ask_der`)
+    /// are deliberately *not* added here; they only feed the SEV-SNP chain
+    /// verifier.
+    pub tls_roots: rustls::RootCertStore,
     /// Optional ATC URL override for **fallback** lookups when the enclave's
     /// own v3 well-known document is missing pieces (today: the VCEK).
     /// Defaults to [`bundle::DEFAULT_ATC_URL`] when `None`. ATC is never
@@ -135,10 +168,12 @@ pub struct AttestingClientConfig<'a> {
 /// after construction and treat its outcome as the readiness check.
 pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwest::Client, Error> {
     let host = enclave_host(config.inference_base_url);
+    let tls_roots = std::sync::Arc::new(config.tls_roots);
     let atc_fallback = AtcFallback {
         url: config.atc_url.map(str::to_string),
         repo: config.enclave_repo.map(str::to_string),
         enclave_host: host,
+        tls_roots: tls_roots.clone(),
     };
 
     let tdx_policy = match config.tdx_advisory_allowlist {
@@ -160,6 +195,7 @@ pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwe
         tdx_observer: config.tdx_observer,
         snp_policy,
         snp_observer: config.snp_observer,
+        tls_roots,
     })
 }
 
@@ -171,6 +207,8 @@ pub(crate) struct AtcFallback {
     pub url: Option<String>,
     pub repo: Option<String>,
     pub enclave_host: String,
+    /// Shared TLS root store used to validate the ATC endpoint's cert.
+    pub tls_roots: std::sync::Arc<rustls::RootCertStore>,
 }
 
 impl AtcFallback {
@@ -188,7 +226,13 @@ impl AtcFallback {
             "Fetching ATC fallback VCEK from {display_url} (enclave={}, repo={repo})",
             self.enclave_host
         );
-        let bundle = bundle::fetch_bundle(self.url.as_deref(), &self.enclave_host, repo).await?;
+        let bundle = bundle::fetch_bundle(
+            self.url.as_deref(),
+            &self.enclave_host,
+            repo,
+            &self.tls_roots,
+        )
+        .await?;
         sevsnp::decode_base64(&bundle.vcek)
     }
 }

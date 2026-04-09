@@ -105,12 +105,14 @@ pub async fn fetch_bundle(
     atc_url: Option<&str>,
     enclave_url: &str,
     repo: &str,
+    tls_roots: &rustls::RootCertStore,
 ) -> Result<AttestationBundle, Error> {
     let url = atc_url.unwrap_or(DEFAULT_ATC_URL);
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // Cloning the store is cheap-ish (a Vec of trust anchors). The verifier
+    // is the only caller and reuses the same store across all of its
+    // outbound HTTPS, so the clone happens at most a few times per process.
     let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .with_root_certificates(tls_roots.clone())
         .with_no_client_auth();
 
     let client = reqwest::Client::builder()

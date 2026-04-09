@@ -40,9 +40,12 @@ rsa = "0.9"
 # HTTP client for fetching attestation bundle
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 
-# TLS verification
+# TLS verification. Trust roots are supplied by the caller via
+# `AttestingClientConfig::tls_roots` — the verifier intentionally does not
+# bundle `webpki-roots` or `rustls-native-certs` so each consumer (server in
+# enclave, CLI on developer machine, etc.) can pick the source that fits its
+# environment without dragging the wrong dep into the others.
 rustls = { version = "0.23", default-features = false, features = ["std"] }
-webpki-roots = "1"
 
 # Connector layer plumbing for the per-handshake attesting client.
 # `tower` gives us Layer/Service traits; `hyper` and `hyper-util` give us the
@@ -83,3 +86,7 @@ tracing = "0.1"
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 rustls = { version = "0.23", features = ["ring"] }
+# Live integration tests pull in WebPKI roots so they can talk to
+# inference.tinfoil.sh / ATC. Production callers (eidola-server) bring their
+# own.
+webpki-roots = "1"

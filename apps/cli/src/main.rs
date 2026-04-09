@@ -285,17 +285,32 @@ fn now_iso() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
+/// Load the OS trust store into a fresh `RootCertStore`. Used for both the
+/// non-attesting and attesting code paths so the developer's local dev CA
+/// (e.g. the tinfoil shim mock's `tls-ca.pem`, installed in the keychain)
+/// is honored everywhere the CLI talks to a server.
+fn load_native_root_store() -> rustls::RootCertStore {
+    let mut store = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        eprintln!(
+            "warning: rustls_native_certs reported errors loading the system trust store: {:?}",
+            native.errors,
+        );
+    }
+    for cert in native.certs {
+        let _ = store.add(cert);
+    }
+    store
+}
+
 /// Build a reqwest client. When `trusted_measurements` is configured, the
 /// client verifies Tinfoil enclave attestation on each new TLS connection,
 /// ensuring the server is running expected code inside a TEE.
 async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
     if config.trusted_measurements.is_empty() {
-        let mut root_store = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            let _ = root_store.add(cert);
-        }
         let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
+            .with_root_certificates(load_native_root_store())
             .with_no_client_auth();
         return reqwest::Client::builder()
             .tls_backend_preconfigured(tls_config)
@@ -331,6 +346,7 @@ async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
         tdx_observer: None,
         snp_min_tcb: None,
         snp_observer: None,
+        tls_roots: load_native_root_store(),
     })
     .await
     .map_err(|e| format!("attestation client build failed: {e}"))

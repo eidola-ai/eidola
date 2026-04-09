@@ -83,9 +83,13 @@ impl AmdGeneration {
 
 /// Per-client cache of AMD CRLs keyed by [`AmdGeneration`]. See the
 /// module-level docs for the cache state machine.
-#[derive(Default)]
 pub struct CrlCache {
     slots: Mutex<HashMap<AmdGeneration, Arc<Slot>>>,
+    /// TLS root store used to validate AMD KDS' cert when the cache fetches
+    /// or refreshes a CRL. AMD KDS uses a public WebPKI cert, so the caller
+    /// typically populates this with `webpki-roots` (or whatever superset of
+    /// public roots they have available).
+    tls_roots: Arc<rustls::RootCertStore>,
 }
 
 /// One cache slot. Same shape as `tdx::CollateralCache`'s `Slot`: state
@@ -127,8 +131,11 @@ impl VerifiedCrl {
 }
 
 impl CrlCache {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(tls_roots: Arc<rustls::RootCertStore>) -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+            tls_roots,
+        }
     }
 
     /// Look up the CRL for `generation` and verify that none of the
@@ -221,7 +228,7 @@ impl CrlCache {
             return Ok(entry.crl);
         }
 
-        let entry = fetch_and_build_entry(generation, ark).await?;
+        let entry = fetch_and_build_entry(generation, ark, &self.tls_roots).await?;
         let crl = entry.crl.clone();
         *slot.state.lock().expect("CRL slot mutex poisoned") = Some(entry);
         tracing::debug!(
@@ -238,6 +245,7 @@ impl CrlCache {
         slot: Arc<Slot>,
         ark: Certificate,
     ) {
+        let tls_roots = self.tls_roots.clone();
         tokio::spawn(async move {
             let Ok(_guard) = slot.fetch_lock.try_lock() else {
                 tracing::trace!(
@@ -246,7 +254,7 @@ impl CrlCache {
                 );
                 return;
             };
-            match fetch_and_build_entry(generation, &ark).await {
+            match fetch_and_build_entry(generation, &ark, &tls_roots).await {
                 Ok(entry) => {
                     let revoked_count = entry.crl.revoked_count();
                     *slot.state.lock().expect("CRL slot mutex poisoned") = Some(entry);
@@ -272,6 +280,7 @@ impl CrlCache {
 async fn fetch_and_build_entry(
     generation: AmdGeneration,
     ark: &Certificate,
+    tls_roots: &rustls::RootCertStore,
 ) -> Result<SlotEntry, Error> {
     let url = generation.crl_url();
     tracing::debug!(
@@ -281,12 +290,17 @@ async fn fetch_and_build_entry(
     );
 
     // Each refresh allocates a fresh reqwest client. Same trade-off as
-    // dcap-qvl::collateral::get_collateral_from_pcs: AMD KDS uses public
-    // WebPKI, no custom roots are involved, and refresh frequency is
-    // ~hourly per generation in steady state.
+    // dcap-qvl::collateral::get_collateral_from_pcs: refresh frequency is
+    // ~hourly per generation in steady state. The roots come from the
+    // caller — AMD KDS uses public WebPKI so callers typically supply
+    // `webpki-roots` here.
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(tls_roots.clone())
+        .with_no_client_auth();
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
+        .tls_backend_preconfigured(tls_config)
         .build()
         .map_err(|e| Error::CertChain(format!("failed to build CRL HTTP client: {e}")))?;
 
@@ -452,7 +466,7 @@ mod tests {
 
     #[test]
     fn check_revocation_passes_when_serials_clear() {
-        let cache = CrlCache::new();
+        let cache = CrlCache::new(Arc::new(rustls::RootCertStore::empty()));
         let slot = cache.slot(AmdGeneration::Genoa);
         // Pre-populate the slot with a known empty CRL so the test
         // doesn't hit the network.
@@ -472,7 +486,7 @@ mod tests {
 
     #[test]
     fn check_revocation_rejects_listed_serial() {
-        let cache = CrlCache::new();
+        let cache = CrlCache::new(Arc::new(rustls::RootCertStore::empty()));
         let slot = cache.slot(AmdGeneration::Genoa);
         let mut revoked = HashSet::new();
         revoked.insert(vec![0xab, 0xcd]);

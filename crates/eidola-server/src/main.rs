@@ -242,6 +242,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 )],
             );
         });
+    // The server runs `FROM scratch` inside an enclave with no system trust
+    // store, so trust roots come from the bundled Mozilla list. Tinfoil's
+    // production cert, the ATC service, and AMD KDS all chain under public
+    // WebPKI. We deliberately do not pull in `rustls-native-certs` here.
+    let mut tls_roots = rustls::RootCertStore::empty();
+    tls_roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
     let attesting_client =
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
             allowed_measurements: measurements::ALLOWED.as_slice(),
@@ -254,6 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tdx_observer: Some(tdx_observer),
             snp_min_tcb: None,
             snp_observer: Some(snp_observer),
+            tls_roots,
         })
         .await
         .map_err(|e| {

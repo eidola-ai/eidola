@@ -17,8 +17,11 @@ async fn live_attestation_verification() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
+    let mut webpki = rustls::RootCertStore::empty();
+    webpki.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
     // Fetch the attestation bundle
-    let bundle = tinfoil_verifier::bundle::fetch_bundle(None, LIVE_ENCLAVE, LIVE_REPO)
+    let bundle = tinfoil_verifier::bundle::fetch_bundle(None, LIVE_ENCLAVE, LIVE_REPO, &webpki)
         .await
         .expect("failed to fetch attestation bundle");
 
@@ -66,8 +69,13 @@ async fn live_attesting_client() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
+    // Live tests reach out to inference.tinfoil.sh and ATC, both of which
+    // chain under public WebPKI.
+    let mut webpki = rustls::RootCertStore::empty();
+    webpki.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
     // First, get the current measurement from ATC (we don't hardcode it in tests)
-    let bundle = tinfoil_verifier::bundle::fetch_bundle(None, LIVE_ENCLAVE, LIVE_REPO)
+    let bundle = tinfoil_verifier::bundle::fetch_bundle(None, LIVE_ENCLAVE, LIVE_REPO, &webpki)
         .await
         .expect("failed to fetch attestation bundle");
 
@@ -107,6 +115,7 @@ async fn live_attesting_client() {
         tdx_observer: None,
         snp_min_tcb: None,
         snp_observer: None,
+        tls_roots: webpki,
     })
     .await
     .expect("attesting_client failed");
