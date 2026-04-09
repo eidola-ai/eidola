@@ -1,17 +1,17 @@
 {
   "artifacts": {
     "eidola-cli": {
-      "digest": "sha256:006b6c61026e888416aeccd5eb2530cbceb74009567afa7134d381e380e1b0d3",
+      "digest": "sha256:ed4bb7ccc2e356f1acb96f0a2ae57d5ad3d0e8fad4314e211a709b6dc408e559",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
-      "narHash": "sha256-vYhYJ49kK1dUQmcJL4Wp0CVoLVx+WgX3BYWMcNrqX7c=",
+      "narHash": "sha256-yCv/32bb7EcKmdCiNKD4uoOnLN65eIFVloKnne5EKFQ=",
       "platform": "darwin/universal",
       "type": "nix"
     },
     "eidola-macos-app": {
-      "narHash": "sha256-TzV9vhIFvQao96lOQT+mQqtVwhVCSGG9lEGuacz2wfg=",
+      "narHash": "sha256-pQhkKrvVFo9lT3Ywlo89gZxSAtVaMYFCVIZNSK+gqEg=",
       "platform": "darwin/universal",
       "type": "nix"
     },
@@ -21,17 +21,17 @@
       "type": "oci"
     },
     "eidola-server": {
-      "digest": "sha256:0f6121528a83db2b564ee80182a1401120cb9eaaaa619f081297174167034479",
+      "digest": "sha256:5a0db19389d93aa665c28f6111344d2d612cf5a59bfc1f3fe77df899cc796e90",
       "platform": "linux/amd64",
       "type": "oci"
     }
   },
   "enclave": {
-    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=6d25d97ecbdf02376c9587f224a3e286bb2795ca2d855a1c40baefd76d27aa6d",
-    "snp_measurement": "7398485d6cb3f759b6a6927bae228ebef21af70a18e6e5c8279655fe768e0bc276b6d63f1a219f48ec0ca354fd72dde9",
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=611b6181c64db766273a1f15d89f312296c0c41ce746867ffdec243889dafea4",
+    "snp_measurement": "32fb1a0315eac45f3506db5f937a276cead76236d2bf9c874a07fcb7db1b390fdc2d9603963f73be8f3fd199c008d7a9",
     "tdx_measurement": {
       "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-      "rtmr2": "9944fe86a17fb6e074bbfc9320bba29da11f29758db7eeb11791d575d06453a7757ec89b1875418d02a9cbe42d17be8c"
+      "rtmr2": "90a0a05fc7cf6c46fdf8288a25b1cdeecf064a250263f866350234a2acd76b50246ca998845dbd1a3ea8a57ed0031d67"
     }
   },
   "version": 1

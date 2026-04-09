@@ -282,6 +282,8 @@ pub(crate) fn check_tdx_measurement(
 ///
 /// Used as the `enclaveUrl` parameter in the ATC `POST /attestation` request,
 /// and as the `Host` header in the per-handshake inline attestation request.
+/// IPv6 literals are returned with their surrounding brackets so the result
+/// is a valid HTTP `Host` header value per RFC 7230.
 pub(crate) fn enclave_host(inference_base_url: &str) -> String {
     let after_scheme = match inference_base_url.find("://") {
         Some(scheme_end) => &inference_base_url[scheme_end + 3..],
@@ -289,7 +291,18 @@ pub(crate) fn enclave_host(inference_base_url: &str) -> String {
     };
     let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
     let authority = &after_scheme[..authority_end];
-    // Strip an optional port
+    // IPv6 literals are bracketed in URL authorities (`[::1]` or `[::1]:8443`).
+    // Keep the brackets — they're required in the HTTP `Host` header — and
+    // strip only a port that follows the closing bracket. A bare `rfind(':')`
+    // would corrupt the address by slicing inside the literal.
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some(close) = rest.find(']') {
+            return authority[..close + 2].to_string();
+        }
+        // Malformed (no closing bracket) — fall through and return as-is.
+        return authority.to_string();
+    }
+    // Regular host[:port].
     match authority.rfind(':') {
         Some(colon) => authority[..colon].to_string(),
         None => authority.to_string(),
@@ -315,5 +328,20 @@ mod tests {
             "inference.tinfoil.sh"
         );
         assert_eq!(enclave_host("inference.tinfoil.sh"), "inference.tinfoil.sh");
+    }
+
+    #[test]
+    fn enclave_host_preserves_ipv6_literal() {
+        // Bracketed IPv6 with no port — brackets must survive so the result
+        // is a valid HTTP Host header value.
+        assert_eq!(enclave_host("https://[::1]/v1"), "[::1]");
+        assert_eq!(enclave_host("https://[::1]"), "[::1]");
+        // Bracketed IPv6 with explicit port — port stripped, brackets kept.
+        assert_eq!(enclave_host("https://[::1]:8443/v1"), "[::1]");
+        assert_eq!(
+            enclave_host("https://[2001:db8::1]:443/foo"),
+            "[2001:db8::1]"
+        );
+        assert_eq!(enclave_host("https://[fe80::1%25eth0]"), "[fe80::1%25eth0]");
     }
 }
