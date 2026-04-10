@@ -135,7 +135,7 @@ fn init_otel_providers() -> Option<OtelGuard> {
 /// Centralized metric instruments. Using `opentelemetry::global::meter()` ensures
 /// these are no-ops when OTel is not configured.
 pub mod metrics {
-    use opentelemetry::metrics::{Counter, Histogram};
+    use opentelemetry::metrics::{Counter, Gauge, Histogram};
     use std::sync::LazyLock;
 
     fn meter() -> opentelemetry::metrics::Meter {
@@ -172,6 +172,61 @@ pub mod metrics {
         meter()
             .u64_counter("chat.completion.requests")
             .with_description("Chat completion requests")
+            .build()
+    });
+
+    /// Total TDX attestations observed during outbound enclave handshakes,
+    /// labeled by the merged platform + QE TCB status. Includes
+    /// attestations the verifier ultimately rejects, so the rate of
+    /// non-`up_to_date` observations is the operator-visible signal that
+    /// Intel has published a TCB advisory affecting the upstream fleet.
+    pub static TDX_ATTESTATIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("tinfoil.tdx.attestations")
+            .with_description("TDX attestations observed by the tinfoil verifier")
+            .build()
+    });
+
+    /// Signed clock drift between the server and the database, in
+    /// seconds. Positive values mean the database is ahead of the
+    /// server; negative values mean the server is ahead of the
+    /// database. Updated after every successful `check_clock_skew`
+    /// call (boot + each key rotation iteration). Alert on
+    /// `abs(db.clock.skew.seconds) > 5` for sustained periods to catch
+    /// NTP/chrony failures before they reach the 10s hard threshold.
+    pub static DB_CLOCK_SKEW_SECONDS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+        meter()
+            .f64_gauge("db.clock.skew.seconds")
+            .with_description(
+                "Signed clock drift between server and database (positive = db ahead)",
+            )
+            .with_unit("s")
+            .build()
+    });
+
+    /// Count of failed `check_clock_skew` invocations, labeled by
+    /// `reason`: `pool` (could not check out a connection), `query`
+    /// (the SELECT failed), or `exceeded` (drift exceeded the
+    /// threshold). Any non-zero rate is operator-actionable.
+    pub static DB_CLOCK_SKEW_CHECK_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("db.clock.skew.check.failures")
+            .with_description("Failed database clock skew checks, by reason")
+            .build()
+    });
+
+    /// Total SEV-SNP attestations observed during outbound enclave
+    /// handshakes, labeled by a coarse TCB bucket: `meets_floor`,
+    /// `below_floor`, or `rollback_detected`. Includes attestations the
+    /// verifier ultimately rejects, so a non-zero `below_floor` rate
+    /// signals AMD has published a firmware update we haven't accepted
+    /// yet, and any `rollback_detected` is an immediate red flag (a
+    /// hypervisor is reporting a TCB lower than the firmware has
+    /// committed to).
+    pub static SNP_ATTESTATIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        meter()
+            .u64_counter("tinfoil.snp.attestations")
+            .with_description("SEV-SNP attestations observed by the tinfoil verifier")
             .build()
     });
 }

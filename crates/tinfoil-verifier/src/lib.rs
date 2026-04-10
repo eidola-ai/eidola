@@ -1,8 +1,28 @@
-//! Tinfoil attestation verification with per-connection attesting.
+//! Tinfoil attestation verification with per-handshake attesting.
 //!
-//! Verifies that Tinfoil inference enclaves are running genuine AMD SEV-SNP or
-//! Intel TDX hardware with expected code measurements, then verifies attestation
-//! on each new TLS connection (caching verified fingerprints for reconnections).
+//! Verifies that every new TLS connection to a Tinfoil inference enclave
+//! terminates inside genuine AMD SEV-SNP or Intel TDX hardware running an
+//! allowed code measurement.
+//!
+//! All verification happens in the data-plane connector layer (see
+//! [`attesting_client`]). On every new TCP+TLS handshake the connector
+//! issues an inline HTTP/1.1 attestation request over the *same* stream that
+//! will subsequently carry application traffic, then verifies the response
+//! binds to the peer's TLS public key before yielding the connection back to
+//! hyper. There is no fingerprint cache, so policy changes (TCB floor,
+//! allowed measurements) take effect on the next connection without a
+//! process restart, and there is no separate startup bootstrap path — the
+//! first real request through the returned client is also the first
+//! attestation. Callers that want fail-fast-at-startup semantics can issue
+//! a single trivial request through the client themselves.
+//!
+//! The enclave's self-contained
+//! `/.well-known/tinfoil-attestation?v=3` document is the source of truth.
+//! Tinfoil's ATC service is consulted only as a fallback for elements that
+//! a non-self-contained v3 document is missing (today: the VCEK certificate,
+//! until upstream ships fully self-contained reports). The verifier never
+//! talks to AMD KDS for the chain itself — ATC is the single fallback target —
+//! though it does fetch AMD KDS CRLs in production mode for revocation checks.
 //!
 //! SEV-SNP verification is delegated to the [`sev`](https://crates.io/crates/sev)
 //! crate. TDX Quote V4 verification is delegated to [`dcap_qvl`].
@@ -11,263 +31,281 @@
 //!
 //! A rustls `CryptoProvider` must be installed before calling [`attesting_client`].
 //! The eidola server does this in `main.rs` via `rustls_rustcrypto::provider()`.
+//!
+//! # TLS root sourcing
+//!
+//! `tinfoil-verifier` is intentionally agnostic about where TLS trust roots
+//! come from. Callers populate [`AttestingClientConfig::tls_roots`] themselves
+//! and the same store is used for the attested inference endpoint, ATC
+//! fallback lookups, and AMD KDS CRL fetches. Each consumer picks the source
+//! that fits its environment:
+//!
+//! - **Server (in enclave):** `webpki-roots`. The server runs `FROM scratch`
+//!   inside an enclave with no system trust store, so it bundles the Mozilla
+//!   list. Tinfoil's production cert and the public services it talks to all
+//!   chain under it.
+//! - **CLI / macOS app:** `rustls-native-certs`. Picks up the developer's OS
+//!   keychain so locally-installed dev CAs (e.g. the tinfoil shim mock's
+//!   `tls-ca.pem`) work without recompilation.
+//!
+//! This crate deliberately does **not** depend on either source so neither
+//! gets dragged into the wrong consumer transitively.
 
 mod attesting_client;
 pub mod bundle;
 mod error;
+pub mod measurement;
 pub mod sevsnp;
+pub mod sevsnp_crl;
 pub mod tdx;
 
 pub use bundle::Platform;
 pub use error::Error;
-
-/// Result of a successful attestation verification.
-#[derive(Debug, Clone)]
-pub struct Verification {
-    /// Hex-encoded measurement that matched an allowed value.
-    pub measurement: String,
-    /// Hex-encoded SHA-256 fingerprint of the enclave's TLS public key.
-    pub tls_fingerprint: String,
-}
+pub use measurement::{EnclaveMeasurement, MatchedMeasurement, TdxMeasurement};
+pub use sevsnp::{SevSnpObserver, SevSnpTcbObservation, SevSnpTcbPolicy, SevSnpTcbSvns};
+pub use tdx::{TcbPolicy as TdxTcbPolicy, TdxObserver, TdxTcbObservation, TdxTcbStatus};
 
 /// Configuration for [`attesting_client`].
 pub struct AttestingClientConfig<'a> {
-    /// Hex-encoded allowed measurements.
-    pub allowed_measurements: &'a [&'a str],
+    /// Allowed enclave releases. Each entry pairs a SEV-SNP measurement with a
+    /// TDX measurement; the verifier picks the matching field based on the
+    /// platform observed in the attestation document.
+    pub allowed_measurements: &'a [EnclaveMeasurement],
     /// Base URL of the inference endpoint (e.g. `https://inference.tinfoil.sh/v1`).
     /// The `/.well-known/tinfoil-attestation` endpoint is derived from the origin.
     pub inference_base_url: &'a str,
-    /// Optional ATC URL override for initial bootstrap verification.
+    /// TLS root store used for **all** outbound HTTPS performed by the
+    /// resulting client: the attested inference endpoint, ATC fallback
+    /// lookups, and AMD KDS CRL fetches. The verifier is intentionally
+    /// agnostic about where these roots come from — the caller decides
+    /// whether to populate the store from `webpki-roots`, the OS keychain
+    /// via `rustls-native-certs`, a custom PEM, or some union. The server
+    /// (running inside an enclave with no system trust store) typically
+    /// uses `webpki-roots`; the CLI and macOS app use `rustls-native-certs`
+    /// so developers can install local dev CAs in their keychain. Custom
+    /// SEV-SNP attestation roots (`trusted_ark_der` / `trusted_ask_der`)
+    /// are deliberately *not* added here; they only feed the SEV-SNP chain
+    /// verifier.
+    pub tls_roots: rustls::RootCertStore,
+    /// Optional ATC URL override for **fallback** lookups when the enclave's
+    /// own v3 well-known document is missing pieces (today: the VCEK).
+    /// Defaults to [`bundle::DEFAULT_ATC_URL`] when `None`. ATC is never
+    /// consulted when the well-known document is self-contained.
     pub atc_url: Option<&'a str>,
-    /// Optional custom trusted ARK (Root CA) DER bytes.
-    /// When set, this overrides the built-in AMD Genoa ARK for chain verification
-    /// and is also added as a TLS root certificate for bootstrap connections.
+    /// Source repository to attest against (e.g.
+    /// `tinfoilsh/confidential-model-router`). Used as the `repo` field in
+    /// the ATC `POST /attestation` request body when an ATC fallback lookup
+    /// is required. When `None`, the verifier will fail any handshake whose
+    /// well-known document is not self-contained, since there is no
+    /// fallback target to consult.
+    pub enclave_repo: Option<&'a str>,
+    /// Optional custom trusted ARK (Root CA) DER bytes. Overrides the
+    /// built-in AMD Genoa ARK in the SEV-SNP attestation chain verifier.
+    /// **Not** added to any TLS root store; if you need TLS to trust a
+    /// custom CA (e.g. for the tinfoil shim mock), install the cert in your
+    /// system trust store.
     pub trusted_ark_der: Option<&'a [u8]>,
-    /// Optional custom trusted ASK DER bytes.
+    /// Optional custom trusted ASK DER bytes. Same caveats as
+    /// [`Self::trusted_ark_der`].
     pub trusted_ask_der: Option<&'a [u8]>,
+    /// Optional allowlist of Intel advisory IDs (e.g. `INTEL-SA-00837`)
+    /// the operator has explicitly reviewed and accepted.
+    ///
+    /// When `None` or empty, TDX attestation follows Intel's recommended
+    /// verifier policy: `UpToDate` accepted silently; `*Needed` levels
+    /// accepted with a warning; `OutOfDate*` and `Revoked` rejected.
+    /// When non-empty, an `OutOfDate*` level is also accepted (with a
+    /// warning) iff every advisory ID associated with the matched TCB
+    /// level is contained in the allowlist. Unrelated to SEV-SNP, which
+    /// has its own minimum-firmware floor in
+    /// [`crate::sevsnp::verify_tcb_policy`].
+    pub tdx_advisory_allowlist: Option<&'a [&'a str]>,
+    /// Optional observer fired for every TDX attestation that completes
+    /// signature verification, **including ones the policy rejects**.
+    /// Lets the consuming application record metrics, traces, or alerts
+    /// without `tinfoil-verifier` taking a dependency on a metrics
+    /// framework.
+    ///
+    /// The callback runs synchronously inside the connector layer on the
+    /// TLS handshake hot path, so it must be cheap and non-blocking
+    /// (e.g. an OTel counter increment is fine; HTTP I/O is not).
+    /// Unused on SEV-SNP backends.
+    pub tdx_observer: Option<TdxObserver>,
+    /// Operator-supplied minimum TCB SVNs the SEV-SNP `reported_tcb`
+    /// must satisfy. When `None`, defaults to
+    /// [`SevSnpTcbPolicy::amd_recommended`] (`bootloader >= 0x07`,
+    /// `snp >= 0x0E`, `microcode >= 0x48`, no `tee` floor). The rollback
+    /// check (`reported_tcb >= committed_tcb`) is structural and always
+    /// applied regardless of this setting. Unrelated to TDX, which has
+    /// its own [`Self::tdx_advisory_allowlist`].
+    pub snp_min_tcb: Option<SevSnpTcbPolicy>,
+    /// Optional observer fired for every SEV-SNP attestation that
+    /// completes signature verification, **including ones the policy
+    /// rejects**. Same lifecycle and constraints as
+    /// [`Self::tdx_observer`]. Unused on TDX backends.
+    pub snp_observer: Option<SevSnpObserver>,
 }
 
-/// Build an attesting HTTP client that verifies enclave attestation per-connection.
+/// Build a `reqwest::Client` whose connector verifies enclave attestation on
+/// every new TLS connection.
 ///
-/// 1. Fetches the attestation bundle from ATC for initial bootstrap verification
-/// 2. Verifies VCEK chain, report signature, TCB policy, and measurement
-/// 3. Returns a `reqwest::Client` that verifies attestation on each new TLS
-///    connection, caching verified fingerprints for fast reconnections
+/// The client is ready to use immediately and performs no network I/O during
+/// construction. The first request through it will trigger the connector,
+/// which:
 ///
-/// Unlike static cert pinning, this approach handles load-balanced deployments:
-/// each new connection fetches `/.well-known/tinfoil-attestation` from the
-/// connected instance to verify its attestation before proceeding.
-pub async fn attesting_client(
-    config: AttestingClientConfig<'_>,
-) -> Result<(reqwest::Client, Verification), Error> {
-    let attestation_url = well_known_url(config.inference_base_url);
-    let allowed: Vec<String> = config
-        .allowed_measurements
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    // Determine whether to fetch from ATC or the server's own well-known endpoint.
-    // When a custom root CA is configured (tinfoil shim mock), always fetch directly from
-    // the server — ATC only knows about the production Tinfoil enclave.
-    // Also use direct fetch when atc_url explicitly matches the well-known URL.
-    let use_direct = config.trusted_ark_der.is_some()
-        || config
-            .atc_url
-            .map(|url| url == attestation_url)
-            .unwrap_or(false);
-
-    // Fetch attestation: direct (v3 → v2 fallback) or ATC bundle
-    let resolved = if use_direct {
-        let client = build_bootstrap_client(config.trusted_ark_der)?;
-        tracing::info!("Fetching attestation from {attestation_url} (direct)...");
-        bundle::fetch_well_known(&client, &attestation_url).await?
-    } else {
-        let display_url = config.atc_url.unwrap_or(bundle::DEFAULT_ATC_URL);
-        tracing::info!("Fetching attestation bundle from {display_url} for bootstrap...");
-        let atc_bundle = bundle::fetch_bundle(config.atc_url).await?;
-        let platform = bundle::platform_from_format(&atc_bundle.enclave_attestation_report.format)?;
-        bundle::ResolvedAttestation {
-            platform,
-            report_bytes: bundle::decode_report_gzipped(
-                &atc_bundle.enclave_attestation_report.body,
-            )?,
-            vcek_der: Some(sevsnp::decode_base64(&atc_bundle.vcek)?),
-            ark_der: atc_bundle
-                .ark
-                .as_ref()
-                .and_then(|s| sevsnp::decode_base64(s).ok()),
-            ask_der: atc_bundle
-                .ask
-                .as_ref()
-                .and_then(|s| sevsnp::decode_base64(s).ok()),
-            enclave_cert: Some(atc_bundle.enclave_cert),
-        }
+/// 1. Completes the TCP+TLS handshake.
+/// 2. Issues an inline HTTP/1.1 `GET /.well-known/tinfoil-attestation?v=3`
+///    over the *same* connection.
+/// 3. Falls back to ATC for any element the v3 document is missing
+///    (currently the VCEK).
+/// 4. Verifies the AMD VCEK chain, the report signature, the TCB floor, the
+///    measurement against `allowed_measurements`, and that the report's
+///    `report_data[0..32]` matches `sha256(SPKI(peer_cert))`.
+/// 5. Yields the connection to hyper for the real request.
+///
+/// Callers that want fail-fast-at-startup semantics should make one trivial
+/// request (e.g. `client.get(format!("{base}/v1/models")).send().await`)
+/// after construction and treat its outcome as the readiness check.
+pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwest::Client, Error> {
+    let host = enclave_host(config.inference_base_url);
+    let tls_roots = std::sync::Arc::new(config.tls_roots);
+    let atc_fallback = AtcFallback {
+        url: config.atc_url.map(str::to_string),
+        repo: config.enclave_repo.map(str::to_string),
+        enclave_host: host,
+        tls_roots: tls_roots.clone(),
     };
 
-    tracing::info!("Platform: {:?}", resolved.platform);
-
-    // Dispatch verification based on platform
-    let (measurement_hex, tls_fingerprint, chip_id, vcek_der) = match resolved.platform {
-        bundle::Platform::SevSnp => verify_snp_bootstrap(&config, &resolved)?,
-        bundle::Platform::Tdx => {
-            let bootstrap_client = build_bootstrap_client(config.trusted_ark_der)?;
-            verify_tdx_bootstrap(&config, &resolved, &bootstrap_client).await?
+    let tdx_policy = match config.tdx_advisory_allowlist {
+        Some(list) if !list.is_empty() => {
+            tdx::TcbPolicy::with_advisory_allowlist(list.iter().copied())
         }
+        _ => tdx::TcbPolicy::intel_recommended(),
     };
 
-    // Cross-check enclave certificate against report_data (if available).
-    // This is a defense-in-depth sanity check — the primary binding is enforced
-    // per-connection in the TLS verifier. The check is platform-independent:
-    // SHA256(SPKI(enclave_cert)) must equal report_data[0..32].
-    if let Some(enclave_cert) = &resolved.enclave_cert {
-        sevsnp::verify_enclave_cert_binding(enclave_cert, &tls_fingerprint)?;
+    let snp_policy = config.snp_min_tcb.unwrap_or_default();
+
+    attesting_client::build_attesting_client(attesting_client::BuildParams {
+        inference_base_url: config.inference_base_url.to_string(),
+        trusted_ark_der: config.trusted_ark_der.map(|d| d.to_vec()),
+        trusted_ask_der: config.trusted_ask_der.map(|d| d.to_vec()),
+        allowed_measurements: config.allowed_measurements.to_vec(),
+        atc_fallback,
+        tdx_policy,
+        tdx_observer: config.tdx_observer,
+        snp_policy,
+        snp_observer: config.snp_observer,
+        tls_roots,
+    })
+}
+
+/// Configuration for the ATC fallback path used by the per-handshake
+/// connector when a self-contained attestation document is missing required
+/// elements.
+#[derive(Clone)]
+pub(crate) struct AtcFallback {
+    pub url: Option<String>,
+    pub repo: Option<String>,
+    pub enclave_host: String,
+    /// Shared TLS root store used to validate the ATC endpoint's cert.
+    pub tls_roots: std::sync::Arc<rustls::RootCertStore>,
+}
+
+impl AtcFallback {
+    /// Fetch a bundle from ATC and return the VCEK certificate from it.
+    pub async fn fetch_vcek(&self) -> Result<Vec<u8>, Error> {
+        let repo = self.repo.as_deref().ok_or_else(|| {
+            Error::Bundle(
+                "well-known attestation document is not self-contained and no \
+                 enclave_repo is configured for ATC fallback"
+                    .to_string(),
+            )
+        })?;
+        let display_url = self.url.as_deref().unwrap_or(bundle::DEFAULT_ATC_URL);
+        tracing::info!(
+            "Fetching ATC fallback VCEK from {display_url} (enclave={}, repo={repo})",
+            self.enclave_host
+        );
+        let bundle = bundle::fetch_bundle(
+            self.url.as_deref(),
+            &self.enclave_host,
+            repo,
+            &self.tls_roots,
+        )
+        .await?;
+        sevsnp::decode_base64(&bundle.vcek)
     }
-
-    let tls_fingerprint_hex = hex::encode(tls_fingerprint);
-    tracing::info!("TLS fingerprint verified: {tls_fingerprint_hex}");
-
-    // Derive the well-known attestation URL from the inference base URL
-    tracing::info!("Per-connection attestation URL: {attestation_url}");
-
-    // Build the attesting client, seeded with the initial verified fingerprint
-    let client = attesting_client::build_attesting_client(
-        tls_fingerprint,
-        chip_id,
-        vcek_der,
-        config.trusted_ark_der.map(|d| d.to_vec()),
-        config.trusted_ask_der.map(|d| d.to_vec()),
-        allowed,
-        attestation_url,
-    )?;
-
-    Ok((
-        client,
-        Verification {
-            measurement: measurement_hex,
-            tls_fingerprint: tls_fingerprint_hex,
-        },
-    ))
 }
 
-/// Bootstrap verification result: (measurement_hex, tls_fingerprint, chip_id, vcek_der).
-type BootstrapResult = (String, [u8; 32], [u8; 64], Vec<u8>);
-
-/// SEV-SNP bootstrap verification.
-fn verify_snp_bootstrap(
-    config: &AttestingClientConfig<'_>,
-    resolved: &bundle::ResolvedAttestation,
-) -> Result<BootstrapResult, Error> {
-    // Resolve VCEK: from attestation doc, or fail
-    let vcek_der = resolved
-        .vcek_der
-        .clone()
-        .ok_or_else(|| Error::Bundle("no VCEK in attestation (v3 endpoint may not include it yet — set attestation_url to ATC as fallback)".to_string()))?;
-
-    // Resolve ARK/ASK: prefer trusted config, fall back to doc, then built-in Genoa
-    let ark_der = config.trusted_ark_der.or(resolved.ark_der.as_deref());
-    let ask_der = config.trusted_ask_der.or(resolved.ask_der.as_deref());
-
-    // Verify chain + report signature (delegated to sev crate)
-    tracing::info!("Verifying VCEK certificate chain and report signature...");
-    let report = sevsnp::verify_attestation(&vcek_der, &resolved.report_bytes, ark_der, ask_der)?;
-
-    // Validate TCB policy
-    sevsnp::verify_tcb_policy(&report)?;
-
-    // Check measurement against allowed values
-    let measurement_hex = hex::encode(report.measurement);
-    check_measurement(config.allowed_measurements, &measurement_hex)?;
-    tracing::info!("Measurement verified: {measurement_hex}");
-
-    let mut tls_fingerprint = [0u8; 32];
-    tls_fingerprint.copy_from_slice(&report.report_data[..32]);
-
-    Ok((measurement_hex, tls_fingerprint, report.chip_id, vcek_der))
-}
-
-/// TDX bootstrap verification.
-///
-/// `chip_id` and `vcek_der` are returned as empty/dummy values since TDX doesn't use
-/// AMD's VCEK/chip_id system. The attesting client handles this by detecting the platform.
-async fn verify_tdx_bootstrap(
-    config: &AttestingClientConfig<'_>,
-    resolved: &bundle::ResolvedAttestation,
-    http_client: &reqwest::Client,
-) -> Result<BootstrapResult, Error> {
-    tracing::info!("Fetching TDX collateral from Intel PCS...");
-    let collateral = tdx::fetch_collateral(http_client, &resolved.report_bytes).await?;
-
-    tracing::info!("Verifying TDX quote...");
-    let tdx_result = tdx::verify_quote(&resolved.report_bytes, &collateral)?;
-
-    // Check measurement (RTMR1||RTMR2) against allowed values
-    let measurement_hex = tdx::measurement_hex(&tdx_result.rtmr1, &tdx_result.rtmr2);
-    check_measurement(config.allowed_measurements, &measurement_hex)?;
-    tracing::info!("Measurement verified: {measurement_hex}");
-
-    let mut tls_fingerprint = [0u8; 32];
-    tls_fingerprint.copy_from_slice(&tdx_result.report_data[..32]);
-
-    // TDX doesn't use VCEK/chip_id — return empty placeholders.
-    // The per-connection verifier detects TDX from the attestation doc platform field.
-    Ok((measurement_hex, tls_fingerprint, [0u8; 64], Vec::new()))
-}
-
-/// Check a measurement against the allowed list (case-insensitive).
-fn check_measurement(allowed: &[&str], measurement_hex: &str) -> Result<(), Error> {
-    let matched = allowed
+/// Check a SEV-SNP measurement against the allowed list (case-insensitive).
+/// Returns the matched [`MatchedMeasurement::SevSnp`] on success.
+pub(crate) fn check_snp_measurement(
+    allowed: &[EnclaveMeasurement],
+    measurement_hex: &str,
+) -> Result<MatchedMeasurement, Error> {
+    let hit = allowed
         .iter()
-        .any(|m| m.eq_ignore_ascii_case(measurement_hex));
-    if !matched {
-        return Err(Error::MeasurementMismatch {
-            measurement: measurement_hex.to_string(),
-            allowed: allowed.iter().map(|s| s.to_string()).collect(),
-        });
+        .find(|m| m.snp_measurement.eq_ignore_ascii_case(measurement_hex));
+    match hit {
+        Some(m) => Ok(MatchedMeasurement::SevSnp(m.snp_measurement.clone())),
+        None => Err(Error::MeasurementMismatch {
+            observed: MatchedMeasurement::SevSnp(measurement_hex.to_string()),
+            allowed_count: allowed.len(),
+        }),
     }
-    Ok(())
 }
 
-/// Build a reqwest client for bootstrap attestation fetches.
-///
-/// When a custom trusted ARK is provided, it's added as a TLS root certificate
-/// so the client can connect to servers using certs signed by that root (e.g.
-/// the tinfoil shim mock). Without a custom root, standard WebPKI roots are used.
-fn build_bootstrap_client(trusted_ark_der: Option<&[u8]>) -> Result<reqwest::Client, Error> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    if let Some(ark_der) = trusted_ark_der {
-        root_store
-            .add(ark_der.into())
-            .map_err(|e| Error::Tls(format!("invalid ARK cert for TLS root: {e}")))?;
+/// Check a TDX RTMR1+RTMR2 pair against the allowed list (case-insensitive).
+/// Returns the matched [`MatchedMeasurement::Tdx`] on success.
+pub(crate) fn check_tdx_measurement(
+    allowed: &[EnclaveMeasurement],
+    rtmr1_hex: &str,
+    rtmr2_hex: &str,
+) -> Result<MatchedMeasurement, Error> {
+    let hit = allowed.iter().find(|m| {
+        m.tdx_measurement.rtmr1.eq_ignore_ascii_case(rtmr1_hex)
+            && m.tdx_measurement.rtmr2.eq_ignore_ascii_case(rtmr2_hex)
+    });
+    match hit {
+        Some(m) => Ok(MatchedMeasurement::Tdx(m.tdx_measurement.clone())),
+        None => Err(Error::MeasurementMismatch {
+            observed: MatchedMeasurement::Tdx(TdxMeasurement {
+                rtmr1: rtmr1_hex.to_string(),
+                rtmr2: rtmr2_hex.to_string(),
+            }),
+            allowed_count: allowed.len(),
+        }),
     }
-
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .tls_backend_preconfigured(tls_config)
-        .build()
-        .map_err(|e| Error::Tls(format!("failed to build bootstrap client: {e}")))
 }
 
-/// Derive `/.well-known/tinfoil-attestation` URL from an inference base URL.
+/// Extract the bare host (no scheme, no port, no path) from an inference base URL.
 ///
-/// Strips any path (e.g. `/v1`) and appends the well-known path to the origin.
-fn well_known_url(inference_base_url: &str) -> String {
-    // Parse to extract just the origin (scheme + authority)
-    match inference_base_url.find("://") {
-        Some(scheme_end) => {
-            let after_scheme = &inference_base_url[scheme_end + 3..];
-            let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-            let origin = &inference_base_url[..scheme_end + 3 + authority_end];
-            format!("{origin}/.well-known/tinfoil-attestation")
+/// Used as the `enclaveUrl` parameter in the ATC `POST /attestation` request,
+/// and as the `Host` header in the per-handshake inline attestation request.
+/// IPv6 literals are returned with their surrounding brackets so the result
+/// is a valid HTTP `Host` header value per RFC 7230.
+pub(crate) fn enclave_host(inference_base_url: &str) -> String {
+    let after_scheme = match inference_base_url.find("://") {
+        Some(scheme_end) => &inference_base_url[scheme_end + 3..],
+        None => inference_base_url,
+    };
+    let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    // IPv6 literals are bracketed in URL authorities (`[::1]` or `[::1]:8443`).
+    // Keep the brackets — they're required in the HTTP `Host` header — and
+    // strip only a port that follows the closing bracket. A bare `rfind(':')`
+    // would corrupt the address by slicing inside the literal.
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some(close) = rest.find(']') {
+            return authority[..close + 2].to_string();
         }
-        None => format!("{inference_base_url}/.well-known/tinfoil-attestation"),
+        // Malformed (no closing bracket) — fall through and return as-is.
+        return authority.to_string();
+    }
+    // Regular host[:port].
+    match authority.rfind(':') {
+        Some(colon) => authority[..colon].to_string(),
+        None => authority.to_string(),
     }
 }
 
@@ -276,26 +314,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn well_known_url_strips_path() {
+    fn enclave_host_strips_scheme_path_port() {
         assert_eq!(
-            well_known_url("https://inference.tinfoil.sh/v1"),
-            "https://inference.tinfoil.sh/.well-known/tinfoil-attestation"
+            enclave_host("https://inference.tinfoil.sh/v1"),
+            "inference.tinfoil.sh"
         );
+        assert_eq!(
+            enclave_host("https://inference.tinfoil.sh"),
+            "inference.tinfoil.sh"
+        );
+        assert_eq!(
+            enclave_host("https://inference.tinfoil.sh:8443/v1"),
+            "inference.tinfoil.sh"
+        );
+        assert_eq!(enclave_host("inference.tinfoil.sh"), "inference.tinfoil.sh");
     }
 
     #[test]
-    fn well_known_url_no_path() {
+    fn enclave_host_preserves_ipv6_literal() {
+        // Bracketed IPv6 with no port — brackets must survive so the result
+        // is a valid HTTP Host header value.
+        assert_eq!(enclave_host("https://[::1]/v1"), "[::1]");
+        assert_eq!(enclave_host("https://[::1]"), "[::1]");
+        // Bracketed IPv6 with explicit port — port stripped, brackets kept.
+        assert_eq!(enclave_host("https://[::1]:8443/v1"), "[::1]");
         assert_eq!(
-            well_known_url("https://inference.tinfoil.sh"),
-            "https://inference.tinfoil.sh/.well-known/tinfoil-attestation"
+            enclave_host("https://[2001:db8::1]:443/foo"),
+            "[2001:db8::1]"
         );
-    }
-
-    #[test]
-    fn well_known_url_trailing_slash() {
-        assert_eq!(
-            well_known_url("https://inference.tinfoil.sh/"),
-            "https://inference.tinfoil.sh/.well-known/tinfoil-attestation"
-        );
+        assert_eq!(enclave_host("https://[fe80::1%25eth0]"), "[fe80::1%25eth0]");
     }
 }

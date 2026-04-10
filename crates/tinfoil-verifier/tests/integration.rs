@@ -2,6 +2,9 @@
 //!
 //! Run with: `cargo test --package tinfoil-verifier -- --ignored`
 
+const LIVE_ENCLAVE: &str = "inference.tinfoil.sh";
+const LIVE_REPO: &str = "tinfoilsh/confidential-model-router";
+
 /// Full verification flow against the live Tinfoil attestation endpoint.
 ///
 /// Fetches a real attestation bundle from the ATC service, verifies the VCEK
@@ -14,12 +17,19 @@ async fn live_attestation_verification() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
+    let mut webpki = rustls::RootCertStore::empty();
+    webpki.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
     // Fetch the attestation bundle
-    let bundle = tinfoil_verifier::bundle::fetch_bundle(None)
+    let bundle = tinfoil_verifier::bundle::fetch_bundle(None, LIVE_ENCLAVE, LIVE_REPO, &webpki)
         .await
         .expect("failed to fetch attestation bundle");
 
     eprintln!("Domain: {}", bundle.domain);
+    assert_eq!(
+        bundle.domain, LIVE_ENCLAVE,
+        "ATC POST should bind the bundle to the requested enclave"
+    );
 
     // Decode VCEK and report
     let vcek_der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &bundle.vcek)
@@ -35,8 +45,10 @@ async fn live_attestation_verification() {
     let report = tinfoil_verifier::sevsnp::verify_attestation(&vcek_der, &report_bytes, None, None)
         .expect("attestation verification failed");
 
-    // Verify TCB policy
-    tinfoil_verifier::sevsnp::verify_tcb_policy(&report).expect("TCB policy verification failed");
+    // Verify TCB policy (defaults: AMD recommended floor + rollback check)
+    let policy = tinfoil_verifier::SevSnpTcbPolicy::amd_recommended();
+    let (_observation, result) = policy.evaluate(&report);
+    result.expect("TCB policy verification failed");
 
     let measurement = hex::encode(report.measurement);
     eprintln!("Measurement: {measurement}");
@@ -57,8 +69,13 @@ async fn live_attesting_client() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
+    // Live tests reach out to inference.tinfoil.sh and ATC, both of which
+    // chain under public WebPKI.
+    let mut webpki = rustls::RootCertStore::empty();
+    webpki.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
     // First, get the current measurement from ATC (we don't hardcode it in tests)
-    let bundle = tinfoil_verifier::bundle::fetch_bundle(None)
+    let bundle = tinfoil_verifier::bundle::fetch_bundle(None, LIVE_ENCLAVE, LIVE_REPO, &webpki)
         .await
         .expect("failed to fetch attestation bundle");
 
@@ -73,24 +90,38 @@ async fn live_attesting_client() {
 
     eprintln!("Using measurement: {measurement}");
 
-    // Build the attesting client
-    let (client, verification) =
-        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &[measurement.as_str()],
-            inference_base_url: "https://inference.tinfoil.sh/v1",
-            atc_url: None,
-            trusted_ark_der: None,
-            trusted_ask_der: None,
-        })
-        .await
-        .expect("attesting_client failed");
+    // The bootstrap path here is SEV-SNP (live ATC bundle), so populate the
+    // SNP field with the observed measurement and fill the TDX side with
+    // dummy values that will never match — the verifier picks the field that
+    // matches the observed platform.
+    let allowed = vec![tinfoil_verifier::EnclaveMeasurement {
+        snp_measurement: measurement.clone(),
+        tdx_measurement: tinfoil_verifier::TdxMeasurement {
+            rtmr1: "0".repeat(96),
+            rtmr2: "0".repeat(96),
+        },
+    }];
 
-    eprintln!(
-        "Verification: measurement={}, fingerprint={}",
-        verification.measurement, verification.tls_fingerprint
-    );
+    // Build the attesting client. Verification happens lazily on the first
+    // real request.
+    let client = tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
+        allowed_measurements: &allowed,
+        inference_base_url: "https://inference.tinfoil.sh/v1",
+        atc_url: None,
+        enclave_repo: Some(LIVE_REPO),
+        trusted_ark_der: None,
+        trusted_ask_der: None,
+        tdx_advisory_allowlist: None,
+        tdx_observer: None,
+        snp_min_tcb: None,
+        snp_observer: None,
+        tls_roots: webpki,
+    })
+    .await
+    .expect("attesting_client failed");
 
-    // Make a request through the attesting client
+    // Make a request through the attesting client; this is what triggers
+    // per-handshake attestation.
     let resp = client
         .get("https://inference.tinfoil.sh/v1/models")
         .send()

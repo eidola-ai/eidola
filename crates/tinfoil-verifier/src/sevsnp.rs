@@ -2,23 +2,53 @@
 //!
 //! Delegates certificate chain verification and report signature checking to
 //! the [`sev`](https://crates.io/crates/sev) crate (virtee/sev). This crate
-//! only adds TCB policy enforcement and TLS fingerprint cross-checking.
+//! adds TCB policy enforcement (configurable per-component floors plus a
+//! rollback check against `committed_tcb`) and TLS fingerprint
+//! cross-checking on top.
+//!
+//! ## TCB policy: AMD vs Intel
+//!
+//! AMD does not publish a pull-based TCB recommendation feed equivalent to
+//! Intel's `tcb_info` JSON, so the relying party's "minimum TCB SVNs" are
+//! operator-set rather than fetched from a remote endpoint. The defaults
+//! in [`SevSnpTcbPolicy::amd_recommended`] are picked to match the floor
+//! enforced by Google's `go-sev-guest`; operators can tighten them via
+//! [`crate::AttestingClientConfig::snp_min_tcb`].
+//!
+//! ## Rollback protection
+//!
+//! Each SEV-SNP attestation report carries multiple TCB version fields.
+//! The two we care about for policy purposes are:
+//!
+//! - `reported_tcb`: the TCB version associated with the VCEK that signed
+//!   the report. The hypervisor can change this via the firmware's
+//!   `SET_TCB_VERSION` command, but only downward (it can't lie upward,
+//!   because there is no VCEK that would sign for a higher TCB).
+//! - `committed_tcb`: a one-way commit by the firmware. Once the firmware
+//!   commits to a TCB level, it will not honor any `SET_TCB_VERSION`
+//!   request that would drop reported_tcb below it.
+//!
+//! A malicious hypervisor that wants to make an enclave appear to be
+//! running on an older (and known-vulnerable) TCB could call
+//! `SET_TCB_VERSION` to drop `reported_tcb` to a value the firmware has
+//! *not* committed never to honor. We catch this by requiring
+//! `reported_tcb >= committed_tcb` componentwise; the only legitimate way
+//! the inequality could fail is a firmware bug or a hypervisor that's
+//! actively lying about the TCB level. We classify this as a separate,
+//! more severe failure mode than "below operator floor."
 
 use std::io::Cursor;
+use std::sync::Arc;
 
 use base64::Engine;
 use der::{Decode, Encode};
 use sev::certs::snp::{Certificate, Chain, Verifiable, builtin::genoa, ca};
 use sev::firmware::guest::AttestationReport;
+use sev::firmware::host::TcbVersion;
 use sev::parser::Decoder;
 use sha2::{Digest, Sha256};
 
 use crate::Error;
-
-// TCB policy minimums (matching Go SDK / go-sev-guest)
-const MIN_BL_SPL: u8 = 0x07;
-const MIN_SNP_SPL: u8 = 0x0E;
-const MIN_UCODE_SPL: u8 = 0x48;
 
 /// Decode base64, ignoring whitespace and PEM headers/footers.
 pub fn decode_base64(s: &str) -> Result<Vec<u8>, Error> {
@@ -100,43 +130,260 @@ pub fn verify_attestation(
     Ok(report)
 }
 
-/// Build the AMD KDS URL for fetching a VCEK certificate.
+/// Resolve ARK and ASK as raw DER bytes, falling back to the built-in
+/// AMD Genoa certs when no override is supplied.
 ///
-/// URL format: `https://kdsintf.amd.com/vcek/v1/Genoa/{chip_id}?blSPL={bl}&teeSPL={tee}&snpSPL={snp}&ucodeSPL={ucode}`
-pub fn kds_vcek_url(report: &AttestationReport) -> String {
-    let chip_id = hex::encode(report.chip_id);
-    let tcb = &report.reported_tcb;
-    format!(
-        "https://kdsintf.amd.com/vcek/v1/Genoa/{chip_id}?blSPL={}&teeSPL={}&snpSPL={}&ucodeSPL={}",
-        tcb.bootloader, tcb.tee, tcb.snp, tcb.microcode
-    )
+/// Used by the per-handshake connector to obtain the DER bytes it needs
+/// for downstream operations the `sev` crate's `verify_report` doesn't
+/// itself return — specifically, parsing into `x509-cert::Certificate`
+/// for CRL signature verification and serial number extraction.
+pub fn resolve_chain_certs_der(
+    custom_ark: Option<&[u8]>,
+    custom_ask: Option<&[u8]>,
+) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let ark = match custom_ark {
+        Some(der) => der.to_vec(),
+        None => genoa::ark()
+            .map_err(|e| Error::CertChain(format!("failed to load Genoa ARK: {e}")))?
+            .to_der()
+            .map_err(|e| Error::CertChain(format!("failed to DER-encode Genoa ARK: {e}")))?,
+    };
+    let ask = match custom_ask {
+        Some(der) => der.to_vec(),
+        None => genoa::ask()
+            .map_err(|e| Error::CertChain(format!("failed to load Genoa ASK: {e}")))?
+            .to_der()
+            .map_err(|e| Error::CertChain(format!("failed to DER-encode Genoa ASK: {e}")))?,
+    };
+    Ok((ark, ask))
 }
 
-/// Validate TCB version against minimum policy.
-pub fn verify_tcb_policy(report: &AttestationReport) -> Result<(), Error> {
-    let tcb = &report.reported_tcb;
-
-    if tcb.bootloader < MIN_BL_SPL {
-        return Err(Error::TcbPolicy(format!(
-            "bl_spl {:#04x} < minimum {MIN_BL_SPL:#04x}",
-            tcb.bootloader
-        )));
-    }
-    if tcb.snp < MIN_SNP_SPL {
-        return Err(Error::TcbPolicy(format!(
-            "snp_spl {:#04x} < minimum {MIN_SNP_SPL:#04x}",
-            tcb.snp
-        )));
-    }
-    if tcb.microcode < MIN_UCODE_SPL {
-        return Err(Error::TcbPolicy(format!(
-            "ucode_spl {:#04x} < minimum {MIN_UCODE_SPL:#04x}",
-            tcb.microcode
-        )));
-    }
-
-    Ok(())
+/// Extract the raw serial number bytes from a DER-encoded X.509
+/// certificate. The result is suitable for direct comparison against
+/// the serial numbers in an `x509_cert::crl::CertificateList`.
+pub fn cert_serial_from_der(cert_der: &[u8]) -> Result<Vec<u8>, Error> {
+    let cert = x509_cert::Certificate::from_der(cert_der)
+        .map_err(|e| Error::CertParse(format!("failed to parse cert DER: {e}")))?;
+    Ok(cert.tbs_certificate.serial_number.as_bytes().to_vec())
 }
+
+/// Per-component TCB SVNs extracted from a SEV-SNP attestation report.
+///
+/// We re-define this rather than re-exporting [`sev::firmware::host::TcbVersion`]
+/// so the public surface of `tinfoil-verifier` does not leak its dependency
+/// on the `sev` crate. The field set covers everything we currently
+/// inspect; the upstream type also carries an `Option<u8> fmc` field for
+/// Turin and newer, which we copy through verbatim for forward
+/// compatibility but do not enforce a floor on by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SevSnpTcbSvns {
+    pub bootloader: u8,
+    pub tee: u8,
+    pub snp: u8,
+    pub microcode: u8,
+    /// Present on Turin and newer; `None` on Genoa and earlier.
+    pub fmc: Option<u8>,
+}
+
+impl From<TcbVersion> for SevSnpTcbSvns {
+    fn from(t: TcbVersion) -> Self {
+        Self {
+            bootloader: t.bootloader,
+            tee: t.tee,
+            snp: t.snp,
+            microcode: t.microcode,
+            fmc: t.fmc,
+        }
+    }
+}
+
+impl std::fmt::Display for SevSnpTcbSvns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "bl={:#04x} tee={:#04x} snp={:#04x} ucode={:#04x}",
+            self.bootloader, self.tee, self.snp, self.microcode,
+        )?;
+        if let Some(fmc) = self.fmc {
+            write!(f, " fmc={fmc:#04x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Operator-supplied minimum TCB SVNs the verifier will accept.
+///
+/// Defaults match the floor enforced by `go-sev-guest` for the AMD Genoa
+/// generation and the historical hardcoded constants this module shipped
+/// with: `bootloader >= 0x07`, `snp >= 0x0E`, `microcode >= 0x48`. The
+/// `tee` (PSP OS version) field was previously not checked at all; the
+/// default of `0x00` preserves that behavior, but operators can tighten
+/// it through [`crate::AttestingClientConfig::snp_min_tcb`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SevSnpTcbPolicy {
+    pub min_bootloader: u8,
+    pub min_tee: u8,
+    pub min_snp: u8,
+    pub min_microcode: u8,
+}
+
+impl SevSnpTcbPolicy {
+    /// AMD-recommended floor matching the historical hardcoded constants.
+    pub fn amd_recommended() -> Self {
+        Self {
+            min_bootloader: 0x07,
+            min_tee: 0x00,
+            min_snp: 0x0E,
+            min_microcode: 0x48,
+        }
+    }
+
+    /// Evaluate a parsed attestation report against this policy.
+    ///
+    /// Returns the [`SevSnpTcbObservation`] (always — even on failure, so
+    /// observers can record rejected attestations) and a `Result` that is
+    /// `Ok(())` when the report passes, or `Err(Error::TcbPolicy)` when
+    /// either the rollback check fails or any SVN is below the configured
+    /// floor. Rollback is checked before the floor so the error message
+    /// reflects the more severe condition first.
+    pub fn evaluate(
+        &self,
+        report: &AttestationReport,
+    ) -> (SevSnpTcbObservation, Result<(), Error>) {
+        let reported = SevSnpTcbSvns::from(report.reported_tcb);
+        let committed = SevSnpTcbSvns::from(report.committed_tcb);
+
+        let rollback = self.detect_rollback(&reported, &committed);
+        let below_floor = self.detect_below_floor(&reported);
+
+        let bucket = if rollback.is_some() {
+            BUCKET_ROLLBACK
+        } else if below_floor.is_some() {
+            BUCKET_BELOW_FLOOR
+        } else {
+            BUCKET_MEETS_FLOOR
+        };
+
+        let observation = SevSnpTcbObservation {
+            reported_tcb: reported,
+            committed_tcb: committed,
+            chip_id: report.chip_id,
+            bucket,
+        };
+
+        let result = match (rollback, below_floor) {
+            (Some(msg), _) => Err(Error::TcbPolicy(msg)),
+            (None, Some(msg)) => Err(Error::TcbPolicy(msg)),
+            (None, None) => Ok(()),
+        };
+
+        (observation, result)
+    }
+
+    fn detect_rollback(
+        &self,
+        reported: &SevSnpTcbSvns,
+        committed: &SevSnpTcbSvns,
+    ) -> Option<String> {
+        if reported.bootloader < committed.bootloader
+            || reported.tee < committed.tee
+            || reported.snp < committed.snp
+            || reported.microcode < committed.microcode
+        {
+            Some(format!(
+                "SEV-SNP reported_tcb ({reported}) is below committed_tcb ({committed}); \
+                 possible firmware rollback or hypervisor SET_TCB_VERSION abuse",
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn detect_below_floor(&self, reported: &SevSnpTcbSvns) -> Option<String> {
+        let mut violations: Vec<String> = Vec::new();
+        if reported.bootloader < self.min_bootloader {
+            violations.push(format!(
+                "bootloader {:#04x} < min {:#04x}",
+                reported.bootloader, self.min_bootloader
+            ));
+        }
+        if reported.tee < self.min_tee {
+            violations.push(format!(
+                "tee {:#04x} < min {:#04x}",
+                reported.tee, self.min_tee
+            ));
+        }
+        if reported.snp < self.min_snp {
+            violations.push(format!(
+                "snp {:#04x} < min {:#04x}",
+                reported.snp, self.min_snp
+            ));
+        }
+        if reported.microcode < self.min_microcode {
+            violations.push(format!(
+                "microcode {:#04x} < min {:#04x}",
+                reported.microcode, self.min_microcode
+            ));
+        }
+        if violations.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "SEV-SNP reported_tcb below operator floor: {}",
+                violations.join(", "),
+            ))
+        }
+    }
+}
+
+impl Default for SevSnpTcbPolicy {
+    fn default() -> Self {
+        Self::amd_recommended()
+    }
+}
+
+// Bucket labels for `SevSnpTcbObservation::as_metric_label`. Stable
+// strings — dashboards and alert rules depend on these.
+const BUCKET_MEETS_FLOOR: &str = "meets_floor";
+const BUCKET_BELOW_FLOOR: &str = "below_floor";
+const BUCKET_ROLLBACK: &str = "rollback_detected";
+
+/// Observation surfaced after a SEV-SNP attestation has been
+/// signature-verified, before the policy result is propagated.
+///
+/// Consumers receive this via the optional observer callback on
+/// [`crate::AttestingClientConfig`] and can use it to drive metrics,
+/// traces, or alerting. The observer fires for *every* attestation that
+/// completes signature verification, including ones the policy
+/// subsequently rejects, so operators have full visibility into the
+/// population of observed TCB levels — not just the ones that made it
+/// through.
+#[derive(Debug, Clone)]
+pub struct SevSnpTcbObservation {
+    /// TCB version associated with the VCEK that signed the report.
+    pub reported_tcb: SevSnpTcbSvns,
+    /// TCB version the firmware has one-way-committed to. The verifier
+    /// requires `reported_tcb >= committed_tcb` componentwise.
+    pub committed_tcb: SevSnpTcbSvns,
+    /// 64-byte chip identifier from the report. High cardinality —
+    /// suitable for trace enrichment, *not* as a metric label.
+    pub chip_id: [u8; 64],
+    bucket: &'static str,
+}
+
+impl SevSnpTcbObservation {
+    /// Stable lowercase identifier suitable for use as a metric label.
+    /// One of `meets_floor`, `below_floor`, or `rollback_detected`.
+    pub fn as_metric_label(&self) -> &'static str {
+        self.bucket
+    }
+}
+
+/// Observer callback type. Invoked synchronously inside the connector
+/// layer for every SEV-SNP attestation that completes signature
+/// verification, regardless of policy outcome. Implementations must be
+/// cheap and non-blocking — they run on the TLS handshake hot path.
+pub type SevSnpObserver = Arc<dyn Fn(&SevSnpTcbObservation) + Send + Sync>;
 
 /// Verify the enclave certificate's public key fingerprint matches report_data[0..32].
 pub fn verify_enclave_cert_binding(
@@ -187,5 +434,130 @@ mod tests {
         (&ca_chain)
             .verify()
             .expect("Genoa CA chain verification failed");
+    }
+
+    fn report_with_tcb(reported: SevSnpTcbSvns, committed: SevSnpTcbSvns) -> AttestationReport {
+        AttestationReport {
+            reported_tcb: TcbVersion {
+                bootloader: reported.bootloader,
+                tee: reported.tee,
+                snp: reported.snp,
+                microcode: reported.microcode,
+                fmc: reported.fmc,
+            },
+            committed_tcb: TcbVersion {
+                bootloader: committed.bootloader,
+                tee: committed.tee,
+                snp: committed.snp,
+                microcode: committed.microcode,
+                fmc: committed.fmc,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn svns(bootloader: u8, tee: u8, snp: u8, microcode: u8) -> SevSnpTcbSvns {
+        SevSnpTcbSvns {
+            bootloader,
+            tee,
+            snp,
+            microcode,
+            fmc: None,
+        }
+    }
+
+    #[test]
+    fn policy_accepts_report_at_or_above_floor() {
+        let policy = SevSnpTcbPolicy::amd_recommended();
+        let reported = svns(0x07, 0x00, 0x0E, 0x48);
+        let committed = svns(0x07, 0x00, 0x0E, 0x48);
+        let report = report_with_tcb(reported, committed);
+        let (obs, result) = policy.evaluate(&report);
+        assert!(result.is_ok());
+        assert_eq!(obs.as_metric_label(), "meets_floor");
+    }
+
+    #[test]
+    fn policy_accepts_report_above_floor() {
+        let policy = SevSnpTcbPolicy::amd_recommended();
+        let reported = svns(0x10, 0x05, 0x20, 0x80);
+        let committed = svns(0x10, 0x05, 0x20, 0x80);
+        let (obs, result) = policy.evaluate(&report_with_tcb(reported, committed));
+        assert!(result.is_ok());
+        assert_eq!(obs.as_metric_label(), "meets_floor");
+    }
+
+    #[test]
+    fn policy_rejects_below_bootloader_floor() {
+        let policy = SevSnpTcbPolicy::amd_recommended();
+        let reported = svns(0x06, 0x00, 0x0E, 0x48); // bootloader one short
+        let committed = svns(0x06, 0x00, 0x0E, 0x48); // committed matches, no rollback
+        let (obs, result) = policy.evaluate(&report_with_tcb(reported, committed));
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::TcbPolicy(_)));
+        assert_eq!(obs.as_metric_label(), "below_floor");
+        let Error::TcbPolicy(msg) = err else {
+            unreachable!()
+        };
+        assert!(msg.contains("bootloader"), "got: {msg}");
+    }
+
+    #[test]
+    fn policy_rejects_below_snp_and_microcode_floor() {
+        let policy = SevSnpTcbPolicy::amd_recommended();
+        let reported = svns(0x07, 0x00, 0x05, 0x10);
+        let committed = reported;
+        let (_, result) = policy.evaluate(&report_with_tcb(reported, committed));
+        let Error::TcbPolicy(msg) = result.unwrap_err() else {
+            panic!("expected TcbPolicy error");
+        };
+        assert!(msg.contains("snp"), "got: {msg}");
+        assert!(msg.contains("microcode"), "got: {msg}");
+    }
+
+    #[test]
+    fn policy_detects_rollback_even_when_above_floor() {
+        let policy = SevSnpTcbPolicy::amd_recommended();
+        // reported is above the floor on every component, but the
+        // firmware has committed to a higher snp SVN. This is the case
+        // a malicious hypervisor SET_TCB_VERSION call would produce.
+        let reported = svns(0x10, 0x05, 0x10, 0x80);
+        let committed = svns(0x10, 0x05, 0x14, 0x80);
+        let (obs, result) = policy.evaluate(&report_with_tcb(reported, committed));
+        let Error::TcbPolicy(msg) = result.unwrap_err() else {
+            panic!("expected TcbPolicy error");
+        };
+        assert_eq!(obs.as_metric_label(), "rollback_detected");
+        assert!(msg.contains("rollback"), "got: {msg}");
+    }
+
+    #[test]
+    fn policy_rollback_takes_precedence_over_below_floor() {
+        // Both rollback and below-floor: the more severe condition wins
+        // and the bucket label reflects rollback.
+        let policy = SevSnpTcbPolicy::amd_recommended();
+        let reported = svns(0x05, 0x00, 0x05, 0x10);
+        let committed = svns(0x07, 0x00, 0x0E, 0x48);
+        let (obs, result) = policy.evaluate(&report_with_tcb(reported, committed));
+        assert!(result.is_err());
+        assert_eq!(obs.as_metric_label(), "rollback_detected");
+    }
+
+    #[test]
+    fn policy_default_matches_amd_recommended() {
+        assert_eq!(
+            SevSnpTcbPolicy::default(),
+            SevSnpTcbPolicy::amd_recommended()
+        );
+    }
+
+    #[test]
+    fn policy_can_tighten_individual_components() {
+        let mut policy = SevSnpTcbPolicy::amd_recommended();
+        policy.min_snp = 0x14;
+        let reported = svns(0x07, 0x00, 0x10, 0x48); // above old floor, below new
+        let (obs, result) = policy.evaluate(&report_with_tcb(reported, reported));
+        assert!(result.is_err());
+        assert_eq!(obs.as_metric_label(), "below_floor");
     }
 }

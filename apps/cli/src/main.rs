@@ -40,10 +40,16 @@ enum Command {
         /// Path to PEM-encoded SEV-SNP ASK (Intermediate CA) certificate
         #[arg(long)]
         hardware_intermediate_ca: Option<String>,
-        /// Add a trusted enclave measurement (hex-encoded, 96 chars)
+        /// Add a trusted enclave release. Each release pairs an SEV-SNP
+        /// measurement with the matching TDX RTMR1/RTMR2 values, given as
+        /// `<snp>:<rtmr1>:<rtmr2>` (three 96-char hex strings separated by
+        /// colons). The values can be lifted directly from Tinfoil's
+        /// `tinfoil-deployment.json`.
         #[arg(long)]
         trust_measurement: Option<String>,
-        /// Remove a trusted enclave measurement
+        /// Remove a trusted enclave release. Match by the 96-char SNP
+        /// measurement, or by the same `<snp>:<rtmr1>:<rtmr2>` triple used
+        /// with --trust_measurement.
         #[arg(long)]
         untrust_measurement: Option<String>,
     },
@@ -279,17 +285,32 @@ fn now_iso() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
 
+/// Load the OS trust store into a fresh `RootCertStore`. Used for both the
+/// non-attesting and attesting code paths so the developer's local dev CA
+/// (e.g. the tinfoil shim mock's `tls-ca.pem`, installed in the keychain)
+/// is honored everywhere the CLI talks to a server.
+fn load_native_root_store() -> rustls::RootCertStore {
+    let mut store = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        eprintln!(
+            "warning: rustls_native_certs reported errors loading the system trust store: {:?}",
+            native.errors,
+        );
+    }
+    for cert in native.certs {
+        let _ = store.add(cert);
+    }
+    store
+}
+
 /// Build a reqwest client. When `trusted_measurements` is configured, the
 /// client verifies Tinfoil enclave attestation on each new TLS connection,
 /// ensuring the server is running expected code inside a TEE.
 async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
     if config.trusted_measurements.is_empty() {
-        let mut root_store = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            let _ = root_store.add(cert);
-        }
         let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
+            .with_root_certificates(load_native_root_store())
             .with_no_client_auth();
         return reqwest::Client::builder()
             .tls_backend_preconfigured(tls_config)
@@ -302,12 +323,6 @@ async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
         .as_deref()
         .ok_or("base_url is required when attestation is enabled")?;
 
-    let measurements: Vec<&str> = config
-        .trusted_measurements
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-
     let hardware_root_der =
         parse_cert_config(config.hardware_root_ca.as_deref(), "hardware_root_ca")?;
     let hardware_intermediate_der = parse_cert_config(
@@ -315,23 +330,26 @@ async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
         "hardware_intermediate_ca",
     )?;
 
-    let (client, verification) =
-        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &measurements,
-            inference_base_url: origin,
-            atc_url: config.attestation_url.as_deref(),
-            trusted_ark_der: hardware_root_der.as_deref(),
-            trusted_ask_der: hardware_intermediate_der.as_deref(),
-        })
-        .await
-        .map_err(|e| format!("attestation verification failed: {e}"))?;
-
-    eprintln!(
-        "attestation verified — measurement: {}, tls: {}",
-        verification.measurement, verification.tls_fingerprint
-    );
-
-    Ok(client)
+    // Attestation now happens inside the connector on the first real request
+    // (and on every subsequent new TLS handshake). The CLI is interactive, so
+    // we don't bother with a startup smoke test — failures will surface on the
+    // first command the user runs and are mapped to a human-readable error by
+    // `describe_request_error` below.
+    tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
+        allowed_measurements: &config.trusted_measurements,
+        inference_base_url: origin,
+        atc_url: config.attestation_url.as_deref(),
+        enclave_repo: Some(config.attestation_repo()),
+        trusted_ark_der: hardware_root_der.as_deref(),
+        trusted_ask_der: hardware_intermediate_der.as_deref(),
+        tdx_advisory_allowlist: None,
+        tdx_observer: None,
+        snp_min_tcb: None,
+        snp_observer: None,
+        tls_roots: load_native_root_store(),
+    })
+    .await
+    .map_err(|e| format!("attestation client build failed: {e}"))
 }
 
 /// Map a reqwest send error to a human-readable message.
@@ -397,6 +415,42 @@ fn parse_cert_config(value: Option<&str>, field_name: &str) -> Result<Option<Vec
     }
 }
 
+/// Parse a `<snp>:<rtmr1>:<rtmr2>` trust spec into an [`EnclaveMeasurement`].
+fn parse_trust_measurement(spec: &str) -> Result<tinfoil_verifier::EnclaveMeasurement, String> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() != 3 {
+        return Err(
+            "trust_measurement must be `<snp>:<rtmr1>:<rtmr2>` (three colon-separated 96-char hex strings)"
+                .into(),
+        );
+    }
+    let snp = validate_hex_field(parts[0], "snp_measurement")?;
+    let rtmr1 = validate_hex_field(parts[1], "tdx.rtmr1")?;
+    let rtmr2 = validate_hex_field(parts[2], "tdx.rtmr2")?;
+    Ok(tinfoil_verifier::EnclaveMeasurement {
+        snp_measurement: snp,
+        tdx_measurement: tinfoil_verifier::TdxMeasurement { rtmr1, rtmr2 },
+    })
+}
+
+/// Parse an `--untrust_measurement` argument into an SNP measurement key.
+/// Accepts either a bare 96-char SNP measurement or the full
+/// `<snp>:<rtmr1>:<rtmr2>` triple (for symmetry with --trust_measurement).
+fn parse_untrust_key(spec: &str) -> Result<String, String> {
+    let snp = match spec.split_once(':') {
+        Some((snp, _)) => snp,
+        None => spec,
+    };
+    validate_hex_field(snp, "snp_measurement")
+}
+
+fn validate_hex_field(value: &str, field: &str) -> Result<String, String> {
+    if value.len() != 96 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("{field} must be 96 hex characters (48 bytes)"));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
 fn require_base_url(config: &Config) -> Result<&str, String> {
     config
         .base_url
@@ -448,10 +502,12 @@ async fn run(cli: Cli) -> Result<(), String> {
             if config.trusted_measurements.is_empty() {
                 println!("trusted_measurements: <none> (attestation disabled)");
             } else {
-                println!(
-                    "trusted_measurements: {}",
-                    config.trusted_measurements.join(", ")
-                );
+                println!("trusted_measurements:");
+                for m in &config.trusted_measurements {
+                    println!("  - snp = {}", m.snp_measurement);
+                    println!("    tdx.rtmr1 = {}", m.tdx_measurement.rtmr1);
+                    println!("    tdx.rtmr2 = {}", m.tdx_measurement.rtmr2);
+                }
             }
             println!(
                 "hardware_root_ca: {}",
@@ -513,23 +569,40 @@ async fn run(cli: Cli) -> Result<(), String> {
                 config.hardware_intermediate_ca = Some(pem.trim().to_string());
                 println!("hardware_intermediate_ca set from {path}");
             }
-            if let Some(m) = &trust_measurement {
-                if m.len() != 96 || !m.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err("measurement must be 96 hex characters (48 bytes)".into());
-                }
-                if !config.trusted_measurements.contains(m) {
-                    config.trusted_measurements.push(m.clone());
-                    println!("added trusted measurement: {m}");
+            if let Some(spec) = &trust_measurement {
+                let entry = parse_trust_measurement(spec)?;
+                if config.trusted_measurements.iter().any(|m| {
+                    m.snp_measurement
+                        .eq_ignore_ascii_case(&entry.snp_measurement)
+                }) {
+                    println!(
+                        "measurement already trusted (snp={})",
+                        entry.snp_measurement
+                    );
                 } else {
-                    println!("measurement already trusted: {m}");
+                    println!(
+                        "added trusted measurement: snp={}, tdx.rtmr1={}, tdx.rtmr2={}",
+                        entry.snp_measurement,
+                        entry.tdx_measurement.rtmr1,
+                        entry.tdx_measurement.rtmr2,
+                    );
+                    config.trusted_measurements.push(entry);
                 }
             }
-            if let Some(m) = &untrust_measurement {
-                if let Some(pos) = config.trusted_measurements.iter().position(|x| x == m) {
-                    config.trusted_measurements.remove(pos);
-                    println!("removed trusted measurement: {m}");
+            if let Some(spec) = &untrust_measurement {
+                let key = parse_untrust_key(spec)?;
+                if let Some(pos) = config
+                    .trusted_measurements
+                    .iter()
+                    .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
+                {
+                    let removed = config.trusted_measurements.remove(pos);
+                    println!(
+                        "removed trusted measurement (snp={})",
+                        removed.snp_measurement
+                    );
                 } else {
-                    println!("measurement not found: {m}");
+                    println!("measurement not found (snp={key})");
                 }
             }
             config.save()?;

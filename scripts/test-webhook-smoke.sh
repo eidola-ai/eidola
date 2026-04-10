@@ -18,7 +18,7 @@ set -euo pipefail
 
 cleanup() {
     echo "==> Cleaning up..."
-    docker compose --profile test down --volumes --remove-orphans 2>/dev/null || true
+    docker compose --profile server --profile stripe down --volumes --remove-orphans 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -72,7 +72,7 @@ echo "    secret: ${STRIPE_WEBHOOK_SECRET:0:12}..."
 # ── Start server + stripe-cli ────────────────────────────────────────────────
 
 echo "==> Starting server and stripe-cli..."
-docker compose --profile test up -d server stripe-cli
+docker compose --profile server --profile stripe up -d server shim stripe-cli
 
 # ── Poll /health ─────────────────────────────────────────────────────────────
 
@@ -84,7 +84,7 @@ for i in $(seq 1 30); do
     fi
     if [ "$i" -eq 30 ]; then
         echo "ERROR: server did not become healthy in 30s" >&2
-        docker compose --profile test logs server
+        docker compose --profile server --profile stripe logs server
         exit 1
     fi
     sleep 1
@@ -94,13 +94,13 @@ done
 
 echo "==> Waiting for stripe-cli to be ready..."
 for i in $(seq 1 30); do
-    if docker compose --profile test logs stripe-cli 2>&1 | grep -q "Ready!"; then
+    if docker compose --profile server --profile stripe logs stripe-cli 2>&1 | grep -q "Ready!"; then
         echo "    stripe-cli ready"
         break
     fi
     if [ "$i" -eq 30 ]; then
         echo "ERROR: stripe-cli did not become ready in 30s" >&2
-        docker compose --profile test logs stripe-cli
+        docker compose --profile server --profile stripe logs stripe-cli
         exit 1
     fi
     sleep 1
@@ -131,7 +131,7 @@ sleep 5
 
 echo "==> Running assertions..."
 FAILED=0
-SERVER_LOGS=$(docker compose --profile test logs server 2>&1)
+SERVER_LOGS=$(docker compose --profile server --profile stripe logs server 2>&1)
 
 # Server is still running
 if ! curl -sf http://localhost:8080/health >/dev/null 2>&1; then

@@ -6,14 +6,17 @@ default:
 
 # --- Development ---
 
-# Start postgres + server (full stack in containers)
+# Run the full stack with the server in a container (detached).
 dev:
-    ./scripts/dev.sh
+    ./scripts/dev.sh --container
 
-# Start backing services (postgres) for running the server on the host with cargo
+# Run backing services for host-mode dev — server runs on host with cargo; writes .env.local with BIND_ADDR + STRIPE_WEBHOOK_SECRET to source.
 services:
-    docker buildx bake postgres
-    docker compose up -d --no-build postgres
+    ./scripts/dev.sh --host
+
+# Stop everything started by `just dev` or `just services`.
+down:
+    docker compose --profile server --profile stripe down --remove-orphans
 
 # Drop and recreate the eidola database, then apply schema.sql
 db-reset:

@@ -23,6 +23,7 @@ struct Config {
     bind_addr: SocketAddr,
     tinfoil_api_key: String,
     tinfoil_base_url: Option<String>,
+    tinfoil_repo: String,
     database_url: String,
     database_password: Option<String>,
     database_ssl_cert: Option<String>,
@@ -43,6 +44,12 @@ impl Config {
             .map_err(|_| "TINFOIL_API_KEY environment variable is required")?;
 
         let tinfoil_base_url = std::env::var("TINFOIL_BASE_URL").ok();
+
+        // Source repo used to attest the upstream enclave via the ATC
+        // `POST /attestation` endpoint. Must match the GitHub repo whose
+        // signed measurements correspond to the running enclave.
+        let tinfoil_repo = std::env::var("TINFOIL_REPO")
+            .unwrap_or_else(|_| "tinfoilsh/confidential-model-router".to_string());
 
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
@@ -102,6 +109,7 @@ impl Config {
             bind_addr,
             tinfoil_api_key,
             tinfoil_base_url,
+            tinfoil_repo,
             database_url,
             database_password,
             database_ssl_cert,
@@ -197,30 +205,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let credential_key_cache: credentials::KeyCache = Default::default();
     let epoch_config = EpochConfig::default();
 
-    // Verify Tinfoil enclave attestation and build an attesting client.
-    info!("Verifying Tinfoil enclave attestation...");
+    // Build the attesting client. Verification happens per-handshake inside
+    // the connector, so this call performs no network I/O — the first real
+    // request through the client is also the first attestation. We make a
+    // tiny smoke-test request immediately after construction to fail fast at
+    // startup if the upstream is misconfigured.
+    info!("Building Tinfoil attesting client...");
     let default_base_url = "https://inference.tinfoil.sh/v1".to_string();
     let inference_base_url = config
         .tinfoil_base_url
         .as_deref()
         .unwrap_or(&default_base_url);
-    let (attesting_client, verification) =
+    // Observers wired to the OTel TDX_ATTESTATIONS / SNP_ATTESTATIONS
+    // counters so every attestation the verifier sees (including ones
+    // it rejects) is surfaced as a labeled metric. The closures run on
+    // the TLS handshake hot path inside the connector layer, so we keep
+    // them to a single counter increment each with no allocation in the
+    // steady state.
+    let tdx_observer: tinfoil_verifier::TdxObserver =
+        std::sync::Arc::new(|observation: &tinfoil_verifier::TdxTcbObservation| {
+            telemetry::metrics::TDX_ATTESTATIONS.add(
+                1,
+                &[opentelemetry::KeyValue::new(
+                    "status",
+                    observation.status.as_metric_label(),
+                )],
+            );
+        });
+    let snp_observer: tinfoil_verifier::SevSnpObserver =
+        std::sync::Arc::new(|observation: &tinfoil_verifier::SevSnpTcbObservation| {
+            telemetry::metrics::SNP_ATTESTATIONS.add(
+                1,
+                &[opentelemetry::KeyValue::new(
+                    "bucket",
+                    observation.as_metric_label(),
+                )],
+            );
+        });
+    // The server runs `FROM scratch` inside an enclave with no system trust
+    // store, so trust roots come from the bundled Mozilla list. Tinfoil's
+    // production cert, the ATC service, and AMD KDS all chain under public
+    // WebPKI. We deliberately do not pull in `rustls-native-certs` here.
+    let mut tls_roots = rustls::RootCertStore::empty();
+    tls_roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let attesting_client =
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: measurements::ALLOWED,
+            allowed_measurements: measurements::ALLOWED.as_slice(),
             inference_base_url,
             atc_url: None,
+            enclave_repo: Some(&config.tinfoil_repo),
             trusted_ark_der: None,
             trusted_ask_der: None,
+            tdx_advisory_allowlist: None,
+            tdx_observer: Some(tdx_observer),
+            snp_min_tcb: None,
+            snp_observer: Some(snp_observer),
+            tls_roots,
         })
         .await
         .map_err(|e| {
-            error!("Tinfoil attestation verification failed: {e}");
+            error!("Tinfoil attesting client build failed: {e}");
             e
         })?;
-    info!(
-        "Tinfoil attestation verified — measurement: {}, TLS fingerprint: {}",
-        verification.measurement, verification.tls_fingerprint
-    );
+
+    info!("Smoke-testing Tinfoil enclave attestation via {inference_base_url}/models...");
+    attesting_client
+        .get(format!("{inference_base_url}/models"))
+        .header(
+            "authorization",
+            format!("Bearer {}", config.tinfoil_api_key),
+        )
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Tinfoil attestation smoke test failed: {e}");
+            e
+        })?
+        .error_for_status()
+        .map_err(|e| {
+            error!("Tinfoil attestation smoke test returned non-success: {e}");
+            e
+        })?;
+    info!("Tinfoil attestation smoke test succeeded");
 
     // Create shared state
     let state = AppState::new(
@@ -237,6 +304,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         credential_key_cache,
         epoch_config,
     );
+
+    // Verify that this server's clock agrees with the database clock
+    // before doing anything that writes time-anchored state. A skewed
+    // node would otherwise create issuer keys with bogus issuance
+    // windows that other (correctly-clocked) nodes would never
+    // produce, polluting shared state.
+    eidola_server::db::check_clock_skew(&state.db_pool, eidola_server::db::MAX_CLOCK_SKEW)
+        .await
+        .map_err(|e| {
+            error!("Database clock skew check failed: {}", e);
+            e.to_string()
+        })?;
 
     // Provision issuer keys on boot and start periodic rotation task.
     match credentials::ensure_keys(
@@ -257,6 +336,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state.db_pool.clone(),
         state.epoch_config.clone(),
     );
+
+    // Keep the database connection pool warm and prevent serverless Postgres
+    // (e.g. Neon) from autosuspending the compute during quiet periods.
+    eidola_server::db::spawn_keepalive(state.db_pool.clone(), std::time::Duration::from_secs(60));
 
     // Build the router with OpenAPI integration
     let (router, api) = eidola_server::build_router()

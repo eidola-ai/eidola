@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::measurement::MatchedMeasurement;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("failed to fetch attestation bundle: {0}")]
@@ -29,10 +31,12 @@ pub enum Error {
     #[error("TCB policy violation: {0}")]
     TcbPolicy(String),
 
-    #[error("measurement mismatch: got {measurement}, allowed: {allowed:?}")]
+    #[error(
+        "measurement mismatch: observed {observed} is not in the allowed list ({allowed_count} entries)"
+    )]
     MeasurementMismatch {
-        measurement: String,
-        allowed: Vec<String>,
+        observed: MatchedMeasurement,
+        allowed_count: usize,
     },
 
     #[error("TLS fingerprint mismatch: report_data={report_data}, enclave_cert={enclave_cert}")]
@@ -46,4 +50,18 @@ pub enum Error {
 
     #[error("TLS configuration error: {0}")]
     Tls(String),
+
+    /// Catch-all for failures that happen inside the per-handshake attesting
+    /// connector layer: HTTP/1.1 framing errors, EOF, missing TLS info on the
+    /// freshly-handshaken connection, JSON parse failures on the attestation
+    /// document body, and similar.
+    #[error("attestation connector error: {0}")]
+    Connector(String),
+
+    /// The inline attestation fetch did not complete within the configured
+    /// per-handshake deadline. The TLS handshake itself succeeded, but either
+    /// the upstream stalled before serving the well-known document or the
+    /// HTTP response was being streamed unusually slowly.
+    #[error("inline attestation fetch timed out after {seconds}s")]
+    AttestationTimeout { seconds: u64 },
 }
