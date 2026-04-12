@@ -21,17 +21,17 @@
       "type": "oci"
     },
     "eidola-server": {
-      "digest": "sha256:5a0db19389d93aa665c28f6111344d2d612cf5a59bfc1f3fe77df899cc796e90",
+      "digest": "sha256:26d2e786d5a61559dceee77297488dd4933d9a1c07069966d31c2fe00dfaeea0",
       "platform": "linux/amd64",
       "type": "oci"
     }
   },
   "enclave": {
-    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=611b6181c64db766273a1f15d89f312296c0c41ce746867ffdec243889dafea4",
-    "snp_measurement": "32fb1a0315eac45f3506db5f937a276cead76236d2bf9c874a07fcb7db1b390fdc2d9603963f73be8f3fd199c008d7a9",
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=c7f19bd965d2d66231dcba58404894c61b6d6125be49050186e9b2df2b17bc51",
+    "snp_measurement": "10f4e2664c90967c94ab92e7f8b6c1cf4aa75aacf4159699b588ca336fceb1bebb334c2d2fa58f8d6a43fecdf9457e56",
     "tdx_measurement": {
       "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-      "rtmr2": "90a0a05fc7cf6c46fdf8288a25b1cdeecf064a250263f866350234a2acd76b50246ca998845dbd1a3ea8a57ed0031d67"
+      "rtmr2": "cdc85f309009ac83c533e97e429bc5a62dd12de0b6b49ad7d976bf46683ed5f3f36385f1e7579e5aca5201653ebc9dca"
     }
   },
   "version": 1
