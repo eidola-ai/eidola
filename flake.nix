@@ -988,7 +988,7 @@ with open(path, "wb") as f:
                 ];
 
                 text = ''
-                  ${./scripts/update-shared-bindings.sh} \
+                  ${./scripts/update-bindings.sh} \
                     "${self.packages.${system}.eidola-app-core-swift-bindings}/Sources"
                 '';
               }
