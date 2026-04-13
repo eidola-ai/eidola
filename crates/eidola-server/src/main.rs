@@ -261,6 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tdx_observer: Some(tdx_observer),
             snp_min_tcb: None,
             snp_observer: Some(snp_observer),
+            attestation_observer: None,
             tls_roots,
         })
         .await

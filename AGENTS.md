@@ -96,19 +96,31 @@ This still relies on Tinfoil's TLS private key being sealed inside the enclave: 
 
 ## App Core Architecture
 
-The macOS app and CLI share a common Rust core (`crates/eidola-app-core/`) exposed to Swift via direct [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings. Rust functions and types are exported with `#[uniffi::export]`, `#[derive(uniffi::Object)]`, `#[derive(uniffi::Record)]`, and `#[derive(uniffi::Enum)]`. Async operations use `#[uniffi::export(async)]` to bridge Rust futures to Swift async/await. No serialization layer, event/effect pattern, or Crux dependency — Swift calls Rust functions directly and gets native Swift types back.
+The macOS app and CLI share a common Rust core (`crates/eidola-app-core/`) exposed to Swift via direct [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings. All business logic — config management, local database, HTTP client construction, account operations, wallet/credential management, and chat inference — lives in the core crate. The CLI (`apps/cli/`) is a thin Clap wrapper that constructs an `AppCore` and formats output; the macOS app (`apps/macos/`) uses the same `AppCore` via UniFFI-generated Swift bindings.
+
+Rust functions and types are exported with `#[uniffi::export]`, `#[derive(uniffi::Object)]`, `#[derive(uniffi::Record)]`, and `#[derive(uniffi::Enum)]`. Async operations use `#[uniffi::export(async)]` to bridge Rust futures to Swift async/await. No serialization layer, event/effect pattern, or Crux dependency — Swift calls Rust functions directly and gets native Swift types back.
+
+**Core crate modules:**
+- `lib.rs` — `AppCore` object (UniFFI-exported), all high-level operations (account create/show/allocate, chat, wallet), UniFFI record types (`ConfigState`, `ChatResult`, `PriceInfo`, etc.), internal helpers (ACT token serialization, attestation flushing, HTTP response handling)
+- `config.rs` — `Config` struct (TOML serde), load/save with explicit paths, measurement parsing, certificate parsing, domain separator constants
+- `db.rs` — Turso (libSQL) database layer with 3-layer schema (wallet, transport, semantic), migrations, all CRUD operations
+- `error.rs` — `AppError` enum (UniFFI-exported), request error classification (attestation vs network vs server)
+
+**CLI usage:** The CLI depends on `eidola-app-core` as a regular Rust crate dependency. It calls `AppCore::new(config_dir, data_dir)` and invokes methods directly — no FFI involved.
+
+**macOS app usage:** The macOS app depends on the UniFFI-generated Swift package. `Core.swift` wraps `AppCore` in an `@Observable @MainActor` class that bridges async Rust calls to SwiftUI state. Views: `ChatView` (message bubbles, model picker), `AccountView` (balances, allocation, prices), `WalletView` (credential list), `SettingsView` (base URL, credentials, attestation config).
 
 **Crate layout:** Pure Rust crates in `crates/` implement capability logic. The `crates/` tree also contains the Rust code generation binary (`uniffi-bindgen-swift`) plus operational utilities such as `generate-openapi`, `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`.
 
 **Codegen pipeline:**
 - `uniffi-bindgen-swift` (workspace crate under `crates/`) → FFI bridge (Swift bindings + C headers)
 
-## CLI Database & Migrations
+## Local Database & Migrations
 
-The CLI uses an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidola/eidola.db` for local app data (wallet credentials, conversation history, etc.).
+Both the CLI and macOS app use an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidola/eidola.db` for local app data (wallet credentials, conversation history, attestation records, etc.). The database layer lives in `crates/eidola-app-core/src/db.rs`.
 
 **Schema management:**
-- `apps/cli/schema/schema.sql` is the canonical schema — always reflects the current desired state
+- `crates/eidola-app-core/schema/schema.sql` is the canonical schema — always reflects the current desired state
 - Fresh installs apply `schema.sql` directly via `execute_batch` and set `PRAGMA user_version` to `LATEST_VERSION`
 - Existing databases run incremental migrations in `db.rs` (gated by `user_version`)
 
@@ -117,7 +129,7 @@ The CLI uses an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libS
 2. Add a `MIGRATION_N` constant in `db.rs` with the ALTER/CREATE statements
 3. Add an `if current_version < N` block in `migrate()` that runs the migration and sets `user_version`
 4. Bump `LATEST_VERSION`
-5. Run `cargo test -p eidola-cli` — the `migrations_match_schema` test structurally compares a fresh-from-schema database against a fully-migrated database (via `PRAGMA table_info`, `PRAGMA index_info`, and view SQL)
+5. Run `cargo test -p eidola-app-core` — the `migrations_match_schema` test structurally compares a fresh-from-schema database against a fully-migrated database (via `PRAGMA table_info`, `PRAGMA index_info`, and view SQL)
 
 **Limitations:** The `turso` crate does not support `ALTER TABLE ALTER COLUMN` (a libSQL C extension). To add `NOT NULL` columns, use `ADD COLUMN ... DEFAULT <value>` — the default persists and must also be declared in `schema.sql` so both paths match.
 

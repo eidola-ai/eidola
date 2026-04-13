@@ -113,8 +113,10 @@ jobs:
 
           # The previous SNP measurement, used only to detect whether the
           # CURRENT release actually changed.
+          # After rustfmt the hash may wrap to the next line, so just
+          # grab the first 96-char hex string in the block (always SNP).
           PREV_SNP=$(printf '%s\n' "${PREV_BLOCK}" \
-            | grep -oP '(?<=snp_measurement:\s)"[a-f0-9]+"' | head -1 | tr -d '"' || true)
+            | grep -oP '[a-f0-9]{96}' | head -1 || true)
 
           HAS_PREV=false
           if [ -n "${PREV_BLOCK}" ] && [ -n "${PREV_SNP}" ] && [ "${PREV_SNP}" != "${SNP}" ]; then
