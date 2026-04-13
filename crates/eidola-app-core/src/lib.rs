@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anonymous_credit_tokens::{
-    CreditToken, IssuanceResponse, Params, PreIssuance, PublicKey, Refund, credit_to_scalar,
-    scalar_to_credit,
+    CreditToken, IssuanceResponse, Params, PreIssuance, PreRefund, PublicKey, Refund, SpendProof,
+    credit_to_scalar, scalar_to_credit,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -846,81 +846,92 @@ impl Inner {
         });
         let request_at = now_ms();
 
-        let resp = client
+        // Send the chat request. On failure, attempt refund recovery before
+        // propagating the error so the credential isn't abandoned.
+        let chat_result = client
             .post(format!("{base_url}/v1/chat/completions"))
             .header("Authorization", &auth_value)
             .json(&request_body_json)
             .send()
-            .await
-            .map_err(AppError::from_request)?;
+            .await;
         let response_at = now_ms();
 
-        if let Some(new_cid) =
-            flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?
-        {
-            connection_id = Some(new_cid);
-        }
-
-        let status = resp.status();
-        let response_text = resp.text().await.map_err(|e| AppError::Network {
-            message: format!("failed to read response: {e}"),
-        })?;
-        let body: serde_json::Value =
-            serde_json::from_str(&response_text).map_err(|e| AppError::Network {
-                message: format!("failed to parse response JSON: {e}"),
-            })?;
-
-        if let Some(refund_obj) = body.get("refund") {
-            let refund_b64 = refund_obj
-                .get("refund")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Credential {
-                    message: "missing refund data in response".into(),
-                })?;
-            let refund_key_id = refund_obj
-                .get("issuer_key_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Credential {
-                    message: "missing issuer_key_id in refund".into(),
-                })?;
-
-            let refund_cbor =
-                URL_SAFE_NO_PAD
-                    .decode(refund_b64)
-                    .map_err(|e| AppError::Credential {
-                        message: format!("invalid refund base64: {e}"),
-                    })?;
-            let refund = Refund::from_cbor(&refund_cbor).map_err(|e| AppError::Credential {
-                message: format!("invalid refund CBOR: {e}"),
-            })?;
-
-            let new_token = pre_refund
-                .to_credit_token::<128>(&params, &spend_proof, &refund, &public_key)
-                .map_err(|e| AppError::Credential {
-                    message: format!("failed to construct refund credit token: {e:?}"),
-                })?;
-
-            let new_token_cbor = new_token.to_cbor().map_err(|e| AppError::Credential {
-                message: format!("failed to encode new credit token: {e}"),
-            })?;
-            let new_nonce = hex_encode(&new_token.nullifier().to_bytes());
-            let new_credits = scalar_to_credit::<128>(&new_token.credits()).map_err(|e| {
-                AppError::Credential {
-                    message: format!("invalid credit amount in refund token: {e}"),
+        let (status, response_text, body) = match chat_result {
+            Ok(resp) => {
+                if let Some(new_cid) =
+                    flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now)
+                        .await?
+                {
+                    connection_id = Some(new_cid);
                 }
-            })?;
 
-            db::insert_credential(
+                let status = resp.status();
+                let text = resp.text().await.map_err(|e| AppError::Network {
+                    message: format!("failed to read response: {e}"),
+                })?;
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|e| AppError::Network {
+                        message: format!("failed to parse response JSON: {e}"),
+                    })?;
+                (status, text, parsed)
+            }
+            Err(e) => {
+                // Network error — the server may or may not have received the
+                // request. Try to recover the refund token.
+                let original_err = AppError::from_request(e);
+                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
+                    let _ = process_refund(
+                        &refund_obj,
+                        &params,
+                        &spend_proof,
+                        &pre_refund,
+                        &public_key,
+                        &db_conn,
+                        &pre_cred_id,
+                        cred.generation + 1,
+                        now,
+                    )
+                    .await;
+                }
+                return Err(original_err);
+            }
+        };
+
+        // Process the refund token from the response. If none is present,
+        // attempt recovery from the server.
+        let mut refund_stored = false;
+        if let Some(refund_obj) = body.get("refund") {
+            process_refund(
+                refund_obj,
+                &params,
+                &spend_proof,
+                &pre_refund,
+                &public_key,
                 &db_conn,
-                &new_nonce,
                 &pre_cred_id,
-                refund_key_id,
-                &new_token_cbor,
-                new_credits as i64,
                 cred.generation + 1,
                 now,
             )
             .await?;
+            refund_stored = true;
+        }
+
+        if !refund_stored {
+            // No refund in the response — try the recovery endpoint.
+            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
+                let _ = process_refund(
+                    &refund_obj,
+                    &params,
+                    &spend_proof,
+                    &pre_refund,
+                    &public_key,
+                    &db_conn,
+                    &pre_cred_id,
+                    cred.generation + 1,
+                    now,
+                )
+                .await;
+            }
         }
 
         let usage = body.get("usage");
@@ -1433,6 +1444,121 @@ struct ModelListEntry {
     id: String,
     context_length: u64,
     pricing: ModelPricingInfo,
+}
+
+// ============================================================================
+// Refund processing helpers
+// ============================================================================
+
+/// Extract a refund token from a JSON object and store the resulting credential.
+///
+/// `refund_obj` is the `"refund"` value from a server response (either a chat
+/// completion or the recovery endpoint). Returns `true` if the credential was
+/// successfully stored.
+#[allow(clippy::too_many_arguments)]
+async fn process_refund(
+    refund_obj: &serde_json::Value,
+    params: &Params,
+    spend_proof: &SpendProof<128>,
+    pre_refund: &PreRefund,
+    public_key: &PublicKey,
+    db_conn: &turso::Connection,
+    pre_cred_id: &str,
+    generation: i64,
+    now: i64,
+) -> Result<(), AppError> {
+    let refund_b64 = refund_obj
+        .get("refund")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Credential {
+            message: "missing refund data in response".into(),
+        })?;
+    let refund_key_id = refund_obj
+        .get("issuer_key_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Credential {
+            message: "missing issuer_key_id in refund".into(),
+        })?;
+
+    let refund_cbor = URL_SAFE_NO_PAD
+        .decode(refund_b64)
+        .map_err(|e| AppError::Credential {
+            message: format!("invalid refund base64: {e}"),
+        })?;
+    let refund = Refund::from_cbor(&refund_cbor).map_err(|e| AppError::Credential {
+        message: format!("invalid refund CBOR: {e}"),
+    })?;
+
+    let new_token = pre_refund
+        .to_credit_token::<128>(params, spend_proof, &refund, public_key)
+        .map_err(|e| AppError::Credential {
+            message: format!("failed to construct refund credit token: {e:?}"),
+        })?;
+
+    let new_token_cbor = new_token.to_cbor().map_err(|e| AppError::Credential {
+        message: format!("failed to encode new credit token: {e}"),
+    })?;
+    let new_nonce = hex_encode(&new_token.nullifier().to_bytes());
+    let new_credits =
+        scalar_to_credit::<128>(&new_token.credits()).map_err(|e| AppError::Credential {
+            message: format!("invalid credit amount in refund token: {e}"),
+        })?;
+
+    db::insert_credential(
+        db_conn,
+        &new_nonce,
+        pre_cred_id,
+        refund_key_id,
+        &new_token_cbor,
+        new_credits as i64,
+        generation,
+        now,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Attempt to recover a refund token from the server via
+/// `POST /v1/credentials/refund`. Returns the refund JSON object on success.
+async fn recover_refund(
+    client: &reqwest::Client,
+    base_url: &str,
+    auth_value: &str,
+) -> Result<serde_json::Value, AppError> {
+    let resp = client
+        .post(format!("{base_url}/v1/credentials/refund"))
+        .header("Authorization", auth_value)
+        .send()
+        .await
+        .map_err(AppError::from_request)?;
+
+    let status = resp.status();
+    let body_text = resp.text().await.map_err(|e| AppError::Network {
+        message: format!("failed to read recovery response: {e}"),
+    })?;
+    let body: serde_json::Value =
+        serde_json::from_str(&body_text).map_err(|e| AppError::Network {
+            message: format!("failed to parse recovery response: {e}"),
+        })?;
+
+    if !status.is_success() {
+        let msg = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(AppError::Server {
+            status: status.as_u16(),
+            message: format!("refund recovery failed: {msg}"),
+        });
+    }
+
+    body.get("refund")
+        .cloned()
+        .ok_or_else(|| AppError::Credential {
+            message: "recovery response missing refund field".into(),
+        })
 }
 
 // ============================================================================

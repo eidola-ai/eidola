@@ -616,15 +616,64 @@ pub async fn record_nullifier(
         .await
         .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
 
-    let row = client
-        .query_one(
-            "SELECT record_nullifier($1, $2) as recorded",
+    let rows_affected = client
+        .execute(
+            "INSERT INTO nullifier (issuer_key_id, value) \
+             VALUES ($1, $2) ON CONFLICT DO NOTHING",
             &[&issuer_key_id, &value],
         )
         .await
         .map_err(|e| ServerError::Internal(format!("record_nullifier failed: {e:?}")))?;
 
-    Ok(row.get::<_, bool>("recorded"))
+    Ok(rows_affected > 0)
+}
+
+/// Store a CBOR-encoded refund token on an existing nullifier row.
+pub async fn store_refund_token(
+    pool: &Pool,
+    issuer_key_id: &str,
+    nullifier_value: &[u8],
+    refund_token: &[u8],
+) -> Result<(), ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    client
+        .execute(
+            "UPDATE nullifier SET refund_token = $3 \
+             WHERE issuer_key_id = $1 AND value = $2",
+            &[&issuer_key_id, &nullifier_value, &refund_token],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("store_refund_token failed: {e:?}")))?;
+
+    Ok(())
+}
+
+/// Retrieve a stored refund token for a nullifier. Returns `None` if the
+/// nullifier does not exist or no refund token has been stored yet.
+pub async fn get_refund_token(
+    pool: &Pool,
+    issuer_key_id: &str,
+    nullifier_value: &[u8],
+) -> Result<Option<Vec<u8>>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e:?}")))?;
+
+    let row = client
+        .query_opt(
+            "SELECT refund_token FROM nullifier \
+             WHERE issuer_key_id = $1 AND value = $2",
+            &[&issuer_key_id, &nullifier_value],
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("get_refund_token failed: {e:?}")))?;
+
+    Ok(row.and_then(|r| r.get::<_, Option<Vec<u8>>>("refund_token")))
 }
 
 /// A single ledger entry row.

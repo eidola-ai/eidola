@@ -115,6 +115,9 @@ fn actual_cost(usage: &Usage, model: &Model) -> u128 {
 ///
 /// `refund_credits` is the number of credits to return (i.e., the `t` parameter
 /// in the ACT spec — the resulting token will have `c - s + t` credits).
+///
+/// The refund token is also stored in the nullifier row so the client can
+/// recover it via `POST /v1/credentials/refund` if the response is lost.
 async fn issue_refund_async(
     state: &AppState,
     spend_proof: &SpendProof<128>,
@@ -138,9 +141,19 @@ async fn issue_refund_async(
         .to_cbor()
         .map_err(|e| ServerError::Internal(format!("refund CBOR encoding failed: {e:?}")))?;
 
+    // Best-effort store in DB for client recovery. Failure here is not fatal
+    // — the refund is still returned in the response.
+    let key_id = hex::encode(issuer_key_hash);
+    let nullifier_bytes = spend_proof.nullifier().as_bytes().to_vec();
+    if let Err(e) =
+        db::store_refund_token(&state.db_pool, &key_id, &nullifier_bytes, &refund_cbor).await
+    {
+        warn!("Failed to store refund token for recovery: {e}");
+    }
+
     Ok(RefundInfo {
         refund: URL_SAFE_NO_PAD.encode(&refund_cbor),
-        issuer_key_id: hex::encode(issuer_key_hash),
+        issuer_key_id: key_id,
     })
 }
 

@@ -100,5 +100,6 @@ pub fn build_router() -> OpenApiRouter<AppState> {
         .routes(routes!(account::get_ledger))
         .routes(routes!(credentials::list_keys))
         .routes(routes!(credentials::issue_credentials))
+        .routes(routes!(credentials::recover_refund))
         .routes(routes!(webhook::stripe_webhook))
 }
