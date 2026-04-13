@@ -693,10 +693,49 @@ impl Inner {
                 })?;
 
         let max_completion_tokens = (model_entry.context_length).min(4096) as u32;
+
+        let user_participant_id =
+            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+        let model_participant_id =
+            db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
+
+        // Reuse existing space or create a new one
+        let space_id = if let Some(sid) = space_id {
+            db::get_space(&db_conn, sid)
+                .await?
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("space not found: {sid}"),
+                })?;
+            // Ensure model participant is in the space (may be new model for this space)
+            let _ =
+                db::insert_space_participant(&db_conn, sid, &model_participant_id, "member", now)
+                    .await; // ignore duplicate
+            sid.to_string()
+        } else {
+            let sid = Uuid::now_v7().to_string();
+            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
+            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
+                .await?;
+            db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
+                .await?;
+            sid
+        };
+
+        // Load prior actions to build multi-turn context — needed both for
+        // credit estimation (total prompt size) and message assembly.
+        let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
+        let prior_messages = actions_to_messages(&prior_action_rows);
+
+        // Estimate prompt size from ALL messages (prior history + current prompt)
+        let total_prompt_bytes: u128 = prior_messages
+            .iter()
+            .map(|m| m.content.len() as u128)
+            .sum::<u128>()
+            + prompt.len() as u128;
+
         let sf = model_entry.pricing.per_prompt_token.scale_factor as u128;
-        let prompt_bytes = prompt.len() as u128;
         let prompt_rate = model_entry.pricing.per_prompt_token.value as u128;
-        let prompt_credits = (prompt_bytes * prompt_rate).div_ceil(sf);
+        let prompt_credits = (total_prompt_bytes * prompt_rate).div_ceil(sf);
         let completion_rate = model_entry.pricing.per_completion_token.value as u128;
         let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
         let charge_credits = prompt_credits + completion_credits;
@@ -763,37 +802,6 @@ impl Inner {
 
         let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
         let auth_value = format!("PrivateToken token=\"{token_b64}\"");
-
-        let user_participant_id =
-            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
-        let model_participant_id =
-            db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
-
-        // Reuse existing space or create a new one
-        let space_id = if let Some(sid) = space_id {
-            db::get_space(&db_conn, sid)
-                .await?
-                .ok_or_else(|| AppError::NotConfigured {
-                    message: format!("space not found: {sid}"),
-                })?;
-            // Ensure model participant is in the space (may be new model for this space)
-            let _ =
-                db::insert_space_participant(&db_conn, sid, &model_participant_id, "member", now)
-                    .await; // ignore duplicate
-            sid.to_string()
-        } else {
-            let sid = Uuid::now_v7().to_string();
-            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
-            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
-                .await?;
-            db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
-                .await?;
-            sid
-        };
-
-        // Load prior actions from this space to build multi-turn context
-        let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
-        let prior_messages = actions_to_messages(&prior_action_rows);
 
         // Find the last action in the space for antecedent linking
         let last_action_id = db::last_action_in_space(&db_conn, &space_id).await?;
