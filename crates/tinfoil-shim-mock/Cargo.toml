@@ -26,7 +26,7 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "rin
 rsa = { version = "0.9", features = ["pem"] }
 x509-cert = "0.2"
 der = { version = "0.7", features = ["alloc", "pem"] }
-spki = "0.7"
+spki = "0.8"
 
 # Attestation chain self-verification (same crate the verifier uses)
 sev = { version = "7", default-features = false, features = ["snp", "crypto_nossl"] }
