@@ -115,6 +115,7 @@ async fn live_attesting_client() {
         tdx_observer: None,
         snp_min_tcb: None,
         snp_observer: None,
+        attestation_observer: None,
         tls_roots: webpki,
     })
     .await

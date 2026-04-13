@@ -1424,20 +1424,11 @@ dependencies = [
 name = "eidola-app-core"
 version = "0.1.0"
 dependencies = [
- "uniffi",
-]
-
-[[package]]
-name = "eidola-cli"
-version = "0.1.0"
-dependencies = [
  "anonymous-credit-tokens",
  "base64 0.22.1",
  "blake3",
- "clap",
  "der",
  "dirs",
- "open",
  "rand_core 0.6.4",
  "reqwest 0.13.2",
  "rustls",
@@ -1446,12 +1437,23 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "thiserror 2.0.18",
  "tinfoil-verifier",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "turso",
+ "uniffi",
  "uuid",
  "x509-cert",
+]
+
+[[package]]
+name = "eidola-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "eidola-app-core",
+ "open",
 ]
 
 [[package]]

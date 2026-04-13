@@ -1,17 +1,1534 @@
+pub mod config;
+pub mod db;
+pub mod error;
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anonymous_credit_tokens::{
+    CreditToken, IssuanceResponse, Params, PreIssuance, PublicKey, Refund, credit_to_scalar,
+    scalar_to_credit,
+};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rand_core::OsRng;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use config::Config;
+use error::AppError;
+
 uniffi::setup_scaffolding!();
 
-/// A simple greeting as a smoke test for the UniFFI bridge.
-#[uniffi::export]
-pub fn greet() -> String {
-    "Hello, World!".to_string()
+// ============================================================================
+// UniFFI record types — data transfer objects crossing the FFI boundary
+// ============================================================================
+
+/// Snapshot of the current config for display.
+#[derive(uniffi::Record)]
+pub struct ConfigState {
+    pub base_url: Option<String>,
+    pub has_account: bool,
+    pub has_account_secret: bool,
+    pub domain_separator: String,
+    pub trusted_measurements: Vec<MeasurementInfo>,
+    pub has_hardware_root_ca: bool,
+    pub has_hardware_intermediate_ca: bool,
+    pub attestation_url: Option<String>,
 }
+
+#[derive(uniffi::Record)]
+pub struct MeasurementInfo {
+    pub snp: String,
+    pub tdx_rtmr1: String,
+    pub tdx_rtmr2: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct AccountCreateResult {
+    pub id: String,
+    pub created_at: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct AccountShowResult {
+    pub id: String,
+    pub stripe_customer_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct PriceInfo {
+    pub id: String,
+    pub product_name: String,
+    pub product_description: Option<String>,
+    pub amount_display: String,
+    pub recurrence: String,
+    pub credits: i64,
+}
+
+#[derive(uniffi::Record)]
+pub struct BalancesResult {
+    pub available: i64,
+    pub pools: Vec<BalancePoolInfo>,
+}
+
+#[derive(uniffi::Record)]
+pub struct BalancePoolInfo {
+    pub amount: i64,
+    pub source: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct CredentialInfo {
+    pub nonce: String,
+    pub credits: i64,
+    pub generation: i64,
+}
+
+#[derive(uniffi::Record)]
+pub struct AllocateResult {
+    pub nonce: String,
+    pub credits: i64,
+    pub issuer_key_id: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct ChatResult {
+    pub content: String,
+    pub model: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub credits_charged: i64,
+}
+
+#[derive(uniffi::Record)]
+pub struct ModelInfo {
+    pub id: String,
+    pub context_length: u64,
+}
+
+// ============================================================================
+// Default directory helpers (exported via UniFFI for use from Swift)
+// ============================================================================
+
+#[uniffi::export]
+pub fn default_config_dir() -> Option<String> {
+    config::default_config_path().and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
+}
+
+#[uniffi::export]
+pub fn default_data_dir() -> Option<String> {
+    config::default_data_dir().map(|d| d.to_string_lossy().into_owned())
+}
+
+// ============================================================================
+// Inner — shared state used by AppCore, wrapped in Arc so it can move into
+// spawned futures on the owned tokio runtime.
+// ============================================================================
+
+struct Inner {
+    config_path: PathBuf,
+    data_dir: PathBuf,
+    db: tokio::sync::OnceCell<turso::Database>,
+}
+
+// --- Config helpers (sync) ---------------------------------------------------
+
+impl Inner {
+    fn load_config(&self) -> Config {
+        Config::load_from(&self.config_path)
+    }
+
+    fn require_base_url<'a>(&self, cfg: &'a Config) -> Result<&'a str, AppError> {
+        cfg.base_url
+            .as_deref()
+            .ok_or_else(|| AppError::NotConfigured {
+                message: "base_url not configured".into(),
+            })
+    }
+
+    fn require_credentials<'a>(&self, cfg: &'a Config) -> Result<(&'a str, &'a str), AppError> {
+        match (&cfg.account_id, &cfg.account_secret) {
+            (Some(id), Some(secret)) => Ok((id, secret)),
+            _ => Err(AppError::NotConfigured {
+                message: "account not configured".into(),
+            }),
+        }
+    }
+}
+
+// --- Async infrastructure ----------------------------------------------------
+
+impl Inner {
+    async fn db_conn(&self) -> Result<turso::Connection, AppError> {
+        let database = self.db.get_or_try_init(|| db::open(&self.data_dir)).await?;
+        database.connect().map_err(AppError::db)
+    }
+
+    async fn build_client(
+        &self,
+        config: &Config,
+        attestation_observer: Option<tinfoil_verifier::AttestationObserver>,
+    ) -> Result<reqwest::Client, AppError> {
+        if config.trusted_measurements.is_empty() {
+            let tls_config = rustls::ClientConfig::builder()
+                .with_root_certificates(load_native_root_store())
+                .with_no_client_auth();
+            return reqwest::Client::builder()
+                .tls_backend_preconfigured(tls_config)
+                .build()
+                .map_err(|e| AppError::Network {
+                    message: format!("failed to build HTTP client: {e}"),
+                });
+        }
+
+        let origin = config
+            .base_url
+            .as_deref()
+            .ok_or_else(|| AppError::NotConfigured {
+                message: "base_url is required when attestation is enabled".into(),
+            })?;
+
+        let hardware_root_der =
+            config::parse_cert_config(config.hardware_root_ca.as_deref(), "hardware_root_ca")?;
+        let hardware_intermediate_der = config::parse_cert_config(
+            config.hardware_intermediate_ca.as_deref(),
+            "hardware_intermediate_ca",
+        )?;
+
+        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
+            allowed_measurements: &config.trusted_measurements,
+            inference_base_url: origin,
+            atc_url: config.attestation_url.as_deref(),
+            enclave_repo: Some(config.attestation_repo()),
+            trusted_ark_der: hardware_root_der.as_deref(),
+            trusted_ask_der: hardware_intermediate_der.as_deref(),
+            tdx_advisory_allowlist: None,
+            tdx_observer: None,
+            snp_min_tcb: None,
+            snp_observer: None,
+            attestation_observer,
+            tls_roots: load_native_root_store(),
+        })
+        .await
+        .map_err(|e| AppError::Attestation {
+            message: format!("attestation client build failed: {e}"),
+        })
+    }
+}
+
+// --- High-level async operations (run on the owned tokio runtime) ------------
+
+impl Inner {
+    async fn account_show(&self) -> Result<AccountShowResult, AppError> {
+        let cfg = self.load_config();
+        let base_url = self.require_base_url(&cfg)?;
+        let (id, secret) = self.require_credentials(&cfg)?;
+
+        let client = self.build_client(&cfg, None).await?;
+        let resp = client
+            .get(format!("{base_url}/v1/account"))
+            .basic_auth(id, Some(secret))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let account: GetAccountResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse response: {e}"),
+            })?;
+
+        Ok(AccountShowResult {
+            id: account.id.to_string(),
+            stripe_customer_id: account.stripe_customer_id,
+            created_at: account.created_at,
+        })
+    }
+
+    async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
+        let cfg = self.load_config();
+        let base_url = self.require_base_url(&cfg)?;
+
+        if cfg.account_id.is_some() || cfg.account_secret.is_some() {
+            return Err(AppError::Config {
+                message: "account credentials already configured — reset first".into(),
+            });
+        }
+
+        let client = self.build_client(&cfg, None).await?;
+        let resp = client
+            .post(format!("{base_url}/v1/account"))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let created: CreateAccountResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse response: {e}"),
+            })?;
+
+        let mut cfg = self.load_config();
+        cfg.account_id = Some(created.account_id.to_string());
+        cfg.account_secret = Some(created.secret);
+        cfg.save_to(&self.config_path)?;
+
+        Ok(AccountCreateResult {
+            id: created.account_id.to_string(),
+            created_at: created.created_at,
+        })
+    }
+
+    async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
+        let cfg = self.load_config();
+        let base_url = self.require_base_url(&cfg)?;
+
+        let client = self.build_client(&cfg, None).await?;
+        let resp = client
+            .get(format!("{base_url}/v1/prices"))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let prices: ListPricesResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse response: {e}"),
+            })?;
+
+        Ok(prices
+            .data
+            .into_iter()
+            .map(|p| {
+                let amount_display = p
+                    .unit_amount
+                    .map(|a| format!("{}.{:02} {}", a / 100, a % 100, p.currency.to_uppercase()))
+                    .unwrap_or_else(|| "free".to_string());
+
+                let recurrence = p
+                    .recurring
+                    .as_ref()
+                    .map(|r| {
+                        if r.interval_count == 1 {
+                            format!("/{}", r.interval)
+                        } else {
+                            format!("/{}x{}", r.interval_count, r.interval)
+                        }
+                    })
+                    .unwrap_or_default();
+
+                PriceInfo {
+                    id: p.id,
+                    product_name: p.product_name,
+                    product_description: p.product_description,
+                    amount_display,
+                    recurrence,
+                    credits: p.credits,
+                }
+            })
+            .collect())
+    }
+
+    async fn account_checkout(&self, price_id: &str) -> Result<String, AppError> {
+        let cfg = self.load_config();
+        let base_url = self.require_base_url(&cfg)?;
+        let (id, secret) = self.require_credentials(&cfg)?;
+
+        let client = self.build_client(&cfg, None).await?;
+        let resp = client
+            .post(format!("{base_url}/v1/account/checkout"))
+            .basic_auth(id, Some(secret))
+            .json(&serde_json::json!({ "price_id": price_id }))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let checkout: CheckoutUrlResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse response: {e}"),
+            })?;
+
+        Ok(checkout.checkout_url)
+    }
+
+    async fn account_balances(&self) -> Result<BalancesResult, AppError> {
+        let cfg = self.load_config();
+        let base_url = self.require_base_url(&cfg)?;
+        let (id, secret) = self.require_credentials(&cfg)?;
+
+        let client = self.build_client(&cfg, None).await?;
+        let resp = client
+            .get(format!("{base_url}/v1/account/balances"))
+            .basic_auth(id, Some(secret))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let balances: BalancesResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse response: {e}"),
+            })?;
+
+        Ok(BalancesResult {
+            available: balances.available,
+            pools: balances
+                .pools
+                .into_iter()
+                .map(|p| BalancePoolInfo {
+                    amount: p.amount,
+                    source: p.source,
+                    expires_at: p.expires_at,
+                })
+                .collect(),
+        })
+    }
+
+    async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
+        if credits <= 0 {
+            return Err(AppError::Credential {
+                message: "credits must be greater than 0".into(),
+            });
+        }
+
+        let cfg = self.load_config();
+        let base_url = self.require_base_url(&cfg)?;
+        let (account_id, secret) = self.require_credentials(&cfg)?;
+        let client = self.build_client(&cfg, None).await?;
+
+        // 1. Fetch issuer keys
+        let resp = client
+            .get(format!("{base_url}/v1/keys"))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let keys: ListKeysResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse keys response: {e}"),
+            })?;
+
+        let expected_ds = cfg.domain_separator();
+        let key = keys
+            .data
+            .iter()
+            .find(|k| k.domain_separator == expected_ds)
+            .ok_or_else(|| {
+                let server_ds: Vec<&str> = keys
+                    .data
+                    .iter()
+                    .map(|k| k.domain_separator.as_str())
+                    .collect();
+                AppError::Credential {
+                    message: format!(
+                        "no issuer key matches expected domain separator \"{expected_ds}\"\n\
+                         server advertised: {server_ds:?}"
+                    ),
+                }
+            })?;
+
+        let public_key_cbor =
+            URL_SAFE_NO_PAD
+                .decode(&key.public_key)
+                .map_err(|e| AppError::Credential {
+                    message: format!("invalid base64 public key: {e}"),
+                })?;
+
+        let public_key =
+            PublicKey::from_cbor(&public_key_cbor).map_err(|e| AppError::Credential {
+                message: format!("invalid public key CBOR: {e}"),
+            })?;
+
+        let params = params_from_domain_separator(expected_ds)?;
+
+        // 2. Open DB and store issuer key
+        let db_conn = self.db_conn().await?;
+        let params_hash = blake3::hash(key.domain_separator.as_bytes())
+            .to_hex()
+            .to_string();
+        let now = now_ms();
+        let expires_at = iso_to_ms(&key.issue_until)?;
+
+        db::upsert_issuer_key(
+            &db_conn,
+            &key.id,
+            &params_hash,
+            &public_key_cbor,
+            key.domain_separator.as_bytes(),
+            expires_at,
+            now,
+        )
+        .await?;
+
+        // 3. Create PreIssuance checkpoint
+        let pre_issuance = PreIssuance::random(OsRng);
+        let pre_issuance_cbor = pre_issuance.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode pre_issuance: {e}"),
+        })?;
+        let pre_credential_id = Uuid::now_v7().to_string();
+        db::insert_pre_credential_issuance(
+            &db_conn,
+            &pre_credential_id,
+            &key.id,
+            &pre_issuance_cbor,
+            credits,
+            now,
+        )
+        .await?;
+
+        // 4. Send issuance request
+        let issuance_request = pre_issuance.request(&params, OsRng);
+        let request_cbor = issuance_request
+            .to_cbor()
+            .map_err(|e| AppError::Credential {
+                message: format!("failed to encode issuance request: {e}"),
+            })?;
+
+        let resp = client
+            .post(format!("{base_url}/v1/account/credentials"))
+            .basic_auth(account_id, Some(secret))
+            .json(&serde_json::json!({
+                "issuance_request": URL_SAFE_NO_PAD.encode(&request_cbor),
+                "credits": credits,
+            }))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let issued: IssueCredentialsResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse issuance response: {e}"),
+            })?;
+
+        // 5. Construct CreditToken
+        let response_cbor = URL_SAFE_NO_PAD
+            .decode(&issued.issuance_response)
+            .map_err(|e| AppError::Credential {
+                message: format!("invalid issuance response base64: {e}"),
+            })?;
+        let issuance_response =
+            IssuanceResponse::from_cbor(&response_cbor).map_err(|e| AppError::Credential {
+                message: format!("invalid issuance response CBOR: {e}"),
+            })?;
+        let credit_token = pre_issuance
+            .to_credit_token::<128>(&params, &public_key, &issuance_request, &issuance_response)
+            .map_err(|e| AppError::Credential {
+                message: format!("failed to construct credit token: {e}"),
+            })?;
+
+        // 6. Store credential
+        let token_cbor = credit_token.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode credit token: {e}"),
+        })?;
+        let nonce_hex = hex_encode(&credit_token.nullifier().to_bytes());
+        let token_credits =
+            scalar_to_credit::<128>(&credit_token.credits()).map_err(|e| AppError::Credential {
+                message: format!("invalid credit amount in token: {e}"),
+            })?;
+
+        db::insert_credential(
+            &db_conn,
+            &nonce_hex,
+            &pre_credential_id,
+            &issued.issuer_key_id,
+            &token_cbor,
+            token_credits as i64,
+            0,
+            now,
+        )
+        .await?;
+
+        Ok(AllocateResult {
+            nonce: nonce_hex,
+            credits: issued.credits,
+            issuer_key_id: issued.issuer_key_id,
+        })
+    }
+
+    async fn wallet_credentials(&self) -> Result<Vec<CredentialInfo>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_active_credentials(&db_conn).await?;
+        Ok(rows
+            .into_iter()
+            .map(|c| CredentialInfo {
+                nonce: c.nonce,
+                credits: c.credits,
+                generation: c.generation,
+            })
+            .collect())
+    }
+
+    async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
+        let cfg = self.load_config();
+        let base_url = self.require_base_url(&cfg)?;
+        let client = self.build_client(&cfg, None).await?;
+
+        let models = fetch_models(&client, base_url).await?;
+        Ok(models
+            .data
+            .into_iter()
+            .map(|m| ModelInfo {
+                id: m.id,
+                context_length: m.context_length,
+            })
+            .collect())
+    }
+
+    async fn chat(&self, prompt: &str, model: &str) -> Result<ChatResult, AppError> {
+        let cfg = self.load_config();
+        let base_url = self.require_base_url(&cfg)?;
+        let now = now_ms();
+
+        let db_conn = self.db_conn().await?;
+        let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
+
+        let attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let log_clone = attestation_log.clone();
+        let observer: Option<tinfoil_verifier::AttestationObserver> = Some(Arc::new(
+            move |att: tinfoil_verifier::VerifiedAttestation| {
+                log_clone.lock().unwrap().push(att);
+            },
+        ));
+
+        let client = self.build_client(&cfg, observer).await?;
+
+        let models = fetch_models(&client, base_url).await?;
+        let mut connection_id =
+            flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?;
+
+        let model_entry =
+            models
+                .data
+                .iter()
+                .find(|m| m.id == model)
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("model not found: {model}"),
+                })?;
+
+        let max_completion_tokens = (model_entry.context_length).min(4096) as u32;
+        let sf = model_entry.pricing.per_prompt_token.scale_factor as u128;
+        let prompt_bytes = prompt.len() as u128;
+        let prompt_rate = model_entry.pricing.per_prompt_token.value as u128;
+        let prompt_credits = (prompt_bytes * prompt_rate).div_ceil(sf);
+        let completion_rate = model_entry.pricing.per_completion_token.value as u128;
+        let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
+        let charge_credits = prompt_credits + completion_credits;
+
+        if charge_credits == 0 {
+            return Err(AppError::Credential {
+                message: "computed charge is zero — model pricing may be missing".into(),
+            });
+        }
+
+        let cred = db::find_spendable_credential(&db_conn, charge_credits as i64)
+            .await?
+            .ok_or_else(|| AppError::Credential {
+                message: "no credential with sufficient credits found".into(),
+            })?;
+
+        let credit_token =
+            CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
+                message: format!("failed to decode credential: {e}"),
+            })?;
+        let public_key =
+            PublicKey::from_cbor(&cred.public_key_data).map_err(|e| AppError::Credential {
+                message: format!("failed to decode public key: {e}"),
+            })?;
+
+        let params = params_from_domain_separator(cfg.domain_separator())?;
+
+        let charge_scalar =
+            credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
+                message: format!("invalid charge amount: {e:?}"),
+            })?;
+        let (spend_proof, pre_refund) = credit_token
+            .prove_spend::<128>(&params, charge_scalar, OsRng)
+            .map_err(|e| AppError::Credential {
+                message: format!("failed to create spend proof: {e:?}"),
+            })?;
+
+        let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode pre_refund: {e}"),
+        })?;
+        let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode spend proof: {e}"),
+        })?;
+        let pre_cred_id = Uuid::now_v7().to_string();
+        db::insert_pre_credential_refund(
+            &db_conn,
+            &pre_cred_id,
+            &cred.nonce,
+            &cred.issuer_key_id,
+            &pre_refund_cbor,
+            charge_credits as i64,
+            now,
+        )
+        .await?;
+
+        let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
+        let challenge_digest = compute_challenge_digest();
+
+        let mut token_bytes = Vec::new();
+        token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+        token_bytes.extend_from_slice(&challenge_digest);
+        token_bytes.extend_from_slice(&issuer_key_hash);
+        token_bytes.extend_from_slice(&spend_proof_cbor);
+
+        let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
+        let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+
+        let user_participant_id =
+            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+        let model_participant_id =
+            db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
+
+        let space_id = Uuid::now_v7().to_string();
+        db::insert_space(&db_conn, &space_id, None, "unlinked", now).await?;
+        db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
+            .await?;
+        db::insert_space_participant(&db_conn, &space_id, &model_participant_id, "member", now)
+            .await?;
+
+        let user_action_id = Uuid::now_v7().to_string();
+        db::insert_action(
+            &db_conn,
+            &db::ActionEntry {
+                id: user_action_id.clone(),
+                space_id: space_id.clone(),
+                participant_id: user_participant_id,
+                action_type: "user_input".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at: now,
+            },
+        )
+        .await?;
+        db::insert_text_content_block(
+            &db_conn,
+            &Uuid::now_v7().to_string(),
+            &user_action_id,
+            0,
+            "text",
+            prompt,
+        )
+        .await?;
+
+        let request_body_json = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_completion_tokens": max_completion_tokens,
+        });
+        let request_at = now_ms();
+
+        let resp = client
+            .post(format!("{base_url}/v1/chat/completions"))
+            .header("Authorization", &auth_value)
+            .json(&request_body_json)
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+        let response_at = now_ms();
+
+        if let Some(new_cid) =
+            flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?
+        {
+            connection_id = Some(new_cid);
+        }
+
+        let status = resp.status();
+        let response_text = resp.text().await.map_err(|e| AppError::Network {
+            message: format!("failed to read response: {e}"),
+        })?;
+        let body: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| AppError::Network {
+                message: format!("failed to parse response JSON: {e}"),
+            })?;
+
+        if let Some(refund_obj) = body.get("refund") {
+            let refund_b64 = refund_obj
+                .get("refund")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Credential {
+                    message: "missing refund data in response".into(),
+                })?;
+            let refund_key_id = refund_obj
+                .get("issuer_key_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Credential {
+                    message: "missing issuer_key_id in refund".into(),
+                })?;
+
+            let refund_cbor =
+                URL_SAFE_NO_PAD
+                    .decode(refund_b64)
+                    .map_err(|e| AppError::Credential {
+                        message: format!("invalid refund base64: {e}"),
+                    })?;
+            let refund = Refund::from_cbor(&refund_cbor).map_err(|e| AppError::Credential {
+                message: format!("invalid refund CBOR: {e}"),
+            })?;
+
+            let new_token = pre_refund
+                .to_credit_token::<128>(&params, &spend_proof, &refund, &public_key)
+                .map_err(|e| AppError::Credential {
+                    message: format!("failed to construct refund credit token: {e:?}"),
+                })?;
+
+            let new_token_cbor = new_token.to_cbor().map_err(|e| AppError::Credential {
+                message: format!("failed to encode new credit token: {e}"),
+            })?;
+            let new_nonce = hex_encode(&new_token.nullifier().to_bytes());
+            let new_credits = scalar_to_credit::<128>(&new_token.credits()).map_err(|e| {
+                AppError::Credential {
+                    message: format!("invalid credit amount in refund token: {e}"),
+                }
+            })?;
+
+            db::insert_credential(
+                &db_conn,
+                &new_nonce,
+                &pre_cred_id,
+                refund_key_id,
+                &new_token_cbor,
+                new_credits as i64,
+                cred.generation + 1,
+                now,
+            )
+            .await?;
+        }
+
+        let usage = body.get("usage");
+        let input_tokens = usage
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_i64());
+        let output_tokens = usage
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_i64());
+
+        let inference_action_id = Uuid::now_v7().to_string();
+        db::insert_action(
+            &db_conn,
+            &db::ActionEntry {
+                id: inference_action_id.clone(),
+                space_id: space_id.clone(),
+                participant_id: model_participant_id,
+                action_type: "inference".to_string(),
+                status: if status.is_success() {
+                    "complete"
+                } else {
+                    "error"
+                }
+                .to_string(),
+                intent: None,
+                model: Some(model.to_string()),
+                input_tokens,
+                output_tokens,
+                credits_consumed: Some(charge_credits as i64),
+                created_at: now_ms(),
+            },
+        )
+        .await?;
+        db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0).await?;
+
+        let context_assembly_id = Uuid::now_v7().to_string();
+        db::insert_context_assembly(
+            &db_conn,
+            &context_assembly_id,
+            &inference_action_id,
+            None,
+            input_tokens,
+            false,
+            now_ms(),
+        )
+        .await?;
+        db::insert_context_assembly_action(&db_conn, &context_assembly_id, &user_action_id, 0)
+            .await?;
+
+        let response_content = body
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if !response_content.is_empty() {
+            db::insert_text_content_block(
+                &db_conn,
+                &Uuid::now_v7().to_string(),
+                &inference_action_id,
+                0,
+                "text",
+                &response_content,
+            )
+            .await?;
+        }
+
+        db::insert_request(
+            &db_conn,
+            &db::Request {
+                id: Uuid::now_v7().to_string(),
+                connection_id,
+                action_id: Some(inference_action_id),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                request_headers: None,
+                request_body: Some(request_body_json.to_string().into_bytes()),
+                response_status: Some(status.as_u16() as i64),
+                response_headers: None,
+                response_body: Some(response_text.as_bytes().to_vec()),
+                request_at,
+                response_at: Some(response_at),
+                duration_ms: Some(response_at - request_at),
+                error: None,
+                credential_nonce: Some(cred.nonce.clone()),
+                created_at: now_ms(),
+            },
+        )
+        .await?;
+
+        if !status.is_success() {
+            let error_msg = body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            return Err(AppError::Server {
+                status: status.as_u16(),
+                message: error_msg.to_string(),
+            });
+        }
+
+        Ok(ChatResult {
+            content: response_content,
+            model: model.to_string(),
+            input_tokens,
+            output_tokens,
+            credits_charged: charge_credits as i64,
+        })
+    }
+}
+
+// ============================================================================
+// AppCore — the UniFFI entry point.
+//
+// Owns a tokio runtime so that all async Rust code (turso, reqwest, tokio
+// primitives) runs on proper tokio worker threads rather than on whatever
+// thread the UniFFI foreign executor polls from.
+// ============================================================================
+
+#[derive(uniffi::Object)]
+pub struct AppCore {
+    runtime: tokio::runtime::Runtime,
+    inner: Arc<Inner>,
+}
+
+/// Rust-only access to the owned runtime (not exported via UniFFI).
+/// The CLI uses this to drive async work with `block_on`.
+impl AppCore {
+    pub fn runtime(&self) -> &tokio::runtime::Runtime {
+        &self.runtime
+    }
+}
+
+/// Convert a `tokio::task::JoinError` (panic / cancellation) into `AppError`.
+fn join_err(e: tokio::task::JoinError) -> AppError {
+    AppError::Internal {
+        message: format!("async task failed: {e}"),
+    }
+}
+
+#[uniffi::export]
+impl AppCore {
+    /// Create a new core instance.
+    ///
+    /// `config_dir` — directory containing `config.toml`.
+    /// `data_dir` — directory for the local database.
+    #[uniffi::constructor]
+    pub fn new(config_dir: String, data_dir: String) -> Self {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(8 * 1024 * 1024) // 8 MB — matches default main-thread size
+            .build()
+            .expect("failed to create tokio runtime");
+        Self {
+            runtime,
+            inner: Arc::new(Inner {
+                config_path: PathBuf::from(&config_dir).join("config.toml"),
+                data_dir: PathBuf::from(data_dir),
+                db: tokio::sync::OnceCell::new(),
+            }),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Config — sync methods (no runtime needed, delegate directly)
+    // -----------------------------------------------------------------------
+
+    pub fn config_state(&self) -> ConfigState {
+        let cfg = self.inner.load_config();
+        ConfigState {
+            base_url: cfg.base_url.clone(),
+            has_account: cfg.account_id.is_some(),
+            has_account_secret: cfg.account_secret.is_some(),
+            domain_separator: cfg.domain_separator().to_string(),
+            trusted_measurements: cfg
+                .trusted_measurements
+                .iter()
+                .map(|m| MeasurementInfo {
+                    snp: m.snp_measurement.clone(),
+                    tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
+                    tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
+                })
+                .collect(),
+            has_hardware_root_ca: cfg.hardware_root_ca.is_some(),
+            has_hardware_intermediate_ca: cfg.hardware_intermediate_ca.is_some(),
+            attestation_url: cfg.attestation_url.clone(),
+        }
+    }
+
+    pub fn set_base_url(&self, url: String) -> Result<(), AppError> {
+        let mut cfg = self.inner.load_config();
+        cfg.base_url = Some(url);
+        cfg.save_to(&self.inner.config_path)
+    }
+
+    pub fn set_attestation_url(&self, url: String) -> Result<(), AppError> {
+        let mut cfg = self.inner.load_config();
+        cfg.attestation_url = Some(url);
+        cfg.save_to(&self.inner.config_path)
+    }
+
+    pub fn set_hardware_root_ca(&self, pem: String) -> Result<(), AppError> {
+        config::parse_cert_config(Some(&pem), "hardware_root_ca")?;
+        let mut cfg = self.inner.load_config();
+        cfg.hardware_root_ca = Some(pem.trim().to_string());
+        cfg.save_to(&self.inner.config_path)
+    }
+
+    pub fn set_hardware_intermediate_ca(&self, pem: String) -> Result<(), AppError> {
+        config::parse_cert_config(Some(&pem), "hardware_intermediate_ca")?;
+        let mut cfg = self.inner.load_config();
+        cfg.hardware_intermediate_ca = Some(pem.trim().to_string());
+        cfg.save_to(&self.inner.config_path)
+    }
+
+    pub fn trust_measurement(
+        &self,
+        snp: String,
+        tdx_rtmr1: String,
+        tdx_rtmr2: String,
+    ) -> Result<bool, AppError> {
+        let spec = format!("{snp}:{tdx_rtmr1}:{tdx_rtmr2}");
+        let entry = config::parse_trust_measurement(&spec)?;
+        let mut cfg = self.inner.load_config();
+        if cfg.trusted_measurements.iter().any(|m| {
+            m.snp_measurement
+                .eq_ignore_ascii_case(&entry.snp_measurement)
+        }) {
+            return Ok(false);
+        }
+        cfg.trusted_measurements.push(entry);
+        cfg.save_to(&self.inner.config_path)?;
+        Ok(true)
+    }
+
+    pub fn untrust_measurement(&self, snp: String) -> Result<bool, AppError> {
+        let key = config::parse_untrust_key(&snp)?;
+        let mut cfg = self.inner.load_config();
+        if let Some(pos) = cfg
+            .trusted_measurements
+            .iter()
+            .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
+        {
+            cfg.trusted_measurements.remove(pos);
+            cfg.save_to(&self.inner.config_path)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn set_account_credentials(&self, id: String, secret: String) -> Result<(), AppError> {
+        let cfg = self.inner.load_config();
+        if cfg.account_id.is_some() || cfg.account_secret.is_some() {
+            return Err(AppError::Config {
+                message: "account credentials already configured — reset first".into(),
+            });
+        }
+        let mut cfg = cfg;
+        cfg.account_id = Some(id);
+        cfg.account_secret = Some(secret);
+        cfg.save_to(&self.inner.config_path)
+    }
+
+    pub fn reset_account(&self) -> Result<(), AppError> {
+        let mut cfg = self.inner.load_config();
+        cfg.account_id = None;
+        cfg.account_secret = None;
+        cfg.save_to(&self.inner.config_path)
+    }
+
+    // -----------------------------------------------------------------------
+    // Async methods — spawn onto the owned tokio runtime
+    // -----------------------------------------------------------------------
+
+    pub async fn account_show(&self) -> Result<AccountShowResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.account_show().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.account_create().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.account_prices().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn account_checkout(&self, price_id: String) -> Result<String, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.account_checkout(&price_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn account_balances(&self) -> Result<BalancesResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.account_balances().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.account_allocate(credits).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn wallet_credentials(&self) -> Result<Vec<CredentialInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.wallet_credentials().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.available_models().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn chat(&self, prompt: String, model: String) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.chat(&prompt, &model).await })
+            .await
+            .map_err(join_err)?
+    }
+}
+
+// ============================================================================
+// Internal API response types
+// ============================================================================
+
+#[derive(Deserialize)]
+struct CreateAccountResponse {
+    account_id: Uuid,
+    secret: String,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct GetAccountResponse {
+    id: Uuid,
+    stripe_customer_id: Option<String>,
+    created_at: String,
+}
+
+#[derive(Deserialize)]
+struct ListPricesResponse {
+    data: Vec<PriceResponse>,
+}
+
+#[derive(Deserialize)]
+struct PriceResponse {
+    id: String,
+    product_name: String,
+    product_description: Option<String>,
+    unit_amount: Option<i64>,
+    currency: String,
+    #[allow(dead_code)]
+    #[serde(rename = "type")]
+    price_type: String,
+    recurring: Option<RecurringResponse>,
+    credits: i64,
+}
+
+#[derive(Deserialize)]
+struct RecurringResponse {
+    interval: String,
+    interval_count: i64,
+}
+
+#[derive(Deserialize)]
+struct CheckoutUrlResponse {
+    checkout_url: String,
+}
+
+#[derive(Deserialize)]
+struct BalancesResponse {
+    available: i64,
+    pools: Vec<BalancePoolResponse>,
+}
+
+#[derive(Deserialize)]
+struct BalancePoolResponse {
+    amount: i64,
+    source: String,
+    expires_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListKeysResponse {
+    data: Vec<IssuerKeyResponse>,
+}
+
+#[derive(Deserialize)]
+struct IssuerKeyResponse {
+    id: String,
+    public_key: String,
+    domain_separator: String,
+    #[allow(dead_code)]
+    issue_from: String,
+    issue_until: String,
+    #[allow(dead_code)]
+    accept_until: String,
+}
+
+#[derive(Deserialize)]
+struct IssueCredentialsResponse {
+    issuance_response: String,
+    issuer_key_id: String,
+    credits: i64,
+    #[allow(dead_code)]
+    ledger_entry_id: String,
+}
+
+#[derive(Deserialize)]
+struct ModelPricingInfo {
+    per_prompt_token: ScaledPriceInfo,
+    per_completion_token: ScaledPriceInfo,
+}
+
+#[derive(Deserialize)]
+struct ScaledPriceInfo {
+    value: u64,
+    scale_factor: u64,
+}
+
+#[derive(Deserialize)]
+struct ModelsResponseInfo {
+    data: Vec<ModelListEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelListEntry {
+    id: String,
+    context_length: u64,
+    pricing: ModelPricingInfo,
+}
+
+// ============================================================================
+// Free-standing helpers
+// ============================================================================
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, AppError> {
+    if !s.len().is_multiple_of(2) {
+        return Err(AppError::Credential {
+            message: "odd-length hex string".into(),
+        });
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| AppError::Credential {
+                message: format!("invalid hex: {e}"),
+            })
+        })
+        .collect()
+}
+
+const ACT_TOKEN_TYPE: u16 = 0xE5AD;
+const ISSUER_NAME: &str = "eidola";
+const ORIGIN_INFO: &str = "inference";
+
+fn serialize_token_challenge() -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+    buf.extend_from_slice(&(ISSUER_NAME.len() as u16).to_be_bytes());
+    buf.extend_from_slice(ISSUER_NAME.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(&(ORIGIN_INFO.len() as u16).to_be_bytes());
+    buf.extend_from_slice(ORIGIN_INFO.as_bytes());
+    buf.push(0);
+    buf
+}
+
+fn compute_challenge_digest() -> [u8; 32] {
+    Sha256::digest(serialize_token_challenge()).into()
+}
+
+/// Current time as milliseconds since Unix epoch.
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_millis() as i64
+}
+
+/// Parse an ISO 8601 timestamp to epoch ms.
+pub fn iso_to_ms(s: &str) -> Result<i64, AppError> {
+    let s = s.trim().trim_end_matches('Z');
+    let (date, time) = s.split_once('T').ok_or_else(|| AppError::Network {
+        message: format!("invalid ISO 8601: {s}"),
+    })?;
+    let dp: Vec<&str> = date.split('-').collect();
+    let tp: Vec<&str> = time.split(':').collect();
+    if dp.len() != 3 || tp.len() != 3 {
+        return Err(AppError::Network {
+            message: format!("invalid ISO 8601: {s}"),
+        });
+    }
+    let y: i64 = dp[0].parse().map_err(|_| AppError::Network {
+        message: "bad year".into(),
+    })?;
+    let m: u32 = dp[1].parse().map_err(|_| AppError::Network {
+        message: "bad month".into(),
+    })?;
+    let d: u32 = dp[2].parse().map_err(|_| AppError::Network {
+        message: "bad day".into(),
+    })?;
+    let hour: i64 = tp[0].parse().map_err(|_| AppError::Network {
+        message: "bad hour".into(),
+    })?;
+    let min: i64 = tp[1].parse().map_err(|_| AppError::Network {
+        message: "bad minute".into(),
+    })?;
+    let sec: i64 = tp[2]
+        .split('.')
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| AppError::Network {
+            message: "bad second".into(),
+        })?;
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = y_adj.div_euclid(400);
+    let yoe = y_adj.rem_euclid(400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe as i64 - 719468;
+    let secs = days * 86400 + hour * 3600 + min * 60 + sec;
+    Ok(secs * 1000)
+}
+
+fn load_native_root_store() -> rustls::RootCertStore {
+    let mut store = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = store.add(cert);
+    }
+    store
+}
+
+fn params_from_domain_separator(ds: &str) -> Result<Params, AppError> {
+    let parts: Vec<&str> = ds.split(':').collect();
+    if parts.len() != 5 {
+        return Err(AppError::Config {
+            message: format!("domain separator has wrong format: {ds}"),
+        });
+    }
+    Ok(Params::new(parts[1], parts[2], parts[3], parts[4]))
+}
+
+async fn read_response(resp: reqwest::Response) -> Result<(reqwest::StatusCode, String), AppError> {
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| AppError::Network {
+        message: format!("failed to read response body: {e}"),
+    })?;
+    Ok((status, body))
+}
+
+fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError> {
+    if status.is_success() {
+        return Ok(());
+    }
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| body.to_string());
+    Err(AppError::Server {
+        status: status.as_u16(),
+        message,
+    })
+}
+
+async fn fetch_models(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<ModelsResponseInfo, AppError> {
+    let resp = client
+        .get(format!("{base_url}/v1/models"))
+        .send()
+        .await
+        .map_err(AppError::from_request)?;
+    let (status, body) = read_response(resp).await?;
+    check_status(status, &body)?;
+    serde_json::from_str(&body).map_err(|e| AppError::Network {
+        message: format!("failed to parse models response: {e}"),
+    })
+}
+
+async fn flush_attestations(
+    attestation_log: &Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>,
+    db_conn: &turso::Connection,
+    provider_id: &str,
+    base_url: &str,
+    now: i64,
+) -> Result<Option<String>, AppError> {
+    let attestations: Vec<_> = attestation_log.lock().unwrap().drain(..).collect();
+    let mut connection_id = None;
+    for att in &attestations {
+        db::upsert_attestation(
+            db_conn,
+            &att.attestation_hash,
+            &att.attestation_doc,
+            Some(&att.pcr_digest),
+            now,
+        )
+        .await?;
+        let cid = Uuid::now_v7().to_string();
+        db::insert_connection(
+            db_conn,
+            &cid,
+            provider_id,
+            base_url,
+            "clearnet",
+            Some(&att.attestation_hash),
+            now,
+            now,
+        )
+        .await?;
+        connection_id = Some(cid);
+    }
+    Ok(connection_id)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_greet() {
-        assert_eq!(greet(), "Hello, World!");
+    fn hex_round_trip() {
+        let data = vec![0xde, 0xad, 0xbe, 0xef];
+        let encoded = hex_encode(&data);
+        assert_eq!(encoded, "deadbeef");
+        assert_eq!(hex_decode(&encoded).unwrap(), data);
+    }
+
+    #[test]
+    fn hex_decode_rejects_odd_length() {
+        assert!(hex_decode("abc").is_err());
+    }
+
+    #[test]
+    fn challenge_digest_is_deterministic() {
+        let d1 = compute_challenge_digest();
+        let d2 = compute_challenge_digest();
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn iso_to_ms_basic() {
+        // 2026-01-01T00:00:00Z → 1767225600000
+        let ms = iso_to_ms("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(ms, 1767225600000);
+    }
+
+    #[test]
+    fn token_challenge_serialization() {
+        let buf = serialize_token_challenge();
+        assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), ACT_TOKEN_TYPE);
+    }
+
+    #[test]
+    fn params_from_domain_separator_valid() {
+        let p = params_from_domain_separator("ACT-v1:org:service:deploy:ver");
+        assert!(p.is_ok());
+    }
+
+    #[test]
+    fn params_from_domain_separator_rejects_wrong_format() {
+        assert!(params_from_domain_separator("bad").is_err());
     }
 }

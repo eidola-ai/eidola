@@ -1,90 +1,87 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use turso::{Builder, Connection, Database, Value};
+
+use crate::error::AppError;
 
 const SCHEMA: &str = include_str!("../schema/schema.sql");
 const LATEST_VERSION: i64 = 1;
 
-/// Returns the path to the CLI database file.
-fn db_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("eidola").join("eidola.db"))
-}
-
-/// Opens (or creates) the local database and runs any pending migrations.
-pub async fn open() -> Result<Database, String> {
-    let path = db_path().ok_or("could not determine data directory")?;
+/// Opens (or creates) the local database at `data_dir/eidola.db` and runs any
+/// pending migrations.
+pub async fn open(data_dir: &Path) -> Result<Database, AppError> {
+    let path = data_dir.join("eidola.db");
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create data directory: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| AppError::Database {
+            message: format!("failed to create data directory: {e}"),
+        })?;
     }
 
     let db = Builder::new_local(path.to_string_lossy().as_ref())
         .build()
         .await
-        .map_err(|e| format!("failed to open database: {e}"))?;
+        .map_err(|e| AppError::Database {
+            message: format!("failed to open database: {e}"),
+        })?;
 
-    let conn = db
-        .connect()
-        .map_err(|e| format!("failed to connect: {e}"))?;
-
+    let conn = db.connect().map_err(AppError::db)?;
     initialize(&conn).await?;
 
     Ok(db)
 }
 
-/// Initializes the database: fresh install gets schema.sql directly,
-/// existing databases run incremental migrations.
-async fn initialize(conn: &Connection) -> Result<(), String> {
+/// Initialize: fresh install gets schema.sql directly, existing databases run
+/// incremental migrations.
+async fn initialize(conn: &Connection) -> Result<(), AppError> {
     let version = get_user_version(conn).await?;
 
     if version == 0 {
-        // Fresh database — apply canonical schema directly
         conn.execute_batch(SCHEMA)
             .await
-            .map_err(|e| format!("schema init failed: {e}"))?;
+            .map_err(|e| AppError::Database {
+                message: format!("schema init failed: {e}"),
+            })?;
         set_user_version(conn, LATEST_VERSION).await?;
     } else {
-        // Existing database — run incremental migrations
         migrate(conn, version).await?;
     }
 
     Ok(())
 }
 
-/// Runs forward-only migrations from `current_version` to `LATEST_VERSION`.
-async fn migrate(conn: &Connection, current_version: i64) -> Result<(), String> {
+async fn migrate(conn: &Connection, current_version: i64) -> Result<(), AppError> {
     if current_version < 1 {
         conn.execute_batch(MIGRATION_1)
             .await
-            .map_err(|e| format!("migration 1 failed: {e}"))?;
+            .map_err(|e| AppError::Database {
+                message: format!("migration 1 failed: {e}"),
+            })?;
         set_user_version(conn, 1).await?;
     }
 
     Ok(())
 }
 
-async fn get_user_version(conn: &Connection) -> Result<i64, String> {
+async fn get_user_version(conn: &Connection) -> Result<i64, AppError> {
     let mut stmt = conn
         .prepare("PRAGMA user_version")
         .await
-        .map_err(|e| format!("failed to query user_version: {e}"))?;
-    let mut rows = stmt
-        .query(())
-        .await
-        .map_err(|e| format!("failed to query user_version: {e}"))?;
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
     let row = rows
         .next()
         .await
-        .map_err(|e| format!("failed to read user_version: {e}"))?
-        .ok_or("no user_version row")?;
-    row.get::<i64>(0)
-        .map_err(|e| format!("failed to read user_version value: {e}"))
+        .map_err(AppError::db)?
+        .ok_or_else(|| AppError::Database {
+            message: "no user_version row".into(),
+        })?;
+    row.get::<i64>(0).map_err(AppError::db)
 }
 
-async fn set_user_version(conn: &Connection, version: i64) -> Result<(), String> {
+async fn set_user_version(conn: &Connection, version: i64) -> Result<(), AppError> {
     conn.execute(&format!("PRAGMA user_version = {version}"), ())
         .await
-        .map_err(|e| format!("failed to set user_version: {e}"))?;
+        .map_err(AppError::db)?;
     Ok(())
 }
 
@@ -92,7 +89,6 @@ async fn set_user_version(conn: &Connection, version: i64) -> Result<(), String>
 // Layer 0 — Wallet: Issuer key operations
 // ---------------------------------------------------------------------------
 
-/// Upsert an issuer key (insert or ignore if already exists).
 pub async fn upsert_issuer_key(
     conn: &Connection,
     id: &str,
@@ -101,7 +97,7 @@ pub async fn upsert_issuer_key(
     params_data: &[u8],
     expires_at: i64,
     created_at: i64,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT OR IGNORE INTO issuer_key (id, params_hash, public_key_data, params_data, expires_at, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -115,7 +111,9 @@ pub async fn upsert_issuer_key(
         ),
     )
     .await
-    .map_err(|e| format!("failed to upsert issuer key: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to upsert issuer key: {e}"),
+    })?;
     Ok(())
 }
 
@@ -123,7 +121,6 @@ pub async fn upsert_issuer_key(
 // Layer 0 — Wallet: Pre-credential operations
 // ---------------------------------------------------------------------------
 
-/// Insert a pre-credential record for issuance.
 pub async fn insert_pre_credential_issuance(
     conn: &Connection,
     id: &str,
@@ -131,7 +128,7 @@ pub async fn insert_pre_credential_issuance(
     data: &[u8],
     credits: i64,
     created_at: i64,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, created_at) \
          VALUES (?1, 'issuance', NULL, ?2, ?3, ?4, NULL, ?5)",
@@ -144,11 +141,12 @@ pub async fn insert_pre_credential_issuance(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert pre_credential: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert pre_credential: {e}"),
+    })?;
     Ok(())
 }
 
-/// Insert a pre-credential record for a refund (spend checkpoint).
 pub async fn insert_pre_credential_refund(
     conn: &Connection,
     id: &str,
@@ -157,7 +155,7 @@ pub async fn insert_pre_credential_refund(
     data: &[u8],
     spend_amount: i64,
     created_at: i64,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, created_at) \
          VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6)",
@@ -171,7 +169,9 @@ pub async fn insert_pre_credential_refund(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert refund pre_credential: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert refund pre_credential: {e}"),
+    })?;
     Ok(())
 }
 
@@ -179,7 +179,6 @@ pub async fn insert_pre_credential_refund(
 // Layer 0 — Wallet: Credential operations
 // ---------------------------------------------------------------------------
 
-/// Insert a completed credential.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_credential(
     conn: &Connection,
@@ -190,7 +189,7 @@ pub async fn insert_credential(
     credits: i64,
     generation: i64,
     created_at: i64,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO credential (nonce, pre_credential_id, issuer_key_id, data, credits, generation, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -205,12 +204,12 @@ pub async fn insert_credential(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert credential: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert credential: {e}"),
+    })?;
     Ok(())
 }
 
-/// A spendable credential with associated key data.
-#[allow(dead_code)]
 pub struct SpendableCredential {
     pub nonce: String,
     pub issuer_key_id: String,
@@ -220,11 +219,10 @@ pub struct SpendableCredential {
     pub public_key_data: Vec<u8>,
 }
 
-/// Find an active credential with at least `min_credits`, returning it with key data.
 pub async fn find_spendable_credential(
     conn: &Connection,
     min_credits: i64,
-) -> Result<Option<SpendableCredential>, String> {
+) -> Result<Option<SpendableCredential>, AppError> {
     let mut stmt = conn
         .prepare(
             "SELECT c.nonce, c.issuer_key_id, c.data, c.credits, c.generation, ik.public_key_data \
@@ -236,42 +234,21 @@ pub async fn find_spendable_credential(
              LIMIT 1",
         )
         .await
-        .map_err(|e| format!("failed to prepare query: {e}"))?;
-    let mut rows = stmt
-        .query([min_credits])
-        .await
-        .map_err(|e| format!("failed to query credentials: {e}"))?;
-    match rows
-        .next()
-        .await
-        .map_err(|e| format!("failed to read row: {e}"))?
-    {
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query([min_credits]).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
         None => Ok(None),
         Some(row) => Ok(Some(SpendableCredential {
-            nonce: row
-                .get::<String>(0)
-                .map_err(|e| format!("failed to read nonce: {e}"))?,
-            issuer_key_id: row
-                .get::<String>(1)
-                .map_err(|e| format!("failed to read issuer_key_id: {e}"))?,
-            data: row
-                .get::<Vec<u8>>(2)
-                .map_err(|e| format!("failed to read data: {e}"))?,
-            credits: row
-                .get::<i64>(3)
-                .map_err(|e| format!("failed to read credits: {e}"))?,
-            generation: row
-                .get::<i64>(4)
-                .map_err(|e| format!("failed to read generation: {e}"))?,
-            public_key_data: row
-                .get::<Vec<u8>>(5)
-                .map_err(|e| format!("failed to read public_key_data: {e}"))?,
+            nonce: row.get::<String>(0).map_err(AppError::db)?,
+            issuer_key_id: row.get::<String>(1).map_err(AppError::db)?,
+            data: row.get::<Vec<u8>>(2).map_err(AppError::db)?,
+            credits: row.get::<i64>(3).map_err(AppError::db)?,
+            generation: row.get::<i64>(4).map_err(AppError::db)?,
+            public_key_data: row.get::<Vec<u8>>(5).map_err(AppError::db)?,
         })),
     }
 }
 
-/// A row from the credential_lifecycle view.
-#[allow(dead_code)]
 pub struct CredentialRow {
     pub nonce: String,
     pub credits: i64,
@@ -280,8 +257,7 @@ pub struct CredentialRow {
     pub state: String,
 }
 
-/// List active credentials (not expired, not spent).
-pub async fn list_active_credentials(conn: &Connection) -> Result<Vec<CredentialRow>, String> {
+pub async fn list_active_credentials(conn: &Connection) -> Result<Vec<CredentialRow>, AppError> {
     let mut stmt = conn
         .prepare(
             "SELECT nonce, credits, generation, created_at, state \
@@ -289,33 +265,16 @@ pub async fn list_active_credentials(conn: &Connection) -> Result<Vec<Credential
              ORDER BY created_at",
         )
         .await
-        .map_err(|e| format!("failed to prepare query: {e}"))?;
-    let mut rows = stmt
-        .query(())
-        .await
-        .map_err(|e| format!("failed to query credentials: {e}"))?;
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
     let mut results = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| format!("failed to read row: {e}"))?
-    {
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
         results.push(CredentialRow {
-            nonce: row
-                .get::<String>(0)
-                .map_err(|e| format!("failed to read nonce: {e}"))?,
-            credits: row
-                .get::<i64>(1)
-                .map_err(|e| format!("failed to read credits: {e}"))?,
-            generation: row
-                .get::<i64>(2)
-                .map_err(|e| format!("failed to read generation: {e}"))?,
-            created_at: row
-                .get::<i64>(3)
-                .map_err(|e| format!("failed to read created_at: {e}"))?,
-            state: row
-                .get::<String>(4)
-                .map_err(|e| format!("failed to read state: {e}"))?,
+            nonce: row.get::<String>(0).map_err(AppError::db)?,
+            credits: row.get::<i64>(1).map_err(AppError::db)?,
+            generation: row.get::<i64>(2).map_err(AppError::db)?,
+            created_at: row.get::<i64>(3).map_err(AppError::db)?,
+            state: row.get::<String>(4).map_err(AppError::db)?,
         });
     }
     Ok(results)
@@ -325,35 +284,26 @@ pub async fn list_active_credentials(conn: &Connection) -> Result<Vec<Credential
 // Layer 1 — Transport: Provider operations
 // ---------------------------------------------------------------------------
 
-/// Find a provider by name, or create one if it doesn't exist. Returns the id.
 pub async fn ensure_provider(
     conn: &Connection,
     name: &str,
     kind: &str,
     created_at: i64,
-) -> Result<String, String> {
-    // Try to find existing
+) -> Result<String, AppError> {
     let mut stmt = conn
         .prepare("SELECT id FROM provider WHERE name = ?1 AND kind = ?2 LIMIT 1")
         .await
-        .map_err(|e| format!("failed to prepare provider query: {e}"))?;
+        .map_err(AppError::db)?;
     let mut rows = stmt
         .query((Value::Text(name.to_string()), Value::Text(kind.to_string())))
         .await
-        .map_err(|e| format!("failed to query provider: {e}"))?;
-    if let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| format!("failed to read provider row: {e}"))?
-    {
-        return row
-            .get::<String>(0)
-            .map_err(|e| format!("failed to read provider id: {e}"));
+        .map_err(AppError::db)?;
+    if let Some(row) = rows.next().await.map_err(AppError::db)? {
+        return row.get::<String>(0).map_err(AppError::db);
     }
     drop(rows);
     drop(stmt);
 
-    // Create new
     let id = uuid::Uuid::now_v7().to_string();
     conn.execute(
         "INSERT INTO provider (id, name, kind, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -365,7 +315,9 @@ pub async fn ensure_provider(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert provider: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert provider: {e}"),
+    })?;
     Ok(id)
 }
 
@@ -373,14 +325,13 @@ pub async fn ensure_provider(
 // Layer 1 — Transport: Attestation operations
 // ---------------------------------------------------------------------------
 
-/// Insert an attestation record (ignore if hash already exists).
 pub async fn upsert_attestation(
     conn: &Connection,
     hash: &str,
     doc: &[u8],
     pcr_digest: Option<&str>,
     created_at: i64,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT OR IGNORE INTO attestation (hash, doc, pcr_digest, created_at) \
          VALUES (?1, ?2, ?3, ?4)",
@@ -395,7 +346,9 @@ pub async fn upsert_attestation(
         ),
     )
     .await
-    .map_err(|e| format!("failed to upsert attestation: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to upsert attestation: {e}"),
+    })?;
     Ok(())
 }
 
@@ -403,7 +356,6 @@ pub async fn upsert_attestation(
 // Layer 1 — Transport: Connection operations
 // ---------------------------------------------------------------------------
 
-/// Insert a new connection record.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_connection(
     conn: &Connection,
@@ -414,7 +366,7 @@ pub async fn insert_connection(
     attestation_hash: Option<&str>,
     opened_at: i64,
     created_at: i64,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO connection (id, provider_id, base_url, transport, attestation_hash, opened_at, closed_at, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
@@ -432,7 +384,9 @@ pub async fn insert_connection(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert connection: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert connection: {e}"),
+    })?;
     Ok(())
 }
 
@@ -440,7 +394,6 @@ pub async fn insert_connection(
 // Layer 1 — Transport: Request operations
 // ---------------------------------------------------------------------------
 
-/// A request/response entry.
 pub struct Request {
     pub id: String,
     pub connection_id: Option<String>,
@@ -460,8 +413,7 @@ pub struct Request {
     pub created_at: i64,
 }
 
-/// Insert a request entry.
-pub async fn insert_request(conn: &Connection, entry: &Request) -> Result<(), String> {
+pub async fn insert_request(conn: &Connection, entry: &Request) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO request (id, connection_id, action_id, method, path, \
          request_headers, request_body, response_status, response_headers, response_body, \
@@ -502,7 +454,9 @@ pub async fn insert_request(conn: &Connection, entry: &Request) -> Result<(), St
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert request: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert request: {e}"),
+    })?;
     Ok(())
 }
 
@@ -517,33 +471,26 @@ fn opt_text(v: &Option<String>) -> Value {
 // Layer 2 — Semantic: Participant operations
 // ---------------------------------------------------------------------------
 
-/// Find a participant by kind+label, or create one. Returns the id.
 pub async fn ensure_participant(
     conn: &Connection,
     kind: &str,
     label: &str,
     provider_id: Option<&str>,
     created_at: i64,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     let mut stmt = conn
         .prepare("SELECT id FROM participant WHERE kind = ?1 AND label = ?2 LIMIT 1")
         .await
-        .map_err(|e| format!("failed to prepare participant query: {e}"))?;
+        .map_err(AppError::db)?;
     let mut rows = stmt
         .query((
             Value::Text(kind.to_string()),
             Value::Text(label.to_string()),
         ))
         .await
-        .map_err(|e| format!("failed to query participant: {e}"))?;
-    if let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| format!("failed to read participant row: {e}"))?
-    {
-        return row
-            .get::<String>(0)
-            .map_err(|e| format!("failed to read participant id: {e}"));
+        .map_err(AppError::db)?;
+    if let Some(row) = rows.next().await.map_err(AppError::db)? {
+        return row.get::<String>(0).map_err(AppError::db);
     }
     drop(rows);
     drop(stmt);
@@ -563,7 +510,9 @@ pub async fn ensure_participant(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert participant: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert participant: {e}"),
+    })?;
     Ok(id)
 }
 
@@ -571,14 +520,13 @@ pub async fn ensure_participant(
 // Layer 2 — Semantic: Space operations
 // ---------------------------------------------------------------------------
 
-/// Create a new space.
 pub async fn insert_space(
     conn: &Connection,
     id: &str,
     title: Option<&str>,
     linkability: &str,
     created_at: i64,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO space (id, parent_space_id, title, linkability, created_at) \
          VALUES (?1, NULL, ?2, ?3, ?4)",
@@ -593,18 +541,19 @@ pub async fn insert_space(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert space: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert space: {e}"),
+    })?;
     Ok(())
 }
 
-/// Add a participant to a space.
 pub async fn insert_space_participant(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
     role: &str,
     joined_at: i64,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO space_participant (space_id, participant_id, role, joined_at) \
          VALUES (?1, ?2, ?3, ?4)",
@@ -616,7 +565,9 @@ pub async fn insert_space_participant(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert space_participant: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert space_participant: {e}"),
+    })?;
     Ok(())
 }
 
@@ -624,7 +575,6 @@ pub async fn insert_space_participant(
 // Layer 2 — Semantic: Action operations
 // ---------------------------------------------------------------------------
 
-/// An action to insert.
 pub struct ActionEntry {
     pub id: String,
     pub space_id: String,
@@ -639,8 +589,7 @@ pub struct ActionEntry {
     pub created_at: i64,
 }
 
-/// Insert an action.
-pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(), String> {
+pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO action (id, space_id, participant_id, action_type, status, \
          intent, model, input_tokens, output_tokens, credits_consumed, created_at) \
@@ -669,17 +618,18 @@ pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(),
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert action: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert action: {e}"),
+    })?;
     Ok(())
 }
 
-/// Insert an antecedent edge in the action causal graph.
 pub async fn insert_action_antecedent(
     conn: &Connection,
     action_id: &str,
     antecedent_action_id: &str,
     ordinal: i64,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO action_antecedent (action_id, antecedent_action_id, ordinal) \
          VALUES (?1, ?2, ?3)",
@@ -690,7 +640,9 @@ pub async fn insert_action_antecedent(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert action_antecedent: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert action_antecedent: {e}"),
+    })?;
     Ok(())
 }
 
@@ -698,7 +650,6 @@ pub async fn insert_action_antecedent(
 // Layer 2 — Semantic: Content block operations
 // ---------------------------------------------------------------------------
 
-/// Insert a text content block.
 pub async fn insert_text_content_block(
     conn: &Connection,
     id: &str,
@@ -706,7 +657,7 @@ pub async fn insert_text_content_block(
     ordinal: i64,
     block_type: &str,
     text_content: &str,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO content_block (id, action_id, ordinal, block_type, text_content) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -719,72 +670,9 @@ pub async fn insert_text_content_block(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert content_block: {e}"))?;
-    Ok(())
-}
-
-/// Insert a tool_use content block.
-#[allow(dead_code)]
-pub async fn insert_tool_use_content_block(
-    conn: &Connection,
-    id: &str,
-    action_id: &str,
-    ordinal: i64,
-    tool_name: &str,
-    tool_call_id: &str,
-    data: Option<&str>,
-) -> Result<(), String> {
-    conn.execute(
-        "INSERT INTO content_block (id, action_id, ordinal, block_type, tool_name, tool_call_id, data) \
-         VALUES (?1, ?2, ?3, 'tool_use', ?4, ?5, ?6)",
-        (
-            Value::Text(id.to_string()),
-            Value::Text(action_id.to_string()),
-            Value::Integer(ordinal),
-            Value::Text(tool_name.to_string()),
-            Value::Text(tool_call_id.to_string()),
-            match data {
-                Some(d) => Value::Text(d.to_string()),
-                None => Value::Null,
-            },
-        ),
-    )
-    .await
-    .map_err(|e| format!("failed to insert tool_use content_block: {e}"))?;
-    Ok(())
-}
-
-/// Insert a tool_result content block.
-#[allow(dead_code)]
-pub async fn insert_tool_result_content_block(
-    conn: &Connection,
-    id: &str,
-    action_id: &str,
-    ordinal: i64,
-    tool_call_id: &str,
-    text_content: Option<&str>,
-    data: Option<&str>,
-) -> Result<(), String> {
-    conn.execute(
-        "INSERT INTO content_block (id, action_id, ordinal, block_type, tool_call_id, text_content, data) \
-         VALUES (?1, ?2, ?3, 'tool_result', ?4, ?5, ?6)",
-        (
-            Value::Text(id.to_string()),
-            Value::Text(action_id.to_string()),
-            Value::Integer(ordinal),
-            Value::Text(tool_call_id.to_string()),
-            match text_content {
-                Some(t) => Value::Text(t.to_string()),
-                None => Value::Null,
-            },
-            match data {
-                Some(d) => Value::Text(d.to_string()),
-                None => Value::Null,
-            },
-        ),
-    )
-    .await
-    .map_err(|e| format!("failed to insert tool_result content_block: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert content_block: {e}"),
+    })?;
     Ok(())
 }
 
@@ -792,8 +680,8 @@ pub async fn insert_tool_result_content_block(
 // Layer 2 — Semantic: System prompt operations
 // ---------------------------------------------------------------------------
 
-/// Upsert a system prompt (deduplicated by SHA-256 hash). Returns the hash.
-pub async fn upsert_system_prompt(conn: &Connection, text: &str) -> Result<String, String> {
+#[allow(dead_code)]
+pub async fn upsert_system_prompt(conn: &Connection, text: &str) -> Result<String, AppError> {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(text.as_bytes());
     let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -802,7 +690,9 @@ pub async fn upsert_system_prompt(conn: &Connection, text: &str) -> Result<Strin
         (Value::Text(hash.clone()), Value::Text(text.to_string())),
     )
     .await
-    .map_err(|e| format!("failed to upsert system_prompt: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to upsert system_prompt: {e}"),
+    })?;
     Ok(hash)
 }
 
@@ -810,7 +700,6 @@ pub async fn upsert_system_prompt(conn: &Connection, text: &str) -> Result<Strin
 // Layer 2 — Semantic: Context assembly operations
 // ---------------------------------------------------------------------------
 
-/// Insert a context assembly record for an inference action.
 pub async fn insert_context_assembly(
     conn: &Connection,
     id: &str,
@@ -819,7 +708,7 @@ pub async fn insert_context_assembly(
     total_tokens: Option<i64>,
     truncation_applied: bool,
     created_at: i64,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO context_assembly (id, action_id, system_prompt_hash, total_tokens, truncation_applied, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -839,17 +728,18 @@ pub async fn insert_context_assembly(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert context_assembly: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert context_assembly: {e}"),
+    })?;
     Ok(())
 }
 
-/// Insert a context assembly action (an action that contributed to an inference prompt).
 pub async fn insert_context_assembly_action(
     conn: &Connection,
     context_assembly_id: &str,
     action_id: &str,
     position: i64,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO context_assembly_action (context_assembly_id, action_id, position) \
          VALUES (?1, ?2, ?3)",
@@ -860,7 +750,9 @@ pub async fn insert_context_assembly_action(
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert context_assembly_action: {e}"))?;
+    .map_err(|e| AppError::Database {
+        message: format!("failed to insert context_assembly_action: {e}"),
+    })?;
     Ok(())
 }
 
@@ -893,7 +785,6 @@ mod tests {
         db
     }
 
-    /// List all table and view names from sqlite_master, sorted.
     async fn list_objects(conn: &Connection) -> Vec<(String, String)> {
         let mut stmt = conn
             .prepare(
@@ -912,8 +803,6 @@ mod tests {
         objects
     }
 
-    /// Dump columns for a table via PRAGMA table_info, sorted by name.
-    /// Returns (name, type, notnull, dflt_value, pk) tuples.
     async fn table_columns(
         conn: &Connection,
         table: &str,
@@ -926,18 +815,17 @@ mod tests {
         let mut cols = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
             cols.push((
-                row.get::<String>(1).unwrap(),         // name
-                row.get::<String>(2).unwrap(),         // type
-                row.get::<i64>(3).unwrap() != 0,       // notnull
-                row.get::<Option<String>>(4).unwrap(), // dflt_value
-                row.get::<i64>(5).unwrap() != 0,       // pk
+                row.get::<String>(1).unwrap(),
+                row.get::<String>(2).unwrap(),
+                row.get::<i64>(3).unwrap() != 0,
+                row.get::<Option<String>>(4).unwrap(),
+                row.get::<i64>(5).unwrap() != 0,
             ));
         }
         cols.sort_by(|a, b| a.0.cmp(&b.0));
         cols
     }
 
-    /// Dump index columns via PRAGMA index_info, sorted by name.
     async fn index_columns(conn: &Connection, index: &str) -> Vec<String> {
         let mut stmt = conn
             .prepare(&format!("PRAGMA index_info('{index}')"))
@@ -952,7 +840,6 @@ mod tests {
         cols
     }
 
-    /// Get the SQL for a view from sqlite_master.
     async fn view_sql(conn: &Connection, name: &str) -> String {
         let mut stmt = conn
             .prepare("SELECT sql FROM sqlite_master WHERE type='view' AND name=?1")
@@ -980,15 +867,12 @@ mod tests {
             .filter(|(t, _)| t == "table")
             .map(|(_, n)| n.as_str())
             .collect();
-        // Layer 0
         assert!(table_names.contains(&"issuer_key"));
         assert!(table_names.contains(&"pre_credential"));
         assert!(table_names.contains(&"credential"));
-        // Layer 1
         assert!(table_names.contains(&"provider"));
         assert!(table_names.contains(&"attestation"));
         assert!(table_names.contains(&"connection"));
-        // Layer 2
         assert!(table_names.contains(&"participant"));
         assert!(table_names.contains(&"space"));
         assert!(table_names.contains(&"action"));
@@ -1000,7 +884,6 @@ mod tests {
     async fn initialize_is_idempotent() {
         let db = open_memory_fresh().await;
         let conn = db.connect().unwrap();
-
         initialize(&conn).await.unwrap();
         assert_eq!(get_user_version(&conn).await.unwrap(), LATEST_VERSION);
     }
@@ -1012,7 +895,6 @@ mod tests {
         let fresh = fresh_db.connect().unwrap();
         let migrated = migrated_db.connect().unwrap();
 
-        // 1. Same set of objects (tables, views, indexes)
         let fresh_objects = list_objects(&fresh).await;
         let migrated_objects = list_objects(&migrated).await;
         assert_eq!(
@@ -1023,7 +905,6 @@ mod tests {
         for (obj_type, name) in &fresh_objects {
             match obj_type.as_str() {
                 "table" => {
-                    // 2. Same columns (name, type, notnull, pk) per table
                     let fresh_cols = table_columns(&fresh, name).await;
                     let migrated_cols = table_columns(&migrated, name).await;
                     assert_eq!(
@@ -1032,7 +913,6 @@ mod tests {
                     );
                 }
                 "index" => {
-                    // 3. Same index columns
                     let fresh_cols = index_columns(&fresh, name).await;
                     let migrated_cols = index_columns(&migrated, name).await;
                     assert_eq!(
@@ -1041,7 +921,6 @@ mod tests {
                     );
                 }
                 "view" => {
-                    // 4. Same view SQL
                     let fresh_sql = view_sql(&fresh, name).await;
                     let migrated_sql = view_sql(&migrated, name).await;
                     assert_eq!(
