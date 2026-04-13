@@ -20,7 +20,6 @@ let package = Package(
     )
   ],
   dependencies: [
-    .package(url: "https://github.com/swiftlang/swift-testing.git", from: "6.2.3"),
     .package(path: "../../crates/eidola-app-core"),
   ],
   targets: [
@@ -38,9 +37,7 @@ let package = Package(
         "EidolaApp"
       ],
       path: "Sources/EidolaEntrypoint",
-      resources: [
-        .process("Assets.xcassets")
-      ],
+      exclude: ["Assets.xcassets"],
       swiftSettings: swiftSettings,
       linkerSettings: [
         .linkedFramework("SystemConfiguration")
@@ -50,7 +47,6 @@ let package = Package(
       name: "EidolaTests",
       dependencies: [
         "EidolaApp",
-        .product(name: "Testing", package: "swift-testing"),
       ],
       path: "Tests/EidolaTests",
       swiftSettings: swiftSettings

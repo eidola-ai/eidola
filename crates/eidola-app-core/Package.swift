@@ -37,9 +37,7 @@ let package = Package(
       targets: ["EidolaAppCore"]
     )
   ],
-  dependencies: [
-    .package(url: "https://github.com/swiftlang/swift-testing.git", from: "6.2.3")
-  ],
+  dependencies: [],
   targets: [
     binaryTarget,
 
@@ -65,7 +63,6 @@ let package = Package(
       name: "EidolaAppCoreTests",
       dependencies: [
         "EidolaAppCore",
-        .product(name: "Testing", package: "swift-testing"),
       ],
       path: "swift/Tests/EidolaAppCoreTests",
       swiftSettings: swiftSettings
