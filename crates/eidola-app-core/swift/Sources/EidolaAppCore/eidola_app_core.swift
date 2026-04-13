@@ -549,11 +549,19 @@ public protocol AppCoreProtocol: AnyObject, Sendable {
 
   func accountShow() async throws -> AccountShowResult
 
+  func archiveSpace(spaceId: String) async throws -> Bool
+
   func availableModels() async throws -> [ModelInfo]
 
-  func chat(prompt: String, model: String) async throws -> ChatResult
+  func chat(prompt: String, model: String, spaceId: String?) async throws -> ChatResult
 
   func configState() -> ConfigState
+
+  func createSpace(title: String?) async throws -> SpaceInfo
+
+  func getSpaceMessages(spaceId: String) async throws -> [SpaceMessage]
+
+  func listSpaces() async throws -> [SpaceInfo]
 
   func resetAccount() throws
 
@@ -741,6 +749,23 @@ open class AppCore: AppCoreProtocol, @unchecked Sendable {
       )
   }
 
+  open func archiveSpace(spaceId: String) async throws -> Bool {
+    return
+      try await uniffiRustCallAsync(
+        rustFutureFunc: {
+          uniffi_eidola_app_core_fn_method_appcore_archive_space(
+            self.uniffiCloneHandle(),
+            FfiConverterString.lower(spaceId)
+          )
+        },
+        pollFunc: ffi_eidola_app_core_rust_future_poll_i8,
+        completeFunc: ffi_eidola_app_core_rust_future_complete_i8,
+        freeFunc: ffi_eidola_app_core_rust_future_free_i8,
+        liftFunc: FfiConverterBool.lift,
+        errorHandler: FfiConverterTypeAppError_lift
+      )
+  }
+
   open func availableModels() async throws -> [ModelInfo] {
     return
       try await uniffiRustCallAsync(
@@ -758,13 +783,14 @@ open class AppCore: AppCoreProtocol, @unchecked Sendable {
       )
   }
 
-  open func chat(prompt: String, model: String) async throws -> ChatResult {
+  open func chat(prompt: String, model: String, spaceId: String?) async throws -> ChatResult {
     return
       try await uniffiRustCallAsync(
         rustFutureFunc: {
           uniffi_eidola_app_core_fn_method_appcore_chat(
             self.uniffiCloneHandle(),
-            FfiConverterString.lower(prompt), FfiConverterString.lower(model)
+            FfiConverterString.lower(prompt), FfiConverterString.lower(model),
+            FfiConverterOptionString.lower(spaceId)
           )
         },
         pollFunc: ffi_eidola_app_core_rust_future_poll_rust_buffer,
@@ -782,6 +808,57 @@ open class AppCore: AppCoreProtocol, @unchecked Sendable {
           self.uniffiCloneHandle(), $0
         )
       })
+  }
+
+  open func createSpace(title: String?) async throws -> SpaceInfo {
+    return
+      try await uniffiRustCallAsync(
+        rustFutureFunc: {
+          uniffi_eidola_app_core_fn_method_appcore_create_space(
+            self.uniffiCloneHandle(),
+            FfiConverterOptionString.lower(title)
+          )
+        },
+        pollFunc: ffi_eidola_app_core_rust_future_poll_rust_buffer,
+        completeFunc: ffi_eidola_app_core_rust_future_complete_rust_buffer,
+        freeFunc: ffi_eidola_app_core_rust_future_free_rust_buffer,
+        liftFunc: FfiConverterTypeSpaceInfo_lift,
+        errorHandler: FfiConverterTypeAppError_lift
+      )
+  }
+
+  open func getSpaceMessages(spaceId: String) async throws -> [SpaceMessage] {
+    return
+      try await uniffiRustCallAsync(
+        rustFutureFunc: {
+          uniffi_eidola_app_core_fn_method_appcore_get_space_messages(
+            self.uniffiCloneHandle(),
+            FfiConverterString.lower(spaceId)
+          )
+        },
+        pollFunc: ffi_eidola_app_core_rust_future_poll_rust_buffer,
+        completeFunc: ffi_eidola_app_core_rust_future_complete_rust_buffer,
+        freeFunc: ffi_eidola_app_core_rust_future_free_rust_buffer,
+        liftFunc: FfiConverterSequenceTypeSpaceMessage.lift,
+        errorHandler: FfiConverterTypeAppError_lift
+      )
+  }
+
+  open func listSpaces() async throws -> [SpaceInfo] {
+    return
+      try await uniffiRustCallAsync(
+        rustFutureFunc: {
+          uniffi_eidola_app_core_fn_method_appcore_list_spaces(
+            self.uniffiCloneHandle()
+
+          )
+        },
+        pollFunc: ffi_eidola_app_core_rust_future_poll_rust_buffer,
+        completeFunc: ffi_eidola_app_core_rust_future_complete_rust_buffer,
+        freeFunc: ffi_eidola_app_core_rust_future_free_rust_buffer,
+        liftFunc: FfiConverterSequenceTypeSpaceInfo.lift,
+        errorHandler: FfiConverterTypeAppError_lift
+      )
   }
 
   open func resetAccount() throws {
@@ -1186,6 +1263,7 @@ public func FfiConverterTypeBalancesResult_lower(_ value: BalancesResult) -> Rus
 }
 
 public struct ChatResult: Equatable, Hashable {
+  public var spaceId: String
   public var content: String
   public var model: String
   public var inputTokens: Int64?
@@ -1195,8 +1273,10 @@ public struct ChatResult: Equatable, Hashable {
   // Default memberwise initializers are never public by default, so we
   // declare one manually.
   public init(
-    content: String, model: String, inputTokens: Int64?, outputTokens: Int64?, creditsCharged: Int64
+    spaceId: String, content: String, model: String, inputTokens: Int64?, outputTokens: Int64?,
+    creditsCharged: Int64
   ) {
+    self.spaceId = spaceId
     self.content = content
     self.model = model
     self.inputTokens = inputTokens
@@ -1217,6 +1297,7 @@ public struct FfiConverterTypeChatResult: FfiConverterRustBuffer {
   public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChatResult {
     return
       try ChatResult(
+        spaceId: FfiConverterString.read(from: &buf),
         content: FfiConverterString.read(from: &buf),
         model: FfiConverterString.read(from: &buf),
         inputTokens: FfiConverterOptionInt64.read(from: &buf),
@@ -1226,6 +1307,7 @@ public struct FfiConverterTypeChatResult: FfiConverterRustBuffer {
   }
 
   public static func write(_ value: ChatResult, into buf: inout [UInt8]) {
+    FfiConverterString.write(value.spaceId, into: &buf)
     FfiConverterString.write(value.content, into: &buf)
     FfiConverterString.write(value.model, into: &buf)
     FfiConverterOptionInt64.write(value.inputTokens, into: &buf)
@@ -1552,6 +1634,108 @@ public func FfiConverterTypePriceInfo_lift(_ buf: RustBuffer) throws -> PriceInf
 #endif
 public func FfiConverterTypePriceInfo_lower(_ value: PriceInfo) -> RustBuffer {
   return FfiConverterTypePriceInfo.lower(value)
+}
+
+public struct SpaceInfo: Equatable, Hashable {
+  public var id: String
+  public var title: String?
+  public var createdAt: Int64
+
+  // Default memberwise initializers are never public by default, so we
+  // declare one manually.
+  public init(id: String, title: String?, createdAt: Int64) {
+    self.id = id
+    self.title = title
+    self.createdAt = createdAt
+  }
+
+}
+
+#if compiler(>=6)
+  extension SpaceInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSpaceInfo: FfiConverterRustBuffer {
+  public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SpaceInfo {
+    return
+      try SpaceInfo(
+        id: FfiConverterString.read(from: &buf),
+        title: FfiConverterOptionString.read(from: &buf),
+        createdAt: FfiConverterInt64.read(from: &buf)
+      )
+  }
+
+  public static func write(_ value: SpaceInfo, into buf: inout [UInt8]) {
+    FfiConverterString.write(value.id, into: &buf)
+    FfiConverterOptionString.write(value.title, into: &buf)
+    FfiConverterInt64.write(value.createdAt, into: &buf)
+  }
+}
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceInfo_lift(_ buf: RustBuffer) throws -> SpaceInfo {
+  return try FfiConverterTypeSpaceInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceInfo_lower(_ value: SpaceInfo) -> RustBuffer {
+  return FfiConverterTypeSpaceInfo.lower(value)
+}
+
+public struct SpaceMessage: Equatable, Hashable {
+  public var role: String
+  public var content: String
+
+  // Default memberwise initializers are never public by default, so we
+  // declare one manually.
+  public init(role: String, content: String) {
+    self.role = role
+    self.content = content
+  }
+
+}
+
+#if compiler(>=6)
+  extension SpaceMessage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSpaceMessage: FfiConverterRustBuffer {
+  public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SpaceMessage {
+    return
+      try SpaceMessage(
+        role: FfiConverterString.read(from: &buf),
+        content: FfiConverterString.read(from: &buf)
+      )
+  }
+
+  public static func write(_ value: SpaceMessage, into buf: inout [UInt8]) {
+    FfiConverterString.write(value.role, into: &buf)
+    FfiConverterString.write(value.content, into: &buf)
+  }
+}
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceMessage_lift(_ buf: RustBuffer) throws -> SpaceMessage {
+  return try FfiConverterTypeSpaceMessage.lift(buf)
+}
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpaceMessage_lower(_ value: SpaceMessage) -> RustBuffer {
+  return FfiConverterTypeSpaceMessage.lower(value)
 }
 
 /**
@@ -1901,6 +2085,57 @@ fileprivate struct FfiConverterSequenceTypePriceInfo: FfiConverterRustBuffer {
     return seq
   }
 }
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSpaceInfo: FfiConverterRustBuffer {
+  typealias SwiftType = [SpaceInfo]
+
+  public static func write(_ value: [SpaceInfo], into buf: inout [UInt8]) {
+    let len = Int32(value.count)
+    writeInt(&buf, len)
+    for item in value {
+      FfiConverterTypeSpaceInfo.write(item, into: &buf)
+    }
+  }
+
+  public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SpaceInfo] {
+    let len: Int32 = try readInt(&buf)
+    var seq = [SpaceInfo]()
+    seq.reserveCapacity(Int(len))
+    for _ in 0..<len {
+      seq.append(try FfiConverterTypeSpaceInfo.read(from: &buf))
+    }
+    return seq
+  }
+}
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSpaceMessage: FfiConverterRustBuffer {
+  typealias SwiftType = [SpaceMessage]
+
+  public static func write(_ value: [SpaceMessage], into buf: inout [UInt8]) {
+    let len = Int32(value.count)
+    writeInt(&buf, len)
+    for item in value {
+      FfiConverterTypeSpaceMessage.write(item, into: &buf)
+    }
+  }
+
+  public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SpaceMessage]
+  {
+    let len: Int32 = try readInt(&buf)
+    var seq = [SpaceMessage]()
+    seq.reserveCapacity(Int(len))
+    for _ in 0..<len {
+      seq.append(try FfiConverterTypeSpaceMessage.read(from: &buf))
+    }
+    return seq
+  }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
@@ -2006,13 +2241,25 @@ private let initializationResult: InitializationResult = {
   if (uniffi_eidola_app_core_checksum_method_appcore_account_show() != 41463) {
     return InitializationResult.apiChecksumMismatch
   }
+  if (uniffi_eidola_app_core_checksum_method_appcore_archive_space() != 14597) {
+    return InitializationResult.apiChecksumMismatch
+  }
   if (uniffi_eidola_app_core_checksum_method_appcore_available_models() != 18987) {
     return InitializationResult.apiChecksumMismatch
   }
-  if (uniffi_eidola_app_core_checksum_method_appcore_chat() != 22416) {
+  if (uniffi_eidola_app_core_checksum_method_appcore_chat() != 9728) {
     return InitializationResult.apiChecksumMismatch
   }
   if (uniffi_eidola_app_core_checksum_method_appcore_config_state() != 42267) {
+    return InitializationResult.apiChecksumMismatch
+  }
+  if (uniffi_eidola_app_core_checksum_method_appcore_create_space() != 12454) {
+    return InitializationResult.apiChecksumMismatch
+  }
+  if (uniffi_eidola_app_core_checksum_method_appcore_get_space_messages() != 30996) {
+    return InitializationResult.apiChecksumMismatch
+  }
+  if (uniffi_eidola_app_core_checksum_method_appcore_list_spaces() != 40346) {
     return InitializationResult.apiChecksumMismatch
   }
   if (uniffi_eidola_app_core_checksum_method_appcore_reset_account() != 36033) {

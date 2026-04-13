@@ -47,6 +47,17 @@ enum Command {
     Chat {
         /// The prompt to send
         prompt: String,
+        /// Model to use (defaults to first available)
+        #[arg(long, short)]
+        model: Option<String>,
+        /// Continue an existing conversation by space ID
+        #[arg(long, short)]
+        space: Option<String>,
+    },
+    /// Manage conversation spaces
+    Spaces {
+        #[command(subcommand)]
+        command: SpacesCommand,
     },
 }
 
@@ -95,6 +106,17 @@ enum WalletCommand {
 enum CredentialsCommand {
     /// List active credentials
     List,
+}
+
+#[derive(Subcommand)]
+enum SpacesCommand {
+    /// List active conversation spaces
+    List,
+    /// Archive a conversation space
+    Archive {
+        /// Space ID to archive
+        id: String,
+    },
 }
 
 fn build_core() -> AppCore {
@@ -342,10 +364,45 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 }
             },
         },
-        Some(Command::Chat { prompt }) => {
-            let result = core.chat(prompt, "glm-5-1".to_string()).await?;
+        Some(Command::Chat {
+            prompt,
+            model,
+            space,
+        }) => {
+            let model = model.unwrap_or_else(|| "glm-5-1".to_string());
+            let result = core.chat(prompt, model.clone(), space).await?;
             println!("{}", result.content);
+            eprintln!(
+                "---\nspace: {}  model: {}  tokens: {}/{}",
+                result.space_id,
+                result.model,
+                result.input_tokens.unwrap_or(0),
+                result.output_tokens.unwrap_or(0),
+            );
             Ok(())
         }
+        Some(Command::Spaces { command }) => match command {
+            SpacesCommand::List => {
+                let spaces = core.list_spaces().await?;
+                if spaces.is_empty() {
+                    println!("no active spaces");
+                    return Ok(());
+                }
+                for s in &spaces {
+                    let title = s.title.as_deref().unwrap_or("<untitled>");
+                    println!("{}: {}", s.id, title);
+                }
+                Ok(())
+            }
+            SpacesCommand::Archive { id } => {
+                let archived = core.archive_space(id.clone()).await?;
+                if archived {
+                    println!("archived space {id}");
+                } else {
+                    println!("space not found or already archived: {id}");
+                }
+                Ok(())
+            }
+        },
     }
 }

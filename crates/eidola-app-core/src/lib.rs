@@ -98,11 +98,25 @@ pub struct AllocateResult {
 
 #[derive(uniffi::Record)]
 pub struct ChatResult {
+    pub space_id: String,
     pub content: String,
     pub model: String,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub credits_charged: i64,
+}
+
+#[derive(uniffi::Record)]
+pub struct SpaceInfo {
+    pub id: String,
+    pub title: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct SpaceMessage {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(uniffi::Record)]
@@ -594,7 +608,59 @@ impl Inner {
             .collect())
     }
 
-    async fn chat(&self, prompt: &str, model: &str) -> Result<ChatResult, AppError> {
+    async fn list_spaces(&self) -> Result<Vec<SpaceInfo>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_spaces(&db_conn).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SpaceInfo {
+                id: r.id,
+                title: r.title,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
+    async fn get_space_messages(&self, space_id: &str) -> Result<Vec<SpaceMessage>, AppError> {
+        let db_conn = self.db_conn().await?;
+        db::get_space(&db_conn, space_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            })?;
+        let action_rows = db::get_space_actions_for_context(&db_conn, space_id).await?;
+        Ok(actions_to_messages(&action_rows))
+    }
+
+    async fn create_space(&self, title: Option<&str>) -> Result<SpaceInfo, AppError> {
+        let db_conn = self.db_conn().await?;
+        let now = now_ms();
+        let space_id = Uuid::now_v7().to_string();
+        db::insert_space(&db_conn, &space_id, title, "unlinked", now).await?;
+
+        let user_participant_id =
+            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+        db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
+            .await?;
+
+        Ok(SpaceInfo {
+            id: space_id,
+            title: title.map(String::from),
+            created_at: now,
+        })
+    }
+
+    async fn archive_space(&self, space_id: &str) -> Result<bool, AppError> {
+        let db_conn = self.db_conn().await?;
+        db::archive_space(&db_conn, space_id, now_ms()).await
+    }
+
+    async fn chat(
+        &self,
+        prompt: &str,
+        model: &str,
+        space_id: Option<&str>,
+    ) -> Result<ChatResult, AppError> {
         let cfg = self.load_config();
         let base_url = self.require_base_url(&cfg)?;
         let now = now_ms();
@@ -703,13 +769,36 @@ impl Inner {
         let model_participant_id =
             db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
 
-        let space_id = Uuid::now_v7().to_string();
-        db::insert_space(&db_conn, &space_id, None, "unlinked", now).await?;
-        db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
-            .await?;
-        db::insert_space_participant(&db_conn, &space_id, &model_participant_id, "member", now)
-            .await?;
+        // Reuse existing space or create a new one
+        let space_id = if let Some(sid) = space_id {
+            db::get_space(&db_conn, sid)
+                .await?
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("space not found: {sid}"),
+                })?;
+            // Ensure model participant is in the space (may be new model for this space)
+            let _ =
+                db::insert_space_participant(&db_conn, sid, &model_participant_id, "member", now)
+                    .await; // ignore duplicate
+            sid.to_string()
+        } else {
+            let sid = Uuid::now_v7().to_string();
+            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
+            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
+                .await?;
+            db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
+                .await?;
+            sid
+        };
 
+        // Load prior actions from this space to build multi-turn context
+        let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
+        let prior_messages = actions_to_messages(&prior_action_rows);
+
+        // Find the last action in the space for antecedent linking
+        let last_action_id = db::last_action_in_space(&db_conn, &space_id).await?;
+
+        // Insert the new user_input action
         let user_action_id = Uuid::now_v7().to_string();
         db::insert_action(
             &db_conn,
@@ -738,9 +827,21 @@ impl Inner {
         )
         .await?;
 
+        // Link to previous action as antecedent
+        if let Some(ref ante_id) = last_action_id {
+            db::insert_action_antecedent(&db_conn, &user_action_id, ante_id, 0).await?;
+        }
+
+        // Build the messages array: prior history + current prompt
+        let mut messages: Vec<serde_json::Value> = prior_messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
+        messages.push(serde_json::json!({"role": "user", "content": prompt}));
+
         let request_body_json = serde_json::json!({
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_completion_tokens": max_completion_tokens,
         });
         let request_at = now_ms();
@@ -855,6 +956,7 @@ impl Inner {
         .await?;
         db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0).await?;
 
+        // Record context assembly: all prior actions + the new user action
         let context_assembly_id = Uuid::now_v7().to_string();
         db::insert_context_assembly(
             &db_conn,
@@ -866,8 +968,15 @@ impl Inner {
             now_ms(),
         )
         .await?;
-        db::insert_context_assembly_action(&db_conn, &context_assembly_id, &user_action_id, 0)
-            .await?;
+
+        let prior_action_ids = db::space_action_ids(&db_conn, &space_id).await?;
+        for (pos, aid) in prior_action_ids.iter().enumerate() {
+            // Skip the inference action we just inserted (it's not context, it's the output)
+            if aid != &inference_action_id {
+                db::insert_context_assembly_action(&db_conn, &context_assembly_id, aid, pos as i64)
+                    .await?;
+            }
+        }
 
         let response_content = body
             .get("choices")
@@ -927,6 +1036,7 @@ impl Inner {
         }
 
         Ok(ChatResult {
+            space_id,
             content: response_content,
             model: model.to_string(),
             input_tokens,
@@ -1165,10 +1275,50 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    pub async fn chat(&self, prompt: String, model: String) -> Result<ChatResult, AppError> {
+    pub async fn list_spaces(&self) -> Result<Vec<SpaceInfo>, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.chat(&prompt, &model).await })
+            .spawn(async move { inner.list_spaces().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn get_space_messages(
+        &self,
+        space_id: String,
+    ) -> Result<Vec<SpaceMessage>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.get_space_messages(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn create_space(&self, title: Option<String>) -> Result<SpaceInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.create_space(title.as_deref()).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn archive_space(&self, space_id: String) -> Result<bool, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.archive_space(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn chat(
+        &self,
+        prompt: String,
+        model: String,
+        space_id: Option<String>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.chat(&prompt, &model, space_id.as_deref()).await })
             .await
             .map_err(join_err)?
     }
@@ -1288,6 +1438,41 @@ struct ModelListEntry {
 // ============================================================================
 // Free-standing helpers
 // ============================================================================
+
+/// Convert space action rows into a sequence of role/content messages suitable
+/// for the OpenAI messages array and for UI display. Groups content blocks by
+/// action and concatenates text.
+fn actions_to_messages(action_rows: &[db::SpaceActionRow]) -> Vec<SpaceMessage> {
+    let mut messages: Vec<SpaceMessage> = Vec::new();
+    let mut current_action_id: Option<&str> = None;
+
+    for row in action_rows {
+        let role = match (row.action_type.as_str(), row.participant_kind.as_str()) {
+            ("user_input", _) => "user",
+            ("inference", _) => "assistant",
+            _ => continue, // skip tool_call, tool_result, etc. for now
+        };
+
+        if current_action_id == Some(row.action_id.as_str()) {
+            // Additional content block for the same action — append text
+            if let Some(text) = &row.text_content
+                && let Some(last) = messages.last_mut()
+            {
+                last.content.push_str(text);
+            }
+        } else {
+            // New action
+            current_action_id = Some(&row.action_id);
+            let content = row.text_content.clone().unwrap_or_default();
+            messages.push(SpaceMessage {
+                role: role.to_string(),
+                content,
+            });
+        }
+    }
+
+    messages
+}
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

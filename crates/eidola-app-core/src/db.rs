@@ -757,6 +757,186 @@ pub async fn insert_context_assembly_action(
 }
 
 // ---------------------------------------------------------------------------
+// Layer 2 — Semantic: Space query operations
+// ---------------------------------------------------------------------------
+
+pub struct SpaceRow {
+    pub id: String,
+    pub title: Option<String>,
+    pub created_at: i64,
+}
+
+pub async fn list_spaces(conn: &Connection) -> Result<Vec<SpaceRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, created_at FROM space \
+             WHERE archived_at IS NULL \
+             ORDER BY created_at DESC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(SpaceRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            title: row.get::<Option<String>>(1).map_err(AppError::db)?,
+            created_at: row.get::<i64>(2).map_err(AppError::db)?,
+        });
+    }
+    Ok(results)
+}
+
+pub async fn get_space(conn: &Connection, space_id: &str) -> Result<Option<SpaceRow>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT id, title, created_at FROM space WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(SpaceRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            title: row.get::<Option<String>>(1).map_err(AppError::db)?,
+            created_at: row.get::<i64>(2).map_err(AppError::db)?,
+        })),
+    }
+}
+
+pub struct SpaceActionRow {
+    pub action_id: String,
+    pub action_type: String,
+    pub participant_kind: String,
+    pub status: String,
+    pub text_content: Option<String>,
+    pub block_ordinal: Option<i64>,
+}
+
+/// Returns actions in a space with their text content blocks, suitable for
+/// building the OpenAI messages array. Filters to terminal statuses and
+/// uses action_resolved to dereference origin references.
+pub async fn get_space_actions_for_context(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Vec<SpaceActionRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ar.action_id, ar.action_type, p.kind, ar.status, \
+                    cb.text_content, cb.ordinal \
+             FROM action_resolved ar \
+             JOIN participant p ON p.id = ar.participant_id \
+             LEFT JOIN content_block cb ON cb.action_id = ar.content_source_id \
+             WHERE ar.space_id = ?1 \
+               AND ar.status IN ('complete', 'cancelled') \
+             ORDER BY ar.created_at ASC, cb.ordinal ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(SpaceActionRow {
+            action_id: row.get::<String>(0).map_err(AppError::db)?,
+            action_type: row.get::<String>(1).map_err(AppError::db)?,
+            participant_kind: row.get::<String>(2).map_err(AppError::db)?,
+            status: row.get::<String>(3).map_err(AppError::db)?,
+            text_content: row.get::<Option<String>>(4).map_err(AppError::db)?,
+            block_ordinal: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+        });
+    }
+    Ok(results)
+}
+
+/// Returns the ID of the last terminal action in a space (for antecedent linking).
+pub async fn last_action_in_space(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM action \
+             WHERE space_id = ?1 AND status IN ('complete', 'cancelled') \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// Returns all action IDs in a space with terminal status, ordered by created_at.
+pub async fn space_action_ids(conn: &Connection, space_id: &str) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM action \
+             WHERE space_id = ?1 AND status IN ('complete', 'cancelled') \
+             ORDER BY created_at ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        ids.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(ids)
+}
+
+pub async fn archive_space(
+    conn: &Connection,
+    space_id: &str,
+    archived_at: i64,
+) -> Result<bool, AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE space SET archived_at = ?2 WHERE id = ?1 AND archived_at IS NULL",
+            (
+                Value::Text(space_id.to_string()),
+                Value::Integer(archived_at),
+            ),
+        )
+        .await
+        .map_err(|e| AppError::Database {
+            message: format!("failed to archive space: {e}"),
+        })?;
+    Ok(changed > 0)
+}
+
+pub async fn update_space_title(
+    conn: &Connection,
+    space_id: &str,
+    title: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE space SET title = ?2 WHERE id = ?1",
+        (
+            Value::Text(space_id.to_string()),
+            Value::Text(title.to_string()),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to update space title: {e}"),
+    })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Migrations
 // ---------------------------------------------------------------------------
 
