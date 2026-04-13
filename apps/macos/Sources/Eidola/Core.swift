@@ -26,7 +26,9 @@ public final class Core {
 
   // Chat
   public private(set) var models: [ModelInfo] = []
-  public private(set) var chatHistory: [ChatEntry] = []
+  public private(set) var spaces: [SpaceInfo] = []
+  public private(set) var currentSpaceId: String?
+  public private(set) var spaceMessages: [SpaceMessage] = []
 
   // MARK: – Inner core
 
@@ -155,48 +157,63 @@ public final class Core {
     isLoading = false
   }
 
+  // MARK: – Spaces
+
+  public func fetchSpaces() async {
+    do {
+      spaces = try await core.listSpaces()
+    } catch {
+      errorMessage = error.localizedDescription
+    }
+  }
+
+  public func selectSpace(_ id: String) async {
+    currentSpaceId = id
+    do {
+      spaceMessages = try await core.getSpaceMessages(spaceId: id)
+    } catch {
+      errorMessage = error.localizedDescription
+    }
+  }
+
+  public func newChat() {
+    currentSpaceId = nil
+    spaceMessages = []
+  }
+
+  public func archiveSpace(_ id: String) async {
+    do {
+      _ = try await core.archiveSpace(spaceId: id)
+      if currentSpaceId == id {
+        newChat()
+      }
+      await fetchSpaces()
+    } catch {
+      errorMessage = error.localizedDescription
+    }
+  }
+
   // MARK: – Chat
 
   public func sendMessage(_ prompt: String, model: String) async {
-    chatHistory.append(ChatEntry(role: .user, content: prompt))
+    // Optimistically show the user message
+    spaceMessages.append(SpaceMessage(role: "user", content: prompt))
 
     isLoading = true
     errorMessage = nil
     do {
-      let result = try await core.chat(prompt: prompt, model: model)
-      chatHistory.append(
-        ChatEntry(
-          role: .assistant,
-          content: result.content,
-          model: result.model,
-          inputTokens: result.inputTokens,
-          outputTokens: result.outputTokens
-        ))
+      let result = try await core.chat(prompt: prompt, model: model, spaceId: currentSpaceId)
+      currentSpaceId = result.spaceId
+
+      // Reload messages from DB to get the authoritative state
+      spaceMessages = try await core.getSpaceMessages(spaceId: result.spaceId)
+
+      // Refresh space list (new space may have been created)
+      await fetchSpaces()
     } catch {
       errorMessage = error.localizedDescription
-      chatHistory.append(ChatEntry(role: .error, content: error.localizedDescription))
+      spaceMessages.append(SpaceMessage(role: "error", content: error.localizedDescription))
     }
     isLoading = false
-  }
-
-  public func clearChat() {
-    chatHistory.removeAll()
-  }
-}
-
-// MARK: – Chat entry model
-
-public struct ChatEntry: Identifiable {
-  public let id = UUID()
-  public let role: Role
-  public let content: String
-  public var model: String?
-  public var inputTokens: Int64?
-  public var outputTokens: Int64?
-
-  public enum Role {
-    case user
-    case assistant
-    case error
   }
 }
