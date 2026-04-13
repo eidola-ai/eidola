@@ -48,6 +48,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::{Layer, Service};
 
 use der::Decode;
+use sha2::Digest as _;
 
 use crate::measurement::EnclaveMeasurement;
 use crate::{
@@ -83,6 +84,7 @@ pub(crate) struct BuildParams {
     pub tdx_observer: Option<tdx::TdxObserver>,
     pub snp_policy: sevsnp::SevSnpTcbPolicy,
     pub snp_observer: Option<sevsnp::SevSnpObserver>,
+    pub attestation_observer: Option<crate::AttestationObserver>,
     pub tls_roots: Arc<rustls::RootCertStore>,
 }
 
@@ -97,6 +99,7 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         tdx_observer,
         snp_policy,
         snp_observer,
+        attestation_observer,
         tls_roots,
     } = params;
     let host = crate::enclave_host(&inference_base_url);
@@ -127,6 +130,7 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         snp_policy,
         snp_observer,
         snp_crl_cache: sevsnp_crl::CrlCache::new(tls_roots),
+        attestation_observer,
     });
 
     reqwest::Client::builder()
@@ -242,6 +246,9 @@ struct AttestationCheck {
     /// Same stale-while-revalidate / single-flight semantics as the TDX
     /// collateral cache. Unused on TDX backends.
     snp_crl_cache: sevsnp_crl::CrlCache,
+    /// Optional consumer-provided observer fired for every successful
+    /// attestation. Same lifecycle as the platform-specific observers.
+    attestation_observer: Option<crate::AttestationObserver>,
 }
 
 impl AttestationCheck {
@@ -414,6 +421,18 @@ impl AttestationCheck {
             tcb_bucket = snp_observation.as_metric_label(),
             "SEV-SNP attestation verified for new connection",
         );
+
+        if let Some(observer) = &self.attestation_observer {
+            observer(crate::VerifiedAttestation {
+                platform: bundle::Platform::SevSnp,
+                matched_measurement: matched,
+                attestation_hash: hex::encode(sha2::Sha256::digest(&resolved.report_bytes)),
+                attestation_doc: resolved.report_bytes.clone(),
+                pcr_digest: measurement_hex,
+                peer_spki_hash: hex::encode(peer_spki),
+            });
+        }
+
         Ok(())
     }
 
@@ -449,6 +468,18 @@ impl AttestationCheck {
             tls_fingerprint = hex::encode(peer_spki),
             "TDX attestation verified for new connection",
         );
+
+        if let Some(observer) = &self.attestation_observer {
+            observer(crate::VerifiedAttestation {
+                platform: bundle::Platform::Tdx,
+                matched_measurement: matched,
+                attestation_hash: hex::encode(sha2::Sha256::digest(&resolved.report_bytes)),
+                attestation_doc: resolved.report_bytes.clone(),
+                pcr_digest: format!("{rtmr1_hex}:{rtmr2_hex}"),
+                peer_spki_hash: hex::encode(peer_spki),
+            });
+        }
+
         Ok(())
     }
 }

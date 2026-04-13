@@ -65,6 +65,31 @@ pub use measurement::{EnclaveMeasurement, MatchedMeasurement, TdxMeasurement};
 pub use sevsnp::{SevSnpObserver, SevSnpTcbObservation, SevSnpTcbPolicy, SevSnpTcbSvns};
 pub use tdx::{TcbPolicy as TdxTcbPolicy, TdxObserver, TdxTcbObservation, TdxTcbStatus};
 
+/// Details of a verified TEE attestation, emitted after each successful
+/// new-connection attestation check.
+#[derive(Debug, Clone)]
+pub struct VerifiedAttestation {
+    /// TEE platform (SEV-SNP or TDX).
+    pub platform: Platform,
+    /// The enclave measurement that matched the allowed list.
+    pub matched_measurement: MatchedMeasurement,
+    /// SHA-256 of the raw attestation report bytes (hex-encoded).
+    pub attestation_hash: String,
+    /// Raw attestation report bytes (SEV-SNP report or TDX quote).
+    pub attestation_doc: Vec<u8>,
+    /// Platform-specific code measurement digest (hex-encoded).
+    /// For SEV-SNP: the 48-byte launch digest.
+    /// For TDX: `{rtmr1}:{rtmr2}` (two 48-byte digests, colon-separated).
+    pub pcr_digest: String,
+    /// SHA-256 of the peer TLS certificate's SPKI (hex-encoded).
+    pub peer_spki_hash: String,
+}
+
+/// Callback fired after each successful new-connection attestation.
+/// Runs synchronously on the TLS handshake hot path — must be cheap
+/// and non-blocking (e.g. push to a vec or increment a counter).
+pub type AttestationObserver = std::sync::Arc<dyn Fn(VerifiedAttestation) + Send + Sync>;
+
 /// Configuration for [`attesting_client`].
 pub struct AttestingClientConfig<'a> {
     /// Allowed enclave releases. Each entry pairs a SEV-SNP measurement with a
@@ -144,6 +169,11 @@ pub struct AttestingClientConfig<'a> {
     /// rejects**. Same lifecycle and constraints as
     /// [`Self::tdx_observer`]. Unused on TDX backends.
     pub snp_observer: Option<SevSnpObserver>,
+    /// Optional observer fired on every successful attestation verification
+    /// for a new TLS connection. Receives the full attestation details
+    /// including the raw report bytes, matched measurement, and TLS
+    /// binding hash. Same lifecycle and constraints as [`Self::tdx_observer`].
+    pub attestation_observer: Option<AttestationObserver>,
 }
 
 /// Build a `reqwest::Client` whose connector verifies enclave attestation on
@@ -195,6 +225,7 @@ pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwe
         tdx_observer: config.tdx_observer,
         snp_policy,
         snp_observer: config.snp_observer,
+        attestation_observer: config.attestation_observer,
         tls_roots,
     })
 }

@@ -2,6 +2,7 @@ mod config;
 mod db;
 
 use std::io::IsTerminal;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anonymous_credit_tokens::{
@@ -260,29 +261,45 @@ fn compute_challenge_digest() -> [u8; 32] {
     Sha256::digest(serialize_token_challenge()).into()
 }
 
-fn now_iso() -> String {
-    let secs = SystemTime::now()
+/// Current time as milliseconds since Unix epoch.
+fn now_ms() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before epoch")
-        .as_secs();
-    let days = (secs / 86400) as i64;
-    let time_of_day = secs % 86400;
-    let (hour, min, sec) = (
-        time_of_day / 3600,
-        (time_of_day % 3600) / 60,
-        time_of_day % 60,
-    );
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+        .as_millis() as i64
+}
+
+/// Parse an ISO 8601 timestamp (e.g. "2026-04-12T00:00:00Z") to epoch ms.
+fn iso_to_ms(s: &str) -> Result<i64, String> {
+    let s = s.trim().trim_end_matches('Z');
+    let (date, time) = s
+        .split_once('T')
+        .ok_or_else(|| format!("invalid ISO 8601: {s}"))?;
+    let dp: Vec<&str> = date.split('-').collect();
+    let tp: Vec<&str> = time.split(':').collect();
+    if dp.len() != 3 || tp.len() != 3 {
+        return Err(format!("invalid ISO 8601: {s}"));
+    }
+    let y: i64 = dp[0].parse().map_err(|_| "bad year".to_string())?;
+    let m: u32 = dp[1].parse().map_err(|_| "bad month".to_string())?;
+    let d: u32 = dp[2].parse().map_err(|_| "bad day".to_string())?;
+    let hour: i64 = tp[0].parse().map_err(|_| "bad hour".to_string())?;
+    let min: i64 = tp[1].parse().map_err(|_| "bad minute".to_string())?;
+    let sec: i64 = tp[2]
+        .split('.')
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| "bad second".to_string())?;
+    // Civil date to days since epoch (Howard Hinnant algorithm)
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = y_adj.div_euclid(400);
+    let yoe = y_adj.rem_euclid(400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe as i64 - 719468;
+    let secs = days * 86400 + hour * 3600 + min * 60 + sec;
+    Ok(secs * 1000)
 }
 
 /// Load the OS trust store into a fresh `RootCertStore`. Used for both the
@@ -307,7 +324,10 @@ fn load_native_root_store() -> rustls::RootCertStore {
 /// Build a reqwest client. When `trusted_measurements` is configured, the
 /// client verifies Tinfoil enclave attestation on each new TLS connection,
 /// ensuring the server is running expected code inside a TEE.
-async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
+async fn build_client(
+    config: &Config,
+    attestation_observer: Option<tinfoil_verifier::AttestationObserver>,
+) -> Result<reqwest::Client, String> {
     if config.trusted_measurements.is_empty() {
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(load_native_root_store())
@@ -330,11 +350,6 @@ async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
         "hardware_intermediate_ca",
     )?;
 
-    // Attestation now happens inside the connector on the first real request
-    // (and on every subsequent new TLS handshake). The CLI is interactive, so
-    // we don't bother with a startup smoke test — failures will surface on the
-    // first command the user runs and are mapped to a human-readable error by
-    // `describe_request_error` below.
     tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
         allowed_measurements: &config.trusted_measurements,
         inference_base_url: origin,
@@ -346,6 +361,7 @@ async fn build_client(config: &Config) -> Result<reqwest::Client, String> {
         tdx_observer: None,
         snp_min_tcb: None,
         snp_observer: None,
+        attestation_observer,
         tls_roots: load_native_root_store(),
     })
     .await
@@ -635,7 +651,7 @@ async fn cmd_account_show() -> Result<(), String> {
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = build_client(&config).await?;
+    let client = build_client(&config, None).await?;
     let resp = client
         .get(format!("{base_url}/v1/account"))
         .basic_auth(id, Some(secret))
@@ -672,7 +688,7 @@ async fn cmd_account_create() -> Result<(), String> {
         );
     }
 
-    let client = build_client(&config).await?;
+    let client = build_client(&config, None).await?;
     let resp = client
         .post(format!("{base_url}/v1/account"))
         .send()
@@ -731,7 +747,7 @@ async fn cmd_account_prices() -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
 
-    let client = build_client(&config).await?;
+    let client = build_client(&config, None).await?;
     let resp = client
         .get(format!("{base_url}/v1/prices"))
         .send()
@@ -788,7 +804,7 @@ async fn cmd_account_checkout(price_id: &str, no_browser: bool) -> Result<(), St
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = build_client(&config).await?;
+    let client = build_client(&config, None).await?;
     let resp = client
         .post(format!("{base_url}/v1/account/checkout"))
         .basic_auth(id, Some(secret))
@@ -824,7 +840,7 @@ async fn cmd_account_balances() -> Result<(), String> {
     let base_url = require_base_url(&config)?;
     let (id, secret) = require_credentials(&config)?;
 
-    let client = build_client(&config).await?;
+    let client = build_client(&config, None).await?;
     let resp = client
         .get(format!("{base_url}/v1/account/balances"))
         .basic_auth(id, Some(secret))
@@ -863,7 +879,7 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
     let (account_id, secret) = require_credentials(&config)?;
-    let client = build_client(&config).await?;
+    let client = build_client(&config, None).await?;
 
     // 1. Fetch issuer keys from server
     let resp = client
@@ -932,7 +948,8 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
     let params_hash = blake3::hash(domain_separator.as_bytes())
         .to_hex()
         .to_string();
-    let now = now_iso();
+    let now = now_ms();
+    let expires_at = iso_to_ms(&key.issue_until)?;
 
     db::upsert_issuer_key(
         &conn,
@@ -940,8 +957,8 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
         &params_hash,
         &public_key_cbor,
         domain_separator.as_bytes(),
-        &key.issue_until,
-        &now,
+        expires_at,
+        now,
     )
     .await?;
 
@@ -959,7 +976,7 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
         &key.id,
         &pre_issuance_cbor,
         credits,
-        &now,
+        now,
     )
     .await?;
 
@@ -1020,7 +1037,7 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
         &token_cbor,
         token_credits as i64,
         0,
-        &now,
+        now,
     )
     .await?;
 
@@ -1030,11 +1047,67 @@ async fn cmd_account_allocate(credits: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// Drain any pending attestations from the observer log and persist them.
+/// Returns the most recently created connection ID (if any new attestation fired).
+async fn flush_attestations(
+    attestation_log: &Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>,
+    db_conn: &turso::Connection,
+    provider_id: &str,
+    base_url: &str,
+    now: i64,
+) -> Result<Option<String>, String> {
+    let attestations: Vec<_> = attestation_log.lock().unwrap().drain(..).collect();
+    let mut connection_id = None;
+    for att in &attestations {
+        db::upsert_attestation(
+            db_conn,
+            &att.attestation_hash,
+            &att.attestation_doc,
+            Some(&att.pcr_digest),
+            now,
+        )
+        .await?;
+        let cid = Uuid::now_v7().to_string();
+        db::insert_connection(
+            db_conn,
+            &cid,
+            provider_id,
+            base_url,
+            "clearnet",
+            Some(&att.attestation_hash),
+            now,
+            now,
+        )
+        .await?;
+        connection_id = Some(cid);
+    }
+    Ok(connection_id)
+}
+
 async fn cmd_chat(prompt: &str) -> Result<(), String> {
     let config = Config::load();
     let base_url = require_base_url(&config)?;
-    let client = build_client(&config).await?;
-    let model_id = "kimi-k2-5";
+    let model_id = "glm-5-1";
+    let now = now_ms();
+
+    // Open DB and set up provider
+    let database = db::open().await?;
+    let db_conn = database
+        .connect()
+        .map_err(|e| format!("failed to connect: {e}"))?;
+    let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
+
+    // Set up attestation tracking
+    let attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let log_clone = attestation_log.clone();
+    let observer: Option<tinfoil_verifier::AttestationObserver> = Some(Arc::new(
+        move |att: tinfoil_verifier::VerifiedAttestation| {
+            log_clone.lock().unwrap().push(att);
+        },
+    ));
+
+    let client = build_client(&config, observer).await?;
 
     // 1. Fetch model info for pricing
     let resp = client
@@ -1051,6 +1124,11 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
         .json()
         .await
         .map_err(|e| format!("failed to parse models response: {e}"))?;
+
+    // Persist any attestation from the models request
+    let mut connection_id =
+        flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?;
+
     let model = models
         .data
         .iter()
@@ -1060,8 +1138,7 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
     // 2. Estimate max_completion_tokens: cap at 4096
     let max_completion_tokens = (model.context_length).min(4096) as u32;
 
-    // 3. Calculate worst-case cost (mirrors server logic):
-    //    prompt_bytes * prompt_rate + max_completion_tokens * completion_rate
+    // 3. Calculate worst-case cost
     let sf = model.pricing.per_prompt_token.scale_factor as u128;
     let prompt_bytes = prompt.len() as u128;
     let prompt_rate = model.pricing.per_prompt_token.value as u128;
@@ -1074,13 +1151,8 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
         return Err("computed charge is zero — model pricing may be missing".into());
     }
 
-    // 4. Open DB and find a credential with enough credits
-    let database = db::open().await?;
-    let conn = database
-        .connect()
-        .map_err(|e| format!("failed to connect: {e}"))?;
-
-    let cred = db::find_spendable_credential(&conn, charge_credits as i64)
+    // 4. Find a credential with enough credits
+    let cred = db::find_spendable_credential(&db_conn, charge_credits as i64)
         .await?
         .ok_or("no credential with sufficient credits found")?;
 
@@ -1110,19 +1182,18 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
         .to_cbor()
         .map_err(|e| format!("failed to encode spend proof: {e}"))?;
     let pre_cred_id = Uuid::now_v7().to_string();
-    let now = now_iso();
     db::insert_pre_credential_refund(
-        &conn,
+        &db_conn,
         &pre_cred_id,
         &cred.nonce,
         &cred.issuer_key_id,
         &pre_refund_cbor,
         charge_credits as i64,
-        &now,
+        now,
     )
     .await?;
 
-    // 8. Build ACT wire token: token_type || challenge_digest || issuer_key_id || spend_proof_cbor
+    // 8. Build ACT wire token
     let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
     let challenge_digest = compute_challenge_digest();
 
@@ -1135,26 +1206,77 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
     let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
     let auth_value = format!("PrivateToken token=\"{token_b64}\"");
 
-    // 9. Send chat completion request
+    // 9. Create semantic records: space, participants, user_input action
+    let user_participant_id = db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+    let model_participant_id =
+        db::ensure_participant(&db_conn, "agent", model_id, Some(&provider_id), now).await?;
+
+    let space_id = Uuid::now_v7().to_string();
+    db::insert_space(&db_conn, &space_id, None, "unlinked", now).await?;
+    db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now).await?;
+    db::insert_space_participant(&db_conn, &space_id, &model_participant_id, "member", now).await?;
+
+    let user_action_id = Uuid::now_v7().to_string();
+    db::insert_action(
+        &db_conn,
+        &db::ActionEntry {
+            id: user_action_id.clone(),
+            space_id: space_id.clone(),
+            participant_id: user_participant_id,
+            action_type: "user_input".to_string(),
+            status: "complete".to_string(),
+            intent: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            credits_consumed: None,
+            created_at: now,
+        },
+    )
+    .await?;
+    db::insert_text_content_block(
+        &db_conn,
+        &Uuid::now_v7().to_string(),
+        &user_action_id,
+        0,
+        "text",
+        prompt,
+    )
+    .await?;
+
+    // 10. Send chat completion request
+    let request_body_json = serde_json::json!({
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_completion_tokens": max_completion_tokens,
+    });
+    let request_at = now_ms();
+
     let resp = client
         .post(format!("{base_url}/v1/chat/completions"))
         .header("Authorization", &auth_value)
-        .json(&serde_json::json!({
-            "model": model_id,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_completion_tokens": max_completion_tokens,
-        }))
+        .json(&request_body_json)
         .send()
         .await
         .map_err(describe_request_error)?;
+    let response_at = now_ms();
+
+    // Flush attestations from the completions request
+    if let Some(new_cid) =
+        flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?
+    {
+        connection_id = Some(new_cid);
+    }
 
     let status = resp.status();
-    let body: serde_json::Value = resp
-        .json()
+    let response_text = resp
+        .text()
         .await
-        .map_err(|e| format!("failed to parse response: {e}"))?;
+        .map_err(|e| format!("failed to read response: {e}"))?;
+    let body: serde_json::Value = serde_json::from_str(&response_text)
+        .map_err(|e| format!("failed to parse response JSON: {e}"))?;
 
-    // 10. Extract and process refund if present
+    // 11. Extract and process refund if present
     if let Some(refund_obj) = body.get("refund") {
         let refund_b64 = refund_obj
             .get("refund")
@@ -1183,17 +1305,96 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
             .map_err(|e| format!("invalid credit amount in refund token: {e}"))?;
 
         db::insert_credential(
-            &conn,
+            &db_conn,
             &new_nonce,
             &pre_cred_id,
             refund_key_id,
             &new_token_cbor,
             new_credits as i64,
             cred.generation + 1,
-            &now,
+            now,
         )
         .await?;
     }
+
+    // 12. Create inference action with token usage from response
+    let usage = body.get("usage");
+    let input_tokens = usage
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|v| v.as_i64());
+    let output_tokens = usage
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(|v| v.as_i64());
+
+    let inference_action_id = Uuid::now_v7().to_string();
+    db::insert_action(
+        &db_conn,
+        &db::ActionEntry {
+            id: inference_action_id.clone(),
+            space_id: space_id.clone(),
+            participant_id: model_participant_id,
+            action_type: "inference".to_string(),
+            status: if status.is_success() {
+                "complete"
+            } else {
+                "error"
+            }
+            .to_string(),
+            intent: None,
+            model: Some(model_id.to_string()),
+            input_tokens,
+            output_tokens,
+            credits_consumed: Some(charge_credits as i64),
+            created_at: now_ms(),
+        },
+    )
+    .await?;
+    db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0).await?;
+
+    // 13. Create content blocks for the response
+    let response_content = body
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str());
+
+    if let Some(content) = response_content {
+        db::insert_text_content_block(
+            &db_conn,
+            &Uuid::now_v7().to_string(),
+            &inference_action_id,
+            0,
+            "text",
+            content,
+        )
+        .await?;
+    }
+
+    // 14. Record the HTTP request/response
+    db::insert_request_log(
+        &db_conn,
+        &db::RequestLogEntry {
+            id: Uuid::now_v7().to_string(),
+            connection_id,
+            action_id: Some(inference_action_id),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            request_headers: None,
+            request_body: Some(request_body_json.to_string().into_bytes()),
+            response_status: Some(status.as_u16() as i64),
+            response_headers: None,
+            response_body: Some(response_text.as_bytes().to_vec()),
+            request_at,
+            response_at: Some(response_at),
+            duration_ms: Some(response_at - request_at),
+            error: None,
+            credential_nonce: Some(cred.nonce.clone()),
+            created_at: now_ms(),
+        },
+    )
+    .await?;
 
     if !status.is_success() {
         let error_msg = body
@@ -1204,14 +1405,8 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
         return Err(format!("server returned {status}: {error_msg}"));
     }
 
-    // 11. Print response content
-    if let Some(choices) = body.get("choices").and_then(|c| c.as_array())
-        && let Some(content) = choices
-            .first()
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-    {
+    // 15. Print response content
+    if let Some(content) = response_content {
         println!("{content}");
     }
 
