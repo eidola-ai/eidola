@@ -793,6 +793,7 @@ pub async fn insert_tool_result_content_block(
 // ---------------------------------------------------------------------------
 
 /// Upsert a system prompt (deduplicated by SHA-256 hash). Returns the hash.
+#[allow(dead_code)]
 pub async fn upsert_system_prompt(conn: &Connection, text: &str) -> Result<String, String> {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(text.as_bytes());
