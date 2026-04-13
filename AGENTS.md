@@ -139,6 +139,13 @@ Both the CLI and macOS app use an embedded [Turso](https://crates.io/crates/turs
 
 The `justfile` is the primary development interface. Run `just` to see all available recipes.
 
+**Key recipes:**
+- `just build {server,cli,macos}` — local-toolchain builds for fast iteration. The `macos` target regenerates UniFFI bindings and the XCFramework, runs `swift build`, then assembles a `.app` bundle via `scripts/package-macos-app.sh` into `apps/macos/build/Eidola.app`. macOS-only.
+- `just run {server,cli,macos}` — build and run. For `macos`, opens the `.app` bundle via `open`. Accepts trailing args (e.g. `just run cli chat "hello"`).
+- `just test` — runs `cargo test` plus Swift tests (`crates/eidola-app-core` and `apps/macos`) on macOS.
+- `just check` — clippy, rustfmt, swift-format lint.
+- `just dev` / `just services` / `just down` — container-based development workflows (see Compose files above).
+
 ## Conventions
 
 - Pure Rust dependencies preferred (for cross-compilation)

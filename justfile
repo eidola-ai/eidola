@@ -6,7 +6,7 @@ default:
 
 # --- Development ---
 
-# Run the full stack with the server in a container (detached).
+# Run the full server stack with the server in a container (detached).
 dev:
     ./scripts/dev.sh --container
 
@@ -24,7 +24,61 @@ db-reset:
     docker compose exec postgres createdb -U eidola eidola
     docker compose exec postgres psql -U eidola -d eidola -f /docker-entrypoint-initdb.d/schema.sql
 
-# --- Rust (inner loop, runs on host) ---
+# --- Build (local toolchain, fast iteration) ---
+
+# Build a system: server, cli, or macos
+build system:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ system }}" in
+      server)
+        cargo build -p eidola-server
+        ;;
+      cli)
+        cargo build -p eidola-cli
+        ;;
+      macos)
+        if [[ "$(uname -s)" != "Darwin" ]]; then
+          echo "error: macOS app can only be built on macOS" >&2
+          exit 1
+        fi
+        just update-bindings
+        just update-xcframework
+        ( cd apps/macos && swift build )
+        ./scripts/package-macos-app.sh
+        ;;
+      *)
+        echo "error: unknown system '{{ system }}' (expected: server, cli, macos)" >&2
+        exit 1
+        ;;
+    esac
+
+# Build and run a system: server, cli, or macos
+run system *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ system }}" in
+      server)
+        cargo run -p eidola-server -- {{ args }}
+        ;;
+      cli)
+        cargo run -p eidola-cli -- {{ args }}
+        ;;
+      macos)
+        if [[ "$(uname -s)" != "Darwin" ]]; then
+          echo "error: macOS app can only run on macOS" >&2
+          exit 1
+        fi
+        just build macos
+        open "apps/macos/build/Eidola.app" {{ args }}
+        ;;
+      *)
+        echo "error: unknown system '{{ system }}' (expected: server, cli, macos)" >&2
+        exit 1
+        ;;
+    esac
+
+# --- Checks & Tests (inner loop, runs on host) ---
 
 # Lint and format check
 check:
@@ -32,9 +86,17 @@ check:
     cargo fmt --check
     git ls-files '*.swift' | xargs swift format lint --strict
 
-# Run all tests
+# Run all tests (Rust + Swift on macOS)
 test:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo test
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      echo "--- Swift tests (crates/eidola-app-core) ---"
+      ( cd crates/eidola-app-core && swift test )
+      echo "--- Swift tests (apps/macos) ---"
+      ( cd apps/macos && swift test )
+    fi
 
 # Run integration tests (requires: just services && just db-reset)
 test-integration:
@@ -64,10 +126,6 @@ update-xcframework-release:
 
 # --- CI / Release ---
 
-build:
-    # Build OCI images (server, cli, postgresql)
-    docker buildx bake
-
 # Compute enclave measurements from tinfoil-config.yml and CVM artifacts
 measure:
     ./scripts/artifact-manifest.sh measure
@@ -79,15 +137,3 @@ measure:
 # measurements. Requires macOS for the Nix-built app and CLI artifacts.
 update-manifest:
     ./scripts/artifact-manifest.sh update --ensure-builder
-
-# Run all Nix checks (formatting, linting, tests, artifact freshness)
-ci-check:
-    nix flake check --show-trace
-
-# Build XCFramework via Nix
-ci-build-xcframework:
-    nix run '.#update-eidola-app-core-swift-xcframework'
-
-# Build macOS app via Nix (reproducible, open-source Swift 6.2 toolchain)
-build-macos-app:
-    nix build '.#eidola-macos-app' --show-trace

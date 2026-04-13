@@ -25,6 +25,9 @@ xcuserdata/
 .swiftpm/
 core/target/
 
+# Local .app bundle output
+apps/macos/build/
+
 # macOS
 .DS_Store
 

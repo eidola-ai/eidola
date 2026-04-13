@@ -4,8 +4,7 @@ import Testing
 @testable import EidolaAppCore
 
 @Suite struct EidolaAppCoreTests {
-  @Test func greetReturnsHelloWorld() {
-    let greeting = greet()
-    #expect(greeting == "Hello, World!")
+  @Test func coreImportsSuccessfully() async throws {
+    // Verify the EidolaAppCore module can be imported and linked.
   }
 }

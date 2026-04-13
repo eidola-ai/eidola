@@ -104,16 +104,30 @@ To run the CLI against a local development stack:
 
 Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) for convenience.
 
+### macOS App
+
+Build, run, and test the macOS app from the command line:
+
+```bash
+just build macos    # regenerate bindings + xcframework, swift build, package .app
+just run macos      # build and open Eidola.app
+just test           # cargo test + swift tests (on macOS)
+```
+
+`just build macos` produces `apps/macos/build/Eidola.app`. For Xcode-based
+development (debugging, previews, UI tests), open the wrapper project at
+`apps/macos/Xcode/Eidola.xcodeproj`.
+
 See more available commands:
 
 ```bash
-just --help
+just
 ```
 
 **Updating generated files:**
 If you change Rust APIs or types, update the committed Swift bindings or OpenAPI spec:
 ```bash
-just update-bindings      # UniFFI Swift bindings + Crux types
+just update-bindings      # UniFFI Swift bindings
 just update-openapi       # OpenAPI spec
 just update-xcframework   # XCFramework (dev, native arch only)
 ```
