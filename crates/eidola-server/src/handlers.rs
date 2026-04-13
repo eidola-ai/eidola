@@ -159,16 +159,12 @@ fn error_response_with_refund(
 // Chat completions
 // ---------------------------------------------------------------------------
 
-/// Verify the spend proof, validate the model and pricing, check the charge
-/// amount, and record the nullifier. Returns the model info and charge amount.
+/// Cryptographically verify the spend proof.
 ///
-/// After this function returns `Ok`, the nullifier has been recorded and a
-/// refund MUST be issued to the client on any subsequent error.
-async fn authorize_spend(
-    state: &AppState,
-    act: &ActSpend,
-    request: &ChatCompletionRequest,
-) -> Result<(Model, u128), ServerError> {
+/// Checks challenge_digest, loads the issuer key, validates request_context,
+/// and verifies the proof itself. Does NOT record the nullifier — errors here
+/// mean the ACT is invalid or malformed, so no refund is needed.
+async fn verify_spend_proof(state: &AppState, act: &ActSpend) -> Result<(), ServerError> {
     let master_key = &state.credential_master_key;
 
     // Verify the challenge_digest matches our expected TokenChallenge.
@@ -189,26 +185,41 @@ async fn authorize_spend(
     .await?;
 
     // Verify the spend proof's request_context matches what we expect.
-    {
-        let cache = state.credential_key_cache.read().await;
-        let key = cache.get(&act.issuer_key_hash).ok_or_else(|| {
-            ServerError::Internal("issuer key evicted from cache unexpectedly".to_string())
+    let cache = state.credential_key_cache.read().await;
+    let key = cache.get(&act.issuer_key_hash).ok_or_else(|| {
+        ServerError::Internal("issuer key evicted from cache unexpectedly".to_string())
+    })?;
+
+    if act.spend_proof.context() != key.request_context_scalar {
+        return Err(ServerError::Unauthorized {
+            message: "invalid request_context in spend proof".to_string(),
+        });
+    }
+
+    // Verify the spend proof by calling refund with t=0 (discards the result).
+    key.secret_key
+        .refund::<128>(&key.params, &act.spend_proof, Scalar::ZERO, OsRng)
+        .map_err(|_| ServerError::Unauthorized {
+            message: "invalid spend proof".to_string(),
         })?;
 
-        // Check that the spend proof's ctx matches the expected request_context scalar.
-        if act.spend_proof.context() != key.request_context_scalar {
-            return Err(ServerError::Unauthorized {
-                message: "invalid request_context in spend proof".to_string(),
-            });
-        }
+    Ok(())
+}
 
-        // Verify the spend proof by calling refund with t=0 (discards the result).
-        key.secret_key
-            .refund::<128>(&key.params, &act.spend_proof, Scalar::ZERO, OsRng)
-            .map_err(|_| ServerError::Unauthorized {
-                message: "invalid spend proof".to_string(),
-            })?;
-    }
+/// Validate the model and charge amount against the request.
+///
+/// Called after the nullifier is recorded. Errors here require a full refund.
+fn validate_request(
+    state: &AppState,
+    act: &ActSpend,
+    request: &ChatCompletionRequest,
+) -> Result<(Model, u128), ServerError> {
+    // Decode the charge amount from the spend proof.
+    let charge_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).map_err(|_| {
+        ServerError::BadRequest {
+            message: "invalid charge amount in spend proof".to_string(),
+        }
+    })?;
 
     // Look up the model and validate pricing.
     let model =
@@ -219,13 +230,6 @@ async fn authorize_spend(
                 message: format!("unknown model: {}", request.model),
             })?;
 
-    // Decode the charge amount from the spend proof.
-    let charge_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).map_err(|_| {
-        ServerError::BadRequest {
-            message: "invalid charge amount in spend proof".to_string(),
-        }
-    })?;
-
     // Check that the charge covers the worst-case cost.
     let wc = worst_case_cost(request, &model);
     if charge_credits < wc {
@@ -235,17 +239,6 @@ async fn authorize_spend(
                 charge_credits, wc
             ),
             available: charge_credits as i64,
-        });
-    }
-
-    // Atomically record the nullifier.
-    let key_id = hex::encode(act.issuer_key_hash);
-    let nullifier = act.spend_proof.nullifier();
-    let nullifier_bytes = nullifier.as_bytes().to_vec();
-    let recorded = db::record_nullifier(&state.db_pool, &key_id, &nullifier_bytes).await?;
-    if !recorded {
-        return Err(ServerError::Conflict {
-            message: "credential already spent (duplicate nullifier)".to_string(),
         });
     }
 
@@ -276,11 +269,46 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<axum::response::Response, ServerError> {
-    let (model, charge_credits) = authorize_spend(&state, &act, &request).await?;
+    // Phase 1: Verify the ACT cryptographically. Errors here mean the token
+    // is invalid/malformed — no nullifier recorded, no refund needed.
+    verify_spend_proof(&state, &act).await?;
+
+    // Phase 2: Record the nullifier. After this succeeds, the credential is
+    // consumed and we MUST issue a refund on every subsequent code path.
+    let key_id = hex::encode(act.issuer_key_hash);
+    let nullifier = act.spend_proof.nullifier();
+    let nullifier_bytes = nullifier.as_bytes().to_vec();
+    let recorded = db::record_nullifier(&state.db_pool, &key_id, &nullifier_bytes).await?;
+    if !recorded {
+        return Err(ServerError::Conflict {
+            message: "credential already spent (duplicate nullifier)".to_string(),
+        });
+    }
 
     // --- POINT OF NO RETURN: nullifier is recorded ---
     // From here on, we MUST issue a refund on any error.
 
+    // Phase 3: Validate the request (model, charge amount). On failure, issue
+    // a full refund of the charge amount back to the client.
+    let (model, charge_credits) = match validate_request(&state, &act, &request) {
+        Ok(v) => v,
+        Err(e) => {
+            // Decode charge for the refund. If this also fails, fall back to
+            // zero refund (returns blind remaining value c - s).
+            let refund_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).unwrap_or(0);
+            warn!("Request validation failed after nullifier recorded, issuing full refund: {e}");
+            let refund = issue_refund_async(
+                &state,
+                &act.spend_proof,
+                &act.issuer_key_hash,
+                refund_credits,
+            )
+            .await;
+            return Ok(error_response_with_refund(&e, refund.ok()));
+        }
+    };
+
+    // Phase 4: Handle the request.
     let result = if request.stream {
         handle_streaming_request(state, &request, &act, &model, charge_credits).await
     } else {
@@ -461,10 +489,18 @@ async fn handle_streaming_request(
                 Ok(info) => Some(info),
                 Err(e) => {
                     error!(
-                        "CRITICAL: failed to issue refund ({} credits): {}",
+                        "CRITICAL: failed to issue refund ({} credits): {}, retrying with zero",
                         refund_credits, e
                     );
-                    None
+                    // Fall back to a zero refund (returns blind remaining value
+                    // c - s) so the client doesn't lose the credential entirely.
+                    match issue_refund_async(state, &proof, issuer_key_hash, 0).await {
+                        Ok(info) => Some(info),
+                        Err(e2) => {
+                            error!("CRITICAL: failed to issue fallback zero refund: {}", e2);
+                            None
+                        }
+                    }
                 }
             }
         }
