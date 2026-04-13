@@ -6,7 +6,9 @@ use std::time::{Duration, SystemTime};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use anonymous_credit_tokens::{IssuanceRequest, Params, PrivateKey, Scalar, credit_to_scalar};
+use anonymous_credit_tokens::{
+    IssuanceRequest, Params, PrivateKey, Scalar, credit_to_scalar, scalar_to_credit,
+};
 use axum::Json;
 use axum::extract::State;
 use base64::Engine;
@@ -19,10 +21,11 @@ use tracing::{info, warn};
 use utoipa::ToSchema;
 
 use crate::AppState;
-use crate::auth::BasicAuth;
+use crate::auth::{BasicAuth, TokenAuth};
 use crate::db;
 use crate::error::ServerError;
 use crate::helpers::{EpochConfig, system_time_to_iso_lossy};
+use crate::response::RefundInfo;
 
 // ---------------------------------------------------------------------------
 // Key cache types
@@ -670,6 +673,151 @@ pub async fn issue_credentials(
         issuer_key_id: key_id,
         credits: request.credits,
         ledger_entry_id: ledger_entry_id.to_string(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Refund recovery
+// ---------------------------------------------------------------------------
+
+/// Response from the refund recovery endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RefundRecoveryResponse {
+    /// The refund token.
+    pub refund: RefundInfo,
+}
+
+/// Recover a refund token for a previously spent ACT.
+///
+/// If the ACT's nullifier was already recorded (the server received and
+/// processed the original request), the stored refund token is returned.
+///
+/// If the nullifier was NOT recorded (the original request never arrived),
+/// the server verifies the spend proof, records the nullifier, issues a
+/// full refund (no credits consumed), stores it, and returns it.
+///
+/// In both cases, the client gets a refund token it can combine with its
+/// local `PreRefund` state to reconstruct a credential.
+#[utoipa::path(
+    post,
+    path = "/v1/credentials/refund",
+    tag = "Unlinked",
+    responses(
+        (status = 200, description = "Refund token recovered or issued", body = RefundRecoveryResponse),
+        (status = 401, description = "Invalid spend proof", body = crate::types::ErrorResponse),
+        (status = 404, description = "Nullifier found but refund token not yet available", body = crate::types::ErrorResponse),
+        (status = 500, description = "Internal error", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn recover_refund(
+    TokenAuth(act): TokenAuth,
+    State(state): State<AppState>,
+) -> Result<Json<RefundRecoveryResponse>, ServerError> {
+    let master_key = &state.credential_master_key;
+
+    // Verify the challenge_digest matches our expected TokenChallenge.
+    let expected_digest = compute_challenge_digest();
+    if act.challenge_digest != expected_digest {
+        return Err(ServerError::Unauthorized {
+            message: "invalid challenge_digest in token".to_string(),
+        });
+    }
+
+    // Load the issuer key.
+    load_key_for_spending(
+        &state.credential_key_cache,
+        master_key,
+        &state.db_pool,
+        &act.issuer_key_hash,
+    )
+    .await?;
+
+    let key_id = hex::encode(act.issuer_key_hash);
+    let nullifier_bytes = act.spend_proof.nullifier().as_bytes().to_vec();
+
+    // Check if the nullifier was already recorded (original request arrived).
+    if let Some(refund_cbor) =
+        db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await?
+    {
+        // Nullifier exists and has a stored refund token — return it.
+        return Ok(Json(RefundRecoveryResponse {
+            refund: RefundInfo {
+                refund: URL_SAFE_NO_PAD.encode(&refund_cbor),
+                issuer_key_id: key_id,
+            },
+        }));
+    }
+
+    // Either the nullifier doesn't exist (request never arrived) or it exists
+    // but the refund token hasn't been stored yet (race with in-flight request).
+    // Try to record the nullifier — if it succeeds, we own it.
+    let recorded = db::record_nullifier(&state.db_pool, &key_id, &nullifier_bytes).await?;
+
+    if !recorded {
+        // Nullifier exists but no refund token stored yet. The original
+        // request is likely still in flight. The client should retry shortly.
+        return Err(ServerError::NotFound {
+            message: "nullifier recorded but refund token not yet available — \
+                      the original request may still be in flight, retry shortly"
+                .to_string(),
+        });
+    }
+
+    // Nullifier was not previously recorded — the original request never
+    // arrived. Verify the spend proof and issue a full refund.
+    {
+        let cache = state.credential_key_cache.read().await;
+        let key = cache.get(&act.issuer_key_hash).ok_or_else(|| {
+            ServerError::Internal("issuer key evicted from cache unexpectedly".to_string())
+        })?;
+
+        if act.spend_proof.context() != key.request_context_scalar {
+            return Err(ServerError::Unauthorized {
+                message: "invalid request_context in spend proof".to_string(),
+            });
+        }
+
+        key.secret_key
+            .refund::<128>(&key.params, &act.spend_proof, Scalar::ZERO, OsRng)
+            .map_err(|_| ServerError::Unauthorized {
+                message: "invalid spend proof".to_string(),
+            })?;
+    }
+
+    // Issue a full refund (charge_credits returned in full since no work was done).
+    let charge_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).map_err(|_| {
+        ServerError::BadRequest {
+            message: "invalid charge amount in spend proof".to_string(),
+        }
+    })?;
+
+    let t = credit_to_scalar::<128>(charge_credits)
+        .map_err(|e| ServerError::Internal(format!("invalid refund amount: {e:?}")))?;
+
+    let refund_cbor = {
+        let cache = state.credential_key_cache.read().await;
+        let key = cache.get(&act.issuer_key_hash).ok_or_else(|| {
+            ServerError::Internal("issuer key not in cache for refund".to_string())
+        })?;
+
+        let refund = key
+            .secret_key
+            .refund(&key.params, &act.spend_proof, t, OsRng)
+            .map_err(|e| ServerError::Internal(format!("refund issuance failed: {e:?}")))?;
+
+        refund
+            .to_cbor()
+            .map_err(|e| ServerError::Internal(format!("refund CBOR encoding failed: {e:?}")))?
+    };
+
+    // Store the refund token for idempotency.
+    db::store_refund_token(&state.db_pool, &key_id, &nullifier_bytes, &refund_cbor).await?;
+
+    Ok(Json(RefundRecoveryResponse {
+        refund: RefundInfo {
+            refund: URL_SAFE_NO_PAD.encode(&refund_cbor),
+            issuer_key_id: key_id,
+        },
     }))
 }
 

@@ -471,6 +471,58 @@
         }
       }
     },
+    "/v1/credentials/refund": {
+      "post": {
+        "tags": [
+          "Unlinked"
+        ],
+        "summary": "Recover a refund token for a previously spent ACT.",
+        "description": "If the ACT's nullifier was already recorded (the server received and\nprocessed the original request), the stored refund token is returned.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier, issues a\nfull refund (no credits consumed), stores it, and returns it.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.",
+        "operationId": "recover_refund",
+        "responses": {
+          "200": {
+            "description": "Refund token recovered or issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefundRecoveryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid spend proof",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Nullifier found but refund token not yet available",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/keys": {
       "get": {
         "tags": [
@@ -1698,6 +1750,19 @@
           "refund": {
             "type": "string",
             "description": "Base64url-encoded CBOR `Refund` message."
+          }
+        }
+      },
+      "RefundRecoveryResponse": {
+        "type": "object",
+        "description": "Response from the refund recovery endpoint.",
+        "required": [
+          "refund"
+        ],
+        "properties": {
+          "refund": {
+            "$ref": "#/components/schemas/RefundInfo",
+            "description": "The refund token."
           }
         }
       },
