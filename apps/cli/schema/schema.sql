@@ -242,7 +242,7 @@ CREATE TABLE action_antecedent (
     )
 );
 
-CREATE INDEX idx_antecedent_reverse
+CREATE INDEX idx_action_antecedent_reverse
     ON action_antecedent (antecedent_action_id);
 
 -- ============================================================
@@ -353,9 +353,9 @@ CREATE TABLE context_assembly_action (
 );
 
 -- ============================================================
--- Request log: raw HTTP request/response pairs
+-- Request: raw HTTP request/response pairs
 -- ============================================================
-CREATE TABLE request_log (
+CREATE TABLE request (
     id                TEXT PRIMARY KEY,        -- UUIDv7
     connection_id     TEXT REFERENCES connection(id),
     action_id         TEXT REFERENCES action(id),
@@ -375,7 +375,7 @@ CREATE TABLE request_log (
 
     error             TEXT,
 
-    retry_of_id       TEXT REFERENCES request_log(id),
+    retry_of_id       TEXT REFERENCES request(id),
     attempt_number    INTEGER NOT NULL DEFAULT 1,
 
     credential_nonce  TEXT REFERENCES credential(nonce),
@@ -383,15 +383,15 @@ CREATE TABLE request_log (
     created_at        INTEGER NOT NULL
 );
 
-CREATE INDEX idx_request_log_action
-    ON request_log (action_id)
+CREATE INDEX idx_request_action
+    ON request (action_id)
     WHERE action_id IS NOT NULL;
 
-CREATE INDEX idx_request_log_connection
-    ON request_log (connection_id);
+CREATE INDEX idx_request_connection
+    ON request (connection_id);
 
-CREATE INDEX idx_request_log_credential
-    ON request_log (credential_nonce)
+CREATE INDEX idx_request_credential
+    ON request (credential_nonce)
     WHERE credential_nonce IS NOT NULL;
 
 
@@ -541,12 +541,12 @@ SELECT
     cl.nonce            AS credential_nonce,
     cl.spend_amount,
     cl.state            AS credential_state,
-    rl.id               AS request_log_id,
-    rl.method,
-    rl.path,
-    rl.request_at,
-    rl.duration_ms,
-    rl.attempt_number,
+    r.id                AS request_id,
+    r.method,
+    r.path,
+    r.request_at,
+    r.duration_ms,
+    r.attempt_number,
     a.id                AS action_id,
     a.action_type,
     a.model,
@@ -556,8 +556,8 @@ SELECT
     s.title             AS space_title,
     s.linkability
 FROM credential_lifecycle cl
-JOIN request_log rl   ON rl.credential_nonce = cl.nonce
-LEFT JOIN action a    ON a.id = rl.action_id
+JOIN request r        ON r.credential_nonce = cl.nonce
+LEFT JOIN action a    ON a.id = r.action_id
 LEFT JOIN space s     ON s.id = a.space_id
 WHERE cl.state IN ('spending', 'spent')
   AND (a.origin_action_id IS NULL);  -- exclude references

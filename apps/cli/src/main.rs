@@ -1351,7 +1351,22 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
     .await?;
     db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0).await?;
 
-    // 13. Create content blocks for the response
+    // 13. Record context assembly (what was sent to the model)
+    let context_assembly_id = Uuid::now_v7().to_string();
+    db::insert_context_assembly(
+        &db_conn,
+        &context_assembly_id,
+        &inference_action_id,
+        None, // no system prompt in this request
+        input_tokens,
+        false, // no truncation
+        now_ms(),
+    )
+    .await?;
+    // The user_input action was the sole action assembled into the prompt
+    db::insert_context_assembly_action(&db_conn, &context_assembly_id, &user_action_id, 0).await?;
+
+    // 14. Create content blocks for the response
     let response_content = body
         .get("choices")
         .and_then(|c| c.as_array())
@@ -1372,10 +1387,10 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
         .await?;
     }
 
-    // 14. Record the HTTP request/response
-    db::insert_request_log(
+    // 15. Record the HTTP request/response
+    db::insert_request(
         &db_conn,
-        &db::RequestLogEntry {
+        &db::Request {
             id: Uuid::now_v7().to_string(),
             connection_id,
             action_id: Some(inference_action_id),
@@ -1405,7 +1420,7 @@ async fn cmd_chat(prompt: &str) -> Result<(), String> {
         return Err(format!("server returned {status}: {error_msg}"));
     }
 
-    // 15. Print response content
+    // 16. Print response content
     if let Some(content) = response_content {
         println!("{content}");
     }

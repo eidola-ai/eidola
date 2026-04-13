@@ -437,11 +437,11 @@ pub async fn insert_connection(
 }
 
 // ---------------------------------------------------------------------------
-// Layer 1 — Transport: Request log operations
+// Layer 1 — Transport: Request operations
 // ---------------------------------------------------------------------------
 
-/// A request/response log entry.
-pub struct RequestLogEntry {
+/// A request/response entry.
+pub struct Request {
     pub id: String,
     pub connection_id: Option<String>,
     pub action_id: Option<String>,
@@ -460,10 +460,10 @@ pub struct RequestLogEntry {
     pub created_at: i64,
 }
 
-/// Insert a request log entry.
-pub async fn insert_request_log(conn: &Connection, entry: &RequestLogEntry) -> Result<(), String> {
+/// Insert a request entry.
+pub async fn insert_request(conn: &Connection, entry: &Request) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO request_log (id, connection_id, action_id, method, path, \
+        "INSERT INTO request (id, connection_id, action_id, method, path, \
          request_headers, request_body, response_status, response_headers, response_body, \
          request_at, response_at, duration_ms, error, credential_nonce, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
@@ -502,7 +502,7 @@ pub async fn insert_request_log(conn: &Connection, entry: &RequestLogEntry) -> R
         ),
     )
     .await
-    .map_err(|e| format!("failed to insert request_log: {e}"))?;
+    .map_err(|e| format!("failed to insert request: {e}"))?;
     Ok(())
 }
 
@@ -789,6 +789,82 @@ pub async fn insert_tool_result_content_block(
 }
 
 // ---------------------------------------------------------------------------
+// Layer 2 — Semantic: System prompt operations
+// ---------------------------------------------------------------------------
+
+/// Upsert a system prompt (deduplicated by SHA-256 hash). Returns the hash.
+pub async fn upsert_system_prompt(conn: &Connection, text: &str) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(text.as_bytes());
+    let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    conn.execute(
+        "INSERT OR IGNORE INTO system_prompt (hash, text) VALUES (?1, ?2)",
+        (Value::Text(hash.clone()), Value::Text(text.to_string())),
+    )
+    .await
+    .map_err(|e| format!("failed to upsert system_prompt: {e}"))?;
+    Ok(hash)
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2 — Semantic: Context assembly operations
+// ---------------------------------------------------------------------------
+
+/// Insert a context assembly record for an inference action.
+pub async fn insert_context_assembly(
+    conn: &Connection,
+    id: &str,
+    action_id: &str,
+    system_prompt_hash: Option<&str>,
+    total_tokens: Option<i64>,
+    truncation_applied: bool,
+    created_at: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO context_assembly (id, action_id, system_prompt_hash, total_tokens, truncation_applied, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        (
+            Value::Text(id.to_string()),
+            Value::Text(action_id.to_string()),
+            match system_prompt_hash {
+                Some(h) => Value::Text(h.to_string()),
+                None => Value::Null,
+            },
+            match total_tokens {
+                Some(t) => Value::Integer(t),
+                None => Value::Null,
+            },
+            Value::Integer(if truncation_applied { 1 } else { 0 }),
+            Value::Integer(created_at),
+        ),
+    )
+    .await
+    .map_err(|e| format!("failed to insert context_assembly: {e}"))?;
+    Ok(())
+}
+
+/// Insert a context assembly action (an action that contributed to an inference prompt).
+pub async fn insert_context_assembly_action(
+    conn: &Connection,
+    context_assembly_id: &str,
+    action_id: &str,
+    position: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO context_assembly_action (context_assembly_id, action_id, position) \
+         VALUES (?1, ?2, ?3)",
+        (
+            Value::Text(context_assembly_id.to_string()),
+            Value::Text(action_id.to_string()),
+            Value::Integer(position),
+        ),
+    )
+    .await
+    .map_err(|e| format!("failed to insert context_assembly_action: {e}"))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Migrations
 // ---------------------------------------------------------------------------
 
@@ -917,7 +993,7 @@ mod tests {
         assert!(table_names.contains(&"space"));
         assert!(table_names.contains(&"action"));
         assert!(table_names.contains(&"content_block"));
-        assert!(table_names.contains(&"request_log"));
+        assert!(table_names.contains(&"request"));
     }
 
     #[tokio::test]
