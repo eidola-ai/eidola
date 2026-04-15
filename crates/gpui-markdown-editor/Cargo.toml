@@ -1,0 +1,39 @@
+[package]
+name = "gpui-markdown-editor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "gpui_markdown_editor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"
+
+[dependencies]
+# Mirror the apps/gui pin so cargo unifies on a single gpui copy across the
+# workspace.
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
+
+pulldown-cmark = { version = "0.12", default-features = false }
+smallvec = "1.13"
+unicode-segmentation = "1"
+
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support", "font-kit"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[test]]
+name = "visual"
+path = "tests/visual.rs"
+# `VisualTestAppContext` talks to AppKit and must run on the main thread.
+# `harness = false` lets us run a hand-rolled `fn main()` directly.
+harness = false
