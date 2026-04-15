@@ -26,9 +26,6 @@ public final class Core {
 
   // Chat
   public private(set) var models: [ModelInfo] = []
-  public private(set) var spaces: [SpaceInfo] = []
-  public private(set) var currentSpaceId: String?
-  public private(set) var spaceMessages: [SpaceMessage] = []
 
   // MARK: – Inner core
 
@@ -157,63 +154,13 @@ public final class Core {
     isLoading = false
   }
 
-  // MARK: – Spaces
-
-  public func fetchSpaces() async {
-    do {
-      spaces = try await core.listSpaces()
-    } catch {
-      errorMessage = error.localizedDescription
-    }
-  }
-
-  public func selectSpace(_ id: String) async {
-    currentSpaceId = id
-    do {
-      spaceMessages = try await core.getSpaceMessages(spaceId: id)
-    } catch {
-      errorMessage = error.localizedDescription
-    }
-  }
-
-  public func newChat() {
-    currentSpaceId = nil
-    spaceMessages = []
-  }
-
-  public func archiveSpace(_ id: String) async {
-    do {
-      _ = try await core.archiveSpace(spaceId: id)
-      if currentSpaceId == id {
-        newChat()
-      }
-      await fetchSpaces()
-    } catch {
-      errorMessage = error.localizedDescription
-    }
-  }
-
   // MARK: – Chat
 
-  public func sendMessage(_ prompt: String, model: String) async {
-    // Optimistically show the user message
-    spaceMessages.append(SpaceMessage(role: "user", content: prompt))
+  public func chat(prompt: String, model: String, spaceId: String?) async throws -> ChatResult {
+    try await core.chat(prompt: prompt, model: model, spaceId: spaceId)
+  }
 
-    isLoading = true
-    errorMessage = nil
-    do {
-      let result = try await core.chat(prompt: prompt, model: model, spaceId: currentSpaceId)
-      currentSpaceId = result.spaceId
-
-      // Reload messages from DB to get the authoritative state
-      spaceMessages = try await core.getSpaceMessages(spaceId: result.spaceId)
-
-      // Refresh space list (new space may have been created)
-      await fetchSpaces()
-    } catch {
-      errorMessage = error.localizedDescription
-      spaceMessages.append(SpaceMessage(role: "error", content: error.localizedDescription))
-    }
-    isLoading = false
+  public func getSpaceMessages(spaceId: String) async throws -> [SpaceMessage] {
+    try await core.getSpaceMessages(spaceId: spaceId)
   }
 }
