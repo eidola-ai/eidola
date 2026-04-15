@@ -647,7 +647,7 @@ with open(path, "wb") as f:
         # Returns null if no icon images are present (all slots empty).
         appIcon =
           let
-            appiconset = ./apps/macos/Sources/Eidola/Assets.xcassets/AppIcon.appiconset;
+            appiconset = ./apps/macos/Eidola/Assets.xcassets/AppIcon.appiconset;
             contentsJson = builtins.fromJSON (builtins.readFile (appiconset + "/Contents.json"));
             # An image entry has a "filename" key when a PNG is assigned
             hasImages = builtins.any (img: img ? filename) contentsJson.images;
@@ -693,7 +693,7 @@ with open(path, "wb") as f:
               src = pkgs.lib.fileset.toSource {
                 root = ./.;
                 fileset = pkgs.lib.fileset.unions [
-                  ./apps/macos/Sources
+                  ./apps/macos/Eidola
                   ./apps/macos/Support/Info.plist
                   ./crates/eidola-app-core/swift
                 ];
@@ -744,7 +744,7 @@ with open(path, "wb") as f:
                   -I "$FFI_HEADERS" \
                   -Xcc -fmodule-map-file="$MODULEMAP" \
                   -o "$OBJS/Eidola.o" \
-                  $(find "apps/macos/Sources/Eidola" -name '*.swift' | sort)
+                  $(find "apps/macos/Eidola" -name '*.swift' | sort)
 
                 echo "Linking Eidola..."
                 swiftc \
