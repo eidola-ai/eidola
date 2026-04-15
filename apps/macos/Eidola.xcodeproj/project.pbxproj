@@ -34,19 +34,19 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		27AFF1002F8F4BBA00CF847B /* Sources/Eidola */ = {
+		27AFF1002F8F4BBA00CF847B /* Eidola */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = Sources/Eidola;
+			path = Eidola;
 			sourceTree = "<group>";
 		};
-		27AFF10E2F8F4BBA00CF847B /* Tests/EidolaTests */ = {
+		27AFF10E2F8F4BBA00CF847B /* EidolaTests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = Tests/EidolaTests;
+			path = EidolaTests;
 			sourceTree = "<group>";
 		};
-		27AFF1182F8F4BBB00CF847B /* Tests/EidolaUITests */ = {
+		27AFF1182F8F4BBB00CF847B /* EidolaUITests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = Tests/EidolaUITests;
+			path = EidolaUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */

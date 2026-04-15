@@ -22,7 +22,7 @@ let package = Package(
       dependencies: [
         .product(name: "EidolaAppCore", package: "eidola-app-core")
       ],
-      path: "Sources/Eidola",
+      path: "Eidola",
       exclude: ["Assets.xcassets"],
       swiftSettings: swiftSettings,
       linkerSettings: [
@@ -34,7 +34,7 @@ let package = Package(
       dependencies: [
         "Eidola",
       ],
-      path: "Tests/EidolaTests",
+      path: "EidolaTests",
       swiftSettings: swiftSettings
     ),
   ]
