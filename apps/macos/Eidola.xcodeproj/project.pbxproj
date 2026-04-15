@@ -80,9 +80,9 @@
 		27AFF0F52F8F4BBA00CF847B = {
 			isa = PBXGroup;
 			children = (
-				27AFF1002F8F4BBA00CF847B /* Sources/Eidola */,
-				27AFF10E2F8F4BBA00CF847B /* Tests/EidolaTests */,
-				27AFF1182F8F4BBB00CF847B /* Tests/EidolaUITests */,
+				27AFF1002F8F4BBA00CF847B /* Eidola */,
+				27AFF10E2F8F4BBA00CF847B /* EidolaTests */,
+				27AFF1182F8F4BBB00CF847B /* EidolaUITests */,
 				27AFF0FF2F8F4BBA00CF847B /* Products */,
 			);
 			sourceTree = "<group>";
@@ -113,7 +113,7 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				27AFF1002F8F4BBA00CF847B /* Sources/Eidola */,
+				27AFF1002F8F4BBA00CF847B /* Eidola */,
 			);
 			name = Eidola;
 			packageProductDependencies = (
@@ -137,7 +137,7 @@
 				27AFF10D2F8F4BBA00CF847B /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
-				27AFF10E2F8F4BBA00CF847B /* Tests/EidolaTests */,
+				27AFF10E2F8F4BBA00CF847B /* EidolaTests */,
 			);
 			name = EidolaTests;
 			packageProductDependencies = (
@@ -160,7 +160,7 @@
 				27AFF1172F8F4BBB00CF847B /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
-				27AFF1182F8F4BBB00CF847B /* Tests/EidolaUITests */,
+				27AFF1182F8F4BBB00CF847B /* EidolaUITests */,
 			);
 			name = EidolaUITests;
 			packageProductDependencies = (
