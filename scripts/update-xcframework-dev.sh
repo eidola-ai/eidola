@@ -4,6 +4,8 @@ set -euo pipefail
 # Development version of update-xcframework.sh
 # - Only compiles for native architecture (no universal binary)
 # - Uses debug build (no --release flag)
+# - Produces a dynamic framework (not static) so Xcode previews work
+#   (the JIT linker can't process a 375MB+ staticlib in 30 seconds)
 
 if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
     echo "error: not in a git repository" >&2
@@ -32,33 +34,71 @@ case "$ARCH" in
     ;;
 esac
 
-echo "Building for $TARGET (debug)..."
+echo "Building for $TARGET (debug, dynamic)..."
 (cd "$REPO_ROOT" && cargo build -p eidola-app-core --target "$TARGET")
 
-# Prepare temp XCFramework structure
 TARGET_DIR="$REPO_ROOT/target"
+DYLIB_PATH="$TARGET_DIR/$TARGET/debug/libeidola_app_core.dylib"
+
+if [[ ! -f "$DYLIB_PATH" ]]; then
+  echo "Error: Dynamic library not found after build."
+  echo "Expected: $DYLIB_PATH"
+  exit 1
+fi
+
+# Prepare temp XCFramework structure with a dynamic .framework
 TEMP_ROOT="$TARGET_DIR/generated-xcframework"
 rm -rf "$TEMP_ROOT"
 mkdir -p "$TEMP_ROOT"
 
 XCFW_NAME="libeidola_app_core-rs.xcframework"
 XCFW_PATH="$TEMP_ROOT/$XCFW_NAME"
-MACOS_DIR="$XCFW_PATH/macos-arm64_x86_64"
+FW_DIR="$XCFW_PATH/macos-arm64_x86_64/EidolaAppCoreRS.framework"
 
-mkdir -p "$MACOS_DIR"
+mkdir -p "$FW_DIR"
 
-LIB_PATH="$TARGET_DIR/$TARGET/debug/libeidola_app_core.a"
+echo "Creating dynamic framework (versioned bundle)..."
 
-if [[ ! -f "$LIB_PATH" ]]; then
-  echo "Error: Static library not found after build."
-  echo "Expected: $LIB_PATH"
-  exit 1
-fi
+# macOS requires the versioned framework structure
+VERSIONS_DIR="$FW_DIR/Versions/A"
+mkdir -p "$VERSIONS_DIR/Resources"
 
-echo "Copying library..."
-cp "$LIB_PATH" "$MACOS_DIR/libeidola_app_core.a"
+cp "$DYLIB_PATH" "$VERSIONS_DIR/EidolaAppCoreRS"
 
-echo "Creating Info.plist..."
+# Fix the install_name so the linker embeds the correct rpath reference
+install_name_tool -id "@rpath/EidolaAppCoreRS.framework/Versions/A/EidolaAppCoreRS" "$VERSIONS_DIR/EidolaAppCoreRS"
+
+# Ad-hoc codesign (required for dylibs on Apple Silicon)
+codesign --force --sign - "$VERSIONS_DIR/EidolaAppCoreRS"
+
+# Symlinks for versioned bundle
+ln -sfn A "$FW_DIR/Versions/Current"
+ln -sfn Versions/Current/EidolaAppCoreRS "$FW_DIR/EidolaAppCoreRS"
+ln -sfn Versions/Current/Resources "$FW_DIR/Resources"
+
+# Framework Info.plist
+cat > "$VERSIONS_DIR/Resources/Info.plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>EidolaAppCoreRS</string>
+  <key>CFBundleIdentifier</key>
+  <string>ai.eidola.EidolaAppCoreRS</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundlePackageType</key>
+  <string>FMWK</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+</dict>
+</plist>
+EOF
+
+# XCFramework Info.plist (declares a framework, not a static library)
 cat > "$XCFW_PATH/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -67,10 +107,12 @@ cat > "$XCFW_PATH/Info.plist" << 'EOF'
   <key>AvailableLibraries</key>
   <array>
     <dict>
+      <key>BinaryPath</key>
+      <string>EidolaAppCoreRS</string>
       <key>LibraryIdentifier</key>
       <string>macos-arm64_x86_64</string>
       <key>LibraryPath</key>
-      <string>libeidola_app_core.a</string>
+      <string>EidolaAppCoreRS.framework</string>
       <key>SupportedArchitectures</key>
       <array>
         <string>arm64</string>
@@ -90,13 +132,10 @@ EOF
 
 DEST="$REPO_ROOT/crates/eidola-app-core/target/apple/libeidola_app_core-rs.xcframework"
 
-echo "Copying shared core XCframework..."
-echo "  Source: $TEMP_ROOT"
-echo "  Dest:   $DEST"
-
+echo "Installing XCFramework..."
 mkdir -p "$(dirname "$DEST")"
 rm -rf "$DEST"
 cp -R "$TEMP_ROOT/$XCFW_NAME" "$DEST"
 chmod -R +w "$DEST"
 
-echo "Done (dev build for $ARCH only)."
+echo "Done (dev dynamic framework for $ARCH, $(du -sh "$FW_DIR/Versions/A/EidolaAppCoreRS" | cut -f1) dylib)."

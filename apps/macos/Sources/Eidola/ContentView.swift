@@ -55,7 +55,7 @@ struct ContentView: View {
   }
 }
 
-#if canImport(PreviewsMacros)
+#if DEBUG
   #Preview {
     ContentView()
   }
