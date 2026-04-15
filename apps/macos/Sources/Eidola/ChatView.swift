@@ -24,14 +24,16 @@ struct ChatView: View {
 
         Divider()
 
-        List(selection: Binding(
-          get: { core.currentSpaceId },
-          set: { id in
-            if let id {
-              Task { await core.selectSpace(id) }
+        List(
+          selection: Binding(
+            get: { core.currentSpaceId },
+            set: { id in
+              if let id {
+                Task { await core.selectSpace(id) }
+              }
             }
-          }
-        )) {
+          )
+        ) {
           ForEach(core.spaces, id: \.id) { space in
             Text(space.title ?? "Untitled")
               .tag(space.id)
@@ -107,7 +109,8 @@ struct ChatView: View {
               .font(.title2)
           }
           .disabled(
-            prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || core.isLoading)
+            prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || core.isLoading
+          )
           .buttonStyle(.borderless)
         }
         .padding()
