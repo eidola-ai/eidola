@@ -11,15 +11,13 @@ let package = Package(
     .library(name: "MarkdownEditor", targets: ["MarkdownEditor"])
   ],
   dependencies: [
-    .package(url: "https://github.com/krzyzanowskim/STTextView", from: "2.3.0"),
-    .package(url: "https://github.com/swiftlang/swift-markdown", from: "0.7.0"),
+    .package(url: "https://github.com/swiftlang/swift-markdown", from: "0.7.0")
   ],
   targets: [
     .target(
       name: "MarkdownEditor",
       dependencies: [
-        .product(name: "STTextView", package: "STTextView"),
-        .product(name: "Markdown", package: "swift-markdown"),
+        .product(name: "Markdown", package: "swift-markdown")
       ]
     ),
     .executableTarget(

@@ -1,5 +1,4 @@
 import AppKit
-import STTextView
 import SwiftUI
 
 /// An inline WYSIWYG markdown editor view.
@@ -17,20 +16,20 @@ public struct MarkdownEditor: NSViewRepresentable {
   }
 
   public func makeNSView(context: Context) -> NSScrollView {
-    let scrollView = STTextView.scrollableTextView()
-    let textView = scrollView.documentView as! STTextView
+    let scrollView = NSTextView.scrollableTextView()
+    let textView = scrollView.documentView as! NSTextView
     context.coordinator.configure(textView)
-    textView.text = text
+    textView.string = text
     context.coordinator.highlighter.highlight(textView: textView)
     return scrollView
   }
 
   public func updateNSView(_ scrollView: NSScrollView, context: Context) {
-    guard let textView = scrollView.documentView as? STTextView else { return }
+    guard let textView = scrollView.documentView as? NSTextView else { return }
     guard !context.coordinator.isUpdating else { return }
-    if textView.text != text {
+    if textView.string != text {
       context.coordinator.isUpdating = true
-      textView.text = text
+      textView.string = text
       context.coordinator.highlighter.highlight(textView: textView)
       context.coordinator.isUpdating = false
     }
@@ -41,37 +40,47 @@ public struct MarkdownEditor: NSViewRepresentable {
   }
 
   @MainActor
-  public final class Coordinator: NSObject, @preconcurrency STTextViewDelegate {
+  public final class Coordinator: NSObject, NSTextViewDelegate {
     var text: Binding<String>
     let highlighter = SyntaxHighlighter()
     var isUpdating = false
-    private weak var textView: STTextView?
+    private weak var textView: NSTextView?
 
     init(text: Binding<String>) {
       self.text = text
     }
 
-    func configure(_ textView: STTextView) {
+    func configure(_ textView: NSTextView) {
       self.textView = textView
-      textView.textDelegate = self
+      textView.delegate = self
       textView.font = highlighter.style.baseFont
       textView.isHorizontallyResizable = false
-      textView.highlightSelectedLine = false
-      textView.showsLineNumbers = false
+      textView.isAutomaticQuoteSubstitutionEnabled = false
+      textView.isAutomaticDashSubstitutionEnabled = false
+      textView.isAutomaticTextReplacementEnabled = false
+      textView.isRichText = false
+      textView.allowsUndo = true
+      textView.usesFindBar = true
+
+      // Make text view fill the scroll view width
+      textView.autoresizingMask = [.width]
+      textView.textContainer?.widthTracksTextView = true
+      textView.textContainer?.containerSize = NSSize(
+        width: 0, height: CGFloat.greatestFiniteMagnitude)
     }
 
-    // MARK: - STTextViewDelegate
+    // MARK: - NSTextViewDelegate
 
-    public func textViewDidChangeText(_ notification: Notification) {
-      guard !isUpdating, let textView = notification.object as? STTextView else { return }
+    public func textDidChange(_ notification: Notification) {
+      guard !isUpdating, let textView = notification.object as? NSTextView else { return }
       isUpdating = true
-      text.wrappedValue = textView.text ?? ""
+      text.wrappedValue = textView.string
       highlighter.highlight(textView: textView)
       isUpdating = false
     }
 
     public func textViewDidChangeSelection(_ notification: Notification) {
-      guard let textView = notification.object as? STTextView else { return }
+      guard let textView = notification.object as? NSTextView else { return }
       highlighter.updateDelimiterVisibility(textView: textView)
     }
   }
