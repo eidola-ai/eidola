@@ -647,7 +647,7 @@ with open(path, "wb") as f:
         # Returns null if no icon images are present (all slots empty).
         appIcon =
           let
-            appiconset = ./apps/macos/Sources/EidolaEntrypoint/Assets.xcassets/AppIcon.appiconset;
+            appiconset = ./apps/macos/Sources/Eidola/Assets.xcassets/AppIcon.appiconset;
             contentsJson = builtins.fromJSON (builtins.readFile (appiconset + "/Contents.json"));
             # An image entry has a "filename" key when a PNG is assigned
             hasImages = builtins.any (img: img ? filename) contentsJson.images;
@@ -736,20 +736,20 @@ with open(path, "wb") as f:
                   -o "$OBJS/EidolaAppCore.o" \
                   $(find "$SHARED/Sources/EidolaAppCore" -name '*.swift' | sort)
 
-                echo "Building EidolaApp module..."
+                echo "Building Eidola module..."
                 swiftc -c "''${COMMON_FLAGS[@]}" \
-                  -module-name EidolaApp \
-                  -emit-module-path "$MODULES/EidolaApp.swiftmodule" \
+                  -module-name Eidola \
+                  -emit-module-path "$MODULES/Eidola.swiftmodule" \
                   -I "$MODULES" \
                   -I "$FFI_HEADERS" \
                   -Xcc -fmodule-map-file="$MODULEMAP" \
-                  -o "$OBJS/EidolaApp.o" \
+                  -o "$OBJS/Eidola.o" \
                   $(find "apps/macos/Sources/Eidola" -name '*.swift' | sort)
 
                 echo "Linking Eidola..."
                 swiftc \
                   -o Eidola \
-                  -module-name EidolaEntrypoint \
+                  -module-name Eidola \
                   -I "$MODULES" \
                   -I "$FFI_HEADERS" \
                   -Xcc -fmodule-map-file="$MODULEMAP" \
@@ -759,8 +759,7 @@ with open(path, "wb") as f:
                   -Xfrontend -no-serialize-debugging-options \
                   -Xlinker -reproducible \
                   -enable-upcoming-feature MemberImportVisibility \
-                  "$OBJS/EidolaAppCore.o" "$OBJS/EidolaApp.o" \
-                  apps/macos/Sources/EidolaEntrypoint/main.swift
+                  "$OBJS/EidolaAppCore.o" "$OBJS/Eidola.o"
               '';
 
               installPhase = ''

@@ -14,7 +14,7 @@ CONFIG="${1:-debug}"
 
 ARCH="$(uname -m)"
 BIN_DIR="$REPO_ROOT/apps/macos/.build/${ARCH}-apple-macosx/${CONFIG}"
-EXECUTABLE="$BIN_DIR/EidolaEntrypoint"
+EXECUTABLE="$BIN_DIR/Eidola"
 
 if [[ ! -f "$EXECUTABLE" ]]; then
   echo "error: executable not found at $EXECUTABLE" >&2

@@ -8,35 +8,21 @@ let swiftSettings: [SwiftSetting] = [
 ]
 
 let package = Package(
-  name: "EidolaApp",
+  name: "Eidola",
   defaultLocalization: "en",
   platforms: [
     .macOS(.v26)
-  ],
-  products: [
-    .library(
-      name: "EidolaApp",
-      targets: ["EidolaApp"]
-    )
   ],
   dependencies: [
     .package(path: "../../crates/eidola-app-core"),
   ],
   targets: [
-    .target(
-      name: "EidolaApp",
+    .executableTarget(
+      name: "Eidola",
       dependencies: [
         .product(name: "EidolaAppCore", package: "eidola-app-core")
       ],
       path: "Sources/Eidola",
-      swiftSettings: swiftSettings
-    ),
-    .executableTarget(
-      name: "EidolaEntrypoint",
-      dependencies: [
-        "EidolaApp"
-      ],
-      path: "Sources/EidolaEntrypoint",
       exclude: ["Assets.xcassets"],
       swiftSettings: swiftSettings,
       linkerSettings: [
@@ -46,7 +32,7 @@ let package = Package(
     .testTarget(
       name: "EidolaTests",
       dependencies: [
-        "EidolaApp",
+        "Eidola",
       ],
       path: "Tests/EidolaTests",
       swiftSettings: swiftSettings

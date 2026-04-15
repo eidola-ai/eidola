@@ -7,10 +7,9 @@
 
 import SwiftUI
 
-public struct EidolaAppMain: App {
-  public init() {}
-
-  public var body: some Scene {
+@main
+struct EidolaApp: App {
+  var body: some Scene {
     WindowGroup {
       ContentView()
     }
