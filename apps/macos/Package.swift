@@ -16,6 +16,7 @@ let package = Package(
   dependencies: [
     .package(path: "../../crates/eidola-app-core"),
     .package(url: "https://github.com/gonzalezreal/swift-markdown-ui", from: "2.0.2"),
+    .package(path: "Packages/MarkdownEditor"),
   ],
   targets: [
     .executableTarget(
@@ -23,6 +24,7 @@ let package = Package(
       dependencies: [
         .product(name: "EidolaAppCore", package: "eidola-app-core"),
         .product(name: "MarkdownUI", package: "swift-markdown-ui"),
+        .product(name: "MarkdownEditor", package: "MarkdownEditor"),
       ],
       path: "Eidola",
       exclude: ["Assets.xcassets"],
