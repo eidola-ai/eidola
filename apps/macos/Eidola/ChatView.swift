@@ -116,7 +116,6 @@ struct ChatView: View {
         .padding()
       }
     }
-    .navigationTitle("Chat")
     .task {
       await core.fetchModels()
       await core.fetchSpaces()
@@ -135,6 +134,13 @@ struct ChatView: View {
     }
   }
 }
+
+#if DEBUG
+  #Preview {
+    ChatView(core: Core())
+      .frame(width: 600, height: 600)
+  }
+#endif
 
 struct MessageBubble: View {
   let message: SpaceMessage

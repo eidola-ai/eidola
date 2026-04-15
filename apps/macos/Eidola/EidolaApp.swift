@@ -9,9 +9,16 @@ import SwiftUI
 
 @main
 struct EidolaApp: App {
+  @State private var core = Core()
+
   var body: some Scene {
     WindowGroup {
-      ContentView()
+      ChatView(core: core)
+        .frame(minWidth: 480, minHeight: 360)
+    }
+
+    Settings {
+      SettingsWindow(core: core)
     }
   }
 }

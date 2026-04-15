@@ -15,7 +15,7 @@ struct WalletView: View {
         ContentUnavailableView(
           "No Credentials",
           systemImage: "creditcard.trianglebadge.exclamationmark",
-          description: Text("Allocate credits from the Account tab to get started.")
+          description: Text("Allocate credits from Account in Settings to get started.")
         )
       } else {
         Section("Active Credentials") {
@@ -41,13 +41,6 @@ struct WalletView: View {
       }
     }
     .navigationTitle("Wallet")
-    .toolbar {
-      ToolbarItem(placement: .automatic) {
-        Button("Refresh", systemImage: "arrow.clockwise") {
-          Task { await core.fetchCredentials() }
-        }
-      }
-    }
     .overlay {
       if core.isLoading {
         ProgressView()

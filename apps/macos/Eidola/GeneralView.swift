@@ -1,18 +1,15 @@
 //
-//  SettingsView.swift
+//  GeneralView.swift
 //  Eidola
 //
 
 import EidolaAppCore
 import SwiftUI
 
-struct SettingsView: View {
+struct GeneralView: View {
   var core: Core
 
   @State private var baseUrlInput = ""
-  @State private var accountIdInput = ""
-  @State private var accountSecretInput = ""
-
   var body: some View {
     Form {
       // Server
@@ -29,34 +26,6 @@ struct SettingsView: View {
             }
             .disabled(baseUrlInput.isEmpty)
           }
-        }
-      }
-
-      // Account credentials
-      Section("Account Credentials") {
-        if core.configState?.hasAccount == true {
-          Label("Credentials configured", systemImage: "checkmark.circle.fill")
-            .foregroundStyle(.green)
-        } else {
-          LabeledContent("Account ID") {
-            TextField("UUID", text: $accountIdInput)
-              .textFieldStyle(.roundedBorder)
-              .frame(minWidth: 200)
-          }
-
-          LabeledContent("Secret") {
-            SecureField("Secret", text: $accountSecretInput)
-              .textFieldStyle(.roundedBorder)
-              .frame(minWidth: 200)
-          }
-
-          Button("Save Credentials") {
-            guard !accountIdInput.isEmpty, !accountSecretInput.isEmpty else { return }
-            try? core.setAccountCredentials(id: accountIdInput, secret: accountSecretInput)
-            accountIdInput = ""
-            accountSecretInput = ""
-          }
-          .disabled(accountIdInput.isEmpty || accountSecretInput.isEmpty)
         }
       }
 
@@ -126,7 +95,7 @@ struct SettingsView: View {
       }
     }
     .formStyle(.grouped)
-    .navigationTitle("Settings")
+    .navigationTitle("General")
     .onAppear {
       if let state = core.configState {
         baseUrlInput = state.baseUrl ?? ""
