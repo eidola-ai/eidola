@@ -32,6 +32,14 @@ echo "Assembling Eidola.app..."
 # Executable (renamed per CFBundleExecutable in Info.plist)
 cp "$EXECUTABLE" "$APP_DIR/Contents/MacOS/Eidola"
 
+# Embed the Rust dylib framework in dev builds (release uses static linking)
+FRAMEWORK_SRC="$BIN_DIR/EidolaAppCoreRS.framework"
+if [[ -d "$FRAMEWORK_SRC" ]]; then
+  mkdir -p "$APP_DIR/Contents/Frameworks"
+  cp -R "$FRAMEWORK_SRC" "$APP_DIR/Contents/Frameworks/"
+  install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_DIR/Contents/MacOS/Eidola" 2>/dev/null || true
+fi
+
 # Info.plist
 cp "$REPO_ROOT/apps/macos/Support/Info.plist" "$APP_DIR/Contents/"
 
@@ -41,7 +49,10 @@ if [[ -f "$ICON" ]]; then
   cp "$ICON" "$APP_DIR/Contents/Resources/"
 fi
 
-# Ad-hoc codesign for local dev
+# Ad-hoc codesign for local dev (sign embedded frameworks first)
+if [[ -d "$APP_DIR/Contents/Frameworks" ]]; then
+  find "$APP_DIR/Contents/Frameworks" -name "*.framework" -exec codesign --force --sign - {} \;
+fi
 codesign --force --sign - "$APP_DIR"
 
 echo "Done: $APP_DIR"
