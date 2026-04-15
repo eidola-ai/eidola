@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		275044A72F8F5CDC00EA9C7F /* EidolaAppCore in Frameworks */ = {isa = PBXBuildFile; productRef = 275044A62F8F5CDC00EA9C7F /* EidolaAppCore */; };
+		27B0A0012FC00000000AAAAA /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = 27B0A0002FC00000000AAAAA /* MarkdownUI */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -118,6 +119,7 @@
 			name = Eidola;
 			packageProductDependencies = (
 				275044A62F8F5CDC00EA9C7F /* EidolaAppCore */,
+				27B0A0002FC00000000AAAAA /* MarkdownUI */,
 			);
 			productName = Eidola;
 			productReference = 27AFF0FE2F8F4BBA00CF847B /* Eidola.app */;
@@ -203,6 +205,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				275044A52F8F5CDC00EA9C7F /* XCLocalSwiftPackageReference "../../crates/eidola-app-core" */,
+				27B0A0022FC00000000AAAAA /* XCRemoteSwiftPackageReference "swift-markdown-ui" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 27AFF0FF2F8F4BBA00CF847B /* Products */;
@@ -590,10 +593,26 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		27B0A0022FC00000000AAAAA /* XCRemoteSwiftPackageReference "swift-markdown-ui" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/gonzalezreal/swift-markdown-ui";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.0.2;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		275044A62F8F5CDC00EA9C7F /* EidolaAppCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = EidolaAppCore;
+		};
+		27B0A0002FC00000000AAAAA /* MarkdownUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 27B0A0022FC00000000AAAAA /* XCRemoteSwiftPackageReference "swift-markdown-ui" */;
+			productName = MarkdownUI;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
