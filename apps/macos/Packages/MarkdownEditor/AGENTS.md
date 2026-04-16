@@ -12,7 +12,7 @@ This editor aims to match the inline WYSIWYG behavior of **Obsidian** and **Milk
 
 2. **Delimiters reveal when the cursor enters the construct.** When the cursor moves into a heading line, the `# ` prefix reappears (dimmed) so the user can edit or delete it. Same for `**`, `` ` ``, `[](url)`, etc.
 
-3. **Formatting applies to content, not delimiters.** The heading text is large/bold. The `# ` prefix, when visible, is shown in a dimmed color at normal size — it should NOT have heading styling applied to it.
+3. **Formatting applies to content, not delimiters (except paragraph style).** The heading text is large/bold. The `# ` prefix, when visible, is shown in a dimmed color but at the heading's font size — it shares the heading line's paragraph style so there is no jarring size mismatch within the line.
 
 4. **The underlying text is always valid markdown.** The editor never modifies the markdown to achieve visual effects — it only changes how it's _displayed_. Copy/paste always produces the raw markdown.
 
@@ -42,7 +42,7 @@ When reviewing test snapshots, check against these expectations:
 - Delimiters hiding when they shouldn't (cursor is inside the construct)
 - Font/size suddenly changing mid-word because a construct boundary falls there
 - Hidden characters leaving blank gaps or causing text to jump when cursor moves in/out
-- Heading style applied to the `# ` delimiter when it should only be dimmed
+- Heading delimiter `# ` rendered at body-text font size instead of the heading's font size
 
 ## Architecture
 
@@ -167,68 +167,69 @@ let comparison = BitmapComparator.compare(freshBitmap, incrementalBitmap)
 #expect(comparison.isMatch)
 ```
 
-## Process for Adding a New Markdown Feature
+## Process for Adding/Fixing a Markdown Feature
 
-### Step 1: Understand the Feature
+Each feature goes through three phases. The agent should complete all three in one pass.
 
-Determine:
-- What markdown syntax triggers it (e.g., `**text**` for bold)
-- What visual changes it should produce (bold font, hidden delimiters)
-- What keyboard behaviors it needs (if any)
+### Phase 1: Discover
 
-### Step 2: Write State Tests
+Run the test harness to produce visual artifacts, then **read every image** to identify deviations from the expected Obsidian/Milkdown behavior described in "Target Behavior" above.
 
-If the feature needs markdown-aware keyboard behavior in `EditorUpdate.update()`:
+Think like a user: Would this feel right? Would there be a jarring jump? Would a delimiter appearing/disappearing cause confusion? Does the styling feel consistent?
+
+### Phase 2: Articulate Tests
+
+Turn discovered issues into test cases. There are two kinds:
+
+**Functional tests** — programmatic assertions on state or rendering properties:
 
 ```swift
-@Test("Enter at end of list item continues list")
-func enterContinuesList() {
-    let state = EditorState(markdown: "- Item 1", selection: .cursor(8))
-    let result = EditorUpdate.update(state, event: .insertNewline)
-    #expect(result.markdown == "- Item 1\n- ")
-    #expect(result.selection == .cursor(11))
+@Test("Heading delimiter uses heading font when cursor is inside")
+func headingDelimiterFont() {
+    // Set up state, render, check that the delimiter range has heading-sized font
 }
 ```
 
-### Step 3: Write Visual Tests
-
-Use the harness to capture before/after snapshots:
+**Visual regression tests** — produce artifacts with natural-language descriptions of expected appearance. The test itself just ensures images are generated; a reviewer (human or LLM) checks correctness:
 
 ```swift
-@Test("Bold text renders with bold font")
-func boldRendering() {
+@Test("Typing '# Hello World' character by character")
+func typingHeading() {
     let results = EditorTestHarness.runTyping(
-        name: "bold-text",
-        characters: "**bold**")
-
-    // Review images at test-artifacts/bold-text/
-    let fm = FileManager.default
-    for r in results {
-        #expect(fm.fileExists(atPath: r.imagePath))
-    }
+        name: "heading-typing",
+        characters: "# Hello World")
+    // ... assertions on state ...
 }
 ```
 
-### Step 4: Review Images
+The harness writes a `manifest.md` for each test. Add a `## Expected Behavior` section to the manifest (via the harness or test code) describing what a reviewer should see at key steps. This builds the "well-articulated spec" iteratively.
 
-Read the generated PNG images to verify:
-- Text renders with correct styling (font size, weight, color)
-- Delimiters are visible when cursor is inside the construct
-- Delimiters are hidden when cursor is outside
-- No visual artifacts or unexpected changes
+### Phase 3: Fix
 
-### Step 5: Implement
+Update the implementation to make tests pass. After fixing:
 
-Most markdown features only need changes in the **parsing/rendering layer** (which already exists for many constructs via `MarkdownParser` + `MarkdownRenderer`). Only add code to `EditorUpdate.update()` if the feature needs custom keyboard behavior (list continuation, etc.).
+1. Run `swift test` — all tests must pass
+2. **Read the generated images again** to verify the fix looks correct
+3. If images still look wrong, iterate (back to Phase 1)
 
-### Step 6: Run All Tests
+### Quick Reference: Where to Make Changes
+
+| What | Where |
+|------|-------|
+| Keyboard behavior (Enter, Backspace with markdown awareness) | `EditorUpdate.swift` |
+| Markdown parsing (new construct types) | `MarkdownParser.swift` + `SyntaxNode.swift` |
+| Visual styling (fonts, colors, spacing) | `MarkdownStyle.swift` |
+| Delimiter hiding/revealing logic | `MarkdownRenderer.swift` |
+| Glyph suppression mechanics | `GlyphHidingLayoutManagerDelegate.swift` |
+| Attribute application to NSTextView | `RenderApplicator.swift` |
+
+### Build & Test
 
 ```bash
 cd apps/macos/Packages/MarkdownEditor
+swift build
 swift test
 ```
-
-All tests must pass. Review any newly generated images to confirm visual correctness.
 
 ## Build & Run
 
