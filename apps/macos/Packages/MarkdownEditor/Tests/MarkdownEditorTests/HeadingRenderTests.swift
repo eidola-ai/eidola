@@ -56,6 +56,51 @@ struct HeadingCursorOverlapTests {
     #expect(!spec.temporaryAttributes.isEmpty, "Delimiter should have dimmed color")
   }
 
+  @Test("Cursor at end of heading line before newline reveals delimiter")
+  func cursorAtEndOfHeadingBeforeNewline() {
+    // Regression: cursor at position 7 in "# Hello\nBody text"
+    // is at the end of the heading content, just before the \n.
+    // The delimiter should be visible (not hidden).
+    let text = "# Hello\nBody text"
+    let cursorRange = NSRange(location: 7, length: 0)
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+
+    #expect(
+      spec.hiddenIndexes.isEmpty,
+      "Heading delimiter should be visible when cursor is at end of heading line before \\n")
+    #expect(
+      !spec.temporaryAttributes.isEmpty,
+      "Heading delimiter should be dimmed when cursor is on the heading line")
+  }
+
+  @Test("Cursor at end of heading line before newline with body paragraph")
+  func cursorAtEndOfHeadingBeforeNewlineWithBody() {
+    // Same bug but with a blank line separator (common markdown pattern)
+    let text = "# Hello\n\nBody text"
+    let cursorRange = NSRange(location: 7, length: 0)
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+
+    #expect(
+      spec.hiddenIndexes.isEmpty,
+      "Heading delimiter should be visible at end of heading before \\n even with blank line after")
+    #expect(!spec.temporaryAttributes.isEmpty)
+  }
+
+  @Test("Cursor on line after heading hides delimiter (not confused with end-of-heading)")
+  func cursorOnLineAfterHeadingStillHides() {
+    // Ensure the fix for end-of-heading doesn't break the next-line case
+    let text = "# Hello\nBody text"
+    let cursorRange = NSRange(location: 8, length: 0)  // start of "Body text"
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+
+    #expect(
+      !spec.hiddenIndexes.isEmpty,
+      "Heading delimiter should be hidden when cursor is on the next line")
+    #expect(
+      spec.temporaryAttributes.isEmpty,
+      "No dimmed attributes when cursor is outside heading")
+  }
+
   @Test("Delimiter gets heading font, not body font")
   func delimiterGetsHeadingFont() {
     let text = "# Hello"

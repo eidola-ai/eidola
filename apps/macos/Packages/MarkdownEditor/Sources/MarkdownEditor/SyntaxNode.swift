@@ -15,4 +15,6 @@ struct SyntaxNode {
 
 enum SyntaxNodeType: Sendable {
   case heading(level: Int)
+  case strong
+  case emphasis
 }
