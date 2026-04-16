@@ -1,0 +1,101 @@
+import AppKit
+
+/// Applies a `RenderSpec` to an `NSTextView`. Stateless — holds no styling data.
+@MainActor
+enum RenderApplicator {
+
+  /// Full application: reset all attributes and apply the complete spec.
+  /// Used after text changes and on initial load.
+  static func apply(_ spec: RenderSpec, to textView: NSTextView) {
+    guard let textStorage = textView.textStorage,
+      let layoutManager = textView.layoutManager
+    else { return }
+
+    let textLength = (textView.string as NSString).length
+    guard textLength > 0 else { return }
+    let fullRange = NSRange(location: 0, length: textLength)
+
+    // Set glyph state BEFORE text storage edit so that glyph generation
+    // triggered by endEditing() uses the correct hidden/bullet state.
+    // This prevents the visible flash/jitter on keystroke.
+    if let glyphDelegate = layoutManager.delegate as? GlyphHidingLayoutManagerDelegate {
+      glyphDelegate.hiddenCharacterIndexes = spec.hiddenIndexes
+      glyphDelegate.bulletCharacterIndexes = spec.bulletIndexes
+    }
+
+    // Apply stored attributes
+    textStorage.beginEditing()
+    textStorage.setAttributes(spec.baseAttributes, range: fullRange)
+
+    for styled in spec.styledRanges {
+      textStorage.addAttributes(styled.attributes, range: styled.range)
+    }
+
+    for traitApp in spec.fontTraits {
+      applyFontTrait(traitApp.trait, to: textStorage, in: traitApp.range)
+    }
+
+    textStorage.endEditing()
+
+    // Apply rendering-only attributes (delimiter colors when cursor is inside)
+    layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: fullRange)
+    for tempAttr in spec.temporaryAttributes {
+      layoutManager.addTemporaryAttributes(
+        tempAttr.attributes, forCharacterRange: tempAttr.range)
+    }
+  }
+
+  /// Cursor-only update: applies only glyph and temporary attribute changes.
+  /// More efficient than full `apply` — skips text storage attribute reset.
+  static func applyCursorUpdate(
+    _ spec: RenderSpec,
+    previousHidden: IndexSet,
+    previousBullets: IndexSet,
+    to textView: NSTextView
+  ) {
+    guard let layoutManager = textView.layoutManager else { return }
+    let textLength = (textView.string as NSString).length
+    guard textLength > 0 else { return }
+    let fullRange = NSRange(location: 0, length: textLength)
+
+    // Update glyph delegate
+    if let glyphDelegate = layoutManager.delegate as? GlyphHidingLayoutManagerDelegate {
+      glyphDelegate.hiddenCharacterIndexes = spec.hiddenIndexes
+      glyphDelegate.bulletCharacterIndexes = spec.bulletIndexes
+    }
+
+    // Invalidate only the ranges that changed
+    let allPrevious = previousHidden.union(previousBullets)
+    let allNew = spec.hiddenIndexes.union(spec.bulletIndexes)
+    let changed = allPrevious.symmetricDifference(allNew)
+
+    for range in changed.rangeView {
+      let nsRange = NSRange(location: range.lowerBound, length: range.count)
+      layoutManager.invalidateGlyphs(
+        forCharacterRange: nsRange, changeInLength: 0, actualCharacterRange: nil)
+      layoutManager.invalidateLayout(
+        forCharacterRange: nsRange, actualCharacterRange: nil)
+    }
+
+    // Update temporary attributes
+    layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: fullRange)
+    for tempAttr in spec.temporaryAttributes {
+      layoutManager.addTemporaryAttributes(
+        tempAttr.attributes, forCharacterRange: tempAttr.range)
+    }
+  }
+
+  // MARK: - Private
+
+  private static func applyFontTrait(
+    _ trait: NSFontTraitMask, to storage: NSTextStorage, in range: NSRange
+  ) {
+    guard range.length > 0 else { return }
+    storage.enumerateAttribute(.font, in: range, options: []) { value, attrRange, _ in
+      if let font = value as? NSFont {
+        let newFont = NSFontManager.shared.convert(font, toHaveTrait: trait)
+        storage.addAttribute(.font, value: newFont, range: attrRange)
+      }
+    }
+  }
+}
