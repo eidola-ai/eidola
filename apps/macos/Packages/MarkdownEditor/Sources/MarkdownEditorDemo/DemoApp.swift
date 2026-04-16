@@ -19,6 +19,8 @@ struct DemoApp: App {
       ### Features
 
       Plain text editing and heading rendering are supported so far.
+
+      *This text is italic* and **this text is bold**. But ***this text is both*** — who would have thought!?
       """)
 
   var body: some Scene {

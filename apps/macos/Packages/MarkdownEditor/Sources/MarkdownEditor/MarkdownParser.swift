@@ -45,6 +45,65 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
       ))
     descendInto(heading)
   }
+
+  // MARK: - Inline Elements
+
+  mutating func visitStrong(_ strong: Strong) -> () {
+    guard let sourceRange = strong.range else { return descendInto(strong) }
+    let range = converter.nsRange(from: sourceRange)
+
+    // Strong uses ** (2 chars) as delimiters. In nested `***bold***`,
+    // swift-markdown gives both Emphasis and Strong the same range as the
+    // outer Emphasis. When that happens, Strong's ** delimiters are the
+    // inner 2 asterisks (offset inward by the Emphasis delimiter width of 1).
+    let delimiterWidth = 2
+    let nestedInEmphasis = strong.parent is Emphasis
+      && strong.parent?.range == strong.range
+    let inset = nestedInEmphasis ? 1 : 0
+    let contentRange = NSRange(
+      location: range.location + delimiterWidth + inset,
+      length: max(0, range.length - (delimiterWidth + inset) * 2))
+    let delimiterRanges = [
+      NSRange(location: range.location + inset, length: delimiterWidth),
+      NSRange(
+        location: range.location + range.length - delimiterWidth - inset, length: delimiterWidth),
+    ]
+
+    nodes.append(
+      SyntaxNode(
+        type: .strong,
+        range: range,
+        contentRange: contentRange,
+        delimiterRanges: delimiterRanges,
+        attributes: [:]
+      ))
+    descendInto(strong)
+  }
+
+  mutating func visitEmphasis(_ emphasis: Emphasis) -> () {
+    guard let sourceRange = emphasis.range else { return descendInto(emphasis) }
+    let range = converter.nsRange(from: sourceRange)
+
+    // Emphasis uses * (1 char) as delimiters.
+    let delimiterWidth = 1
+    let contentRange = NSRange(
+      location: range.location + delimiterWidth,
+      length: max(0, range.length - delimiterWidth * 2))
+    let delimiterRanges = [
+      NSRange(location: range.location, length: delimiterWidth),
+      NSRange(location: range.location + range.length - delimiterWidth, length: delimiterWidth),
+    ]
+
+    nodes.append(
+      SyntaxNode(
+        type: .emphasis,
+        range: range,
+        contentRange: contentRange,
+        delimiterRanges: delimiterRanges,
+        attributes: [:]
+      ))
+    descendInto(emphasis)
+  }
 }
 
 extension SourceRangeConverter {

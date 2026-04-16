@@ -28,6 +28,11 @@ When reviewing test snapshots, check against these expectations:
 - **Bold (cursor outside):** `**` hidden on both sides. Text renders bold.
 - **Bold (cursor inside):** `**` visible but dimmed. Text renders bold.
 - **Italic (cursor outside):** `*` hidden. Text renders italic.
+- **Italic (cursor inside):** `*` visible but dimmed. Text renders italic.
+- **Bold italic (cursor outside):** `***` hidden on both sides. Text renders bold and italic.
+- **Bold italic (cursor inside):** `***` visible but dimmed. Text renders bold and italic.
+- **Bold inside heading (cursor outside):** `# ` and `**` all hidden. Text renders in heading font with bold trait.
+- **Bold inside heading (cursor inside):** `# ` and `**` visible but dimmed. Text renders in heading font with bold trait.
 - **Unordered list (cursor outside):** `- ` hidden, replaced by bullet glyph `•`. Content indented.
 - **Unordered list (cursor inside):** `- ` visible, dimmed. Content indented.
 - **Inline code (cursor outside):** Backticks hidden. Text in monospace with subtle background.
@@ -120,6 +125,27 @@ Each step returns:
 - `state` — the resulting `EditorState` (markdown + selection)
 - `imagePath` — path to the PNG snapshot
 - `bitmapHash` — hash of the bitmap data (for change detection)
+
+### Critical: Test Cursor at Many Positions
+
+Most bugs only appear when the cursor is NOT at the position where the user just finished typing. Typing tests alone are insufficient — they always leave the cursor at the end of the typed text.
+
+**Every visual test must include cursor placement at varied positions:**
+
+1. **Inside the construct** — cursor in the middle of content (delimiters should be visible/dimmed)
+2. **At the start boundary** — cursor at the first character of the construct
+3. **At the end boundary** — cursor at the last character of the construct
+4. **Just outside** — cursor one position before or after the construct (delimiters should be hidden)
+5. **On a completely unrelated line** — cursor far from the construct
+6. **At the end of a line followed by `\n`** — this is a known tricky boundary
+7. **At the end of the document** (no trailing `\n`) — another known boundary
+
+For inline constructs (bold, italic, code), also test:
+- Cursor just before the opening delimiter
+- Cursor just after the closing delimiter
+- Cursor between adjacent constructs (e.g., between `**bold** *italic*`)
+
+**Kitchen Sink Test:** Every implemented feature should have a combined "kitchen sink" test that places a document with ALL supported constructs in various combinations, then moves the cursor to many "interesting" positions and captures a snapshot at each. This catches interaction bugs between features that isolated tests miss.
 
 ### Test Categories
 
