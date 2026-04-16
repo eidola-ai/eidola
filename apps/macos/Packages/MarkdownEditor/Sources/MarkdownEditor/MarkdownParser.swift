@@ -9,6 +9,8 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
   private(set) var nodes: [SyntaxNode] = []
   /// Tracks nesting depth of unordered lists during traversal.
   private var unorderedListDepth = 0
+  /// Tracks nesting depth of ordered lists during traversal.
+  private var orderedListDepth = 0
 
   init(converter: SourceRangeConverter, style: MarkdownStyle = .default) {
     self.converter = converter
@@ -54,15 +56,25 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
     unorderedListDepth -= 1
   }
 
+  mutating func visitOrderedList(_ orderedList: OrderedList) -> () {
+    orderedListDepth += 1
+    descendInto(orderedList)
+    orderedListDepth -= 1
+  }
+
   mutating func visitListItem(_ listItem: ListItem) -> () {
-    // Only handle list items that are children of unordered lists.
-    guard listItem.parent is UnorderedList else {
+    let isUnordered = listItem.parent is UnorderedList
+    let isOrdered = listItem.parent is OrderedList
+
+    guard isUnordered || isOrdered else {
       return descendInto(listItem)
     }
     guard let sourceRange = listItem.range else { return descendInto(listItem) }
     let range = converter.nsRange(from: sourceRange)
 
-    // The delimiter is the marker character (-, *, +) plus the space after it.
+    // The delimiter is the marker character(s) plus the space after it.
+    // For unordered: "- " or "* " or "+ " (marker char + space)
+    // For ordered: "1. " or "12. " etc. (digits + ". ")
     // swift-markdown's ListItem range starts at the marker. The first child's
     // range starts at the content after the marker + space.
     let delimiterLength: Int
@@ -72,25 +84,39 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
       let childStart = converter.utf16Offset(from: childRange.lowerBound)
       delimiterLength = childStart - range.location
     } else {
-      delimiterLength = 2  // fallback: "- "
+      delimiterLength = isOrdered ? 3 : 2  // fallback: "1. " or "- "
     }
 
-    let delimiterRange = NSRange(location: range.location, length: delimiterLength)
     let contentRange = NSRange(
       location: range.location + delimiterLength,
       length: max(0, range.length - delimiterLength)
     )
 
-    let indentLevel = unorderedListDepth
+    if isUnordered {
+      let delimiterRange = NSRange(location: range.location, length: delimiterLength)
+      let indentLevel = unorderedListDepth
 
-    nodes.append(
-      SyntaxNode(
-        type: .unorderedListItem(indentLevel: indentLevel),
-        range: range,
-        contentRange: contentRange,
-        delimiterRanges: [delimiterRange],
-        attributes: style.listItemAttributes(indentLevel: indentLevel)
-      ))
+      nodes.append(
+        SyntaxNode(
+          type: .unorderedListItem(indentLevel: indentLevel),
+          range: range,
+          contentRange: contentRange,
+          delimiterRanges: [delimiterRange],
+          attributes: style.listItemAttributes(indentLevel: indentLevel)
+        ))
+    } else {
+      // Ordered list: marker is always visible, no delimiter ranges.
+      let indentLevel = orderedListDepth
+
+      nodes.append(
+        SyntaxNode(
+          type: .orderedListItem(indentLevel: indentLevel),
+          range: range,
+          contentRange: contentRange,
+          delimiterRanges: [],
+          attributes: style.listItemAttributes(indentLevel: indentLevel)
+        ))
+    }
     descendInto(listItem)
   }
 

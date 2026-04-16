@@ -18,4 +18,5 @@ enum SyntaxNodeType: Sendable {
   case strong
   case emphasis
   case unorderedListItem(indentLevel: Int)
+  case orderedListItem(indentLevel: Int)
 }

@@ -147,6 +147,16 @@ enum MarkdownRenderer {
           hiddenIndexes: &hiddenIndexes,
           temporaryAttributes: &temporaryAttributes)
 
+      case .orderedListItem:
+        // Ordered list items: marker is always visible (no hiding/revealing).
+        // Just apply the list item attributes (indentation) to the full line range.
+        let lineRange = nsText.lineRange(for: safeNodeRange)
+
+        if !node.attributes.isEmpty {
+          styledRanges.append(
+            RenderSpec.StyledRange(range: lineRange, attributes: node.attributes))
+        }
+
       case .unorderedListItem:
         // Extend to line range for cursor detection (same pattern as headings).
         let lineRange = nsText.lineRange(for: safeNodeRange)
