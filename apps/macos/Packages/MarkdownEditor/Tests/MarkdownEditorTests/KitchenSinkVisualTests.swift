@@ -11,7 +11,7 @@ import Testing
 struct KitchenSinkVisualTests {
 
   // The kitchen sink document exercises headings (h1, h2, h3), body text,
-  // bold, italic, bold-italic, and bold inside a heading.
+  // bold, italic, bold-italic, bold inside a heading, and unordered lists.
   static let kitchenSinkMarkdown = """
     # Main Heading
 
@@ -26,6 +26,10 @@ struct KitchenSinkVisualTests {
     Text with ***bold italic*** in it.
 
     ### Third Heading with **bold** inside
+
+    - First list item
+    - Second with **bold**
+    - Third item
     """
 
   /// Named cursor positions for clarity in artifacts.
@@ -161,6 +165,40 @@ struct KitchenSinkVisualTests {
       name: "h2-inside",
       offset: h2Start + 6,
       description: "Inside h2 heading content -- ## delimiter visible and dimmed"))
+
+    // 18. Inside first list item content
+    let firstListItem = offsetOf("- First list item")
+    positions.append(CursorPosition(
+      name: "list-first-inside",
+      offset: firstListItem + 5,
+      description: "Inside first list item -- - delimiter visible and dimmed, bullet NOT shown"))
+
+    // 19. Inside second list item (which has bold)
+    let secondListItem = offsetOf("- Second with **bold**")
+    positions.append(CursorPosition(
+      name: "list-second-bold-inside",
+      offset: secondListItem + 5,
+      description: "Inside second list item -- - visible, ** visible, all dimmed"))
+
+    // 20. On a body line with cursor outside all list items
+    // (all list markers should show bullets)
+    positions.append(CursorPosition(
+      name: "list-all-outside",
+      offset: bodyStart + 5,
+      description: "Cursor in body text -- all list items show bullet glyphs"))
+
+    // 21. At start of a list item marker
+    positions.append(CursorPosition(
+      name: "list-at-marker-start",
+      offset: firstListItem,
+      description: "Cursor at start of list marker -- delimiter visible (cursor at node start)"))
+
+    // 22. At end of last list item
+    let thirdListItem = offsetOf("- Third item")
+    positions.append(CursorPosition(
+      name: "list-third-end",
+      offset: thirdListItem + ("- Third item" as NSString).length,
+      description: "Cursor at end of third list item -- delimiter visible"))
 
     return positions
   }

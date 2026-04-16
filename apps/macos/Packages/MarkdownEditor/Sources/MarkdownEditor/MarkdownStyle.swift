@@ -29,6 +29,22 @@ struct MarkdownStyle {
     ]
   }
 
+  /// Indentation per nesting level for list items.
+  var listIndent: CGFloat = 20
+
+  func listItemAttributes(indentLevel: Int) -> [NSAttributedString.Key: Any] {
+    let paragraphStyle = NSMutableParagraphStyle()
+    let indent = listIndent * CGFloat(indentLevel)
+    paragraphStyle.headIndent = indent
+    paragraphStyle.firstLineHeadIndent = indent
+    paragraphStyle.paragraphSpacing = 2
+    return [
+      .font: baseFont,
+      .foregroundColor: textColor,
+      .paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle,
+    ]
+  }
+
   var baseAttributes: [NSAttributedString.Key: Any] {
     let paragraphStyle = NSMutableParagraphStyle()
     paragraphStyle.paragraphSpacing = 4
