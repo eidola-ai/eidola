@@ -15,6 +15,8 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
   /// Character indexes whose glyphs should be replaced with a bullet (•).
   var bulletCharacterIndexes = IndexSet()
 
+  // MARK: - Glyph Generation
+
   func layoutManager(
     _ layoutManager: NSLayoutManager,
     shouldGenerateGlyphs glyphs: UnsafePointer<CGGlyph>,
@@ -38,6 +40,12 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
 
     guard needsModification else { return 0 }
 
+    // We need the text to detect paragraph boundaries.
+    let text = layoutManager.textStorage?.string as NSString?
+
+    // Look up zero-width space glyph lazily for paragraph-start hidden chars.
+    var zwspGlyph: CGGlyph?
+
     let newGlyphs = UnsafeMutablePointer<CGGlyph>.allocate(capacity: count)
     let newProps = UnsafeMutablePointer<NSLayoutManager.GlyphProperty>.allocate(capacity: count)
     defer {
@@ -51,8 +59,37 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
     for i in 0..<count {
       let charIdx = charIndexes[i]
       if hiddenCharacterIndexes.contains(charIdx) {
-        newGlyphs[i] = glyphs[i]
-        newProps[i] = .null
+        // For the very first hidden character at a paragraph start, use
+        // `.controlCharacter` with a zero-width space glyph instead of `.null`.
+        // This keeps the glyph participating in paragraph layout (so TextKit
+        // correctly computes paragraphSpacingBefore/After) while rendering
+        // nothing visible.
+        let isParagraphStart: Bool
+        if let text = text {
+          if charIdx == 0 {
+            isParagraphStart = true
+          } else if charIdx > 0, charIdx < text.length {
+            isParagraphStart = text.character(at: charIdx - 1) == 0x000A  // \n
+          } else {
+            isParagraphStart = false
+          }
+        } else {
+          isParagraphStart = false
+        }
+
+        if isParagraphStart {
+          if zwspGlyph == nil {
+            var zwspChar: UniChar = 0x200B  // ZERO WIDTH SPACE
+            var glyph: CGGlyph = 0
+            CTFontGetGlyphsForCharacters(aFont as CTFont, &zwspChar, &glyph, 1)
+            zwspGlyph = glyph
+          }
+          newGlyphs[i] = zwspGlyph ?? glyphs[i]
+          newProps[i] = .controlCharacter
+        } else {
+          newGlyphs[i] = glyphs[i]
+          newProps[i] = .null
+        }
       } else if bulletCharacterIndexes.contains(charIdx) {
         // Replace with bullet glyph
         if bulletGlyph == nil {
