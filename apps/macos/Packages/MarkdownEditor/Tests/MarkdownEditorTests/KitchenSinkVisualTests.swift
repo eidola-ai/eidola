@@ -11,7 +11,8 @@ import Testing
 struct KitchenSinkVisualTests {
 
   // The kitchen sink document exercises headings (h1, h2, h3), body text,
-  // bold, italic, bold-italic, bold inside a heading, and unordered lists.
+  // bold, italic, bold-italic, bold inside a heading, unordered lists,
+  // and ordered lists.
   static let kitchenSinkMarkdown = """
     # Main Heading
 
@@ -30,6 +31,10 @@ struct KitchenSinkVisualTests {
     - First list item
     - Second with **bold**
     - Third item
+
+    1. First ordered
+    2. Second ordered
+    3. Third with **bold**
     """
 
   /// Named cursor positions for clarity in artifacts.
@@ -193,12 +198,45 @@ struct KitchenSinkVisualTests {
       offset: firstListItem,
       description: "Cursor at start of list marker -- delimiter visible (cursor at node start)"))
 
-    // 22. At end of last list item
+    // 22. At end of last unordered list item
     let thirdListItem = offsetOf("- Third item")
     positions.append(CursorPosition(
       name: "list-third-end",
       offset: thirdListItem + ("- Third item" as NSString).length,
       description: "Cursor at end of third list item -- delimiter visible"))
+
+    // 23. Inside first ordered list item
+    let firstOrderedItem = offsetOf("1. First ordered")
+    positions.append(CursorPosition(
+      name: "ordered-first-inside",
+      offset: firstOrderedItem + 5,
+      description: "Inside first ordered list item -- marker always visible, indented"))
+
+    // 24. Inside second ordered list item
+    let secondOrderedItem = offsetOf("2. Second ordered")
+    positions.append(CursorPosition(
+      name: "ordered-second-inside",
+      offset: secondOrderedItem + 5,
+      description: "Inside second ordered list item -- marker always visible"))
+
+    // 25. Inside third ordered list item (which has bold)
+    let thirdOrderedItem = offsetOf("3. Third with **bold**")
+    positions.append(CursorPosition(
+      name: "ordered-third-bold-inside",
+      offset: thirdOrderedItem + 5,
+      description: "Inside third ordered item -- marker visible, ** delimiters visible"))
+
+    // 26. At start of ordered list marker
+    positions.append(CursorPosition(
+      name: "ordered-at-marker-start",
+      offset: firstOrderedItem,
+      description: "Cursor at start of ordered list marker -- marker always visible"))
+
+    // 27. In body after ordered list (all ordered markers should stay visible)
+    positions.append(CursorPosition(
+      name: "ordered-all-outside",
+      offset: bodyStart + 3,
+      description: "Cursor in body -- all ordered list markers visible (no bullets)"))
 
     return positions
   }
