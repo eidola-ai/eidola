@@ -59,6 +59,7 @@ enum MarkdownRenderer {
     var styledRanges: [RenderSpec.StyledRange] = []
     var fontTraits: [RenderSpec.TraitApplication] = []
     var hiddenIndexes = IndexSet()
+    var bulletIndexes = IndexSet()
     var temporaryAttributes: [RenderSpec.StyledRange] = []
 
     for node in nodes {
@@ -145,6 +146,53 @@ enum MarkdownRenderer {
           style: style,
           hiddenIndexes: &hiddenIndexes,
           temporaryAttributes: &temporaryAttributes)
+
+      case .unorderedListItem:
+        // Extend to line range for cursor detection (same pattern as headings).
+        let lineRange = nsText.lineRange(for: safeNodeRange)
+        let lineEnd = lineRange.location + lineRange.length
+        let lineContentEnd: Int
+        if lineEnd > lineRange.location
+          && lineEnd <= textLength
+          && nsText.character(at: lineEnd - 1) == UInt16(0x000A)
+        {
+          lineContentEnd = lineEnd - 1
+        } else {
+          lineContentEnd = lineEnd
+        }
+        let lineContentRange = NSRange(
+          location: lineRange.location,
+          length: lineContentEnd - lineRange.location)
+        let cursorInNode = cursorOverlaps(
+          cursorRange, node: lineContentRange, textLength: textLength)
+
+        // Apply list item attributes (indentation) to the full line range.
+        if !node.attributes.isEmpty {
+          styledRanges.append(
+            RenderSpec.StyledRange(range: lineRange, attributes: node.attributes))
+        }
+
+        // Delimiter handling: bullet substitution or dimmed visibility.
+        for delim in node.delimiterRanges {
+          let safeDelim = clamp(delim, to: textLength)
+          guard safeDelim.length > 0 else { continue }
+
+          if cursorInNode {
+            // Cursor inside: show delimiter dimmed
+            temporaryAttributes.append(
+              RenderSpec.StyledRange(
+                range: safeDelim,
+                attributes: [.foregroundColor: style.delimiterColor]))
+          } else {
+            // Cursor outside: first char -> bullet, rest -> hidden
+            bulletIndexes.insert(safeDelim.location)
+            if safeDelim.length > 1 {
+              let spaceRange =
+                (safeDelim.location + 1)..<(safeDelim.location + safeDelim.length)
+              hiddenIndexes.insert(integersIn: spaceRange)
+            }
+          }
+        }
       }
     }
 
@@ -153,7 +201,7 @@ enum MarkdownRenderer {
       styledRanges: styledRanges,
       fontTraits: fontTraits,
       hiddenIndexes: hiddenIndexes,
-      bulletIndexes: IndexSet(),
+      bulletIndexes: bulletIndexes,
       temporaryAttributes: temporaryAttributes
     )
   }
