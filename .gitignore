@@ -28,6 +28,9 @@ core/target/
 # Local .app bundle output
 apps/macos/build/
 
+# Test artifacts
+test-artifacts/
+
 # macOS
 .DS_Store
 

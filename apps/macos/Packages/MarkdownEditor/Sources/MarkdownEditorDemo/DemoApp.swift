@@ -6,54 +6,29 @@ import SwiftUI
 struct DemoApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
-  @State private var markdown = """
-    # Welcome to MarkdownEditor
+  @State private var editorState = EditorState(
+    markdown: """
+      # Welcome to MarkdownEditor
 
-    This is a **bold** statement, and this is *italic* text.
+      This is a simple markdown editor with WYSIWYG heading support.
 
-    You can also do ***bold and italic*** together.
+      ## Getting Started
 
-    ## Code
+      Type some text here. Headings use the # prefix.
 
-    Here's some `inline code` in a sentence.
+      ### Features
 
-    ```swift
-    let greeting = "Hello, world!"
-    print(greeting)
-    ```
-
-    ## Lists
-
-    - First item
-    - Second item
-    - Third item
-
-    1. Ordered one
-    2. Ordered two
-    3. Ordered three
-
-    ## Other Elements
-
-    > This is a blockquote. It should appear
-    > indented with a visual indicator.
-
-    Here's a [link to Apple](https://apple.com) in a sentence.
-
-    This text has ~~strikethrough~~ in it.
-
-    ---
-
-    That was a thematic break above.
-    """
+      Plain text editing and heading rendering are supported so far.
+      """)
 
   var body: some Scene {
     WindowGroup {
       HSplitView {
-        MarkdownEditor(text: $markdown)
+        MarkdownEditor(state: $editorState)
           .frame(minWidth: 400)
 
         ScrollView {
-          Text(markdown)
+          Text(editorState.markdown)
             .font(.system(.body, design: .monospaced))
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)
