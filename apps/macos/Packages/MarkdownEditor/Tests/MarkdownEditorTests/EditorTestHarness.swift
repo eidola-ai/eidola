@@ -149,10 +149,13 @@ enum EditorTestHarness {
       }
       return "text"
     case .insertNewline: return "newline"
+    case .insertLineBreak: return "linebreak"
     case .deleteBackward: return "backspace"
     case .deleteForward: return "delete"
     case .setSelection: return "select"
     case .paste: return "paste"
+    case .indent: return "indent"
+    case .outdent: return "outdent"
     }
   }
 
@@ -189,6 +192,7 @@ enum EditorTestHarness {
       if text.count <= 3 { return "`\(text)`" }
       return "Insert(\(text.count) chars)"
     case .insertNewline: return "Enter"
+    case .insertLineBreak: return "Shift+Enter"
     case .deleteBackward: return "Backspace"
     case .deleteForward: return "Delete"
     case .setSelection(let sel):
@@ -197,6 +201,8 @@ enum EditorTestHarness {
       case .range(let a, let h): return "Select(\(a)..\(h))"
       }
     case .paste(let text): return "Paste(\(text.count) chars)"
+    case .indent: return "Tab"
+    case .outdent: return "Shift+Tab"
     }
   }
 }

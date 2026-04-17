@@ -77,23 +77,31 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
     // For ordered: "1. " or "12. " etc. (digits + ". ")
     // swift-markdown's ListItem range starts at the marker. The first child's
     // range starts at the content after the marker + space.
-    let delimiterLength: Int
+    let markerLength: Int
     if let firstChild = listItem.children.first(where: { $0.range != nil }),
       let childRange = firstChild.range
     {
       let childStart = converter.utf16Offset(from: childRange.lowerBound)
-      delimiterLength = childStart - range.location
+      markerLength = childStart - range.location
     } else {
-      delimiterLength = isOrdered ? 3 : 2  // fallback: "1. " or "- "
+      markerLength = isOrdered ? 3 : 2  // fallback: "1. " or "- "
     }
 
+    // Compute leading whitespace before the marker. For nested items, the
+    // source has indentation spaces that need to be hidden so the paragraph
+    // style controls indentation instead.
+    let nsText = converter.string as NSString
+    let lineStart = nsText.lineRange(for: NSRange(location: range.location, length: 0)).location
+    let leadingWhitespaceLength = range.location - lineStart
+
     let contentRange = NSRange(
-      location: range.location + delimiterLength,
-      length: max(0, range.length - delimiterLength)
+      location: range.location + markerLength,
+      length: max(0, range.length - markerLength)
     )
 
     if isUnordered {
-      let delimiterRange = NSRange(location: range.location, length: delimiterLength)
+      // Delimiter includes leading whitespace + marker ("    - ")
+      let delimiterRange = NSRange(location: lineStart, length: leadingWhitespaceLength + markerLength)
       let indentLevel = unorderedListDepth
 
       nodes.append(
@@ -105,15 +113,21 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
           attributes: style.listItemAttributes(indentLevel: indentLevel)
         ))
     } else {
-      // Ordered list: marker is always visible, no delimiter ranges.
+      // Ordered list: leading whitespace is a delimiter (hidden when cursor
+      // outside), but the number marker stays visible.
       let indentLevel = orderedListDepth
+
+      var delimiterRanges: [NSRange] = []
+      if leadingWhitespaceLength > 0 {
+        delimiterRanges.append(NSRange(location: lineStart, length: leadingWhitespaceLength))
+      }
 
       nodes.append(
         SyntaxNode(
           type: .orderedListItem(indentLevel: indentLevel),
           range: range,
           contentRange: contentRange,
-          delimiterRanges: [],
+          delimiterRanges: delimiterRanges,
           attributes: style.listItemAttributes(indentLevel: indentLevel)
         ))
     }

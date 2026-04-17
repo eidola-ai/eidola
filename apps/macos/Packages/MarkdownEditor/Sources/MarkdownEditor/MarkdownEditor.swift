@@ -105,7 +105,11 @@ public struct MarkdownEditor: NSViewRepresentable {
       _ textView: NSTextView, doCommandBy commandSelector: Selector
     ) -> Bool {
       if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-        processEvent(.insertNewline, textView: textView)
+        if NSApp.currentEvent?.modifierFlags.contains(.shift) == true {
+          processEvent(.insertLineBreak, textView: textView)
+        } else {
+          processEvent(.insertNewline, textView: textView)
+        }
         return true
       }
       if commandSelector == #selector(NSResponder.deleteBackward(_:)) {
@@ -114,6 +118,14 @@ public struct MarkdownEditor: NSViewRepresentable {
       }
       if commandSelector == #selector(NSResponder.deleteForward(_:)) {
         processEvent(.deleteForward, textView: textView)
+        return true
+      }
+      if commandSelector == #selector(NSResponder.insertTab(_:)) {
+        processEvent(.indent, textView: textView)
+        return true
+      }
+      if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
+        processEvent(.outdent, textView: textView)
         return true
       }
       return false

@@ -15,6 +15,11 @@ public enum EditorEvent: Sendable, Equatable {
   /// (list continuation, etc.) hooks into this event.
   case insertNewline
 
+  /// Insert a line break (Shift+Return). In list context, this continues
+  /// the current list item on the next line with appropriate indentation.
+  /// Outside a list, behaves like a plain newline.
+  case insertLineBreak
+
   /// Delete the character before the cursor, or delete the selection.
   case deleteBackward
 
@@ -26,4 +31,10 @@ public enum EditorEvent: Sendable, Equatable {
 
   /// Paste text, replacing the current selection if any.
   case paste(String)
+
+  /// Indent the current line (Tab key). In list context, increases nesting.
+  case indent
+
+  /// Outdent the current line (Shift+Tab). In list context, decreases nesting.
+  case outdent
 }

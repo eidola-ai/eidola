@@ -35,8 +35,8 @@ struct MarkdownStyle {
   func listItemAttributes(indentLevel: Int) -> [NSAttributedString.Key: Any] {
     let paragraphStyle = NSMutableParagraphStyle()
     let indent = listIndent * CGFloat(indentLevel)
-    paragraphStyle.headIndent = indent
     paragraphStyle.firstLineHeadIndent = indent
+    paragraphStyle.headIndent = indent
     paragraphStyle.paragraphSpacing = 2
     return [
       .font: baseFont,
