@@ -37,6 +37,9 @@ enum EditorUpdate {
     case .insertNewline:
       newState = handleInsertNewline(state)
 
+    case .insertLineBreak:
+      newState = handleInsertLineBreak(state)
+
     case .deleteBackward:
       newState = handleDeleteBackward(state)
 
@@ -48,6 +51,12 @@ enum EditorUpdate {
 
     case .paste(let text):
       newState = handleInsertText(state, text: text)
+
+    case .indent:
+      newState = handleIndent(state)
+
+    case .outdent:
+      newState = handleOutdent(state)
     }
 
     // Post-process: renumber ordered lists after any text mutation.
@@ -158,8 +167,99 @@ enum EditorUpdate {
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
+    // Check if we're on a continuation line (indented, no marker) belonging
+    // to a parent list item. If so, create a new list item.
+    if let parent = findParentListItem(in: nsMarkdown, at: pos) {
+      // First, handle any selected text by deleting it.
+      var workMarkdown = state.markdown
+      var workPos = pos
+      if case .range(let anchor, let head) = state.selection {
+        let start = min(anchor, head)
+        let end = max(anchor, head)
+        let clampedStart = min(start, nsMarkdown.length)
+        let clampedEnd = min(end, nsMarkdown.length)
+        let deleteRange = NSRange(location: clampedStart, length: clampedEnd - clampedStart)
+        workMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
+        workPos = clampedStart
+      }
+
+      let workNS = workMarkdown as NSString
+      let newPrefix: String
+      if parent.isOrdered {
+        let nextNumber = parent.number + 1
+        newPrefix = "\(parent.indent)\(nextNumber). "
+      } else {
+        newPrefix = parent.prefix
+      }
+      let insertion = "\n\(newPrefix)"
+      let newMarkdown = workNS.replacingCharacters(
+        in: NSRange(location: workPos, length: 0), with: insertion)
+      let newPos = workPos + (insertion as NSString).length
+      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+    }
+
     // Default: plain newline insertion.
     return handleInsertText(state, text: "\n")
+  }
+
+  // Regex matching any list line (unordered or ordered) to extract the full marker width.
+  private static let anyListMarkerWidthPattern = try! NSRegularExpression(
+    pattern: #"^([ \t]*)([-*+]|\d+\.) "#, options: [])
+
+  private static func handleInsertLineBreak(_ state: EditorState) -> EditorState {
+    let nsMarkdown = state.markdown as NSString
+
+    // Resolve the insertion position (delete selection first if range).
+    var workMarkdown = state.markdown
+    var workPos: Int
+    switch state.selection {
+    case .cursor(let p):
+      workPos = min(p, nsMarkdown.length)
+    case .range(let anchor, let head):
+      let start = min(anchor, head)
+      let end = max(anchor, head)
+      let clampedStart = min(start, nsMarkdown.length)
+      let clampedEnd = min(end, nsMarkdown.length)
+      let deleteRange = NSRange(location: clampedStart, length: clampedEnd - clampedStart)
+      workMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
+      workPos = clampedStart
+    }
+
+    let workNS = workMarkdown as NSString
+    let (_, lineText) = currentLine(workNS, at: workPos)
+    let lineNS = lineText as NSString
+
+    // Check if the current line starts with a list marker.
+    if let match = anyListMarkerWidthPattern.firstMatch(
+      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+    {
+      // The full marker (indent + marker chars + space) width determines
+      // how many spaces to indent the continuation line.
+      let markerWidth = match.range.length
+      let indent = String(repeating: " ", count: markerWidth)
+      let insertion = "\n\(indent)"
+      let newMarkdown = workNS.replacingCharacters(
+        in: NSRange(location: workPos, length: 0), with: insertion)
+      let newPos = workPos + (insertion as NSString).length
+      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+    }
+
+    // Check if we're on a continuation line (indented, no marker) belonging
+    // to a parent list item.
+    if let parent = findParentListItem(in: workNS, at: workPos) {
+      let markerWidth = parent.prefix.count
+      let indent = String(repeating: " ", count: markerWidth)
+      let insertion = "\n\(indent)"
+      let newMarkdown = workNS.replacingCharacters(
+        in: NSRange(location: workPos, length: 0), with: insertion)
+      let newPos = workPos + (insertion as NSString).length
+      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+    }
+
+    // Not in a list item: plain newline.
+    return handleInsertText(
+      EditorState(markdown: workMarkdown, selection: .cursor(workPos)),
+      text: "\n")
   }
 
   private static func handleInsertText(_ state: EditorState, text: String) -> EditorState {
@@ -274,6 +374,92 @@ enum EditorUpdate {
     }
   }
 
+  /// Regex matching any list marker at the start of a line (unordered or ordered).
+  private static let anyListLinePattern = try! NSRegularExpression(
+    pattern: #"^([ \t]*)([-*+]|\d+\.) "#, options: [])
+
+  private static func handleIndent(_ state: EditorState) -> EditorState {
+    let nsMarkdown = state.markdown as NSString
+    let pos: Int
+    switch state.selection {
+    case .cursor(let p): pos = min(p, nsMarkdown.length)
+    case .range(_, let head): pos = min(head, nsMarkdown.length)
+    }
+
+    let (lineRange, lineText) = currentLine(nsMarkdown, at: pos)
+    let lineNS = lineText as NSString
+
+    // Check if the current line is a list item line
+    let listMatch = anyListLinePattern.firstMatch(
+      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+
+    if listMatch != nil {
+      // On a list item line: add 4 spaces before the marker (at start of line)
+      let indent = "    "
+      let insertPos = lineRange.location
+      let newMarkdown = nsMarkdown.replacingCharacters(
+        in: NSRange(location: insertPos, length: 0), with: indent)
+      let newPos = pos + 4
+      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+    }
+
+    // Check if we're on a continuation line belonging to a list item
+    if findParentListItem(in: nsMarkdown, at: pos) != nil {
+      let indent = "    "
+      let insertPos = lineRange.location
+      let newMarkdown = nsMarkdown.replacingCharacters(
+        in: NSRange(location: insertPos, length: 0), with: indent)
+      let newPos = pos + 4
+      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+    }
+
+    // Not on a list line: insert 4 spaces at cursor position
+    return handleInsertText(state, text: "    ")
+  }
+
+  private static func handleOutdent(_ state: EditorState) -> EditorState {
+    let nsMarkdown = state.markdown as NSString
+    let pos: Int
+    switch state.selection {
+    case .cursor(let p): pos = min(p, nsMarkdown.length)
+    case .range(_, let head): pos = min(head, nsMarkdown.length)
+    }
+
+    let (lineRange, lineText) = currentLine(nsMarkdown, at: pos)
+    let lineNS = lineText as NSString
+
+    // Check if the current line is a list item line
+    let listMatch = anyListLinePattern.firstMatch(
+      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+
+    if listMatch != nil {
+      // Count leading spaces on this line
+      let leadingSpaces = lineText.prefix(while: { $0 == " " })
+      let spacesToRemove = min(leadingSpaces.count, 4)
+      guard spacesToRemove > 0 else { return state }
+
+      let removeRange = NSRange(location: lineRange.location, length: spacesToRemove)
+      let newMarkdown = nsMarkdown.replacingCharacters(in: removeRange, with: "")
+      let newPos = max(lineRange.location, pos - spacesToRemove)
+      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+    }
+
+    // Check if we're on a continuation line belonging to a list item
+    if findParentListItem(in: nsMarkdown, at: pos) != nil {
+      let leadingSpaces = lineText.prefix(while: { $0 == " " })
+      let spacesToRemove = min(leadingSpaces.count, 4)
+      guard spacesToRemove > 0 else { return state }
+
+      let removeRange = NSRange(location: lineRange.location, length: spacesToRemove)
+      let newMarkdown = nsMarkdown.replacingCharacters(in: removeRange, with: "")
+      let newPos = max(lineRange.location, pos - spacesToRemove)
+      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+    }
+
+    // Not on a list line: do nothing
+    return state
+  }
+
   private static func handleSetSelection(_ state: EditorState, selection: Selection) -> EditorState {
     let maxPos = (state.markdown as NSString).length
 
@@ -289,6 +475,99 @@ enum EditorUpdate {
     }
 
     return EditorState(markdown: state.markdown, selection: clamped)
+  }
+
+  // MARK: - Continuation Line Detection
+
+  /// Information about a parent list item found by walking backwards from a continuation line.
+  private struct ParentListItem {
+    /// The full marker prefix (e.g. "- ", "  - ", "1. ", "  1. ")
+    let prefix: String
+    /// Whether the parent is an ordered list item.
+    let isOrdered: Bool
+    /// The number of the ordered list item (only meaningful if isOrdered).
+    let number: Int
+    /// The leading indent string.
+    let indent: String
+    /// The marker character for unordered lists (e.g. "-", "*", "+").
+    let markerChar: String
+  }
+
+  /// Regex matching any list marker line to extract components.
+  private static let anyListMarkerPattern = try! NSRegularExpression(
+    pattern: #"^([ \t]*)([-*+]) "#, options: [])
+  private static let anyOrderedMarkerPattern = try! NSRegularExpression(
+    pattern: #"^([ \t]*)(\d+)\. "#, options: [])
+
+  /// Walk backwards from the current line to find the parent list item for a continuation line.
+  /// Returns nil if the current line is not a continuation line.
+  private static func findParentListItem(
+    in nsMarkdown: NSString, at pos: Int
+  ) -> ParentListItem? {
+    let (lineRange, lineText) = currentLine(nsMarkdown, at: pos)
+    let lineNS = lineText as NSString
+
+    // Check if the current line is itself a list marker line (not a continuation)
+    if anyListMarkerWidthPattern.firstMatch(
+      in: lineText, range: NSRange(location: 0, length: lineNS.length)) != nil
+    {
+      return nil
+    }
+
+    // Check if the current line starts with whitespace (potential continuation)
+    let leadingSpaces = lineText.prefix(while: { $0 == " " || $0 == "\t" })
+    guard !leadingSpaces.isEmpty else { return nil }
+
+    // Walk backwards through previous lines
+    var searchPos = lineRange.location
+    while searchPos > 0 {
+      // Move to previous line
+      let prevLineEnd = searchPos - 1
+      let (prevLineRange, prevLineText) = currentLine(nsMarkdown, at: max(0, prevLineEnd))
+      let prevNS = prevLineText as NSString
+
+      // Check for unordered list marker
+      if let match = anyListMarkerPattern.firstMatch(
+        in: prevLineText, range: NSRange(location: 0, length: prevNS.length))
+      {
+        let indent = prevNS.substring(with: match.range(at: 1))
+        let marker = prevNS.substring(with: match.range(at: 2))
+        let prefix = "\(indent)\(marker) "
+        // Verify our line's indentation matches or exceeds the marker width
+        if leadingSpaces.count >= prefix.count {
+          return ParentListItem(
+            prefix: prefix, isOrdered: false, number: 0,
+            indent: indent, markerChar: marker)
+        }
+        return nil
+      }
+
+      // Check for ordered list marker
+      if let match = anyOrderedMarkerPattern.firstMatch(
+        in: prevLineText, range: NSRange(location: 0, length: prevNS.length))
+      {
+        let indent = prevNS.substring(with: match.range(at: 1))
+        let numberStr = prevNS.substring(with: match.range(at: 2))
+        let number = Int(numberStr) ?? 1
+        let prefix = "\(indent)\(numberStr). "
+        // Verify our line's indentation matches or exceeds the marker width
+        if leadingSpaces.count >= prefix.count {
+          return ParentListItem(
+            prefix: prefix, isOrdered: true, number: number,
+            indent: indent, markerChar: "")
+        }
+        return nil
+      }
+
+      // Check if this previous line is also a continuation (starts with whitespace)
+      let prevLeading = prevLineText.prefix(while: { $0 == " " || $0 == "\t" })
+      guard !prevLeading.isEmpty else { return nil }
+
+      // Continue walking backwards
+      searchPos = prevLineRange.location
+    }
+
+    return nil
   }
 
   // MARK: - Ordered List Renumbering
@@ -323,6 +602,10 @@ enum EditorUpdate {
     var anchorDelta = 0
     var charOffset = 0  // running character offset into the original string
 
+    // Track the last ordered list marker width per indent level so we can
+    // identify continuation lines (indented text belonging to a multi-line item).
+    var lastMarkerWidth: [String: Int] = [:]
+
     for line in lines {
       let lineNS = line as NSString
       let match = orderedLinePattern.firstMatch(
@@ -344,6 +627,9 @@ enum EditorUpdate {
         // Mark this indent as active. Clear indents that are "deeper" or different
         // if the current line is at a shallower indent.
         activeIndents.insert(indent)
+
+        // Track the full marker width (indent + number + ". ") for continuation detection.
+        lastMarkerWidth[indent] = match.range.length
 
         if correctNumberStr != oldNumberStr {
           // Replace the number
@@ -377,9 +663,33 @@ enum EditorUpdate {
           newLines.append(line)
         }
       } else {
-        // Not an ordered list line — reset all counters for indents that are
-        // no longer active. A blank line or non-list-item breaks all lists.
-        activeIndents.removeAll()
+        // Not an ordered list line. Check if it's a continuation line
+        // (starts with whitespace at least as deep as the marker width of the
+        // active list item). Continuation lines don't break the list.
+        let isContinuation: Bool
+        if !activeIndents.isEmpty, !line.isEmpty {
+          // Check if this line starts with enough whitespace to be a continuation
+          // of any active ordered list item.
+          let leadingSpaces = line.prefix(while: { $0 == " " || $0 == "\t" })
+          if !leadingSpaces.isEmpty {
+            // A continuation line must start with whitespace >= marker width.
+            // Check against any active indent level's marker width.
+            isContinuation = activeIndents.contains(where: { indent in
+              guard let mw = lastMarkerWidth[indent] else { return false }
+              return leadingSpaces.count >= mw
+            })
+          } else {
+            isContinuation = false
+          }
+        } else {
+          isContinuation = false
+        }
+
+        if !isContinuation {
+          // A blank line or non-list, non-continuation line breaks all lists.
+          activeIndents.removeAll()
+          lastMarkerWidth.removeAll()
+        }
         // Don't clear counters — they'll be reset when activeIndents doesn't contain
         // the indent on the next ordered item.
         newLines.append(line)

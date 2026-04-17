@@ -148,14 +148,42 @@ enum MarkdownRenderer {
           temporaryAttributes: &temporaryAttributes)
 
       case .orderedListItem:
-        // Ordered list items: marker is always visible (no hiding/revealing).
-        // Just apply the list item attributes (indentation) to the full line range.
+        // Ordered list items: number marker is always visible, but leading
+        // whitespace (for nested items) is hidden when cursor is outside.
         let lineRange = nsText.lineRange(for: safeNodeRange)
+        let lineEnd = lineRange.location + lineRange.length
+        let lineContentEnd: Int
+        if lineEnd > lineRange.location
+          && lineEnd <= textLength
+          && nsText.character(at: lineEnd - 1) == UInt16(0x000A)
+        {
+          lineContentEnd = lineEnd - 1
+        } else {
+          lineContentEnd = lineEnd
+        }
+        let lineContentRange = NSRange(
+          location: lineRange.location,
+          length: lineContentEnd - lineRange.location)
+        let cursorInNode = cursorOverlaps(
+          cursorRange, node: lineContentRange, textLength: textLength)
 
         if !node.attributes.isEmpty {
           styledRanges.append(
             RenderSpec.StyledRange(range: lineRange, attributes: node.attributes))
         }
+
+        // Leading whitespace is always hidden (paragraph style handles indentation).
+        for delim in node.delimiterRanges {
+          let safeDelim = clamp(delim, to: textLength)
+          guard safeDelim.length > 0 else { continue }
+          hiddenIndexes.insert(
+            integersIn: safeDelim.location..<(safeDelim.location + safeDelim.length))
+        }
+
+        // Hide leading whitespace on continuation lines within this list item.
+        hideContinuationWhitespace(
+          in: nsText, nodeRange: safeNodeRange, textLength: textLength,
+          hiddenIndexes: &hiddenIndexes)
 
       case .unorderedListItem:
         // Extend to line range for cursor detection (same pattern as headings).
@@ -182,27 +210,50 @@ enum MarkdownRenderer {
             RenderSpec.StyledRange(range: lineRange, attributes: node.attributes))
         }
 
-        // Delimiter handling: bullet substitution or dimmed visibility.
+        // Delimiter is: [leading whitespace][marker char][space]
+        // Leading whitespace is ALWAYS hidden (paragraph style handles indentation).
+        // The marker portion is hidden/revealed based on cursor position.
         for delim in node.delimiterRanges {
           let safeDelim = clamp(delim, to: textLength)
           guard safeDelim.length > 0 else { continue }
 
+          let markerCharIndex = safeNodeRange.location
+          let leadingStart = safeDelim.location
+          let delimEnd = safeDelim.location + safeDelim.length
+
+          // Always hide leading whitespace
+          if markerCharIndex > leadingStart {
+            hiddenIndexes.insert(integersIn: leadingStart..<markerCharIndex)
+          }
+
+          // Marker portion: from markerCharIndex to delimEnd
+          let markerRange = NSRange(
+            location: markerCharIndex,
+            length: delimEnd - markerCharIndex)
+
           if cursorInNode {
-            // Cursor inside: show delimiter dimmed
-            temporaryAttributes.append(
-              RenderSpec.StyledRange(
-                range: safeDelim,
-                attributes: [.foregroundColor: style.delimiterColor]))
+            // Cursor inside: show marker dimmed
+            if markerRange.length > 0 {
+              temporaryAttributes.append(
+                RenderSpec.StyledRange(
+                  range: markerRange,
+                  attributes: [.foregroundColor: style.delimiterColor]))
+            }
           } else {
-            // Cursor outside: first char -> bullet, rest -> hidden
-            bulletIndexes.insert(safeDelim.location)
-            if safeDelim.length > 1 {
-              let spaceRange =
-                (safeDelim.location + 1)..<(safeDelim.location + safeDelim.length)
-              hiddenIndexes.insert(integersIn: spaceRange)
+            // Cursor outside: replace marker char with bullet, hide space
+            if markerCharIndex < delimEnd {
+              bulletIndexes.insert(markerCharIndex)
+            }
+            if markerCharIndex + 1 < delimEnd {
+              hiddenIndexes.insert(integersIn: (markerCharIndex + 1)..<delimEnd)
             }
           }
         }
+
+        // Hide leading whitespace on continuation lines within this list item.
+        hideContinuationWhitespace(
+          in: nsText, nodeRange: safeNodeRange, textLength: textLength,
+          hiddenIndexes: &hiddenIndexes)
       }
     }
 
@@ -270,6 +321,59 @@ enum MarkdownRenderer {
       }
     }
     return false
+  }
+
+  /// Hide leading whitespace on continuation lines within a list item's range.
+  ///
+  /// Continuation lines are lines after the first within a list item node that
+  /// start with whitespace. The whitespace exists in the markdown source to tell
+  /// the parser the line belongs to the list item, but visually the paragraph
+  /// style's `headIndent` already handles indentation, so the whitespace must
+  /// be hidden to avoid double indentation.
+  private static func hideContinuationWhitespace(
+    in nsText: NSString,
+    nodeRange: NSRange,
+    textLength: Int,
+    hiddenIndexes: inout IndexSet
+  ) {
+    let nodeEnd = min(nodeRange.location + nodeRange.length, textLength)
+    var pos = nodeRange.location
+
+    // Skip the first line (it has the marker, handled separately)
+    while pos < nodeEnd {
+      if nsText.character(at: pos) == UInt16(0x000A) {  // \n
+        pos += 1
+        break
+      }
+      pos += 1
+    }
+
+    // Scan subsequent lines for leading whitespace
+    while pos < nodeEnd {
+      let lineStart = pos
+      // Count leading whitespace (spaces and tabs)
+      while pos < nodeEnd {
+        let ch = nsText.character(at: pos)
+        if ch == UInt16(0x0020) || ch == UInt16(0x0009) {  // space or tab
+          pos += 1
+        } else {
+          break
+        }
+      }
+      let wsCount = pos - lineStart
+      if wsCount > 0 {
+        hiddenIndexes.insert(integersIn: lineStart..<(lineStart + wsCount))
+      }
+
+      // Skip to end of this line
+      while pos < nodeEnd {
+        if nsText.character(at: pos) == UInt16(0x000A) {
+          pos += 1
+          break
+        }
+        pos += 1
+      }
+    }
   }
 
   static func clamp(_ range: NSRange, to maxLength: Int) -> NSRange {
