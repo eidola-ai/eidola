@@ -118,8 +118,8 @@ struct OrderedListRenderTests {
 
     // Unordered item at position 0 should have bullet
     #expect(spec.bulletIndexes.contains(0), "Unordered marker should be bullet")
-    // Unordered space at position 1 should be hidden
-    #expect(spec.hiddenIndexes.contains(1), "Unordered space should be hidden")
+    // Unordered space at position 1 should be visible (spacing)
+    #expect(!spec.hiddenIndexes.contains(1), "Unordered space should be visible")
 
     // Ordered item at position 12 should NOT have bullet or be hidden
     #expect(!spec.bulletIndexes.contains(12), "Ordered '1' should not be bullet")

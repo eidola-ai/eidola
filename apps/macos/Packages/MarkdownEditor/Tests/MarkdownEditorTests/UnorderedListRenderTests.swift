@@ -19,8 +19,8 @@ struct UnorderedListRenderTests {
 
     // Position 0 (the '-') should be in bulletIndexes
     #expect(spec.bulletIndexes.contains(0), "Marker char should be a bullet glyph")
-    // Position 1 (space) should be hidden
-    #expect(spec.hiddenIndexes.contains(1), "Space after marker should be hidden")
+    // Position 1 (space) stays visible for spacing between bullet and content
+    #expect(!spec.hiddenIndexes.contains(1), "Space after marker should be visible for spacing")
     // Content should not be hidden or bullet
     #expect(!spec.hiddenIndexes.contains(2), "Content should not be hidden")
     #expect(!spec.bulletIndexes.contains(2), "Content should not be bullet")
@@ -33,7 +33,7 @@ struct UnorderedListRenderTests {
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
     #expect(spec.bulletIndexes.contains(0), "Star marker should become bullet")
-    #expect(spec.hiddenIndexes.contains(1), "Space after star should be hidden")
+    #expect(!spec.hiddenIndexes.contains(1), "Space after star should be visible")
   }
 
   @Test("List item with + marker shows bullet when cursor outside")
@@ -43,7 +43,7 @@ struct UnorderedListRenderTests {
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
     #expect(spec.bulletIndexes.contains(0), "Plus marker should become bullet")
-    #expect(spec.hiddenIndexes.contains(1), "Space after plus should be hidden")
+    #expect(!spec.hiddenIndexes.contains(1), "Space after plus should be visible")
   }
 
   // MARK: - Delimiter dimmed when cursor inside
@@ -99,10 +99,10 @@ struct UnorderedListRenderTests {
     #expect(spec.bulletIndexes.contains(9), "Second item marker should be bullet")
     #expect(spec.bulletIndexes.contains(18), "Third item marker should be bullet")
 
-    // Each list item's space should be hidden
-    #expect(spec.hiddenIndexes.contains(1), "First item space should be hidden")
-    #expect(spec.hiddenIndexes.contains(10), "Second item space should be hidden")
-    #expect(spec.hiddenIndexes.contains(19), "Third item space should be hidden")
+    // Each list item's space should be visible (spacing between bullet and content)
+    #expect(!spec.hiddenIndexes.contains(1), "First item space should be visible")
+    #expect(!spec.hiddenIndexes.contains(10), "Second item space should be visible")
+    #expect(!spec.hiddenIndexes.contains(19), "Third item space should be visible")
   }
 
   @Test("Cursor on one list item reveals only that item's delimiter")

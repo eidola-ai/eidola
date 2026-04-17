@@ -11,6 +11,14 @@ enum EditorUpdate {
   private static let listMarkerPattern = try! NSRegularExpression(
     pattern: #"^([ \t]*)([-*+]) $"#, options: [])
 
+  // Regex matching an empty checkbox list marker: leading whitespace + marker + " [ ] " or " [x] "
+  private static let checkboxMarkerPattern = try! NSRegularExpression(
+    pattern: #"^([ \t]*)([-*+]) \[[xX ]\] $"#, options: [])
+
+  // Regex matching a non-empty checkbox list item line (marker + checkbox + content).
+  private static let checkboxItemPattern = try! NSRegularExpression(
+    pattern: #"^([ \t]*[-*+] \[[xX ]\] ).+"#, options: [])
+
   // Regex matching a non-empty list item line (marker + at least one content char).
   private static let listItemPattern = try! NSRegularExpression(
     pattern: #"^([ \t]*[-*+] ).+"#, options: [])
@@ -85,6 +93,15 @@ enum EditorUpdate {
     let (lineRange, lineText) = currentLine(nsMarkdown, at: pos)
     let lineNS = lineText as NSString
 
+    // Check if the current line is an empty checkbox list item (just marker + checkbox, no content).
+    let emptyCheckboxMatch = checkboxMarkerPattern.firstMatch(
+      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+    if emptyCheckboxMatch != nil {
+      // Remove the marker line entirely, leave a blank line.
+      let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: "\n")
+      return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location))
+    }
+
     // Check if the current line is an empty list item (just marker, no content).
     // Pattern: optional whitespace + marker char + space + end-of-line
     let emptyMatch = listMarkerPattern.firstMatch(
@@ -132,6 +149,47 @@ enum EditorUpdate {
 
       let workNS = workMarkdown as NSString
       let insertion = "\n\(prefix)"
+      let newMarkdown = workNS.replacingCharacters(
+        in: NSRange(location: workPos, length: 0), with: insertion)
+      let newPos = workPos + (insertion as NSString).length
+      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+    }
+
+    // Check if the current line is a non-empty checkbox list item.
+    let checkboxItemMatch = checkboxItemPattern.firstMatch(
+      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+    if let checkboxItemMatch = checkboxItemMatch {
+      // Continue the list with a new unchecked checkbox.
+      // Extract the prefix up to the checkbox and build a new unchecked prefix.
+      let fullPrefixRange = checkboxItemMatch.range(at: 1)
+      let fullPrefix = lineNS.substring(with: fullPrefixRange)
+      // Replace the checkbox state with unchecked: the prefix ends with "[ ] " or "[x] "
+      // We want to always continue with "[ ] ". Extract the part before the checkbox.
+      let checkboxRegex = try! NSRegularExpression(pattern: #"^([ \t]*[-*+] )\[[xX ]\] $"#, options: [])
+      let basePrefix: String
+      if let baseMatch = checkboxRegex.firstMatch(
+        in: fullPrefix, range: NSRange(location: 0, length: (fullPrefix as NSString).length))
+      {
+        basePrefix = (fullPrefix as NSString).substring(with: baseMatch.range(at: 1)) + "[ ] "
+      } else {
+        basePrefix = fullPrefix  // fallback
+      }
+
+      // First, handle any selected text by deleting it.
+      var workMarkdown = state.markdown
+      var workPos = pos
+      if case .range(let anchor, let head) = state.selection {
+        let start = min(anchor, head)
+        let end = max(anchor, head)
+        let clampedStart = min(start, nsMarkdown.length)
+        let clampedEnd = min(end, nsMarkdown.length)
+        let deleteRange = NSRange(location: clampedStart, length: clampedEnd - clampedStart)
+        workMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
+        workPos = clampedStart
+      }
+
+      let workNS = workMarkdown as NSString
+      let insertion = "\n\(basePrefix)"
       let newMarkdown = workNS.replacingCharacters(
         in: NSRange(location: workPos, length: 0), with: insertion)
       let newPos = workPos + (insertion as NSString).length
@@ -229,6 +287,21 @@ enum EditorUpdate {
     let (_, lineText) = currentLine(workNS, at: workPos)
     let lineNS = lineText as NSString
 
+    // Check if the current line starts with a checkbox list marker.
+    let checkboxLinePattern = try! NSRegularExpression(
+      pattern: #"^([ \t]*)([-*+]) \[[xX ]\] "#, options: [])
+    if let match = checkboxLinePattern.firstMatch(
+      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+    {
+      let markerWidth = match.range.length
+      let indent = String(repeating: " ", count: markerWidth)
+      let insertion = "\n\(indent)"
+      let newMarkdown = workNS.replacingCharacters(
+        in: NSRange(location: workPos, length: 0), with: insertion)
+      let newPos = workPos + (insertion as NSString).length
+      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+    }
+
     // Check if the current line starts with a list marker.
     if let match = anyListMarkerWidthPattern.firstMatch(
       in: lineText, range: NSRange(location: 0, length: lineNS.length))
@@ -298,6 +371,24 @@ enum EditorUpdate {
       let (lineRange, lineText) = currentLine(nsMarkdown, at: clampedPos)
       let lineNS = lineText as NSString
       let posInLine = clampedPos - lineRange.location
+
+      // Match checkbox: "  - [ ] " or "- [x] " at start of line
+      let checkboxMarkerRegex = try! NSRegularExpression(
+        pattern: #"^([ \t]*)([-*+]) \[[xX ]\] "#, options: [])
+      if let match = checkboxMarkerRegex.firstMatch(
+        in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      {
+        let markerEnd = match.range.location + match.range.length
+        if posInLine == markerEnd {
+          // Cursor is right after checkbox marker — remove the entire marker.
+          let markerAbsRange = NSRange(
+            location: lineRange.location + match.range.location,
+            length: match.range.length)
+          let newMarkdown = nsMarkdown.replacingCharacters(in: markerAbsRange, with: "")
+          return EditorState(
+            markdown: newMarkdown, selection: .cursor(markerAbsRange.location))
+        }
+      }
 
       // Match unordered: "  - " or "- " at start of line
       let markerRegex = try! NSRegularExpression(pattern: #"^([ \t]*)([-*+]) "#, options: [])

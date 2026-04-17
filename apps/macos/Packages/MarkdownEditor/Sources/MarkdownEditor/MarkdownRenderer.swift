@@ -31,6 +31,8 @@ enum MarkdownRenderer {
         fontTraits: [],
         hiddenIndexes: IndexSet(),
         bulletIndexes: IndexSet(),
+        uncheckedCheckboxIndexes: IndexSet(),
+        checkedCheckboxIndexes: IndexSet(),
         temporaryAttributes: []
       )
     }
@@ -60,6 +62,8 @@ enum MarkdownRenderer {
     var fontTraits: [RenderSpec.TraitApplication] = []
     var hiddenIndexes = IndexSet()
     var bulletIndexes = IndexSet()
+    var uncheckedCheckboxIndexes = IndexSet()
+    var checkedCheckboxIndexes = IndexSet()
     var temporaryAttributes: [RenderSpec.StyledRange] = []
 
     for node in nodes {
@@ -196,6 +200,93 @@ enum MarkdownRenderer {
           in: nsText, nodeRange: safeNodeRange, textLength: textLength,
           hiddenIndexes: &hiddenIndexes)
 
+        // Override firstLineHeadIndent on continuation lines so they align
+        // with content, not the marker position.
+        applyContinuationParagraphStyle(
+          in: nsText, nodeRange: safeNodeRange, nodeAttributes: node.attributes,
+          textLength: textLength, styledRanges: &styledRanges)
+
+      case .checkboxListItem(let checked, _):
+        // Checkbox list items: same pattern as unordered but with checkbox glyph
+        // substitution instead of bullet. The delimiter covers the full
+        // "- [ ] " or "- [x] " prefix (plus leading whitespace for nested items).
+        let lineRange = nsText.lineRange(for: safeNodeRange)
+        let lineEnd = lineRange.location + lineRange.length
+        let lineContentEnd: Int
+        if lineEnd > lineRange.location
+          && lineEnd <= textLength
+          && nsText.character(at: lineEnd - 1) == UInt16(0x000A)
+        {
+          lineContentEnd = lineEnd - 1
+        } else {
+          lineContentEnd = lineEnd
+        }
+        let lineContentRange = NSRange(
+          location: lineRange.location,
+          length: lineContentEnd - lineRange.location)
+        let cursorInNode = cursorOverlaps(
+          cursorRange, node: lineContentRange, textLength: textLength)
+
+        if !node.attributes.isEmpty {
+          styledRanges.append(
+            RenderSpec.StyledRange(range: lineRange, attributes: node.attributes))
+        }
+
+        for delim in node.delimiterRanges {
+          let safeDelim = clamp(delim, to: textLength)
+          guard safeDelim.length > 0 else { continue }
+
+          let markerCharIndex = safeNodeRange.location
+          let leadingStart = safeDelim.location
+          let delimEnd = safeDelim.location + safeDelim.length
+
+          // Always hide leading whitespace
+          if markerCharIndex > leadingStart {
+            hiddenIndexes.insert(integersIn: leadingStart..<markerCharIndex)
+          }
+
+          // Marker portion: from markerCharIndex to delimEnd
+          // For checkbox: "- [ ] " or "- [x] " (6 chars)
+          let markerRange = NSRange(
+            location: markerCharIndex,
+            length: delimEnd - markerCharIndex)
+
+          if cursorInNode {
+            // Cursor inside: show full marker dimmed
+            if markerRange.length > 0 {
+              temporaryAttributes.append(
+                RenderSpec.StyledRange(
+                  range: markerRange,
+                  attributes: [.foregroundColor: style.delimiterColor]))
+            }
+          } else {
+            // Cursor outside: replace marker char with checkbox glyph,
+            // hide middle chars, keep trailing space visible for spacing.
+            if markerCharIndex < delimEnd {
+              if checked {
+                checkedCheckboxIndexes.insert(markerCharIndex)
+              } else {
+                uncheckedCheckboxIndexes.insert(markerCharIndex)
+              }
+            }
+            // Hide chars between glyph and trailing space (but keep the space)
+            if markerCharIndex + 1 < delimEnd - 1 {
+              hiddenIndexes.insert(integersIn: (markerCharIndex + 1)..<(delimEnd - 1))
+            }
+          }
+        }
+
+        // Hide leading whitespace on continuation lines within this list item.
+        hideContinuationWhitespace(
+          in: nsText, nodeRange: safeNodeRange, textLength: textLength,
+          hiddenIndexes: &hiddenIndexes)
+
+        // Override firstLineHeadIndent on continuation lines so they align
+        // with content, not the marker position.
+        applyContinuationParagraphStyle(
+          in: nsText, nodeRange: safeNodeRange, nodeAttributes: node.attributes,
+          textLength: textLength, styledRanges: &styledRanges)
+
       case .unorderedListItem:
         // Extend to line range for cursor detection (same pattern as headings).
         let lineRange = nsText.lineRange(for: safeNodeRange)
@@ -251,12 +342,14 @@ enum MarkdownRenderer {
                   attributes: [.foregroundColor: style.delimiterColor]))
             }
           } else {
-            // Cursor outside: replace marker char with bullet, hide space
+            // Cursor outside: replace marker char with bullet,
+            // hide middle chars, keep trailing space visible for spacing.
             if markerCharIndex < delimEnd {
               bulletIndexes.insert(markerCharIndex)
             }
-            if markerCharIndex + 1 < delimEnd {
-              hiddenIndexes.insert(integersIn: (markerCharIndex + 1)..<delimEnd)
+            // Hide chars between glyph and trailing space (but keep the space)
+            if markerCharIndex + 1 < delimEnd - 1 {
+              hiddenIndexes.insert(integersIn: (markerCharIndex + 1)..<(delimEnd - 1))
             }
           }
         }
@@ -265,6 +358,12 @@ enum MarkdownRenderer {
         hideContinuationWhitespace(
           in: nsText, nodeRange: safeNodeRange, textLength: textLength,
           hiddenIndexes: &hiddenIndexes)
+
+        // Override firstLineHeadIndent on continuation lines so they align
+        // with content, not the marker position.
+        applyContinuationParagraphStyle(
+          in: nsText, nodeRange: safeNodeRange, nodeAttributes: node.attributes,
+          textLength: textLength, styledRanges: &styledRanges)
       }
     }
 
@@ -274,6 +373,8 @@ enum MarkdownRenderer {
       fontTraits: fontTraits,
       hiddenIndexes: hiddenIndexes,
       bulletIndexes: bulletIndexes,
+      uncheckedCheckboxIndexes: uncheckedCheckboxIndexes,
+      checkedCheckboxIndexes: checkedCheckboxIndexes,
       temporaryAttributes: temporaryAttributes
     )
   }
@@ -384,6 +485,56 @@ enum MarkdownRenderer {
         }
         pos += 1
       }
+    }
+  }
+
+  /// Apply a paragraph style override to continuation lines within a list item
+  /// so that `firstLineHeadIndent` matches `headIndent`. Without this, continuation
+  /// lines (whose leading whitespace is hidden) would start at the marker position
+  /// instead of the content position.
+  private static func applyContinuationParagraphStyle(
+    in nsText: NSString,
+    nodeRange: NSRange,
+    nodeAttributes: [NSAttributedString.Key: Any],
+    textLength: Int,
+    styledRanges: inout [RenderSpec.StyledRange]
+  ) {
+    guard let existingStyle = nodeAttributes[.paragraphStyle] as? NSParagraphStyle else { return }
+    let headIndent = existingStyle.headIndent
+    guard headIndent > 0 else { return }
+
+    let nodeEnd = min(nodeRange.location + nodeRange.length, textLength)
+    var pos = nodeRange.location
+
+    // Skip the first line (it uses firstLineHeadIndent for the marker position)
+    while pos < nodeEnd {
+      if nsText.character(at: pos) == UInt16(0x000A) {
+        pos += 1
+        break
+      }
+      pos += 1
+    }
+
+    // Apply overridden paragraph style to each continuation line
+    while pos < nodeEnd {
+      let lineStart = pos
+      // Find end of this line
+      while pos < nodeEnd && nsText.character(at: pos) != UInt16(0x000A) {
+        pos += 1
+      }
+      let lineEnd = pos
+      if pos < nodeEnd { pos += 1 }  // skip \n
+
+      let lineLength = lineEnd - lineStart
+      guard lineLength > 0 else { continue }
+
+      let contStyle = NSMutableParagraphStyle()
+      contStyle.setParagraphStyle(existingStyle)
+      contStyle.firstLineHeadIndent = headIndent
+      styledRanges.append(
+        RenderSpec.StyledRange(
+          range: NSRange(location: lineStart, length: lineLength),
+          attributes: [.paragraphStyle: contStyle.copy() as! NSParagraphStyle]))
     }
   }
 

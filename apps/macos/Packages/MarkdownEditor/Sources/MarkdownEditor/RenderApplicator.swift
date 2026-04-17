@@ -21,6 +21,8 @@ enum RenderApplicator {
     if let glyphDelegate = layoutManager.delegate as? GlyphHidingLayoutManagerDelegate {
       glyphDelegate.hiddenCharacterIndexes = spec.hiddenIndexes
       glyphDelegate.bulletCharacterIndexes = spec.bulletIndexes
+      glyphDelegate.uncheckedCheckboxCharacterIndexes = spec.uncheckedCheckboxIndexes
+      glyphDelegate.checkedCheckboxCharacterIndexes = spec.checkedCheckboxIndexes
     }
 
     // Apply stored attributes
@@ -51,6 +53,8 @@ enum RenderApplicator {
     _ spec: RenderSpec,
     previousHidden: IndexSet,
     previousBullets: IndexSet,
+    previousUncheckedCheckboxes: IndexSet = IndexSet(),
+    previousCheckedCheckboxes: IndexSet = IndexSet(),
     to textView: NSTextView
   ) {
     guard let layoutManager = textView.layoutManager else { return }
@@ -62,11 +66,15 @@ enum RenderApplicator {
     if let glyphDelegate = layoutManager.delegate as? GlyphHidingLayoutManagerDelegate {
       glyphDelegate.hiddenCharacterIndexes = spec.hiddenIndexes
       glyphDelegate.bulletCharacterIndexes = spec.bulletIndexes
+      glyphDelegate.uncheckedCheckboxCharacterIndexes = spec.uncheckedCheckboxIndexes
+      glyphDelegate.checkedCheckboxCharacterIndexes = spec.checkedCheckboxIndexes
     }
 
     // Invalidate only the ranges that changed
     let allPrevious = previousHidden.union(previousBullets)
+      .union(previousUncheckedCheckboxes).union(previousCheckedCheckboxes)
     let allNew = spec.hiddenIndexes.union(spec.bulletIndexes)
+      .union(spec.uncheckedCheckboxIndexes).union(spec.checkedCheckboxIndexes)
     let changed = allPrevious.symmetricDifference(allNew)
 
     for range in changed.rangeView {
