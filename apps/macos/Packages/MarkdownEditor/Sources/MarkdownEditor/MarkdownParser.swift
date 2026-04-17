@@ -11,6 +11,10 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
   private var unorderedListDepth = 0
   /// Tracks nesting depth of ordered lists during traversal.
   private var orderedListDepth = 0
+  /// The widest marker text and its rendered width among items in the
+  /// current ordered list, so all items get consistent alignment.
+  private var currentOrderedListWidestMarker: String?
+  private var currentOrderedListWidestWidth: CGFloat = 0
 
   init(converter: SourceRangeConverter, style: MarkdownStyle = .default) {
     self.converter = converter
@@ -57,9 +61,42 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
   }
 
   mutating func visitOrderedList(_ orderedList: OrderedList) -> () {
+    // Find the widest marker among all items so every item in this list
+    // gets the same headIndent, preventing jagged content alignment.
+    let font = style.baseFont
+    var widestMarker = "1. "
+    var widestWidth: CGFloat = 0
+
+    for child in orderedList.children {
+      guard let item = child as? ListItem, let itemRange = item.range else { continue }
+      let itemStart = converter.utf16Offset(from: itemRange.lowerBound)
+      let markerLen: Int
+      if let firstChild = item.children.first(where: { $0.range != nil }),
+        let childRange = firstChild.range
+      {
+        markerLen = converter.utf16Offset(from: childRange.lowerBound) - itemStart
+      } else {
+        markerLen = 3
+      }
+      let markerRange = NSRange(location: itemStart, length: markerLen)
+      if let text = converter.substringForRange(markerRange) {
+        let width = (text as NSString).size(withAttributes: [.font: font]).width
+        if width > widestWidth {
+          widestWidth = width
+          widestMarker = text
+        }
+      }
+    }
+
+    let previousWidest = currentOrderedListWidestMarker
+    let previousWidth = currentOrderedListWidestWidth
+    currentOrderedListWidestMarker = widestMarker
+    currentOrderedListWidestWidth = widestWidth
     orderedListDepth += 1
     descendInto(orderedList)
     orderedListDepth -= 1
+    currentOrderedListWidestMarker = previousWidest
+    currentOrderedListWidestWidth = previousWidth
   }
 
   mutating func visitListItem(_ listItem: ListItem) -> () {
@@ -110,12 +147,22 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
           range: range,
           contentRange: contentRange,
           delimiterRanges: [delimiterRange],
-          attributes: style.listItemAttributes(indentLevel: indentLevel)
+          attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: "• ")
         ))
     } else {
       // Ordered list: leading whitespace is a delimiter (hidden when cursor
       // outside), but the number marker stays visible.
       let indentLevel = orderedListDepth
+
+      // Use the widest marker in this list so all items align consistently.
+      let widestMarkerText = currentOrderedListWidestMarker ?? "1. "
+
+      // Compute padding: difference between widest marker width and this item's marker width.
+      let font = style.baseFont
+      let thisMarkerRange = NSRange(location: range.location, length: markerLength)
+      let thisMarkerText = converter.substringForRange(thisMarkerRange) ?? "1. "
+      let thisWidth = (thisMarkerText as NSString).size(withAttributes: [.font: font]).width
+      let padding = max(0, currentOrderedListWidestWidth - thisWidth)
 
       var delimiterRanges: [NSRange] = []
       if leadingWhitespaceLength > 0 {
@@ -124,11 +171,11 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
 
       nodes.append(
         SyntaxNode(
-          type: .orderedListItem(indentLevel: indentLevel),
+          type: .orderedListItem(indentLevel: indentLevel, markerPadding: padding),
           range: range,
           contentRange: contentRange,
           delimiterRanges: delimiterRanges,
-          attributes: style.listItemAttributes(indentLevel: indentLevel)
+          attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: widestMarkerText)
         ))
     }
     descendInto(listItem)

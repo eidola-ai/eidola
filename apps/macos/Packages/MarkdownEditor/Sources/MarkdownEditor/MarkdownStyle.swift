@@ -32,11 +32,18 @@ struct MarkdownStyle {
   /// Indentation per nesting level for list items.
   var listIndent: CGFloat = 20
 
-  func listItemAttributes(indentLevel: Int) -> [NSAttributedString.Key: Any] {
+  /// Build list item attributes with `headIndent` matching the actual rendered
+  /// marker width so wrapped/continuation lines align with the content start.
+  ///
+  /// - `markerText`: The text that is actually displayed as the marker.
+  ///   For unordered items this is `"•"` (the bullet glyph that replaces `- `).
+  ///   For ordered items this is the full marker like `"1. "` or `"22. "`.
+  func listItemAttributes(indentLevel: Int, markerText: String = "•") -> [NSAttributedString.Key: Any] {
     let paragraphStyle = NSMutableParagraphStyle()
-    let indent = listIndent * CGFloat(indentLevel)
-    paragraphStyle.firstLineHeadIndent = indent
-    paragraphStyle.headIndent = indent
+    let bulletPosition = listIndent * CGFloat(indentLevel)
+    let markerWidth = (markerText as NSString).size(withAttributes: [.font: baseFont]).width
+    paragraphStyle.firstLineHeadIndent = bulletPosition
+    paragraphStyle.headIndent = bulletPosition + markerWidth
     paragraphStyle.paragraphSpacing = 2
     return [
       .font: baseFont,

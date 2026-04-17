@@ -18,5 +18,7 @@ enum SyntaxNodeType: Sendable {
   case strong
   case emphasis
   case unorderedListItem(indentLevel: Int)
-  case orderedListItem(indentLevel: Int)
+  /// - `markerPadding`: Extra kern to add after the marker so content aligns
+  ///   with the widest marker in this list. Zero if this IS the widest.
+  case orderedListItem(indentLevel: Int, markerPadding: CGFloat)
 }
