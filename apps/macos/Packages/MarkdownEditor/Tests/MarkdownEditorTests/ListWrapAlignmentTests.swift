@@ -96,6 +96,42 @@ struct ListWrapAlignmentTests {
     #expect(fm.fileExists(atPath: results[0].imagePath))
   }
 
+  // MARK: - Ordered list marker padding (single → double digit)
+
+  static let repeatingL = "LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL"
+
+  /// When an ordered list crosses from single-digit (1-9) to double-digit (10+),
+  /// shorter markers like "1. " must be padded so their content starts at the
+  /// same horizontal position as "10. " content. The "L" characters make
+  /// alignment easy to verify visually — all "L" columns should be vertically
+  /// aligned across every item.
+  ///
+  /// **Pass criteria:**
+  /// - The "L" in items 1-9 starts at the SAME horizontal position as the "L" in item 10
+  /// - Wrapped lines in ALL items align with the first-line content start
+  /// - There is NO visible jagged left edge in the content column
+  ///
+  /// **Fail criteria:**
+  /// - Items 1-9 have their "L" further left than item 10 (no padding applied)
+  /// - Wrapped lines start at a different position than first-line content
+  @Test("Ordered list single-to-double digit marker padding alignment")
+  func orderedListMarkerPadding() {
+    var lines: [String] = []
+    for i in 1...10 {
+      lines.append("\(i). \(Self.repeatingL)")
+    }
+    let markdown = lines.joined(separator: "\n")
+
+    let results = EditorTestHarness.run(
+      name: "ordered-marker-padding",
+      initial: EditorState(markdown: markdown, selection: .cursor(markdown.count)),
+      events: [],
+      size: NSSize(width: 600, height: 800))
+
+    let fm = FileManager.default
+    #expect(fm.fileExists(atPath: results[0].imagePath))
+  }
+
   // MARK: - Nested wrap regression (headings + 3 levels of both list types)
 
   static let nestedWrapMarkdown = """

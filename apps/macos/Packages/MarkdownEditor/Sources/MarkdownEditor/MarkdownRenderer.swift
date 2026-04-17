@@ -147,7 +147,7 @@ enum MarkdownRenderer {
           hiddenIndexes: &hiddenIndexes,
           temporaryAttributes: &temporaryAttributes)
 
-      case .orderedListItem:
+      case .orderedListItem(_, let markerPadding):
         // Ordered list items: number marker is always visible, but leading
         // whitespace (for nested items) is hidden when cursor is outside.
         let lineRange = nsText.lineRange(for: safeNodeRange)
@@ -170,6 +170,17 @@ enum MarkdownRenderer {
         if !node.attributes.isEmpty {
           styledRanges.append(
             RenderSpec.StyledRange(range: lineRange, attributes: node.attributes))
+        }
+
+        // Pad shorter markers so content aligns with the widest marker in
+        // this list. Apply kern to the last character of the marker (the space
+        // before content) to push content rightward.
+        if markerPadding > 0.5, safeContentRange.location > 0 {
+          let spaceIndex = safeContentRange.location - 1
+          styledRanges.append(
+            RenderSpec.StyledRange(
+              range: NSRange(location: spaceIndex, length: 1),
+              attributes: [.kern: markerPadding]))
         }
 
         // Leading whitespace is always hidden (paragraph style handles indentation).
