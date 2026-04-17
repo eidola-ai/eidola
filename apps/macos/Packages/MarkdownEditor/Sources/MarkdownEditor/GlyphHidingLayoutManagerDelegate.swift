@@ -15,6 +15,12 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
   /// Character indexes whose glyphs should be replaced with a bullet (•).
   var bulletCharacterIndexes = IndexSet()
 
+  /// Character indexes whose glyphs should be replaced with an unchecked checkbox (☐ U+2610).
+  var uncheckedCheckboxCharacterIndexes = IndexSet()
+
+  /// Character indexes whose glyphs should be replaced with a checked checkbox (☒ U+2612).
+  var checkedCheckboxCharacterIndexes = IndexSet()
+
   // MARK: - Glyph Generation
 
   func layoutManager(
@@ -32,7 +38,10 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
     var needsModification = false
     for i in 0..<count {
       let charIdx = charIndexes[i]
-      if hiddenCharacterIndexes.contains(charIdx) || bulletCharacterIndexes.contains(charIdx) {
+      if hiddenCharacterIndexes.contains(charIdx) || bulletCharacterIndexes.contains(charIdx)
+        || uncheckedCheckboxCharacterIndexes.contains(charIdx)
+        || checkedCheckboxCharacterIndexes.contains(charIdx)
+      {
         needsModification = true
         break
       }
@@ -55,6 +64,9 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
 
     // Look up bullet glyph lazily
     var bulletGlyph: CGGlyph?
+    // Look up checkbox glyphs lazily
+    var uncheckedCheckboxGlyph: CGGlyph?
+    var checkedCheckboxGlyph: CGGlyph?
 
     for i in 0..<count {
       let charIdx = charIndexes[i]
@@ -100,6 +112,28 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
         }
         newGlyphs[i] = bulletGlyph ?? glyphs[i]
         newProps[i] = props[i]
+      } else if uncheckedCheckboxCharacterIndexes.contains(charIdx) {
+        // Replace with unchecked checkbox glyph □ (U+25A1 WHITE SQUARE)
+        // Note: U+2610 BALLOT BOX is not in the macOS system font, so we use
+        // U+25A1 which is visually similar and available.
+        if uncheckedCheckboxGlyph == nil {
+          var checkboxChar: UniChar = 0x25A1  // □ WHITE SQUARE
+          var glyph: CGGlyph = 0
+          CTFontGetGlyphsForCharacters(aFont as CTFont, &checkboxChar, &glyph, 1)
+          uncheckedCheckboxGlyph = glyph
+        }
+        newGlyphs[i] = uncheckedCheckboxGlyph ?? glyphs[i]
+        newProps[i] = props[i]
+      } else if checkedCheckboxCharacterIndexes.contains(charIdx) {
+        // Replace with checked checkbox glyph ☒ (U+2612 BALLOT BOX WITH X)
+        if checkedCheckboxGlyph == nil {
+          var checkboxChar: UniChar = 0x2612  // ☒ BALLOT BOX WITH X
+          var glyph: CGGlyph = 0
+          CTFontGetGlyphsForCharacters(aFont as CTFont, &checkboxChar, &glyph, 1)
+          checkedCheckboxGlyph = glyph
+        }
+        newGlyphs[i] = checkedCheckboxGlyph ?? glyphs[i]
+        newProps[i] = props[i]
       } else {
         newGlyphs[i] = glyphs[i]
         newProps[i] = props[i]
@@ -113,4 +147,5 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
     )
     return count
   }
+
 }

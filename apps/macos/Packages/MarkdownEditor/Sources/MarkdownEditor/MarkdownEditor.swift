@@ -162,8 +162,12 @@ public struct MarkdownEditor: NSViewRepresentable {
       let spec = MarkdownRenderer.render(state: state.wrappedValue)
       let prevHidden = lastSpec?.hiddenIndexes ?? IndexSet()
       let prevBullets = lastSpec?.bulletIndexes ?? IndexSet()
+      let prevUncheckedCheckboxes = lastSpec?.uncheckedCheckboxIndexes ?? IndexSet()
+      let prevCheckedCheckboxes = lastSpec?.checkedCheckboxIndexes ?? IndexSet()
       RenderApplicator.applyCursorUpdate(
-        spec, previousHidden: prevHidden, previousBullets: prevBullets, to: textView)
+        spec, previousHidden: prevHidden, previousBullets: prevBullets,
+        previousUncheckedCheckboxes: prevUncheckedCheckboxes,
+        previousCheckedCheckboxes: prevCheckedCheckboxes, to: textView)
       lastSpec = spec
       isProcessingEvent = false
     }

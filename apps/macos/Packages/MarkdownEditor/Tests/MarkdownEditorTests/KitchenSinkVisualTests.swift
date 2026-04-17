@@ -12,7 +12,7 @@ struct KitchenSinkVisualTests {
 
   // The kitchen sink document exercises headings (h1, h2, h3), body text,
   // bold, italic, bold-italic, bold inside a heading, unordered lists,
-  // and ordered lists.
+  // and ordered lists, and checkbox list items.
   static let kitchenSinkMarkdown = """
     # Main Heading
 
@@ -35,6 +35,10 @@ struct KitchenSinkVisualTests {
     1. First ordered
     2. Second ordered
     3. Third with **bold**
+
+    - [ ] Unchecked task
+    - [x] Completed task
+    - [ ] Another **bold** task
     """
 
   /// Named cursor positions for clarity in artifacts.
@@ -237,6 +241,39 @@ struct KitchenSinkVisualTests {
       name: "ordered-all-outside",
       offset: bodyStart + 3,
       description: "Cursor in body -- all ordered list markers visible (no bullets)"))
+
+    // 28. Inside unchecked checkbox item
+    let uncheckedItem = offsetOf("- [ ] Unchecked task")
+    positions.append(CursorPosition(
+      name: "checkbox-unchecked-inside",
+      offset: uncheckedItem + 10,
+      description: "Inside unchecked checkbox item -- full '- [ ] ' prefix visible and dimmed"))
+
+    // 29. Inside checked checkbox item
+    let checkedItem = offsetOf("- [x] Completed task")
+    positions.append(CursorPosition(
+      name: "checkbox-checked-inside",
+      offset: checkedItem + 10,
+      description: "Inside checked checkbox item -- full '- [x] ' prefix visible and dimmed"))
+
+    // 30. Inside checkbox item with bold
+    let boldCheckbox = offsetOf("- [ ] Another **bold** task")
+    positions.append(CursorPosition(
+      name: "checkbox-bold-inside",
+      offset: boldCheckbox + 10,
+      description: "Inside checkbox item with bold -- both checkbox prefix and ** visible"))
+
+    // 31. At start of checkbox marker
+    positions.append(CursorPosition(
+      name: "checkbox-at-marker-start",
+      offset: uncheckedItem,
+      description: "Cursor at start of checkbox marker -- prefix visible (cursor at node start)"))
+
+    // 32. Cursor in body -- all checkbox items show checkbox glyphs
+    positions.append(CursorPosition(
+      name: "checkbox-all-outside",
+      offset: bodyStart + 7,
+      description: "Cursor in body -- all checkbox items show checkbox glyphs"))
 
     return positions
   }

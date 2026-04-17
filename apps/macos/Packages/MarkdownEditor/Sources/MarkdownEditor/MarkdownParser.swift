@@ -7,10 +7,8 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
   private let converter: SourceRangeConverter
   private let style: MarkdownStyle
   private(set) var nodes: [SyntaxNode] = []
-  /// Tracks nesting depth of unordered lists during traversal.
-  private var unorderedListDepth = 0
-  /// Tracks nesting depth of ordered lists during traversal.
-  private var orderedListDepth = 0
+  /// Tracks total nesting depth across all list types during traversal.
+  private var listDepth = 0
   /// The widest marker text and its rendered width among items in the
   /// current ordered list, so all items get consistent alignment.
   private var currentOrderedListWidestMarker: String?
@@ -55,9 +53,9 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
   }
 
   mutating func visitUnorderedList(_ unorderedList: UnorderedList) -> () {
-    unorderedListDepth += 1
+    listDepth += 1
     descendInto(unorderedList)
-    unorderedListDepth -= 1
+    listDepth -= 1
   }
 
   mutating func visitOrderedList(_ orderedList: OrderedList) -> () {
@@ -92,9 +90,9 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
     let previousWidth = currentOrderedListWidestWidth
     currentOrderedListWidestMarker = widestMarker
     currentOrderedListWidestWidth = widestWidth
-    orderedListDepth += 1
+    listDepth += 1
     descendInto(orderedList)
-    orderedListDepth -= 1
+    listDepth -= 1
     currentOrderedListWidestMarker = previousWidest
     currentOrderedListWidestWidth = previousWidth
   }
@@ -139,20 +137,38 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
     if isUnordered {
       // Delimiter includes leading whitespace + marker ("    - ")
       let delimiterRange = NSRange(location: lineStart, length: leadingWhitespaceLength + markerLength)
-      let indentLevel = unorderedListDepth
+      let indentLevel = listDepth
 
-      nodes.append(
-        SyntaxNode(
-          type: .unorderedListItem(indentLevel: indentLevel),
-          range: range,
-          contentRange: contentRange,
-          delimiterRanges: [delimiterRange],
-          attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: "• ")
-        ))
+      // Check for checkbox list item: ListItem.checkbox is set by swift-markdown.
+      // When a checkbox is present, swift-markdown's first child starts AFTER the
+      // full "- [ ] " prefix, so markerLength already includes the checkbox text.
+      // The delimiter range (leading whitespace + markerLength) covers everything.
+      if let checkbox = listItem.checkbox {
+        let isChecked = checkbox == .checked
+        let markerText = isChecked ? "\u{2612} " : "\u{25A1} "
+
+        nodes.append(
+          SyntaxNode(
+            type: .checkboxListItem(checked: isChecked, indentLevel: indentLevel),
+            range: range,
+            contentRange: contentRange,
+            delimiterRanges: [delimiterRange],
+            attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: markerText)
+          ))
+      } else {
+        nodes.append(
+          SyntaxNode(
+            type: .unorderedListItem(indentLevel: indentLevel),
+            range: range,
+            contentRange: contentRange,
+            delimiterRanges: [delimiterRange],
+            attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: "• ")
+          ))
+      }
     } else {
       // Ordered list: leading whitespace is a delimiter (hidden when cursor
       // outside), but the number marker stays visible.
-      let indentLevel = orderedListDepth
+      let indentLevel = listDepth
 
       // Use the widest marker in this list so all items align consistently.
       let widestMarkerText = currentOrderedListWidestMarker ?? "1. "

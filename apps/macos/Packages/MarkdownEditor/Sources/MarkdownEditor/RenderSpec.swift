@@ -22,6 +22,12 @@ struct RenderSpec {
   /// Characters whose glyphs should be replaced with a bullet (•).
   let bulletIndexes: IndexSet
 
+  /// Characters whose glyphs should be replaced with an unchecked checkbox (☐ U+2610).
+  let uncheckedCheckboxIndexes: IndexSet
+
+  /// Characters whose glyphs should be replaced with a checked checkbox (☒ U+2612).
+  let checkedCheckboxIndexes: IndexSet
+
   /// Rendering-only attributes (e.g., dimmed delimiter color when cursor is inside a construct).
   /// Applied via `NSLayoutManager.addTemporaryAttributes` — they don't affect the text storage.
   let temporaryAttributes: [StyledRange]
@@ -40,6 +46,8 @@ struct RenderSpec {
   func matches(_ other: RenderSpec) -> Bool {
     guard hiddenIndexes == other.hiddenIndexes,
       bulletIndexes == other.bulletIndexes,
+      uncheckedCheckboxIndexes == other.uncheckedCheckboxIndexes,
+      checkedCheckboxIndexes == other.checkedCheckboxIndexes,
       styledRanges.count == other.styledRanges.count,
       fontTraits.count == other.fontTraits.count,
       temporaryAttributes.count == other.temporaryAttributes.count
