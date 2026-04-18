@@ -17,7 +17,7 @@ enum MarkdownTextViewFactory {
 
   static func create(size: NSSize = NSSize(width: 600, height: 400)) -> Components {
     let textStorage = NSTextStorage()
-    let layoutManager = NSLayoutManager()
+    let layoutManager = CodeBlockBackgroundLayoutManager()
     let glyphDelegate = GlyphHidingLayoutManagerDelegate()
     layoutManager.delegate = glyphDelegate
     layoutManager.allowsNonContiguousLayout = true

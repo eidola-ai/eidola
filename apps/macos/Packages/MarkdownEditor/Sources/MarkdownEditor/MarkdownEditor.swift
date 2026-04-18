@@ -64,8 +64,19 @@ public struct MarkdownEditor: NSViewRepresentable {
       textView.textContainer?.containerSize = NSSize(
         width: 0, height: CGFloat.greatestFiniteMagnitude)
 
-      textView.layoutManager?.delegate = glyphDelegate
-      textView.layoutManager?.allowsNonContiguousLayout = true
+      // Replace the default NSLayoutManager with our custom subclass that
+      // draws full-width backgrounds for code blocks.
+      if let textContainer = textView.textContainer,
+        let textStorage = textView.textStorage,
+        let oldLayoutManager = textView.layoutManager
+      {
+        textStorage.removeLayoutManager(oldLayoutManager)
+        let codeBlockLM = CodeBlockBackgroundLayoutManager()
+        codeBlockLM.delegate = glyphDelegate
+        codeBlockLM.allowsNonContiguousLayout = true
+        codeBlockLM.addTextContainer(textContainer)
+        textStorage.addLayoutManager(codeBlockLM)
+      }
     }
 
     /// Apply editor state to the text view (full sync).

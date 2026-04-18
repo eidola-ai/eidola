@@ -33,7 +33,8 @@ enum MarkdownRenderer {
         bulletIndexes: IndexSet(),
         uncheckedCheckboxIndexes: IndexSet(),
         checkedCheckboxIndexes: IndexSet(),
-        temporaryAttributes: []
+        temporaryAttributes: [],
+        codeBlockCharacterRanges: []
       )
     }
 
@@ -65,6 +66,7 @@ enum MarkdownRenderer {
     var uncheckedCheckboxIndexes = IndexSet()
     var checkedCheckboxIndexes = IndexSet()
     var temporaryAttributes: [RenderSpec.StyledRange] = []
+    var codeBlockCharacterRanges: [NSRange] = []
 
     for node in nodes {
       let safeContentRange = clamp(node.contentRange, to: textLength)
@@ -357,6 +359,39 @@ enum MarkdownRenderer {
           hiddenIndexes: &hiddenIndexes,
           temporaryAttributes: &temporaryAttributes)
 
+      case .codeBlock:
+        // Code block: the entire multi-line block is the construct.
+        // Cursor anywhere within reveals the fences; cursor outside hides them.
+        // Use the full node range (including fences) for cursor detection.
+        let cursorInNode = cursorOverlaps(
+          cursorRange, node: safeNodeRange, textLength: textLength)
+
+        // Apply code attributes (font, paragraph style) to the FULL node
+        // range — including fence lines. This is critical because when fences
+        // are hidden, TextKit collapses paragraphs and uses the paragraph
+        // style from the first character of the merged paragraph. Without
+        // this, the hidden fence characters would have the base paragraph
+        // style (no indent), causing misaligned content.
+        if safeNodeRange.length > 0, !node.attributes.isEmpty {
+          styledRanges.append(
+            RenderSpec.StyledRange(range: safeNodeRange, attributes: node.attributes))
+        }
+
+        // Record the code block range for full-width background drawing
+        // by CodeBlockBackgroundLayoutManager.
+        if safeNodeRange.length > 0 {
+          codeBlockCharacterRanges.append(safeNodeRange)
+        }
+
+        // Delimiter visibility (hidden vs revealed)
+        applyDelimiterVisibility(
+          delimiterRanges: node.delimiterRanges,
+          cursorInNode: cursorInNode,
+          textLength: textLength,
+          style: style,
+          hiddenIndexes: &hiddenIndexes,
+          temporaryAttributes: &temporaryAttributes)
+
       case .unorderedListItem:
         // Extend to line range for cursor detection (same pattern as headings).
         let lineRange = nsText.lineRange(for: safeNodeRange)
@@ -445,7 +480,8 @@ enum MarkdownRenderer {
       bulletIndexes: bulletIndexes,
       uncheckedCheckboxIndexes: uncheckedCheckboxIndexes,
       checkedCheckboxIndexes: checkedCheckboxIndexes,
-      temporaryAttributes: temporaryAttributes
+      temporaryAttributes: temporaryAttributes,
+      codeBlockCharacterRanges: codeBlockCharacterRanges
     )
   }
 

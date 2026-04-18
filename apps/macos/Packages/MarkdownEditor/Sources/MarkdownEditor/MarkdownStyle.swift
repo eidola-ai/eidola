@@ -65,6 +65,26 @@ struct MarkdownStyle {
     ]
   }
 
+  // MARK: - Code Blocks
+
+  var codeBlockAttributes: [NSAttributedString.Key: Any] {
+    let paragraphStyle = NSMutableParagraphStyle()
+    paragraphStyle.headIndent = 12
+    paragraphStyle.firstLineHeadIndent = 12
+    // Negative tailIndent extends the paragraph to the right margin.
+    paragraphStyle.tailIndent = -12
+    paragraphStyle.paragraphSpacing = 2
+    paragraphStyle.paragraphSpacingBefore = 2
+    // Note: .backgroundColor is NOT set here. Full-width code block backgrounds
+    // are drawn by CodeBlockBackgroundLayoutManager, which uses the line fragment
+    // rect (full container width) instead of the glyph extent. This ensures
+    // hidden fence lines get the same background as content lines.
+    return [
+      .font: codeFont,
+      .paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle,
+    ]
+  }
+
   // MARK: - Links
 
   var linkColor: NSColor { .linkColor }
