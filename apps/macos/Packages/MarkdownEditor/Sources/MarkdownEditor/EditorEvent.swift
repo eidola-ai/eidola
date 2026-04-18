@@ -32,6 +32,18 @@ public enum EditorEvent: Sendable, Equatable {
   /// Paste text, replacing the current selection if any.
   case paste(String)
 
+  /// Delete from cursor to beginning of the line.
+  case deleteToBeginningOfLine
+
+  /// Delete from cursor to end of the line.
+  case deleteToEndOfLine
+
+  /// Delete the word before the cursor.
+  case deleteWordBackward
+
+  /// Delete the word after the cursor.
+  case deleteWordForward
+
   /// Indent the current line (Tab key). In list context, increases nesting.
   case indent
 
