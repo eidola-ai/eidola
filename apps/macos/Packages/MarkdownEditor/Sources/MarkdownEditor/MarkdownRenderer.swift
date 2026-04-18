@@ -185,6 +185,25 @@ enum MarkdownRenderer {
           hiddenIndexes: &hiddenIndexes,
           temporaryAttributes: &temporaryAttributes)
 
+      case .strikethrough:
+        let cursorInNode = cursorOverlaps(
+          cursorRange, node: safeNodeRange, textLength: textLength)
+
+        // Apply strikethrough attribute to content range
+        if safeContentRange.length > 0, !node.attributes.isEmpty {
+          styledRanges.append(
+            RenderSpec.StyledRange(range: safeContentRange, attributes: node.attributes))
+        }
+
+        // Delimiter visibility
+        applyDelimiterVisibility(
+          delimiterRanges: node.delimiterRanges,
+          cursorInNode: cursorInNode,
+          textLength: textLength,
+          style: style,
+          hiddenIndexes: &hiddenIndexes,
+          temporaryAttributes: &temporaryAttributes)
+
       case .orderedListItem(_, let markerPadding):
         // Ordered list items: number marker is always visible, but leading
         // whitespace (for nested items) is hidden when cursor is outside.
