@@ -272,6 +272,24 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
     descendInto(listItem)
   }
 
+  mutating func visitThematicBreak(_ thematicBreak: ThematicBreak) -> () {
+    guard let sourceRange = thematicBreak.range else { return }
+    let range = converter.nsRange(from: sourceRange)
+    guard range.length > 0 else { return }
+
+    // The entire thematic break (e.g. `---`, `***`, `___`) is both the delimiter
+    // and the content — there is no separate content. We treat the full range as
+    // the delimiter range so it can be hidden/revealed based on cursor position.
+    nodes.append(
+      SyntaxNode(
+        type: .thematicBreak,
+        range: range,
+        contentRange: range,
+        delimiterRanges: [range],
+        attributes: style.thematicBreakAttributes
+      ))
+  }
+
   mutating func visitCodeBlock(_ codeBlock: CodeBlock) -> () {
     guard let sourceRange = codeBlock.range else { return }
     let range = converter.nsRange(from: sourceRange)

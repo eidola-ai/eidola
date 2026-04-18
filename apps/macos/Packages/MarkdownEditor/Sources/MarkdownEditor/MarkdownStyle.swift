@@ -100,6 +100,20 @@ struct MarkdownStyle {
     return attrs
   }
 
+  // MARK: - Thematic Breaks
+
+  var thematicBreakColor: NSColor { .separatorColor }
+
+  /// Attributes for thematic break when cursor is outside: transparent text + thick strikethrough.
+  /// This creates a horizontal line effect without custom drawing.
+  var thematicBreakAttributes: [NSAttributedString.Key: Any] {
+    [
+      .foregroundColor: NSColor.clear,
+      .strikethroughStyle: NSUnderlineStyle.thick.rawValue,
+      .strikethroughColor: thematicBreakColor,
+    ]
+  }
+
   // MARK: - Blockquotes
 
   var blockquoteIndent: CGFloat = 20

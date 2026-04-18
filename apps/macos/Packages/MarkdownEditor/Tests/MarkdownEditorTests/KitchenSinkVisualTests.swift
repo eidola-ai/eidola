@@ -51,6 +51,8 @@ struct KitchenSinkVisualTests {
     print(x)
     ```
 
+    ---
+
     > A simple blockquote
     > with **bold** inside
     """
@@ -383,27 +385,52 @@ struct KitchenSinkVisualTests {
       offset: codeBlockFence - 1,
       description: "Just before code block -- fences hidden, code content in monospace"))
 
-    // 47. Inside blockquote content
+    // 47. On the thematic break (---)
+    let hrStart = offsetOf("---")
+    positions.append(CursorPosition(
+      name: "thematic-break-inside",
+      offset: hrStart + 1,
+      description: "Inside thematic break --- -- raw text visible and dimmed"))
+
+    // 48. At start of thematic break
+    positions.append(CursorPosition(
+      name: "thematic-break-at-start",
+      offset: hrStart,
+      description: "At start of thematic break -- raw text visible (cursor at node start)"))
+
+    // 49. At end of thematic break
+    positions.append(CursorPosition(
+      name: "thematic-break-at-end",
+      offset: hrStart + 3,
+      description: "At end of thematic break -- raw text visible (cursor at node end)"))
+
+    // 50. Just before thematic break (on blank line)
+    positions.append(CursorPosition(
+      name: "thematic-break-before",
+      offset: hrStart - 1,
+      description: "Just before thematic break -- horizontal line visible (transparent text + strikethrough)"))
+
+    // 51. Inside blockquote content
     let blockquoteStart = offsetOf("> A simple blockquote")
     positions.append(CursorPosition(
       name: "blockquote-inside",
       offset: blockquoteStart + 5,
       description: "Inside blockquote content -- > prefix visible and dimmed"))
 
-    // 48. At start of blockquote (on > character)
+    // 52. At start of blockquote (on > character)
     positions.append(CursorPosition(
       name: "blockquote-at-start",
       offset: blockquoteStart,
       description: "At > of blockquote -- prefix visible (cursor at node start)"))
 
-    // 49. Inside blockquote second line with bold
+    // 53. Inside blockquote second line with bold
     let blockquoteBold = offsetOf("> with **bold** inside")
     positions.append(CursorPosition(
       name: "blockquote-bold-inside",
       offset: blockquoteBold + 5,
       description: "Inside second blockquote line -- > and ** visible and dimmed"))
 
-    // 50. Cursor in body -- blockquote > prefixes should be hidden
+    // 54. Cursor in body -- blockquote > prefixes should be hidden
     positions.append(CursorPosition(
       name: "blockquote-all-outside",
       offset: bodyStart + 2,
