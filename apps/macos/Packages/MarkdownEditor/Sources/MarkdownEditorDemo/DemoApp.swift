@@ -10,17 +10,51 @@ struct DemoApp: App {
     markdown: """
       # Welcome to MarkdownEditor
 
-      This is a simple markdown editor with WYSIWYG heading support.
+      A WYSIWYG markdown editor where formatting is visible inline. Click on any formatted text to reveal the underlying markdown syntax.
 
-      ## Getting Started
+      ## Text Formatting
 
-      Type some text here. Headings use the # prefix.
+      This is **bold text**, *italic text*, ***bold and italic***, ~~strikethrough~~, and `inline code`.
 
-      ### Features
+      ## Links & Images
 
-      Plain text editing and heading rendering are supported so far.
+      Here's a [link to Apple](https://apple.com) and an ![image alt](https://example.com/image.png) reference.
 
-      *This text is italic* and **this text is bold**. But ***this text is both*** — who would have thought!?
+      ## Lists
+
+      Unordered lists use bullet markers:
+
+      - First item
+      - Second item with **bold** inside
+      - Third item
+
+      Ordered lists auto-number:
+
+      1. First ordered
+      2. Second ordered
+      3. Third ordered
+
+      Task lists use checkboxes:
+
+      - [ ] Unchecked task
+      - [x] Completed task
+      - [ ] Another task
+
+      ## Code Blocks
+
+      ```swift
+      let greeting = "Hello, world!"
+      print(greeting)
+      ```
+
+      ## Blockquotes
+
+      > This is a blockquote that can span
+      > multiple lines with the `>` prefix.
+
+      ---
+
+      That's a horizontal rule above. Try editing any of these elements!
       """)
 
   var body: some Scene {

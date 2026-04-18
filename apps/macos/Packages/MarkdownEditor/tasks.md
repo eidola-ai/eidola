@@ -1,0 +1,5 @@
+- [ ] Add support for inline code spans and hyperlinks
+- [ ] Add support for code blocks. We need not worry about syntax highlighting yet, but we should support syntax specification
+- [ ] Add support for blockquotes
+- [ ] Add support for horizontal rules
+- [ ] Add support for images

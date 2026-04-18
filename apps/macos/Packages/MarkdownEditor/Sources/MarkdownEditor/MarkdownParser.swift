@@ -504,6 +504,39 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
     descendInto(image)
   }
 
+  mutating func visitStrikethrough(_ strikethrough: Strikethrough) -> () {
+    guard let sourceRange = strikethrough.range else { return descendInto(strikethrough) }
+    let range = converter.nsRange(from: sourceRange)
+
+    // Strikethrough uses ~~ (2 chars) or ~ (1 char) as delimiters.
+    // Detect actual width from the first child's position.
+    let delimiterWidth: Int
+    if let firstChild = strikethrough.children.first(where: { $0.range != nil }),
+      let childRange = firstChild.range
+    {
+      delimiterWidth = converter.utf16Offset(from: childRange.lowerBound) - range.location
+    } else {
+      delimiterWidth = 2  // fallback
+    }
+    let contentRange = NSRange(
+      location: range.location + delimiterWidth,
+      length: max(0, range.length - delimiterWidth * 2))
+    let delimiterRanges = [
+      NSRange(location: range.location, length: delimiterWidth),
+      NSRange(location: range.location + range.length - delimiterWidth, length: delimiterWidth),
+    ]
+
+    nodes.append(
+      SyntaxNode(
+        type: .strikethrough,
+        range: range,
+        contentRange: contentRange,
+        delimiterRanges: delimiterRanges,
+        attributes: style.strikethroughAttributes
+      ))
+    descendInto(strikethrough)
+  }
+
   mutating func visitEmphasis(_ emphasis: Emphasis) -> () {
     guard let sourceRange = emphasis.range else { return descendInto(emphasis) }
     let range = converter.nsRange(from: sourceRange)

@@ -40,6 +40,8 @@ struct KitchenSinkVisualTests {
     - [x] Completed task
     - [ ] Another **bold** task
 
+    Some ~~struck through~~ text in a paragraph.
+
     Some `inline code` in a paragraph.
 
     A [link to example](https://example.com) in text.
@@ -293,7 +295,27 @@ struct KitchenSinkVisualTests {
       offset: bodyStart + 7,
       description: "Cursor in body -- all checkbox items show checkbox glyphs"))
 
-    // 33. Inside inline code content
+    // 33. Inside strikethrough content
+    let strikethroughStart = offsetOf("~~struck through~~")
+    positions.append(CursorPosition(
+      name: "strikethrough-inside",
+      offset: strikethroughStart + 5,
+      description: "Inside strikethrough content -- ~~ delimiters visible and dimmed, strikethrough line on text"))
+
+    // 34. Just before opening ~~ of strikethrough
+    positions.append(CursorPosition(
+      name: "strikethrough-before",
+      offset: strikethroughStart - 1,
+      description: "Just before strikethrough -- ~~ delimiters hidden, text has strikethrough line"))
+
+    // 35. Just after closing ~~ of strikethrough
+    let strikethroughEnd = strikethroughStart + ("~~struck through~~" as NSString).length
+    positions.append(CursorPosition(
+      name: "strikethrough-after",
+      offset: strikethroughEnd,
+      description: "Just after strikethrough closing ~~ -- delimiters may be visible"))
+
+    // 36. Inside inline code content
     let inlineCodeStart = offsetOf("`inline code`")
     positions.append(CursorPosition(
       name: "inline-code-inside",

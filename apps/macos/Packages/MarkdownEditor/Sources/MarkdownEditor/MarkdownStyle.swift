@@ -52,6 +52,14 @@ struct MarkdownStyle {
     ]
   }
 
+  // MARK: - Strikethrough
+
+  var strikethroughAttributes: [NSAttributedString.Key: Any] {
+    [
+      .strikethroughStyle: NSUnderlineStyle.single.rawValue
+    ]
+  }
+
   // MARK: - Inline Code
 
   var codeFontSize: CGFloat { baseFontSize - 1.5 }
