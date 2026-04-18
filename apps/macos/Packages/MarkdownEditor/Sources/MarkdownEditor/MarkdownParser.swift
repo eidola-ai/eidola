@@ -256,6 +256,80 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
     descendInto(strong)
   }
 
+  mutating func visitInlineCode(_ inlineCode: InlineCode) -> () {
+    guard let sourceRange = inlineCode.range else { return }
+    let range = converter.nsRange(from: sourceRange)
+
+    // Inline code uses backtick delimiters (1 char each side for single backtick).
+    let delimiterWidth = 1
+    let contentRange = NSRange(
+      location: range.location + delimiterWidth,
+      length: max(0, range.length - delimiterWidth * 2))
+    let delimiterRanges = [
+      NSRange(location: range.location, length: delimiterWidth),
+      NSRange(location: range.location + range.length - delimiterWidth, length: delimiterWidth),
+    ]
+
+    nodes.append(
+      SyntaxNode(
+        type: .inlineCode,
+        range: range,
+        contentRange: contentRange,
+        delimiterRanges: delimiterRanges,
+        attributes: style.inlineCodeAttributes
+      ))
+  }
+
+  mutating func visitLink(_ link: Markdown.Link) -> () {
+    guard let sourceRange = link.range else { return descendInto(link) }
+    let range = converter.nsRange(from: sourceRange)
+
+    // Link syntax: [text](url)
+    // Opening delimiter: `[` (1 char)
+    // Content: the link text between `[` and `]`
+    // Closing delimiter: `](url)` - everything from `]` to the end of the range
+    let openingDelimiterRange = NSRange(location: range.location, length: 1)
+
+    // Find the `]` position by looking at the first child's range or calculating
+    // from the link text length. The content is between `[` and `]`.
+    let contentStart = range.location + 1
+
+    // To find where the content ends (where `]` is), we look at the raw text.
+    // The link text content ends where `](` begins.
+    let fullText = converter.substringForRange(range) ?? ""
+    let closingBracketOffset: Int
+    // Search for `](` from the end, backwards, to handle nested brackets
+    if let bracketParenRange = fullText.range(of: "](", options: .backwards) {
+      closingBracketOffset = fullText.distance(from: fullText.startIndex, to: bracketParenRange.lowerBound)
+    } else {
+      // Fallback: content is everything except first and last char
+      closingBracketOffset = max(1, range.length - 1)
+    }
+
+    let contentLength = max(0, closingBracketOffset - 1)
+    let contentRange = NSRange(location: contentStart, length: contentLength)
+
+    // Closing delimiter: from `]` to end of range (covers `](url)`)
+    let closingDelimiterStart = range.location + closingBracketOffset
+    let closingDelimiterLength = range.length - closingBracketOffset
+    let closingDelimiterRange = NSRange(
+      location: closingDelimiterStart, length: closingDelimiterLength)
+
+    let delimiterRanges = [openingDelimiterRange, closingDelimiterRange]
+
+    let destination = link.destination
+
+    nodes.append(
+      SyntaxNode(
+        type: .link(destination: destination),
+        range: range,
+        contentRange: contentRange,
+        delimiterRanges: delimiterRanges,
+        attributes: style.linkAttributes(destination: destination)
+      ))
+    descendInto(link)
+  }
+
   mutating func visitEmphasis(_ emphasis: Emphasis) -> () {
     guard let sourceRange = emphasis.range else { return descendInto(emphasis) }
     let range = converter.nsRange(from: sourceRange)
