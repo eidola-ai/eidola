@@ -72,6 +72,38 @@ enum MarkdownRenderer {
 
       switch node.type {
       case .heading:
+        // Detect setext headings: content starts at node start (no `# ` prefix),
+        // delimiter is the underline on the next line.
+        let isSetext = safeContentRange.location == safeNodeRange.location
+          && !node.delimiterRanges.isEmpty
+
+        // For setext headings with a single `-` underline, suppress heading
+        // styling when the cursor is on/after the underline. A single `-` is
+        // ambiguous (could be the start of a list item), so we don't want the
+        // jarring visual change to heading font while the user is typing.
+        // Two or more dashes (`--`) are unambiguous and DO get heading styling.
+        if isSetext, let delim = node.delimiterRanges.first {
+          let safeDelim = clamp(delim, to: textLength)
+          // The delimiter includes the \n + underline chars. Extract just the
+          // underline text (after the \n), trimming whitespace.
+          let delimText = nsText.substring(with: safeDelim)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+          let isSingleDash = delimText == "-"
+
+          if isSingleDash {
+            // Check if cursor is on the underline line
+            let underlineLineRange = nsText.lineRange(
+              for: NSRange(location: safeDelim.location + safeDelim.length - 1, length: 0))
+            let cursorOnUnderline = cursorRange.location >= underlineLineRange.location
+              && cursorRange.location <= underlineLineRange.location + underlineLineRange.length
+
+            if cursorOnUnderline {
+              // Skip heading styling entirely — render as plain text
+              break
+            }
+          }
+        }
+
         // Extend the node range to cover the full line content (excluding trailing
         // newline) for both cursor overlap detection and styling. The parser may not
         // include trailing whitespace in the node range, but the cursor sitting after
