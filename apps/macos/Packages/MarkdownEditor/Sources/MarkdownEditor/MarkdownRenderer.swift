@@ -359,6 +359,31 @@ enum MarkdownRenderer {
           hiddenIndexes: &hiddenIndexes,
           temporaryAttributes: &temporaryAttributes)
 
+      case .image:
+        let cursorInNode = cursorOverlaps(
+          cursorRange, node: safeNodeRange, textLength: textLength)
+
+        // Apply image attributes (secondary color) to content range
+        if safeContentRange.length > 0, !node.attributes.isEmpty {
+          styledRanges.append(
+            RenderSpec.StyledRange(range: safeContentRange, attributes: node.attributes))
+        }
+
+        // Apply italic trait to content range
+        if safeContentRange.length > 0 {
+          fontTraits.append(
+            RenderSpec.TraitApplication(range: safeContentRange, trait: .italicFontMask))
+        }
+
+        // Delimiter visibility
+        applyDelimiterVisibility(
+          delimiterRanges: node.delimiterRanges,
+          cursorInNode: cursorInNode,
+          textLength: textLength,
+          style: style,
+          hiddenIndexes: &hiddenIndexes,
+          temporaryAttributes: &temporaryAttributes)
+
       case .codeBlock:
         // Code block: the entire multi-line block is the construct.
         // Cursor anywhere within reveals the fences; cursor outside hides them.

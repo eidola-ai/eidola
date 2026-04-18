@@ -12,7 +12,7 @@ struct KitchenSinkVisualTests {
 
   // The kitchen sink document exercises headings (h1, h2, h3), body text,
   // bold, italic, bold-italic, bold inside a heading, unordered lists,
-  // ordered lists, checkbox list items, inline code, links, and blockquotes.
+  // ordered lists, checkbox list items, inline code, links, images, and blockquotes.
   static let kitchenSinkMarkdown = """
     # Main Heading
 
@@ -43,6 +43,8 @@ struct KitchenSinkVisualTests {
     Some `inline code` in a paragraph.
 
     A [link to example](https://example.com) in text.
+
+    An ![image alt](https://example.com/img.png) in text.
 
     Code and links: `foo` and [bar](https://bar.com).
 
@@ -344,93 +346,120 @@ struct KitchenSinkVisualTests {
       offset: linkEnd,
       description: "Just after link closing ) -- delimiters may be visible"))
 
-    // 41. Inside inline code on the last line (with both code and link)
+    // 41. Inside image alt text
+    let imageStart = offsetOf("![image alt]")
+    positions.append(CursorPosition(
+      name: "image-inside-alt",
+      offset: imageStart + 5,
+      description: "Inside image alt text -- ![ and ](url) delimiters visible and dimmed, italic"))
+
+    // 42. Just before opening ![ of image
+    positions.append(CursorPosition(
+      name: "image-before",
+      offset: imageStart - 1,
+      description: "Just before image -- delimiters hidden, only alt text visible in secondary color"))
+
+    // 43. On the URL portion of the image
+    let imageUrlStart = offsetOf("(https://example.com/img.png)")
+    positions.append(CursorPosition(
+      name: "image-on-url",
+      offset: imageUrlStart + 5,
+      description: "On URL portion of image -- all delimiters visible"))
+
+    // 44. Just after closing ) of image
+    let imageEnd = imageUrlStart + ("(https://example.com/img.png)" as NSString).length
+    positions.append(CursorPosition(
+      name: "image-after",
+      offset: imageEnd,
+      description: "Just after image closing ) -- delimiters may be visible"))
+
+    // 45. Inside inline code on the last line (with both code and link)
     let fooCode = offsetOf("`foo`")
     positions.append(CursorPosition(
       name: "mixed-line-code-inside",
       offset: fooCode + 2,
       description: "Inside `foo` inline code on mixed line -- backticks visible, link delimiters hidden"))
 
-    // 42. Inside link on the last line
+    // 46. Inside link on the last line
     let barLink = offsetOf("[bar]")
     positions.append(CursorPosition(
       name: "mixed-line-link-inside",
       offset: barLink + 2,
       description: "Inside [bar] link on mixed line -- link delimiters visible, code backticks hidden"))
 
-    // 43. On opening fence of code block
+    // 47. On opening fence of code block
     let codeBlockFence = offsetOf("```swift")
     positions.append(CursorPosition(
       name: "code-block-opening-fence",
       offset: codeBlockFence,
       description: "At opening fence of code block -- fences visible and dimmed"))
 
-    // 44. Inside code block content (on "let x = 42")
+    // 48. Inside code block content (on "let x = 42")
     let codeBlockContent = offsetOf("let x = 42")
     positions.append(CursorPosition(
       name: "code-block-content-inside",
       offset: codeBlockContent + 5,
       description: "Inside code block content -- fences visible and dimmed, monospace font"))
 
-    // 45. On closing fence of code block (the last ``` in the document)
+    // 49. On closing fence of code block (the last ``` in the document)
     let lastClosingFence = ns.range(of: "```", options: .backwards)
     positions.append(CursorPosition(
       name: "code-block-closing-fence",
       offset: lastClosingFence.location + 1,
       description: "On closing fence of code block -- fences visible and dimmed"))
 
-    // 46. Just before code block (on blank line before it)
+    // 50. Just before code block (on blank line before it)
     positions.append(CursorPosition(
       name: "code-block-before",
       offset: codeBlockFence - 1,
       description: "Just before code block -- fences hidden, code content in monospace"))
 
-    // 47. On the thematic break (---)
+    // 51. On the thematic break (---)
     let hrStart = offsetOf("---")
     positions.append(CursorPosition(
       name: "thematic-break-inside",
       offset: hrStart + 1,
       description: "Inside thematic break --- -- raw text visible and dimmed"))
 
-    // 48. At start of thematic break
+    // 52. At start of thematic break
     positions.append(CursorPosition(
       name: "thematic-break-at-start",
       offset: hrStart,
       description: "At start of thematic break -- raw text visible (cursor at node start)"))
 
-    // 49. At end of thematic break
+    // 53. At end of thematic break
     positions.append(CursorPosition(
       name: "thematic-break-at-end",
       offset: hrStart + 3,
       description: "At end of thematic break -- raw text visible (cursor at node end)"))
 
-    // 50. Just before thematic break (on blank line)
+    // 54. Just before thematic break (on blank line)
     positions.append(CursorPosition(
       name: "thematic-break-before",
       offset: hrStart - 1,
       description: "Just before thematic break -- horizontal line visible (transparent text + strikethrough)"))
 
-    // 51. Inside blockquote content
+    // 55. Inside blockquote content
     let blockquoteStart = offsetOf("> A simple blockquote")
     positions.append(CursorPosition(
       name: "blockquote-inside",
       offset: blockquoteStart + 5,
       description: "Inside blockquote content -- > prefix visible and dimmed"))
 
-    // 52. At start of blockquote (on > character)
+    // 56. At start of blockquote (on > character)
     positions.append(CursorPosition(
       name: "blockquote-at-start",
       offset: blockquoteStart,
       description: "At > of blockquote -- prefix visible (cursor at node start)"))
 
-    // 53. Inside blockquote second line with bold
+    // 57. Inside blockquote second line with bold
     let blockquoteBold = offsetOf("> with **bold** inside")
     positions.append(CursorPosition(
       name: "blockquote-bold-inside",
       offset: blockquoteBold + 5,
       description: "Inside second blockquote line -- > and ** visible and dimmed"))
 
-    // 54. Cursor in body -- blockquote > prefixes should be hidden
+    // 58. Cursor in body -- blockquote > prefixes should be hidden
     positions.append(CursorPosition(
       name: "blockquote-all-outside",
       offset: bodyStart + 2,

@@ -100,6 +100,16 @@ struct MarkdownStyle {
     return attrs
   }
 
+  // MARK: - Images
+
+  var imageColor: NSColor { .secondaryLabelColor }
+
+  var imageAttributes: [NSAttributedString.Key: Any] {
+    [
+      .foregroundColor: imageColor
+    ]
+  }
+
   // MARK: - Thematic Breaks
 
   var thematicBreakColor: NSColor { .separatorColor }

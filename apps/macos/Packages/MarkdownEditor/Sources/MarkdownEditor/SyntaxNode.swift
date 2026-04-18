@@ -25,6 +25,7 @@ enum SyntaxNodeType: Sendable {
   case inlineCode
   case codeBlock(language: String?)
   case link(destination: String?)
+  case image(destination: String?)
   case blockquote
   case thematicBreak
 }
