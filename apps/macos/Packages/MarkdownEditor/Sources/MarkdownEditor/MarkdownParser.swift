@@ -459,6 +459,51 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
     descendInto(link)
   }
 
+  mutating func visitImage(_ image: Markdown.Image) -> () {
+    guard let sourceRange = image.range else { return descendInto(image) }
+    let range = converter.nsRange(from: sourceRange)
+
+    // Image syntax: ![alt text](url)
+    // Opening delimiter: `![` (2 chars)
+    // Content: the alt text between `![` and `]`
+    // Closing delimiter: `](url)` - everything from `]` to the end of the range
+    let openingDelimiterRange = NSRange(location: range.location, length: 2)
+
+    let contentStart = range.location + 2
+
+    // Find where `](` begins to determine where alt text ends.
+    let fullText = converter.substringForRange(range) ?? ""
+    let closingBracketOffset: Int
+    if let bracketParenRange = fullText.range(of: "](", options: .backwards) {
+      closingBracketOffset = fullText.distance(from: fullText.startIndex, to: bracketParenRange.lowerBound)
+    } else {
+      closingBracketOffset = max(2, range.length - 1)
+    }
+
+    let contentLength = max(0, closingBracketOffset - 2)
+    let contentRange = NSRange(location: contentStart, length: contentLength)
+
+    // Closing delimiter: from `]` to end of range (covers `](url)`)
+    let closingDelimiterStart = range.location + closingBracketOffset
+    let closingDelimiterLength = range.length - closingBracketOffset
+    let closingDelimiterRange = NSRange(
+      location: closingDelimiterStart, length: closingDelimiterLength)
+
+    let delimiterRanges = [openingDelimiterRange, closingDelimiterRange]
+
+    let destination = image.source
+
+    nodes.append(
+      SyntaxNode(
+        type: .image(destination: destination),
+        range: range,
+        contentRange: contentRange,
+        delimiterRanges: delimiterRanges,
+        attributes: style.imageAttributes
+      ))
+    descendInto(image)
+  }
+
   mutating func visitEmphasis(_ emphasis: Emphasis) -> () {
     guard let sourceRange = emphasis.range else { return descendInto(emphasis) }
     let range = converter.nsRange(from: sourceRange)
