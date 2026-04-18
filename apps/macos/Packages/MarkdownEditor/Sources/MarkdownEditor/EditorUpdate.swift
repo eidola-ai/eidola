@@ -91,7 +91,14 @@ enum EditorUpdate {
     }
 
     // Post-process: normalize setext headings to ATX, then renumber ordered lists.
-    let normalized = normalizeSetextHeadings(in: newState)
+    return postProcess(newState)
+  }
+
+  /// Run post-processing (renumbering, normalization) on a state.
+  /// Called externally when text was mutated outside the Elm loop
+  /// (e.g., by NSTextView natively).
+  static func postProcess(_ state: EditorState) -> EditorState {
+    let normalized = normalizeSetextHeadings(in: state)
     return renumberOrderedLists(in: normalized)
   }
 

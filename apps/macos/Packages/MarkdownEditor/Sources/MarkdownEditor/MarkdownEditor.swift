@@ -84,8 +84,19 @@ public struct MarkdownEditor: NSViewRepresentable {
       isProcessingEvent = true
       defer { isProcessingEvent = false }
 
-      if textView.string != editorState.markdown {
-        textView.string = editorState.markdown
+      let currentText = textView.string
+      if currentText != editorState.markdown {
+        if currentText.isEmpty {
+          // Initial load — full replacement is fine (no scroll to preserve).
+          textView.string = editorState.markdown
+        } else if let diff = Self.computeDiff(old: currentText, new: editorState.markdown) {
+          // External state change — apply surgically to preserve scroll & undo.
+          if let textStorage = textView.textStorage {
+            textStorage.beginEditing()
+            textStorage.replaceCharacters(in: diff.range, with: diff.replacement)
+            textStorage.endEditing()
+          }
+        }
       }
       textView.setSelectedRange(editorState.selection.nsRange)
 
@@ -94,20 +105,70 @@ public struct MarkdownEditor: NSViewRepresentable {
       lastSpec = spec
     }
 
-    /// Process an event through the Elm loop.
+    /// Process an event through the Elm loop, applying text changes surgically.
     private func processEvent(_ event: EditorEvent, textView: NSTextView) {
       isProcessingEvent = true
       defer { isProcessingEvent = false }
 
+      let oldMarkdown = state.wrappedValue.markdown
       let newState = EditorUpdate.update(state.wrappedValue, event: event)
       state.wrappedValue = newState
 
-      textView.string = newState.markdown
+      // Apply text changes surgically instead of replacing the entire string.
+      if let diff = Self.computeDiff(old: oldMarkdown, new: newState.markdown) {
+        if let textStorage = textView.textStorage {
+          textStorage.beginEditing()
+          textStorage.replaceCharacters(in: diff.range, with: diff.replacement)
+          textStorage.endEditing()
+        }
+      }
+
       textView.setSelectedRange(newState.selection.nsRange)
 
       let spec = MarkdownRenderer.render(state: newState)
       RenderApplicator.apply(spec, to: textView)
       lastSpec = spec
+    }
+
+    // MARK: - Diff Helper
+
+    /// Compute the minimal changed region between two strings.
+    /// Returns `nil` if the strings are identical.
+    private static func computeDiff(
+      old: String, new: String
+    ) -> (range: NSRange, replacement: String)? {
+      let oldNS = old as NSString
+      let newNS = new as NSString
+
+      // Find common prefix
+      let minLen = min(oldNS.length, newNS.length)
+      var prefixLen = 0
+      while prefixLen < minLen
+        && oldNS.character(at: prefixLen) == newNS.character(at: prefixLen)
+      {
+        prefixLen += 1
+      }
+
+      // Find common suffix (not overlapping with prefix)
+      var suffixLen = 0
+      while suffixLen < minLen - prefixLen
+        && oldNS.character(at: oldNS.length - 1 - suffixLen)
+          == newNS.character(at: newNS.length - 1 - suffixLen)
+      {
+        suffixLen += 1
+      }
+
+      let oldChangedLen = oldNS.length - prefixLen - suffixLen
+      let newChangedLen = newNS.length - prefixLen - suffixLen
+
+      if oldChangedLen == 0 && newChangedLen == 0 {
+        return nil  // No change
+      }
+
+      let range = NSRange(location: prefixLen, length: oldChangedLen)
+      let replacement = newNS.substring(
+        with: NSRange(location: prefixLen, length: newChangedLen))
+      return (range, replacement)
     }
 
     // MARK: - NSTextViewDelegate
@@ -166,58 +227,47 @@ public struct MarkdownEditor: NSViewRepresentable {
       _ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange,
       replacementString: String?
     ) -> Bool {
-      guard !isProcessingEvent else { return true }
-      guard let replacement = replacementString else { return true }
-
-      if replacement == "\n" {
-        // Newlines are handled by doCommandBy (insertNewline/insertLineBreak)
-        return true
-      }
-
-      if replacement.isEmpty && affectedCharRange.length > 0 {
-        // Deletion not caught by doCommandBy (e.g., cut, drag-delete).
-        // Route through Elm loop: select the range, then delete.
-        isProcessingEvent = true
-        var s = state.wrappedValue
-        s = EditorUpdate.update(
-          s,
-          event: .setSelection(.range(
-            anchor: affectedCharRange.location,
-            head: affectedCharRange.location + affectedCharRange.length)))
-        s = EditorUpdate.update(s, event: .deleteBackward)
-        state.wrappedValue = s
-        textView.string = s.markdown
-        textView.setSelectedRange(s.selection.nsRange)
-        let spec = MarkdownRenderer.render(state: s)
-        RenderApplicator.apply(spec, to: textView)
-        lastSpec = spec
-        isProcessingEvent = false
-        return false
-      }
-
-      processEvent(.insertText(replacement), textView: textView)
-      return false  // We handled it
+      // Always allow NSTextView to handle the edit natively.
+      // textDidChange will sync state and re-render attributes.
+      return true
     }
 
     public func textDidChange(_ notification: Notification) {
       guard !isProcessingEvent, let textView = notification.object as? NSTextView else { return }
-      // Safety net: if text changed without going through our Elm loop,
-      // sync state from the text view.
-      if textView.string != state.wrappedValue.markdown {
-        isProcessingEvent = true
-        let nsRange = textView.selectedRange()
-        let selection: Selection
-        if nsRange.length == 0 {
-          selection = .cursor(nsRange.location)
-        } else {
-          selection = .range(anchor: nsRange.location, head: nsRange.location + nsRange.length)
+
+      isProcessingEvent = true
+      defer { isProcessingEvent = false }
+
+      // Read current state from text view (NSTextView already applied the edit).
+      let nsRange = textView.selectedRange()
+      let selection: Selection = nsRange.length == 0
+        ? .cursor(nsRange.location)
+        : .range(anchor: nsRange.location, head: nsRange.location + nsRange.length)
+
+      let currentMarkdown = textView.string
+      var newState = EditorState(markdown: currentMarkdown, selection: selection)
+
+      // Run post-processing (renumbering, setext normalization).
+      newState = EditorUpdate.postProcess(newState)
+
+      // If post-processing changed the markdown, apply surgically.
+      if newState.markdown != currentMarkdown {
+        if let diff = Self.computeDiff(old: currentMarkdown, new: newState.markdown) {
+          if let textStorage = textView.textStorage {
+            textStorage.beginEditing()
+            textStorage.replaceCharacters(in: diff.range, with: diff.replacement)
+            textStorage.endEditing()
+          }
         }
-        state.wrappedValue = EditorState(markdown: textView.string, selection: selection)
-        let spec = MarkdownRenderer.render(state: state.wrappedValue)
-        RenderApplicator.apply(spec, to: textView)
-        lastSpec = spec
-        isProcessingEvent = false
+        textView.setSelectedRange(newState.selection.nsRange)
       }
+
+      state.wrappedValue = newState
+
+      // Re-render attributes.
+      let spec = MarkdownRenderer.render(state: newState)
+      RenderApplicator.apply(spec, to: textView)
+      lastSpec = spec
     }
 
     public func textViewDidChangeSelection(_ notification: Notification) {
