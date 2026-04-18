@@ -128,6 +128,26 @@ public struct MarkdownEditor: NSViewRepresentable {
         processEvent(.outdent, textView: textView)
         return true
       }
+      if commandSelector == #selector(NSResponder.deleteToBeginningOfLine(_:))
+        || commandSelector == #selector(NSResponder.deleteToBeginningOfParagraph(_:))
+      {
+        processEvent(.deleteToBeginningOfLine, textView: textView)
+        return true
+      }
+      if commandSelector == #selector(NSResponder.deleteToEndOfLine(_:))
+        || commandSelector == #selector(NSResponder.deleteToEndOfParagraph(_:))
+      {
+        processEvent(.deleteToEndOfLine, textView: textView)
+        return true
+      }
+      if commandSelector == #selector(NSResponder.deleteWordBackward(_:)) {
+        processEvent(.deleteWordBackward, textView: textView)
+        return true
+      }
+      if commandSelector == #selector(NSResponder.deleteWordForward(_:)) {
+        processEvent(.deleteWordForward, textView: textView)
+        return true
+      }
       return false
     }
 
@@ -135,13 +155,58 @@ public struct MarkdownEditor: NSViewRepresentable {
       _ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange,
       replacementString: String?
     ) -> Bool {
+      guard !isProcessingEvent else { return true }
       guard let replacement = replacementString else { return true }
-      // Let doCommandBy handle newline and delete
-      if replacement == "\n" || (replacement.isEmpty && affectedCharRange.length > 0) {
+
+      if replacement == "\n" {
+        // Newlines are handled by doCommandBy (insertNewline/insertLineBreak)
         return true
       }
+
+      if replacement.isEmpty && affectedCharRange.length > 0 {
+        // Deletion not caught by doCommandBy (e.g., cut, drag-delete).
+        // Route through Elm loop: select the range, then delete.
+        isProcessingEvent = true
+        var s = state.wrappedValue
+        s = EditorUpdate.update(
+          s,
+          event: .setSelection(.range(
+            anchor: affectedCharRange.location,
+            head: affectedCharRange.location + affectedCharRange.length)))
+        s = EditorUpdate.update(s, event: .deleteBackward)
+        state.wrappedValue = s
+        textView.string = s.markdown
+        textView.setSelectedRange(s.selection.nsRange)
+        let spec = MarkdownRenderer.render(state: s)
+        RenderApplicator.apply(spec, to: textView)
+        lastSpec = spec
+        isProcessingEvent = false
+        return false
+      }
+
       processEvent(.insertText(replacement), textView: textView)
       return false  // We handled it
+    }
+
+    public func textDidChange(_ notification: Notification) {
+      guard !isProcessingEvent, let textView = notification.object as? NSTextView else { return }
+      // Safety net: if text changed without going through our Elm loop,
+      // sync state from the text view.
+      if textView.string != state.wrappedValue.markdown {
+        isProcessingEvent = true
+        let nsRange = textView.selectedRange()
+        let selection: Selection
+        if nsRange.length == 0 {
+          selection = .cursor(nsRange.location)
+        } else {
+          selection = .range(anchor: nsRange.location, head: nsRange.location + nsRange.length)
+        }
+        state.wrappedValue = EditorState(markdown: textView.string, selection: selection)
+        let spec = MarkdownRenderer.render(state: state.wrappedValue)
+        RenderApplicator.apply(spec, to: textView)
+        lastSpec = spec
+        isProcessingEvent = false
+      }
     }
 
     public func textViewDidChangeSelection(_ notification: Notification) {

@@ -54,6 +54,18 @@ enum EditorUpdate {
     case .deleteForward:
       newState = handleDeleteForward(state)
 
+    case .deleteToBeginningOfLine:
+      newState = handleDeleteToBeginningOfLine(state)
+
+    case .deleteToEndOfLine:
+      newState = handleDeleteToEndOfLine(state)
+
+    case .deleteWordBackward:
+      newState = handleDeleteWordBackward(state)
+
+    case .deleteWordForward:
+      newState = handleDeleteWordForward(state)
+
     case .setSelection(let selection):
       // Selection changes don't mutate text, but they can trigger setext
       // normalization if the cursor moved away from a setext underline.
@@ -467,6 +479,119 @@ enum EditorUpdate {
       let newMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
       return EditorState(markdown: newMarkdown, selection: .cursor(clampedStart))
     }
+  }
+
+  private static func handleDeleteToBeginningOfLine(_ state: EditorState) -> EditorState {
+    let nsMarkdown = state.markdown as NSString
+
+    // If there's a selection, delete it (same as deleteBackward with selection).
+    if case .range = state.selection {
+      return handleDeleteBackward(state)
+    }
+
+    guard case .cursor(let pos) = state.selection else { return state }
+    let clampedPos = min(pos, nsMarkdown.length)
+    guard clampedPos > 0 else { return state }
+
+    let lineRange = nsMarkdown.lineRange(for: NSRange(location: clampedPos, length: 0))
+    let lineStart = lineRange.location
+
+    // If cursor is already at the start of the line, no-op.
+    guard clampedPos > lineStart else { return state }
+
+    let deleteRange = NSRange(location: lineStart, length: clampedPos - lineStart)
+    let newMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
+    return EditorState(markdown: newMarkdown, selection: .cursor(lineStart))
+  }
+
+  private static func handleDeleteToEndOfLine(_ state: EditorState) -> EditorState {
+    let nsMarkdown = state.markdown as NSString
+
+    // If there's a selection, delete it.
+    if case .range = state.selection {
+      return handleDeleteBackward(state)
+    }
+
+    guard case .cursor(let pos) = state.selection else { return state }
+    let clampedPos = min(pos, nsMarkdown.length)
+    guard clampedPos < nsMarkdown.length else { return state }
+
+    let lineRange = nsMarkdown.lineRange(for: NSRange(location: clampedPos, length: 0))
+    let lineEnd = lineRange.location + lineRange.length
+
+    // Exclude the trailing \n from deletion (delete to end of line content, not the newline).
+    let contentEnd: Int
+    if lineEnd > lineRange.location
+      && lineEnd <= nsMarkdown.length
+      && nsMarkdown.character(at: lineEnd - 1) == UInt16(0x000A)
+    {
+      contentEnd = lineEnd - 1
+    } else {
+      contentEnd = lineEnd
+    }
+
+    // If cursor is already at the end of the line content, no-op.
+    guard clampedPos < contentEnd else { return state }
+
+    let deleteRange = NSRange(location: clampedPos, length: contentEnd - clampedPos)
+    let newMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
+    return EditorState(markdown: newMarkdown, selection: .cursor(clampedPos))
+  }
+
+  private static func handleDeleteWordBackward(_ state: EditorState) -> EditorState {
+    let nsMarkdown = state.markdown as NSString
+
+    // If there's a selection, delete it.
+    if case .range = state.selection {
+      return handleDeleteBackward(state)
+    }
+
+    guard case .cursor(let pos) = state.selection else { return state }
+    let clampedPos = min(pos, nsMarkdown.length)
+    guard clampedPos > 0 else { return state }
+
+    // Skip whitespace backwards, then skip non-whitespace backwards.
+    var target = clampedPos
+    while target > 0 {
+      let ch = Character(UnicodeScalar(nsMarkdown.character(at: target - 1))!)
+      if ch.isWhitespace { target -= 1 } else { break }
+    }
+    while target > 0 {
+      let ch = Character(UnicodeScalar(nsMarkdown.character(at: target - 1))!)
+      if !ch.isWhitespace { target -= 1 } else { break }
+    }
+
+    let deleteRange = NSRange(location: target, length: clampedPos - target)
+    let newMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
+    return EditorState(markdown: newMarkdown, selection: .cursor(target))
+  }
+
+  private static func handleDeleteWordForward(_ state: EditorState) -> EditorState {
+    let nsMarkdown = state.markdown as NSString
+
+    // If there's a selection, delete it.
+    if case .range = state.selection {
+      return handleDeleteBackward(state)
+    }
+
+    guard case .cursor(let pos) = state.selection else { return state }
+    let clampedPos = min(pos, nsMarkdown.length)
+    guard clampedPos < nsMarkdown.length else { return state }
+
+    // Skip non-whitespace forward, then skip whitespace forward.
+    var target = clampedPos
+    while target < nsMarkdown.length {
+      let ch = Character(UnicodeScalar(nsMarkdown.character(at: target))!)
+      if !ch.isWhitespace { target += 1 } else { break }
+    }
+    while target < nsMarkdown.length {
+      let ch = Character(UnicodeScalar(nsMarkdown.character(at: target))!)
+      if ch.isWhitespace { target += 1 } else { break }
+    }
+
+    let deleteRange = NSRange(location: clampedPos, length: target - clampedPos)
+    let newMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
+    return EditorState(markdown: newMarkdown, selection: .cursor(clampedPos))
   }
 
   /// Regex matching any list marker at the start of a line (unordered or ordered).

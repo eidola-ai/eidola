@@ -152,6 +152,10 @@ enum EditorTestHarness {
     case .insertLineBreak: return "linebreak"
     case .deleteBackward: return "backspace"
     case .deleteForward: return "delete"
+    case .deleteToBeginningOfLine: return "delToLineStart"
+    case .deleteToEndOfLine: return "delToLineEnd"
+    case .deleteWordBackward: return "delWordBack"
+    case .deleteWordForward: return "delWordFwd"
     case .setSelection: return "select"
     case .paste: return "paste"
     case .indent: return "indent"
@@ -195,6 +199,10 @@ enum EditorTestHarness {
     case .insertLineBreak: return "Shift+Enter"
     case .deleteBackward: return "Backspace"
     case .deleteForward: return "Delete"
+    case .deleteToBeginningOfLine: return "Cmd+Backspace"
+    case .deleteToEndOfLine: return "Ctrl+K"
+    case .deleteWordBackward: return "Opt+Backspace"
+    case .deleteWordForward: return "Opt+Delete"
     case .setSelection(let sel):
       switch sel {
       case .cursor(let pos): return "Cursor(\(pos))"
