@@ -23,5 +23,6 @@ enum SyntaxNodeType: Sendable {
   ///   with the widest marker in this list. Zero if this IS the widest.
   case orderedListItem(indentLevel: Int, markerPadding: CGFloat)
   case inlineCode
+  case codeBlock(language: String?)
   case link(destination: String?)
 }

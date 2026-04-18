@@ -32,6 +32,11 @@ struct RenderSpec {
   /// Applied via `NSLayoutManager.addTemporaryAttributes` — they don't affect the text storage.
   let temporaryAttributes: [StyledRange]
 
+  /// Character ranges that should receive full-width code block background drawing.
+  /// Consumed by `CodeBlockBackgroundLayoutManager` to draw backgrounds that span the
+  /// entire text container width, regardless of glyph visibility.
+  let codeBlockCharacterRanges: [NSRange]
+
   struct StyledRange {
     let range: NSRange
     let attributes: [NSAttributedString.Key: Any]
@@ -50,7 +55,8 @@ struct RenderSpec {
       checkedCheckboxIndexes == other.checkedCheckboxIndexes,
       styledRanges.count == other.styledRanges.count,
       fontTraits.count == other.fontTraits.count,
-      temporaryAttributes.count == other.temporaryAttributes.count
+      temporaryAttributes.count == other.temporaryAttributes.count,
+      codeBlockCharacterRanges == other.codeBlockCharacterRanges
     else { return false }
 
     guard attrsEqual(baseAttributes, other.baseAttributes) else { return false }

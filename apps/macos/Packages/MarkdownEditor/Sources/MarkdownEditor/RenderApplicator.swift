@@ -25,6 +25,11 @@ enum RenderApplicator {
       glyphDelegate.checkedCheckboxCharacterIndexes = spec.checkedCheckboxIndexes
     }
 
+    // Set code block ranges for full-width background drawing.
+    if let codeBlockLM = layoutManager as? CodeBlockBackgroundLayoutManager {
+      codeBlockLM.codeBlockCharacterRanges = spec.codeBlockCharacterRanges
+    }
+
     // Apply stored attributes
     textStorage.beginEditing()
     textStorage.setAttributes(spec.baseAttributes, range: fullRange)
@@ -68,6 +73,11 @@ enum RenderApplicator {
       glyphDelegate.bulletCharacterIndexes = spec.bulletIndexes
       glyphDelegate.uncheckedCheckboxCharacterIndexes = spec.uncheckedCheckboxIndexes
       glyphDelegate.checkedCheckboxCharacterIndexes = spec.checkedCheckboxIndexes
+    }
+
+    // Update code block ranges for full-width background drawing.
+    if let codeBlockLM = layoutManager as? CodeBlockBackgroundLayoutManager {
+      codeBlockLM.codeBlockCharacterRanges = spec.codeBlockCharacterRanges
     }
 
     // Invalidate only the ranges that changed

@@ -222,6 +222,67 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
     descendInto(listItem)
   }
 
+  mutating func visitCodeBlock(_ codeBlock: CodeBlock) -> () {
+    guard let sourceRange = codeBlock.range else { return }
+    let range = converter.nsRange(from: sourceRange)
+    guard range.length > 0 else { return }
+
+    let fullText = converter.substringForRange(range) ?? ""
+    let language = codeBlock.language
+
+    // Find the opening fence text (everything before the first \n).
+    // The \n itself is NOT part of the delimiter — it must remain visible
+    // so TextKit preserves the paragraph boundary. Hiding the \n would
+    // collapse the fence paragraph into the content paragraph, causing
+    // glyph-layout issues (first content character clipped).
+    var openingFenceTextLength = 0
+    if let firstNewline = fullText.firstIndex(of: "\n") {
+      openingFenceTextLength = fullText.distance(from: fullText.startIndex, to: firstNewline)
+    } else {
+      openingFenceTextLength = fullText.count
+    }
+    // Opening fence line occupies fenceText + \n in the source
+    let openingLineLength = openingFenceTextLength + (fullText.contains("\n") ? 1 : 0)
+
+    // Find the closing fence line.
+    // The closing fence is the last line of the code block. We search
+    // backwards for the last \n, then check if everything after it is a fence.
+    var closingFenceLength = 0
+    let trimmed = fullText.hasSuffix("\n") ? String(fullText.dropLast()) : fullText
+    if let lastNewline = trimmed.lastIndex(of: "\n") {
+      let afterLastNewline = trimmed[trimmed.index(after: lastNewline)...]
+      let lastLine = String(afterLastNewline).trimmingCharacters(in: .whitespaces)
+      if lastLine.hasPrefix("```") || lastLine.hasPrefix("~~~") {
+        closingFenceLength = fullText.count - fullText.distance(from: fullText.startIndex, to: lastNewline) - 1
+      }
+    }
+
+    // Opening fence delimiter: just the fence text, excluding the \n
+    let openingFenceRange = NSRange(location: range.location, length: openingFenceTextLength)
+    let closingFenceRange = NSRange(
+      location: range.location + range.length - closingFenceLength,
+      length: closingFenceLength)
+
+    // Content starts after the opening fence line (including \n)
+    let contentStart = range.location + openingLineLength
+    let contentLength = max(0, range.length - openingLineLength - closingFenceLength)
+    let contentRange = NSRange(location: contentStart, length: contentLength)
+
+    var delimiterRanges: [NSRange] = [openingFenceRange]
+    if closingFenceLength > 0 {
+      delimiterRanges.append(closingFenceRange)
+    }
+
+    nodes.append(
+      SyntaxNode(
+        type: .codeBlock(language: language),
+        range: range,
+        contentRange: contentRange,
+        delimiterRanges: delimiterRanges,
+        attributes: style.codeBlockAttributes
+      ))
+  }
+
   // MARK: - Inline Elements
 
   mutating func visitStrong(_ strong: Strong) -> () {

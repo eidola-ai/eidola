@@ -45,6 +45,11 @@ struct KitchenSinkVisualTests {
     A [link to example](https://example.com) in text.
 
     Code and links: `foo` and [bar](https://bar.com).
+
+    ```swift
+    let x = 42
+    print(x)
+    ```
     """
 
   /// Named cursor positions for clarity in artifacts.
@@ -348,6 +353,33 @@ struct KitchenSinkVisualTests {
       offset: barLink + 2,
       description: "Inside [bar] link on mixed line -- link delimiters visible, code backticks hidden"))
 
+    // 43. On opening fence of code block
+    let codeBlockFence = offsetOf("```swift")
+    positions.append(CursorPosition(
+      name: "code-block-opening-fence",
+      offset: codeBlockFence,
+      description: "At opening fence of code block -- fences visible and dimmed"))
+
+    // 44. Inside code block content (on "let x = 42")
+    let codeBlockContent = offsetOf("let x = 42")
+    positions.append(CursorPosition(
+      name: "code-block-content-inside",
+      offset: codeBlockContent + 5,
+      description: "Inside code block content -- fences visible and dimmed, monospace font"))
+
+    // 45. On closing fence of code block (the last ``` in the document)
+    let lastClosingFence = ns.range(of: "```", options: .backwards)
+    positions.append(CursorPosition(
+      name: "code-block-closing-fence",
+      offset: lastClosingFence.location + 1,
+      description: "On closing fence of code block -- fences visible and dimmed"))
+
+    // 46. Just before code block (on blank line before it)
+    positions.append(CursorPosition(
+      name: "code-block-before",
+      offset: codeBlockFence - 1,
+      description: "Just before code block -- fences hidden, code content in monospace"))
+
     return positions
   }
 
@@ -371,7 +403,7 @@ struct KitchenSinkVisualTests {
       name: "kitchen-sink",
       initial: initial,
       events: Array(events.dropFirst()),
-      size: NSSize(width: 700, height: 800))
+      size: NSSize(width: 700, height: 900))
 
     // We should have initial + (N-1) events = N total results
     #expect(results.count == positions.count)
