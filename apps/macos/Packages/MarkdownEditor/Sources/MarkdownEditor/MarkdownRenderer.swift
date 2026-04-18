@@ -414,6 +414,27 @@ enum MarkdownRenderer {
           hiddenIndexes: &hiddenIndexes,
           temporaryAttributes: &temporaryAttributes)
 
+      case .thematicBreak:
+        // Thematic break: the entire `---`/`***`/`___` is the construct.
+        // When cursor is outside: transparent text + thick strikethrough (horizontal line effect).
+        // When cursor is inside: dimmed text, no strikethrough.
+        let cursorInNode = cursorOverlaps(
+          cursorRange, node: safeNodeRange, textLength: textLength)
+
+        if cursorInNode {
+          // Cursor inside: show raw text dimmed, no special attributes
+          temporaryAttributes.append(
+            RenderSpec.StyledRange(
+              range: safeNodeRange,
+              attributes: [.foregroundColor: style.delimiterColor]))
+        } else {
+          // Cursor outside: apply thematic break attributes (transparent text + strikethrough)
+          if safeNodeRange.length > 0, !node.attributes.isEmpty {
+            styledRanges.append(
+              RenderSpec.StyledRange(range: safeNodeRange, attributes: node.attributes))
+          }
+        }
+
       case .unorderedListItem:
         // Extend to line range for cursor detection (same pattern as headings).
         let lineRange = nsText.lineRange(for: safeNodeRange)
