@@ -12,7 +12,7 @@ struct KitchenSinkVisualTests {
 
   // The kitchen sink document exercises headings (h1, h2, h3), body text,
   // bold, italic, bold-italic, bold inside a heading, unordered lists,
-  // and ordered lists, and checkbox list items.
+  // ordered lists, checkbox list items, inline code, and links.
   static let kitchenSinkMarkdown = """
     # Main Heading
 
@@ -39,6 +39,12 @@ struct KitchenSinkVisualTests {
     - [ ] Unchecked task
     - [x] Completed task
     - [ ] Another **bold** task
+
+    Some `inline code` in a paragraph.
+
+    A [link to example](https://example.com) in text.
+
+    Code and links: `foo` and [bar](https://bar.com).
     """
 
   /// Named cursor positions for clarity in artifacts.
@@ -275,6 +281,73 @@ struct KitchenSinkVisualTests {
       offset: bodyStart + 7,
       description: "Cursor in body -- all checkbox items show checkbox glyphs"))
 
+    // 33. Inside inline code content
+    let inlineCodeStart = offsetOf("`inline code`")
+    positions.append(CursorPosition(
+      name: "inline-code-inside",
+      offset: inlineCodeStart + 5,
+      description: "Inside inline code content -- backtick delimiters visible and dimmed"))
+
+    // 34. Just before opening backtick of inline code
+    positions.append(CursorPosition(
+      name: "inline-code-before",
+      offset: inlineCodeStart - 1,
+      description: "Just before inline code -- backtick delimiters hidden"))
+
+    // 35. Just after closing backtick of inline code
+    let inlineCodeEnd = inlineCodeStart + ("`inline code`" as NSString).length
+    positions.append(CursorPosition(
+      name: "inline-code-after",
+      offset: inlineCodeEnd,
+      description: "Just after inline code closing backtick -- delimiters may be visible"))
+
+    // 36. At start of inline code (on opening backtick)
+    positions.append(CursorPosition(
+      name: "inline-code-at-start",
+      offset: inlineCodeStart,
+      description: "At opening backtick of inline code -- delimiters visible (cursor at node start)"))
+
+    // 37. Inside link text content
+    let linkStart = offsetOf("[link to example]")
+    positions.append(CursorPosition(
+      name: "link-inside-text",
+      offset: linkStart + 5,
+      description: "Inside link text -- [ and ](url) delimiters visible and dimmed"))
+
+    // 38. Just before opening [ of link
+    positions.append(CursorPosition(
+      name: "link-before",
+      offset: linkStart - 1,
+      description: "Just before link -- delimiters hidden, only link text visible in blue"))
+
+    // 39. On the URL portion of the link
+    let urlInLink = offsetOf("(https://example.com)")
+    positions.append(CursorPosition(
+      name: "link-on-url",
+      offset: urlInLink + 5,
+      description: "On URL portion of link -- all delimiters visible"))
+
+    // 40. Just after closing ) of link
+    let linkEnd = urlInLink + ("(https://example.com)" as NSString).length
+    positions.append(CursorPosition(
+      name: "link-after",
+      offset: linkEnd,
+      description: "Just after link closing ) -- delimiters may be visible"))
+
+    // 41. Inside inline code on the last line (with both code and link)
+    let fooCode = offsetOf("`foo`")
+    positions.append(CursorPosition(
+      name: "mixed-line-code-inside",
+      offset: fooCode + 2,
+      description: "Inside `foo` inline code on mixed line -- backticks visible, link delimiters hidden"))
+
+    // 42. Inside link on the last line
+    let barLink = offsetOf("[bar]")
+    positions.append(CursorPosition(
+      name: "mixed-line-link-inside",
+      offset: barLink + 2,
+      description: "Inside [bar] link on mixed line -- link delimiters visible, code backticks hidden"))
+
     return positions
   }
 
@@ -298,7 +371,7 @@ struct KitchenSinkVisualTests {
       name: "kitchen-sink",
       initial: initial,
       events: Array(events.dropFirst()),
-      size: NSSize(width: 700, height: 600))
+      size: NSSize(width: 700, height: 800))
 
     // We should have initial + (N-1) events = N total results
     #expect(results.count == positions.count)

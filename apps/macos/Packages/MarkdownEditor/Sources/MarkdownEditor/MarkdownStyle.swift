@@ -52,6 +52,34 @@ struct MarkdownStyle {
     ]
   }
 
+  // MARK: - Inline Code
+
+  var codeFontSize: CGFloat { baseFontSize - 1.5 }
+  var codeFont: NSFont { .monospacedSystemFont(ofSize: codeFontSize, weight: .regular) }
+  var codeBackgroundColor: NSColor { .quaternaryLabelColor.withAlphaComponent(0.5) }
+
+  var inlineCodeAttributes: [NSAttributedString.Key: Any] {
+    [
+      .font: codeFont,
+      .backgroundColor: codeBackgroundColor,
+    ]
+  }
+
+  // MARK: - Links
+
+  var linkColor: NSColor { .linkColor }
+
+  func linkAttributes(destination: String?) -> [NSAttributedString.Key: Any] {
+    var attrs: [NSAttributedString.Key: Any] = [
+      .foregroundColor: linkColor,
+      .underlineStyle: NSUnderlineStyle.single.rawValue,
+    ]
+    if let destination = destination, let url = URL(string: destination) {
+      attrs[.link] = url
+    }
+    return attrs
+  }
+
   var baseAttributes: [NSAttributedString.Key: Any] {
     let paragraphStyle = NSMutableParagraphStyle()
     paragraphStyle.paragraphSpacing = 4

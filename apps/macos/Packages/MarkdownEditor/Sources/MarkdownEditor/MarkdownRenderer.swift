@@ -319,6 +319,44 @@ enum MarkdownRenderer {
           in: nsText, nodeRange: safeNodeRange, nodeAttributes: node.attributes,
           textLength: textLength, styledRanges: &styledRanges)
 
+      case .inlineCode:
+        let cursorInNode = cursorOverlaps(
+          cursorRange, node: safeNodeRange, textLength: textLength)
+
+        // Apply code attributes (monospace font + background) to content range
+        if safeContentRange.length > 0, !node.attributes.isEmpty {
+          styledRanges.append(
+            RenderSpec.StyledRange(range: safeContentRange, attributes: node.attributes))
+        }
+
+        // Delimiter visibility
+        applyDelimiterVisibility(
+          delimiterRanges: node.delimiterRanges,
+          cursorInNode: cursorInNode,
+          textLength: textLength,
+          style: style,
+          hiddenIndexes: &hiddenIndexes,
+          temporaryAttributes: &temporaryAttributes)
+
+      case .link:
+        let cursorInNode = cursorOverlaps(
+          cursorRange, node: safeNodeRange, textLength: textLength)
+
+        // Apply link attributes (blue + underline + URL) to content range
+        if safeContentRange.length > 0, !node.attributes.isEmpty {
+          styledRanges.append(
+            RenderSpec.StyledRange(range: safeContentRange, attributes: node.attributes))
+        }
+
+        // Delimiter visibility
+        applyDelimiterVisibility(
+          delimiterRanges: node.delimiterRanges,
+          cursorInNode: cursorInNode,
+          textLength: textLength,
+          style: style,
+          hiddenIndexes: &hiddenIndexes,
+          temporaryAttributes: &temporaryAttributes)
+
       case .unorderedListItem:
         // Extend to line range for cursor detection (same pattern as headings).
         let lineRange = nsText.lineRange(for: safeNodeRange)
