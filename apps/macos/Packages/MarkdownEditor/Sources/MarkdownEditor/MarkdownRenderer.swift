@@ -392,6 +392,28 @@ enum MarkdownRenderer {
           hiddenIndexes: &hiddenIndexes,
           temporaryAttributes: &temporaryAttributes)
 
+      case .blockquote:
+        // Blockquote: the entire multi-line block is the construct.
+        // Cursor anywhere within reveals the `> ` prefixes; cursor outside hides them.
+        let cursorInNode = cursorOverlaps(
+          cursorRange, node: safeNodeRange, textLength: textLength)
+
+        // Apply blockquote attributes (secondary label color, indentation) to the
+        // full node range so all lines get the blockquote styling.
+        if safeNodeRange.length > 0, !node.attributes.isEmpty {
+          styledRanges.append(
+            RenderSpec.StyledRange(range: safeNodeRange, attributes: node.attributes))
+        }
+
+        // Delimiter visibility (hidden vs revealed) for all `> ` prefixes
+        applyDelimiterVisibility(
+          delimiterRanges: node.delimiterRanges,
+          cursorInNode: cursorInNode,
+          textLength: textLength,
+          style: style,
+          hiddenIndexes: &hiddenIndexes,
+          temporaryAttributes: &temporaryAttributes)
+
       case .unorderedListItem:
         // Extend to line range for cursor detection (same pattern as headings).
         let lineRange = nsText.lineRange(for: safeNodeRange)

@@ -77,6 +77,56 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
     descendInto(heading)
   }
 
+  mutating func visitBlockQuote(_ blockQuote: BlockQuote) -> () {
+    guard let sourceRange = blockQuote.range else { return descendInto(blockQuote) }
+    let range = converter.nsRange(from: sourceRange)
+    let nsText = converter.string as NSString
+
+    // Find all `> ` prefixes on each line within the blockquote range.
+    // These are the delimiter ranges that get hidden/revealed.
+    var delimiterRanges: [NSRange] = []
+    let rangeEnd = range.location + range.length
+
+    var pos = range.location
+    while pos < rangeEnd {
+      // Check if this line starts with `> `
+      if pos < nsText.length, nsText.character(at: pos) == UInt16(0x003E) {  // '>'
+        // Check for space after '>'
+        let nextPos = pos + 1
+        if nextPos < nsText.length, nsText.character(at: nextPos) == UInt16(0x0020) {  // ' '
+          delimiterRanges.append(NSRange(location: pos, length: 2))  // "> "
+        } else {
+          // Just ">" without space
+          delimiterRanges.append(NSRange(location: pos, length: 1))
+        }
+      }
+
+      // Advance to next line
+      while pos < rangeEnd {
+        if pos < nsText.length, nsText.character(at: pos) == UInt16(0x000A) {  // \n
+          pos += 1
+          break
+        }
+        pos += 1
+      }
+      // If we didn't hit a newline, we're past the end
+      if pos >= rangeEnd { break }
+    }
+
+    // Content range is the full range (content is interspersed with `> ` prefixes)
+    let contentRange = range
+
+    nodes.append(
+      SyntaxNode(
+        type: .blockquote,
+        range: range,
+        contentRange: contentRange,
+        delimiterRanges: delimiterRanges,
+        attributes: style.blockquoteAttributes
+      ))
+    descendInto(blockQuote)
+  }
+
   mutating func visitUnorderedList(_ unorderedList: UnorderedList) -> () {
     listDepth += 1
     descendInto(unorderedList)

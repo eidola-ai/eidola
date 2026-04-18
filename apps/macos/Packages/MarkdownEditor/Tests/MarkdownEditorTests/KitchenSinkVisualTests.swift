@@ -12,7 +12,7 @@ struct KitchenSinkVisualTests {
 
   // The kitchen sink document exercises headings (h1, h2, h3), body text,
   // bold, italic, bold-italic, bold inside a heading, unordered lists,
-  // ordered lists, checkbox list items, inline code, and links.
+  // ordered lists, checkbox list items, inline code, links, and blockquotes.
   static let kitchenSinkMarkdown = """
     # Main Heading
 
@@ -50,6 +50,9 @@ struct KitchenSinkVisualTests {
     let x = 42
     print(x)
     ```
+
+    > A simple blockquote
+    > with **bold** inside
     """
 
   /// Named cursor positions for clarity in artifacts.
@@ -379,6 +382,32 @@ struct KitchenSinkVisualTests {
       name: "code-block-before",
       offset: codeBlockFence - 1,
       description: "Just before code block -- fences hidden, code content in monospace"))
+
+    // 47. Inside blockquote content
+    let blockquoteStart = offsetOf("> A simple blockquote")
+    positions.append(CursorPosition(
+      name: "blockquote-inside",
+      offset: blockquoteStart + 5,
+      description: "Inside blockquote content -- > prefix visible and dimmed"))
+
+    // 48. At start of blockquote (on > character)
+    positions.append(CursorPosition(
+      name: "blockquote-at-start",
+      offset: blockquoteStart,
+      description: "At > of blockquote -- prefix visible (cursor at node start)"))
+
+    // 49. Inside blockquote second line with bold
+    let blockquoteBold = offsetOf("> with **bold** inside")
+    positions.append(CursorPosition(
+      name: "blockquote-bold-inside",
+      offset: blockquoteBold + 5,
+      description: "Inside second blockquote line -- > and ** visible and dimmed"))
+
+    // 50. Cursor in body -- blockquote > prefixes should be hidden
+    positions.append(CursorPosition(
+      name: "blockquote-all-outside",
+      offset: bodyStart + 2,
+      description: "Cursor in body -- blockquote > prefixes hidden"))
 
     return positions
   }

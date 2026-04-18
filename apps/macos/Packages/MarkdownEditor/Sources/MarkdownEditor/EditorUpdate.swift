@@ -35,6 +35,14 @@ enum EditorUpdate {
   private static let orderedLinePattern = try! NSRegularExpression(
     pattern: #"^([ \t]*)(\d+)\. "#, options: [])
 
+  // Regex matching an empty blockquote line: just "> " with no content.
+  private static let emptyBlockquotePattern = try! NSRegularExpression(
+    pattern: #"^> $"#, options: [])
+
+  // Regex matching a non-empty blockquote line: "> " followed by content.
+  private static let blockquoteItemPattern = try! NSRegularExpression(
+    pattern: #"^> .+"#, options: [])
+
   /// Compute the next editor state from the current state and an event.
   static func update(_ state: EditorState, event: EditorEvent) -> EditorState {
     let newState: EditorState
@@ -241,6 +249,40 @@ enum EditorUpdate {
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
+    // Check if the current line is an empty blockquote (just "> ", no content).
+    let emptyBlockquoteMatch = emptyBlockquotePattern.firstMatch(
+      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+    if emptyBlockquoteMatch != nil {
+      // Remove the marker line entirely, leave a blank line.
+      let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: "\n")
+      return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location))
+    }
+
+    // Check if the current line is a non-empty blockquote line.
+    let blockquoteItemMatch = blockquoteItemPattern.firstMatch(
+      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+    if blockquoteItemMatch != nil {
+      // Continue the blockquote: insert newline + "> ".
+      var workMarkdown = state.markdown
+      var workPos = pos
+      if case .range(let anchor, let head) = state.selection {
+        let start = min(anchor, head)
+        let end = max(anchor, head)
+        let clampedStart = min(start, nsMarkdown.length)
+        let clampedEnd = min(end, nsMarkdown.length)
+        let deleteRange = NSRange(location: clampedStart, length: clampedEnd - clampedStart)
+        workMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
+        workPos = clampedStart
+      }
+
+      let workNS = workMarkdown as NSString
+      let insertion = "\n> "
+      let newMarkdown = workNS.replacingCharacters(
+        in: NSRange(location: workPos, length: 0), with: insertion)
+      let newPos = workPos + (insertion as NSString).length
+      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+    }
+
     // Check if we're on a continuation line (indented, no marker) belonging
     // to a parent list item. If so, create a new list item.
     if let parent = findParentListItem(in: nsMarkdown, at: pos) {
@@ -345,6 +387,18 @@ enum EditorUpdate {
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
+    // Check if the current line is a blockquote line.
+    let blockquoteLinePattern = try! NSRegularExpression(pattern: #"^> "#, options: [])
+    if blockquoteLinePattern.firstMatch(
+      in: lineText, range: NSRange(location: 0, length: lineNS.length)) != nil
+    {
+      let insertion = "\n> "
+      let newMarkdown = workNS.replacingCharacters(
+        in: NSRange(location: workPos, length: 0), with: insertion)
+      let newPos = workPos + (insertion as NSString).length
+      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+    }
+
     // Not in a list item: plain newline.
     return handleInsertText(
       EditorState(markdown: workMarkdown, selection: .cursor(workPos)),
@@ -432,6 +486,23 @@ enum EditorUpdate {
         let markerEnd = match.range.location + match.range.length
         if posInLine == markerEnd {
           // Cursor is right after ordered marker — remove the entire marker.
+          let markerAbsRange = NSRange(
+            location: lineRange.location + match.range.location,
+            length: match.range.length)
+          let newMarkdown = nsMarkdown.replacingCharacters(in: markerAbsRange, with: "")
+          return EditorState(
+            markdown: newMarkdown, selection: .cursor(markerAbsRange.location))
+        }
+      }
+
+      // Match blockquote: "> " at start of line
+      let blockquoteMarkerRegex = try! NSRegularExpression(pattern: #"^> "#, options: [])
+      if let match = blockquoteMarkerRegex.firstMatch(
+        in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      {
+        let markerEnd = match.range.location + match.range.length
+        if posInLine == markerEnd {
+          // Cursor is right after "> " — remove the entire prefix.
           let markerAbsRange = NSRange(
             location: lineRange.location + match.range.location,
             length: match.range.length)
