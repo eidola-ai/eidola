@@ -55,7 +55,10 @@ enum EditorUpdate {
       newState = handleDeleteForward(state)
 
     case .setSelection(let selection):
-      return handleSetSelection(state, selection: selection)
+      // Selection changes don't mutate text, but they can trigger setext
+      // normalization if the cursor moved away from a setext underline.
+      let selected = handleSetSelection(state, selection: selection)
+      return normalizeSetextHeadings(in: selected)
 
     case .paste(let text):
       newState = handleInsertText(state, text: text)
@@ -67,8 +70,9 @@ enum EditorUpdate {
       newState = handleOutdent(state)
     }
 
-    // Post-process: renumber ordered lists after any text mutation.
-    return renumberOrderedLists(in: newState)
+    // Post-process: normalize setext headings to ATX, then renumber ordered lists.
+    let normalized = normalizeSetextHeadings(in: newState)
+    return renumberOrderedLists(in: normalized)
   }
 
   // MARK: - Helpers
@@ -664,6 +668,82 @@ enum EditorUpdate {
   // MARK: - Ordered List Renumbering
 
   /// Scan all lines and renumber ordered list items so each contiguous run
+  // MARK: - Setext Heading Normalization
+
+  /// Setext heading pattern: a non-empty line followed by a line of only `=` or `-` (1+).
+  private static let setextPattern = try! NSRegularExpression(
+    pattern: #"^(.+)\n(=+|-+)[ \t]*$"#, options: [.anchorsMatchLines])
+
+  /// Pattern matching a line that is purely `=` or `-` characters (with optional trailing whitespace).
+  /// Used to detect if the cursor is on a setext underline.
+  private static let setextUnderlinePattern = try! NSRegularExpression(
+    pattern: #"^(=+|-+)[ \t]*$"#, options: [])
+
+  /// Convert setext-style headings to ATX format (`# heading`).
+  ///
+  /// Normalizes when the cursor is NOT on a setext underline line. This means:
+  /// - While typing `=` or `-` after text, no heading conversion occurs (cursor is on the underline)
+  /// - As soon as the cursor moves away (click, arrow, Enter, etc.), the setext heading
+  ///   is converted to ATX format and the underline disappears
+  private static func normalizeSetextHeadings(in state: EditorState) -> EditorState {
+    let text = state.markdown
+    let nsText = text as NSString
+    let cursorPos = state.selection.head
+
+    // Check if cursor is currently on a setext underline line — if so, skip normalization.
+    if cursorPos <= nsText.length {
+      let cursorLineRange = nsText.lineRange(for: NSRange(location: cursorPos, length: 0))
+      let cursorLine = nsText.substring(with: cursorLineRange)
+        .trimmingCharacters(in: .newlines)
+      if !cursorLine.isEmpty,
+        setextUnderlinePattern.firstMatch(
+          in: cursorLine, range: NSRange(location: 0, length: (cursorLine as NSString).length)) != nil
+      {
+        return state
+      }
+    }
+
+    let matches = setextPattern.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+    guard !matches.isEmpty else { return state }
+
+    var result = text
+    var cursorOffset = 0
+
+    // Process matches in reverse to preserve ranges
+    for match in matches.reversed() {
+      let fullRange = match.range
+      let titleRange = match.range(at: 1)
+      let underlineRange = match.range(at: 2)
+
+      let title = nsText.substring(with: titleRange)
+      let underline = nsText.substring(with: underlineRange)
+      let level = underline.hasPrefix("=") ? 1 : 2
+      let prefix = String(repeating: "#", count: level)
+      let replacement = "\(prefix) \(title)"
+
+      let nsResult = result as NSString
+      result = nsResult.replacingCharacters(in: fullRange, with: replacement)
+
+      // Adjust cursor if it's after this match
+      let lengthDelta = (replacement as NSString).length - fullRange.length
+      if cursorPos > fullRange.location + fullRange.length {
+        cursorOffset += lengthDelta
+      } else if cursorPos > fullRange.location {
+        // Cursor is inside the setext heading — place it in the ATX heading content
+        let posInMatch = cursorPos - fullRange.location
+        let newPos = fullRange.location + min(posInMatch, (replacement as NSString).length)
+        cursorOffset += newPos - cursorPos
+      }
+    }
+
+    let newCursorPos = max(0, cursorPos + cursorOffset)
+    return EditorState(
+      markdown: result,
+      selection: .cursor(min(newCursorPos, (result as NSString).length)))
+  }
+
+  // MARK: - Ordered List Renumbering
+
   /// of same-indent ordered items is numbered sequentially starting from 1.
   /// Adjusts cursor position if renumbering changes character counts before it.
   private static func renumberOrderedLists(in state: EditorState) -> EditorState {

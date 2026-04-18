@@ -35,18 +35,43 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
       delimiterLength = heading.level + 1
     }
 
-    let delimiterRange = NSRange(location: range.location, length: delimiterLength)
-    let contentRange = NSRange(
-      location: range.location + delimiterLength,
-      length: max(0, range.length - delimiterLength)
-    )
+    // Setext-style headings (content\n===) have delimiterLength == 0 because the
+    // content starts at the heading start (no `# ` prefix). The underline is the
+    // delimiter that spans from the \n to the end of the heading range.
+    // EditorUpdate normalizes setext → ATX when the cursor moves away from the
+    // underline, so setext headings are transient.
+    let delimiterRanges: [NSRange]
+    let contentRange: NSRange
+
+    if delimiterLength == 0 {
+      // Setext: content is first line, delimiter is \n + underline
+      let headingText = converter.substringForRange(range) ?? ""
+      if let newlineIdx = headingText.firstIndex(of: "\n") {
+        let contentLen = headingText.distance(from: headingText.startIndex, to: newlineIdx)
+        contentRange = NSRange(location: range.location, length: contentLen)
+        // Delimiter covers from the \n through end of range (the underline)
+        let delimStart = range.location + contentLen
+        let delimLen = range.length - contentLen
+        delimiterRanges = [NSRange(location: delimStart, length: delimLen)]
+      } else {
+        // Fallback: no newline found, treat entire range as content
+        contentRange = range
+        delimiterRanges = []
+      }
+    } else {
+      // ATX: delimiter is the `# ` prefix
+      delimiterRanges = [NSRange(location: range.location, length: delimiterLength)]
+      contentRange = NSRange(
+        location: range.location + delimiterLength,
+        length: max(0, range.length - delimiterLength))
+    }
 
     nodes.append(
       SyntaxNode(
         type: .heading(level: heading.level),
         range: range,
         contentRange: contentRange,
-        delimiterRanges: [delimiterRange],
+        delimiterRanges: delimiterRanges,
         attributes: style.headingAttributes(level: heading.level)
       ))
     descendInto(heading)
