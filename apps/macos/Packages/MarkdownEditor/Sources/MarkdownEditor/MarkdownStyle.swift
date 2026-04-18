@@ -100,6 +100,21 @@ struct MarkdownStyle {
     return attrs
   }
 
+  // MARK: - Blockquotes
+
+  var blockquoteIndent: CGFloat = 20
+
+  var blockquoteAttributes: [NSAttributedString.Key: Any] {
+    let paragraphStyle = NSMutableParagraphStyle()
+    paragraphStyle.headIndent = blockquoteIndent
+    paragraphStyle.firstLineHeadIndent = blockquoteIndent
+    paragraphStyle.paragraphSpacing = 4
+    return [
+      .foregroundColor: NSColor.secondaryLabelColor,
+      .paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle,
+    ]
+  }
+
   var baseAttributes: [NSAttributedString.Key: Any] {
     let paragraphStyle = NSMutableParagraphStyle()
     paragraphStyle.paragraphSpacing = 4
