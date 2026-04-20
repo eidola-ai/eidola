@@ -38,9 +38,10 @@ struct MarkdownStyle {
   /// - `markerText`: The text that is actually displayed as the marker.
   ///   For unordered items this is `"•"` (the bullet glyph that replaces `- `).
   ///   For ordered items this is the full marker like `"1. "` or `"22. "`.
-  func listItemAttributes(indentLevel: Int, markerText: String = "•") -> [NSAttributedString.Key: Any] {
+  /// - `baseIndent`: Extra indentation from enclosing block constructs (e.g. blockquotes).
+  func listItemAttributes(indentLevel: Int, markerText: String = "•", baseIndent: CGFloat = 0) -> [NSAttributedString.Key: Any] {
     let paragraphStyle = NSMutableParagraphStyle()
-    let bulletPosition = listIndent * CGFloat(indentLevel)
+    let bulletPosition = baseIndent + listIndent * CGFloat(indentLevel)
     let markerWidth = (markerText as NSString).size(withAttributes: [.font: baseFont]).width
     paragraphStyle.firstLineHeadIndent = bulletPosition
     paragraphStyle.headIndent = bulletPosition + markerWidth
@@ -75,10 +76,10 @@ struct MarkdownStyle {
 
   // MARK: - Code Blocks
 
-  var codeBlockAttributes: [NSAttributedString.Key: Any] {
+  func codeBlockAttributes(baseIndent: CGFloat = 0) -> [NSAttributedString.Key: Any] {
     let paragraphStyle = NSMutableParagraphStyle()
-    paragraphStyle.headIndent = 12
-    paragraphStyle.firstLineHeadIndent = 12
+    paragraphStyle.headIndent = 12 + baseIndent
+    paragraphStyle.firstLineHeadIndent = 12 + baseIndent
     // Negative tailIndent extends the paragraph to the right margin.
     paragraphStyle.tailIndent = -12
     paragraphStyle.paragraphSpacing = 2
@@ -136,10 +137,20 @@ struct MarkdownStyle {
 
   var blockquoteIndent: CGFloat = 20
 
-  var blockquoteAttributes: [NSAttributedString.Key: Any] {
+  func blockquoteAttributes(depth: Int = 1, cursorInside: Bool = false, baseIndent: CGFloat = 0) -> [NSAttributedString.Key: Any] {
     let paragraphStyle = NSMutableParagraphStyle()
-    paragraphStyle.headIndent = blockquoteIndent
-    paragraphStyle.firstLineHeadIndent = blockquoteIndent
+    if cursorInside {
+      // When cursor is inside, `> ` prefixes are visible and provide the offset,
+      // so paragraph indent should be the list base indent only.
+      paragraphStyle.headIndent = baseIndent
+      paragraphStyle.firstLineHeadIndent = baseIndent
+    } else {
+      // When cursor is outside, `> ` prefixes are hidden, so paragraph indent
+      // replaces them visually.
+      let totalIndent = baseIndent + blockquoteIndent * CGFloat(depth)
+      paragraphStyle.headIndent = totalIndent
+      paragraphStyle.firstLineHeadIndent = totalIndent
+    }
     paragraphStyle.paragraphSpacing = 4
     return [
       .foregroundColor: NSColor.secondaryLabelColor,

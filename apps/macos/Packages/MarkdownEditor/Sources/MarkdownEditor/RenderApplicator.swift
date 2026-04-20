@@ -28,6 +28,7 @@ enum RenderApplicator {
     // Set code block ranges for full-width background drawing.
     if let codeBlockLM = layoutManager as? CodeBlockBackgroundLayoutManager {
       codeBlockLM.codeBlockCharacterRanges = spec.codeBlockCharacterRanges
+      codeBlockLM.blockquoteCharacterRanges = spec.blockquoteCharacterRanges
     }
 
     // Apply stored attributes
@@ -78,6 +79,7 @@ enum RenderApplicator {
     // Update code block ranges for full-width background drawing.
     if let codeBlockLM = layoutManager as? CodeBlockBackgroundLayoutManager {
       codeBlockLM.codeBlockCharacterRanges = spec.codeBlockCharacterRanges
+      codeBlockLM.blockquoteCharacterRanges = spec.blockquoteCharacterRanges
     }
 
     // Invalidate only the ranges that changed
