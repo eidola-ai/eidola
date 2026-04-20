@@ -10,6 +10,9 @@ struct MarkdownStyle {
 
   var textColor: NSColor { .labelColor }
   var delimiterColor: NSColor { .tertiaryLabelColor }
+  var blockquotePrefixText: String { "> " }
+  var blockquotePrefixWidth: CGFloat { textWidth(blockquotePrefixText) }
+  var blockquoteBorderLeftPadding: CGFloat = 6
 
   func headingFont(level: Int) -> NSFont {
     let sizes: [CGFloat] = [28, 22, 18, 16, 15, 14]
@@ -166,5 +169,9 @@ struct MarkdownStyle {
       .foregroundColor: textColor,
       .paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle,
     ]
+  }
+
+  func textWidth(_ text: String, font: NSFont? = nil) -> CGFloat {
+    (text as NSString).size(withAttributes: [.font: font ?? baseFont]).width
   }
 }

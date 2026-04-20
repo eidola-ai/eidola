@@ -21,6 +21,7 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
   /// Character indexes whose glyphs should be replaced with a checked checkbox (☒ U+2612).
   var checkedCheckboxCharacterIndexes = IndexSet()
 
+
   // MARK: - Glyph Generation
 
   func layoutManager(
@@ -62,9 +63,8 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
       newProps.deallocate()
     }
 
-    // Look up bullet glyph lazily
+    // Look up replacement glyphs lazily
     var bulletGlyph: CGGlyph?
-    // Look up checkbox glyphs lazily
     var uncheckedCheckboxGlyph: CGGlyph?
     var checkedCheckboxGlyph: CGGlyph?
 

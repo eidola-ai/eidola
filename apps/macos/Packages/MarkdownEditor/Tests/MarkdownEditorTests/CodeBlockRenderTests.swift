@@ -6,7 +6,6 @@ import Testing
 @Suite("Code Block Render Tests")
 @MainActor
 struct CodeBlockRenderTests {
-
   // MARK: - Attributes
 
   @Test("Code block applies monospace font to content range")
@@ -157,6 +156,25 @@ struct CodeBlockRenderTests {
     #expect(spec.hiddenIndexes.contains(7), "Opening fence should be hidden")
     #expect(spec.hiddenIndexes.contains(8), "Opening fence should be hidden")
     #expect(spec.hiddenIndexes.contains(9), "Opening fence should be hidden")
+  }
+
+  @Test("Code block inside blockquote hides closing fence when cursor is outside")
+  func blockquoteClosingFenceHiddenOutside() {
+    let text = "> ```js\n> let x = 42\n> ```\n\nBody"
+    let cursorRange = NSRange(location: (text as NSString).length - 2, length: 0)
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+
+    let closingFence = (text as NSString).range(of: "> ```", options: .backwards)
+    #expect(closingFence.location != NSNotFound, "Should find closing fence line")
+    if closingFence.location != NSNotFound {
+      // The > at the start of the fence line is transparent (not hidden)
+      #expect(!spec.hiddenIndexes.contains(closingFence.location),
+        "Closing fence > at \(closingFence.location) should not be hidden (transparent glyph)")
+      // Remaining characters (space + ```) should be hidden
+      for idx in (closingFence.location + 1)..<(closingFence.location + closingFence.length) {
+        #expect(spec.hiddenIndexes.contains(idx), "Closing fence char at \(idx) should be hidden when cursor is outside")
+      }
+    }
   }
 
   // MARK: - Multiline content

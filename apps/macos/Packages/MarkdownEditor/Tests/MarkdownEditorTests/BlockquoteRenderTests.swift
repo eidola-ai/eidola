@@ -38,7 +38,8 @@ struct BlockquoteRenderTests {
 
     if let styled = blockquoteStyled {
       let ps = styled.attributes[.paragraphStyle] as! NSParagraphStyle
-      #expect(ps.firstLineHeadIndent > 0, "firstLineHeadIndent should be > 0 when cursor outside")
+      // firstLineHeadIndent is 0 because the transparent > glyph + kern provides the indent
+      #expect(ps.firstLineHeadIndent == 0, "firstLineHeadIndent should be 0 when cursor outside (transparent > glyph)")
       #expect(ps.headIndent > 0, "headIndent should be > 0 when cursor outside")
     }
   }
@@ -59,8 +60,8 @@ struct BlockquoteRenderTests {
 
     if let styled = blockquoteStyled {
       let ps = styled.attributes[.paragraphStyle] as! NSParagraphStyle
-      #expect(ps.firstLineHeadIndent == 0, "firstLineHeadIndent should be 0 when cursor inside (> provides offset)")
-      #expect(ps.headIndent == 0, "headIndent should be 0 when cursor inside (> provides offset)")
+      #expect(ps.firstLineHeadIndent == 0, "firstLineHeadIndent should be 0 when cursor inside (> stays visible)")
+      #expect(ps.headIndent > 0, "headIndent should stay positive so wrapped lines align after the visible > prefix")
     }
   }
 
@@ -72,8 +73,8 @@ struct BlockquoteRenderTests {
     let cursorRange = NSRange(location: 10, length: 0)  // cursor in "Body"
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    // "> " at positions 0,1 should be hidden
-    #expect(spec.hiddenIndexes.contains(0), "> char should be hidden when cursor outside")
+    // > at position 0 is kept as a transparent glyph (not hidden); space at position 1 is hidden
+    #expect(!spec.hiddenIndexes.contains(0), "> char should not be hidden (it's transparent, same kern)")
     #expect(spec.hiddenIndexes.contains(1), "space after > should be hidden when cursor outside")
 
     // Content should not be hidden
@@ -86,9 +87,10 @@ struct BlockquoteRenderTests {
     let cursorRange = NSRange(location: 4, length: 0)  // inside content
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    // > prefix should NOT be hidden
+    // > character should NOT be hidden (it has kern to fill blockquoteIndent)
     #expect(!spec.hiddenIndexes.contains(0), "> should not be hidden when cursor inside")
-    #expect(!spec.hiddenIndexes.contains(1), "space should not be hidden when cursor inside")
+    // space after > IS hidden — kern on > provides the spacing instead
+    #expect(spec.hiddenIndexes.contains(1), "space after > should be hidden (kern provides spacing)")
 
     // Should have temporary attributes for dimmed delimiter
     #expect(
@@ -103,8 +105,8 @@ struct BlockquoteRenderTests {
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
     #expect(!spec.blockquoteCharacterRanges.isEmpty,
       "Should have blockquote border ranges when cursor is outside")
-    #expect(spec.blockquoteCharacterRanges.first?.depth == 1,
-      "Should have depth 1")
+    #expect((spec.blockquoteCharacterRanges.first?.xPosition ?? 0) > 0,
+      "Should have a positive x position")
   }
 
   @Test("Blockquote border ranges empty when cursor is inside")
@@ -122,9 +124,9 @@ struct BlockquoteRenderTests {
     let cursorRange = NSRange(location: 0, length: 0)
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    #expect(
-      spec.hiddenIndexes.isEmpty,
-      "Nothing should be hidden when cursor is at start of blockquote")
+    #expect(!spec.hiddenIndexes.contains(0), "> should not be hidden")
+    // space after > is hidden (kern provides spacing)
+    #expect(!spec.hiddenIndexes.contains(2), "Content should not be hidden")
   }
 
   @Test("Blockquote > prefix visible when cursor is at end")
@@ -133,9 +135,9 @@ struct BlockquoteRenderTests {
     let cursorRange = NSRange(location: 7, length: 0)
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    #expect(
-      spec.hiddenIndexes.isEmpty,
-      "Nothing should be hidden when cursor is at end of blockquote")
+    #expect(!spec.hiddenIndexes.contains(0), "> should not be hidden")
+    // space after > is hidden (kern provides spacing)
+    #expect(!spec.hiddenIndexes.contains(2), "Content should not be hidden")
   }
 
   // MARK: - Multi-line blockquotes
@@ -147,12 +149,12 @@ struct BlockquoteRenderTests {
     let cursorRange = NSRange(location: 24, length: 0)
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    // First line "> " at 0,1
-    #expect(spec.hiddenIndexes.contains(0), "First > should be hidden")
+    // First line: > at 0 is transparent (not hidden), space at 1 is hidden
+    #expect(!spec.hiddenIndexes.contains(0), "First > should not be hidden (transparent glyph)")
     #expect(spec.hiddenIndexes.contains(1), "First space should be hidden")
 
-    // Second line "> " at 11,12
-    #expect(spec.hiddenIndexes.contains(11), "Second > should be hidden")
+    // Second line: > at 11 is transparent (not hidden), space at 12 is hidden
+    #expect(!spec.hiddenIndexes.contains(11), "Second > should not be hidden (transparent glyph)")
     #expect(spec.hiddenIndexes.contains(12), "Second space should be hidden")
 
     // Content not hidden
@@ -167,11 +169,11 @@ struct BlockquoteRenderTests {
     let cursorRange = NSRange(location: 15, length: 0)
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    // No prefixes should be hidden
+    // > characters should not be hidden; spaces after > ARE hidden (kern provides spacing)
     #expect(!spec.hiddenIndexes.contains(0), "First > should not be hidden")
-    #expect(!spec.hiddenIndexes.contains(1), "First space should not be hidden")
+    #expect(spec.hiddenIndexes.contains(1), "First space after > should be hidden (kern provides spacing)")
     #expect(!spec.hiddenIndexes.contains(11), "Second > should not be hidden")
-    #expect(!spec.hiddenIndexes.contains(12), "Second space should not be hidden")
+    #expect(spec.hiddenIndexes.contains(12), "Second space after > should be hidden (kern provides spacing)")
 
     // Should have temp attrs for dimming
     #expect(
@@ -213,8 +215,8 @@ struct BlockquoteRenderTests {
     let cursorRange = NSRange(location: 18, length: 0)  // in body
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    // > prefix should be hidden
-    #expect(spec.hiddenIndexes.contains(0), "> should be hidden")
+    // > prefix: > is transparent (not hidden), space is hidden
+    #expect(!spec.hiddenIndexes.contains(0), "> should not be hidden (transparent glyph)")
     #expect(spec.hiddenIndexes.contains(1), "space should be hidden")
     // Bold delimiters should be hidden
     #expect(spec.hiddenIndexes.contains(2), "Opening ** first char should be hidden")
@@ -230,8 +232,8 @@ struct BlockquoteRenderTests {
     let cursorRange = NSRange(location: 19, length: 0)  // in body
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    // > prefix should be hidden
-    #expect(spec.hiddenIndexes.contains(0), "> should be hidden")
+    // > prefix: > is transparent (not hidden), space after is hidden
+    #expect(!spec.hiddenIndexes.contains(0), "> should not be hidden (transparent glyph)")
     // Italic delimiters should be hidden
     #expect(spec.hiddenIndexes.contains(2), "Opening * should be hidden")
     // Italic content should have italic trait
@@ -248,7 +250,7 @@ struct BlockquoteRenderTests {
     let cursorRange = NSRange(location: 8, length: 0)
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    #expect(spec.hiddenIndexes.contains(0), "> should be hidden when cursor is just outside")
+    #expect(!spec.hiddenIndexes.contains(0), "> should not be hidden when cursor is just outside (transparent glyph)")
   }
 
   @Test("Cursor on > prefix reveals delimiters")
@@ -258,8 +260,8 @@ struct BlockquoteRenderTests {
     let cursorRange = NSRange(location: 1, length: 0)
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    #expect(
-      spec.hiddenIndexes.isEmpty,
-      "Nothing should be hidden when cursor is on the > prefix")
+    #expect(!spec.hiddenIndexes.contains(0), "> should not be hidden")
+    // space after > is hidden (kern on > provides the spacing)
+    #expect(!spec.hiddenIndexes.contains(2), "Content should not be hidden")
   }
 }

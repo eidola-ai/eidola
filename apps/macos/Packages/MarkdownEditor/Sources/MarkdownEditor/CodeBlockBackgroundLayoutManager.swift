@@ -10,27 +10,21 @@ import AppKit
 final class CodeBlockBackgroundLayoutManager: NSLayoutManager {
   /// Character ranges that should receive full-width code block background.
   /// Set by `RenderApplicator` after each render pass.
-  nonisolated(unsafe) var codeBlockCharacterRanges: [RenderSpec.CodeBlockRange] = []
+  nonisolated(unsafe) var codeBlockCharacterRanges: [RenderSpec.CodeBlockDecoration] = []
 
   /// Character ranges that should receive a left border for blockquote indication.
   /// Set by `RenderApplicator` after each render pass.
-  nonisolated(unsafe) var blockquoteCharacterRanges: [RenderSpec.BlockquoteRange] = []
+  nonisolated(unsafe) var blockquoteCharacterRanges: [RenderSpec.BlockquoteDecoration] = []
 
   /// The background color to draw behind code block lines.
   nonisolated(unsafe) var codeBlockBackgroundColor: NSColor = .quaternaryLabelColor
     .withAlphaComponent(0.5)
 
   /// The color to draw blockquote left borders.
-  nonisolated(unsafe) var blockquoteBorderColor: NSColor = .tertiaryLabelColor
-
-  /// The indent per blockquote depth level (must match MarkdownStyle.blockquoteIndent).
-  nonisolated(unsafe) var blockquoteIndent: CGFloat = 20
+  nonisolated(unsafe) var blockquoteBorderColor: NSColor = .separatorColor
 
   /// Width of the blockquote left border line.
-  nonisolated(unsafe) var blockquoteBorderWidth: CGFloat = 2
-
-  /// Left padding before the first blockquote border line.
-  nonisolated(unsafe) var blockquoteBorderLeftPadding: CGFloat = 6
+  nonisolated(unsafe) var blockquoteBorderWidth: CGFloat = 3
 
   override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
     // Draw standard backgrounds first (for non-code-block ranges).
@@ -61,10 +55,10 @@ final class CodeBlockBackgroundLayoutManager: NSLayoutManager {
             forGlyphRange: NSRange(location: overlapStart, length: overlapEnd - overlapStart)
           ) { lineFragmentRect, _, _, _, _ in
             // Draw a full-width rectangle at this line's vertical position,
-            // offset by the code block's base indent (for list nesting).
+            // offset by the resolved code block origin.
             var rect = lineFragmentRect
-            rect.origin.x = codeRange.baseIndent
-            rect.size.width = containerWidth - codeRange.baseIndent
+            rect.origin.x = codeRange.xOrigin
+            rect.size.width = containerWidth - codeRange.xOrigin
             rect.origin.x += origin.x
             rect.origin.y += origin.y
             NSBezierPath.fill(rect)
@@ -92,14 +86,9 @@ final class CodeBlockBackgroundLayoutManager: NSLayoutManager {
       enumerateLineFragments(
         forGlyphRange: NSRange(location: overlapStart, length: overlapEnd - overlapStart)
       ) { lineFragmentRect, _, _, _, _ in
-        // Draw ONE vertical border line at this depth's position. Each blockquote
-        // depth level has its own entry in blockquoteCharacterRanges, so parent
-        // levels draw their own borders — no need to re-draw them here.
-        let xPosition =
-          bqRange.listBaseIndent + self.blockquoteBorderLeftPadding + self.blockquoteIndent * CGFloat(bqRange.depth - 1)
         self.blockquoteBorderColor.setFill()
         let borderRect = NSRect(
-          x: xPosition + origin.x,
+          x: bqRange.xPosition + origin.x,
           y: lineFragmentRect.origin.y + origin.y,
           width: self.blockquoteBorderWidth,
           height: lineFragmentRect.size.height)

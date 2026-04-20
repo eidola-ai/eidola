@@ -35,22 +35,21 @@ struct RenderSpec {
   /// Character ranges that should receive full-width code block background drawing.
   /// Consumed by `CodeBlockBackgroundLayoutManager` to draw backgrounds that span the
   /// entire text container width, regardless of glyph visibility.
-  let codeBlockCharacterRanges: [CodeBlockRange]
+  let codeBlockCharacterRanges: [CodeBlockDecoration]
 
   /// Character ranges that should receive a left border for blockquote visual indication.
-  /// Each entry is a range + depth pair. Consumed by `CodeBlockBackgroundLayoutManager`
-  /// to draw vertical lines at the appropriate indent positions when cursor is outside.
-  let blockquoteCharacterRanges: [BlockquoteRange]
+  /// Each entry carries the exact x-position for the border, so drawing does not
+  /// have to reconstruct nesting from partial metadata.
+  let blockquoteCharacterRanges: [BlockquoteDecoration]
 
-  struct BlockquoteRange {
+  struct BlockquoteDecoration {
     let range: NSRange
-    let depth: Int
-    let listBaseIndent: CGFloat
+    let xPosition: CGFloat
   }
 
-  struct CodeBlockRange {
+  struct CodeBlockDecoration {
     let range: NSRange
-    let baseIndent: CGFloat
+    let xOrigin: CGFloat
   }
 
   struct StyledRange {
@@ -77,11 +76,11 @@ struct RenderSpec {
     else { return false }
 
     for (a, b) in zip(codeBlockCharacterRanges, other.codeBlockCharacterRanges) {
-      guard a.range == b.range, a.baseIndent == b.baseIndent else { return false }
+      guard a.range == b.range, a.xOrigin == b.xOrigin else { return false }
     }
 
     for (a, b) in zip(blockquoteCharacterRanges, other.blockquoteCharacterRanges) {
-      guard a.range == b.range, a.depth == b.depth, a.listBaseIndent == b.listBaseIndent else { return false }
+      guard a.range == b.range, a.xPosition == b.xPosition else { return false }
     }
 
     guard attrsEqual(baseAttributes, other.baseAttributes) else { return false }
