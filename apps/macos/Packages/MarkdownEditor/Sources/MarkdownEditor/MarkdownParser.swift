@@ -9,10 +9,15 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
   private(set) var nodes: [SyntaxNode] = []
   /// Tracks total nesting depth across all list types during traversal.
   private var listDepth = 0
+  /// Tracks blockquote nesting depth during traversal.
+  private var blockquoteDepth = 0
   /// The widest marker text and its rendered width among items in the
   /// current ordered list, so all items get consistent alignment.
   private var currentOrderedListWidestMarker: String?
   private var currentOrderedListWidestWidth: CGFloat = 0
+  /// The `headIndent` (content wrap position) of the innermost enclosing list item,
+  /// so child blockquotes and code blocks can position themselves inside the list's area.
+  private var currentListItemContentIndent: CGFloat = 0
 
   init(converter: SourceRangeConverter, style: MarkdownStyle = .default) {
     self.converter = converter
@@ -78,53 +83,97 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
   }
 
   mutating func visitBlockQuote(_ blockQuote: BlockQuote) -> () {
-    guard let sourceRange = blockQuote.range else { return descendInto(blockQuote) }
+    guard let sourceRange = blockQuote.range else {
+      blockquoteDepth += 1
+      descendInto(blockQuote)
+      blockquoteDepth -= 1
+      return
+    }
     let range = converter.nsRange(from: sourceRange)
     let nsText = converter.string as NSString
 
-    // Find all `> ` prefixes on each line within the blockquote range.
-    // These are the delimiter ranges that get hidden/revealed.
+    blockquoteDepth += 1
+    let depth = blockquoteDepth
+
+    // Find all `> ` prefixes on each line within the blockquote range
+    // that belong to THIS blockquote level. For nested blockquotes like
+    // `> > inner`, the outer blockquote should only claim the first `> `
+    // on each line, and the inner blockquote claims its own `> `.
     var delimiterRanges: [NSRange] = []
     let rangeEnd = range.location + range.length
 
     var pos = range.location
     while pos < rangeEnd {
-      // Check if this line starts with `> `
-      if pos < nsText.length, nsText.character(at: pos) == UInt16(0x003E) {  // '>'
-        // Check for space after '>'
-        let nextPos = pos + 1
-        if nextPos < nsText.length, nsText.character(at: nextPos) == UInt16(0x0020) {  // ' '
-          delimiterRanges.append(NSRange(location: pos, length: 2))  // "> "
+      // Find the actual start of the line (may be before the blockquote range
+      // for nested blockquotes where the range starts mid-line).
+      let actualLineStart = nsText.lineRange(for: NSRange(location: pos, length: 0)).location
+
+      // Skip list/continuation indentation whitespace, then skip `> ` prefixes
+      // from outer blockquote levels to find this level's prefix.
+      var linePos = actualLineStart
+      // Skip leading whitespace (list indentation for blockquotes inside lists)
+      while linePos < nsText.length {
+        let ch = nsText.character(at: linePos)
+        if ch == UInt16(0x0020) || ch == UInt16(0x0009) { linePos += 1 }
+        else { break }
+      }
+      var skippedLevels = 0
+      while skippedLevels < depth - 1, linePos < nsText.length {
+        // Skip whitespace between `> ` levels (for nested lists between blockquotes)
+        while linePos < nsText.length {
+          let ch = nsText.character(at: linePos)
+          if ch == UInt16(0x0020) || ch == UInt16(0x0009) { linePos += 1 }
+          else { break }
+        }
+        if nsText.character(at: linePos) == UInt16(0x003E) {  // '>'
+          let nextPos = linePos + 1
+          if nextPos < nsText.length, nsText.character(at: nextPos) == UInt16(0x0020) {
+            linePos += 2
+          } else {
+            linePos += 1
+          }
+          skippedLevels += 1
         } else {
-          // Just ">" without space
-          delimiterRanges.append(NSRange(location: pos, length: 1))
+          break
+        }
+      }
+
+      // Now check for this level's `> ` prefix
+      if linePos < nsText.length, nsText.character(at: linePos) == UInt16(0x003E) {
+        let nextPos = linePos + 1
+        if nextPos < nsText.length, nsText.character(at: nextPos) == UInt16(0x0020) {
+          delimiterRanges.append(NSRange(location: linePos, length: 2))
+        } else {
+          delimiterRanges.append(NSRange(location: linePos, length: 1))
         }
       }
 
       // Advance to next line
       while pos < rangeEnd {
-        if pos < nsText.length, nsText.character(at: pos) == UInt16(0x000A) {  // \n
+        if pos < nsText.length, nsText.character(at: pos) == UInt16(0x000A) {
           pos += 1
           break
         }
         pos += 1
       }
-      // If we didn't hit a newline, we're past the end
       if pos >= rangeEnd { break }
     }
 
     // Content range is the full range (content is interspersed with `> ` prefixes)
     let contentRange = range
 
+    let listBaseIndent = currentListItemContentIndent
+
     nodes.append(
       SyntaxNode(
-        type: .blockquote,
+        type: .blockquote(depth: depth, listBaseIndent: listBaseIndent),
         range: range,
         contentRange: contentRange,
         delimiterRanges: delimiterRanges,
-        attributes: style.blockquoteAttributes
+        attributes: style.blockquoteAttributes(depth: depth, baseIndent: listBaseIndent)
       ))
     descendInto(blockQuote)
+    blockquoteDepth -= 1
   }
 
   mutating func visitUnorderedList(_ unorderedList: UnorderedList) -> () {
@@ -200,19 +249,46 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
     // Compute leading whitespace before the marker. For nested items, the
     // source has indentation spaces that need to be hidden so the paragraph
     // style controls indentation instead.
+    //
+    // When inside a blockquote, the line starts with `> ` prefixes that are
+    // managed by the blockquote node, not the list item. Skip past all `> `
+    // prefixes to find the effective start of whitespace for this list item.
     let nsText = converter.string as NSString
     let lineStart = nsText.lineRange(for: NSRange(location: range.location, length: 0)).location
-    let leadingWhitespaceLength = range.location - lineStart
+    let effectiveLineStart: Int
+    if blockquoteDepth > 0 {
+      // Skip past blockquote `> ` prefixes at the start of the line
+      var pos = lineStart
+      var skipped = 0
+      while skipped < blockquoteDepth, pos < nsText.length {
+        if nsText.character(at: pos) == UInt16(0x003E) {  // '>'
+          pos += 1
+          if pos < nsText.length, nsText.character(at: pos) == UInt16(0x0020) {  // ' '
+            pos += 1
+          }
+          skipped += 1
+        } else {
+          break
+        }
+      }
+      effectiveLineStart = pos
+    } else {
+      effectiveLineStart = lineStart
+    }
+    let leadingWhitespaceLength = range.location - effectiveLineStart
 
     let contentRange = NSRange(
       location: range.location + markerLength,
       length: max(0, range.length - markerLength)
     )
 
+    // When inside a blockquote, offset list indentation by the blockquote's indent.
+    let baseIndent = style.blockquoteIndent * CGFloat(blockquoteDepth)
+    let indentLevel = listDepth
+
     if isUnordered {
       // Delimiter includes leading whitespace + marker ("    - ")
-      let delimiterRange = NSRange(location: lineStart, length: leadingWhitespaceLength + markerLength)
-      let indentLevel = listDepth
+      let delimiterRange = NSRange(location: effectiveLineStart, length: leadingWhitespaceLength + markerLength)
 
       // Check for checkbox list item: ListItem.checkbox is set by swift-markdown.
       // When a checkbox is present, swift-markdown's first child starts AFTER the
@@ -228,7 +304,7 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
             range: range,
             contentRange: contentRange,
             delimiterRanges: [delimiterRange],
-            attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: markerText)
+            attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: markerText, baseIndent: baseIndent)
           ))
       } else {
         nodes.append(
@@ -237,13 +313,12 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
             range: range,
             contentRange: contentRange,
             delimiterRanges: [delimiterRange],
-            attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: "• ")
+            attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: "• ", baseIndent: baseIndent)
           ))
       }
     } else {
       // Ordered list: leading whitespace is a delimiter (hidden when cursor
       // outside), but the number marker stays visible.
-      let indentLevel = listDepth
 
       // Use the widest marker in this list so all items align consistently.
       let widestMarkerText = currentOrderedListWidestMarker ?? "1. "
@@ -257,7 +332,7 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
 
       var delimiterRanges: [NSRange] = []
       if leadingWhitespaceLength > 0 {
-        delimiterRanges.append(NSRange(location: lineStart, length: leadingWhitespaceLength))
+        delimiterRanges.append(NSRange(location: effectiveLineStart, length: leadingWhitespaceLength))
       }
 
       nodes.append(
@@ -266,10 +341,18 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
           range: range,
           contentRange: contentRange,
           delimiterRanges: delimiterRanges,
-          attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: widestMarkerText)
+          attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: widestMarkerText, baseIndent: baseIndent)
         ))
     }
+
+    // Track content indent so child blockquotes/code blocks nest inside this list item
+    let prevContentIndent = currentListItemContentIndent
+    let bulletPosition = baseIndent + style.listIndent * CGFloat(indentLevel)
+    let effectiveMarkerText = isOrdered ? (currentOrderedListWidestMarker ?? "1. ") : "• "
+    let effectiveMarkerWidth = (effectiveMarkerText as NSString).size(withAttributes: [.font: style.baseFont]).width
+    currentListItemContentIndent = bulletPosition + effectiveMarkerWidth
     descendInto(listItem)
+    currentListItemContentIndent = prevContentIndent
   }
 
   mutating func visitThematicBreak(_ thematicBreak: ThematicBreak) -> () {
@@ -341,13 +424,17 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
       delimiterRanges.append(closingFenceRange)
     }
 
+    // Full parent indent: list nesting + blockquote nesting.
+    // The renderer adjusts the blockquote portion based on cursor state.
+    let parentBaseIndent = currentListItemContentIndent + style.blockquoteIndent * CGFloat(blockquoteDepth)
+
     nodes.append(
       SyntaxNode(
-        type: .codeBlock(language: language),
+        type: .codeBlock(language: language, listBaseIndent: parentBaseIndent),
         range: range,
         contentRange: contentRange,
         delimiterRanges: delimiterRanges,
-        attributes: style.codeBlockAttributes
+        attributes: style.codeBlockAttributes(baseIndent: parentBaseIndent)
       ))
   }
 

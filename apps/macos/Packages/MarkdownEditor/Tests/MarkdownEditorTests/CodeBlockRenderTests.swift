@@ -36,7 +36,7 @@ struct CodeBlockRenderTests {
     // codeBlockCharacterRanges, not via .backgroundColor on styled ranges.
     #expect(!spec.codeBlockCharacterRanges.isEmpty, "Code block should have character ranges for background drawing")
     #expect(
-      spec.codeBlockCharacterRanges.first == NSRange(location: 0, length: (text as NSString).length),
+      spec.codeBlockCharacterRanges.first?.range == NSRange(location: 0, length: (text as NSString).length),
       "Code block range should cover the full node")
   }
 

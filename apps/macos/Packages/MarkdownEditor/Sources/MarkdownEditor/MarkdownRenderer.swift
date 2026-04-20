@@ -34,7 +34,8 @@ enum MarkdownRenderer {
         uncheckedCheckboxIndexes: IndexSet(),
         checkedCheckboxIndexes: IndexSet(),
         temporaryAttributes: [],
-        codeBlockCharacterRanges: []
+        codeBlockCharacterRanges: [],
+        blockquoteCharacterRanges: []
       )
     }
 
@@ -66,7 +67,11 @@ enum MarkdownRenderer {
     var uncheckedCheckboxIndexes = IndexSet()
     var checkedCheckboxIndexes = IndexSet()
     var temporaryAttributes: [RenderSpec.StyledRange] = []
-    var codeBlockCharacterRanges: [NSRange] = []
+    var codeBlockCharacterRanges: [RenderSpec.CodeBlockRange] = []
+    var blockquoteCharacterRanges: [RenderSpec.BlockquoteRange] = []
+    // Track blockquote ranges where cursor is inside, so child constructs
+    // (like list items) can adjust their baseIndent accordingly.
+    var cursorInsideBlockquoteRanges: [(range: NSRange, depth: Int, listBaseIndent: CGFloat)] = []
 
     for node in nodes {
       let safeContentRange = clamp(node.contentRange, to: textLength)
@@ -133,9 +138,15 @@ enum MarkdownRenderer {
         // Content attributes — apply to the full line range so delimiters and
         // any trailing whitespace inherit the heading's paragraph style (font size,
         // spacing). Using lineRange ensures consistent styling across the entire line.
+        // When inside a blockquote, merge blockquote indentation into the heading's
+        // paragraph style so the heading aligns with other blockquote content.
         if !node.attributes.isEmpty {
+          let adjustedAttrs = adjustAttributesForBlockquoteHeading(
+            node.attributes, nodeRange: safeNodeRange,
+            cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges,
+            nodes: nodes, style: style)
           styledRanges.append(
-            RenderSpec.StyledRange(range: lineRange, attributes: node.attributes))
+            RenderSpec.StyledRange(range: lineRange, attributes: adjustedAttrs))
         }
 
         // Delimiter visibility (hidden vs revealed)
@@ -225,8 +236,12 @@ enum MarkdownRenderer {
           cursorRange, node: lineContentRange, textLength: textLength)
 
         if !node.attributes.isEmpty {
+          let adjustedAttrs = adjustAttributesForCursorActiveBlockquote(
+            node.attributes, nodeRange: safeNodeRange,
+            cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges,
+            nodes: nodes, style: style)
           styledRanges.append(
-            RenderSpec.StyledRange(range: lineRange, attributes: node.attributes))
+            RenderSpec.StyledRange(range: lineRange, attributes: adjustedAttrs))
         }
 
         // Pad shorter markers so content aligns with the widest marker in
@@ -240,24 +255,28 @@ enum MarkdownRenderer {
               attributes: [.kern: markerPadding]))
         }
 
-        // Leading whitespace is always hidden (paragraph style handles indentation).
-        for delim in node.delimiterRanges {
-          let safeDelim = clamp(delim, to: textLength)
-          guard safeDelim.length > 0 else { continue }
-          hiddenIndexes.insert(
-            integersIn: safeDelim.location..<(safeDelim.location + safeDelim.length))
+        // Leading whitespace handling: when directly inside a cursor-active
+        // blockquote, keep whitespace visible (it's part of the raw markdown
+        // the user is editing and provides nesting visual). Otherwise hide it
+        // (paragraph style handles indentation).
+        let orderedDirectBQ = isDirectlyInsideCursorActiveBlockquote(
+          nodeRange: safeNodeRange,
+          cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges,
+          nodes: nodes)
+        if !orderedDirectBQ {
+          for delim in node.delimiterRanges {
+            let safeDelim = clamp(delim, to: textLength)
+            guard safeDelim.length > 0 else { continue }
+            hiddenIndexes.insert(
+              integersIn: safeDelim.location..<(safeDelim.location + safeDelim.length))
+          }
+          hideContinuationWhitespace(
+            in: nsText, nodeRange: safeNodeRange, textLength: textLength,
+            hiddenIndexes: &hiddenIndexes)
+          applyContinuationParagraphStyle(
+            in: nsText, nodeRange: safeNodeRange, nodeAttributes: node.attributes,
+            textLength: textLength, styledRanges: &styledRanges)
         }
-
-        // Hide leading whitespace on continuation lines within this list item.
-        hideContinuationWhitespace(
-          in: nsText, nodeRange: safeNodeRange, textLength: textLength,
-          hiddenIndexes: &hiddenIndexes)
-
-        // Override firstLineHeadIndent on continuation lines so they align
-        // with content, not the marker position.
-        applyContinuationParagraphStyle(
-          in: nsText, nodeRange: safeNodeRange, nodeAttributes: node.attributes,
-          textLength: textLength, styledRanges: &styledRanges)
 
       case .checkboxListItem(let checked, _):
         // Checkbox list items: same pattern as unordered but with checkbox glyph
@@ -281,9 +300,18 @@ enum MarkdownRenderer {
           cursorRange, node: lineContentRange, textLength: textLength)
 
         if !node.attributes.isEmpty {
+          let adjustedAttrs = adjustAttributesForCursorActiveBlockquote(
+            node.attributes, nodeRange: safeNodeRange,
+            cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges,
+            nodes: nodes, style: style)
           styledRanges.append(
-            RenderSpec.StyledRange(range: lineRange, attributes: node.attributes))
+            RenderSpec.StyledRange(range: lineRange, attributes: adjustedAttrs))
         }
+
+        let checkboxDirectBQ = isDirectlyInsideCursorActiveBlockquote(
+          nodeRange: safeNodeRange,
+          cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges,
+          nodes: nodes)
 
         for delim in node.delimiterRanges {
           let safeDelim = clamp(delim, to: textLength)
@@ -293,8 +321,8 @@ enum MarkdownRenderer {
           let leadingStart = safeDelim.location
           let delimEnd = safeDelim.location + safeDelim.length
 
-          // Always hide leading whitespace
-          if markerCharIndex > leadingStart {
+          // Hide leading whitespace only when NOT in cursor-active blockquote
+          if !checkboxDirectBQ, markerCharIndex > leadingStart {
             hiddenIndexes.insert(integersIn: leadingStart..<markerCharIndex)
           }
 
@@ -329,16 +357,14 @@ enum MarkdownRenderer {
           }
         }
 
-        // Hide leading whitespace on continuation lines within this list item.
-        hideContinuationWhitespace(
-          in: nsText, nodeRange: safeNodeRange, textLength: textLength,
-          hiddenIndexes: &hiddenIndexes)
-
-        // Override firstLineHeadIndent on continuation lines so they align
-        // with content, not the marker position.
-        applyContinuationParagraphStyle(
-          in: nsText, nodeRange: safeNodeRange, nodeAttributes: node.attributes,
-          textLength: textLength, styledRanges: &styledRanges)
+        if !checkboxDirectBQ {
+          hideContinuationWhitespace(
+            in: nsText, nodeRange: safeNodeRange, textLength: textLength,
+            hiddenIndexes: &hiddenIndexes)
+          applyContinuationParagraphStyle(
+            in: nsText, nodeRange: safeNodeRange, nodeAttributes: node.attributes,
+            textLength: textLength, styledRanges: &styledRanges)
+        }
 
       case .inlineCode:
         let cursorInNode = cursorOverlaps(
@@ -403,28 +429,61 @@ enum MarkdownRenderer {
           hiddenIndexes: &hiddenIndexes,
           temporaryAttributes: &temporaryAttributes)
 
-      case .codeBlock:
+      case .codeBlock(_, let parsedBaseIndent):
         // Code block: the entire multi-line block is the construct.
         // Cursor anywhere within reveals the fences; cursor outside hides them.
         // Use the full node range (including fences) for cursor detection.
         let cursorInNode = cursorOverlaps(
           cursorRange, node: safeNodeRange, textLength: textLength)
 
-        // Apply code attributes (font, paragraph style) to the FULL node
-        // range — including fence lines. This is critical because when fences
-        // are hidden, TextKit collapses paragraphs and uses the paragraph
-        // style from the first character of the merged paragraph. Without
-        // this, the hidden fence characters would have the base paragraph
-        // style (no indent), causing misaligned content.
-        if safeNodeRange.length > 0, !node.attributes.isEmpty {
-          styledRanges.append(
-            RenderSpec.StyledRange(range: safeNodeRange, attributes: node.attributes))
+        // Compute effective base indent: the parsed value includes both list
+        // and blockquote contributions. Reduce the blockquote portion when
+        // cursor is inside a parent blockquote (same logic as list items).
+        let effectiveBaseIndent: CGFloat
+        if isDirectlyInsideCursorActiveBlockquote(
+          nodeRange: safeNodeRange,
+          cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges,
+          nodes: nodes)
+        {
+          // Directly inside cursor-active blockquote: visible chars provide layout.
+          let parentBQ = cursorInsideBlockquoteRanges
+            .filter { bq in
+              bq.range.location <= safeNodeRange.location
+                && bq.range.location + bq.range.length >= safeNodeRange.location + safeNodeRange.length
+            }
+            .max(by: { $0.depth < $1.depth })
+          effectiveBaseIndent = parentBQ?.listBaseIndent ?? 0
+        } else {
+          let parentDepth = deepestCursorActiveBlockquoteDepth(
+            forNodeAt: safeNodeRange,
+            cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges)
+          if parentDepth > 0 {
+            let reduction = style.blockquoteIndent * CGFloat(parentDepth)
+            effectiveBaseIndent = max(0, parsedBaseIndent - reduction)
+          } else {
+            effectiveBaseIndent = parsedBaseIndent
+          }
         }
 
-        // Record the code block range for full-width background drawing
-        // by CodeBlockBackgroundLayoutManager.
+        // Apply code attributes (font, paragraph style) to the FULL node
+        // range — including fence lines.
+        if safeNodeRange.length > 0, !node.attributes.isEmpty {
+          var attrs = node.attributes
+          if effectiveBaseIndent > 0, let existingPS = attrs[.paragraphStyle] as? NSParagraphStyle {
+            let newPS = NSMutableParagraphStyle()
+            newPS.setParagraphStyle(existingPS)
+            newPS.headIndent += effectiveBaseIndent
+            newPS.firstLineHeadIndent += effectiveBaseIndent
+            attrs[.paragraphStyle] = newPS.copy() as! NSParagraphStyle
+          }
+          styledRanges.append(
+            RenderSpec.StyledRange(range: safeNodeRange, attributes: attrs))
+        }
+
+        // Record the code block range for background drawing.
         if safeNodeRange.length > 0 {
-          codeBlockCharacterRanges.append(safeNodeRange)
+          codeBlockCharacterRanges.append(
+            RenderSpec.CodeBlockRange(range: safeNodeRange, baseIndent: effectiveBaseIndent))
         }
 
         // Delimiter visibility (hidden vs revealed)
@@ -436,17 +495,38 @@ enum MarkdownRenderer {
           hiddenIndexes: &hiddenIndexes,
           temporaryAttributes: &temporaryAttributes)
 
-      case .blockquote:
+      case .blockquote(let depth, let listBaseIndent):
         // Blockquote: the entire multi-line block is the construct.
         // Cursor anywhere within reveals the `> ` prefixes; cursor outside hides them.
         let cursorInNode = cursorOverlaps(
           cursorRange, node: safeNodeRange, textLength: textLength)
 
-        // Apply blockquote attributes (secondary label color, indentation) to the
-        // full node range so all lines get the blockquote styling.
-        if safeNodeRange.length > 0, !node.attributes.isEmpty {
+        // Compute effective depth: when cursor is inside a parent blockquote,
+        // that parent's `> ` prefix is visible (no indent needed), so we only
+        // need indentation for the remaining depth levels.
+        let parentCursorDepth = deepestCursorActiveBlockquoteDepth(
+          forNodeAt: safeNodeRange,
+          cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges)
+        let effectiveDepth = cursorInNode ? depth : max(0, depth - parentCursorDepth)
+
+        // Adjust listBaseIndent: if this blockquote's parent list is itself
+        // inside a cursor-active blockquote, the list's continuation whitespace
+        // is visible and provides the layout offset, so listBaseIndent = 0.
+        let effectiveListBaseIndent: CGFloat
+        if listBaseIndent > 0, parentCursorDepth > 0 {
+          effectiveListBaseIndent = 0
+        } else {
+          effectiveListBaseIndent = listBaseIndent
+        }
+
+        // Apply blockquote attributes using effective depth.
+        let blockquoteAttrs = style.blockquoteAttributes(
+          depth: effectiveDepth, cursorInside: cursorInNode, baseIndent: effectiveListBaseIndent)
+
+        if safeNodeRange.length > 0 {
+          let lineRange = nsText.lineRange(for: safeNodeRange)
           styledRanges.append(
-            RenderSpec.StyledRange(range: safeNodeRange, attributes: node.attributes))
+            RenderSpec.StyledRange(range: lineRange, attributes: blockquoteAttrs))
         }
 
         // Delimiter visibility (hidden vs revealed) for all `> ` prefixes
@@ -457,6 +537,21 @@ enum MarkdownRenderer {
           style: style,
           hiddenIndexes: &hiddenIndexes,
           temporaryAttributes: &temporaryAttributes)
+
+        // Record blockquote range for left border drawing when cursor is outside.
+        // Use effective depth so the border position accounts for cursor-active parents.
+        if !cursorInNode && effectiveDepth > 0 && safeNodeRange.length > 0 {
+          blockquoteCharacterRanges.append(
+            RenderSpec.BlockquoteRange(
+              range: safeNodeRange, depth: effectiveDepth,
+              listBaseIndent: effectiveListBaseIndent))
+        }
+
+        // Track cursor-inside blockquotes so child constructs can adjust indent.
+        if cursorInNode {
+          cursorInsideBlockquoteRanges.append(
+            (range: safeNodeRange, depth: depth, listBaseIndent: effectiveListBaseIndent))
+        }
 
       case .thematicBreak:
         // Thematic break: the entire `---`/`***`/`___` is the construct.
@@ -499,14 +594,24 @@ enum MarkdownRenderer {
           cursorRange, node: lineContentRange, textLength: textLength)
 
         // Apply list item attributes (indentation) to the full line range.
+        // Adjust baseIndent when inside a cursor-active blockquote.
         if !node.attributes.isEmpty {
+          let adjustedAttrs = adjustAttributesForCursorActiveBlockquote(
+            node.attributes, nodeRange: safeNodeRange,
+            cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges,
+            nodes: nodes, style: style)
           styledRanges.append(
-            RenderSpec.StyledRange(range: lineRange, attributes: node.attributes))
+            RenderSpec.StyledRange(range: lineRange, attributes: adjustedAttrs))
         }
 
         // Delimiter is: [leading whitespace][marker char][space]
-        // Leading whitespace is ALWAYS hidden (paragraph style handles indentation).
-        // The marker portion is hidden/revealed based on cursor position.
+        // When directly inside a cursor-active blockquote, keep leading
+        // whitespace visible (raw markdown editing). Otherwise hide it.
+        let unorderedDirectBQ = isDirectlyInsideCursorActiveBlockquote(
+          nodeRange: safeNodeRange,
+          cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges,
+          nodes: nodes)
+
         for delim in node.delimiterRanges {
           let safeDelim = clamp(delim, to: textLength)
           guard safeDelim.length > 0 else { continue }
@@ -515,8 +620,8 @@ enum MarkdownRenderer {
           let leadingStart = safeDelim.location
           let delimEnd = safeDelim.location + safeDelim.length
 
-          // Always hide leading whitespace
-          if markerCharIndex > leadingStart {
+          // Hide leading whitespace only when NOT in cursor-active blockquote
+          if !unorderedDirectBQ, markerCharIndex > leadingStart {
             hiddenIndexes.insert(integersIn: leadingStart..<markerCharIndex)
           }
 
@@ -546,16 +651,18 @@ enum MarkdownRenderer {
           }
         }
 
-        // Hide leading whitespace on continuation lines within this list item.
-        hideContinuationWhitespace(
-          in: nsText, nodeRange: safeNodeRange, textLength: textLength,
-          hiddenIndexes: &hiddenIndexes)
+        if !unorderedDirectBQ {
+          // Hide leading whitespace on continuation lines within this list item.
+          hideContinuationWhitespace(
+            in: nsText, nodeRange: safeNodeRange, textLength: textLength,
+            hiddenIndexes: &hiddenIndexes)
 
-        // Override firstLineHeadIndent on continuation lines so they align
-        // with content, not the marker position.
-        applyContinuationParagraphStyle(
-          in: nsText, nodeRange: safeNodeRange, nodeAttributes: node.attributes,
-          textLength: textLength, styledRanges: &styledRanges)
+          // Override firstLineHeadIndent on continuation lines so they align
+          // with content, not the marker position.
+          applyContinuationParagraphStyle(
+            in: nsText, nodeRange: safeNodeRange, nodeAttributes: node.attributes,
+            textLength: textLength, styledRanges: &styledRanges)
+        }
       }
     }
 
@@ -568,7 +675,8 @@ enum MarkdownRenderer {
       uncheckedCheckboxIndexes: uncheckedCheckboxIndexes,
       checkedCheckboxIndexes: checkedCheckboxIndexes,
       temporaryAttributes: temporaryAttributes,
-      codeBlockCharacterRanges: codeBlockCharacterRanges
+      codeBlockCharacterRanges: codeBlockCharacterRanges,
+      blockquoteCharacterRanges: blockquoteCharacterRanges
     )
   }
 
@@ -597,6 +705,169 @@ enum MarkdownRenderer {
         hiddenIndexes.insert(integersIn: range)
       }
     }
+  }
+
+  /// Find the depth of the deepest cursor-active blockquote containing a node.
+  /// Returns 0 if the node is not inside any cursor-active blockquote.
+  private static func deepestCursorActiveBlockquoteDepth(
+    forNodeAt nodeRange: NSRange,
+    cursorInsideBlockquoteRanges: [(range: NSRange, depth: Int, listBaseIndent: CGFloat)]
+  ) -> Int {
+    cursorInsideBlockquoteRanges
+      .filter { bq in
+        bq.range.location <= nodeRange.location
+          && bq.range.location + bq.range.length >= nodeRange.location + nodeRange.length
+      }
+      .map(\.depth)
+      .max() ?? 0
+  }
+
+  /// Check if a node is *directly* inside a cursor-active blockquote (i.e., its
+  /// innermost containing blockquote is cursor-active). When true, the `> ` prefix
+  /// is visible on the same line, so paragraph indent should be zero and leading
+  /// whitespace should remain visible (it's part of the raw markdown).
+  private static func isDirectlyInsideCursorActiveBlockquote(
+    nodeRange: NSRange,
+    cursorInsideBlockquoteRanges: [(range: NSRange, depth: Int, listBaseIndent: CGFloat)],
+    nodes: [SyntaxNode]
+  ) -> Bool {
+    let parentDepth = deepestCursorActiveBlockquoteDepth(
+      forNodeAt: nodeRange, cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges)
+    guard parentDepth > 0 else { return false }
+    let innermostBQDepth = nodes
+      .compactMap { n -> Int? in
+        guard case .blockquote(let d, _) = n.type,
+          n.range.location <= nodeRange.location,
+          n.range.location + n.range.length >= nodeRange.location + nodeRange.length
+        else { return nil }
+        return d
+      }
+      .max() ?? 0
+    return innermostBQDepth <= parentDepth
+  }
+
+  /// Adjust child construct attributes when inside a cursor-active blockquote.
+  ///
+  /// When cursor is inside a blockquote, its `> ` prefix is visible at position 0,
+  /// so paragraph indentation must be adjusted:
+  /// - Constructs *directly* inside the cursor-active blockquote (no intervening
+  ///   non-cursor-active blockquote) get ALL indentation zeroed. The visible `> `
+  ///   and any markers provide visual offset through their character widths.
+  /// - Constructs inside a deeper *non*-cursor-active blockquote have only the
+  ///   cursor-active parent's share subtracted, retaining the hidden inner
+  ///   blockquote's indentation.
+  private static func adjustAttributesForCursorActiveBlockquote(
+    _ attributes: [NSAttributedString.Key: Any],
+    nodeRange: NSRange,
+    cursorInsideBlockquoteRanges: [(range: NSRange, depth: Int, listBaseIndent: CGFloat)],
+    nodes: [SyntaxNode],
+    style: MarkdownStyle
+  ) -> [NSAttributedString.Key: Any] {
+    // Find the deepest cursor-active blockquote containing this node (full tuple).
+    let parentBQ = cursorInsideBlockquoteRanges
+      .filter { bq in
+        bq.range.location <= nodeRange.location
+          && bq.range.location + bq.range.length >= nodeRange.location + nodeRange.length
+      }
+      .max(by: { $0.depth < $1.depth })
+    guard let parentBQ = parentBQ else { return attributes }
+
+    guard let existingPS = attributes[.paragraphStyle] as? NSParagraphStyle else {
+      return attributes
+    }
+
+    // Find the innermost blockquote containing this node.
+    let innermostBQDepth = nodes
+      .compactMap { n -> Int? in
+        guard case .blockquote(let d, _) = n.type,
+          n.range.location <= nodeRange.location,
+          n.range.location + n.range.length >= nodeRange.location + nodeRange.length
+        else { return nil }
+        return d
+      }
+      .max() ?? 0
+
+    let newPS = NSMutableParagraphStyle()
+    newPS.setParagraphStyle(existingPS)
+
+    if innermostBQDepth <= parentBQ.depth {
+      // Directly inside the cursor-active blockquote (no intervening
+      // non-cursor-active blockquote). Set indentation to the parent
+      // blockquote's list base indent so the visible `> ` prefix stays
+      // at the correct position within its enclosing list item.
+      newPS.firstLineHeadIndent = parentBQ.listBaseIndent
+      newPS.headIndent = parentBQ.listBaseIndent
+    } else {
+      // Inside a deeper non-cursor-active blockquote: subtract only the
+      // cursor-active parent's share, retaining the inner blockquote's indent.
+      let indentReduction = style.blockquoteIndent * CGFloat(parentBQ.depth)
+      newPS.firstLineHeadIndent = max(parentBQ.listBaseIndent, newPS.firstLineHeadIndent - indentReduction)
+      newPS.headIndent = max(parentBQ.listBaseIndent, newPS.headIndent - indentReduction)
+    }
+
+    var newAttrs = attributes
+    newAttrs[.paragraphStyle] = newPS.copy() as! NSParagraphStyle
+    return newAttrs
+  }
+
+  /// Adjust heading attributes when inside a blockquote.
+  /// The heading's own paragraph style (with indent 0) overwrites the blockquote's,
+  /// so we merge the appropriate blockquote indent into the heading's paragraph style.
+  /// Uses effective depth: when cursor is inside a parent blockquote, only the
+  /// remaining (non-cursor-active) blockquote levels contribute indent.
+  private static func adjustAttributesForBlockquoteHeading(
+    _ attributes: [NSAttributedString.Key: Any],
+    nodeRange: NSRange,
+    cursorInsideBlockquoteRanges: [(range: NSRange, depth: Int, listBaseIndent: CGFloat)],
+    nodes: [SyntaxNode],
+    style: MarkdownStyle
+  ) -> [NSAttributedString.Key: Any] {
+    // Find the innermost containing blockquote node
+    let containingBQ = nodes.last { node in
+      if case .blockquote(let depth, _) = node.type {
+        return node.range.location <= nodeRange.location
+          && node.range.location + node.range.length >= nodeRange.location + nodeRange.length
+          && depth > 0
+      }
+      return false
+    }
+    guard let bqNode = containingBQ,
+      case .blockquote(let bqDepth, let bqListBaseIndent) = bqNode.type
+    else {
+      return attributes
+    }
+
+    // Compute effective depth: subtract cursor-active parent's depth
+    let parentCursorDepth = deepestCursorActiveBlockquoteDepth(
+      forNodeAt: nodeRange, cursorInsideBlockquoteRanges: cursorInsideBlockquoteRanges)
+    let effectiveDepth = max(0, bqDepth - parentCursorDepth)
+
+    guard effectiveDepth > 0 || bqListBaseIndent > 0 else {
+      // Cursor is inside this blockquote (or a blockquote at same/deeper level);
+      // `> ` is visible, heading indent should be 0, and no list base indent.
+      return attributes
+    }
+
+    guard let existingPS = attributes[.paragraphStyle] as? NSParagraphStyle else {
+      return attributes
+    }
+    let newPS = NSMutableParagraphStyle()
+    newPS.setParagraphStyle(existingPS)
+
+    if effectiveDepth == 0 {
+      // Cursor is inside the blockquote, but there's a list base indent to apply
+      newPS.firstLineHeadIndent = newPS.firstLineHeadIndent + bqListBaseIndent
+      newPS.headIndent = newPS.headIndent + bqListBaseIndent
+    } else {
+      // Add the effective blockquote indent plus list base indent to heading
+      let totalIndent = bqListBaseIndent + style.blockquoteIndent * CGFloat(effectiveDepth)
+      newPS.firstLineHeadIndent = newPS.firstLineHeadIndent + totalIndent
+      newPS.headIndent = newPS.headIndent + totalIndent
+    }
+
+    var newAttrs = attributes
+    newAttrs[.paragraphStyle] = newPS.copy() as! NSParagraphStyle
+    return newAttrs
   }
 
   /// Check if cursor range overlaps with a node range (inclusive of boundaries).

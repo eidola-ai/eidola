@@ -43,6 +43,24 @@ enum EditorUpdate {
   private static let blockquoteItemPattern = try! NSRegularExpression(
     pattern: #"^> .+"#, options: [])
 
+  // Regex matching leading blockquote prefixes: one or more `> ` sequences.
+  private static let blockquotePrefixPattern = try! NSRegularExpression(
+    pattern: #"^((?:> )+)"#, options: [])
+
+  /// Extract the blockquote prefix (e.g. `"> "`, `"> > "`) from the start of a line.
+  /// Returns the prefix string and the remaining line text with the prefix stripped.
+  private static func extractBlockquotePrefix(_ lineText: String) -> (prefix: String, stripped: String) {
+    let lineNS = lineText as NSString
+    if let match = blockquotePrefixPattern.firstMatch(
+      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+    {
+      let prefix = lineNS.substring(with: match.range(at: 1))
+      let stripped = lineNS.substring(from: match.range(at: 1).length)
+      return (prefix, stripped)
+    }
+    return ("", lineText)
+  }
+
   /// Compute the next editor state from the current state and an event.
   static func update(_ state: EditorState, event: EditorEvent) -> EditorState {
     let newState: EditorState
@@ -122,48 +140,73 @@ enum EditorUpdate {
     }
 
     let (lineRange, lineText) = currentLine(nsMarkdown, at: pos)
-    let lineNS = lineText as NSString
 
-    // Check if the current line is an empty checkbox list item (just marker + checkbox, no content).
+    // Extract blockquote prefix (e.g. "> ", "> > ") from the current line, then
+    // run list/blockquote detection on the stripped (inner) text. This way the
+    // same list-continuation logic works both at top level and inside blockquotes.
+    let (bqPrefix, strippedLine) = extractBlockquotePrefix(lineText)
+    let strippedNS = strippedLine as NSString
+
+    // Check if the stripped line is an empty checkbox list item (just marker + checkbox, no content).
     let emptyCheckboxMatch = checkboxMarkerPattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
     if emptyCheckboxMatch != nil {
-      // Remove the marker line entirely, leave a blank line.
-      let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: "\n")
-      return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location))
+      if bqPrefix.isEmpty {
+        // Remove the marker line entirely, leave a blank line.
+        let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: "\n")
+        return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location))
+      } else {
+        // Inside blockquote: remove list marker but keep blockquote prefix.
+        let replacement = "\(bqPrefix)\n"
+        let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: replacement)
+        return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location + bqPrefix.count))
+      }
     }
 
-    // Check if the current line is an empty list item (just marker, no content).
-    // Pattern: optional whitespace + marker char + space + end-of-line
+    // Check if the stripped line is an empty list item (just marker, no content).
     let emptyMatch = listMarkerPattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
     if emptyMatch != nil {
-      // Remove the marker line entirely, leave a blank line.
-      let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: "\n")
-      return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location))
+      if bqPrefix.isEmpty {
+        // Remove the marker line entirely, leave a blank line.
+        let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: "\n")
+        return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location))
+      } else {
+        // Inside blockquote: remove list marker but keep blockquote prefix.
+        let replacement = "\(bqPrefix)\n"
+        let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: replacement)
+        return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location + bqPrefix.count))
+      }
     }
 
-    // Check if the current line is an empty ordered list item.
+    // Check if the stripped line is an empty ordered list item.
     let emptyOrderedMatch = orderedListMarkerPattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
     if emptyOrderedMatch != nil {
-      // Remove the marker line entirely, leave a blank line.
-      let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: "\n")
-      return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location))
+      if bqPrefix.isEmpty {
+        // Remove the marker line entirely, leave a blank line.
+        let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: "\n")
+        return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location))
+      } else {
+        // Inside blockquote: remove list marker but keep blockquote prefix.
+        let replacement = "\(bqPrefix)\n"
+        let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: replacement)
+        return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location + bqPrefix.count))
+      }
     }
 
-    // Check if the current line is a non-empty ordered list item.
+    // Check if the stripped line is a non-empty ordered list item.
     let orderedItemMatch = orderedListItemPattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
     if let orderedItemMatch = orderedItemMatch {
       // Extract the current number and increment it.
       let indentRange = orderedItemMatch.range(at: 1)
-      let indent = lineNS.substring(with: indentRange)
+      let indent = strippedNS.substring(with: indentRange)
       let numberRange = orderedItemMatch.range(at: 2)
-      let numberStr = lineNS.substring(with: numberRange)
+      let numberStr = strippedNS.substring(with: numberRange)
       let currentNumber = Int(numberStr) ?? 1
       let nextNumber = currentNumber + 1
-      let prefix = "\(indent)\(nextNumber). "
+      let prefix = "\(bqPrefix)\(indent)\(nextNumber). "
 
       // First, handle any selected text by deleting it.
       var workMarkdown = state.markdown
@@ -186,16 +229,13 @@ enum EditorUpdate {
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
-    // Check if the current line is a non-empty checkbox list item.
+    // Check if the stripped line is a non-empty checkbox list item.
     let checkboxItemMatch = checkboxItemPattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
     if let checkboxItemMatch = checkboxItemMatch {
       // Continue the list with a new unchecked checkbox.
-      // Extract the prefix up to the checkbox and build a new unchecked prefix.
       let fullPrefixRange = checkboxItemMatch.range(at: 1)
-      let fullPrefix = lineNS.substring(with: fullPrefixRange)
-      // Replace the checkbox state with unchecked: the prefix ends with "[ ] " or "[x] "
-      // We want to always continue with "[ ] ". Extract the part before the checkbox.
+      let fullPrefix = strippedNS.substring(with: fullPrefixRange)
       let checkboxRegex = try! NSRegularExpression(pattern: #"^([ \t]*[-*+] )\[[xX ]\] $"#, options: [])
       let basePrefix: String
       if let baseMatch = checkboxRegex.firstMatch(
@@ -220,20 +260,20 @@ enum EditorUpdate {
       }
 
       let workNS = workMarkdown as NSString
-      let insertion = "\n\(basePrefix)"
+      let insertion = "\n\(bqPrefix)\(basePrefix)"
       let newMarkdown = workNS.replacingCharacters(
         in: NSRange(location: workPos, length: 0), with: insertion)
       let newPos = workPos + (insertion as NSString).length
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
-    // Check if the current line is a non-empty unordered list item.
+    // Check if the stripped line is a non-empty unordered list item.
     let itemMatch = listItemPattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
     if let itemMatch = itemMatch {
-      // Continue the list: insert newline + same marker prefix.
+      // Continue the list: insert newline + blockquote prefix + same marker prefix.
       let prefixRange = itemMatch.range(at: 1)
-      let prefix = lineNS.substring(with: prefixRange)
+      let prefix = strippedNS.substring(with: prefixRange)
 
       // First, handle any selected text by deleting it.
       var workMarkdown = state.markdown
@@ -249,27 +289,24 @@ enum EditorUpdate {
       }
 
       let workNS = workMarkdown as NSString
-      let insertion = "\n\(prefix)"
+      let insertion = "\n\(bqPrefix)\(prefix)"
       let newMarkdown = workNS.replacingCharacters(
         in: NSRange(location: workPos, length: 0), with: insertion)
       let newPos = workPos + (insertion as NSString).length
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
-    // Check if the current line is an empty blockquote (just "> ", no content).
-    let emptyBlockquoteMatch = emptyBlockquotePattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
-    if emptyBlockquoteMatch != nil {
+    // Check if the current line is an empty blockquote (just "> " prefix(es), no content after stripping).
+    // This handles both simple "> " and nested "> > " empty blockquote lines.
+    if !bqPrefix.isEmpty && strippedLine.isEmpty {
       // Remove the marker line entirely, leave a blank line.
       let newMarkdown = nsMarkdown.replacingCharacters(in: lineRange, with: "\n")
       return EditorState(markdown: newMarkdown, selection: .cursor(lineRange.location))
     }
 
-    // Check if the current line is a non-empty blockquote line.
-    let blockquoteItemMatch = blockquoteItemPattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
-    if blockquoteItemMatch != nil {
-      // Continue the blockquote: insert newline + "> ".
+    // Check if the current line is a non-empty blockquote line (has prefix and content).
+    if !bqPrefix.isEmpty && !strippedLine.isEmpty {
+      // Continue the blockquote: insert newline + same blockquote prefix.
       var workMarkdown = state.markdown
       var workPos = pos
       if case .range(let anchor, let head) = state.selection {
@@ -283,7 +320,7 @@ enum EditorUpdate {
       }
 
       let workNS = workMarkdown as NSString
-      let insertion = "\n> "
+      let insertion = "\n\(bqPrefix)"
       let newMarkdown = workNS.replacingCharacters(
         in: NSRange(location: workPos, length: 0), with: insertion)
       let newPos = workPos + (insertion as NSString).length
@@ -350,32 +387,33 @@ enum EditorUpdate {
 
     let workNS = workMarkdown as NSString
     let (_, lineText) = currentLine(workNS, at: workPos)
-    let lineNS = lineText as NSString
 
-    // Check if the current line starts with a checkbox list marker.
+    // Extract blockquote prefix so continuation lines inside blockquotes work.
+    let (bqPrefix, strippedLine) = extractBlockquotePrefix(lineText)
+    let strippedNS = strippedLine as NSString
+
+    // Check if the stripped line starts with a checkbox list marker.
     let checkboxLinePattern = try! NSRegularExpression(
       pattern: #"^([ \t]*)([-*+]) \[[xX ]\] "#, options: [])
     if let match = checkboxLinePattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
     {
       let markerWidth = match.range.length
       let indent = String(repeating: " ", count: markerWidth)
-      let insertion = "\n\(indent)"
+      let insertion = "\n\(bqPrefix)\(indent)"
       let newMarkdown = workNS.replacingCharacters(
         in: NSRange(location: workPos, length: 0), with: insertion)
       let newPos = workPos + (insertion as NSString).length
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
-    // Check if the current line starts with a list marker.
+    // Check if the stripped line starts with a list marker.
     if let match = anyListMarkerWidthPattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
     {
-      // The full marker (indent + marker chars + space) width determines
-      // how many spaces to indent the continuation line.
       let markerWidth = match.range.length
       let indent = String(repeating: " ", count: markerWidth)
-      let insertion = "\n\(indent)"
+      let insertion = "\n\(bqPrefix)\(indent)"
       let newMarkdown = workNS.replacingCharacters(
         in: NSRange(location: workPos, length: 0), with: insertion)
       let newPos = workPos + (insertion as NSString).length
@@ -387,19 +425,16 @@ enum EditorUpdate {
     if let parent = findParentListItem(in: workNS, at: workPos) {
       let markerWidth = parent.prefix.count
       let indent = String(repeating: " ", count: markerWidth)
-      let insertion = "\n\(indent)"
+      let insertion = "\n\(bqPrefix)\(indent)"
       let newMarkdown = workNS.replacingCharacters(
         in: NSRange(location: workPos, length: 0), with: insertion)
       let newPos = workPos + (insertion as NSString).length
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
-    // Check if the current line is a blockquote line.
-    let blockquoteLinePattern = try! NSRegularExpression(pattern: #"^> "#, options: [])
-    if blockquoteLinePattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length)) != nil
-    {
-      let insertion = "\n> "
+    // Check if the current line is a blockquote line (has any `> ` prefix).
+    if !bqPrefix.isEmpty {
+      let insertion = "\n\(bqPrefix)"
       let newMarkdown = workNS.replacingCharacters(
         in: NSRange(location: workPos, length: 0), with: insertion)
       let newPos = workPos + (insertion as NSString).length
@@ -445,21 +480,26 @@ enum EditorUpdate {
 
       // Check if cursor is right after a list marker (e.g., "- |content" or "1. |content").
       // If so, remove the entire marker instead of just one character.
+      // Inside blockquotes, strip the blockquote prefix first, then check for list markers.
       let (lineRange, lineText) = currentLine(nsMarkdown, at: clampedPos)
       let lineNS = lineText as NSString
       let posInLine = clampedPos - lineRange.location
 
-      // Match checkbox: "  - [ ] " or "- [x] " at start of line
+      let (bqPrefix, strippedLine) = extractBlockquotePrefix(lineText)
+      let strippedNS = strippedLine as NSString
+      let posInStripped = posInLine - bqPrefix.count
+
+      // Match checkbox: "  - [ ] " or "- [x] " at start of (stripped) line
       let checkboxMarkerRegex = try! NSRegularExpression(
         pattern: #"^([ \t]*)([-*+]) \[[xX ]\] "#, options: [])
       if let match = checkboxMarkerRegex.firstMatch(
-        in: lineText, range: NSRange(location: 0, length: lineNS.length))
+        in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
       {
         let markerEnd = match.range.location + match.range.length
-        if posInLine == markerEnd {
-          // Cursor is right after checkbox marker — remove the entire marker.
+        if posInStripped == markerEnd {
+          // Cursor is right after checkbox marker — remove the entire marker (keep bqPrefix).
           let markerAbsRange = NSRange(
-            location: lineRange.location + match.range.location,
+            location: lineRange.location + bqPrefix.count + match.range.location,
             length: match.range.length)
           let newMarkdown = nsMarkdown.replacingCharacters(in: markerAbsRange, with: "")
           return EditorState(
@@ -467,16 +507,16 @@ enum EditorUpdate {
         }
       }
 
-      // Match unordered: "  - " or "- " at start of line
+      // Match unordered: "  - " or "- " at start of (stripped) line
       let markerRegex = try! NSRegularExpression(pattern: #"^([ \t]*)([-*+]) "#, options: [])
       if let match = markerRegex.firstMatch(
-        in: lineText, range: NSRange(location: 0, length: lineNS.length))
+        in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
       {
         let markerEnd = match.range.location + match.range.length
-        if posInLine == markerEnd {
-          // Cursor is right after marker — remove the entire marker.
+        if posInStripped == markerEnd {
+          // Cursor is right after marker — remove the entire marker (keep bqPrefix).
           let markerAbsRange = NSRange(
-            location: lineRange.location + match.range.location,
+            location: lineRange.location + bqPrefix.count + match.range.location,
             length: match.range.length)
           let newMarkdown = nsMarkdown.replacingCharacters(in: markerAbsRange, with: "")
           return EditorState(
@@ -484,17 +524,17 @@ enum EditorUpdate {
         }
       }
 
-      // Match ordered: "  1. " or "1. " at start of line
+      // Match ordered: "  1. " or "1. " at start of (stripped) line
       let orderedMarkerRegex = try! NSRegularExpression(
         pattern: #"^([ \t]*)(\d+)\. "#, options: [])
       if let match = orderedMarkerRegex.firstMatch(
-        in: lineText, range: NSRange(location: 0, length: lineNS.length))
+        in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
       {
         let markerEnd = match.range.location + match.range.length
-        if posInLine == markerEnd {
-          // Cursor is right after ordered marker — remove the entire marker.
+        if posInStripped == markerEnd {
+          // Cursor is right after ordered marker — remove the entire marker (keep bqPrefix).
           let markerAbsRange = NSRange(
-            location: lineRange.location + match.range.location,
+            location: lineRange.location + bqPrefix.count + match.range.location,
             length: match.range.length)
           let newMarkdown = nsMarkdown.replacingCharacters(in: markerAbsRange, with: "")
           return EditorState(
@@ -502,17 +542,18 @@ enum EditorUpdate {
         }
       }
 
-      // Match blockquote: "> " at start of line
-      let blockquoteMarkerRegex = try! NSRegularExpression(pattern: #"^> "#, options: [])
+      // Match blockquote: "> " at start of line (handles removing one level of blockquote)
+      let blockquoteMarkerRegex = try! NSRegularExpression(pattern: #"^((?:> )*> )"#, options: [])
       if let match = blockquoteMarkerRegex.firstMatch(
         in: lineText, range: NSRange(location: 0, length: lineNS.length))
       {
-        let markerEnd = match.range.location + match.range.length
-        if posInLine == markerEnd {
-          // Cursor is right after "> " — remove the entire prefix.
+        let fullPrefixEnd = match.range.location + match.range.length
+        if posInLine == fullPrefixEnd {
+          // Cursor is right after the last "> " — remove just the last "> " (2 chars).
+          let lastBqStart = fullPrefixEnd - 2
           let markerAbsRange = NSRange(
-            location: lineRange.location + match.range.location,
-            length: match.range.length)
+            location: lineRange.location + lastBqStart,
+            length: 2)
           let newMarkdown = nsMarkdown.replacingCharacters(in: markerAbsRange, with: "")
           return EditorState(
             markdown: newMarkdown, selection: .cursor(markerAbsRange.location))
@@ -685,16 +726,19 @@ enum EditorUpdate {
     }
 
     let (lineRange, lineText) = currentLine(nsMarkdown, at: pos)
-    let lineNS = lineText as NSString
 
-    // Check if the current line is a list item line
+    // Strip blockquote prefix for list detection.
+    let (bqPrefix, strippedLine) = extractBlockquotePrefix(lineText)
+    let strippedNS = strippedLine as NSString
+
+    // Check if the (stripped) line is a list item line
     let listMatch = anyListLinePattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
 
     if listMatch != nil {
-      // On a list item line: add 4 spaces before the marker (at start of line)
+      // On a list item line: add 4 spaces before the marker (after blockquote prefix)
       let indent = "    "
-      let insertPos = lineRange.location
+      let insertPos = lineRange.location + bqPrefix.count
       let newMarkdown = nsMarkdown.replacingCharacters(
         in: NSRange(location: insertPos, length: 0), with: indent)
       let newPos = pos + 4
@@ -704,7 +748,7 @@ enum EditorUpdate {
     // Check if we're on a continuation line belonging to a list item
     if findParentListItem(in: nsMarkdown, at: pos) != nil {
       let indent = "    "
-      let insertPos = lineRange.location
+      let insertPos = lineRange.location + bqPrefix.count
       let newMarkdown = nsMarkdown.replacingCharacters(
         in: NSRange(location: insertPos, length: 0), with: indent)
       let newPos = pos + 4
@@ -724,33 +768,38 @@ enum EditorUpdate {
     }
 
     let (lineRange, lineText) = currentLine(nsMarkdown, at: pos)
-    let lineNS = lineText as NSString
 
-    // Check if the current line is a list item line
+    // Strip blockquote prefix for list detection.
+    let (bqPrefix, strippedLine) = extractBlockquotePrefix(lineText)
+    let strippedNS = strippedLine as NSString
+
+    // Check if the (stripped) line is a list item line
     let listMatch = anyListLinePattern.firstMatch(
-      in: lineText, range: NSRange(location: 0, length: lineNS.length))
+      in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
 
     if listMatch != nil {
-      // Count leading spaces on this line
-      let leadingSpaces = lineText.prefix(while: { $0 == " " })
+      // Count leading spaces after blockquote prefix
+      let leadingSpaces = strippedLine.prefix(while: { $0 == " " })
       let spacesToRemove = min(leadingSpaces.count, 4)
       guard spacesToRemove > 0 else { return state }
 
-      let removeRange = NSRange(location: lineRange.location, length: spacesToRemove)
+      let removeStart = lineRange.location + bqPrefix.count
+      let removeRange = NSRange(location: removeStart, length: spacesToRemove)
       let newMarkdown = nsMarkdown.replacingCharacters(in: removeRange, with: "")
-      let newPos = max(lineRange.location, pos - spacesToRemove)
+      let newPos = max(removeStart, pos - spacesToRemove)
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
     // Check if we're on a continuation line belonging to a list item
     if findParentListItem(in: nsMarkdown, at: pos) != nil {
-      let leadingSpaces = lineText.prefix(while: { $0 == " " })
+      let leadingSpaces = strippedLine.prefix(while: { $0 == " " })
       let spacesToRemove = min(leadingSpaces.count, 4)
       guard spacesToRemove > 0 else { return state }
 
-      let removeRange = NSRange(location: lineRange.location, length: spacesToRemove)
+      let removeStart = lineRange.location + bqPrefix.count
+      let removeRange = NSRange(location: removeStart, length: spacesToRemove)
       let newMarkdown = nsMarkdown.replacingCharacters(in: removeRange, with: "")
-      let newPos = max(lineRange.location, pos - spacesToRemove)
+      let newPos = max(removeStart, pos - spacesToRemove)
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
@@ -953,14 +1002,13 @@ enum EditorUpdate {
     let lines = state.markdown.components(separatedBy: "\n")
     var newLines: [String] = []
 
-    // Track running counters per indent level.
-    // Key: indent string, Value: next expected number
+    // Track running counters per (blockquote prefix + indent level).
+    // Key: bqPrefix + indent, Value: next expected number.
+    // Scoping by blockquote prefix ensures lists at the top level,
+    // inside `> `, and inside `> > ` are renumbered independently.
     var counters: [String: Int] = [:]
-    // Track which indent levels had an ordered item on the previous line,
-    // so we can reset counters when a gap appears.
     var activeIndents: Set<String> = []
 
-    // We need to track cumulative character offset changes to adjust cursor.
     let cursorPos: Int
     switch state.selection {
     case .cursor(let p): cursorPos = p
@@ -974,60 +1022,54 @@ enum EditorUpdate {
 
     var cursorDelta = 0
     var anchorDelta = 0
-    var charOffset = 0  // running character offset into the original string
+    var charOffset = 0
 
-    // Track the last ordered list marker width per indent level so we can
-    // identify continuation lines (indented text belonging to a multi-line item).
     var lastMarkerWidth: [String: Int] = [:]
 
     for line in lines {
       let lineNS = line as NSString
+
+      // Strip blockquote prefix before matching ordered list patterns.
+      let (bqPrefix, strippedLine) = extractBlockquotePrefix(line)
+      let strippedNS = strippedLine as NSString
       let match = orderedLinePattern.firstMatch(
-        in: line, range: NSRange(location: 0, length: lineNS.length))
+        in: strippedLine, range: NSRange(location: 0, length: strippedNS.length))
 
       if let match = match {
-        let indent = lineNS.substring(with: match.range(at: 1))
-        let oldNumberStr = lineNS.substring(with: match.range(at: 2))
+        let indent = strippedNS.substring(with: match.range(at: 1))
+        let oldNumberStr = strippedNS.substring(with: match.range(at: 2))
+        let scopeKey = "\(bqPrefix)\(indent)"
 
-        // Check if this indent was active on the previous line. If not, reset.
-        if !activeIndents.contains(indent) {
-          counters[indent] = 1
+        if !activeIndents.contains(scopeKey) {
+          counters[scopeKey] = 1
         }
 
-        let correctNumber = counters[indent] ?? 1
+        let correctNumber = counters[scopeKey] ?? 1
         let correctNumberStr = String(correctNumber)
-        counters[indent] = correctNumber + 1
+        counters[scopeKey] = correctNumber + 1
 
-        // Mark this indent as active. Clear indents that are "deeper" or different
-        // if the current line is at a shallower indent.
-        activeIndents.insert(indent)
-
-        // Track the full marker width (indent + number + ". ") for continuation detection.
-        lastMarkerWidth[indent] = match.range.length
+        activeIndents.insert(scopeKey)
+        lastMarkerWidth[scopeKey] = match.range.length
 
         if correctNumberStr != oldNumberStr {
-          // Replace the number
           let oldPrefix = "\(indent)\(oldNumberStr). "
           let newPrefix = "\(indent)\(correctNumberStr). "
-          let rest = lineNS.substring(from: match.range.length)
-          let newLine = "\(newPrefix)\(rest)"
+          let rest = strippedNS.substring(from: match.range.length)
+          let newLine = "\(bqPrefix)\(newPrefix)\(rest)"
           newLines.append(newLine)
 
           let lengthDiff = (newPrefix as NSString).length - (oldPrefix as NSString).length
 
-          // Adjust cursor if it's after the number in this line (or on a later line).
-          // charOffset is the start of this line in the original string.
-          let oldPrefixEnd = charOffset + (oldPrefix as NSString).length
-          if cursorPos >= oldPrefixEnd {
-            // Cursor is after the marker on this line or on a later line
+          let oldFullPrefixEnd = charOffset + (bqPrefix as NSString).length
+            + (oldPrefix as NSString).length
+          if cursorPos >= oldFullPrefixEnd {
             cursorDelta += lengthDiff
           } else if cursorPos > charOffset {
-            // Cursor is inside the marker on this line — move it to end of new marker
             cursorDelta += lengthDiff
           }
 
           if let anchor = cursorAnchor {
-            if anchor >= oldPrefixEnd {
+            if anchor >= oldFullPrefixEnd {
               anchorDelta += lengthDiff
             } else if anchor > charOffset {
               anchorDelta += lengthDiff
@@ -1037,19 +1079,16 @@ enum EditorUpdate {
           newLines.append(line)
         }
       } else {
-        // Not an ordered list line. Check if it's a continuation line
-        // (starts with whitespace at least as deep as the marker width of the
-        // active list item). Continuation lines don't break the list.
+        // Not an ordered list line. Check for continuation lines using
+        // the stripped content (after removing blockquote prefix).
         let isContinuation: Bool
-        if !activeIndents.isEmpty, !line.isEmpty {
-          // Check if this line starts with enough whitespace to be a continuation
-          // of any active ordered list item.
-          let leadingSpaces = line.prefix(while: { $0 == " " || $0 == "\t" })
+        if !activeIndents.isEmpty, !strippedLine.isEmpty {
+          let leadingSpaces = strippedLine.prefix(while: { $0 == " " || $0 == "\t" })
           if !leadingSpaces.isEmpty {
-            // A continuation line must start with whitespace >= marker width.
-            // Check against any active indent level's marker width.
-            isContinuation = activeIndents.contains(where: { indent in
-              guard let mw = lastMarkerWidth[indent] else { return false }
+            isContinuation = activeIndents.contains(where: { key in
+              guard key.hasPrefix(bqPrefix),
+                let mw = lastMarkerWidth[key]
+              else { return false }
               return leadingSpaces.count >= mw
             })
           } else {
@@ -1060,16 +1099,15 @@ enum EditorUpdate {
         }
 
         if !isContinuation {
-          // A blank line or non-list, non-continuation line breaks all lists.
-          activeIndents.removeAll()
-          lastMarkerWidth.removeAll()
+          // Clear only the scope entries matching this blockquote prefix.
+          // Lines at a different prefix level don't break other scopes.
+          let keysToRemove = activeIndents.filter { $0.hasPrefix(bqPrefix) }
+          activeIndents.subtract(keysToRemove)
+          for key in keysToRemove { lastMarkerWidth.removeValue(forKey: key) }
         }
-        // Don't clear counters — they'll be reset when activeIndents doesn't contain
-        // the indent on the next ordered item.
         newLines.append(line)
       }
 
-      // Advance charOffset: line length + 1 for the \n separator
       charOffset += lineNS.length + 1
     }
 

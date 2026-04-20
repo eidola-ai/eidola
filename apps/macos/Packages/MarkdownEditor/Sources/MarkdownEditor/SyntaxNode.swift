@@ -23,10 +23,12 @@ enum SyntaxNodeType: Sendable {
   ///   with the widest marker in this list. Zero if this IS the widest.
   case orderedListItem(indentLevel: Int, markerPadding: CGFloat)
   case inlineCode
-  case codeBlock(language: String?)
+  /// - `listBaseIndent`: Extra indentation from enclosing list items. Zero for top-level code blocks.
+  case codeBlock(language: String?, listBaseIndent: CGFloat)
   case link(destination: String?)
   case image(destination: String?)
   case strikethrough
-  case blockquote
+  /// - `listBaseIndent`: Extra indentation from enclosing list items (blockquote nested inside a list). Zero for top-level blockquotes.
+  case blockquote(depth: Int, listBaseIndent: CGFloat)
   case thematicBreak
 }

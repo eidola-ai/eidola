@@ -23,10 +23,10 @@ struct BlockquoteRenderTests {
       "Blockquote should have secondary label color")
   }
 
-  @Test("Blockquote applies paragraph indentation")
-  func blockquoteIndentation() {
-    let text = "> Hello world"
-    let cursorRange = NSRange(location: 0, length: 0)
+  @Test("Blockquote applies paragraph indentation when cursor is outside")
+  func blockquoteIndentationOutside() {
+    let text = "> Hello world\n\nBody"
+    let cursorRange = NSRange(location: 16, length: 0)  // in "Body"
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
     let blockquoteStyled = spec.styledRanges.first {
@@ -34,12 +34,33 @@ struct BlockquoteRenderTests {
     }
     #expect(
       blockquoteStyled != nil,
-      "Blockquote should have paragraph style with head indent")
+      "Blockquote should have paragraph style with head indent when cursor outside")
 
     if let styled = blockquoteStyled {
       let ps = styled.attributes[.paragraphStyle] as! NSParagraphStyle
-      #expect(ps.firstLineHeadIndent > 0, "firstLineHeadIndent should be > 0")
-      #expect(ps.headIndent > 0, "headIndent should be > 0")
+      #expect(ps.firstLineHeadIndent > 0, "firstLineHeadIndent should be > 0 when cursor outside")
+      #expect(ps.headIndent > 0, "headIndent should be > 0 when cursor outside")
+    }
+  }
+
+  @Test("Blockquote has zero paragraph indentation when cursor is inside")
+  func blockquoteIndentationInside() {
+    let text = "> Hello world"
+    let cursorRange = NSRange(location: 4, length: 0)  // inside content
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+
+    let blockquoteStyled = spec.styledRanges.first {
+      ($0.attributes[.paragraphStyle] as? NSParagraphStyle) != nil
+        && ($0.attributes[.foregroundColor] as? NSColor) == .secondaryLabelColor
+    }
+    #expect(
+      blockquoteStyled != nil,
+      "Blockquote should have paragraph style when cursor inside")
+
+    if let styled = blockquoteStyled {
+      let ps = styled.attributes[.paragraphStyle] as! NSParagraphStyle
+      #expect(ps.firstLineHeadIndent == 0, "firstLineHeadIndent should be 0 when cursor inside (> provides offset)")
+      #expect(ps.headIndent == 0, "headIndent should be 0 when cursor inside (> provides offset)")
     }
   }
 
@@ -73,6 +94,26 @@ struct BlockquoteRenderTests {
     #expect(
       !spec.temporaryAttributes.isEmpty,
       "Should have dimmed delimiter temp attrs")
+  }
+
+  @Test("Blockquote border ranges populated when cursor is outside")
+  func blockquoteBorderRangesOutside() {
+    let text = "> Hello\n\nBody"
+    let cursorRange = NSRange(location: 10, length: 0)  // in "Body"
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+    #expect(!spec.blockquoteCharacterRanges.isEmpty,
+      "Should have blockquote border ranges when cursor is outside")
+    #expect(spec.blockquoteCharacterRanges.first?.depth == 1,
+      "Should have depth 1")
+  }
+
+  @Test("Blockquote border ranges empty when cursor is inside")
+  func blockquoteBorderRangesInside() {
+    let text = "> Hello"
+    let cursorRange = NSRange(location: 4, length: 0)  // inside content
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+    #expect(spec.blockquoteCharacterRanges.isEmpty,
+      "Should not have blockquote border ranges when cursor is inside")
   }
 
   @Test("Blockquote > prefix visible when cursor is at start")
