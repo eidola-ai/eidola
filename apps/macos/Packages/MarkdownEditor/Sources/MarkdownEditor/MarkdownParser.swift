@@ -1,33 +1,63 @@
 import AppKit
 import Markdown
 
-/// Walks a swift-markdown AST and produces `SyntaxNode` values with NSRange positions.
+/// Builds an explicit block tree plus flat inline syntax spans from a markdown document.
 @MainActor
-struct MarkdownParser: @preconcurrency MarkupWalker {
+struct MarkdownParser {
+  private struct ParseContext {
+    var blockquoteDepth: Int
+  }
+
   private let converter: SourceRangeConverter
   private let style: MarkdownStyle
-  private(set) var nodes: [SyntaxNode] = []
-  /// Tracks total nesting depth across all list types during traversal.
-  private var listDepth = 0
-  /// Tracks blockquote nesting depth during traversal.
-  private var blockquoteDepth = 0
-  /// The widest marker text and its rendered width among items in the
-  /// current ordered list, so all items get consistent alignment.
-  private var currentOrderedListWidestMarker: String?
-  private var currentOrderedListWidestWidth: CGFloat = 0
-  /// The `headIndent` (content wrap position) of the innermost enclosing list item,
-  /// so child blockquotes and code blocks can position themselves inside the list's area.
-  private var currentListItemContentIndent: CGFloat = 0
+  private let nsText: NSString
+
+  private(set) var document: MarkdownDocument?
+  private(set) var inlineNodes: [InlineSyntaxNode] = []
 
   init(converter: SourceRangeConverter, style: MarkdownStyle = .default) {
     self.converter = converter
     self.style = style
+    self.nsText = converter.string as NSString
   }
 
-  // MARK: - Block Elements
+  mutating func visit(_ document: Document) {
+    inlineNodes = []
+    let blocks = parseBlocks(in: document, context: ParseContext(blockquoteDepth: 0))
+    self.document = MarkdownDocument(blocks: blocks, inlineNodes: inlineNodes)
+  }
 
-  mutating func visitHeading(_ heading: Heading) -> () {
-    guard let sourceRange = heading.range else { return descendInto(heading) }
+  // MARK: - Block Parsing
+
+  private mutating func parseBlocks(in markup: Markup, context: ParseContext) -> [MarkdownBlock] {
+    var blocks: [MarkdownBlock] = []
+
+    for child in markup.children {
+      switch child {
+      case let heading as Heading:
+        if let block = parseHeading(heading) { blocks.append(block) }
+      case let paragraph as Paragraph:
+        if let block = parseParagraph(paragraph) { blocks.append(block) }
+      case let blockQuote as BlockQuote:
+        if let block = parseBlockQuote(blockQuote, context: context) { blocks.append(block) }
+      case let unorderedList as UnorderedList:
+        if let block = parseUnorderedList(unorderedList, context: context) { blocks.append(block) }
+      case let orderedList as OrderedList:
+        if let block = parseOrderedList(orderedList, context: context) { blocks.append(block) }
+      case let codeBlock as CodeBlock:
+        if let block = parseCodeBlock(codeBlock) { blocks.append(block) }
+      case let thematicBreak as ThematicBreak:
+        if let block = parseThematicBreak(thematicBreak) { blocks.append(block) }
+      default:
+        break
+      }
+    }
+
+    return blocks
+  }
+
+  private mutating func parseHeading(_ heading: Heading) -> MarkdownBlock? {
+    guard let sourceRange = heading.range else { return nil }
     let range = converter.nsRange(from: sourceRange)
 
     let delimiterLength: Int
@@ -40,443 +70,299 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
       delimiterLength = heading.level + 1
     }
 
-    // Setext-style headings (content\n===) have delimiterLength == 0 because the
-    // content starts at the heading start (no `# ` prefix). The underline is the
-    // delimiter that spans from the \n to the end of the heading range.
-    // EditorUpdate normalizes setext → ATX when the cursor moves away from the
-    // underline, so setext headings are transient.
     let delimiterRanges: [NSRange]
     let contentRange: NSRange
 
     if delimiterLength == 0 {
-      // Setext: content is first line, delimiter is \n + underline
       let headingText = converter.substringForRange(range) ?? ""
       if let newlineIdx = headingText.firstIndex(of: "\n") {
         let contentLen = headingText.distance(from: headingText.startIndex, to: newlineIdx)
         contentRange = NSRange(location: range.location, length: contentLen)
-        // Delimiter covers from the \n through end of range (the underline)
         let delimStart = range.location + contentLen
-        let delimLen = range.length - contentLen
-        delimiterRanges = [NSRange(location: delimStart, length: delimLen)]
+        delimiterRanges = [NSRange(location: delimStart, length: range.length - contentLen)]
       } else {
-        // Fallback: no newline found, treat entire range as content
         contentRange = range
         delimiterRanges = []
       }
     } else {
-      // ATX: delimiter is the `# ` prefix
       delimiterRanges = [NSRange(location: range.location, length: delimiterLength)]
       contentRange = NSRange(
         location: range.location + delimiterLength,
         length: max(0, range.length - delimiterLength))
     }
 
-    nodes.append(
-      SyntaxNode(
-        type: .heading(level: heading.level),
-        range: range,
-        contentRange: contentRange,
-        delimiterRanges: delimiterRanges,
-        attributes: style.headingAttributes(level: heading.level)
-      ))
-    descendInto(heading)
+    collectInlineNodes(in: heading)
+    return MarkdownBlock(
+      kind: .heading(level: heading.level, contentRange: contentRange, delimiterRanges: delimiterRanges),
+      range: range,
+      children: []
+    )
   }
 
-  mutating func visitBlockQuote(_ blockQuote: BlockQuote) -> () {
-    guard let sourceRange = blockQuote.range else {
-      blockquoteDepth += 1
-      descendInto(blockQuote)
-      blockquoteDepth -= 1
-      return
-    }
+  private mutating func parseParagraph(_ paragraph: Paragraph) -> MarkdownBlock? {
+    guard let sourceRange = paragraph.range else { return nil }
     let range = converter.nsRange(from: sourceRange)
-    let nsText = converter.string as NSString
-
-    blockquoteDepth += 1
-    let depth = blockquoteDepth
-
-    // Find all `> ` prefixes on each line within the blockquote range
-    // that belong to THIS blockquote level. For nested blockquotes like
-    // `> > inner`, the outer blockquote should only claim the first `> `
-    // on each line, and the inner blockquote claims its own `> `.
-    var delimiterRanges: [NSRange] = []
-    let rangeEnd = range.location + range.length
-
-    var pos = range.location
-    while pos < rangeEnd {
-      // Find the actual start of the line (may be before the blockquote range
-      // for nested blockquotes where the range starts mid-line).
-      let actualLineStart = nsText.lineRange(for: NSRange(location: pos, length: 0)).location
-
-      // Skip list/continuation indentation whitespace, then skip `> ` prefixes
-      // from outer blockquote levels to find this level's prefix.
-      var linePos = actualLineStart
-      // Skip leading whitespace (list indentation for blockquotes inside lists)
-      while linePos < nsText.length {
-        let ch = nsText.character(at: linePos)
-        if ch == UInt16(0x0020) || ch == UInt16(0x0009) { linePos += 1 }
-        else { break }
-      }
-      var skippedLevels = 0
-      while skippedLevels < depth - 1, linePos < nsText.length {
-        // Skip whitespace between `> ` levels (for nested lists between blockquotes)
-        while linePos < nsText.length {
-          let ch = nsText.character(at: linePos)
-          if ch == UInt16(0x0020) || ch == UInt16(0x0009) { linePos += 1 }
-          else { break }
-        }
-        if nsText.character(at: linePos) == UInt16(0x003E) {  // '>'
-          let nextPos = linePos + 1
-          if nextPos < nsText.length, nsText.character(at: nextPos) == UInt16(0x0020) {
-            linePos += 2
-          } else {
-            linePos += 1
-          }
-          skippedLevels += 1
-        } else {
-          break
-        }
-      }
-
-      // Now check for this level's `> ` prefix
-      if linePos < nsText.length, nsText.character(at: linePos) == UInt16(0x003E) {
-        let nextPos = linePos + 1
-        if nextPos < nsText.length, nsText.character(at: nextPos) == UInt16(0x0020) {
-          delimiterRanges.append(NSRange(location: linePos, length: 2))
-        } else {
-          delimiterRanges.append(NSRange(location: linePos, length: 1))
-        }
-      }
-
-      // Advance to next line
-      while pos < rangeEnd {
-        if pos < nsText.length, nsText.character(at: pos) == UInt16(0x000A) {
-          pos += 1
-          break
-        }
-        pos += 1
-      }
-      if pos >= rangeEnd { break }
-    }
-
-    // Content range is the full range (content is interspersed with `> ` prefixes)
-    let contentRange = range
-
-    let listBaseIndent = currentListItemContentIndent
-
-    nodes.append(
-      SyntaxNode(
-        type: .blockquote(depth: depth, listBaseIndent: listBaseIndent),
-        range: range,
-        contentRange: contentRange,
-        delimiterRanges: delimiterRanges,
-        attributes: style.blockquoteAttributes(depth: depth, baseIndent: listBaseIndent)
-      ))
-    descendInto(blockQuote)
-    blockquoteDepth -= 1
+    collectInlineNodes(in: paragraph)
+    return MarkdownBlock(kind: .paragraph, range: range, children: [])
   }
 
-  mutating func visitUnorderedList(_ unorderedList: UnorderedList) -> () {
-    listDepth += 1
-    descendInto(unorderedList)
-    listDepth -= 1
+  private mutating func parseBlockQuote(
+    _ blockQuote: BlockQuote,
+    context: ParseContext
+  ) -> MarkdownBlock? {
+    guard let range = blockRange(for: blockQuote) else { return nil }
+    let depth = context.blockquoteDepth + 1
+    let prefixRanges = blockquotePrefixRanges(in: range, depth: depth)
+    let children = parseBlocks(
+      in: blockQuote,
+      context: ParseContext(blockquoteDepth: depth))
+
+    return MarkdownBlock(
+      kind: .blockquote(prefixRanges: prefixRanges),
+      range: range,
+      children: children
+    )
   }
 
-  mutating func visitOrderedList(_ orderedList: OrderedList) -> () {
-    // Find the widest marker among all items so every item in this list
-    // gets the same headIndent, preventing jagged content alignment.
-    let font = style.baseFont
-    var widestMarker = "1. "
-    var widestWidth: CGFloat = 0
-
-    for child in orderedList.children {
-      guard let item = child as? ListItem, let itemRange = item.range else { continue }
-      let itemStart = converter.utf16Offset(from: itemRange.lowerBound)
-      let markerLen: Int
-      if let firstChild = item.children.first(where: { $0.range != nil }),
-        let childRange = firstChild.range
-      {
-        markerLen = converter.utf16Offset(from: childRange.lowerBound) - itemStart
-      } else {
-        markerLen = 3
-      }
-      let markerRange = NSRange(location: itemStart, length: markerLen)
-      if let text = converter.substringForRange(markerRange) {
-        let width = (text as NSString).size(withAttributes: [.font: font]).width
-        if width > widestWidth {
-          widestWidth = width
-          widestMarker = text
-        }
-      }
+  private mutating func parseUnorderedList(
+    _ unorderedList: UnorderedList,
+    context: ParseContext
+  ) -> MarkdownBlock? {
+    guard let range = blockRange(for: unorderedList) else { return nil }
+    let children = unorderedList.children.compactMap { child -> MarkdownBlock? in
+      guard let item = child as? ListItem else { return nil }
+      return parseListItem(item, orderedWidestMarkerText: nil, context: context)
     }
 
-    let previousWidest = currentOrderedListWidestMarker
-    let previousWidth = currentOrderedListWidestWidth
-    currentOrderedListWidestMarker = widestMarker
-    currentOrderedListWidestWidth = widestWidth
-    listDepth += 1
-    descendInto(orderedList)
-    listDepth -= 1
-    currentOrderedListWidestMarker = previousWidest
-    currentOrderedListWidestWidth = previousWidth
+    return MarkdownBlock(kind: .unorderedList, range: range, children: children)
   }
 
-  mutating func visitListItem(_ listItem: ListItem) -> () {
-    let isUnordered = listItem.parent is UnorderedList
-    let isOrdered = listItem.parent is OrderedList
-
-    guard isUnordered || isOrdered else {
-      return descendInto(listItem)
+  private mutating func parseOrderedList(
+    _ orderedList: OrderedList,
+    context: ParseContext
+  ) -> MarkdownBlock? {
+    guard let range = blockRange(for: orderedList) else { return nil }
+    let widestMarkerText = widestOrderedMarkerText(in: orderedList) ?? "1. "
+    let children = orderedList.children.compactMap { child -> MarkdownBlock? in
+      guard let item = child as? ListItem else { return nil }
+      return parseListItem(item, orderedWidestMarkerText: widestMarkerText, context: context)
     }
-    guard let sourceRange = listItem.range else { return descendInto(listItem) }
+
+    return MarkdownBlock(
+      kind: .orderedList(widestMarkerText: widestMarkerText),
+      range: range,
+      children: children
+    )
+  }
+
+  private mutating func parseListItem(
+    _ listItem: ListItem,
+    orderedWidestMarkerText: String?,
+    context: ParseContext
+  ) -> MarkdownBlock? {
+    guard let sourceRange = listItem.range else { return nil }
     let range = converter.nsRange(from: sourceRange)
 
-    // The delimiter is the marker character(s) plus the space after it.
-    // For unordered: "- " or "* " or "+ " (marker char + space)
-    // For ordered: "1. " or "12. " etc. (digits + ". ")
-    // swift-markdown's ListItem range starts at the marker. The first child's
-    // range starts at the content after the marker + space.
-    let markerLength: Int
+    var markerLength: Int
     if let firstChild = listItem.children.first(where: { $0.range != nil }),
       let childRange = firstChild.range
     {
       let childStart = converter.utf16Offset(from: childRange.lowerBound)
       markerLength = childStart - range.location
     } else {
-      markerLength = isOrdered ? 3 : 2  // fallback: "1. " or "- "
+      markerLength = orderedWidestMarkerText == nil ? 2 : 3
     }
 
-    // Compute leading whitespace before the marker. For nested items, the
-    // source has indentation spaces that need to be hidden so the paragraph
-    // style controls indentation instead.
-    //
-    // When inside a blockquote, the line starts with `> ` prefixes that are
-    // managed by the blockquote node, not the list item. Skip past all `> `
-    // prefixes to find the effective start of whitespace for this list item.
-    let nsText = converter.string as NSString
+    let detectedCheckbox = checkboxMarkerInfo(at: range.location)
+    if let checkbox = detectedCheckbox {
+      markerLength = max(markerLength, checkbox.length)
+    }
+
+    let markerRange = NSRange(location: range.location, length: markerLength)
     let lineStart = nsText.lineRange(for: NSRange(location: range.location, length: 0)).location
-    let effectiveLineStart: Int
-    if blockquoteDepth > 0 {
-      // Skip past blockquote `> ` prefixes at the start of the line
-      var pos = lineStart
-      var skipped = 0
-      while skipped < blockquoteDepth, pos < nsText.length {
-        if nsText.character(at: pos) == UInt16(0x003E) {  // '>'
-          pos += 1
-          if pos < nsText.length, nsText.character(at: pos) == UInt16(0x0020) {  // ' '
-            pos += 1
-          }
-          skipped += 1
-        } else {
-          break
-        }
-      }
-      effectiveLineStart = pos
-    } else {
-      effectiveLineStart = lineStart
-    }
-    let leadingWhitespaceLength = range.location - effectiveLineStart
+    let effectiveLineStart = positionAfterBlockquotePrefixes(
+      from: lineStart,
+      depth: context.blockquoteDepth)
+    let leadingWhitespaceLength = max(0, range.location - effectiveLineStart)
+    let leadingWhitespaceRange =
+      leadingWhitespaceLength > 0
+      ? NSRange(location: effectiveLineStart, length: leadingWhitespaceLength)
+      : nil
 
-    let contentRange = NSRange(
-      location: range.location + markerLength,
-      length: max(0, range.length - markerLength)
+    let markerText = converter.substringForRange(markerRange)
+      ?? (orderedWidestMarkerText == nil ? "- " : "1. ")
+
+    let kind: ListItemKind
+    if let checkbox = listItem.checkbox {
+      kind = .checkbox(checked: checkbox == .checked)
+    } else if let checkbox = detectedCheckbox {
+      kind = .checkbox(checked: checkbox.checked)
+    } else if let widestMarkerText = orderedWidestMarkerText {
+      kind = .ordered(widestMarkerText: widestMarkerText)
+    } else {
+      kind = .unordered
+    }
+
+    let children = parseBlocks(in: listItem, context: context)
+    return MarkdownBlock(
+      kind: .listItem(
+        ListItemSyntax(
+          kind: kind,
+          markerRange: markerRange,
+          leadingWhitespaceRange: leadingWhitespaceRange,
+          markerText: markerText
+        )),
+      range: range,
+      children: children
     )
+  }
 
-    // When inside a blockquote, offset list indentation by the blockquote's indent.
-    let baseIndent = style.blockquoteIndent * CGFloat(blockquoteDepth)
-    let indentLevel = listDepth
-
-    if isUnordered {
-      // Delimiter includes leading whitespace + marker ("    - ")
-      let delimiterRange = NSRange(location: effectiveLineStart, length: leadingWhitespaceLength + markerLength)
-
-      // Check for checkbox list item: ListItem.checkbox is set by swift-markdown.
-      // When a checkbox is present, swift-markdown's first child starts AFTER the
-      // full "- [ ] " prefix, so markerLength already includes the checkbox text.
-      // The delimiter range (leading whitespace + markerLength) covers everything.
-      if let checkbox = listItem.checkbox {
-        let isChecked = checkbox == .checked
-        let markerText = isChecked ? "\u{2612} " : "\u{25A1} "
-
-        nodes.append(
-          SyntaxNode(
-            type: .checkboxListItem(checked: isChecked, indentLevel: indentLevel),
-            range: range,
-            contentRange: contentRange,
-            delimiterRanges: [delimiterRange],
-            attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: markerText, baseIndent: baseIndent)
-          ))
-      } else {
-        nodes.append(
-          SyntaxNode(
-            type: .unorderedListItem(indentLevel: indentLevel),
-            range: range,
-            contentRange: contentRange,
-            delimiterRanges: [delimiterRange],
-            attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: "• ", baseIndent: baseIndent)
-          ))
-      }
-    } else {
-      // Ordered list: leading whitespace is a delimiter (hidden when cursor
-      // outside), but the number marker stays visible.
-
-      // Use the widest marker in this list so all items align consistently.
-      let widestMarkerText = currentOrderedListWidestMarker ?? "1. "
-
-      // Compute padding: difference between widest marker width and this item's marker width.
-      let font = style.baseFont
-      let thisMarkerRange = NSRange(location: range.location, length: markerLength)
-      let thisMarkerText = converter.substringForRange(thisMarkerRange) ?? "1. "
-      let thisWidth = (thisMarkerText as NSString).size(withAttributes: [.font: font]).width
-      let padding = max(0, currentOrderedListWidestWidth - thisWidth)
-
-      var delimiterRanges: [NSRange] = []
-      if leadingWhitespaceLength > 0 {
-        delimiterRanges.append(NSRange(location: effectiveLineStart, length: leadingWhitespaceLength))
-      }
-
-      nodes.append(
-        SyntaxNode(
-          type: .orderedListItem(indentLevel: indentLevel, markerPadding: padding),
-          range: range,
-          contentRange: contentRange,
-          delimiterRanges: delimiterRanges,
-          attributes: style.listItemAttributes(indentLevel: indentLevel, markerText: widestMarkerText, baseIndent: baseIndent)
-        ))
+  private mutating func parseCodeBlock(_ codeBlock: CodeBlock) -> MarkdownBlock? {
+    guard let sourceRange = codeBlock.range else { return nil }
+    var range = expandedCodeBlockRange(from: converter.nsRange(from: sourceRange))
+    while range.length > 0, nsText.character(at: range.location) == UInt16(0x000A) {
+      range.location += 1
+      range.length -= 1
     }
-
-    // Track content indent so child blockquotes/code blocks nest inside this list item
-    let prevContentIndent = currentListItemContentIndent
-    let bulletPosition = baseIndent + style.listIndent * CGFloat(indentLevel)
-    let effectiveMarkerText = isOrdered ? (currentOrderedListWidestMarker ?? "1. ") : "• "
-    let effectiveMarkerWidth = (effectiveMarkerText as NSString).size(withAttributes: [.font: style.baseFont]).width
-    currentListItemContentIndent = bulletPosition + effectiveMarkerWidth
-    descendInto(listItem)
-    currentListItemContentIndent = prevContentIndent
-  }
-
-  mutating func visitThematicBreak(_ thematicBreak: ThematicBreak) -> () {
-    guard let sourceRange = thematicBreak.range else { return }
-    let range = converter.nsRange(from: sourceRange)
-    guard range.length > 0 else { return }
-
-    // The entire thematic break (e.g. `---`, `***`, `___`) is both the delimiter
-    // and the content — there is no separate content. We treat the full range as
-    // the delimiter range so it can be hidden/revealed based on cursor position.
-    nodes.append(
-      SyntaxNode(
-        type: .thematicBreak,
-        range: range,
-        contentRange: range,
-        delimiterRanges: [range],
-        attributes: style.thematicBreakAttributes
-      ))
-  }
-
-  mutating func visitCodeBlock(_ codeBlock: CodeBlock) -> () {
-    guard let sourceRange = codeBlock.range else { return }
-    let range = converter.nsRange(from: sourceRange)
-    guard range.length > 0 else { return }
+    guard range.length > 0 else { return nil }
 
     let fullText = converter.substringForRange(range) ?? ""
-    let language = codeBlock.language
-
-    // Find the opening fence text (everything before the first \n).
-    // The \n itself is NOT part of the delimiter — it must remain visible
-    // so TextKit preserves the paragraph boundary. Hiding the \n would
-    // collapse the fence paragraph into the content paragraph, causing
-    // glyph-layout issues (first content character clipped).
-    var openingFenceTextLength = 0
+    let openingFenceTextLength: Int
     if let firstNewline = fullText.firstIndex(of: "\n") {
       openingFenceTextLength = fullText.distance(from: fullText.startIndex, to: firstNewline)
     } else {
       openingFenceTextLength = fullText.count
     }
-    // Opening fence line occupies fenceText + \n in the source
     let openingLineLength = openingFenceTextLength + (fullText.contains("\n") ? 1 : 0)
 
-    // Find the closing fence line.
-    // The closing fence is the last line of the code block. We search
-    // backwards for the last \n, then check if everything after it is a fence.
-    var closingFenceLength = 0
+    var closingLineTotalLength = 0
+    var closingFenceOnlyLength = 0
     let trimmed = fullText.hasSuffix("\n") ? String(fullText.dropLast()) : fullText
     if let lastNewline = trimmed.lastIndex(of: "\n") {
       let afterLastNewline = trimmed[trimmed.index(after: lastNewline)...]
-      let lastLine = String(afterLastNewline).trimmingCharacters(in: .whitespaces)
-      if lastLine.hasPrefix("```") || lastLine.hasPrefix("~~~") {
-        closingFenceLength = fullText.count - fullText.distance(from: fullText.startIndex, to: lastNewline) - 1
+      let lastLine = String(afterLastNewline)
+      if isFenceLine(lastLine) {
+        closingLineTotalLength =
+          fullText.count - fullText.distance(from: fullText.startIndex, to: lastNewline) - 1
+        // Strip blockquote prefixes and whitespace to find where the actual
+        // fence characters start, so the fence range excludes `>` markers.
+        let prefixLen = fencePrefixLength(in: lastLine)
+        closingFenceOnlyLength = closingLineTotalLength - prefixLen
       }
     }
 
-    // Opening fence delimiter: just the fence text, excluding the \n
     let openingFenceRange = NSRange(location: range.location, length: openingFenceTextLength)
-    let closingFenceRange = NSRange(
-      location: range.location + range.length - closingFenceLength,
-      length: closingFenceLength)
+    let closingFenceRange: NSRange? =
+      closingFenceOnlyLength > 0
+      ? NSRange(
+        location: range.location + range.length - closingFenceOnlyLength,
+        length: closingFenceOnlyLength)
+      : nil
 
-    // Content starts after the opening fence line (including \n)
     let contentStart = range.location + openingLineLength
-    let contentLength = max(0, range.length - openingLineLength - closingFenceLength)
+    let contentLength = max(0, range.length - openingLineLength - closingLineTotalLength)
     let contentRange = NSRange(location: contentStart, length: contentLength)
 
-    var delimiterRanges: [NSRange] = [openingFenceRange]
-    if closingFenceLength > 0 {
-      delimiterRanges.append(closingFenceRange)
-    }
-
-    // Full parent indent: list nesting + blockquote nesting.
-    // The renderer adjusts the blockquote portion based on cursor state.
-    let parentBaseIndent = currentListItemContentIndent + style.blockquoteIndent * CGFloat(blockquoteDepth)
-
-    nodes.append(
-      SyntaxNode(
-        type: .codeBlock(language: language, listBaseIndent: parentBaseIndent),
-        range: range,
+    return MarkdownBlock(
+      kind: .codeBlock(
+        language: codeBlock.language,
         contentRange: contentRange,
-        delimiterRanges: delimiterRanges,
-        attributes: style.codeBlockAttributes(baseIndent: parentBaseIndent)
-      ))
+        openingFenceRange: openingFenceRange,
+        closingFenceRange: closingFenceRange),
+      range: range,
+      children: []
+    )
   }
 
-  // MARK: - Inline Elements
-
-  mutating func visitStrong(_ strong: Strong) -> () {
-    guard let sourceRange = strong.range else { return descendInto(strong) }
+  private func parseThematicBreak(_ thematicBreak: ThematicBreak) -> MarkdownBlock? {
+    guard let sourceRange = thematicBreak.range else { return nil }
     let range = converter.nsRange(from: sourceRange)
+    return MarkdownBlock(kind: .thematicBreak, range: range, children: [])
+  }
 
-    // Strong uses ** (2 chars) as delimiters. In nested `***bold***`,
-    // swift-markdown gives both Emphasis and Strong the same range as the
-    // outer Emphasis. When that happens, Strong's ** delimiters are the
-    // inner 2 asterisks (offset inward by the Emphasis delimiter width of 1).
+  private func checkboxMarkerInfo(at itemLocation: Int) -> (length: Int, checked: Bool)? {
+    let lineRange = nsText.lineRange(for: NSRange(location: itemLocation, length: 0))
+    let lineEnd = min(lineRange.location + lineRange.length, nsText.length)
+    var length = max(0, lineEnd - itemLocation)
+
+    while length > 0 {
+      let ch = nsText.character(at: itemLocation + length - 1)
+      if ch == UInt16(0x000A) || ch == UInt16(0x000D) {
+        length -= 1
+      } else {
+        break
+      }
+    }
+
+    guard length >= 6 else { return nil }
+    let lineText = nsText.substring(with: NSRange(location: itemLocation, length: length))
+    let chars = Array(lineText)
+    guard chars.count >= 6 else { return nil }
+    guard "-*+".contains(chars[0]), chars[1] == " ", chars[2] == "[", chars[4] == "]", chars[5] == " "
+    else {
+      return nil
+    }
+
+    switch chars[3] {
+    case " ":
+      return (length: 6, checked: false)
+    case "x", "X":
+      return (length: 6, checked: true)
+    default:
+      return nil
+    }
+  }
+
+  // MARK: - Inline Parsing
+
+  private mutating func collectInlineNodes(in markup: Markup) {
+    for child in markup.children {
+      switch child {
+      case let strong as Strong:
+        inlineNodes.append(makeStrongNode(strong))
+        collectInlineNodes(in: strong)
+      case let emphasis as Emphasis:
+        inlineNodes.append(makeEmphasisNode(emphasis))
+        collectInlineNodes(in: emphasis)
+      case let inlineCode as InlineCode:
+        inlineNodes.append(makeInlineCodeNode(inlineCode))
+      case let link as Markdown.Link:
+        inlineNodes.append(makeLinkNode(link))
+        collectInlineNodes(in: link)
+      case let image as Markdown.Image:
+        inlineNodes.append(makeImageNode(image))
+      case let strikethrough as Strikethrough:
+        inlineNodes.append(makeStrikethroughNode(strikethrough))
+        collectInlineNodes(in: strikethrough)
+      default:
+        collectInlineNodes(in: child)
+      }
+    }
+  }
+
+  private func makeStrongNode(_ strong: Strong) -> InlineSyntaxNode {
+    let range = converter.nsRange(from: strong.range!)
     let delimiterWidth = 2
-    let nestedInEmphasis = strong.parent is Emphasis
-      && strong.parent?.range == strong.range
+    let nestedInEmphasis = strong.parent is Emphasis && strong.parent?.range == strong.range
     let inset = nestedInEmphasis ? 1 : 0
     let contentRange = NSRange(
       location: range.location + delimiterWidth + inset,
       length: max(0, range.length - (delimiterWidth + inset) * 2))
     let delimiterRanges = [
       NSRange(location: range.location + inset, length: delimiterWidth),
-      NSRange(
-        location: range.location + range.length - delimiterWidth - inset, length: delimiterWidth),
+      NSRange(location: range.location + range.length - delimiterWidth - inset, length: delimiterWidth),
     ]
-
-    nodes.append(
-      SyntaxNode(
-        type: .strong,
-        range: range,
-        contentRange: contentRange,
-        delimiterRanges: delimiterRanges,
-        attributes: [:]
-      ))
-    descendInto(strong)
+    return InlineSyntaxNode(
+      kind: .strong,
+      range: range,
+      contentRange: contentRange,
+      delimiterRanges: delimiterRanges,
+      attributes: [:]
+    )
   }
 
-  mutating func visitInlineCode(_ inlineCode: InlineCode) -> () {
-    guard let sourceRange = inlineCode.range else { return }
-    let range = converter.nsRange(from: sourceRange)
-
-    // Inline code uses backtick delimiters (1 char each side for single backtick).
+  private func makeEmphasisNode(_ emphasis: Emphasis) -> InlineSyntaxNode {
+    let range = converter.nsRange(from: emphasis.range!)
     let delimiterWidth = 1
     let contentRange = NSRange(
       location: range.location + delimiterWidth,
@@ -485,81 +371,68 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
       NSRange(location: range.location, length: delimiterWidth),
       NSRange(location: range.location + range.length - delimiterWidth, length: delimiterWidth),
     ]
-
-    nodes.append(
-      SyntaxNode(
-        type: .inlineCode,
-        range: range,
-        contentRange: contentRange,
-        delimiterRanges: delimiterRanges,
-        attributes: style.inlineCodeAttributes
-      ))
+    return InlineSyntaxNode(
+      kind: .emphasis,
+      range: range,
+      contentRange: contentRange,
+      delimiterRanges: delimiterRanges,
+      attributes: [:]
+    )
   }
 
-  mutating func visitLink(_ link: Markdown.Link) -> () {
-    guard let sourceRange = link.range else { return descendInto(link) }
-    let range = converter.nsRange(from: sourceRange)
+  private func makeInlineCodeNode(_ inlineCode: InlineCode) -> InlineSyntaxNode {
+    let range = converter.nsRange(from: inlineCode.range!)
+    let delimiterWidth = 1
+    let contentRange = NSRange(
+      location: range.location + delimiterWidth,
+      length: max(0, range.length - delimiterWidth * 2))
+    let delimiterRanges = [
+      NSRange(location: range.location, length: delimiterWidth),
+      NSRange(location: range.location + range.length - delimiterWidth, length: delimiterWidth),
+    ]
+    return InlineSyntaxNode(
+      kind: .inlineCode,
+      range: range,
+      contentRange: contentRange,
+      delimiterRanges: delimiterRanges,
+      attributes: style.inlineCodeAttributes
+    )
+  }
 
-    // Link syntax: [text](url)
-    // Opening delimiter: `[` (1 char)
-    // Content: the link text between `[` and `]`
-    // Closing delimiter: `](url)` - everything from `]` to the end of the range
+  private func makeLinkNode(_ link: Markdown.Link) -> InlineSyntaxNode {
+    let range = converter.nsRange(from: link.range!)
     let openingDelimiterRange = NSRange(location: range.location, length: 1)
-
-    // Find the `]` position by looking at the first child's range or calculating
-    // from the link text length. The content is between `[` and `]`.
     let contentStart = range.location + 1
 
-    // To find where the content ends (where `]` is), we look at the raw text.
-    // The link text content ends where `](` begins.
     let fullText = converter.substringForRange(range) ?? ""
     let closingBracketOffset: Int
-    // Search for `](` from the end, backwards, to handle nested brackets
     if let bracketParenRange = fullText.range(of: "](", options: .backwards) {
       closingBracketOffset = fullText.distance(from: fullText.startIndex, to: bracketParenRange.lowerBound)
     } else {
-      // Fallback: content is everything except first and last char
       closingBracketOffset = max(1, range.length - 1)
     }
 
     let contentLength = max(0, closingBracketOffset - 1)
     let contentRange = NSRange(location: contentStart, length: contentLength)
-
-    // Closing delimiter: from `]` to end of range (covers `](url)`)
-    let closingDelimiterStart = range.location + closingBracketOffset
-    let closingDelimiterLength = range.length - closingBracketOffset
     let closingDelimiterRange = NSRange(
-      location: closingDelimiterStart, length: closingDelimiterLength)
+      location: range.location + closingBracketOffset,
+      length: range.length - closingBracketOffset)
 
-    let delimiterRanges = [openingDelimiterRange, closingDelimiterRange]
-
-    let destination = link.destination
-
-    nodes.append(
-      SyntaxNode(
-        type: .link(destination: destination),
-        range: range,
-        contentRange: contentRange,
-        delimiterRanges: delimiterRanges,
-        attributes: style.linkAttributes(destination: destination)
-      ))
-    descendInto(link)
+    return InlineSyntaxNode(
+      kind: .link(destination: link.destination),
+      range: range,
+      contentRange: contentRange,
+      delimiterRanges: [openingDelimiterRange, closingDelimiterRange],
+      attributes: style.linkAttributes(destination: link.destination)
+    )
   }
 
-  mutating func visitImage(_ image: Markdown.Image) -> () {
-    guard let sourceRange = image.range else { return descendInto(image) }
-    let range = converter.nsRange(from: sourceRange)
-
-    // Image syntax: ![alt text](url)
-    // Opening delimiter: `![` (2 chars)
-    // Content: the alt text between `![` and `]`
-    // Closing delimiter: `](url)` - everything from `]` to the end of the range
+  private func makeImageNode(_ image: Markdown.Image) -> InlineSyntaxNode {
+    let range = converter.nsRange(from: image.range!)
     let openingDelimiterRange = NSRange(location: range.location, length: 2)
-
     let contentStart = range.location + 2
-
-    // Find where `](` begins to determine where alt text ends.
     let fullText = converter.substringForRange(range) ?? ""
+
     let closingBracketOffset: Int
     if let bracketParenRange = fullText.range(of: "](", options: .backwards) {
       closingBracketOffset = fullText.distance(from: fullText.startIndex, to: bracketParenRange.lowerBound)
@@ -569,42 +442,30 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
 
     let contentLength = max(0, closingBracketOffset - 2)
     let contentRange = NSRange(location: contentStart, length: contentLength)
-
-    // Closing delimiter: from `]` to end of range (covers `](url)`)
-    let closingDelimiterStart = range.location + closingBracketOffset
-    let closingDelimiterLength = range.length - closingBracketOffset
     let closingDelimiterRange = NSRange(
-      location: closingDelimiterStart, length: closingDelimiterLength)
+      location: range.location + closingBracketOffset,
+      length: range.length - closingBracketOffset)
 
-    let delimiterRanges = [openingDelimiterRange, closingDelimiterRange]
-
-    let destination = image.source
-
-    nodes.append(
-      SyntaxNode(
-        type: .image(destination: destination),
-        range: range,
-        contentRange: contentRange,
-        delimiterRanges: delimiterRanges,
-        attributes: style.imageAttributes
-      ))
-    descendInto(image)
+    return InlineSyntaxNode(
+      kind: .image(destination: image.source),
+      range: range,
+      contentRange: contentRange,
+      delimiterRanges: [openingDelimiterRange, closingDelimiterRange],
+      attributes: style.imageAttributes
+    )
   }
 
-  mutating func visitStrikethrough(_ strikethrough: Strikethrough) -> () {
-    guard let sourceRange = strikethrough.range else { return descendInto(strikethrough) }
-    let range = converter.nsRange(from: sourceRange)
-
-    // Strikethrough uses ~~ (2 chars) or ~ (1 char) as delimiters.
-    // Detect actual width from the first child's position.
+  private func makeStrikethroughNode(_ strikethrough: Strikethrough) -> InlineSyntaxNode {
+    let range = converter.nsRange(from: strikethrough.range!)
     let delimiterWidth: Int
     if let firstChild = strikethrough.children.first(where: { $0.range != nil }),
       let childRange = firstChild.range
     {
       delimiterWidth = converter.utf16Offset(from: childRange.lowerBound) - range.location
     } else {
-      delimiterWidth = 2  // fallback
+      delimiterWidth = 2
     }
+
     let contentRange = NSRange(
       location: range.location + delimiterWidth,
       length: max(0, range.length - delimiterWidth * 2))
@@ -613,40 +474,204 @@ struct MarkdownParser: @preconcurrency MarkupWalker {
       NSRange(location: range.location + range.length - delimiterWidth, length: delimiterWidth),
     ]
 
-    nodes.append(
-      SyntaxNode(
-        type: .strikethrough,
-        range: range,
-        contentRange: contentRange,
-        delimiterRanges: delimiterRanges,
-        attributes: style.strikethroughAttributes
-      ))
-    descendInto(strikethrough)
+    return InlineSyntaxNode(
+      kind: .strikethrough,
+      range: range,
+      contentRange: contentRange,
+      delimiterRanges: delimiterRanges,
+      attributes: style.strikethroughAttributes
+    )
   }
 
-  mutating func visitEmphasis(_ emphasis: Emphasis) -> () {
-    guard let sourceRange = emphasis.range else { return descendInto(emphasis) }
-    let range = converter.nsRange(from: sourceRange)
+  // MARK: - Range Helpers
 
-    // Emphasis uses * (1 char) as delimiters.
-    let delimiterWidth = 1
-    let contentRange = NSRange(
-      location: range.location + delimiterWidth,
-      length: max(0, range.length - delimiterWidth * 2))
-    let delimiterRanges = [
-      NSRange(location: range.location, length: delimiterWidth),
-      NSRange(location: range.location + range.length - delimiterWidth, length: delimiterWidth),
-    ]
+  private func blockRange(for markup: Markup) -> NSRange? {
+    if let sourceRange = markup.range {
+      return converter.nsRange(from: sourceRange)
+    }
 
-    nodes.append(
-      SyntaxNode(
-        type: .emphasis,
-        range: range,
-        contentRange: contentRange,
-        delimiterRanges: delimiterRanges,
-        attributes: [:]
-      ))
-    descendInto(emphasis)
+    var start = Int.max
+    var end = 0
+    var found = false
+    for child in markup.children {
+      if let childRange = blockRange(for: child) {
+        start = min(start, childRange.location)
+        end = max(end, childRange.location + childRange.length)
+        found = true
+      }
+    }
+    guard found else { return nil }
+    return NSRange(location: start, length: end - start)
+  }
+
+  private func widestOrderedMarkerText(in orderedList: OrderedList) -> String? {
+    var widestMarker: String?
+    var widestWidth: CGFloat = 0
+
+    for child in orderedList.children {
+      guard let item = child as? ListItem, let itemRange = item.range else { continue }
+      let itemStart = converter.utf16Offset(from: itemRange.lowerBound)
+      let markerLength: Int
+      if let firstChild = item.children.first(where: { $0.range != nil }),
+        let childRange = firstChild.range
+      {
+        markerLength = converter.utf16Offset(from: childRange.lowerBound) - itemStart
+      } else {
+        markerLength = 3
+      }
+
+      let markerRange = NSRange(location: itemStart, length: markerLength)
+      guard let markerText = converter.substringForRange(markerRange) else { continue }
+      let width = (markerText as NSString).size(withAttributes: [.font: style.baseFont]).width
+      if width > widestWidth {
+        widestWidth = width
+        widestMarker = markerText
+      }
+    }
+
+    return widestMarker
+  }
+
+  private func blockquotePrefixRanges(in range: NSRange, depth: Int) -> [NSRange] {
+    let rangeEnd = range.location + range.length
+    var pos = range.location
+    var delimiterRanges: [NSRange] = []
+
+    while pos < rangeEnd {
+      let actualLineStart = nsText.lineRange(for: NSRange(location: pos, length: 0)).location
+      var linePos = actualLineStart
+      linePos = skipWhitespace(from: linePos)
+
+      var skippedLevels = 0
+      while skippedLevels < depth - 1, linePos < nsText.length {
+        linePos = skipWhitespace(from: linePos)
+        guard linePos < nsText.length, nsText.character(at: linePos) == UInt16(0x003E) else { break }
+        linePos += 1
+        if linePos < nsText.length, nsText.character(at: linePos) == UInt16(0x0020) {
+          linePos += 1
+        }
+        skippedLevels += 1
+      }
+
+      linePos = skipWhitespace(from: linePos)
+      if linePos < nsText.length, nsText.character(at: linePos) == UInt16(0x003E) {
+        let length =
+          linePos + 1 < nsText.length && nsText.character(at: linePos + 1) == UInt16(0x0020)
+          ? 2 : 1
+        delimiterRanges.append(NSRange(location: linePos, length: length))
+      }
+
+      while pos < rangeEnd {
+        if pos < nsText.length, nsText.character(at: pos) == UInt16(0x000A) {
+          pos += 1
+          break
+        }
+        pos += 1
+      }
+    }
+
+    return delimiterRanges
+  }
+
+  private func positionAfterBlockquotePrefixes(from lineStart: Int, depth: Int) -> Int {
+    guard depth > 0 else { return lineStart }
+
+    var pos = lineStart
+    pos = skipWhitespace(from: pos)
+
+    var skippedLevels = 0
+    while skippedLevels < depth, pos < nsText.length {
+      guard nsText.character(at: pos) == UInt16(0x003E) else { break }
+      pos += 1
+      if pos < nsText.length, nsText.character(at: pos) == UInt16(0x0020) {
+        pos += 1
+      }
+      skippedLevels += 1
+      pos = skipWhitespace(from: pos)
+    }
+
+    return pos
+  }
+
+  private func skipWhitespace(from start: Int) -> Int {
+    var pos = start
+    while pos < nsText.length {
+      let ch = nsText.character(at: pos)
+      if ch == UInt16(0x0020) || ch == UInt16(0x0009) {
+        pos += 1
+      } else {
+        break
+      }
+    }
+    return pos
+  }
+
+  /// Returns the number of leading characters that are blockquote prefixes
+  /// and whitespace before the actual fence content (e.g. `> ` before `` ``` ``).
+  private func fencePrefixLength(in line: String) -> Int {
+    var remaining = line[...]
+    while true {
+      while let first = remaining.first, first == " " || first == "\t" {
+        remaining.removeFirst()
+      }
+      if remaining.first == ">" {
+        remaining.removeFirst()
+        if remaining.first == " " {
+          remaining.removeFirst()
+        }
+      } else {
+        break
+      }
+    }
+    return line.count - remaining.count
+  }
+
+  private func expandedCodeBlockRange(from initialRange: NSRange) -> NSRange {
+    var expandedStart = initialRange.location
+    var expandedEnd = initialRange.location + initialRange.length
+
+    let firstLineRange = nsText.lineRange(for: NSRange(location: initialRange.location, length: 0))
+    let firstLineText = nsText.substring(with: firstLineRange)
+    if !isFenceLine(firstLineText), firstLineRange.location > 0 {
+      let previousProbe = max(0, firstLineRange.location - 1)
+      let previousLineRange = nsText.lineRange(for: NSRange(location: previousProbe, length: 0))
+      if isFenceLine(nsText.substring(with: previousLineRange)) {
+        expandedStart = previousLineRange.location
+      }
+    }
+
+    let lastProbe = max(initialRange.location, min(nsText.length - 1, expandedEnd - 1))
+    let lastLineRange = nsText.lineRange(for: NSRange(location: lastProbe, length: 0))
+    let lastLineText = nsText.substring(with: lastLineRange)
+    if !isFenceLine(lastLineText), expandedEnd < nsText.length {
+      let nextLineRange = nsText.lineRange(for: NSRange(location: expandedEnd, length: 0))
+      if isFenceLine(nsText.substring(with: nextLineRange)) {
+        expandedEnd = nextLineRange.location + nextLineRange.length
+      }
+    }
+
+    return NSRange(location: expandedStart, length: max(0, expandedEnd - expandedStart))
+  }
+
+  private func isFenceLine(_ line: String) -> Bool {
+    var remaining = line[...]
+
+    while true {
+      while let first = remaining.first, first == " " || first == "\t" || first == "\n" {
+        remaining.removeFirst()
+      }
+      if remaining.first == ">" {
+        remaining.removeFirst()
+        if remaining.first == " " {
+          remaining.removeFirst()
+        }
+      } else {
+        break
+      }
+    }
+
+    let trimmed = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~")
   }
 }
 

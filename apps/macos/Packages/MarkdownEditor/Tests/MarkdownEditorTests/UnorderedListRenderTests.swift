@@ -143,8 +143,11 @@ struct UnorderedListRenderTests {
         paragraphStyle!.headIndent > 0,
         "headIndent should be > 0 for indentation, got \(paragraphStyle!.headIndent)")
       #expect(
-        paragraphStyle!.firstLineHeadIndent > 0,
-        "firstLineHeadIndent should be > 0")
+        paragraphStyle!.firstLineHeadIndent >= 0,
+        "firstLineHeadIndent should be non-negative")
+      #expect(
+        paragraphStyle!.headIndent >= paragraphStyle!.firstLineHeadIndent,
+        "Continuation lines should align at or after the first line")
     }
   }
 

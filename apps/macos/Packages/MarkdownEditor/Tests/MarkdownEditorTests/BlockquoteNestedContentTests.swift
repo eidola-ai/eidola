@@ -10,6 +10,9 @@ import Testing
 @Suite("Blockquote Nested Content Tests")
 @MainActor
 struct BlockquoteNestedContentTests {
+  private func flatten(_ blocks: [MarkdownBlock]) -> [MarkdownBlock] {
+    blocks + blocks.flatMap { flatten($0.children) }
+  }
 
   // MARK: - Parser: verify correct node emission for nested content
 
@@ -20,19 +23,19 @@ struct BlockquoteNestedContentTests {
     var parser = MarkdownParser(converter: converter)
     let doc = Document(parsing: text)
     parser.visit(doc)
-    let nodes = parser.nodes
+    let nodes = flatten(parser.document?.blocks ?? [])
 
     let hasBlockquote = nodes.contains { node in
-      if case .blockquote = node.type { return true }
+      if case .blockquote = node.kind { return true }
       return false
     }
     #expect(hasBlockquote, "Should have a blockquote node")
 
     let listItems = nodes.filter { node in
-      if case .unorderedListItem = node.type { return true }
+      if case .listItem(let syntax) = node.kind, case .unordered = syntax.kind { return true }
       return false
     }
-    #expect(listItems.count == 2, "Should have 2 list item nodes, got \(listItems.count)")
+    #expect(listItems.count == 2, "Should have 2 list item nodes")
   }
 
   @Test("Parser emits outer and inner blockquote nodes")
@@ -42,13 +45,13 @@ struct BlockquoteNestedContentTests {
     var parser = MarkdownParser(converter: converter)
     let doc = Document(parsing: text)
     parser.visit(doc)
-    let nodes = parser.nodes
+    let nodes = flatten(parser.document?.blocks ?? [])
 
     let blockquotes = nodes.filter { node in
-      if case .blockquote = node.type { return true }
+      if case .blockquote = node.kind { return true }
       return false
     }
-    #expect(blockquotes.count >= 2, "Should have at least 2 blockquote nodes (outer + inner), got \(blockquotes.count)")
+    #expect(blockquotes.count >= 2, "Should have at least 2 blockquote nodes")
   }
 
   @Test("Parser emits blockquote and code block nodes for code block inside blockquote")
@@ -58,19 +61,41 @@ struct BlockquoteNestedContentTests {
     var parser = MarkdownParser(converter: converter)
     let doc = Document(parsing: text)
     parser.visit(doc)
-    let nodes = parser.nodes
+    let nodes = flatten(parser.document?.blocks ?? [])
 
     let hasBlockquote = nodes.contains { node in
-      if case .blockquote = node.type { return true }
+      if case .blockquote = node.kind { return true }
       return false
     }
     #expect(hasBlockquote, "Should have a blockquote node")
 
     let codeBlocks = nodes.filter { node in
-      if case .codeBlock = node.type { return true }
+      if case .codeBlock = node.kind { return true }
       return false
     }
-    #expect(codeBlocks.count == 1, "Should have 1 code block node, got \(codeBlocks.count)")
+    #expect(codeBlocks.count == 1, "Should have 1 code block node")
+  }
+
+  @Test("Parser emits checkbox list item nodes for checkbox list inside blockquote")
+  func parserEmitsCheckboxInsideBlockquote() {
+    let text = "> - [ ] Do this\n> - [x] Do that"
+    let converter = SourceRangeConverter(string: text)
+    var parser = MarkdownParser(converter: converter)
+    let doc = Document(parsing: text)
+    parser.visit(doc)
+    let nodes = flatten(parser.document?.blocks ?? [])
+
+    let checkboxItems = nodes.compactMap { node -> Bool? in
+      guard case .listItem(let syntax) = node.kind,
+        case .checkbox(let checked) = syntax.kind
+      else {
+        return nil
+      }
+      return checked
+    }
+
+    #expect(checkboxItems.count == 2, "Should have 2 checkbox list item nodes")
+    #expect(checkboxItems == [false, true], "Should preserve unchecked and checked states")
   }
 
   @Test("List item delimiters inside blockquote do not overlap with blockquote delimiters")
@@ -82,14 +107,14 @@ struct BlockquoteNestedContentTests {
     var parser = MarkdownParser(converter: converter)
     let doc = Document(parsing: text)
     parser.visit(doc)
-    let nodes = parser.nodes
+    let nodes = flatten(parser.document?.blocks ?? [])
 
     let blockquoteNode = nodes.first { node in
-      if case .blockquote = node.type { return true }
+      if case .blockquote = node.kind { return true }
       return false
     }
     let listItemNodes = nodes.filter { node in
-      if case .unorderedListItem = node.type { return true }
+      if case .listItem(let syntax) = node.kind, case .unordered = syntax.kind { return true }
       return false
     }
 
@@ -98,18 +123,22 @@ struct BlockquoteNestedContentTests {
 
     // Blockquote delimiters should cover "> " prefixes
     if let bq = blockquoteNode {
-      #expect(bq.delimiterRanges.contains { $0.location == 0 && $0.length == 2 },
+      if case .blockquote(let prefixRanges) = bq.kind {
+        #expect(prefixRanges.contains { $0.location == 0 && $0.length == 2 },
         "First line > should be a blockquote delimiter")
-      #expect(bq.delimiterRanges.contains { $0.location == 13 && $0.length == 2 },
+        #expect(prefixRanges.contains { $0.location == 13 && $0.length == 2 },
         "Second line > should be a blockquote delimiter")
+      } else {
+        #expect(Bool(false), "Expected blockquote node")
+      }
     }
 
     // List item delimiters should cover only "- " (not "> - ")
     for li in listItemNodes {
-      for delim in li.delimiterRanges {
-        // Delimiter should NOT start at position 0 or 13 (those are blockquote prefixes)
-        #expect(delim.location != 0 && delim.location != 13,
-          "List item delimiter at \(delim) should not overlap with blockquote > prefix")
+      if case .listItem(let syntax) = li.kind {
+        let markerRange = syntax.markerRange
+        #expect(markerRange.location != 0 && markerRange.location != 13,
+          "List item delimiter should not overlap with blockquote > prefix")
       }
     }
   }
@@ -121,10 +150,10 @@ struct BlockquoteNestedContentTests {
     var parser = MarkdownParser(converter: converter)
     let doc = Document(parsing: text)
     parser.visit(doc)
-    let nodes = parser.nodes
+    let nodes = flatten(parser.document?.blocks ?? [])
 
     let blockquotes = nodes.filter { node in
-      if case .blockquote = node.type { return true }
+      if case .blockquote = node.kind { return true }
       return false
     }
     #expect(blockquotes.count >= 2)
@@ -133,11 +162,14 @@ struct BlockquoteNestedContentTests {
     let innerBQ = blockquotes.first { $0.range.location > 0 }
     #expect(innerBQ != nil, "Should have inner blockquote")
     if let inner = innerBQ {
-      #expect(!inner.delimiterRanges.isEmpty,
-        "Inner blockquote should have delimiter ranges for its own > prefix")
-      // The inner blockquote's delimiter should be at position 10 (the second > on line 2)
-      #expect(inner.delimiterRanges.first?.location == 10,
-        "Inner delimiter should be at position 10")
+      if case .blockquote(let prefixRanges) = inner.kind {
+        #expect(!prefixRanges.isEmpty,
+          "Inner blockquote should have delimiter ranges for its own > prefix")
+        #expect(prefixRanges.first?.location == 10,
+          "Inner delimiter should be at position 10")
+      } else {
+        #expect(Bool(false), "Expected blockquote node")
+      }
     }
   }
 
@@ -149,8 +181,8 @@ struct BlockquoteNestedContentTests {
     let cursorRange = NSRange(location: 15, length: 0)  // in "Body"
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    // The `> ` prefix should be hidden (blockquote delimiter)
-    #expect(spec.hiddenIndexes.contains(0), "> should be hidden")
+    // The `>` is transparent (not hidden), space after is hidden (blockquote delimiter)
+    #expect(!spec.hiddenIndexes.contains(0), "> should not be hidden (transparent glyph)")
     #expect(spec.hiddenIndexes.contains(1), "space after > should be hidden")
 
     // The list item `-` should be replaced by bullet
@@ -158,6 +190,18 @@ struct BlockquoteNestedContentTests {
     let dashHidden = spec.hiddenIndexes.contains(2)
     #expect(hasBullet || dashHidden,
       "List item marker should be either bullet-replaced or hidden")
+  }
+
+  @Test("Checkbox list inside blockquote uses checkbox glyphs, not bullets")
+  func checkboxInsideBlockquoteUsesCheckboxGlyphs() {
+    let text = "> - [ ] Do this\n> - [x] Do that\n\nBody"
+    let cursorRange = NSRange(location: text.count, length: 0)
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+
+    #expect(spec.uncheckedCheckboxIndexes.contains(2), "Unchecked checkbox should render at the list marker")
+    #expect(spec.checkedCheckboxIndexes.contains(18), "Checked checkbox should render at the list marker")
+    #expect(!spec.bulletIndexes.contains(2), "Unchecked checkbox should not render as a bullet")
+    #expect(!spec.bulletIndexes.contains(18), "Checked checkbox should not render as a bullet")
   }
 
   @Test("Nested blockquote: inner blockquote has deeper indentation")
@@ -189,14 +233,15 @@ struct BlockquoteNestedContentTests {
     let cursorRange = NSRange(location: 15, length: 0)  // in "Body"
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    // List item should have indentation that includes the blockquote indent
+    // List item should have headIndent that includes the blockquote indent
+    // (firstLineHeadIndent is 0 because the transparent > glyph + kern provides indent)
     let listItemStyled = spec.styledRanges.first { sr in
       if let ps = sr.attributes[.paragraphStyle] as? NSParagraphStyle {
-        return ps.firstLineHeadIndent >= 20  // at least blockquote indent
+        return ps.headIndent >= 20  // at least blockquote indent
       }
       return false
     }
-    #expect(listItemStyled != nil, "List item inside blockquote should have indentation >= blockquote indent")
+    #expect(listItemStyled != nil, "List item inside blockquote should have headIndent >= blockquote indent")
   }
 
   // MARK: - Visual tests
@@ -313,8 +358,9 @@ struct BlockquoteNestedContentTests {
     #expect(headingStyled != nil, "Should have a heading styled range")
     if let hs = headingStyled,
        let ps = hs.attributes[.paragraphStyle] as? NSParagraphStyle {
-      #expect(ps.firstLineHeadIndent >= 20,
-        "Heading inside blockquote should have indentation >= 20, got \(ps.firstLineHeadIndent)")
+      // firstLineHeadIndent is 0 because the transparent > glyph + kern provides indent
+      #expect(ps.firstLineHeadIndent == 0,
+        "Heading inside blockquote should have firstLineHeadIndent == 0 (transparent > glyph), got \(ps.firstLineHeadIndent)")
       #expect(ps.headIndent >= 20,
         "Heading inside blockquote should have headIndent >= 20, got \(ps.headIndent)")
     }
@@ -397,30 +443,54 @@ struct BlockquoteNestedContentTests {
 
   @Test("List inside blockquote: > prefix at position 0 when cursor inside")
   func listInsideBlockquotePrefixAtPosition0() {
-    // When cursor is inside a blockquote, the list item's paragraph style should
-    // have zero firstLineHeadIndent so the `> ` prefix stays at position 0.
+    // When cursor is inside a blockquote, the `>` prefix and leading whitespace
+    // are visible characters. firstLineHeadIndent should be 0 so the `>` starts
+    // at the left edge. headIndent should be positive so wrapped content aligns
+    // after the list marker.
     let text = "> - Item one\n> - Item two"
     let cursorRange = NSRange(location: 5, length: 0)  // inside first item
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    // Find the list item styled range
-    let listStyled = spec.styledRanges.first { sr in
-      if let ps = sr.attributes[.paragraphStyle] as? NSParagraphStyle {
-        // List items have non-zero headIndent or are at position 0
-        return sr.range.location == 0 || sr.range.length > 10
-      }
-      return false
+    let listStyledRanges = spec.styledRanges.filter { sr in
+      guard let ps = sr.attributes[.paragraphStyle] as? NSParagraphStyle else { return false }
+      return ps.headIndent > 0 && sr.range.location == 0
     }
-    // All styled ranges for list items should have firstLineHeadIndent == 0
-    // when cursor is inside the blockquote
-    for sr in spec.styledRanges {
-      if let ps = sr.attributes[.paragraphStyle] as? NSParagraphStyle,
-         ps.firstLineHeadIndent > 0 {
-        // This is a list item with indent — it should be 0 when cursor is inside
-        // the blockquote (so > stays at position 0)
-        #expect(false,
-          "firstLineHeadIndent should be 0 when cursor is inside blockquote, got \(ps.firstLineHeadIndent) for range \(sr.range)")
-      }
+
+    #expect(!listStyledRanges.isEmpty, "Should find list item paragraph styling inside the blockquote")
+
+    for sr in listStyledRanges {
+      guard let ps = sr.attributes[.paragraphStyle] as? NSParagraphStyle else { continue }
+      #expect(
+        ps.firstLineHeadIndent == 0,
+        "firstLineHeadIndent should be 0 so the visible > prefix starts at the left edge, got \(ps.firstLineHeadIndent) for range \(sr.range)")
+      #expect(
+        ps.headIndent > 0,
+        "headIndent should be positive so wrapped content aligns after the list marker, got \(ps.headIndent) for range \(sr.range)")
+    }
+  }
+
+  @Test("Visual: blockquote A-Z alphabet alignment")
+  func visualBlockquoteAlphabetAlignment() {
+    let lines = (UnicodeScalar("A").value...UnicodeScalar("Z").value)
+      .map { "> \(String(UnicodeScalar($0)!))" }
+    let markdown = lines.joined(separator: "\n") + "\n\nBody text outside"
+    let textLen = (markdown as NSString).length
+
+    // Step 0: cursor inside first line (> visible)
+    let initial = EditorState(markdown: markdown, selection: .cursor(3))
+    let events: [EditorEvent] = [
+      .setSelection(.cursor(textLen - 3)),  // cursor in body text (> hidden)
+    ]
+
+    let results = EditorTestHarness.run(
+      name: "blockquote-alphabet-alignment",
+      initial: initial,
+      events: events,
+      size: NSSize(width: 600, height: 600))
+
+    let fm = FileManager.default
+    for r in results {
+      #expect(fm.fileExists(atPath: r.imagePath), "Image missing: \(r.imagePath)")
     }
   }
 

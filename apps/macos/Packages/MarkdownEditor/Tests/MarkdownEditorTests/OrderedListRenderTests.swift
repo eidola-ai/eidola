@@ -87,8 +87,11 @@ struct OrderedListRenderTests {
         paragraphStyle!.headIndent > 0,
         "headIndent should be > 0 for indentation, got \(paragraphStyle!.headIndent)")
       #expect(
-        paragraphStyle!.firstLineHeadIndent > 0,
-        "firstLineHeadIndent should be > 0")
+        paragraphStyle!.firstLineHeadIndent >= 0,
+        "firstLineHeadIndent should be non-negative")
+      #expect(
+        paragraphStyle!.headIndent >= paragraphStyle!.firstLineHeadIndent,
+        "Continuation lines should align at or after the first line")
     }
   }
 
@@ -147,5 +150,29 @@ struct OrderedListRenderTests {
     // Bold content should have bold trait
     let boldTrait = spec.fontTraits.first { $0.trait == .boldFontMask }
     #expect(boldTrait != nil, "Should have bold trait inside ordered list item")
+  }
+
+  @Test("Ordered list explicit continuation line aligns to content indent")
+  func orderedListExplicitContinuationUsesContentIndent() {
+    let text = "1. This is the first line.\n   This is the second line."
+    let spec = MarkdownRenderer.render(text: text, cursorRange: NSRange(location: text.count, length: 0))
+
+    let secondLineLocation = (text as NSString).range(of: "This is the second").location
+    #expect(secondLineLocation != NSNotFound)
+
+    let continuationStyled = spec.styledRanges.last { styled in
+      NSLocationInRange(secondLineLocation, styled.range)
+        && styled.attributes[.paragraphStyle] != nil
+    }
+
+    #expect(continuationStyled != nil, "Continuation line should have an explicit paragraph style")
+    if let continuationStyled,
+       let ps = continuationStyled.attributes[.paragraphStyle] as? NSParagraphStyle
+    {
+      #expect(ps.firstLineHeadIndent == ps.headIndent,
+        "Continuation line should start at the content indent, not the marker indent")
+      #expect(ps.firstLineHeadIndent > 0,
+        "Continuation line should be indented to the list content column")
+    }
   }
 }

@@ -45,6 +45,10 @@ enum RenderApplicator {
 
     textStorage.endEditing()
 
+    layoutManager.invalidateGlyphs(
+      forCharacterRange: fullRange, changeInLength: 0, actualCharacterRange: nil)
+    layoutManager.invalidateLayout(forCharacterRange: fullRange, actualCharacterRange: nil)
+
     // Apply rendering-only attributes (delimiter colors when cursor is inside)
     layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: fullRange)
     for tempAttr in spec.temporaryAttributes {

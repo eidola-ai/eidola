@@ -12,6 +12,9 @@ import Testing
 @Suite("Nesting Stress Tests")
 @MainActor
 struct NestingStressTests {
+  private func flatten(_ blocks: [MarkdownBlock]) -> [MarkdownBlock] {
+    blocks + blocks.flatMap { flatten($0.children) }
+  }
 
   // MARK: - Code block inside list
 
@@ -311,59 +314,151 @@ struct NestingStressTests {
     for r in results { #expect(fm.fileExists(atPath: r.imagePath)) }
   }
 
+  @Test("Visual: reference stress test from nested lists, blockquotes, and code blocks")
+  func visualReferenceStressDocument() {
+    let markdown = """
+      ## Ordered List
+      1. Simple list item
+          1. Nested item
+          2. LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL. Overflow should line up.
+          3. This is the first line.
+             This is the second line. (They should line up.) LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL. Overflow should line up too.
+      2. This contains a nested blockquote:
+         > Some quoted text.
+      3. This contains a nested code block:
+         ```js
+         let foo = "bar";
+         ```
+
+
+      ## Blockquote
+      > Normal text.
+      > 1. Nested ordered list
+      >     1. With a second depth
+      >     2. LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL. Overflow should line up.
+      >     3. This is the first line.
+      >        This is the second line. (They should line up.) LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL LLL. Overflow should line up too.
+      > 
+      > Containing a code block:
+      > ```js
+      > let foo = "bar";
+      > ```
+      > 
+      > Time for some russian stacking dolls:
+      > - unordered list
+      >     - with a blockquote:
+      >       > Some quoted text that contains an ordered list:
+      >       > 1. one
+      >       > 2. with a code block:
+      >       >    ```js
+      >       >    let foo = "bar";
+      >       >    ```
+      >     - and a nested to-do list:
+      >         - [ ] Do this
+      >         - [x] Do that
+      """
+    let textLen = (markdown as NSString).length
+    let initial = EditorState(markdown: markdown, selection: .cursor(20))
+
+    let nsText = markdown as NSString
+    let blockquoteOffset = nsText.range(of: "Normal text.").location
+    let allCodeMatches = try! NSRegularExpression(pattern: #"let foo = "bar";"#)
+      .matches(in: markdown, range: NSRange(location: 0, length: textLen))
+    let nestedCodeOffset = allCodeMatches.last?.range.location ?? max(0, textLen - 1)
+
+    let results = EditorTestHarness.run(
+      name: "nesting-reference-stress-doc",
+      initial: initial,
+      events: [
+        .setSelection(.cursor(max(0, blockquoteOffset + 2))),
+        .setSelection(.cursor(nestedCodeOffset + 4)),
+        .setSelection(.cursor(20)),
+      ],
+      size: NSSize(width: 900, height: 1200))
+
+    #expect(results.count == 4)
+    let fm = FileManager.default
+    for r in results { #expect(fm.fileExists(atPath: r.imagePath)) }
+    #expect(results[0].bitmapHash == results[3].bitmapHash)
+  }
+
   // MARK: - Parser: structural validation
 
-  @Test("Parser: blockquote inside list has listBaseIndent > 0")
-  func parserBlockquoteInsideListHasBaseIndent() {
+  @Test("Parser: blockquote inside list is nested under a list item")
+  func parserBlockquoteInsideListIsNested() {
     let text = "- Item\n  > Quote"
     let converter = SourceRangeConverter(string: text)
     var parser = MarkdownParser(converter: converter)
     let doc = Document(parsing: text)
     parser.visit(doc)
 
-    let bqNode = parser.nodes.first { n in
-      if case .blockquote = n.type { return true }
+    let blocks = flatten(parser.document?.blocks ?? [])
+    let bqNode = blocks.first { n in
+      if case .blockquote = n.kind { return true }
       return false
     }
     #expect(bqNode != nil, "Should find blockquote node")
-    if let bq = bqNode, case .blockquote(_, let lbi) = bq.type {
-      #expect(lbi > 0, "Blockquote inside list should have listBaseIndent > 0, got \(lbi)")
+    if let bq = bqNode {
+      let enclosingListItem = blocks.first { candidate in
+        if case .listItem = candidate.kind {
+          return candidate.range.location <= bq.range.location
+            && candidate.range.location + candidate.range.length >= bq.range.location + bq.range.length
+        }
+        return false
+      }
+      #expect(enclosingListItem != nil, "Blockquote should be nested under a list item")
     }
   }
 
-  @Test("Parser: code block inside list has listBaseIndent > 0")
-  func parserCodeBlockInsideListHasBaseIndent() {
+  @Test("Parser: code block inside list is nested under a list item")
+  func parserCodeBlockInsideListIsNested() {
     let text = "- Item\n  ```\n  code\n  ```"
     let converter = SourceRangeConverter(string: text)
     var parser = MarkdownParser(converter: converter)
     let doc = Document(parsing: text)
     parser.visit(doc)
 
-    let cbNode = parser.nodes.first { n in
-      if case .codeBlock = n.type { return true }
+    let blocks = flatten(parser.document?.blocks ?? [])
+    let cbNode = blocks.first { n in
+      if case .codeBlock = n.kind { return true }
       return false
     }
     #expect(cbNode != nil, "Should find code block node")
-    if let cb = cbNode, case .codeBlock(_, let lbi) = cb.type {
-      #expect(lbi > 0, "Code block inside list should have listBaseIndent > 0, got \(lbi)")
+    if let cb = cbNode {
+      let enclosingListItem = blocks.first { candidate in
+        if case .listItem = candidate.kind {
+          return candidate.range.location <= cb.range.location
+            && candidate.range.location + candidate.range.length >= cb.range.location + cb.range.length
+        }
+        return false
+      }
+      #expect(enclosingListItem != nil, "Code block should be nested under a list item")
     }
   }
 
-  @Test("Parser: top-level blockquote has listBaseIndent == 0")
-  func parserTopLevelBlockquoteHasZeroBaseIndent() {
+  @Test("Parser: top-level blockquote has no enclosing list item")
+  func parserTopLevelBlockquoteHasNoEnclosingListItem() {
     let text = "> Quote"
     let converter = SourceRangeConverter(string: text)
     var parser = MarkdownParser(converter: converter)
     let doc = Document(parsing: text)
     parser.visit(doc)
 
-    let bqNode = parser.nodes.first { n in
-      if case .blockquote = n.type { return true }
+    let blocks = flatten(parser.document?.blocks ?? [])
+    let bqNode = blocks.first { n in
+      if case .blockquote = n.kind { return true }
       return false
     }
     #expect(bqNode != nil)
-    if let bq = bqNode, case .blockquote(_, let lbi) = bq.type {
-      #expect(lbi == 0, "Top-level blockquote should have listBaseIndent == 0")
+    if let bq = bqNode {
+      let enclosingListItem = blocks.first { candidate in
+        if case .listItem = candidate.kind {
+          return candidate.range.location <= bq.range.location
+            && candidate.range.location + candidate.range.length >= bq.range.location + bq.range.length
+        }
+        return false
+      }
+      #expect(enclosingListItem == nil, "Top-level blockquote should not be nested under a list item")
     }
   }
 
@@ -377,12 +472,11 @@ struct NestingStressTests {
 
     #expect(!spec.blockquoteCharacterRanges.isEmpty, "Should have blockquote border range")
     if let bqRange = spec.blockquoteCharacterRanges.first {
-      #expect(bqRange.listBaseIndent > 0,
-        "Blockquote border inside list should have listBaseIndent > 0, got \(bqRange.listBaseIndent)")
+      #expect(bqRange.xPosition > 0, "Blockquote border inside list should have positive x position")
     }
   }
 
-  @Test("Render: code block inside list has baseIndent > 0")
+  @Test("Render: code block inside list has positive x origin")
   func renderCodeBlockInsideListHasBaseIndent() {
     let text = "- Item\n  ```\n  code\n  ```\n\nBody"
     let cursorRange = NSRange(location: (text as NSString).length - 1, length: 0)
@@ -390,12 +484,49 @@ struct NestingStressTests {
 
     #expect(!spec.codeBlockCharacterRanges.isEmpty, "Should have code block range")
     if let cbRange = spec.codeBlockCharacterRanges.first {
-      #expect(cbRange.baseIndent > 0,
-        "Code block inside list should have baseIndent > 0, got \(cbRange.baseIndent)")
+      #expect(cbRange.xOrigin > 0, "Code block inside list should have positive x origin")
     }
   }
 
-  @Test("Render: top-level code block has baseIndent == 0")
+  @Test("Render: nested code block inside list reveals both fences when cursor is inside")
+  func renderNestedCodeBlockInsideListRevealsBothFences() {
+    let text = "- Item\n  ```\n  code\n  ```\n\nBody"
+    let cursorRange = NSRange(location: 16, length: 0)  // inside code content
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+
+    for idx in [9, 10, 11, 22, 23, 24] {
+      #expect(!spec.hiddenIndexes.contains(idx), "Fence character at \(idx) should stay visible when cursor is inside nested code block")
+    }
+  }
+
+  @Test("Render: nested inner blockquote prefixes are hidden when cursor is outside")
+  func renderNestedInnerBlockquotePrefixesHideOutside() {
+    let text = """
+      > Outer
+      > - Item
+      >   > Inner
+      >   > More
+
+      Body
+      """
+    let cursorRange = NSRange(location: (text as NSString).length - 2, length: 0)
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+
+    let nsText = text as NSString
+    let firstInner = nsText.range(of: "> Inner")
+    let secondInner = nsText.range(of: "> More")
+    #expect(firstInner.location != NSNotFound)
+    #expect(secondInner.location != NSNotFound)
+
+    if firstInner.location != NSNotFound {
+      #expect(!spec.hiddenIndexes.contains(firstInner.location), "Inner blockquote prefix should not be hidden (transparent glyph)")
+    }
+    if secondInner.location != NSNotFound {
+      #expect(!spec.hiddenIndexes.contains(secondInner.location), "Inner blockquote prefix should not be hidden on subsequent lines (transparent glyph)")
+    }
+  }
+
+  @Test("Render: top-level code block has zero x origin")
   func renderTopLevelCodeBlockHasZeroBaseIndent() {
     let text = "```\ncode\n```\n\nBody"
     let cursorRange = NSRange(location: (text as NSString).length - 1, length: 0)
@@ -403,7 +534,7 @@ struct NestingStressTests {
 
     #expect(!spec.codeBlockCharacterRanges.isEmpty)
     if let cbRange = spec.codeBlockCharacterRanges.first {
-      #expect(cbRange.baseIndent == 0, "Top-level code block should have baseIndent == 0")
+      #expect(cbRange.xOrigin == 0, "Top-level code block should have zero x origin")
     }
   }
 }
