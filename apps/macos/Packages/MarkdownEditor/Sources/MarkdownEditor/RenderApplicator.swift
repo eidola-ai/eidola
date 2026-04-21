@@ -66,6 +66,7 @@ enum RenderApplicator {
       layoutManager.addTemporaryAttributes(
         tempAttr.attributes, forCharacterRange: tempAttr.range)
     }
+
   }
 
   /// Cursor-only update: applies only glyph and temporary attribute changes.
@@ -128,6 +129,7 @@ enum RenderApplicator {
       layoutManager.addTemporaryAttributes(
         tempAttr.attributes, forCharacterRange: tempAttr.range)
     }
+
   }
 
   // MARK: - Private

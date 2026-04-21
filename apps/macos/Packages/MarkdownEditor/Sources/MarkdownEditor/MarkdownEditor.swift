@@ -240,7 +240,8 @@ public struct MarkdownEditor: NSViewRepresentable {
 
       // Read current state from text view (NSTextView already applied the edit).
       let nsRange = textView.selectedRange()
-      let selection: Selection = nsRange.length == 0
+      let selection: Selection =
+        nsRange.length == 0
         ? .cursor(nsRange.location)
         : .range(anchor: nsRange.location, head: nsRange.location + nsRange.length)
 

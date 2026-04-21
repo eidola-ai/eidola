@@ -1,12 +1,14 @@
 import AppKit
 import CoreText
 
-/// NSLayoutManager delegate that hides characters by setting their glyph property to `.null`,
-/// and optionally substitutes glyphs (e.g., `-` → `•` for list bullets).
+/// NSLayoutManager delegate that hides characters by replacing their glyphs with a
+/// zero-width space (ZWSP) and setting the `.controlCharacter` property, and optionally
+/// substitutes glyphs (e.g., `-` → `•` for list bullets).
 ///
-/// Characters with `.null` glyphs remain in the text storage but occupy zero layout width.
-/// This is the mechanism Apple recommends for inline WYSIWYG markdown editors
-/// (WWDC 2018, Session 221 "TextKit Best Practices").
+/// Hidden characters remain in the text storage but occupy zero layout width. We use
+/// `.controlCharacter` + ZWSP rather than `.null` because `.null` glyphs do not fully
+/// participate in layout — TextKit 1 miscalculates advance widths and `.backgroundColor`
+/// rects when `.null` glyphs appear at line wrapping boundaries.
 @MainActor
 final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayoutManagerDelegate {
   /// Character indexes whose glyphs should be suppressed (zero width, not rendered).
@@ -20,7 +22,6 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
 
   /// Character indexes whose glyphs should be replaced with a checked checkbox (☒ U+2612).
   var checkedCheckboxCharacterIndexes = IndexSet()
-
 
   // MARK: - Glyph Generation
 
@@ -50,10 +51,7 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
 
     guard needsModification else { return 0 }
 
-    // We need the text to detect paragraph boundaries.
-    let text = layoutManager.textStorage?.string as NSString?
-
-    // Look up zero-width space glyph lazily for paragraph-start hidden chars.
+    // Look up zero-width space glyph lazily for hidden characters.
     var zwspGlyph: CGGlyph?
 
     let newGlyphs = UnsafeMutablePointer<CGGlyph>.allocate(capacity: count)
@@ -71,37 +69,14 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
     for i in 0..<count {
       let charIdx = charIndexes[i]
       if hiddenCharacterIndexes.contains(charIdx) {
-        // For the very first hidden character at a paragraph start, use
-        // `.controlCharacter` with a zero-width space glyph instead of `.null`.
-        // This keeps the glyph participating in paragraph layout (so TextKit
-        // correctly computes paragraphSpacingBefore/After) while rendering
-        // nothing visible.
-        let isParagraphStart: Bool
-        if let text = text {
-          if charIdx == 0 {
-            isParagraphStart = true
-          } else if charIdx > 0, charIdx < text.length {
-            isParagraphStart = text.character(at: charIdx - 1) == 0x000A  // \n
-          } else {
-            isParagraphStart = false
-          }
-        } else {
-          isParagraphStart = false
+        if zwspGlyph == nil {
+          var zwspChar: UniChar = 0x200B  // ZERO WIDTH SPACE
+          var glyph: CGGlyph = 0
+          CTFontGetGlyphsForCharacters(aFont as CTFont, &zwspChar, &glyph, 1)
+          zwspGlyph = glyph
         }
-
-        if isParagraphStart {
-          if zwspGlyph == nil {
-            var zwspChar: UniChar = 0x200B  // ZERO WIDTH SPACE
-            var glyph: CGGlyph = 0
-            CTFontGetGlyphsForCharacters(aFont as CTFont, &zwspChar, &glyph, 1)
-            zwspGlyph = glyph
-          }
-          newGlyphs[i] = zwspGlyph ?? glyphs[i]
-          newProps[i] = .controlCharacter
-        } else {
-          newGlyphs[i] = glyphs[i]
-          newProps[i] = .null
-        }
+        newGlyphs[i] = zwspGlyph ?? glyphs[i]
+        newProps[i] = .controlCharacter
       } else if bulletCharacterIndexes.contains(charIdx) {
         // Replace with bullet glyph
         if bulletGlyph == nil {
