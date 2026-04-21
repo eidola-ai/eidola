@@ -272,6 +272,14 @@ public struct MarkdownEditor: NSViewRepresentable {
 
     public func textViewDidChangeSelection(_ notification: Notification) {
       guard !isProcessingEvent, let textView = notification.object as? NSTextView else { return }
+
+      // During cut/paste/typing-over-selection, NSTextView modifies the text
+      // storage before posting the selection-change notification. If our state
+      // still holds the pre-mutation markdown, rendering a spec from it would
+      // produce out-of-bounds ranges that corrupt the layout manager. Skip the
+      // cursor update here — textDidChange will handle the full resync.
+      guard textView.string == state.wrappedValue.markdown else { return }
+
       let nsRange = textView.selectedRange()
       let selection: Selection
       if nsRange.length == 0 {
