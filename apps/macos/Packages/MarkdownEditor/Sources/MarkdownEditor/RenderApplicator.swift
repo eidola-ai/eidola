@@ -31,7 +31,17 @@ enum RenderApplicator {
       codeBlockLM.blockquoteCharacterRanges = spec.blockquoteCharacterRanges
     }
 
-    // Apply stored attributes
+    // Save scroll position — the full-range attribute reset below triggers
+    // layout invalidation which can momentarily displace the scroll origin.
+    let clipView = textView.enclosingScrollView?.contentView
+    let savedOrigin = clipView?.bounds.origin
+
+    // Apply stored attributes. endEditing() coalesces the attribute-change
+    // notifications and fires layout invalidation for all affected ranges.
+    // No explicit invalidateGlyphs/invalidateLayout is needed afterward —
+    // setAttributes(fullRange) already marks the entire document as changed,
+    // so endEditing() invalidates the full range. A redundant second
+    // invalidation pass would cause a visible scroll shudder in long documents.
     textStorage.beginEditing()
     textStorage.setAttributes(spec.baseAttributes, range: fullRange)
 
@@ -45,9 +55,10 @@ enum RenderApplicator {
 
     textStorage.endEditing()
 
-    layoutManager.invalidateGlyphs(
-      forCharacterRange: fullRange, changeInLength: 0, actualCharacterRange: nil)
-    layoutManager.invalidateLayout(forCharacterRange: fullRange, actualCharacterRange: nil)
+    // Restore scroll position in case the attribute reset displaced it.
+    if let origin = savedOrigin, let clipView {
+      clipView.setBoundsOrigin(origin)
+    }
 
     // Apply rendering-only attributes (delimiter colors when cursor is inside)
     layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: fullRange)
@@ -86,6 +97,11 @@ enum RenderApplicator {
       codeBlockLM.blockquoteCharacterRanges = spec.blockquoteCharacterRanges
     }
 
+    // Save scroll position — glyph invalidation for ranges above the
+    // viewport can change layout geometry, displacing the scroll origin.
+    let clipView = textView.enclosingScrollView?.contentView
+    let savedOrigin = clipView?.bounds.origin
+
     // Invalidate only the ranges that changed
     let allPrevious = previousHidden.union(previousBullets)
       .union(previousUncheckedCheckboxes).union(previousCheckedCheckboxes)
@@ -99,6 +115,11 @@ enum RenderApplicator {
         forCharacterRange: nsRange, changeInLength: 0, actualCharacterRange: nil)
       layoutManager.invalidateLayout(
         forCharacterRange: nsRange, actualCharacterRange: nil)
+    }
+
+    // Restore scroll position.
+    if let origin = savedOrigin, let clipView {
+      clipView.setBoundsOrigin(origin)
     }
 
     // Update temporary attributes
