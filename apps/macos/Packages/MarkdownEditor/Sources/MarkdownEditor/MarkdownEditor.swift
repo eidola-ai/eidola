@@ -227,7 +227,41 @@ public struct MarkdownEditor: NSViewRepresentable {
       _ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange,
       replacementString: String?
     ) -> Bool {
-      // Always allow NSTextView to handle the edit natively.
+      guard !isProcessingEvent else { return true }
+
+      // Intercept text insertion when we need to inject a blockquote space.
+      // Normal typing bypasses EditorUpdate.handleInsertText (NSTextView handles
+      // it natively), so space injection after bare `>` would not fire. Route
+      // these cases through the Elm loop instead.
+      if let text = replacementString, !text.isEmpty,
+        !text.hasPrefix(" "), !text.hasPrefix("\n")
+      {
+        let insertPos = affectedCharRange.location
+        if insertPos > 0 {
+          let md = state.wrappedValue.markdown as NSString
+          let lineRange = md.lineRange(for: NSRange(location: insertPos, length: 0))
+          let posInLine = insertPos - lineRange.location
+          if posInLine > 0 {
+            let lineText = md.substring(with: lineRange) as NSString
+            let prefixText = lineText.substring(to: posInLine)
+            let prefixNS = prefixText as NSString
+            let barePattern = try! NSRegularExpression(pattern: #"^[ \t]*(> )*>$"#)
+            if barePattern.firstMatch(
+              in: prefixText, range: NSRange(location: 0, length: prefixNS.length)) != nil
+            {
+              // Route through Elm loop so handleInsertText injects the space.
+              let event: EditorEvent =
+                affectedCharRange.length > 0
+                ? .insertText(text)  // replacing selection
+                : .insertText(text)
+              processEvent(event, textView: textView)
+              return false
+            }
+          }
+        }
+      }
+
+      // Allow NSTextView to handle the edit natively.
       // textDidChange will sync state and re-render attributes.
       return true
     }
