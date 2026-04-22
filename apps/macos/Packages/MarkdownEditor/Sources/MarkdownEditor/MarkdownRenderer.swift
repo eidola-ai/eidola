@@ -586,39 +586,60 @@ enum MarkdownRenderer {
           .paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle,
         ]))
 
-    // When inside a visible blockquote, kern the continuation whitespace so its
-    // total rendered width matches the expected indent. In proportional fonts,
-    // space characters have different widths than marker characters ("1. "),
-    // causing content to shift when the cursor enters/leaves the blockquote.
-    if insideQuote {
-      kernContinuationWhitespaceInVisibleQuote(
-        in: safeRange,
-        targetWidth: contentIndent - context.visibleQuoteWidth,
-        nsText: nsText,
-        textLength: textLength,
-        style: style,
-        accumulator: &accumulator
-      )
-    } else {
-      hideIndentedContinuationWhitespace(
-        in: safeRange,
-        nsText: nsText,
-        textLength: textLength,
-        hiddenIndexes: &accumulator.hiddenIndexes
-      )
-    }
-
+    // Scope continuation whitespace handling to the first child paragraph + gap
+    // before the next sibling. This prevents the list item's marker-width kern/hide
+    // from being applied to nested child blocks (blockquotes, nested lists) which
+    // handle their own continuation whitespace independently.
     var childContext = context
     childContext.hiddenIndent = childHiddenIndent
 
     if let firstChild = block.children.first, firstChildSharesMarkerLine(firstChild, itemRange: safeRange, nsText: nsText) {
+      // Compute continuation range: from the list item start to the end of the
+      // first child paragraph (or next sibling). This prevents kern/hide/paragraph-
+      // style overrides from bleeding into nested child blocks.
+      let contEnd: Int
+      if block.children.count > 1 {
+        contEnd = block.children[1].range.location
+      } else {
+        // Single child — use its range end, stripped of trailing newlines,
+        // to avoid kern/hide bleeding past this line into the next block.
+        var end = firstChild.range.location + firstChild.range.length
+        while end > firstChild.range.location
+          && end <= textLength
+          && nsText.character(at: end - 1) == UInt16(0x000A)
+        {
+          end -= 1
+        }
+        contEnd = end
+      }
+      let contRange = NSRange(
+        location: safeRange.location,
+        length: contEnd - safeRange.location)
+
+      if insideQuote {
+        kernContinuationWhitespaceInVisibleQuote(
+          in: contRange,
+          targetWidth: contentIndent - context.visibleQuoteWidth,
+          nsText: nsText,
+          textLength: textLength,
+          style: style,
+          accumulator: &accumulator
+        )
+      } else {
+        hideIndentedContinuationWhitespace(
+          in: contRange,
+          nsText: nsText,
+          textLength: textLength,
+          hiddenIndexes: &accumulator.hiddenIndexes
+        )
+      }
+
       if !insideQuote, isPlainParagraphBlock(firstChild) {
-        // Apply continuation paragraph styles to the full block range (not just
-        // the first child paragraph) so that blank continuation lines created by
-        // Shift+Return get the correct firstLineHeadIndent = contentIndent.
-        // Child blocks apply their own styles on top, so there's no conflict.
+        let firstChildContRange = NSRange(
+          location: firstChild.range.location,
+          length: contEnd - firstChild.range.location)
         applyListContinuationParagraphStyles(
-          in: safeRange,
+          in: firstChildContRange,
           contentIndent: contentIndent,
           font: style.baseFont,
           color: context.foregroundColor,
@@ -651,6 +672,24 @@ enum MarkdownRenderer {
         )
       }
     } else {
+      // First child doesn't share marker line — apply kern/hide to full range.
+      if insideQuote {
+        kernContinuationWhitespaceInVisibleQuote(
+          in: safeRange,
+          targetWidth: contentIndent - context.visibleQuoteWidth,
+          nsText: nsText,
+          textLength: textLength,
+          style: style,
+          accumulator: &accumulator
+        )
+      } else {
+        hideIndentedContinuationWhitespace(
+          in: safeRange,
+          nsText: nsText,
+          textLength: textLength,
+          hiddenIndexes: &accumulator.hiddenIndexes
+        )
+      }
       for child in block.children {
         renderBlock(
           child,
@@ -751,10 +790,14 @@ enum MarkdownRenderer {
   }
 
   private static func listStyledRange(for block: MarkdownBlock, lineStart: Int) -> NSRange {
-    // Always cover the full block range so that blank continuation lines
-    // (created by Shift+Return) get the list item's paragraph style.
-    // Child blocks (nested lists, code blocks, etc.) apply their own styles
-    // on top, so there's no conflict.
+    // For plain paragraph children, limit to the first child's range. This
+    // prevents the list item's headIndent from bleeding into sibling blocks
+    // (nested blockquotes, subsequent paragraphs). Blank Shift+Return lines
+    // are part of the paragraph content and already within this range.
+    if let firstChild = block.children.first, isPlainParagraphBlock(firstChild) {
+      let end = firstChild.range.location + firstChild.range.length
+      return NSRange(location: lineStart, length: end - lineStart)
+    }
     return NSRange(location: lineStart, length: block.range.location + block.range.length - lineStart)
   }
 
