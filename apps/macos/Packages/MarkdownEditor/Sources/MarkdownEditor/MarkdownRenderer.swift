@@ -372,7 +372,19 @@ enum MarkdownRenderer {
       )
 
     case .thematicBreak:
-      let cursorInside = cursorOverlaps(cursorRange, node: safeRange, textLength: textLength)
+      // Use a content range (excluding trailing newline) for cursor detection
+      // so that a cursor on the NEXT line doesn't keep the break in edit mode.
+      let rangeEnd = safeRange.location + safeRange.length
+      let contentEnd: Int
+      if rangeEnd > safeRange.location && rangeEnd <= textLength
+        && nsText.character(at: rangeEnd - 1) == UInt16(0x000A)
+      {
+        contentEnd = rangeEnd - 1
+      } else {
+        contentEnd = rangeEnd
+      }
+      let contentRange = NSRange(location: safeRange.location, length: contentEnd - safeRange.location)
+      let cursorInside = cursorOverlaps(cursorRange, node: contentRange, textLength: textLength)
       let paragraphStyle = NSMutableParagraphStyle()
       paragraphStyle.firstLineHeadIndent = context.visibleQuoteWidth > 0 ? context.quoteAlignIndent : context.hiddenIndent + context.visibleQuoteWidth
       paragraphStyle.headIndent = context.hiddenIndent + context.visibleQuoteWidth
@@ -444,16 +456,20 @@ enum MarkdownRenderer {
     paragraphStyle.paragraphSpacingBefore = level <= 2 ? 16 : 10
     paragraphStyle.paragraphSpacing = 6
 
+    // Apply the heading font only to the content range (excluding the trailing
+    // newline). This prevents the heading's larger font metrics from bleeding
+    // into the next line, which would make the cursor on the following line
+    // inherit the heading's height.
     accumulator.styledRanges.append(
       RenderSpec.StyledRange(
-        range: lineRange,
+        range: lineContentRange,
         attributes: [
           .font: style.headingFont(level: level),
           .foregroundColor: context.foregroundColor,
           .paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle,
         ]))
 
-    // When inside a blockquote, lineRange includes the > prefix characters.
+    // When inside a blockquote, lineContentRange includes the > prefix characters.
     // Override them to baseFont so the heading's larger/bolder font doesn't
     // affect their width (which would cause horizontal shift) or render
     // them visually inconsistent with > on other blockquote lines.
@@ -597,8 +613,12 @@ enum MarkdownRenderer {
 
     if let firstChild = block.children.first, firstChildSharesMarkerLine(firstChild, itemRange: safeRange, nsText: nsText) {
       if !insideQuote, isPlainParagraphBlock(firstChild) {
+        // Apply continuation paragraph styles to the full block range (not just
+        // the first child paragraph) so that blank continuation lines created by
+        // Shift+Return get the correct firstLineHeadIndent = contentIndent.
+        // Child blocks apply their own styles on top, so there's no conflict.
         applyListContinuationParagraphStyles(
-          in: firstChild.range,
+          in: safeRange,
           contentIndent: contentIndent,
           font: style.baseFont,
           color: context.foregroundColor,
@@ -731,10 +751,10 @@ enum MarkdownRenderer {
   }
 
   private static func listStyledRange(for block: MarkdownBlock, lineStart: Int) -> NSRange {
-    if let firstChild = block.children.first, isPlainParagraphBlock(firstChild) {
-      let end = firstChild.range.location + firstChild.range.length
-      return NSRange(location: lineStart, length: end - lineStart)
-    }
+    // Always cover the full block range so that blank continuation lines
+    // (created by Shift+Return) get the list item's paragraph style.
+    // Child blocks (nested lists, code blocks, etc.) apply their own styles
+    // on top, so there's no conflict.
     return NSRange(location: lineStart, length: block.range.location + block.range.length - lineStart)
   }
 
