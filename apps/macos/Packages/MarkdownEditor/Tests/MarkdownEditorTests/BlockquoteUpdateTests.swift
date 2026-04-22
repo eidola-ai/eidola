@@ -200,6 +200,90 @@ struct BlockquoteUpdateTests {
     #expect(result.markdown == "> 1. Outer\n> > 1. Inner\n> > 2. Inner two")
   }
 
+  // MARK: - Space injection after bare `>`
+
+  @Test("Typing a character after bare > injects a space")
+  func typingAfterBareGtInjectsSpace() {
+    let state = EditorState(markdown: ">", selection: .cursor(1))
+    let result = EditorUpdate.update(state, event: .insertText("H"))
+    #expect(result.markdown == "> H")
+    #expect(result.selection == .cursor(3))
+  }
+
+  @Test("Typing a space after bare > does not double-inject")
+  func typingSpaceAfterBareGtNoDoubleInject() {
+    let state = EditorState(markdown: ">", selection: .cursor(1))
+    let result = EditorUpdate.update(state, event: .insertText(" "))
+    #expect(result.markdown == "> ")
+    #expect(result.selection == .cursor(2))
+  }
+
+  @Test("Typing after nested bare > injects a space")
+  func typingAfterNestedBareGtInjectsSpace() {
+    let state = EditorState(markdown: "> >", selection: .cursor(3))
+    let result = EditorUpdate.update(state, event: .insertText("H"))
+    #expect(result.markdown == "> > H")
+    #expect(result.selection == .cursor(5))
+  }
+
+  @Test("Pasting text after bare > injects a space")
+  func pastingAfterBareGtInjectsSpace() {
+    let state = EditorState(markdown: ">", selection: .cursor(1))
+    let result = EditorUpdate.update(state, event: .paste("Hello"))
+    #expect(result.markdown == "> Hello")
+    #expect(result.selection == .cursor(7))
+  }
+
+  @Test("Typing in middle of blockquote content does not inject space")
+  func typingInContentNoSpaceInjection() {
+    let state = EditorState(markdown: "> Hello", selection: .cursor(4))
+    let result = EditorUpdate.update(state, event: .insertText("x"))
+    #expect(result.markdown == "> Hexllo")
+    #expect(result.selection == .cursor(5))
+  }
+
+  @Test("Typing > at start of line does not inject space (not a prefix yet)")
+  func typingGtAtStartNoInjection() {
+    let state = EditorState(markdown: "", selection: .cursor(0))
+    let result = EditorUpdate.update(state, event: .insertText(">"))
+    #expect(result.markdown == ">")
+    #expect(result.selection == .cursor(1))
+  }
+
+  @Test("Typing after bare > nested inside a list item injects a space")
+  func typingAfterBareGtInsideListInjectsSpace() {
+    let state = EditorState(markdown: "- Item\n  >", selection: .cursor(10))
+    let result = EditorUpdate.update(state, event: .insertText("Q"))
+    #expect(result.markdown == "- Item\n  > Q")
+    #expect(result.selection == .cursor(12))
+  }
+
+  @Test("Typing after bare > with tab indent inside list injects a space")
+  func typingAfterBareGtWithTabIndentInjectsSpace() {
+    let state = EditorState(markdown: "- Item\n\t>", selection: .cursor(9))
+    let result = EditorUpdate.update(state, event: .insertText("Q"))
+    #expect(result.markdown == "- Item\n\t> Q")
+    #expect(result.selection == .cursor(11))
+  }
+
+  // MARK: - Bare `>` whole-unit deletion
+
+  @Test("Backspace after bare > deletes the entire >")
+  func backspaceAfterBareGtDeletesUnit() {
+    let state = EditorState(markdown: ">", selection: .cursor(1))
+    let result = EditorUpdate.update(state, event: .deleteBackward)
+    #expect(result.markdown == "")
+    #expect(result.selection == .cursor(0))
+  }
+
+  @Test("Backspace after bare nested > deletes one level")
+  func backspaceAfterBareNestedGtDeletesOneLevel() {
+    let state = EditorState(markdown: "> >", selection: .cursor(3))
+    let result = EditorUpdate.update(state, event: .deleteBackward)
+    #expect(result.markdown == "> ")
+    #expect(result.selection == .cursor(2))
+  }
+
   // MARK: - No interference with list behavior
 
   @Test("Enter on unordered list item still continues list (not blockquote)")

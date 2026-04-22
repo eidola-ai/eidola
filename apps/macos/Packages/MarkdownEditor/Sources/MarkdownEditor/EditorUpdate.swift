@@ -447,27 +447,59 @@ enum EditorUpdate {
       text: "\n")
   }
 
+  /// Regex matching a bare blockquote prefix (optional leading whitespace, then one
+  /// or more `>` with `> ` separators, ending in `>` without a trailing space).
+  /// Used to inject a trailing space when the user types content after a bare `>`.
+  /// The leading whitespace allows matching blockquotes nested inside list items.
+  private static let bareBlockquotePrefixPattern = try! NSRegularExpression(
+    pattern: #"^[ \t]*(> )*>$"#, options: [])
+
   private static func handleInsertText(_ state: EditorState, text: String) -> EditorState {
     let nsMarkdown = state.markdown as NSString
 
+    // Resolve insertion position (and delete selection if range).
+    let insertPos: Int
+    let baseMarkdown: NSString
     switch state.selection {
     case .cursor(let pos):
-      let clampedPos = min(pos, nsMarkdown.length)
-      let newMarkdown = nsMarkdown.replacingCharacters(
-        in: NSRange(location: clampedPos, length: 0), with: text)
-      let newPos = clampedPos + (text as NSString).length
-      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
-
+      insertPos = min(pos, nsMarkdown.length)
+      baseMarkdown = nsMarkdown
     case .range(let anchor, let head):
       let start = min(anchor, head)
       let end = max(anchor, head)
       let clampedStart = min(start, nsMarkdown.length)
       let clampedEnd = min(end, nsMarkdown.length)
       let replaceRange = NSRange(location: clampedStart, length: clampedEnd - clampedStart)
-      let newMarkdown = nsMarkdown.replacingCharacters(in: replaceRange, with: text)
-      let newPos = clampedStart + (text as NSString).length
-      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+      baseMarkdown = nsMarkdown.replacingCharacters(in: replaceRange, with: "") as NSString
+      insertPos = clampedStart
     }
+
+    // Check if we should inject a space after a bare blockquote `>`.
+    // This normalizes `>text` to `> text`, matching canonical blockquote format.
+    let effectiveText: String
+    if !text.hasPrefix(" ") && !text.hasPrefix("\n") && insertPos > 0 {
+      let (lineRange, lineText) = currentLine(baseMarkdown, at: insertPos)
+      let posInLine = insertPos - lineRange.location
+      if posInLine > 0 {
+        let prefixText = (lineText as NSString).substring(to: posInLine)
+        if bareBlockquotePrefixPattern.firstMatch(
+          in: prefixText, range: NSRange(location: 0, length: (prefixText as NSString).length)) != nil
+        {
+          effectiveText = " \(text)"
+        } else {
+          effectiveText = text
+        }
+      } else {
+        effectiveText = text
+      }
+    } else {
+      effectiveText = text
+    }
+
+    let newMarkdown = baseMarkdown.replacingCharacters(
+      in: NSRange(location: insertPos, length: 0), with: effectiveText)
+    let newPos = insertPos + (effectiveText as NSString).length
+    return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
   }
 
   private static func handleDeleteBackward(_ state: EditorState) -> EditorState {
@@ -554,6 +586,22 @@ enum EditorUpdate {
           let markerAbsRange = NSRange(
             location: lineRange.location + lastBqStart,
             length: 2)
+          let newMarkdown = nsMarkdown.replacingCharacters(in: markerAbsRange, with: "")
+          return EditorState(
+            markdown: newMarkdown, selection: .cursor(markerAbsRange.location))
+        }
+      }
+
+      // Match bare blockquote: a `>` without trailing space (e.g. `>` or `> >`).
+      // Deleting backward here removes the bare `>` (1 char) as a whole unit.
+      if posInLine > 0 {
+        let prefixText = lineNS.substring(to: posInLine)
+        if bareBlockquotePrefixPattern.firstMatch(
+          in: prefixText, range: NSRange(location: 0, length: (prefixText as NSString).length)) != nil
+        {
+          let markerAbsRange = NSRange(
+            location: lineRange.location + posInLine - 1,
+            length: 1)
           let newMarkdown = nsMarkdown.replacingCharacters(in: markerAbsRange, with: "")
           return EditorState(
             markdown: newMarkdown, selection: .cursor(markerAbsRange.location))
