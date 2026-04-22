@@ -161,9 +161,13 @@ struct MarkdownStyle {
     ]
   }
 
+  /// Paragraph spacing used in the base attributes. Exposed so other constructs
+  /// (e.g. thematic breaks) can match it to avoid vertical shifts.
+  var baseParagraphSpacing: CGFloat { 4 }
+
   var baseAttributes: [NSAttributedString.Key: Any] {
     let paragraphStyle = NSMutableParagraphStyle()
-    paragraphStyle.paragraphSpacing = 4
+    paragraphStyle.paragraphSpacing = baseParagraphSpacing
     return [
       .font: baseFont,
       .foregroundColor: textColor,
