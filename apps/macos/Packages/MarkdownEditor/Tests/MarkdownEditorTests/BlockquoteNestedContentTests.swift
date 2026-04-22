@@ -531,4 +531,41 @@ struct BlockquoteNestedContentTests {
       #expect(fm.fileExists(atPath: r.imagePath), "Image missing: \(r.imagePath)")
     }
   }
+
+  @Test("Visual: deeply nested blockquote > list > blockquote > ordered list")
+  func visualDeeplyNestedBlockquoteListOrdered() {
+    let markdown = """
+      > Blockquote 1
+      > > Blockquote 2
+      > > - List A
+      > >   > Blockquote 3, paragraph 1
+      > >   > 1. List B, item 1
+      > >   > 2. List B, item 2
+      > >   > Blockquote 3, paragraph 2
+      """
+    let textLen = (markdown as NSString).length
+    let initial = EditorState(markdown: markdown, selection: .cursor(0))
+
+    let events: [EditorEvent] = [
+      .setSelection(.cursor(0)),                             // outside everything
+      .setSelection(.cursor(17)),                            // inside bq 1
+      .setSelection(.cursor(34)),                            // inside bq 2
+      .setSelection(.cursor(45)),                            // inside list A
+      .setSelection(.cursor(70)),                            // inside bq 3 paragraph 1
+      .setSelection(.cursor(100)),                           // inside list B, item 1
+      .setSelection(.cursor(125)),                           // inside list B, item 2
+      .setSelection(.cursor(min(textLen - 5, textLen))),     // inside bq 3 paragraph 2
+    ]
+
+    let results = EditorTestHarness.run(
+      name: "deeply-nested-bq-list-bq-ordered",
+      initial: initial,
+      events: events,
+      size: NSSize(width: 700, height: 400))
+
+    let fm = FileManager.default
+    for r in results {
+      #expect(fm.fileExists(atPath: r.imagePath), "Image missing: \(r.imagePath)")
+    }
+  }
 }

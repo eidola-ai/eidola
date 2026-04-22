@@ -332,4 +332,118 @@ struct BlockquoteUpdateTests {
     state = EditorUpdate.update(state, event: .insertNewline)
     #expect(state.markdown == "> Line 1\n> Line 2\n\n")
   }
+
+  // MARK: - Deeply nested structures (interleaved blockquotes + lists)
+
+  @Test("Enter on bq > unordered > bq > ordered continues inner ordered list")
+  func enterDeepNestedContinuesOrdered() {
+    // > - > 1. Item  →  Enter  →  >   > 2.
+    let state = EditorState(markdown: "> - > 1. Item", selection: .cursor(13))
+    let result = EditorUpdate.update(state, event: .insertNewline)
+    #expect(result.markdown == "> - > 1. Item\n>   > 2. ")
+    #expect(result.selection == .cursor(23))
+  }
+
+  @Test("Enter on empty inner ordered marker unwinds ordered")
+  func enterEmptyInnerOrderedUnwinds() {
+    let state = EditorState(markdown: "> - > 1. ", selection: .cursor(9))
+    let result = EditorUpdate.update(state, event: .insertNewline)
+    #expect(result.markdown == "> - > \n")
+    #expect(result.selection == .cursor(6))
+  }
+
+  @Test("Enter on empty inner blockquote unwinds blockquote")
+  func enterEmptyInnerBqUnwinds() {
+    let state = EditorState(markdown: "> - > ", selection: .cursor(6))
+    let result = EditorUpdate.update(state, event: .insertNewline)
+    #expect(result.markdown == "> - \n")
+    #expect(result.selection == .cursor(4))
+  }
+
+  @Test("Enter on empty outer unordered unwinds unordered")
+  func enterEmptyOuterUnorderedUnwinds() {
+    let state = EditorState(markdown: "> - ", selection: .cursor(4))
+    let result = EditorUpdate.update(state, event: .insertNewline)
+    #expect(result.markdown == "> \n")
+    #expect(result.selection == .cursor(2))
+  }
+
+  @Test("Enter on bq > ordered > bq > unordered continues inner unordered")
+  func enterDeepNestedContinuesUnordered() {
+    let state = EditorState(markdown: "> 1. > - Item", selection: .cursor(13))
+    let result = EditorUpdate.update(state, event: .insertNewline)
+    #expect(result.markdown == "> 1. > - Item\n>    > - ")
+    #expect(result.selection == .cursor(23))
+  }
+
+  @Test("Enter in middle of deeply nested content splits correctly")
+  func enterMiddleDeepNested() {
+    let state = EditorState(markdown: "> - > 1. Hello World", selection: .cursor(14))
+    let result = EditorUpdate.update(state, event: .insertNewline)
+    #expect(result.markdown == "> - > 1. Hello\n>   > 2.  World")
+    #expect(result.selection == .cursor(24))
+  }
+
+  @Test("Shift+Enter on deeply nested line produces full continuation")
+  func shiftEnterDeepNested() {
+    let state = EditorState(markdown: "> - > 1. Item", selection: .cursor(13))
+    let result = EditorUpdate.update(state, event: .insertLineBreak)
+    #expect(result.markdown == "> - > 1. Item\n>   >    ")
+    #expect(result.selection == .cursor(23))
+  }
+
+  @Test("Backspace after inner ordered marker in deep nesting removes marker")
+  func backspaceInnerOrderedDeepNested() {
+    let state = EditorState(markdown: "> - > 1. Item", selection: .cursor(9))
+    let result = EditorUpdate.update(state, event: .deleteBackward)
+    #expect(result.markdown == "> - > Item")
+    #expect(result.selection == .cursor(6))
+  }
+
+  @Test("Backspace after inner blockquote marker in deep nesting removes blockquote")
+  func backspaceInnerBqDeepNested() {
+    let state = EditorState(markdown: "> - > 1. Item", selection: .cursor(6))
+    let result = EditorUpdate.update(state, event: .deleteBackward)
+    #expect(result.markdown == "> - 1. Item")
+    #expect(result.selection == .cursor(4))
+  }
+
+  @Test("Backspace after outer unordered marker in deep nesting removes marker")
+  func backspaceOuterUnorderedDeepNested() {
+    let state = EditorState(markdown: "> - > 1. Item", selection: .cursor(4))
+    let result = EditorUpdate.update(state, event: .deleteBackward)
+    #expect(result.markdown == "> > 1. Item")
+    #expect(result.selection == .cursor(2))
+  }
+
+  @Test("Full unwind cycle: deeply nested Enter-to-empty")
+  func fullUnwindCycle() {
+    // Start with deeply nested ordered list, repeatedly Enter on empty to unwind
+    var state = EditorState(markdown: "> - > 1. ", selection: .cursor(9))
+
+    // Enter: unwind ordered → "> - > "
+    state = EditorUpdate.update(state, event: .insertNewline)
+    #expect(state.markdown == "> - > \n")
+
+    // Re-position cursor at end of first line
+    state = EditorState(markdown: "> - > ", selection: .cursor(6))
+
+    // Enter: unwind inner blockquote → "> - "
+    state = EditorUpdate.update(state, event: .insertNewline)
+    #expect(state.markdown == "> - \n")
+
+    // Re-position
+    state = EditorState(markdown: "> - ", selection: .cursor(4))
+
+    // Enter: unwind unordered → "> "
+    state = EditorUpdate.update(state, event: .insertNewline)
+    #expect(state.markdown == "> \n")
+
+    // Re-position
+    state = EditorState(markdown: "> ", selection: .cursor(2))
+
+    // Enter: unwind blockquote → empty
+    state = EditorUpdate.update(state, event: .insertNewline)
+    #expect(state.markdown == "\n")
+  }
 }

@@ -240,23 +240,12 @@ public struct MarkdownEditor: NSViewRepresentable {
         if insertPos > 0 {
           let md = state.wrappedValue.markdown as NSString
           let lineRange = md.lineRange(for: NSRange(location: insertPos, length: 0))
+          let lineText = md.substring(with: lineRange)
           let posInLine = insertPos - lineRange.location
-          if posInLine > 0 {
-            let lineText = md.substring(with: lineRange) as NSString
-            let prefixText = lineText.substring(to: posInLine)
-            let prefixNS = prefixText as NSString
-            let barePattern = try! NSRegularExpression(pattern: #"^[ \t]*(> )*>$"#)
-            if barePattern.firstMatch(
-              in: prefixText, range: NSRange(location: 0, length: prefixNS.length)) != nil
-            {
-              // Route through Elm loop so handleInsertText injects the space.
-              let event: EditorEvent =
-                affectedCharRange.length > 0
-                ? .insertText(text)  // replacing selection
-                : .insertText(text)
-              processEvent(event, textView: textView)
-              return false
-            }
+          if EditorUpdate.needsBlockquoteSpaceInjection(lineText: lineText, posInLine: posInLine) {
+            // Route through Elm loop so handleInsertText injects the space.
+            processEvent(.insertText(text), textView: textView)
+            return false
           }
         }
       }
