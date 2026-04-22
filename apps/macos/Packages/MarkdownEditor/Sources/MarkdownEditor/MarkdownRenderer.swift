@@ -376,11 +376,13 @@ enum MarkdownRenderer {
       let paragraphStyle = NSMutableParagraphStyle()
       paragraphStyle.firstLineHeadIndent = context.visibleQuoteWidth > 0 ? context.quoteAlignIndent : context.hiddenIndent + context.visibleQuoteWidth
       paragraphStyle.headIndent = context.hiddenIndent + context.visibleQuoteWidth
-      let themedAttrs = style.thematicBreakAttributes.merging(
-        [
-          .paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle,
-        ],
-        uniquingKeysWith: { _, new in new })
+      paragraphStyle.paragraphSpacing = style.baseParagraphSpacing
+
+      // Always apply the paragraph style so line height is identical in both modes.
+      accumulator.styledRanges.append(
+        RenderSpec.StyledRange(
+          range: safeRange,
+          attributes: [.paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle]))
 
       if cursorInside {
         accumulator.temporaryAttributes.append(
@@ -389,7 +391,7 @@ enum MarkdownRenderer {
             attributes: [.foregroundColor: style.delimiterColor]))
       } else {
         accumulator.styledRanges.append(
-          RenderSpec.StyledRange(range: safeRange, attributes: themedAttrs))
+          RenderSpec.StyledRange(range: safeRange, attributes: style.thematicBreakAttributes))
       }
     }
   }
