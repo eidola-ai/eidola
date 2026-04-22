@@ -205,4 +205,55 @@ struct IndentOutdentUpdateTests {
     #expect(lines[1] == "- Second")
     #expect(lines[2] == "- Third")
   }
+
+  // MARK: - Indent/outdent with continuation lines
+
+  @Test("Tab on list item also indents its continuation lines")
+  func tabIndentsContinuations() {
+    // "- Bravo\n  aaa\n  bbb" — continuations have 2-space indent matching "- " width
+    let state = EditorState(
+      markdown: "- Alpha\n- Bravo\n  aaa\n  bbb",
+      selection: .cursor(14))  // cursor in "Bravo"
+    let result = EditorUpdate.update(state, event: .indent)
+    #expect(result.markdown == "- Alpha\n    - Bravo\n      aaa\n      bbb")
+  }
+
+  @Test("Tab on list item with single continuation line")
+  func tabIndentsSingleContinuation() {
+    let state = EditorState(
+      markdown: "- Item\n  continued",
+      selection: .cursor(4))  // cursor in "Item"
+    let result = EditorUpdate.update(state, event: .indent)
+    #expect(result.markdown == "    - Item\n      continued")
+  }
+
+  @Test("Tab on list item does not indent following list items")
+  func tabDoesNotIndentFollowingListItems() {
+    let state = EditorState(
+      markdown: "- Alpha\n- Bravo\n- Charlie",
+      selection: .cursor(10))  // cursor in "Bravo"
+    let result = EditorUpdate.update(state, event: .indent)
+    let lines = result.markdown.components(separatedBy: "\n")
+    #expect(lines[0] == "- Alpha")
+    #expect(lines[1] == "    - Bravo")
+    #expect(lines[2] == "- Charlie")
+  }
+
+  @Test("Shift+Tab on list item also outdents its continuation lines")
+  func shiftTabOutdentsContinuations() {
+    let state = EditorState(
+      markdown: "- Alpha\n    - Bravo\n      aaa\n      bbb",
+      selection: .cursor(18))  // cursor in "Bravo"
+    let result = EditorUpdate.update(state, event: .outdent)
+    #expect(result.markdown == "- Alpha\n- Bravo\n  aaa\n  bbb")
+  }
+
+  @Test("Shift+Tab on list item with single continuation line")
+  func shiftTabOutdentsSingleContinuation() {
+    let state = EditorState(
+      markdown: "    - Item\n      continued",
+      selection: .cursor(8))  // cursor in "Item"
+    let result = EditorUpdate.update(state, event: .outdent)
+    #expect(result.markdown == "- Item\n  continued")
+  }
 }

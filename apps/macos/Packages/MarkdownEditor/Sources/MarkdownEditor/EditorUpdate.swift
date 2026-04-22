@@ -875,10 +875,23 @@ enum EditorUpdate {
       }
       let indent = "    "
       let insertPos = lineRange.location + offset
-      let newMarkdown = nsMarkdown.replacingCharacters(
-        in: NSRange(location: insertPos, length: 0), with: indent)
+
+      // Collect continuation line ranges that belong to this list item.
+      let continuationRanges = findContinuationLineRanges(
+        in: nsMarkdown, afterLineRange: lineRange, prefixWidth: parsed.prefixLength)
+
+      // Apply insertions from back to front so ranges stay valid.
+      var newMarkdown = nsMarkdown.replacingCharacters(
+        in: NSRange(location: insertPos, length: 0), with: indent) as NSString
+      let extraChars = 4  // characters added to the list item line
+      for contRange in continuationRanges.reversed() {
+        let adjustedLoc = contRange.location + extraChars
+        newMarkdown = newMarkdown.replacingCharacters(
+          in: NSRange(location: adjustedLoc, length: 0), with: indent) as NSString
+      }
+
       let newPos = pos + 4
-      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+      return EditorState(markdown: newMarkdown as String, selection: .cursor(newPos))
     }
 
     // Check if we're on a continuation line belonging to a list item
@@ -929,11 +942,29 @@ enum EditorUpdate {
       let spacesToRemove = min(indentLength, 4)
       guard spacesToRemove > 0 else { return state }
 
+      // Collect continuation line ranges that belong to this list item.
+      let continuationRanges = findContinuationLineRanges(
+        in: nsMarkdown, afterLineRange: lineRange, prefixWidth: parsed.prefixLength)
+
       let removeStart = lineRange.location + indentOffset + (indentLength - spacesToRemove)
       let removeRange = NSRange(location: removeStart, length: spacesToRemove)
-      let newMarkdown = nsMarkdown.replacingCharacters(in: removeRange, with: "")
+
+      // Remove spaces from continuation lines (back to front), then the list item line.
+      var newMarkdown = nsMarkdown as String as NSString
+      for contRange in continuationRanges.reversed() {
+        let contLineText = newMarkdown.substring(with: contRange)
+        let contLeading = contLineText.prefix(while: { $0 == " " || $0 == "\t" })
+        let contRemove = min(contLeading.count, spacesToRemove)
+        if contRemove > 0 {
+          newMarkdown = newMarkdown.replacingCharacters(
+            in: NSRange(location: contRange.location, length: contRemove), with: "") as NSString
+        }
+      }
+      // Now remove from the list item line itself.
+      newMarkdown = newMarkdown.replacingCharacters(in: removeRange, with: "") as NSString
+
       let newPos = max(removeStart, pos - spacesToRemove)
-      return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+      return EditorState(markdown: newMarkdown as String, selection: .cursor(newPos))
     }
 
     // Check if we're on a continuation line belonging to a list item
@@ -1062,6 +1093,41 @@ enum EditorUpdate {
     }
 
     return nil
+  }
+
+  // MARK: - Continuation Line Discovery
+
+  /// Find the ranges of continuation lines that belong to a list item.
+  /// A continuation line follows the list item, is not itself a list marker,
+  /// and has leading whitespace >= `prefixWidth` (the full prefix width of the
+  /// parent list marker line).
+  private static func findContinuationLineRanges(
+    in nsMarkdown: NSString, afterLineRange lineRange: NSRange, prefixWidth: Int
+  ) -> [NSRange] {
+    var ranges: [NSRange] = []
+    var searchPos = NSMaxRange(lineRange)
+    while searchPos < nsMarkdown.length {
+      let nextRange = nsMarkdown.lineRange(for: NSRange(location: searchPos, length: 0))
+      let nextText = nsMarkdown.substring(with: nextRange)
+      let nextNS = nextText as NSString
+
+      // Stop if this line has its own list marker
+      if anyListMarkerWidthPattern.firstMatch(
+        in: nextText, range: NSRange(location: 0, length: nextNS.length)) != nil
+      {
+        break
+      }
+
+      // Stop if the line doesn't start with enough whitespace
+      let leading = nextText.prefix(while: { $0 == " " || $0 == "\t" })
+      if leading.count < prefixWidth {
+        break
+      }
+
+      ranges.append(nextRange)
+      searchPos = NSMaxRange(nextRange)
+    }
+    return ranges
   }
 
   // MARK: - Ordered List Renumbering
