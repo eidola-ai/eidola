@@ -25,12 +25,12 @@ struct LineBreakUpdateTests {
     #expect(result.selection == .cursor(12))
   }
 
-  @Test("Shift+Return outside list is plain newline")
+  @Test("Shift+Return outside list is paragraph break")
   func shiftReturnOutsideList() {
     let state = EditorState(markdown: "Hello", selection: .cursor(5))
     let result = EditorUpdate.update(state, event: .insertLineBreak)
-    #expect(result.markdown == "Hello\n")
-    #expect(result.selection == .cursor(6))
+    #expect(result.markdown == "Hello\n\n")
+    #expect(result.selection == .cursor(7))
   }
 
   @Test("Shift+Return in middle of list item content splits with indent")
@@ -97,12 +97,12 @@ struct LineBreakUpdateTests {
 
   // MARK: - Heading (not a list)
 
-  @Test("Shift+Return in heading is plain newline")
+  @Test("Shift+Return in heading is paragraph break")
   func shiftReturnInHeading() {
     let state = EditorState(markdown: "# Hello", selection: .cursor(7))
     let result = EditorUpdate.update(state, event: .insertLineBreak)
-    #expect(result.markdown == "# Hello\n")
-    #expect(result.selection == .cursor(8))
+    #expect(result.markdown == "# Hello\n\n")
+    #expect(result.selection == .cursor(9))
   }
 
   // MARK: - Empty document

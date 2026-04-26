@@ -64,16 +64,16 @@ struct EditorUpdateTests {
   func insertNewlineAtEnd() {
     let state = EditorState(markdown: "hello", selection: .cursor(5))
     let result = EditorUpdate.update(state, event: .insertNewline)
-    #expect(result.markdown == "hello\n")
-    #expect(result.selection == .cursor(6))
+    #expect(result.markdown == "hello\n\n")
+    #expect(result.selection == .cursor(7))
   }
 
   @Test("Insert newline in middle of text")
   func insertNewlineMiddle() {
     let state = EditorState(markdown: "hello world", selection: .cursor(5))
     let result = EditorUpdate.update(state, event: .insertNewline)
-    #expect(result.markdown == "hello\n world")
-    #expect(result.selection == .cursor(6))
+    #expect(result.markdown == "hello\n\n world")
+    #expect(result.selection == .cursor(7))
   }
 
   // MARK: - Delete Backward

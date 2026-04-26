@@ -49,8 +49,8 @@ struct EditorVisualTests {
       characters: "Line 1\nLine 2")
 
     let finalState = results.last!.state
-    #expect(finalState.markdown == "Line 1\nLine 2")
-    #expect(finalState.selection == .cursor(13))
+    #expect(finalState.markdown == "Line 1\n\nLine 2")
+    #expect(finalState.selection == .cursor(14))
   }
 
   // MARK: - Selection and Deletion
@@ -114,11 +114,11 @@ struct EditorVisualTests {
       characters: "# Title\nBody text")
 
     let finalState = results.last!.state
-    #expect(finalState.markdown == "# Title\nBody text")
+    #expect(finalState.markdown == "# Title\n\nBody text")
 
     // After the newline, cursor should be on line 2
-    // "# Title\n" is 8 chars, then "Body text" is 9 more = cursor at 17
-    #expect(finalState.selection == .cursor(17))
+    // "# Title\n\n" is 9 chars, then "Body text" is 9 more = cursor at 18
+    #expect(finalState.selection == .cursor(18))
   }
 
   @Test("Cursor inside heading reveals delimiters, cursor outside hides them")

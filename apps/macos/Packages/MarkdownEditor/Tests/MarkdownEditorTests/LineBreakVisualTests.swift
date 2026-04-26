@@ -86,7 +86,7 @@ struct LineBreakVisualTests {
 
   // MARK: - Shift+Return outside list
 
-  @Test("Shift+Return outside list is plain newline visual")
+  @Test("Shift+Return outside list is paragraph break visual")
   func shiftReturnOutsideListVisual() {
     var events: [EditorEvent] = []
     for c in "Hello" { events.append(.insertText(String(c))) }
@@ -100,7 +100,7 @@ struct LineBreakVisualTests {
       size: NSSize(width: 600, height: 200))
 
     let finalState = results.last!.state
-    #expect(finalState.markdown == "Hello\nWorld")
+    #expect(finalState.markdown == "Hello\n\nWorld")
 
     let fm = FileManager.default
     for r in results {
