@@ -11,6 +11,7 @@ import SwiftUI
 /// 5. `RenderApplicator.apply(spec, textView)` updates the view
 public struct MarkdownEditor: NSViewRepresentable {
   @Binding var state: EditorState
+  @Environment(\.markdownStyle) private var style
 
   public init(state: Binding<EditorState>) {
     self._state = state
@@ -19,6 +20,7 @@ public struct MarkdownEditor: NSViewRepresentable {
   public func makeNSView(context: Context) -> NSScrollView {
     let scrollView = NSTextView.scrollableTextView()
     let textView = scrollView.documentView as! NSTextView
+    context.coordinator.style = style
     context.coordinator.configure(textView)
     context.coordinator.syncToTextView(state, textView: textView)
     return scrollView
@@ -26,24 +28,30 @@ public struct MarkdownEditor: NSViewRepresentable {
 
   public func updateNSView(_ scrollView: NSScrollView, context: Context) {
     guard let textView = scrollView.documentView as? NSTextView else { return }
+    let styleChanged = context.coordinator.style != style
+    context.coordinator.style = style
     guard !context.coordinator.isProcessingEvent else { return }
-    // External state change (e.g., undo, programmatic update)
-    context.coordinator.syncToTextView(state, textView: textView)
+    // External state change or style change
+    if styleChanged || textView.string != state.markdown {
+      context.coordinator.syncToTextView(state, textView: textView)
+    }
   }
 
   public func makeCoordinator() -> Coordinator {
-    Coordinator(state: $state)
+    Coordinator(state: $state, style: style)
   }
 
   @MainActor
   public final class Coordinator: NSObject, NSTextViewDelegate {
     var state: Binding<EditorState>
+    var style: MarkdownStyle
     var isProcessingEvent = false
     var lastSpec: RenderSpec?
     private let glyphDelegate = GlyphHidingLayoutManagerDelegate()
 
-    init(state: Binding<EditorState>) {
+    init(state: Binding<EditorState>, style: MarkdownStyle = .default) {
       self.state = state
+      self.style = style
     }
 
     func configure(_ textView: NSTextView) {
@@ -100,7 +108,7 @@ public struct MarkdownEditor: NSViewRepresentable {
       }
       textView.setSelectedRange(editorState.selection.nsRange)
 
-      let spec = MarkdownRenderer.render(state: editorState)
+      let spec = MarkdownRenderer.render(state: editorState, style: style)
       RenderApplicator.apply(spec, to: textView)
       lastSpec = spec
     }
@@ -125,7 +133,7 @@ public struct MarkdownEditor: NSViewRepresentable {
 
       textView.setSelectedRange(newState.selection.nsRange)
 
-      let spec = MarkdownRenderer.render(state: newState)
+      let spec = MarkdownRenderer.render(state: newState, style: style)
       RenderApplicator.apply(spec, to: textView)
       lastSpec = spec
     }
@@ -301,7 +309,7 @@ public struct MarkdownEditor: NSViewRepresentable {
       state.wrappedValue = newState
 
       // Re-render attributes.
-      let spec = MarkdownRenderer.render(state: newState)
+      let spec = MarkdownRenderer.render(state: newState, style: style)
       RenderApplicator.apply(spec, to: textView)
       lastSpec = spec
     }
@@ -329,7 +337,7 @@ public struct MarkdownEditor: NSViewRepresentable {
       state.wrappedValue = EditorState(
         markdown: state.wrappedValue.markdown, selection: selection)
 
-      let spec = MarkdownRenderer.render(state: state.wrappedValue)
+      let spec = MarkdownRenderer.render(state: state.wrappedValue, style: style)
       let prevHidden = lastSpec?.hiddenIndexes ?? IndexSet()
       let prevBullets = lastSpec?.bulletIndexes ?? IndexSet()
       let prevUncheckedCheckboxes = lastSpec?.uncheckedCheckboxIndexes ?? IndexSet()

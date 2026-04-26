@@ -101,7 +101,7 @@ enum MarkdownRenderer {
       foregroundColor: style.textColor
     )
 
-    for block in document.blocks {
+    for (i, block) in document.blocks.enumerated() {
       renderBlock(
         block,
         context: rootContext,
@@ -109,7 +109,8 @@ enum MarkdownRenderer {
         nsText: nsText,
         textLength: textLength,
         style: style,
-        accumulator: &accumulator
+        accumulator: &accumulator,
+        previousSiblingKind: i > 0 ? document.blocks[i - 1].kind : nil
       )
     }
 
@@ -157,7 +158,8 @@ enum MarkdownRenderer {
     textLength: Int,
     style: MarkdownStyle,
     accumulator: inout RenderAccumulator,
-    suppressParagraphStyle: Bool = false
+    suppressParagraphStyle: Bool = false,
+    previousSiblingKind: MarkdownBlockKind? = nil
   ) {
     let safeRange = clamp(block.range, to: textLength)
     guard safeRange.length > 0 else { return }
@@ -166,13 +168,22 @@ enum MarkdownRenderer {
     case .paragraph:
       guard !suppressParagraphStyle else { return }
       let paragraphRange = nsText.lineRange(for: safeRange)
+      let afterContainer: Bool
+      switch previousSiblingKind {
+      case .unorderedList, .orderedList, .blockquote: afterContainer = true
+      default: afterContainer = false
+      }
+      let spacingBefore = afterContainer
+        ? style.paragraphSpacing + style.spacingAfterContainerBlock
+        : style.paragraphSpacing
       applyParagraphStyle(
         to: paragraphRange,
         context: context,
         font: style.baseFont,
         color: context.foregroundColor,
-        paragraphSpacingBefore: 0,
-        paragraphSpacing: 4,
+        paragraphSpacingBefore: spacingBefore,
+        paragraphSpacing: style.paragraphSpacing,
+        style: style,
         accumulator: &accumulator
       )
 
@@ -239,7 +250,7 @@ enum MarkdownRenderer {
         }
       }
 
-      for child in block.children {
+      for (i, child) in block.children.enumerated() {
         renderBlock(
           child,
           context: nextContext,
@@ -247,7 +258,8 @@ enum MarkdownRenderer {
           nsText: nsText,
           textLength: textLength,
           style: style,
-          accumulator: &accumulator
+          accumulator: &accumulator,
+          previousSiblingKind: i > 0 ? block.children[i - 1].kind : nil
         )
       }
 
@@ -259,7 +271,7 @@ enum MarkdownRenderer {
       )
 
     case .unorderedList, .orderedList:
-      for child in block.children {
+      for (i, child) in block.children.enumerated() {
         renderBlock(
           child,
           context: context,
@@ -267,7 +279,8 @@ enum MarkdownRenderer {
           nsText: nsText,
           textLength: textLength,
           style: style,
-          accumulator: &accumulator
+          accumulator: &accumulator,
+          previousSiblingKind: i > 0 ? block.children[i - 1].kind : nil
         )
       }
 
@@ -302,8 +315,9 @@ enum MarkdownRenderer {
       paragraphStyle.firstLineHeadIndent = insideQuote ? context.quoteAlignIndent : textOrigin
       paragraphStyle.headIndent = textOrigin
       paragraphStyle.tailIndent = -12
-      paragraphStyle.paragraphSpacing = 2
-      paragraphStyle.paragraphSpacingBefore = 2
+      paragraphStyle.paragraphSpacing = style.codeBlockSpacing
+      paragraphStyle.paragraphSpacingBefore = style.codeBlockSpacing
+      paragraphStyle.lineHeightMultiple = style.lineHeightMultiple
 
       accumulator.styledRanges.append(
         RenderSpec.StyledRange(
@@ -416,6 +430,7 @@ enum MarkdownRenderer {
       paragraphStyle.firstLineHeadIndent = context.visibleQuoteWidth > 0 ? context.quoteAlignIndent : context.hiddenIndent + context.visibleQuoteWidth
       paragraphStyle.headIndent = context.hiddenIndent + context.visibleQuoteWidth
       paragraphStyle.paragraphSpacing = style.baseParagraphSpacing
+      paragraphStyle.lineHeightMultiple = style.lineHeightMultiple
 
       // Always apply the paragraph style so line height is identical in both modes.
       accumulator.styledRanges.append(
@@ -480,8 +495,9 @@ enum MarkdownRenderer {
     let paragraphStyle = NSMutableParagraphStyle()
     paragraphStyle.firstLineHeadIndent = context.visibleQuoteWidth > 0 ? context.quoteAlignIndent : context.hiddenIndent
     paragraphStyle.headIndent = context.hiddenIndent + context.visibleQuoteWidth
-    paragraphStyle.paragraphSpacingBefore = level <= 2 ? 16 : 10
-    paragraphStyle.paragraphSpacing = 6
+    paragraphStyle.paragraphSpacingBefore = level <= 2 ? style.headingSpacingBeforeMajor : style.headingSpacingBeforeMinor
+    paragraphStyle.paragraphSpacing = style.headingSpacingAfter
+    paragraphStyle.lineHeightMultiple = style.lineHeightMultiple
 
     // Apply the heading font only to the content range (excluding the trailing
     // newline). This prevents the heading's larger font metrics from bleeding
@@ -602,7 +618,8 @@ enum MarkdownRenderer {
     let paragraphStyle = NSMutableParagraphStyle()
     paragraphStyle.firstLineHeadIndent = firstLineIndent
     paragraphStyle.headIndent = contentIndent
-    paragraphStyle.paragraphSpacing = 2
+    paragraphStyle.paragraphSpacing = style.listItemSpacing
+    paragraphStyle.lineHeightMultiple = style.lineHeightMultiple
 
     accumulator.styledRanges.append(
       RenderSpec.StyledRange(
@@ -670,7 +687,8 @@ enum MarkdownRenderer {
           contentIndent: contentIndent,
           font: style.baseFont,
           color: context.foregroundColor,
-          paragraphSpacing: 2,
+          paragraphSpacing: style.listItemSpacing,
+          style: style,
           nsText: nsText,
           textLength: textLength,
           accumulator: &accumulator
@@ -805,6 +823,7 @@ enum MarkdownRenderer {
     color: NSColor,
     paragraphSpacingBefore: CGFloat,
     paragraphSpacing: CGFloat,
+    style: MarkdownStyle = .default,
     accumulator: inout RenderAccumulator
   ) {
     let paragraphStyle = NSMutableParagraphStyle()
@@ -812,6 +831,7 @@ enum MarkdownRenderer {
     paragraphStyle.headIndent = context.hiddenIndent + context.visibleQuoteWidth
     paragraphStyle.paragraphSpacingBefore = paragraphSpacingBefore
     paragraphStyle.paragraphSpacing = paragraphSpacing
+    paragraphStyle.lineHeightMultiple = style.lineHeightMultiple
 
     accumulator.styledRanges.append(
       RenderSpec.StyledRange(
@@ -1110,6 +1130,7 @@ enum MarkdownRenderer {
     font: NSFont,
     color: NSColor,
     paragraphSpacing: CGFloat,
+    style: MarkdownStyle,
     nsText: NSString,
     textLength: Int,
     accumulator: inout RenderAccumulator
@@ -1129,6 +1150,7 @@ enum MarkdownRenderer {
         paragraphStyle.firstLineHeadIndent = contentIndent
         paragraphStyle.headIndent = contentIndent
         paragraphStyle.paragraphSpacing = paragraphSpacing
+        paragraphStyle.lineHeightMultiple = style.lineHeightMultiple
 
         accumulator.styledRanges.append(
           RenderSpec.StyledRange(
