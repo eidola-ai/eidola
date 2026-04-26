@@ -322,10 +322,12 @@ public struct MarkdownEditor: NSViewRepresentable {
       let prevBullets = lastSpec?.bulletIndexes ?? IndexSet()
       let prevUncheckedCheckboxes = lastSpec?.uncheckedCheckboxIndexes ?? IndexSet()
       let prevCheckedCheckboxes = lastSpec?.checkedCheckboxIndexes ?? IndexSet()
+      let prevCollapsedNewlines = lastSpec?.collapsedNewlineIndexes ?? IndexSet()
       RenderApplicator.applyCursorUpdate(
         spec, previousHidden: prevHidden, previousBullets: prevBullets,
         previousUncheckedCheckboxes: prevUncheckedCheckboxes,
-        previousCheckedCheckboxes: prevCheckedCheckboxes, to: textView)
+        previousCheckedCheckboxes: prevCheckedCheckboxes,
+        previousCollapsedNewlines: prevCollapsedNewlines, to: textView)
       lastSpec = spec
       isProcessingEvent = false
     }

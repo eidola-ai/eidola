@@ -23,6 +23,9 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
   /// Character indexes whose glyphs should be replaced with a checked checkbox (☒ U+2612).
   var checkedCheckboxCharacterIndexes = IndexSet()
 
+  /// Newline character indexes whose glyphs should be `.null` to collapse their line fragments.
+  var collapsedNewlineCharacterIndexes = IndexSet()
+
   // MARK: - Glyph Generation
 
   func layoutManager(
@@ -43,6 +46,7 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
       if hiddenCharacterIndexes.contains(charIdx) || bulletCharacterIndexes.contains(charIdx)
         || uncheckedCheckboxCharacterIndexes.contains(charIdx)
         || checkedCheckboxCharacterIndexes.contains(charIdx)
+        || collapsedNewlineCharacterIndexes.contains(charIdx)
       {
         needsModification = true
         break
@@ -68,7 +72,12 @@ final class GlyphHidingLayoutManagerDelegate: NSObject, @preconcurrency NSLayout
 
     for i in 0..<count {
       let charIdx = charIndexes[i]
-      if hiddenCharacterIndexes.contains(charIdx) {
+      if collapsedNewlineCharacterIndexes.contains(charIdx) {
+        // Use .null so the glyph does not participate in layout at all,
+        // collapsing the line fragment for this blank-line paragraph to zero height.
+        newGlyphs[i] = glyphs[i]
+        newProps[i] = .null
+      } else if hiddenCharacterIndexes.contains(charIdx) {
         if zwspGlyph == nil {
           var zwspChar: UniChar = 0x200B  // ZERO WIDTH SPACE
           var glyph: CGGlyph = 0
