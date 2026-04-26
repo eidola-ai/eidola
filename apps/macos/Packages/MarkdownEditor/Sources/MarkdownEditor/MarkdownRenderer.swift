@@ -21,6 +21,7 @@ enum MarkdownRenderer {
     var bulletIndexes = IndexSet()
     var uncheckedCheckboxIndexes = IndexSet()
     var checkedCheckboxIndexes = IndexSet()
+    var collapsedNewlineIndexes = IndexSet()
     var temporaryAttributes: [RenderSpec.StyledRange] = []
     var codeBlockCharacterRanges: [RenderSpec.CodeBlockDecoration] = []
     var blockquoteCharacterRanges: [RenderSpec.BlockquoteDecoration] = []
@@ -48,6 +49,7 @@ enum MarkdownRenderer {
         bulletIndexes: IndexSet(),
         uncheckedCheckboxIndexes: IndexSet(),
         checkedCheckboxIndexes: IndexSet(),
+        collapsedNewlineIndexes: IndexSet(),
         temporaryAttributes: [],
         codeBlockCharacterRanges: [],
         blockquoteCharacterRanges: []
@@ -67,6 +69,7 @@ enum MarkdownRenderer {
         bulletIndexes: IndexSet(),
         uncheckedCheckboxIndexes: IndexSet(),
         checkedCheckboxIndexes: IndexSet(),
+        collapsedNewlineIndexes: IndexSet(),
         temporaryAttributes: [],
         codeBlockCharacterRanges: [],
         blockquoteCharacterRanges: []
@@ -120,6 +123,15 @@ enum MarkdownRenderer {
       )
     }
 
+    // Collapse the first blank line in each inter-block gap so that \n\n
+    // paragraph separators render identically to the old single-\n behavior.
+    collapseInterBlockBlankLines(
+      between: document.blocks,
+      nsText: nsText,
+      textLength: textLength,
+      accumulator: &accumulator
+    )
+
     return RenderSpec(
       baseAttributes: style.baseAttributes,
       styledRanges: accumulator.styledRanges,
@@ -128,6 +140,7 @@ enum MarkdownRenderer {
       bulletIndexes: accumulator.bulletIndexes,
       uncheckedCheckboxIndexes: accumulator.uncheckedCheckboxIndexes,
       checkedCheckboxIndexes: accumulator.checkedCheckboxIndexes,
+      collapsedNewlineIndexes: accumulator.collapsedNewlineIndexes,
       temporaryAttributes: accumulator.temporaryAttributes,
       codeBlockCharacterRanges: accumulator.codeBlockCharacterRanges,
       blockquoteCharacterRanges: accumulator.blockquoteCharacterRanges
@@ -238,6 +251,13 @@ enum MarkdownRenderer {
         )
       }
 
+      collapseInterBlockBlankLines(
+        between: block.children,
+        nsText: nsText,
+        textLength: textLength,
+        accumulator: &accumulator
+      )
+
     case .unorderedList, .orderedList:
       for child in block.children {
         renderBlock(
@@ -250,6 +270,13 @@ enum MarkdownRenderer {
           accumulator: &accumulator
         )
       }
+
+      collapseInterBlockBlankLines(
+        between: block.children,
+        nsText: nsText,
+        textLength: textLength,
+        accumulator: &accumulator
+      )
 
     case .listItem(let syntax):
       renderListItem(
@@ -702,6 +729,13 @@ enum MarkdownRenderer {
         )
       }
     }
+
+    collapseInterBlockBlankLines(
+      between: block.children,
+      nsText: nsText,
+      textLength: textLength,
+      accumulator: &accumulator
+    )
   }
 
   // MARK: - Inline Rendering
@@ -1125,6 +1159,74 @@ enum MarkdownRenderer {
     let safeRange = clamp(range, to: textLength)
     guard safeRange.length > 0 else { return 0 }
     return style.textWidth(nsText.substring(with: safeRange))
+  }
+
+  // MARK: - Blank Line Collapsing
+
+  /// Collapse the first blank line in gaps between sibling blocks so that
+  /// `\n\n` paragraph separators render identically to the old single-`\n` behavior.
+  /// Subsequent blank lines in the same gap remain visible, preserving the user's
+  /// ability to create intentional visual space.
+  private static func collapseInterBlockBlankLines(
+    between blocks: [MarkdownBlock],
+    nsText: NSString,
+    textLength: Int,
+    accumulator: inout RenderAccumulator
+  ) {
+    guard blocks.count >= 2 else { return }
+
+    for i in 1..<blocks.count {
+      let prevEnd = blocks[i - 1].range.location + blocks[i - 1].range.length
+      let nextStart = blocks[i].range.location
+
+      guard nextStart > prevEnd else { continue }
+
+      collapseFirstBlankLine(
+        in: NSRange(location: prevEnd, length: nextStart - prevEnd),
+        nsText: nsText,
+        textLength: textLength,
+        accumulator: &accumulator
+      )
+    }
+  }
+
+  /// Find the first blank line (only whitespace and `>` markers) in the given range
+  /// and mark its characters as collapsed newlines so the glyph delegate sets them to
+  /// `.null`, causing the line fragment to collapse to zero height.
+  private static func collapseFirstBlankLine(
+    in range: NSRange,
+    nsText: NSString,
+    textLength: Int,
+    accumulator: inout RenderAccumulator
+  ) {
+    let end = min(range.location + range.length, textLength)
+    var pos = range.location
+
+    while pos < end {
+      let lineRange = nsText.lineRange(for: NSRange(location: pos, length: 0))
+
+      // Only consider lines that start at or after the gap start.
+      // Lines extending before the gap are content lines, not blank lines.
+      if lineRange.location >= range.location && lineRange.length > 0 {
+        let lineText = nsText.substring(with: lineRange)
+        let stripped = lineText
+          .replacingOccurrences(of: ">", with: "")
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if stripped.isEmpty {
+          // Blank line — mark all characters as collapsed so the line fragment
+          // has no visible glyphs and collapses to zero height.
+          for i in lineRange.location..<(lineRange.location + lineRange.length) {
+            accumulator.collapsedNewlineIndexes.insert(i)
+          }
+          return  // Only collapse the first blank line in each gap.
+        }
+      }
+
+      let nextPos = lineRange.location + lineRange.length
+      if nextPos <= pos { break }
+      pos = nextPos
+    }
   }
 
   static func cursorOverlaps(

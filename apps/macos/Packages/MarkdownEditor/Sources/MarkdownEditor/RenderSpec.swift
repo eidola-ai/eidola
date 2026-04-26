@@ -28,6 +28,11 @@ struct RenderSpec {
   /// Characters whose glyphs should be replaced with a checked checkbox (☒ U+2612).
   let checkedCheckboxIndexes: IndexSet
 
+  /// Newline characters whose glyphs should be set to `.null` so their line fragments
+  /// collapse to zero height. Used for the first blank line in each inter-block gap
+  /// so that `\n\n` paragraph separators render as a single visual line break.
+  let collapsedNewlineIndexes: IndexSet
+
   /// Rendering-only attributes (e.g., dimmed delimiter color when cursor is inside a construct).
   /// Applied via `NSLayoutManager.addTemporaryAttributes` — they don't affect the text storage.
   let temporaryAttributes: [StyledRange]
@@ -68,6 +73,7 @@ struct RenderSpec {
       bulletIndexes == other.bulletIndexes,
       uncheckedCheckboxIndexes == other.uncheckedCheckboxIndexes,
       checkedCheckboxIndexes == other.checkedCheckboxIndexes,
+      collapsedNewlineIndexes == other.collapsedNewlineIndexes,
       styledRanges.count == other.styledRanges.count,
       fontTraits.count == other.fontTraits.count,
       temporaryAttributes.count == other.temporaryAttributes.count,

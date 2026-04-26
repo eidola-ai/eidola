@@ -23,6 +23,7 @@ enum RenderApplicator {
       glyphDelegate.bulletCharacterIndexes = spec.bulletIndexes
       glyphDelegate.uncheckedCheckboxCharacterIndexes = spec.uncheckedCheckboxIndexes
       glyphDelegate.checkedCheckboxCharacterIndexes = spec.checkedCheckboxIndexes
+      glyphDelegate.collapsedNewlineCharacterIndexes = spec.collapsedNewlineIndexes
     }
 
     // Set code block ranges for full-width background drawing.
@@ -77,6 +78,7 @@ enum RenderApplicator {
     previousBullets: IndexSet,
     previousUncheckedCheckboxes: IndexSet = IndexSet(),
     previousCheckedCheckboxes: IndexSet = IndexSet(),
+    previousCollapsedNewlines: IndexSet = IndexSet(),
     to textView: NSTextView
   ) {
     guard let layoutManager = textView.layoutManager else { return }
@@ -90,6 +92,7 @@ enum RenderApplicator {
       glyphDelegate.bulletCharacterIndexes = spec.bulletIndexes
       glyphDelegate.uncheckedCheckboxCharacterIndexes = spec.uncheckedCheckboxIndexes
       glyphDelegate.checkedCheckboxCharacterIndexes = spec.checkedCheckboxIndexes
+      glyphDelegate.collapsedNewlineCharacterIndexes = spec.collapsedNewlineIndexes
     }
 
     // Update code block ranges for full-width background drawing.
@@ -106,8 +109,10 @@ enum RenderApplicator {
     // Invalidate only the ranges that changed
     let allPrevious = previousHidden.union(previousBullets)
       .union(previousUncheckedCheckboxes).union(previousCheckedCheckboxes)
+      .union(previousCollapsedNewlines)
     let allNew = spec.hiddenIndexes.union(spec.bulletIndexes)
       .union(spec.uncheckedCheckboxIndexes).union(spec.checkedCheckboxIndexes)
+      .union(spec.collapsedNewlineIndexes)
     let changed = allPrevious.symmetricDifference(allNew)
 
     for range in changed.rangeView {
