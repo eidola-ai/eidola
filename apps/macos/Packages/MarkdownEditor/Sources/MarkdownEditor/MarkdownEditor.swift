@@ -250,6 +250,18 @@ public struct MarkdownEditor: NSViewRepresentable {
         }
       }
 
+      // Normalize soft line breaks in pasted/imported text.
+      // Return key is handled by doCommandBy (which returns true, preventing
+      // this method from being called), so \n here comes from paste, drag-drop,
+      // or other multi-character input — not from user pressing Return.
+      if let text = replacementString, text.contains("\n"), text.count > 1 {
+        let normalized = EditorUpdate.normalizeSoftLineBreaks(in: text)
+        if normalized != text {
+          processEvent(.paste(normalized), textView: textView)
+          return false
+        }
+      }
+
       // Allow NSTextView to handle the edit natively.
       // textDidChange will sync state and re-render attributes.
       return true

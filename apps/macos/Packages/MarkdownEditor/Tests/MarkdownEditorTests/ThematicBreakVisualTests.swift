@@ -14,7 +14,7 @@ struct ThematicBreakVisualTests {
   func typeHorizontalRule() {
     let results = EditorTestHarness.runTyping(
       name: "thematic-break-typing-dashes",
-      characters: "Above\n\n---\n\nBelow",
+      characters: "Above\n---\nBelow",
       size: NSSize(width: 600, height: 200))
 
     let finalState = results.last!.state
@@ -30,7 +30,7 @@ struct ThematicBreakVisualTests {
   func typeAsteriskRule() {
     let results = EditorTestHarness.runTyping(
       name: "thematic-break-typing-asterisks",
-      characters: "Above\n\n***\n\nBelow",
+      characters: "Above\n***\nBelow",
       size: NSSize(width: 600, height: 200))
 
     let finalState = results.last!.state
@@ -46,7 +46,7 @@ struct ThematicBreakVisualTests {
   func typeUnderscoreRule() {
     let results = EditorTestHarness.runTyping(
       name: "thematic-break-typing-underscores",
-      characters: "Above\n\n___\n\nBelow",
+      characters: "Above\n___\nBelow",
       size: NSSize(width: 600, height: 200))
 
     let finalState = results.last!.state
@@ -179,7 +179,7 @@ struct ThematicBreakVisualTests {
   func determinismThematicBreak() {
     let results = EditorTestHarness.runTyping(
       name: "determinism-thematic-break",
-      characters: "Above\n\n---\n\nBelow",
+      characters: "Above\n---\nBelow",
       size: NSSize(width: 600, height: 200))
 
     let finalState = results.last!.state

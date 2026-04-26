@@ -1,4 +1,5 @@
 import Foundation
+import Markdown
 
 /// Pure state transition function for the editor.
 ///
@@ -196,6 +197,33 @@ enum EditorUpdate {
 
     let content = ns.substring(from: pos)
     return ParsedPrefix(components: components, prefixLength: pos, content: content)
+  }
+
+  /// Check if a position is inside a fenced code block by counting fence lines
+  /// (lines starting with ``` or ~~~) before it. An odd count means inside.
+  private static func isInsideFencedCodeBlock(_ nsMarkdown: NSString, at pos: Int) -> Bool {
+    var fenceCount = 0
+    var searchPos = 0
+
+    while searchPos < nsMarkdown.length {
+      let lineRange = nsMarkdown.lineRange(for: NSRange(location: searchPos, length: 0))
+      let lineText = nsMarkdown.substring(with: lineRange)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      // Strip blockquote prefixes for nested code blocks inside `> `
+      let stripped = lineText.drop(while: { $0 == ">" || $0 == " " || $0 == "\t" })
+
+      if stripped.hasPrefix("```") || stripped.hasPrefix("~~~") {
+        fenceCount += 1
+      }
+
+      let nextPos = lineRange.location + lineRange.length
+      if nextPos <= searchPos { break }
+      // Stop after processing the line that contains the cursor.
+      if nextPos > pos { break }
+      searchPos = nextPos
+    }
+
+    return fenceCount % 2 == 1
   }
 
   /// Check if a character can start a structural marker (blockquote, list, ordered).
@@ -507,8 +535,23 @@ enum EditorUpdate {
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
-    // Default: plain newline insertion.
-    return handleInsertText(state, text: "\n")
+    // Default: paragraph break or blank line.
+    // Inside a fenced code block, always use single \n (literal newlines).
+    // In paragraph context, insert \n\n so the raw markdown uses a blank line
+    // to separate paragraphs (per CommonMark). On an already-blank line, insert
+    // a single \n so consecutive Returns produce visible empty paragraphs.
+    if isInsideFencedCodeBlock(nsMarkdown, at: pos) {
+      return handleInsertText(state, text: "\n")
+    }
+    let (_, defaultLineText) = currentLine(nsMarkdown, at: pos)
+    let defaultLineContent = defaultLineText.trimmingCharacters(in: .newlines)
+    let onBlankLine: Bool
+    if case .cursor = state.selection {
+      onBlankLine = defaultLineContent.isEmpty
+    } else {
+      onBlankLine = false
+    }
+    return handleInsertText(state, text: onBlankLine ? "\n" : "\n\n")
   }
 
   // Regex matching any list line (unordered or ordered) to extract the full marker width.
@@ -562,10 +605,17 @@ enum EditorUpdate {
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
-    // Not in a list item: plain newline.
+    // Not in a list item: paragraph break (same as Return for now).
+    if isInsideFencedCodeBlock(workNS, at: workPos) {
+      return handleInsertText(
+        EditorState(markdown: workMarkdown, selection: .cursor(workPos)),
+        text: "\n")
+    }
+    let (_, shiftLineText) = currentLine(workNS, at: workPos)
+    let shiftLineContent = shiftLineText.trimmingCharacters(in: .newlines)
     return handleInsertText(
       EditorState(markdown: workMarkdown, selection: .cursor(workPos)),
-      text: "\n")
+      text: shiftLineContent.isEmpty ? "\n" : "\n\n")
   }
 
   /// Regex matching a bare blockquote prefix (optional leading whitespace, then one
@@ -685,6 +735,18 @@ enum EditorUpdate {
           return EditorState(
             markdown: newMarkdown, selection: .cursor(markerAbsRange.location))
         }
+      }
+
+      // Check for \n\n paragraph boundary: consume both newlines to merge paragraphs.
+      // Without this, deleting one \n would leave a lone \n that is a CommonMark
+      // soft line break rather than a paragraph separator.
+      if clampedPos >= 2
+        && nsMarkdown.character(at: clampedPos - 1) == UInt16(0x000A)
+        && nsMarkdown.character(at: clampedPos - 2) == UInt16(0x000A)
+      {
+        let deleteRange = NSRange(location: clampedPos - 2, length: 2)
+        let newMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
+        return EditorState(markdown: newMarkdown, selection: .cursor(clampedPos - 2))
       }
 
       // Default: delete one character before cursor
@@ -1339,5 +1401,88 @@ enum EditorUpdate {
     }
 
     return EditorState(markdown: newMarkdown, selection: newSelection)
+  }
+
+  // MARK: - Soft Line Break Normalization
+
+  /// Normalize soft line breaks in markdown text by replacing them with spaces.
+  ///
+  /// In CommonMark, a soft line break (`\n` within a paragraph) renders as a space.
+  /// This function parses the text, finds soft/hard line breaks within paragraphs,
+  /// and replaces the `\n` plus any continuation prefix (`> `, indentation) with
+  /// a single space. Also strips trailing whitespace before the break to avoid
+  /// double spaces from hard-break syntax (`  \n`).
+  ///
+  /// Used to normalize pasted markdown so that hard-wrapped paragraphs reflow
+  /// correctly in the WYSIWYG editor.
+  static func normalizeSoftLineBreaks(in text: String) -> String {
+    let doc = Document(parsing: text)
+    let converter = SourceRangeConverter(string: text)
+
+    // Collect gap ranges around SoftBreak/LineBreak nodes.
+    // The gap is the span between the preceding sibling's end and the
+    // following sibling's start, which includes the \n and any continuation
+    // prefix (blockquote markers, list indentation).
+    var gapRanges: [NSRange] = []
+
+    func walkInlines(in node: Markup) {
+      let children = Array(node.children)
+      for (i, child) in children.enumerated() {
+        if child is SoftBreak || child is LineBreak {
+          // Find preceding and following sibling ranges to compute the gap.
+          let prevEnd: Int?
+          if i > 0, let r = children[i - 1].range {
+            prevEnd = converter.utf16Offset(from: r.upperBound)
+          } else {
+            prevEnd = nil
+          }
+          let nextStart: Int?
+          if i + 1 < children.count, let r = children[i + 1].range {
+            nextStart = converter.utf16Offset(from: r.lowerBound)
+          } else {
+            nextStart = nil
+          }
+
+          if let start = prevEnd, let end = nextStart, end > start {
+            // Also strip trailing whitespace before the \n to avoid double spaces.
+            let nsText = text as NSString
+            var trimmedStart = start
+            while trimmedStart > 0
+              && nsText.character(at: trimmedStart - 1) == UInt16(0x0020)
+            {
+              trimmedStart -= 1
+            }
+            // Only trim back if there's at least one space before the break,
+            // preserving the character right before the whitespace.
+            let effectiveStart = trimmedStart < start ? trimmedStart : start
+            gapRanges.append(NSRange(location: effectiveStart, length: end - effectiveStart))
+          }
+        } else {
+          walkInlines(in: child)
+        }
+      }
+    }
+
+    func walkBlocks(_ node: Markup) {
+      for child in node.children {
+        if child is Paragraph {
+          walkInlines(in: child)
+        } else {
+          walkBlocks(child)
+        }
+      }
+    }
+
+    walkBlocks(doc)
+
+    guard !gapRanges.isEmpty else { return text }
+
+    // Apply replacements in reverse order so ranges stay valid.
+    var result = text as NSString
+    for gap in gapRanges.reversed() {
+      result = result.replacingCharacters(in: gap, with: " ") as NSString
+    }
+
+    return result as String
   }
 }
