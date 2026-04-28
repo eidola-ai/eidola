@@ -394,7 +394,7 @@ enum EditorUpdate {
   /// Called externally when text was mutated outside the Elm loop
   /// (e.g., by NSTextView natively).
   static func postProcess(_ state: EditorState) -> EditorState {
-    let normalized = normalizeSetextHeadings(in: state)
+    let normalized = normalizeSetextHeadings(in: state, skipIfCursorMidLine: true)
     return renumberOrderedLists(in: normalized)
   }
 
@@ -1212,7 +1212,9 @@ enum EditorUpdate {
   /// - While typing `=` or `-` after text, no heading conversion occurs (cursor is on the underline)
   /// - As soon as the cursor moves away (click, arrow, Enter, etc.), the setext heading
   ///   is converted to ATX format and the underline disappears
-  private static func normalizeSetextHeadings(in state: EditorState) -> EditorState {
+  private static func normalizeSetextHeadings(
+    in state: EditorState, skipIfCursorMidLine: Bool = false
+  ) -> EditorState {
     let text = state.markdown
     let nsText = text as NSString
     let cursorPos = state.selection.head
@@ -1227,6 +1229,24 @@ enum EditorUpdate {
           in: cursorLine, range: NSRange(location: 0, length: (cursorLine as NSString).length)) != nil
       {
         return state
+      }
+
+      // After text-editing events (not cursor moves), if text follows the
+      // cursor on the same line, skip normalization. This prevents a line
+      // split (Return in the middle of a list item) from triggering setext
+      // conversion — the resulting bare "-" line is a structural artifact,
+      // not an intentional underline.
+      if skipIfCursorMidLine {
+        let lineEnd = cursorLineRange.location + cursorLineRange.length
+        var contentEnd = lineEnd
+        if contentEnd > cursorLineRange.location && contentEnd <= nsText.length
+          && nsText.character(at: contentEnd - 1) == UInt16(0x000A)
+        {
+          contentEnd -= 1
+        }
+        if cursorPos < contentEnd {
+          return state
+        }
       }
     }
 
