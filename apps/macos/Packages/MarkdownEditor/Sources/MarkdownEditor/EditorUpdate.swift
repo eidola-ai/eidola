@@ -427,6 +427,35 @@ enum EditorUpdate {
     // If the prefix has structural components, use prefix-aware logic.
     if !parsed.components.isEmpty {
 
+      // Inside a fenced code block, only continue blockquote/indent prefix.
+      // List markers found by parsePrefix are code content, not structure.
+      if isInsideFencedCodeBlock(nsMarkdown, at: pos) {
+        var codeBlockComponents: [PrefixComponent] = []
+        for comp in parsed.components {
+          if comp.isListMarker { break }
+          if case .checkbox = comp { break }
+          codeBlockComponents.append(comp)
+        }
+        let prefix = rebuildPrefix(codeBlockComponents)
+        var workMarkdown = state.markdown
+        var workPos = pos
+        if case .range(let anchor, let head) = state.selection {
+          let start = min(anchor, head)
+          let end = max(anchor, head)
+          let clampedStart = min(start, nsMarkdown.length)
+          let clampedEnd = min(end, nsMarkdown.length)
+          let deleteRange = NSRange(location: clampedStart, length: clampedEnd - clampedStart)
+          workMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
+          workPos = clampedStart
+        }
+        let workNS = workMarkdown as NSString
+        let insertion = "\n\(prefix)"
+        let newMarkdown = workNS.replacingCharacters(
+          in: NSRange(location: workPos, length: 0), with: insertion)
+        let newPos = workPos + (insertion as NSString).length
+        return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+      }
+
       // Find the innermost list marker and the innermost non-indent component.
       let innermostListIdx = parsed.components.lastIndex(where: { $0.isListMarker })
       let innermostStructuralIdx = parsed.components.lastIndex(where: {
@@ -505,8 +534,15 @@ enum EditorUpdate {
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
-    // No structural prefix — check if we're on a continuation line belonging
-    // to a parent list item. If so, create a new list item.
+    // No structural prefix — inside a fenced code block, just insert a plain newline.
+    // This check must come before findParentListItem, which would otherwise match
+    // code block lines inside lists as continuation lines and create list items.
+    if isInsideFencedCodeBlock(nsMarkdown, at: pos) {
+      return handleInsertText(state, text: "\n")
+    }
+
+    // Check if we're on a continuation line belonging to a parent list item.
+    // If so, create a new list item.
     if let parent = findParentListItem(in: nsMarkdown, at: pos) {
       var workMarkdown = state.markdown
       var workPos = pos
@@ -584,6 +620,23 @@ enum EditorUpdate {
     let parsed = parsePrefix(lineText)
 
     if !parsed.components.isEmpty {
+      // Inside a fenced code block, only continue blockquote/indent prefix.
+      // List markers found by parsePrefix are code content, not structure.
+      if isInsideFencedCodeBlock(workNS, at: workPos) {
+        var codeBlockComponents: [PrefixComponent] = []
+        for comp in parsed.components {
+          if comp.isListMarker { break }
+          if case .checkbox = comp { break }
+          codeBlockComponents.append(comp)
+        }
+        let prefix = rebuildPrefix(codeBlockComponents)
+        let insertion = "\n\(prefix)"
+        let newMarkdown = workNS.replacingCharacters(
+          in: NSRange(location: workPos, length: 0), with: insertion)
+        let newPos = workPos + (insertion as NSString).length
+        return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
+      }
+
       // Build full continuation: all list markers become equal-width spaces,
       // blockquotes are preserved.
       let continuation = buildFullContinuationPrefix(parsed.components)
@@ -594,7 +647,14 @@ enum EditorUpdate {
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
-    // No structural prefix — check for continuation line belonging to a parent.
+    // No structural prefix — inside a fenced code block, just insert a plain newline.
+    if isInsideFencedCodeBlock(workNS, at: workPos) {
+      return handleInsertText(
+        EditorState(markdown: workMarkdown, selection: .cursor(workPos)),
+        text: "\n")
+    }
+
+    // Check for continuation line belonging to a parent.
     if let parent = findParentListItem(in: workNS, at: workPos) {
       let markerWidth = parent.prefix.count
       let indent = String(repeating: " ", count: markerWidth)
@@ -648,8 +708,11 @@ enum EditorUpdate {
     // Check if we should inject a space after a bare blockquote `>`.
     // This normalizes `>text` to `> text`, matching canonical blockquote format.
     // Uses the prefix parser to handle arbitrarily nested structures like `> >   >`.
+    // Skip inside fenced code blocks where `>` is literal content, not a blockquote marker.
     let effectiveText: String
-    if !text.hasPrefix(" ") && !text.hasPrefix("\n") && insertPos > 0 {
+    if !text.hasPrefix(" ") && !text.hasPrefix("\n") && insertPos > 0
+      && !isInsideFencedCodeBlock(baseMarkdown, at: insertPos)
+    {
       let (lineRange, lineText) = currentLine(baseMarkdown, at: insertPos)
       let posInLine = insertPos - lineRange.location
       if posInLine > 0 && needsBlockquoteSpaceInjection(lineText: lineText, posInLine: posInLine) {
@@ -674,6 +737,14 @@ enum EditorUpdate {
     case .cursor(let pos):
       guard pos > 0 else { return state }
       let clampedPos = min(pos, nsMarkdown.length)
+
+      // Inside a fenced code block, skip all structural marker handling and
+      // paragraph boundary collapsing — characters are literal code content.
+      if isInsideFencedCodeBlock(nsMarkdown, at: clampedPos) {
+        let deleteRange = nsMarkdown.rangeOfComposedCharacterSequence(at: clampedPos - 1)
+        let newMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
+        return EditorState(markdown: newMarkdown, selection: .cursor(deleteRange.location))
+      }
 
       // Check if cursor is right after a structural marker (blockquote, list, checkbox).
       // If so, remove the entire marker as a whole unit instead of just one character.
@@ -1259,6 +1330,11 @@ enum EditorUpdate {
     // Process matches in reverse to preserve ranges
     for match in matches.reversed() {
       let fullRange = match.range
+
+      // Skip matches inside fenced code blocks.
+      if isInsideFencedCodeBlock(nsText, at: fullRange.location) {
+        continue
+      }
       let titleRange = match.range(at: 1)
       let underlineRange = match.range(at: 2)
 
@@ -1301,6 +1377,7 @@ enum EditorUpdate {
     // Uses parsePrefix to handle deeply nested structures like `> >   > 1. Item`.
     var counters: [String: Int] = [:]
     var activeScopes: Set<String> = []
+    var insideCodeBlock = false
 
     let cursorPos: Int
     switch state.selection {
@@ -1321,6 +1398,18 @@ enum EditorUpdate {
 
     for line in lines {
       let lineNS = line as NSString
+
+      // Track fenced code block boundaries. Skip renumbering inside code blocks.
+      let fenceCheck = line.drop(while: { $0 == ">" || $0 == " " || $0 == "\t" })
+      if fenceCheck.hasPrefix("```") || fenceCheck.hasPrefix("~~~") {
+        insideCodeBlock = !insideCodeBlock
+      }
+      if insideCodeBlock {
+        newLines.append(line)
+        charOffset += lineNS.length + 1
+        continue
+      }
+
       let parsed = parsePrefix(line)
 
       // Check if the prefix contains an ordered marker (at any nesting depth).

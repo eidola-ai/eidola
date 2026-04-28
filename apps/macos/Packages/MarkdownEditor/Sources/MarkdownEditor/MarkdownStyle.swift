@@ -52,6 +52,9 @@ public struct MarkdownStyle: Equatable, @unchecked Sendable {
   /// Space before/after a fenced code block.
   public var codeBlockSpacing: CGFloat = 6
 
+  /// Space before/after the fence lines (``` / ~~~) themselves.
+  public var codeFenceSpacing: CGFloat = 1
+
   // MARK: - Headings
 
   public func headingFont(level: Int) -> NSFont {
@@ -118,6 +121,11 @@ public struct MarkdownStyle: Equatable, @unchecked Sendable {
 
   public var codeFont: NSFont {
     .monospacedSystemFont(ofSize: baseFont.pointSize - 1.5, weight: .regular)
+  }
+
+  /// Smaller font for code block fence lines (``` / ~~~).
+  public var codeFenceFont: NSFont {
+    .monospacedSystemFont(ofSize: baseFont.pointSize * 0.7, weight: .regular)
   }
   public var codeBackgroundColor: NSColor = .quaternaryLabelColor.withAlphaComponent(0.5)
 
@@ -242,6 +250,7 @@ public struct MarkdownStyle: Equatable, @unchecked Sendable {
       && lhs.spacingAfterContainerBlock == rhs.spacingAfterContainerBlock
       && lhs.listIndent == rhs.listIndent
       && lhs.codeBlockSpacing == rhs.codeBlockSpacing
+      && lhs.codeFenceSpacing == rhs.codeFenceSpacing
       && lhs.codeBackgroundColor == rhs.codeBackgroundColor
       && lhs.blockquoteIndent == rhs.blockquoteIndent
       && lhs.blockquoteBorderLeftPadding == rhs.blockquoteBorderLeftPadding
