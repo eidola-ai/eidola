@@ -23,6 +23,7 @@ public final class Core {
 
   // Wallet
   public private(set) var credentials: [CredentialInfo] = []
+  public private(set) var spendingCredentials: [InFlightCredentialInfo] = []
 
   // Chat
   public private(set) var models: [ModelInfo] = []
@@ -135,10 +136,27 @@ public final class Core {
     errorMessage = nil
     do {
       credentials = try await core.walletCredentials()
+      spendingCredentials = try await core.walletSpendingCredentials()
     } catch {
       errorMessage = error.localizedDescription
     }
     isLoading = false
+  }
+
+  public func recoverSpendingCredentials() async -> [String] {
+    isLoading = true
+    errorMessage = nil
+    do {
+      let recovered = try await core.recoverSpendingCredentials()
+      credentials = try await core.walletCredentials()
+      spendingCredentials = try await core.walletSpendingCredentials()
+      isLoading = false
+      return recovered
+    } catch {
+      errorMessage = error.localizedDescription
+      isLoading = false
+      return []
+    }
   }
 
   // MARK: – Models

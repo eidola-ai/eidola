@@ -154,17 +154,19 @@ pub async fn insert_pre_credential_refund(
     issuer_key_id: &str,
     data: &[u8],
     spend_amount: i64,
+    spend_proof_data: &[u8],
     created_at: i64,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, created_at) \
-         VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6)",
+        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, spend_proof_data, created_at) \
+         VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
         (
             Value::Text(id.to_string()),
             Value::Text(credential_nonce.to_string()),
             Value::Text(issuer_key_id.to_string()),
             Value::Blob(data.to_vec()),
             Value::Integer(spend_amount),
+            Value::Blob(spend_proof_data.to_vec()),
             Value::Integer(created_at),
         ),
     )
@@ -275,6 +277,55 @@ pub async fn list_active_credentials(conn: &Connection) -> Result<Vec<Credential
             generation: row.get::<i64>(2).map_err(AppError::db)?,
             created_at: row.get::<i64>(3).map_err(AppError::db)?,
             state: row.get::<String>(4).map_err(AppError::db)?,
+        });
+    }
+    Ok(results)
+}
+
+pub struct SpendingCredentialRow {
+    pub nonce: String,
+    pub credits: i64,
+    pub generation: i64,
+    pub created_at: i64,
+    pub spend_amount: i64,
+    pub pre_credential_id: String,
+    pub pre_refund_data: Vec<u8>,
+    pub spend_proof_data: Option<Vec<u8>>,
+    pub issuer_key_id: String,
+    pub public_key_data: Vec<u8>,
+}
+
+pub async fn list_spending_credentials(
+    conn: &Connection,
+) -> Result<Vec<SpendingCredentialRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.nonce, c.credits, c.generation, c.created_at, \
+                    pc.spend_amount, pc.id, pc.data, pc.spend_proof_data, \
+                    pc.issuer_key_id, ik.public_key_data \
+             FROM credential_lifecycle cl \
+             JOIN credential c ON c.nonce = cl.nonce \
+             JOIN pre_credential pc ON pc.credential_nonce = c.nonce AND pc.type = 'refund' \
+             JOIN issuer_key ik ON ik.id = pc.issuer_key_id \
+             WHERE cl.state = 'spending' \
+             ORDER BY c.created_at",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(SpendingCredentialRow {
+            nonce: row.get::<String>(0).map_err(AppError::db)?,
+            credits: row.get::<i64>(1).map_err(AppError::db)?,
+            generation: row.get::<i64>(2).map_err(AppError::db)?,
+            created_at: row.get::<i64>(3).map_err(AppError::db)?,
+            spend_amount: row.get::<i64>(4).map_err(AppError::db)?,
+            pre_credential_id: row.get::<String>(5).map_err(AppError::db)?,
+            pre_refund_data: row.get::<Vec<u8>>(6).map_err(AppError::db)?,
+            spend_proof_data: row.get::<Option<Vec<u8>>>(7).map_err(AppError::db)?,
+            issuer_key_id: row.get::<String>(8).map_err(AppError::db)?,
+            public_key_data: row.get::<Vec<u8>>(9).map_err(AppError::db)?,
         });
     }
     Ok(results)
