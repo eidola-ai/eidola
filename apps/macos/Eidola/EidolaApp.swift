@@ -15,6 +15,9 @@ struct EidolaApp: App {
     WindowGroup {
       ChatView(core: core)
         .frame(minWidth: 480, minHeight: 360)
+        .task {
+          _ = await core.recoverSpendingCredentials()
+        }
     }
 
     Settings {

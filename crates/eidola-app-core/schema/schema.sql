@@ -21,6 +21,7 @@ CREATE TABLE pre_credential (
     data             BLOB NOT NULL,
     credits          INTEGER,
     spend_amount     INTEGER,
+    spend_proof_data BLOB,
     created_at       INTEGER NOT NULL,
 
     CHECK (

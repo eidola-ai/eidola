@@ -106,6 +106,8 @@ enum WalletCommand {
 enum CredentialsCommand {
     /// List active credentials
     List,
+    /// Recover stuck (in-flight) credentials
+    Recover,
 }
 
 #[derive(Subcommand)]
@@ -352,13 +354,54 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
         Some(Command::Wallet { command }) => match command {
             WalletCommand::Credentials { command } => match command {
                 CredentialsCommand::List => {
+                    let spending = core.wallet_spending_credentials().await?;
+                    if !spending.is_empty() {
+                        println!("in-flight credentials:");
+                        for c in &spending {
+                            let status = if c.can_recover {
+                                "recoverable"
+                            } else {
+                                "unrecoverable"
+                            };
+                            println!(
+                                "  {}: {} credits, {} charged ({})",
+                                c.nonce, c.credits, c.spend_amount, status
+                            );
+                        }
+                        println!();
+                    }
                     let credentials = core.wallet_credentials().await?;
-                    if credentials.is_empty() {
-                        println!("no active credentials");
+                    if credentials.is_empty() && spending.is_empty() {
+                        println!("no credentials");
                         return Ok(());
                     }
-                    for c in &credentials {
-                        println!("{}: {} credits (gen {})", c.nonce, c.credits, c.generation);
+                    if !credentials.is_empty() {
+                        println!("active credentials:");
+                        for c in &credentials {
+                            println!(
+                                "  {}: {} credits (gen {})",
+                                c.nonce, c.credits, c.generation
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                CredentialsCommand::Recover => {
+                    let spending = core.wallet_spending_credentials().await?;
+                    let recoverable = spending.iter().filter(|c| c.can_recover).count();
+                    if recoverable == 0 {
+                        println!("no recoverable credentials");
+                        return Ok(());
+                    }
+                    println!("attempting to recover {recoverable} credential(s)...");
+                    let recovered = core.recover_spending_credentials().await?;
+                    if recovered.is_empty() {
+                        println!("no credentials could be recovered");
+                    } else {
+                        println!("recovered {} credential(s):", recovered.len());
+                        for nonce in &recovered {
+                            println!("  {nonce}");
+                        }
                     }
                     Ok(())
                 }

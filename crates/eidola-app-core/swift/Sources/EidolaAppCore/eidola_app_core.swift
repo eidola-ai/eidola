@@ -563,6 +563,8 @@ public protocol AppCoreProtocol: AnyObject, Sendable {
 
   func listSpaces() async throws -> [SpaceInfo]
 
+  func recoverSpendingCredentials() async throws -> [String]
+
   func resetAccount() throws
 
   func setAccountCredentials(id: String, secret: String) throws
@@ -580,6 +582,8 @@ public protocol AppCoreProtocol: AnyObject, Sendable {
   func untrustMeasurement(snp: String) throws -> Bool
 
   func walletCredentials() async throws -> [CredentialInfo]
+
+  func walletSpendingCredentials() async throws -> [InFlightCredentialInfo]
 
 }
 open class AppCore: AppCoreProtocol, @unchecked Sendable {
@@ -861,6 +865,23 @@ open class AppCore: AppCoreProtocol, @unchecked Sendable {
       )
   }
 
+  open func recoverSpendingCredentials() async throws -> [String] {
+    return
+      try await uniffiRustCallAsync(
+        rustFutureFunc: {
+          uniffi_eidola_app_core_fn_method_appcore_recover_spending_credentials(
+            self.uniffiCloneHandle()
+
+          )
+        },
+        pollFunc: ffi_eidola_app_core_rust_future_poll_rust_buffer,
+        completeFunc: ffi_eidola_app_core_rust_future_complete_rust_buffer,
+        freeFunc: ffi_eidola_app_core_rust_future_free_rust_buffer,
+        liftFunc: FfiConverterSequenceString.lift,
+        errorHandler: FfiConverterTypeAppError_lift
+      )
+  }
+
   open func resetAccount() throws {
     try rustCallWithError(FfiConverterTypeAppError_lift) {
       uniffi_eidola_app_core_fn_method_appcore_reset_account(
@@ -950,6 +971,23 @@ open class AppCore: AppCoreProtocol, @unchecked Sendable {
         completeFunc: ffi_eidola_app_core_rust_future_complete_rust_buffer,
         freeFunc: ffi_eidola_app_core_rust_future_free_rust_buffer,
         liftFunc: FfiConverterSequenceTypeCredentialInfo.lift,
+        errorHandler: FfiConverterTypeAppError_lift
+      )
+  }
+
+  open func walletSpendingCredentials() async throws -> [InFlightCredentialInfo] {
+    return
+      try await uniffiRustCallAsync(
+        rustFutureFunc: {
+          uniffi_eidola_app_core_fn_method_appcore_wallet_spending_credentials(
+            self.uniffiCloneHandle()
+
+          )
+        },
+        pollFunc: ffi_eidola_app_core_rust_future_poll_rust_buffer,
+        completeFunc: ffi_eidola_app_core_rust_future_complete_rust_buffer,
+        freeFunc: ffi_eidola_app_core_rust_future_free_rust_buffer,
+        liftFunc: FfiConverterSequenceTypeInFlightCredentialInfo.lift,
         errorHandler: FfiConverterTypeAppError_lift
       )
   }
@@ -1464,6 +1502,75 @@ public func FfiConverterTypeCredentialInfo_lower(_ value: CredentialInfo) -> Rus
   return FfiConverterTypeCredentialInfo.lower(value)
 }
 
+public struct InFlightCredentialInfo: Equatable, Hashable {
+  public var nonce: String
+  public var credits: Int64
+  public var generation: Int64
+  public var spendAmount: Int64
+  public var canRecover: Bool
+
+  // Default memberwise initializers are never public by default, so we
+  // declare one manually.
+  public init(
+    nonce: String, credits: Int64, generation: Int64, spendAmount: Int64, canRecover: Bool
+  ) {
+    self.nonce = nonce
+    self.credits = credits
+    self.generation = generation
+    self.spendAmount = spendAmount
+    self.canRecover = canRecover
+  }
+
+}
+
+#if compiler(>=6)
+  extension InFlightCredentialInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeInFlightCredentialInfo: FfiConverterRustBuffer {
+  public static func read(from buf: inout (data: Data, offset: Data.Index)) throws
+    -> InFlightCredentialInfo
+  {
+    return
+      try InFlightCredentialInfo(
+        nonce: FfiConverterString.read(from: &buf),
+        credits: FfiConverterInt64.read(from: &buf),
+        generation: FfiConverterInt64.read(from: &buf),
+        spendAmount: FfiConverterInt64.read(from: &buf),
+        canRecover: FfiConverterBool.read(from: &buf)
+      )
+  }
+
+  public static func write(_ value: InFlightCredentialInfo, into buf: inout [UInt8]) {
+    FfiConverterString.write(value.nonce, into: &buf)
+    FfiConverterInt64.write(value.credits, into: &buf)
+    FfiConverterInt64.write(value.generation, into: &buf)
+    FfiConverterInt64.write(value.spendAmount, into: &buf)
+    FfiConverterBool.write(value.canRecover, into: &buf)
+  }
+}
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeInFlightCredentialInfo_lift(_ buf: RustBuffer) throws
+  -> InFlightCredentialInfo
+{
+  return try FfiConverterTypeInFlightCredentialInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+public func FfiConverterTypeInFlightCredentialInfo_lower(_ value: InFlightCredentialInfo)
+  -> RustBuffer
+{
+  return FfiConverterTypeInFlightCredentialInfo.lower(value)
+}
+
 public struct MeasurementInfo: Equatable, Hashable {
   public var snp: String
   public var tdxRtmr1: String
@@ -1958,6 +2065,31 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
   @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+  typealias SwiftType = [String]
+
+  public static func write(_ value: [String], into buf: inout [UInt8]) {
+    let len = Int32(value.count)
+    writeInt(&buf, len)
+    for item in value {
+      FfiConverterString.write(item, into: &buf)
+    }
+  }
+
+  public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+    let len: Int32 = try readInt(&buf)
+    var seq = [String]()
+    seq.reserveCapacity(Int(len))
+    for _ in 0..<len {
+      seq.append(try FfiConverterString.read(from: &buf))
+    }
+    return seq
+  }
+}
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeBalancePoolInfo: FfiConverterRustBuffer {
   typealias SwiftType = [BalancePoolInfo]
 
@@ -2004,6 +2136,33 @@ fileprivate struct FfiConverterSequenceTypeCredentialInfo: FfiConverterRustBuffe
     seq.reserveCapacity(Int(len))
     for _ in 0..<len {
       seq.append(try FfiConverterTypeCredentialInfo.read(from: &buf))
+    }
+    return seq
+  }
+}
+
+#if swift(>=5.8)
+  @_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeInFlightCredentialInfo: FfiConverterRustBuffer {
+  typealias SwiftType = [InFlightCredentialInfo]
+
+  public static func write(_ value: [InFlightCredentialInfo], into buf: inout [UInt8]) {
+    let len = Int32(value.count)
+    writeInt(&buf, len)
+    for item in value {
+      FfiConverterTypeInFlightCredentialInfo.write(item, into: &buf)
+    }
+  }
+
+  public static func read(from buf: inout (data: Data, offset: Data.Index)) throws
+    -> [InFlightCredentialInfo]
+  {
+    let len: Int32 = try readInt(&buf)
+    var seq = [InFlightCredentialInfo]()
+    seq.reserveCapacity(Int(len))
+    for _ in 0..<len {
+      seq.append(try FfiConverterTypeInFlightCredentialInfo.read(from: &buf))
     }
     return seq
   }
@@ -2262,6 +2421,9 @@ private let initializationResult: InitializationResult = {
   if (uniffi_eidola_app_core_checksum_method_appcore_list_spaces() != 40346) {
     return InitializationResult.apiChecksumMismatch
   }
+  if (uniffi_eidola_app_core_checksum_method_appcore_recover_spending_credentials() != 27601) {
+    return InitializationResult.apiChecksumMismatch
+  }
   if (uniffi_eidola_app_core_checksum_method_appcore_reset_account() != 36033) {
     return InitializationResult.apiChecksumMismatch
   }
@@ -2287,6 +2449,9 @@ private let initializationResult: InitializationResult = {
     return InitializationResult.apiChecksumMismatch
   }
   if (uniffi_eidola_app_core_checksum_method_appcore_wallet_credentials() != 38373) {
+    return InitializationResult.apiChecksumMismatch
+  }
+  if (uniffi_eidola_app_core_checksum_method_appcore_wallet_spending_credentials() != 38178) {
     return InitializationResult.apiChecksumMismatch
   }
   if (uniffi_eidola_app_core_checksum_constructor_appcore_new() != 52737) {

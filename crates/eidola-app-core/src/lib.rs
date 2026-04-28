@@ -90,6 +90,15 @@ pub struct CredentialInfo {
 }
 
 #[derive(uniffi::Record)]
+pub struct InFlightCredentialInfo {
+    pub nonce: String,
+    pub credits: i64,
+    pub generation: i64,
+    pub spend_amount: i64,
+    pub can_recover: bool,
+}
+
+#[derive(uniffi::Record)]
 pub struct AllocateResult {
     pub nonce: String,
     pub credits: i64,
@@ -609,6 +618,89 @@ impl Inner {
             .collect())
     }
 
+    async fn wallet_spending_credentials(&self) -> Result<Vec<InFlightCredentialInfo>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_spending_credentials(&db_conn).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| InFlightCredentialInfo {
+                nonce: r.nonce,
+                credits: r.credits,
+                generation: r.generation,
+                spend_amount: r.spend_amount,
+                can_recover: r.spend_proof_data.is_some(),
+            })
+            .collect())
+    }
+
+    async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
+        let cfg = self.load_config();
+        let base_url = self.require_base_url(&cfg)?;
+        let client = self.build_client(&cfg, None).await?;
+        let db_conn = self.db_conn().await?;
+        let params = params_from_domain_separator(cfg.domain_separator())?;
+        let now = now_ms();
+
+        let rows = db::list_spending_credentials(&db_conn).await?;
+        let mut recovered = Vec::new();
+
+        for row in rows {
+            let spend_proof_cbor = match row.spend_proof_data {
+                Some(data) => data,
+                None => continue, // can't recover without spend proof
+            };
+
+            let spend_proof = match SpendProof::<128>::from_cbor(&spend_proof_cbor) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let pre_refund = match PreRefund::from_cbor(&row.pre_refund_data) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let public_key = match PublicKey::from_cbor(&row.public_key_data) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let issuer_key_hash = match hex_decode(&row.issuer_key_id) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            // Reconstruct the PrivateToken auth header
+            let challenge_digest = compute_challenge_digest();
+            let mut token_bytes = Vec::new();
+            token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+            token_bytes.extend_from_slice(&challenge_digest);
+            token_bytes.extend_from_slice(&issuer_key_hash);
+            token_bytes.extend_from_slice(&spend_proof_cbor);
+            let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
+            let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+
+            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
+                if process_refund(
+                    &refund_obj,
+                    &params,
+                    &spend_proof,
+                    &pre_refund,
+                    &public_key,
+                    &db_conn,
+                    &row.pre_credential_id,
+                    row.generation + 1,
+                    now,
+                )
+                .await
+                .is_ok()
+                {
+                    recovered.push(row.nonce);
+                }
+            }
+        }
+
+        Ok(recovered)
+    }
+
     async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
         let cfg = self.load_config();
         let base_url = self.require_base_url(&cfg)?;
@@ -804,6 +896,7 @@ impl Inner {
             &cred.issuer_key_id,
             &pre_refund_cbor,
             charge_credits as i64,
+            &spend_proof_cbor,
             now,
         )
         .await?;
@@ -1833,6 +1926,24 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.wallet_credentials().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn wallet_spending_credentials(
+        &self,
+    ) -> Result<Vec<InFlightCredentialInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.wallet_spending_credentials().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.recover_spending_credentials().await })
             .await
             .map_err(join_err)?
     }

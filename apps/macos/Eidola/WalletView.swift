@@ -8,34 +8,83 @@ import SwiftUI
 
 struct WalletView: View {
   var core: Core
+  @State private var recoveryMessage: String?
 
   var body: some View {
     List {
-      if core.credentials.isEmpty {
+      if core.credentials.isEmpty && core.spendingCredentials.isEmpty {
         ContentUnavailableView(
           "No Credentials",
           systemImage: "creditcard.trianglebadge.exclamationmark",
           description: Text("Allocate credits from Account in Settings to get started.")
         )
       } else {
-        Section("Active Credentials") {
-          ForEach(core.credentials, id: \.nonce) { cred in
-            HStack {
-              VStack(alignment: .leading, spacing: 2) {
-                Text(cred.nonce.prefix(16) + "...")
-                  .font(.system(.body, design: .monospaced))
-                Text("Generation \(cred.generation)")
+        if !core.spendingCredentials.isEmpty {
+          Section {
+            ForEach(core.spendingCredentials, id: \.nonce) { cred in
+              HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                  Text(cred.nonce.prefix(16) + "...")
+                    .font(.system(.body, design: .monospaced))
+                  Text(
+                    cred.canRecover
+                      ? "Stuck \u{2014} \(cred.spendAmount) credits charged"
+                      : "Unrecoverable \u{2014} spend proof not stored"
+                  )
                   .font(.caption)
-                  .foregroundStyle(.secondary)
+                  .foregroundStyle(cred.canRecover ? .orange : .red)
+                }
+
+                Spacer()
+
+                Text("\(cred.credits) credits")
+                  .fontWeight(.medium)
+                  .monospacedDigit()
               }
-
-              Spacer()
-
-              Text("\(cred.credits) credits")
-                .fontWeight(.medium)
-                .monospacedDigit()
+              .padding(.vertical, 2)
             }
-            .padding(.vertical, 2)
+          } header: {
+            HStack {
+              Text("In Flight")
+              Spacer()
+              if core.spendingCredentials.contains(where: { $0.canRecover }) {
+                Button("Recover All") {
+                  Task {
+                    let recovered = await core.recoverSpendingCredentials()
+                    if recovered.isEmpty {
+                      recoveryMessage = "No credentials could be recovered."
+                    } else {
+                      recoveryMessage = "Recovered \(recovered.count) credential(s)."
+                    }
+                  }
+                }
+                .buttonStyle(.borderless)
+                .disabled(core.isLoading)
+              }
+            }
+          }
+        }
+
+        if !core.credentials.isEmpty {
+          Section("Active Credentials") {
+            ForEach(core.credentials, id: \.nonce) { cred in
+              HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                  Text(cred.nonce.prefix(16) + "...")
+                    .font(.system(.body, design: .monospaced))
+                  Text("Generation \(cred.generation)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Text("\(cred.credits) credits")
+                  .fontWeight(.medium)
+                  .monospacedDigit()
+              }
+              .padding(.vertical, 2)
+            }
           }
         }
       }
@@ -47,6 +96,14 @@ struct WalletView: View {
           .frame(maxWidth: .infinity, maxHeight: .infinity)
           .background(.ultraThinMaterial)
       }
+    }
+    .alert("Recovery", isPresented: Binding(
+      get: { recoveryMessage != nil },
+      set: { if !$0 { recoveryMessage = nil } }
+    )) {
+      Button("OK") { recoveryMessage = nil }
+    } message: {
+      if let msg = recoveryMessage { Text(msg) }
     }
     .task {
       await core.fetchCredentials()
