@@ -412,6 +412,50 @@ enum MarkdownRenderer {
         temporaryAttributes: &accumulator.temporaryAttributes
       )
 
+      // Apply smaller font and tighter spacing to fence lines so they take
+      // up less visual space than the code content.
+      do {
+        let openLineRange = clamp(
+          nsText.lineRange(for: clamp(openingFenceRange, to: textLength)), to: textLength)
+
+        // Opening fence: smaller font, tight spacing after (before first code line).
+        let openPS = NSMutableParagraphStyle()
+        openPS.firstLineHeadIndent = insideQuote ? context.quoteAlignIndent : textOrigin
+        openPS.headIndent = textOrigin
+        openPS.tailIndent = -12
+        openPS.paragraphSpacing = style.codeFenceSpacing
+        openPS.paragraphSpacingBefore = style.codeBlockSpacing
+        openPS.lineHeightMultiple = style.lineHeightMultiple
+        accumulator.styledRanges.append(
+          RenderSpec.StyledRange(
+            range: openLineRange,
+            attributes: [
+              .font: style.codeFenceFont,
+              .paragraphStyle: openPS.copy() as! NSParagraphStyle,
+            ]))
+
+        if let closingFenceRange {
+          let closeLineRange = clamp(
+            nsText.lineRange(for: clamp(closingFenceRange, to: textLength)), to: textLength)
+
+          // Closing fence: tight spacing before (after last code line), smaller font.
+          let closePS = NSMutableParagraphStyle()
+          closePS.firstLineHeadIndent = insideQuote ? context.quoteAlignIndent : textOrigin
+          closePS.headIndent = textOrigin
+          closePS.tailIndent = -12
+          closePS.paragraphSpacing = style.codeBlockSpacing
+          closePS.paragraphSpacingBefore = style.codeFenceSpacing
+          closePS.lineHeightMultiple = style.lineHeightMultiple
+          accumulator.styledRanges.append(
+            RenderSpec.StyledRange(
+              range: closeLineRange,
+              attributes: [
+                .font: style.codeFenceFont,
+                .paragraphStyle: closePS.copy() as! NSParagraphStyle,
+              ]))
+        }
+      }
+
     case .thematicBreak:
       // Use a content range (excluding trailing newline) for cursor detection
       // so that a cursor on the NEXT line doesn't keep the break in edit mode.
