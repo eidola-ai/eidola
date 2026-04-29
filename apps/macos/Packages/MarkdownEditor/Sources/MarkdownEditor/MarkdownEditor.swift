@@ -1,4 +1,5 @@
 import AppKit
+import ObjectiveC
 import SwiftUI
 
 /// An inline WYSIWYG markdown editor view.
@@ -23,13 +24,24 @@ public struct MarkdownEditor: NSViewRepresentable {
     let scrollView: NSScrollView
     let textView: NSTextView
     if useTextKit2 {
-      textView = NSTextView(usingTextLayoutManager: true)
-      textView.minSize = NSSize(width: 0, height: 0)
-      textView.maxSize = NSSize(
+      // NSTextView(usingTextLayoutManager:) is the only reliable way to get a
+      // TK2 stack with textStorage and textContentStorage properly linked
+      // (Phase 2 testing). It returns NSTextView, not our subclass, so we
+      // upgrade the class via the Objective-C runtime. Safe because
+      // TextKit2MarkdownTextView adds no stored properties — only an
+      // overridden characterIndexForInsertion(at:) — so memory layout matches.
+      let tk2TextView = NSTextView(usingTextLayoutManager: true)
+      object_setClass(tk2TextView, TextKit2MarkdownTextView.self)
+      tk2TextView.minSize = NSSize(width: 0, height: 0)
+      tk2TextView.maxSize = NSSize(
         width: CGFloat.greatestFiniteMagnitude,
         height: CGFloat.greatestFiniteMagnitude)
-      textView.isVerticallyResizable = true
-      textView.isHorizontallyResizable = false
+      tk2TextView.isVerticallyResizable = true
+      tk2TextView.isHorizontallyResizable = false
+      tk2TextView.textContentStorage?.delegate =
+        context.coordinator.textKit2ContentStorageDelegate
+      textView = tk2TextView
+
       scrollView = NSScrollView()
       scrollView.borderType = .noBorder
       scrollView.hasVerticalScroller = true
@@ -69,6 +81,9 @@ public struct MarkdownEditor: NSViewRepresentable {
     var isProcessingEvent = false
     var lastSpec: RenderSpec?
     private let glyphDelegate = GlyphHidingLayoutManagerDelegate()
+    /// Held by the Coordinator so it persists for the text view's lifetime
+    /// (NSTextContentStorage holds its delegate weakly).
+    let textKit2ContentStorageDelegate = TextKit2ContentStorageDelegate()
 
     init(state: Binding<EditorState>, style: MarkdownStyle = .default, useTextKit2: Bool = false) {
       self.state = state

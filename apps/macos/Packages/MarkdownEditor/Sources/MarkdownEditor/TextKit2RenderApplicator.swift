@@ -21,9 +21,18 @@ enum TextKit2RenderApplicator {
     guard textLength > 0 else { return }
     let fullRange = NSRange(location: 0, length: textLength)
 
-    // TODO Phase 2: write hidden / bullet / checkbox / collapsedNewline index
-    // sets into the NSTextContentStorage delegate that produces display
-    // paragraphs from source ranges.
+    // Phase 2: write the hiding/substitution index sets into the content-
+    // storage delegate. The delegate is consulted again by TextKit 2 when
+    // the textStorage edit below triggers paragraph rebuilds.
+    if let delegate = textView.textContentStorage?.delegate
+      as? TextKit2ContentStorageDelegate
+    {
+      delegate.hiddenIndexes = spec.hiddenIndexes
+      delegate.bulletIndexes = spec.bulletIndexes
+      delegate.uncheckedCheckboxIndexes = spec.uncheckedCheckboxIndexes
+      delegate.checkedCheckboxIndexes = spec.checkedCheckboxIndexes
+      delegate.collapsedNewlineIndexes = spec.collapsedNewlineIndexes
+    }
 
     // TODO Phase 3: write codeBlockCharacterRanges and blockquoteCharacterRanges
     // into the NSTextLayoutManager delegate that vends custom
@@ -35,6 +44,7 @@ enum TextKit2RenderApplicator {
     let savedOrigin = clipView?.bounds.origin
 
     textStorage.beginEditing()
+
     textStorage.setAttributes(spec.baseAttributes, range: fullRange)
 
     for styled in spec.styledRanges {
@@ -47,6 +57,22 @@ enum TextKit2RenderApplicator {
 
     textStorage.endEditing()
 
+    // Force NSTextContentStorage to re-fetch paragraphs from the delegate.
+    // Attribute-only storage edits (above) don't invalidate the paragraph
+    // cache, so we explicitly record an edit action covering the full
+    // document range. This is the TK2 equivalent of TK1's cursor-update
+    // glyph-invalidation loop and is what makes the content delegate
+    // re-consulted when its index sets change without text content changing.
+    if let contentStorage = textView.textContentStorage {
+      contentStorage.performEditingTransaction {
+        let docRange = contentStorage.documentRange
+        contentStorage.recordEditAction(in: docRange, newTextRange: docRange)
+      }
+    }
+    if let tlm = textView.textLayoutManager {
+      tlm.invalidateLayout(for: tlm.documentRange)
+    }
+
     if let origin = savedOrigin, let clipView {
       clipView.setBoundsOrigin(origin)
     }
@@ -57,10 +83,13 @@ enum TextKit2RenderApplicator {
     // correct API on AppKit (the validator closure is one-shot per fragment).
   }
 
-  /// Cursor-only update. In Phase 1 this is a near-no-op because every effect
-  /// driven by cursor movement (delimiter visibility, glyph hiding, marker
-  /// substitution) lives in deferred phases. Kept as a symmetric API to the
-  /// TK1 applicator so the Coordinator branches stay simple.
+  /// Cursor-only update. The TK1 applicator avoids re-touching all attributes
+  /// on cursor moves because temporary attributes set on the layout manager
+  /// must survive the update. The TK2 path doesn't have that constraint until
+  /// Phase 4 introduces rendering attributes, so for now we re-run the full
+  /// `apply` to refresh the delegate state and trigger paragraph rebuild.
+  /// Phase 4 will optimize this to invalidate only the changed paragraphs
+  /// and update rendering attributes incrementally.
   static func applyCursorUpdate(
     _ spec: RenderSpec,
     previousHidden: IndexSet,
@@ -70,14 +99,12 @@ enum TextKit2RenderApplicator {
     previousCollapsedNewlines: IndexSet = IndexSet(),
     to textView: NSTextView
   ) {
-    // TODO Phase 2: invalidate display paragraphs whose hidden / marker state
-    // changed, so the content-storage delegate is re-consulted.
-    // TODO Phase 4: refresh rendering attributes for delimiter coloring.
     _ = (
-      spec, previousHidden, previousBullets,
+      previousHidden, previousBullets,
       previousUncheckedCheckboxes, previousCheckedCheckboxes,
-      previousCollapsedNewlines, textView
+      previousCollapsedNewlines
     )
+    apply(spec, to: textView)
   }
 
   // MARK: - Private
