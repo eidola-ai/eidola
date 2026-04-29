@@ -34,9 +34,23 @@ enum TextKit2RenderApplicator {
       delegate.collapsedNewlineIndexes = spec.collapsedNewlineIndexes
     }
 
-    // TODO Phase 3: write codeBlockCharacterRanges and blockquoteCharacterRanges
-    // into the NSTextLayoutManager delegate that vends custom
-    // NSTextLayoutFragment subclasses for those paragraphs.
+    // Phase 3: write the per-paragraph decoration ranges (code block bg,
+    // blockquote left borders) into the layout-manager delegate. The
+    // delegate vends a `TextKit2LayoutFragment` per paragraph configured
+    // with the matching decorations; the actual painting happens in the
+    // fragment's `draw(at:in:)` override.
+    if let layoutDelegate = textView.textLayoutManager?.delegate
+      as? TextKit2LayoutManagerDelegate
+    {
+      layoutDelegate.codeBlockCharacterRanges = spec.codeBlockCharacterRanges
+      layoutDelegate.blockquoteCharacterRanges = spec.blockquoteCharacterRanges
+      if let containerWidth = textView.textLayoutManager?.textContainer?.size.width,
+        containerWidth > 0,
+        containerWidth < CGFloat.greatestFiniteMagnitude
+      {
+        layoutDelegate.containerWidth = containerWidth
+      }
+    }
 
     // Save scroll position — full-range attribute reset triggers layout
     // invalidation that can momentarily displace the scroll origin.

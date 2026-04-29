@@ -40,6 +40,16 @@ public struct MarkdownEditor: NSViewRepresentable {
       tk2TextView.isHorizontallyResizable = false
       tk2TextView.textContentStorage?.delegate =
         context.coordinator.textKit2ContentStorageDelegate
+      tk2TextView.textLayoutManager?.delegate =
+        context.coordinator.textKit2LayoutManagerDelegate
+      // Observe frame changes so the layout-manager delegate's
+      // `containerWidth` (and any vended fragment's full-width background)
+      // stays in sync when the text container resizes. Cheaper than running a
+      // full re-render: we just push the new width into the delegate and
+      // invalidate layout to force fragment re-vending. The first render
+      // populates the width via the same path inside `apply()`.
+      tk2TextView.postsFrameChangedNotifications = true
+      context.coordinator.observeTextViewFrameChanges(tk2TextView)
       textView = tk2TextView
 
       scrollView = NSScrollView()
@@ -84,11 +94,74 @@ public struct MarkdownEditor: NSViewRepresentable {
     /// Held by the Coordinator so it persists for the text view's lifetime
     /// (NSTextContentStorage holds its delegate weakly).
     let textKit2ContentStorageDelegate = TextKit2ContentStorageDelegate()
+    /// Held by the Coordinator so it persists for the text view's lifetime
+    /// (NSTextLayoutManager holds its delegate weakly, same as content storage).
+    let textKit2LayoutManagerDelegate = TextKit2LayoutManagerDelegate()
+
+    /// Observation token for the TK2 text view's frame-change notification.
+    /// Cleared by `clearTextKit2FrameObserver()` (called from `observe…`
+    /// before re-installing) and goes away with the Coordinator. AppKit's
+    /// NotificationCenter retains the block; the block holds a weak self.
+    /// `nonisolated(unsafe)` so a non-isolated deinit can read it on
+    /// teardown — only ever assigned on the main actor.
+    private nonisolated(unsafe) var tk2FrameObserver: Any?
 
     init(state: Binding<EditorState>, style: MarkdownStyle = .default, useTextKit2: Bool = false) {
       self.state = state
       self.style = style
       self.useTextKit2 = useTextKit2
+    }
+
+    deinit {
+      if let token = tk2FrameObserver {
+        NotificationCenter.default.removeObserver(token)
+      }
+    }
+
+    /// Wire the layout-manager delegate's `containerWidth` to the text
+    /// view's actual container width on every frame change, then invalidate
+    /// layout so existing fragments are re-vended with the new width.
+    func observeTextViewFrameChanges(_ textView: NSTextView) {
+      // Replace any prior observer.
+      if let token = tk2FrameObserver {
+        NotificationCenter.default.removeObserver(token)
+      }
+      tk2FrameObserver = NotificationCenter.default.addObserver(
+        forName: NSView.frameDidChangeNotification,
+        object: textView, queue: .main
+      ) { [weak self, weak textView] _ in
+        MainActor.assumeIsolated {
+          guard let self, let textView else { return }
+          self.refreshTextKit2ContainerWidth(textView)
+        }
+      }
+    }
+
+    private func refreshTextKit2ContainerWidth(_ textView: NSTextView) {
+      guard useTextKit2,
+        let tlm = textView.textLayoutManager,
+        let width = tlm.textContainer?.size.width,
+        width > 0,
+        width < CGFloat.greatestFiniteMagnitude
+      else { return }
+      // Avoid redundant work if the width hasn't actually changed.
+      guard textKit2LayoutManagerDelegate.containerWidth != width else { return }
+      textKit2LayoutManagerDelegate.containerWidth = width
+
+      // Update the container width on every currently-vended fragment so the
+      // next paint draws full-width backgrounds against the new bounds.
+      // Re-vending alone wouldn't help: TK2 caches fragments per text
+      // element and won't ask the delegate again until the element changes.
+      tlm.enumerateTextLayoutFragments(
+        from: tlm.documentRange.location, options: .ensuresLayout
+      ) { frag in
+        if let custom = frag as? TextKit2LayoutFragment {
+          custom.containerWidth = width
+          custom.invalidateLayout()
+        }
+        return true
+      }
+      textView.needsDisplay = true
     }
 
     func configure(_ textView: NSTextView) {
