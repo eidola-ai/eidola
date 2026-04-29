@@ -66,9 +66,12 @@ struct TextKit2BasicRenderTests {
   }
 
   @Test
-  func tk2_path_does_not_hide_delimiters_in_phase_1() throws {
-    // Phase 1 explicitly leaves glyph hiding to Phase 2. The source markdown
-    // should appear verbatim — `# `, `**`, etc. are visible in the text view.
+  func tk2_text_storage_keeps_raw_markdown_regardless_of_display_transform() throws {
+    // The TK2 path uses an `NSTextContentStorageDelegate` (Phase 2) to
+    // produce a *display* attributedString that may differ from the source.
+    // The text view's `string` property always reflects the *source* — i.e.
+    // the raw markdown — so editing remains in source coordinates. This
+    // invariant must hold whether or not a delegate is wired up.
     let textView = Self.makeTextKit2TextView()
     let markdown = "# Heading\n\n**bold** word"
     textView.string = markdown
@@ -78,10 +81,6 @@ struct TextKit2BasicRenderTests {
       text: markdown, cursorRange: cursorRange, style: .default)
     TextKit2RenderApplicator.apply(spec, to: textView)
 
-    // The raw markdown stays in the text storage in both paths; in TK1 the
-    // glyph layer hides delimiters. In Phase 1 of TK2 the glyph layer does
-    // nothing, so the delimiters render visibly. We assert source-storage
-    // identity here; a Phase 2 test will assert delimiters are visually hidden.
     #expect(textView.string == markdown)
   }
 
