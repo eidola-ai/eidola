@@ -12,14 +12,34 @@ import SwiftUI
 public struct MarkdownEditor: NSViewRepresentable {
   @Binding var state: EditorState
   @Environment(\.markdownStyle) private var style
+  private let useTextKit2: Bool
 
-  public init(state: Binding<EditorState>) {
+  public init(state: Binding<EditorState>, useTextKit2: Bool = false) {
     self._state = state
+    self.useTextKit2 = useTextKit2
   }
 
   public func makeNSView(context: Context) -> NSScrollView {
-    let scrollView = NSTextView.scrollableTextView()
-    let textView = scrollView.documentView as! NSTextView
+    let scrollView: NSScrollView
+    let textView: NSTextView
+    if useTextKit2 {
+      textView = NSTextView(usingTextLayoutManager: true)
+      textView.minSize = NSSize(width: 0, height: 0)
+      textView.maxSize = NSSize(
+        width: CGFloat.greatestFiniteMagnitude,
+        height: CGFloat.greatestFiniteMagnitude)
+      textView.isVerticallyResizable = true
+      textView.isHorizontallyResizable = false
+      scrollView = NSScrollView()
+      scrollView.borderType = .noBorder
+      scrollView.hasVerticalScroller = true
+      scrollView.hasHorizontalScroller = false
+      scrollView.autohidesScrollers = true
+      scrollView.documentView = textView
+    } else {
+      scrollView = NSTextView.scrollableTextView()
+      textView = scrollView.documentView as! NSTextView
+    }
     context.coordinator.style = style
     context.coordinator.configure(textView)
     context.coordinator.syncToTextView(state, textView: textView)
@@ -38,20 +58,22 @@ public struct MarkdownEditor: NSViewRepresentable {
   }
 
   public func makeCoordinator() -> Coordinator {
-    Coordinator(state: $state, style: style)
+    Coordinator(state: $state, style: style, useTextKit2: useTextKit2)
   }
 
   @MainActor
   public final class Coordinator: NSObject, NSTextViewDelegate {
     var state: Binding<EditorState>
     var style: MarkdownStyle
+    let useTextKit2: Bool
     var isProcessingEvent = false
     var lastSpec: RenderSpec?
     private let glyphDelegate = GlyphHidingLayoutManagerDelegate()
 
-    init(state: Binding<EditorState>, style: MarkdownStyle = .default) {
+    init(state: Binding<EditorState>, style: MarkdownStyle = .default, useTextKit2: Bool = false) {
       self.state = state
       self.style = style
+      self.useTextKit2 = useTextKit2
     }
 
     func configure(_ textView: NSTextView) {
@@ -72,9 +94,12 @@ public struct MarkdownEditor: NSViewRepresentable {
       textView.textContainer?.containerSize = NSSize(
         width: 0, height: CGFloat.greatestFiniteMagnitude)
 
-      // Replace the default NSLayoutManager with our custom subclass that
-      // draws full-width backgrounds for code blocks.
-      if let textContainer = textView.textContainer,
+      // TK1 only: replace the default NSLayoutManager with our custom subclass
+      // that draws full-width backgrounds for code blocks. The TK2 path uses
+      // NSTextLayoutManager (will get custom NSTextLayoutFragment subclasses
+      // in Phase 3) and doesn't expose an NSLayoutManager.
+      if !useTextKit2,
+        let textContainer = textView.textContainer,
         let textStorage = textView.textStorage,
         let oldLayoutManager = textView.layoutManager
       {
@@ -109,7 +134,11 @@ public struct MarkdownEditor: NSViewRepresentable {
       textView.setSelectedRange(editorState.selection.nsRange)
 
       let spec = MarkdownRenderer.render(state: editorState, style: style)
-      RenderApplicator.apply(spec, to: textView)
+      if useTextKit2 {
+        TextKit2RenderApplicator.apply(spec, to: textView)
+      } else {
+        RenderApplicator.apply(spec, to: textView)
+      }
       lastSpec = spec
     }
 
@@ -134,7 +163,11 @@ public struct MarkdownEditor: NSViewRepresentable {
       textView.setSelectedRange(newState.selection.nsRange)
 
       let spec = MarkdownRenderer.render(state: newState, style: style)
-      RenderApplicator.apply(spec, to: textView)
+      if useTextKit2 {
+        TextKit2RenderApplicator.apply(spec, to: textView)
+      } else {
+        RenderApplicator.apply(spec, to: textView)
+      }
       lastSpec = spec
     }
 
@@ -310,7 +343,11 @@ public struct MarkdownEditor: NSViewRepresentable {
 
       // Re-render attributes.
       let spec = MarkdownRenderer.render(state: newState, style: style)
-      RenderApplicator.apply(spec, to: textView)
+      if useTextKit2 {
+        TextKit2RenderApplicator.apply(spec, to: textView)
+      } else {
+        RenderApplicator.apply(spec, to: textView)
+      }
       lastSpec = spec
     }
 
@@ -343,11 +380,19 @@ public struct MarkdownEditor: NSViewRepresentable {
       let prevUncheckedCheckboxes = lastSpec?.uncheckedCheckboxIndexes ?? IndexSet()
       let prevCheckedCheckboxes = lastSpec?.checkedCheckboxIndexes ?? IndexSet()
       let prevCollapsedNewlines = lastSpec?.collapsedNewlineIndexes ?? IndexSet()
-      RenderApplicator.applyCursorUpdate(
-        spec, previousHidden: prevHidden, previousBullets: prevBullets,
-        previousUncheckedCheckboxes: prevUncheckedCheckboxes,
-        previousCheckedCheckboxes: prevCheckedCheckboxes,
-        previousCollapsedNewlines: prevCollapsedNewlines, to: textView)
+      if useTextKit2 {
+        TextKit2RenderApplicator.applyCursorUpdate(
+          spec, previousHidden: prevHidden, previousBullets: prevBullets,
+          previousUncheckedCheckboxes: prevUncheckedCheckboxes,
+          previousCheckedCheckboxes: prevCheckedCheckboxes,
+          previousCollapsedNewlines: prevCollapsedNewlines, to: textView)
+      } else {
+        RenderApplicator.applyCursorUpdate(
+          spec, previousHidden: prevHidden, previousBullets: prevBullets,
+          previousUncheckedCheckboxes: prevUncheckedCheckboxes,
+          previousCheckedCheckboxes: prevCheckedCheckboxes,
+          previousCollapsedNewlines: prevCollapsedNewlines, to: textView)
+      }
       lastSpec = spec
       isProcessingEvent = false
     }
