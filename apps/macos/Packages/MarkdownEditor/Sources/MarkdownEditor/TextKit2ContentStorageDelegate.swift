@@ -1,16 +1,36 @@
 import AppKit
 
 /// `NSTextContentStorageDelegate` that produces *display* paragraphs whose
-/// `attributedString` differs from the source range — the TextKit 2
-/// equivalent of the TextKit 1 glyph-hiding / glyph-substitution mechanism.
+/// `attributedString` reflects the spec's hidden / bullet / checkbox index
+/// sets — the TextKit 2 equivalent of the TextKit 1 glyph-hiding /
+/// glyph-substitution mechanism.
 ///
-/// Source characters in `hiddenIndexes` are omitted from display. Source
-/// characters in `bulletIndexes`, `uncheckedCheckboxIndexes`, and
-/// `checkedCheckboxIndexes` are substituted with `•`, `☐`, and `☒`
-/// respectively (preserving the source character's attributes). All other
-/// characters pass through with their attributes.
+/// **Length-matching invariant.** For every paragraph the delegate vends,
+/// `displayString.length == sourceRange.length`. TK2's `NSTextLocation`
+/// model assumes display offsets are source offsets: hit-test, character
+/// navigation, rendering attributes, and the cursor's visual position all
+/// silently break when display and source lengths diverge. Preserving the
+/// invariant via substitution (rather than character removal) keeps every
+/// other layer of the TK2 stack honest without per-paragraph translation
+/// maps.
 ///
-/// `lineBreakIndexes` (soft / hard breaks identified by the AST) are NOT
+/// Substitutions:
+/// - **Hidden chars** (`hiddenIndexes`) → `U+200B ZERO WIDTH SPACE`. 1-for-1
+///   length, zero visual width, valid cursor landing position.
+/// - **Bullet marker** (`bulletIndexes`, source `-`) → `U+2022 •`. 1-for-1.
+/// - **Unchecked checkbox** (`uncheckedCheckboxIndexes`, source `[ ]`) →
+///   `☐` + `U+200B` + `U+200B`. Length 3, only the `☐` is visible.
+/// - **Checked checkbox** (`checkedCheckboxIndexes`, source `[x]`) →
+///   `☒` + `U+200B` + `U+200B`. Length 3.
+/// - **All other source chars** pass through unchanged.
+///
+/// The trailing `\n` of the paragraph (the paragraph separator) stays a
+/// real `\n`. The single exception to the length-matching invariant is
+/// paragraphs whose entire source range is in `hiddenIndexes` — those are
+/// hidden via the `NSTextContentManagerDelegate.shouldEnumerate` hook
+/// below, never vended at all.
+///
+/// `lineBreakIndexes` (soft / hard breaks identified by the AST) is NOT
 /// handled at this layer. The renderer instead emits per-line paragraph
 /// styles with `paragraphSpacing = 0` so soft-break-coupled source
 /// paragraphs render flush against each other — preserving 1:1 source ↔
@@ -40,13 +60,15 @@ final class TextKit2ContentStorageDelegate: NSObject,
   var lineBreakIndexes: IndexSet = IndexSet()
 
   // MARK: - Substitution glyphs
-  //
-  // Mirrors GlyphHidingLayoutManagerDelegate's choices so the two paths
-  // produce the same visual.
 
   private static let bulletString = "\u{2022}"  // •
-  private static let uncheckedCheckboxString = "\u{25A1}"  // □ (BALLOT BOX is unavailable in system fonts)
+  private static let uncheckedCheckboxString = "\u{25A1}"  // □
   private static let checkedCheckboxString = "\u{2612}"  // ☒
+  /// Used as a length-preserving stand-in for hidden source chars and as
+  /// padding after multi-char glyph substitutions (checkboxes). Zero
+  /// rendered width but a valid cursor landing position — so TK2's display
+  /// offsets stay 1:1 with source offsets.
+  private static let zeroWidthSpace = "\u{200B}"
 
   /// Diagnostic: incremented each time the delegate's paragraph hook is
   /// invoked. Used by tests to verify rebuilds happen after spec changes.
@@ -74,27 +96,55 @@ final class TextKit2ContentStorageDelegate: NSObject,
 
     let display = NSMutableAttributedString()
 
-    for i in 0..<scanLength {
+    // Walk one source char at a time, emitting a substitution that has the
+    // SAME UTF-16 length as the source span it replaces. Multi-source-char
+    // substitutions (checkboxes) consume the next `padding` chars after the
+    // visible glyph and emit ZWSPs for them so total length stays equal.
+    var i = 0
+    while i < scanLength {
       let docIdx = range.location + i
-
-      if hiddenIndexes.contains(docIdx) {
-        continue
-      }
-
       let oneChar = source.attributedSubstring(from: NSRange(location: i, length: 1))
       let attrs = oneChar.attributes(at: 0, effectiveRange: nil)
 
-      if bulletIndexes.contains(docIdx) {
+      if hiddenIndexes.contains(docIdx) {
+        // Length-preserving stand-in. Carry the source char's attributes so
+        // any layout-fragment lookups (background, paragraph style) see the
+        // same per-char metadata they would have seen before substitution.
+        display.append(NSAttributedString(string: Self.zeroWidthSpace, attributes: attrs))
+      } else if bulletIndexes.contains(docIdx) {
         display.append(NSAttributedString(string: Self.bulletString, attributes: attrs))
       } else if uncheckedCheckboxIndexes.contains(docIdx) {
         display.append(
           NSAttributedString(string: Self.uncheckedCheckboxString, attributes: attrs))
+        // Pad the remaining 2 source chars (`[ ]` is 3 chars total) with
+        // ZWSPs so total display length matches the 3-char source span.
+        let padCount = min(2, scanLength - i - 1)
+        for j in 0..<padCount {
+          let padIdx = i + 1 + j
+          let padChar = source.attributedSubstring(
+            from: NSRange(location: padIdx, length: 1))
+          let padAttrs = padChar.attributes(at: 0, effectiveRange: nil)
+          display.append(
+            NSAttributedString(string: Self.zeroWidthSpace, attributes: padAttrs))
+        }
+        i += padCount  // advance past consumed padding chars
       } else if checkedCheckboxIndexes.contains(docIdx) {
         display.append(
           NSAttributedString(string: Self.checkedCheckboxString, attributes: attrs))
+        let padCount = min(2, scanLength - i - 1)
+        for j in 0..<padCount {
+          let padIdx = i + 1 + j
+          let padChar = source.attributedSubstring(
+            from: NSRange(location: padIdx, length: 1))
+          let padAttrs = padChar.attributes(at: 0, effectiveRange: nil)
+          display.append(
+            NSAttributedString(string: Self.zeroWidthSpace, attributes: padAttrs))
+        }
+        i += padCount
       } else {
         display.append(oneChar)
       }
+      i += 1
     }
 
     if endsWithNewline {
@@ -114,6 +164,12 @@ final class TextKit2ContentStorageDelegate: NSObject,
   /// space because TK2 preserves their trailing newline as the paragraph
   /// separator. Returning `false` here tells `enumerateTextElements` to
   /// skip the element entirely — it contributes no layout.
+  ///
+  /// This is the SINGLE exception to the length-matching invariant: the
+  /// element isn't vended at all, so there's no displayed paragraph for
+  /// the cursor to land in. Forward / backward arrow-key motion still
+  /// strides past the absorbed source chars because they're in
+  /// `hiddenIndexes` and the move overrides skip them.
   func textContentManager(
     _ textContentManager: NSTextContentManager,
     shouldEnumerate textElement: NSTextElement,
@@ -133,93 +189,5 @@ final class TextKit2ContentStorageDelegate: NSObject,
       }
     }
     return false
-  }
-
-  // MARK: - Hit-test & navigation support
-
-  /// Computes the hidden-prefix length (in source chars) at the start of
-  /// the given paragraph source range, by walking the current
-  /// `hiddenIndexes` set. Pure function over current state — no caching, so
-  /// the result is always consistent with the delegate's index sets even
-  /// after viewport scroll has caused TK2 to discard cached paragraphs.
-  func computeHiddenPrefix(forParagraphSourceRange range: NSRange) -> Int {
-    var prefix = 0
-    while prefix < range.length, hiddenIndexes.contains(range.location + prefix) {
-      prefix += 1
-    }
-    return prefix
-  }
-
-  /// Builds the per-display-character → per-source-character map for the
-  /// given paragraph source range. The returned array has length equal to
-  /// the displayed paragraph's character count (after substitutions and
-  /// hidden-char removal); `map[i]` is the source offset of the i-th
-  /// display character. The trailing `\n` (paragraph separator) is
-  /// included as the last entry so the array length matches the displayed
-  /// paragraph length and addresses past the last visible char land on the
-  /// paragraph end position.
-  ///
-  /// Computed on-demand from the current `hiddenIndexes` set — there is
-  /// no cache. This intentionally mirrors `computeHiddenPrefix`'s
-  /// on-demand approach (Phase 2.5 cache caused scroll bugs); the
-  /// per-paragraph walk is O(paragraph length) and runs only on hit-test
-  /// and per-keypress.
-  func displayToSourceMap(forParagraphSourceRange range: NSRange) -> [Int] {
-    var map: [Int] = []
-    map.reserveCapacity(range.length)
-    let endLocation = range.location + range.length
-    for src in range.location..<endLocation {
-      if hiddenIndexes.contains(src) {
-        continue
-      }
-      map.append(src)
-    }
-    return map
-  }
-
-  /// Returns the next source offset (strictly greater than `sourceOffset`)
-  /// within `paragraphSourceRange` that is NOT hidden. Returns `nil` if
-  /// no such position exists in the paragraph (caller should advance to
-  /// the next paragraph). The position one-past-the-paragraph
-  /// (`paragraphSourceRange.location + paragraphSourceRange.length`) is
-  /// considered a valid landing site — it is the start of the next
-  /// paragraph / the document end.
-  ///
-  /// Bridging across construct boundaries (e.g. crossing out of
-  /// `**bold**`) becomes a single keypress: hidden delimiters are
-  /// transparent to character-level navigation.
-  func nextVisibleSourceOffset(
-    after sourceOffset: Int,
-    inParagraphSourceRange paragraphSourceRange: NSRange
-  ) -> Int? {
-    let end = paragraphSourceRange.location + paragraphSourceRange.length
-    var pos = sourceOffset + 1
-    while pos < end {
-      if !hiddenIndexes.contains(pos) {
-        return pos
-      }
-      pos += 1
-    }
-    if sourceOffset < end {
-      return end
-    }
-    return nil
-  }
-
-  /// Symmetric to `nextVisibleSourceOffset(after:)` but moving leftward.
-  /// Returns the largest source offset strictly less than `sourceOffset`
-  /// within `paragraphSourceRange` that is NOT hidden, or `nil` if none.
-  func previousVisibleSourceOffset(
-    before sourceOffset: Int,
-    inParagraphSourceRange paragraphSourceRange: NSRange
-  ) -> Int? {
-    var pos = sourceOffset - 1
-    while pos >= paragraphSourceRange.location {
-      if !hiddenIndexes.contains(pos) {
-        return pos
-      }
-      pos -= 1
-    }
-    return nil
   }
 }

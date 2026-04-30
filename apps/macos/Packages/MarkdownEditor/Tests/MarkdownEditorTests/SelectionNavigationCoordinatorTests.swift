@@ -18,16 +18,11 @@ import Testing
 /// to force paragraph rebuild, and an `invalidateLayout(for: documentRange)`,
 /// all inside the override before `moveRight` returns.
 ///
-/// When the spec change toggles `**` from hidden to visible (or vice versa)
-/// across the cursor, TK2's layout invalidation re-snaps the cursor to
-/// preserve its visual position — which jumps it to a different source
-/// offset than the one the override just set. The bug only surfaces when
-/// the Coordinator is in the loop; isolated tests miss it.
-///
-/// These tests reproduce the user-reported bug:
-/// > Source `"A **B** C D E F G"`, cursor at 5; right-arrow walks 5→6→7
-/// > correctly, but the next press jumps from 7 to 12 (before "E"),
-/// > skipping " C D " entirely.
+/// These tests pin the user-reported repro that motivated the
+/// length-matching invariant in the content delegate:
+/// > Source `"A **B** C D E F G"`, cursor at 5; right-arrow walks
+/// > 5→6→7→8→9→10→11 with the Coordinator's apply-pipeline running on
+/// > every press.
 @Suite("Selection Navigation (with Coordinator)")
 @MainActor
 struct SelectionNavigationCoordinatorTests {
@@ -49,36 +44,6 @@ struct SelectionNavigationCoordinatorTests {
   private final class StateBox {
     var state: EditorState
     init(_ s: EditorState) { self.state = s }
-  }
-
-  /// Mutable counter shared with notification observers; main-actor isolated
-  /// so we can mutate it from `MainActor.assumeIsolated`.
-  @MainActor
-  private final class FireCounter {
-    var fired = 0
-  }
-
-  /// One-shot interloper installed via `NotificationCenter` Selector
-  /// observation (which sidesteps the `@Sendable` closure constraint of
-  /// the block-based observer API). Mutates the cursor on the FIRST
-  /// `textStorage.didProcessEditingNotification` after the override sets
-  /// the selection — simulating whatever production-only mechanism causes
-  /// the cursor drift the user reports.
-  @MainActor
-  private final class CursorInterloper: NSObject {
-    weak var textView: NSTextView?
-    let target: Int
-    let counter: FireCounter
-    init(textView: NSTextView, target: Int, counter: FireCounter) {
-      self.textView = textView
-      self.target = target
-      self.counter = counter
-    }
-    @objc func handle(_ notification: Notification) {
-      guard counter.fired == 0 else { return }
-      counter.fired += 1
-      textView?.setSelectedRange(NSRange(location: target, length: 0))
-    }
   }
 
   private static func make(
@@ -211,64 +176,18 @@ struct SelectionNavigationCoordinatorTests {
     #expect(p2 == 5, "expected to land on revealed `*` at 5; got \(p2)")
   }
 
-  // MARK: - Drift guard
-
-  /// If something in the apply pipeline (TK2's visual-position-preserve
-  /// heuristic, layout invalidation, or anything else) shifts the cursor
-  /// during the selection-change callback, the Coordinator's drift guard
-  /// must restore the cursor to the position the move override set.
-  ///
-  /// We can't easily force TK2 to drift the cursor in a unit test (the
-  /// test rig's layout is too lightweight to trigger the visual-preserve
-  /// heuristic). Instead we install an `NSTextStorage` edit-notification
-  /// observer that fires *during* `apply` (which calls
-  /// `textStorage.setAttributes` and triggers `didProcessEditing`) and
-  /// explicitly mutates the cursor — this simulates whatever
-  /// production-only mechanism causes the drift the user reports.
-  ///
-  /// The drift happens INSIDE the Coordinator's
-  /// `textViewDidChangeSelection` callback, between when the callback
-  /// captures the intended cursor and when it returns. The drift guard
-  /// (re-setting `selectedRange` after `apply` returns) restores the
-  /// intended position before the callback returns. Because the re-set
-  /// happens while `isProcessingEvent` is still true, it does not
-  /// recursively trigger another `apply`.
-  @Test
-  func drift_guard_restores_cursor_after_intra_apply_shift() {
-    let md = "A **B** C D E F G"
-    let rig = Self.make(markdown: md, cursorPosition: 7)
-
-    // Install an interloping observer on textStorage edit completion.
-    // `apply` calls `textStorage.endEditing()` which posts this
-    // notification synchronously while still inside the Coordinator's
-    // `textViewDidChangeSelection` callback. The interloper mutates the
-    // cursor to 12 (matching the user-reported bug position), simulating
-    // TK2's visual-preserve snap-back.
-    let counter = FireCounter()
-    let interloper = CursorInterloper(
-      textView: rig.textView, target: 12, counter: counter)
-    NotificationCenter.default.addObserver(
-      interloper,
-      selector: #selector(CursorInterloper.handle(_:)),
-      name: NSTextStorage.didProcessEditingNotification,
-      object: rig.textView.textStorage)
-    defer { NotificationCenter.default.removeObserver(interloper) }
-
-    // Press right-arrow. The override sets the cursor to 8. The Coordinator's
-    // textViewDidChangeSelection runs, captures intendedRange=8, then runs
-    // `apply` which triggers our interloper that yanks the cursor to 12.
-    // The drift guard re-reads the cursor, sees it's 12 (not 8), and
-    // restores it to 8 before the callback returns.
-    rig.textView.moveRight(nil)
-    if let tlm = rig.textView.textLayoutManager {
-      tlm.ensureLayout(for: tlm.documentRange)
-    }
-    rig.textView.displayIfNeeded()
-
-    #expect(counter.fired == 1, "interloper must fire to exercise the drift guard")
-    let final = rig.textView.selectedRange().location
-    #expect(
-      final == 8,
-      "drift guard should restore cursor to 8 after interloping shift to 12; got \(final)")
-  }
+  // MARK: - Drift guard removed
+  //
+  // A drift-correction guard used to run inside the Coordinator's
+  // `textViewDidChangeSelection` to restore the cursor when `apply`
+  // re-snapped it to a different source offset. The drift was a symptom
+  // of the content delegate vending paragraphs whose display length was
+  // shorter than their source length — TK2 then computed cursor positions
+  // in display coordinates and the visual position drifted relative to
+  // the source position the caller set. With the length-matching invariant
+  // in the content delegate (display.length == source.length via ZWSP /
+  // glyph substitution), the underlying mismatch is gone and the guard
+  // became unreachable. The previously-reported bug (`right_arrow` from
+  // 7 jumping to 12) is now exercised by the runner end-to-end and stays
+  // pinned at the test-rig level by the *_with_coordinator tests above.
 }
