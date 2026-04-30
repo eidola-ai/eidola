@@ -38,10 +38,12 @@ struct TextKit2HitTestInterceptTests {
   @Test
   func object_setClass_upgrades_textview_to_subclass() {
     let tv = NSTextView(usingTextLayoutManager: true)
-    #expect(!tv.isKind(of: TextKit2MarkdownTextView.self),
+    #expect(
+      !tv.isKind(of: TextKit2MarkdownTextView.self),
       "convenience init should produce plain NSTextView before upgrade")
     object_setClass(tv, TextKit2MarkdownTextView.self)
-    #expect(tv.isKind(of: TextKit2MarkdownTextView.self),
+    #expect(
+      tv.isKind(of: TextKit2MarkdownTextView.self),
       "after object_setClass, the runtime class should be TextKit2MarkdownTextView")
   }
 
@@ -73,12 +75,22 @@ struct TextKit2HitTestInterceptTests {
       tlm.ensureLayout(for: tlm.documentRange)
     }
 
-    // Click resolved to source offset 0 (heading paragraph start, hidden `#`)
-    // → translates forward by 2 to land on the visible `H`.
+    // TK2's hit-test reports display offsets in source-coordinate clothing
+    // (empirically verified — the layout fragment lays out the display
+    // string and TK2 maps display offset N to paragraph.elementRange.location
+    // + N, treating the offset as a source position). Translation walks the
+    // display→source map for the containing paragraph.
+    //
+    // Heading paragraph display = "Heading\n" (length 8); the paragraph's
+    // source range is [0, 11) covering "# Heading\n". hidden = {0, 1}.
+    // displayToSourceMap = [2,3,4,5,6,7,8,9,10].
+    //
+    // Click reported as source 0 → display offset 0 → source 2 (visible 'H').
     #expect(tv.translateHitTestIndex(0) == 2)
-    // Click resolved to a non-paragraph-start offset → unchanged.
-    #expect(tv.translateHitTestIndex(5) == 5)
-    // Click resolved to body paragraph start (no hidden prefix) → unchanged.
+    // Click reported as source 5 → display offset 5 → source 7 (visible 'i').
+    #expect(tv.translateHitTestIndex(5) == 7)
+    // Click on body paragraph (no hidden chars) — display map is identity,
+    // so the offset within the body paragraph passes through unchanged.
     #expect(tv.translateHitTestIndex(bodyOffset) == bodyOffset)
   }
 
@@ -121,7 +133,8 @@ struct TextKit2HitTestInterceptTests {
     var headingStart = 0
     for i in 0..<20 {
       let offset = tv.translateHitTestIndex(headingStart)
-      #expect(offset == headingStart + 2,
+      #expect(
+        offset == headingStart + 2,
         "heading #\(i) at source \(headingStart): expected \(headingStart + 2), got \(offset)")
       headingStart += ("# Heading \(i)\n\nbody \(i)\n\n" as NSString).length
     }

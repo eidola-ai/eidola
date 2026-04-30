@@ -135,7 +135,7 @@ final class TextKit2ContentStorageDelegate: NSObject,
     return false
   }
 
-  // MARK: - Hit-test support
+  // MARK: - Hit-test & navigation support
 
   /// Computes the hidden-prefix length (in source chars) at the start of
   /// the given paragraph source range, by walking the current
@@ -148,5 +148,78 @@ final class TextKit2ContentStorageDelegate: NSObject,
       prefix += 1
     }
     return prefix
+  }
+
+  /// Builds the per-display-character → per-source-character map for the
+  /// given paragraph source range. The returned array has length equal to
+  /// the displayed paragraph's character count (after substitutions and
+  /// hidden-char removal); `map[i]` is the source offset of the i-th
+  /// display character. The trailing `\n` (paragraph separator) is
+  /// included as the last entry so the array length matches the displayed
+  /// paragraph length and addresses past the last visible char land on the
+  /// paragraph end position.
+  ///
+  /// Computed on-demand from the current `hiddenIndexes` set — there is
+  /// no cache. This intentionally mirrors `computeHiddenPrefix`'s
+  /// on-demand approach (Phase 2.5 cache caused scroll bugs); the
+  /// per-paragraph walk is O(paragraph length) and runs only on hit-test
+  /// and per-keypress.
+  func displayToSourceMap(forParagraphSourceRange range: NSRange) -> [Int] {
+    var map: [Int] = []
+    map.reserveCapacity(range.length)
+    let endLocation = range.location + range.length
+    for src in range.location..<endLocation {
+      if hiddenIndexes.contains(src) {
+        continue
+      }
+      map.append(src)
+    }
+    return map
+  }
+
+  /// Returns the next source offset (strictly greater than `sourceOffset`)
+  /// within `paragraphSourceRange` that is NOT hidden. Returns `nil` if
+  /// no such position exists in the paragraph (caller should advance to
+  /// the next paragraph). The position one-past-the-paragraph
+  /// (`paragraphSourceRange.location + paragraphSourceRange.length`) is
+  /// considered a valid landing site — it is the start of the next
+  /// paragraph / the document end.
+  ///
+  /// Bridging across construct boundaries (e.g. crossing out of
+  /// `**bold**`) becomes a single keypress: hidden delimiters are
+  /// transparent to character-level navigation.
+  func nextVisibleSourceOffset(
+    after sourceOffset: Int,
+    inParagraphSourceRange paragraphSourceRange: NSRange
+  ) -> Int? {
+    let end = paragraphSourceRange.location + paragraphSourceRange.length
+    var pos = sourceOffset + 1
+    while pos < end {
+      if !hiddenIndexes.contains(pos) {
+        return pos
+      }
+      pos += 1
+    }
+    if sourceOffset < end {
+      return end
+    }
+    return nil
+  }
+
+  /// Symmetric to `nextVisibleSourceOffset(after:)` but moving leftward.
+  /// Returns the largest source offset strictly less than `sourceOffset`
+  /// within `paragraphSourceRange` that is NOT hidden, or `nil` if none.
+  func previousVisibleSourceOffset(
+    before sourceOffset: Int,
+    inParagraphSourceRange paragraphSourceRange: NSRange
+  ) -> Int? {
+    var pos = sourceOffset - 1
+    while pos >= paragraphSourceRange.location {
+      if !hiddenIndexes.contains(pos) {
+        return pos
+      }
+      pos -= 1
+    }
+    return nil
   }
 }

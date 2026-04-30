@@ -22,6 +22,17 @@ enum TextKit2RenderApplicator {
     guard textLength > 0 else { return }
     let fullRange = NSRange(location: 0, length: textLength)
 
+    let preApplySel = textView.selectedRange()
+    DebugTrace.log("apply.start", [
+      "text_length": textLength,
+      "hidden_count": spec.hiddenIndexes.count,
+      "line_break_count": spec.lineBreakIndexes.count,
+      "styled_ranges": spec.styledRanges.count,
+      "temp_attrs": spec.temporaryAttributes.count,
+      "selection_location": preApplySel.location,
+      "selection_length": preApplySel.length,
+    ])
+
     // Phase 2: write the hiding/substitution index sets into the content-
     // storage delegate. The delegate is consulted again by TextKit 2 when
     // the textStorage edit below triggers paragraph rebuilds.
@@ -85,7 +96,19 @@ enum TextKit2RenderApplicator {
       }
     }
     if let tlm = textView.textLayoutManager {
+      let preInvalidateSel = textView.selectedRange()
       tlm.invalidateLayout(for: tlm.documentRange)
+      let postInvalidateSel = textView.selectedRange()
+      if preInvalidateSel.location != postInvalidateSel.location
+        || preInvalidateSel.length != postInvalidateSel.length
+      {
+        DebugTrace.log("apply.invalidate.selection_shift", [
+          "before_location": preInvalidateSel.location,
+          "before_length": preInvalidateSel.length,
+          "after_location": postInvalidateSel.location,
+          "after_length": postInvalidateSel.length,
+        ])
+      }
     }
 
     if let origin = savedOrigin, let clipView {
@@ -116,6 +139,12 @@ enum TextKit2RenderApplicator {
         tlm.setRenderingAttributes(tempAttr.attributes, for: textRange)
       }
     }
+
+    let postApplySel = textView.selectedRange()
+    DebugTrace.log("apply.end", [
+      "selection_location": postApplySel.location,
+      "selection_length": postApplySel.length,
+    ])
   }
 
   /// Cursor-only update. Re-runs the full `apply` so that index sets, fragment

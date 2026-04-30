@@ -398,12 +398,27 @@ public struct MarkdownEditor: NSViewRepresentable {
       // cursor update here — textDidChange will handle the full resync.
       guard textView.string == state.wrappedValue.markdown else { return }
 
-      let nsRange = textView.selectedRange()
+      // Capture the cursor the caller actually intends. `apply` below mutates
+      // the content delegate's hiddenIndexes (so `**` flips visibility on a
+      // boundary cross), records a full-document edit action, and invalidates
+      // layout. Any of those can cause TK2 to "preserve the visual cursor"
+      // by re-snapping the cursor to a different source offset. We carry the
+      // intended source position across the apply and re-set it if drift
+      // happened — no apparent drift is harmless (the re-set is a no-op),
+      // and the guard against drift is the user-facing fix for cursor jumps
+      // when crossing construct boundaries that toggle delimiter visibility.
+      let intendedRange = textView.selectedRange()
+      DebugTrace.log("selection.before", [
+        "location": intendedRange.location,
+        "length": intendedRange.length,
+      ])
       let selection: Selection
-      if nsRange.length == 0 {
-        selection = .cursor(nsRange.location)
+      if intendedRange.length == 0 {
+        selection = .cursor(intendedRange.location)
       } else {
-        selection = .range(anchor: nsRange.location, head: nsRange.location + nsRange.length)
+        selection = .range(
+          anchor: intendedRange.location,
+          head: intendedRange.location + intendedRange.length)
       }
 
       // Only update rendering (glyph visibility), don't change text
@@ -423,6 +438,29 @@ public struct MarkdownEditor: NSViewRepresentable {
         previousCheckedCheckboxes: prevCheckedCheckboxes,
         previousLineBreaks: prevLineBreaks, to: textView)
       lastSpec = spec
+
+      // Drift guard: if apply moved the cursor (TK2 visual-position-preserve
+      // heuristic, or anything else), restore it to the position the caller
+      // set. `isProcessingEvent` is still true here so the re-set's
+      // selection-change notification is ignored — no recursion, no extra
+      // apply.
+      let postApplyRange = textView.selectedRange()
+      if postApplyRange.location != intendedRange.location
+        || postApplyRange.length != intendedRange.length
+      {
+        DebugTrace.log("selection.drift_corrected", [
+          "intended_location": intendedRange.location,
+          "intended_length": intendedRange.length,
+          "drifted_location": postApplyRange.location,
+          "drifted_length": postApplyRange.length,
+        ])
+        textView.setSelectedRange(intendedRange)
+      }
+      DebugTrace.log("selection.after", [
+        "location": textView.selectedRange().location,
+        "length": textView.selectedRange().length,
+      ])
+
       isProcessingEvent = false
     }
   }

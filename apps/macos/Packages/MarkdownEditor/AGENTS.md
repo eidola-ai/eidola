@@ -147,6 +147,8 @@ EditorState + EditorEvent  →  EditorUpdate.update()  →  new EditorState
 - **Trust TK2's element model; manipulate spacing, not display merging.** TK2's cursor navigation, hit-testing, and selection enumeration all operate on `NSTextElement` ranges, which are 1:1 with source-`\n`-bounded paragraphs. Any approach that tries to coalesce multiple source paragraphs into one displayed paragraph (e.g., substituting `\n` with `U+2028 LINE SEPARATOR` and returning a single merged `NSTextParagraph`) breaks navigation: absorbed elements become "non-represented", the cursor can't enter their content, and right-arrow jumps over their characters entirely. The fix for soft / hard line breaks is per-paragraph spacing (each source paragraph keeps its own element with `paragraphSpacing = 0` between soft-break-coupled segments). The U+2028 trick looks great on paper — and the discovery / articulation phases recommended it — but burned ~70 minutes of agent iteration before the fundamental clash with TK2's element model surfaced. Don't revisit unless TK2 grows an API for source-vs-display element coalescing.
 - **Soft / hard breaks are an `NSAttributedString.paragraphStyle` problem, not an `NSTextContentStorageDelegate` substitution problem.** The renderer's `applyParagraphStyle` (and the list-item style in `renderListItem`) split styled ranges at each soft-break `\n` and apply `paragraphSpacing = 0` to non-final segments and `paragraphSpacingBefore = 0` to non-first segments. The content delegate stays simple (just hide / bullet / checkbox substitution) and ignores `lineBreakIndexes` entirely — it's a renderer-side concern.
 - **`NSTextContentStorage.delegate` is `NSTextContentStorageDelegate?`, but its inherited `NSTextContentManager` has its own delegate slot of type `NSTextContentManagerDelegate?`.** They are sibling protocols, not inheritance. To use both delegate hooks (e.g., `textParagraphWith:` AND `shouldEnumerate:`), the same object must conform to both protocols and you must set both delegate properties — or rely on the storage subclass dispatching both hooks to its single `.delegate` (which it does in practice for our usage; verified empirically).
+- **TK2's hit-test and character-level selection navigation use display offsets in source-coordinate clothing — translate them, don't trust them.** When the content delegate vends an `NSTextParagraph` whose display string is shorter than the source range (because of hidden delimiters, bullet/checkbox substitutions, etc.), TK2's `characterIndexForInsertion(at:)` and `NSTextSelectionNavigation.destinationSelection(...)` walk the *display* string but report results as source offsets by simply adding the offset to `paragraph.elementRange.location`. So a click on display char 4 of "A B C D E F G" comes back as source 4 even though the source position of visible 'C' is 8. Right-arrow within or across hidden runs can jump arbitrarily (e.g. straight to the next paragraph) for the same reason. Fix: in the `NSTextView` subclass, override `moveLeft/Right(_:)` and their `…AndModifySelection(_:)` variants to compute the destination directly from the source-string + `hiddenIndexes` (skip hidden chars wholesale, never land on one); generalize the hit-test override to map TK2's "display-offset-as-source" return value through a per-paragraph `displayToSourceMap` rebuilt on demand. Word-level selectors (`moveWordLeft/Right`) delegate to super then translate the result through the same map. Build the map fresh on every lookup — no cache (the Phase 2.5 prefix cache went stale on viewport scroll, and the per-paragraph rebuild is O(paragraph length) which is well below frame budget for a single keypress).
+- **A move override that calls `setSelectedRange` is not the end of the story — the Coordinator's selection-change callback re-applies the spec, and apply may shift the cursor back.** When `TextKit2MarkdownTextView.moveRight` calls `setSelectedRange(nextSourceOffset)`, the production Coordinator's `textViewDidChangeSelection` fires *synchronously inside* the override. The Coordinator runs `MarkdownRenderer.render` + `TextKit2RenderApplicator.apply`, which mutates `hiddenIndexes` (delimiters flip visibility on a boundary cross), records a full-document edit action via `recordEditAction`, and calls `tlm.invalidateLayout(for: documentRange)`. Any of those — particularly the layout invalidation when the displayed paragraph length changes — can cause TK2 to "preserve the visual cursor position" by re-snapping the cursor to a different source offset (the user-reported repro: cursor at 7 in `A **B** C D E F G` lands at 12, before `E`, after pressing right). The fix lives in the Coordinator: capture the intended `selectedRange` at the top of `textViewDidChangeSelection`, run apply, then re-read the selection — if it drifted, `setSelectedRange(intendedRange)` to restore (the re-set is gated by `isProcessingEvent` which is still true, so it does not recursively trigger another apply). Tests that drive the move overrides without wiring the Coordinator as the text view's delegate WILL NOT catch this regression: the drift only manifests when the apply pipeline runs synchronously inside the override. Selection-navigation tests must register a real Coordinator (`SelectionNavigationCoordinatorTests`) AND ideally simulate a mid-apply cursor mutation (e.g. via an `NSTextStorage.didProcessEditingNotification` observer) to pin the drift guard.
 
 ## Testing Harness
 
@@ -242,7 +244,79 @@ cd apps/macos/Packages/MarkdownEditor
 swift build
 swift test
 swift run MarkdownEditorDemo
+swift run MarkdownEditorScript Scripts/markdown-bug-bold-arrow-walk.json
 ```
+
+### Scripted runner (`MarkdownEditorScript`)
+
+`MarkdownEditorScript` hosts the SwiftUI `MarkdownEditor` view in a real
+`NSWindow` against a real `NSApplication` and replays a JSON event script
+against the production code path (Coordinator wired as `NSTextView`
+delegate, full `apply` pipeline runs synchronously per keypress). Useful
+for blind agent iteration: every script produces a `trace.jsonl` (JSONL
+of state transitions — `selection.before/after`, `apply.start/end`,
+`move.start/end`, `hitTest.start/end`, `selection.drift_corrected`),
+PNG snapshots per `snapshot` event, and a `manifest.md` summary.
+
+Script schema (see `Scripts/markdown-bug-bold-arrow-walk.json` for a
+template):
+
+```json
+{
+  "markdown": "A **B** C D E F G",
+  "size": [800, 200],
+  "outDir": "/tmp/out",
+  "injection": "sendEvent",
+  "stepDelayMs": 60,
+  "events": [
+    { "type": "set_cursor", "position": 5 },
+    { "type": "key", "name": "right" },
+    { "type": "snapshot", "name": "after-right" }
+  ]
+}
+```
+
+Event types: `snapshot`, `set_cursor`, `select_range`, `key`, `type`,
+`click`, `wait`. Key names: `right`, `left`, `up`, `down`, `shift+right`,
+`shift+left`, `home`, `end`, `enter`, `backspace`, `delete`.
+
+Injection mechanisms (for diagnosing event-routing-path sensitivity):
+- `direct` (default fallback) — calls action selectors (`moveRight`)
+  directly. Same path the existing test rig uses.
+- `sendEvent` — synthesizes `NSEvent.keyEvent(...)` and dispatches via
+  `NSApp.sendEvent`. Goes through the real responder chain.
+- `cgEvent` — posts low-level `CGEvent` keypresses. Requires accessibility
+  permissions; without them the events are silently dropped (visible in
+  the trace as a missing `move.start`).
+
+`DebugTrace` (in `Sources/MarkdownEditor/DebugTrace.swift`) is the
+production-side instrumentation gated by `MARKDOWN_EDITOR_TRACE=1` or
+the runner. Per-call cost is one branch when off; never enable in shipped
+code paths.
+
+### Cursor-jump-after-bold-arrow bug — runner findings (2026-04)
+
+User-reported bug: source `"A **B** C D E F G"`, cursor at source 5,
+press right-arrow seven times. Expected walk 5→6→7→8→9→10→11; live demo
+walk reportedly 5→6→7→12→…. The runner (with `sendEvent` injection,
+visible window, full apply pipeline including `tlm.invalidateLayout` and
+`recordEditAction`) produces a clean walk 5→6→7→8→9→10→11→12 — the
+`selection.drift_corrected` line never fires, the
+`apply.invalidate.selection_shift` line never fires, and disabling the
+drift guard via `MARKDOWN_EDITOR_DISABLE_DRIFT_GUARD=1` leaves the walk
+identically clean. So either:
+- The bug requires real OS keyboard events with the actual viewport
+  layout controller running multi-frame display passes, which the
+  scripted runner doesn't faithfully reproduce.
+- Or the bug isn't an in-`apply` cursor drift at all — it's elsewhere
+  (e.g. `setSelectedRange` interpreting offsets as display-coords on the
+  write side, mirroring `characterIndexForInsertion` on the read side).
+The user's separate observation that delimiter dimming and italic font
+traits also appear shifted by the same offset supports the second
+hypothesis: something in the rendering-attribute or font-trait write
+path is treating source ranges as display ranges. Future work: instrument
+`setRenderingAttributes` and `addAttributes` callers, then drive the
+runner script and compare per-keypress before/after attribute ranges.
 
 ## Supported Constructs
 
