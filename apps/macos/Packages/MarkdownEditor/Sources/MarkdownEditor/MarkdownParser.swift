@@ -14,6 +14,7 @@ struct MarkdownParser {
 
   private(set) var document: MarkdownDocument?
   private(set) var inlineNodes: [InlineSyntaxNode] = []
+  private(set) var lineBreakIndexes: IndexSet = IndexSet()
 
   init(converter: SourceRangeConverter, style: MarkdownStyle = .default) {
     self.converter = converter
@@ -23,8 +24,12 @@ struct MarkdownParser {
 
   mutating func visit(_ document: Document) {
     inlineNodes = []
+    lineBreakIndexes = IndexSet()
     let blocks = parseBlocks(in: document, context: ParseContext(blockquoteDepth: 0))
-    self.document = MarkdownDocument(blocks: blocks, inlineNodes: inlineNodes)
+    self.document = MarkdownDocument(
+      blocks: blocks,
+      inlineNodes: inlineNodes,
+      lineBreakIndexes: lineBreakIndexes)
   }
 
   // MARK: - Block Parsing
@@ -334,10 +339,75 @@ struct MarkdownParser {
       case let strikethrough as Strikethrough:
         inlineNodes.append(makeStrikethroughNode(strikethrough))
         collectInlineNodes(in: strikethrough)
+      case is SoftBreak, is LineBreak:
+        recordInlineLineBreak(child)
       default:
         collectInlineNodes(in: child)
       }
     }
+  }
+
+  /// Record the source-character offset of the `\n` represented by a
+  /// `SoftBreak` or `LineBreak` AST node so the renderer can use it for
+  /// per-paragraph spacing decisions.
+  private mutating func recordInlineLineBreak(_ node: Markup) {
+    // swift-markdown often reports `nil` for a SoftBreak's `range`, and
+    // sometimes reports a range that covers the trailing `  ` for a hard
+    // break instead of the `\n` itself. To locate the real `\n`:
+    //
+    //   1. Prefer the node's own range (with a small look-back/-ahead window
+    //      so hard-break ranges that exclude the `\n` still find it).
+    //   2. If the node has no range, fall back to the *enclosing paragraph*'s
+    //      range — never the whole document, because that walks past the
+    //      previous block's trailing `\n` and records it instead. The
+    //      Paragraph parent reliably has a range and bounds the search.
+    //   3. If somehow there's no usable bounding range, give up rather than
+    //      record an arbitrary `\n`.
+    //
+    // The scan additionally starts after the highest already-recorded `\n`
+    // in the bounding range so multiple soft breaks within a single
+    // paragraph (each with nil range) are recorded at distinct offsets.
+    var scanStart = -1
+    var scanEnd = -1
+    if let r = node.range {
+      let lower = converter.utf16Offset(from: r.lowerBound)
+      let upper = converter.utf16Offset(from: r.upperBound)
+      scanStart = max(0, lower - 2)
+      scanEnd = min(nsText.length, upper + 1)
+    } else if let pr = enclosingParagraphRange(of: node) {
+      scanStart = pr.location
+      scanEnd = pr.location + pr.length
+    }
+    guard scanStart >= 0, scanEnd > scanStart else { return }
+
+    if let lastRecorded = lineBreakIndexes.last, lastRecorded + 1 > scanStart {
+      scanStart = lastRecorded + 1
+    }
+
+    var pos = scanStart
+    while pos < scanEnd {
+      if nsText.character(at: pos) == UInt16(0x000A) {
+        lineBreakIndexes.insert(pos)
+        return
+      }
+      pos += 1
+    }
+  }
+
+  /// Walk parent links until we find an ancestor with a usable source range
+  /// (typically the enclosing `Paragraph`). Returns the range as document
+  /// UTF-16 offsets, or `nil` if no ancestor has a range.
+  private func enclosingParagraphRange(of node: Markup) -> NSRange? {
+    var cursor: Markup? = node.parent
+    while let n = cursor {
+      if let r = n.range {
+        let lower = converter.utf16Offset(from: r.lowerBound)
+        let upper = converter.utf16Offset(from: r.upperBound)
+        return NSRange(location: lower, length: max(0, upper - lower))
+      }
+      cursor = n.parent
+    }
+    return nil
   }
 
   private func makeStrongNode(_ strong: Strong) -> InlineSyntaxNode {

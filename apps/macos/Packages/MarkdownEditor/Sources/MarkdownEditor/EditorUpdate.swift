@@ -571,23 +571,27 @@ enum EditorUpdate {
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
-    // Default: paragraph break or blank line.
+    // Default: paragraph break.
     // Inside a fenced code block, always use single \n (literal newlines).
-    // In paragraph context, insert \n\n so the raw markdown uses a blank line
-    // to separate paragraphs (per CommonMark). On an already-blank line, insert
-    // a single \n so consecutive Returns produce visible empty paragraphs.
     if isInsideFencedCodeBlock(nsMarkdown, at: pos) {
       return handleInsertText(state, text: "\n")
     }
-    let (_, defaultLineText) = currentLine(nsMarkdown, at: pos)
-    let defaultLineContent = defaultLineText.trimmingCharacters(in: .newlines)
-    let onBlankLine: Bool
-    if case .cursor = state.selection {
-      onBlankLine = defaultLineContent.isEmpty
-    } else {
-      onBlankLine = false
+
+    // Snap the trailing-`\n` count to even. The renderer's "every two `\n`
+    // produces one visible empty paragraph" rule means that pairs of `\n`
+    // are the unit of vertical spacing; an odd trailing count would create
+    // a phantom orphan that the renderer absorbs silently. By inserting
+    // `\n\n` when trailing is even (including 0) and `\n` when trailing is
+    // odd, each Enter press reliably adds exactly one new visible paragraph
+    // break / empty paragraph — no consecutive presses go silently wasted.
+    var trailingNewlines = 0
+    var scanPos = pos
+    while scanPos > 0, nsMarkdown.character(at: scanPos - 1) == UInt16(0x000A) {
+      trailingNewlines += 1
+      scanPos -= 1
     }
-    return handleInsertText(state, text: onBlankLine ? "\n" : "\n\n")
+    let insertion = trailingNewlines % 2 == 0 ? "\n\n" : "\n"
+    return handleInsertText(state, text: insertion)
   }
 
   // Regex matching any list line (unordered or ordered) to extract the full marker width.
@@ -665,17 +669,15 @@ enum EditorUpdate {
       return EditorState(markdown: newMarkdown, selection: .cursor(newPos))
     }
 
-    // Not in a list item: paragraph break (same as Return for now).
-    if isInsideFencedCodeBlock(workNS, at: workPos) {
-      return handleInsertText(
-        EditorState(markdown: workMarkdown, selection: .cursor(workPos)),
-        text: "\n")
-    }
-    let (_, shiftLineText) = currentLine(workNS, at: workPos)
-    let shiftLineContent = shiftLineText.trimmingCharacters(in: .newlines)
+    // Shift+Enter outside a list/blockquote context inserts a soft break
+    // (single `\n`), per the editor's hybrid newline policy: Enter inserts a
+    // paragraph break (`\n\n`), Shift+Enter inserts a soft break that the
+    // renderer displays as a visible in-paragraph line break (CommonMark
+    // §6.13 spec-allowed alternative). Inside a fenced code block the
+    // structural intent doesn't apply, so a literal `\n` either way.
     return handleInsertText(
       EditorState(markdown: workMarkdown, selection: .cursor(workPos)),
-      text: shiftLineContent.isEmpty ? "\n" : "\n\n")
+      text: "\n")
   }
 
   /// Regex matching a bare blockquote prefix (optional leading whitespace, then one
@@ -808,17 +810,15 @@ enum EditorUpdate {
         }
       }
 
-      // Check for \n\n paragraph boundary: consume both newlines to merge paragraphs.
-      // Without this, deleting one \n would leave a lone \n that is a CommonMark
-      // soft line break rather than a paragraph separator.
-      if clampedPos >= 2
-        && nsMarkdown.character(at: clampedPos - 1) == UInt16(0x000A)
-        && nsMarkdown.character(at: clampedPos - 2) == UInt16(0x000A)
-      {
-        let deleteRange = NSRange(location: clampedPos - 2, length: 2)
-        let newMarkdown = nsMarkdown.replacingCharacters(in: deleteRange, with: "")
-        return EditorState(markdown: newMarkdown, selection: .cursor(clampedPos - 2))
-      }
+      // Backspace deletes ONE character at a time even at a `\n\n` paragraph
+      // boundary. Backing over a paragraph break removes one `\n`, leaving the
+      // other as a soft break — the visual gap collapses to an in-paragraph
+      // line break and a second backspace joins the halves. The earlier
+      // pair-consume behavior (delete both `\n`s atomically) was tightly
+      // coupled to a `normalizeSoftLineBreaks` pass that has since been
+      // removed; keeping it would surprise users by deleting two source
+      // characters per keystroke and would re-introduce the brittleness the
+      // soft-break / paragraph-break refactor was meant to retire.
 
       // Default: delete one character before cursor
       let deleteRange = nsMarkdown.rangeOfComposedCharacterSequence(at: clampedPos - 1)
@@ -1512,86 +1512,4 @@ enum EditorUpdate {
     return EditorState(markdown: newMarkdown, selection: newSelection)
   }
 
-  // MARK: - Soft Line Break Normalization
-
-  /// Normalize soft line breaks in markdown text by replacing them with spaces.
-  ///
-  /// In CommonMark, a soft line break (`\n` within a paragraph) renders as a space.
-  /// This function parses the text, finds soft/hard line breaks within paragraphs,
-  /// and replaces the `\n` plus any continuation prefix (`> `, indentation) with
-  /// a single space. Also strips trailing whitespace before the break to avoid
-  /// double spaces from hard-break syntax (`  \n`).
-  ///
-  /// Used to normalize pasted markdown so that hard-wrapped paragraphs reflow
-  /// correctly in the WYSIWYG editor.
-  static func normalizeSoftLineBreaks(in text: String) -> String {
-    let doc = Document(parsing: text)
-    let converter = SourceRangeConverter(string: text)
-
-    // Collect gap ranges around SoftBreak/LineBreak nodes.
-    // The gap is the span between the preceding sibling's end and the
-    // following sibling's start, which includes the \n and any continuation
-    // prefix (blockquote markers, list indentation).
-    var gapRanges: [NSRange] = []
-
-    func walkInlines(in node: Markup) {
-      let children = Array(node.children)
-      for (i, child) in children.enumerated() {
-        if child is SoftBreak || child is LineBreak {
-          // Find preceding and following sibling ranges to compute the gap.
-          let prevEnd: Int?
-          if i > 0, let r = children[i - 1].range {
-            prevEnd = converter.utf16Offset(from: r.upperBound)
-          } else {
-            prevEnd = nil
-          }
-          let nextStart: Int?
-          if i + 1 < children.count, let r = children[i + 1].range {
-            nextStart = converter.utf16Offset(from: r.lowerBound)
-          } else {
-            nextStart = nil
-          }
-
-          if let start = prevEnd, let end = nextStart, end > start {
-            // Also strip trailing whitespace before the \n to avoid double spaces.
-            let nsText = text as NSString
-            var trimmedStart = start
-            while trimmedStart > 0
-              && nsText.character(at: trimmedStart - 1) == UInt16(0x0020)
-            {
-              trimmedStart -= 1
-            }
-            // Only trim back if there's at least one space before the break,
-            // preserving the character right before the whitespace.
-            let effectiveStart = trimmedStart < start ? trimmedStart : start
-            gapRanges.append(NSRange(location: effectiveStart, length: end - effectiveStart))
-          }
-        } else {
-          walkInlines(in: child)
-        }
-      }
-    }
-
-    func walkBlocks(_ node: Markup) {
-      for child in node.children {
-        if child is Paragraph {
-          walkInlines(in: child)
-        } else {
-          walkBlocks(child)
-        }
-      }
-    }
-
-    walkBlocks(doc)
-
-    guard !gapRanges.isEmpty else { return text }
-
-    // Apply replacements in reverse order so ranges stay valid.
-    var result = text as NSString
-    for gap in gapRanges.reversed() {
-      result = result.replacingCharacters(in: gap, with: " ") as NSString
-    }
-
-    return result as String
-  }
 }

@@ -25,12 +25,15 @@ struct LineBreakUpdateTests {
     #expect(result.selection == .cursor(12))
   }
 
-  @Test("Shift+Return outside list is paragraph break")
+  @Test("Shift+Return outside list is a soft break")
   func shiftReturnOutsideList() {
+    // Per the editor's hybrid newline policy: Enter inserts a paragraph
+    // break (`\n\n`), Shift+Enter inserts a single `\n` soft break that
+    // the renderer displays as a visible in-paragraph line break.
     let state = EditorState(markdown: "Hello", selection: .cursor(5))
     let result = EditorUpdate.update(state, event: .insertLineBreak)
-    #expect(result.markdown == "Hello\n\n")
-    #expect(result.selection == .cursor(7))
+    #expect(result.markdown == "Hello\n")
+    #expect(result.selection == .cursor(6))
   }
 
   @Test("Shift+Return in middle of list item content splits with indent")
@@ -97,12 +100,16 @@ struct LineBreakUpdateTests {
 
   // MARK: - Heading (not a list)
 
-  @Test("Shift+Return in heading is paragraph break")
+  @Test("Shift+Return in heading is a soft break")
   func shiftReturnInHeading() {
+    // Hybrid newline policy: Shift+Enter is always a soft break, even in a
+    // heading. (CommonMark allows soft breaks inside ATX headings only at
+    // the visual-line level; the renderer's behavior for "soft break inside
+    // a heading" is governed by lineBreakIndexes the same way as body text.)
     let state = EditorState(markdown: "# Hello", selection: .cursor(7))
     let result = EditorUpdate.update(state, event: .insertLineBreak)
-    #expect(result.markdown == "# Hello\n\n")
-    #expect(result.selection == .cursor(9))
+    #expect(result.markdown == "# Hello\n")
+    #expect(result.selection == .cursor(8))
   }
 
   // MARK: - Empty document

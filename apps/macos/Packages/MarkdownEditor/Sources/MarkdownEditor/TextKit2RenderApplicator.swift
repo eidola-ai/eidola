@@ -32,7 +32,7 @@ enum TextKit2RenderApplicator {
       delegate.bulletIndexes = spec.bulletIndexes
       delegate.uncheckedCheckboxIndexes = spec.uncheckedCheckboxIndexes
       delegate.checkedCheckboxIndexes = spec.checkedCheckboxIndexes
-      delegate.collapsedNewlineIndexes = spec.collapsedNewlineIndexes
+      delegate.lineBreakIndexes = spec.lineBreakIndexes
     }
 
     // Phase 3: write the per-paragraph decoration ranges (code block bg,
@@ -131,13 +131,13 @@ enum TextKit2RenderApplicator {
     previousBullets: IndexSet,
     previousUncheckedCheckboxes: IndexSet = IndexSet(),
     previousCheckedCheckboxes: IndexSet = IndexSet(),
-    previousCollapsedNewlines: IndexSet = IndexSet(),
+    previousLineBreaks: IndexSet = IndexSet(),
     to textView: NSTextView
   ) {
     _ = (
       previousHidden, previousBullets,
       previousUncheckedCheckboxes, previousCheckedCheckboxes,
-      previousCollapsedNewlines
+      previousLineBreaks
     )
     apply(spec, to: textView)
   }

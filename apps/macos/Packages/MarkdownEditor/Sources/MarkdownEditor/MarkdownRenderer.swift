@@ -21,7 +21,7 @@ enum MarkdownRenderer {
     var bulletIndexes = IndexSet()
     var uncheckedCheckboxIndexes = IndexSet()
     var checkedCheckboxIndexes = IndexSet()
-    var collapsedNewlineIndexes = IndexSet()
+    var lineBreakIndexes = IndexSet()
     var temporaryAttributes: [RenderSpec.StyledRange] = []
     var codeBlockCharacterRanges: [RenderSpec.CodeBlockDecoration] = []
     var blockquoteCharacterRanges: [RenderSpec.BlockquoteDecoration] = []
@@ -49,7 +49,7 @@ enum MarkdownRenderer {
         bulletIndexes: IndexSet(),
         uncheckedCheckboxIndexes: IndexSet(),
         checkedCheckboxIndexes: IndexSet(),
-        collapsedNewlineIndexes: IndexSet(),
+        lineBreakIndexes: IndexSet(),
         temporaryAttributes: [],
         codeBlockCharacterRanges: [],
         blockquoteCharacterRanges: []
@@ -69,7 +69,7 @@ enum MarkdownRenderer {
         bulletIndexes: IndexSet(),
         uncheckedCheckboxIndexes: IndexSet(),
         checkedCheckboxIndexes: IndexSet(),
-        collapsedNewlineIndexes: IndexSet(),
+        lineBreakIndexes: IndexSet(),
         temporaryAttributes: [],
         codeBlockCharacterRanges: [],
         blockquoteCharacterRanges: []
@@ -94,6 +94,11 @@ enum MarkdownRenderer {
   ) -> RenderSpec {
     let nsText = text as NSString
     var accumulator = RenderAccumulator()
+    // Seed soft-break / hard-break offsets from the AST so the content
+    // delegate substitutes them with U+2028 LINE SEPARATOR at display time
+    // and skips the redundant continuation prefix (`>` blockquote markers
+    // and list-item indent) on the line that follows.
+    accumulator.lineBreakIndexes.formUnion(document.lineBreakIndexes)
     let rootContext = BlockRenderContext(
       hiddenIndent: 0,
       visibleQuoteWidth: 0,
@@ -124,13 +129,16 @@ enum MarkdownRenderer {
       )
     }
 
-    // Collapse the first blank line in each inter-block gap so that \n\n
-    // paragraph separators render identically to the old single-\n behavior.
-    collapseInterBlockBlankLines(
-      between: document.blocks,
+    // Apply the AGENTS.md "every two newlines = one paragraph break" rule
+    // to inter-block gaps, recursively (so blockquote / list-item children
+    // also get the same treatment). For a gap with N consecutive `\n`s
+    // between two blocks, exactly `max(0, N/2 - 1)` empty paragraphs remain
+    // visible; the rest are hidden so the content delegate skips them.
+    absorbInterBlockGaps(
+      blocks: document.blocks,
       nsText: nsText,
       textLength: textLength,
-      accumulator: &accumulator
+      hiddenIndexes: &accumulator.hiddenIndexes
     )
 
     return RenderSpec(
@@ -141,7 +149,7 @@ enum MarkdownRenderer {
       bulletIndexes: accumulator.bulletIndexes,
       uncheckedCheckboxIndexes: accumulator.uncheckedCheckboxIndexes,
       checkedCheckboxIndexes: accumulator.checkedCheckboxIndexes,
-      collapsedNewlineIndexes: accumulator.collapsedNewlineIndexes,
+      lineBreakIndexes: accumulator.lineBreakIndexes,
       temporaryAttributes: accumulator.temporaryAttributes,
       codeBlockCharacterRanges: accumulator.codeBlockCharacterRanges,
       blockquoteCharacterRanges: accumulator.blockquoteCharacterRanges
@@ -203,11 +211,21 @@ enum MarkdownRenderer {
 
     case .blockquote(let prefixRanges):
       let cursorInside = cursorOverlaps(cursorRange, node: safeRange, textLength: textLength)
+      // For the border decoration, treat a cursor that sits exactly at the
+      // end of the blockquote AND at the end of the document as "outside":
+      // the user is past the blockquote, and the lazy continuation case
+      // (whose AST blockquote span runs all the way to EOF) would otherwise
+      // never get a border drawn.
+      let cursorAtDocEnd =
+        cursorRange.length == 0
+        && cursorRange.location == textLength
+        && cursorRange.location == safeRange.location + safeRange.length
+      let cursorInsideForBorder = cursorInside && !cursorAtDocEnd
 
       var nextContext = context
       nextContext.foregroundColor = .secondaryLabelColor
 
-      if !cursorInside {
+      if !cursorInsideForBorder {
         accumulator.blockquoteCharacterRanges.append(
           RenderSpec.BlockquoteDecoration(
             range: safeRange,
@@ -263,13 +281,6 @@ enum MarkdownRenderer {
         )
       }
 
-      collapseInterBlockBlankLines(
-        between: block.children,
-        nsText: nsText,
-        textLength: textLength,
-        accumulator: &accumulator
-      )
-
     case .unorderedList, .orderedList:
       for (i, child) in block.children.enumerated() {
         renderBlock(
@@ -283,13 +294,6 @@ enum MarkdownRenderer {
           previousSiblingKind: i > 0 ? block.children[i - 1].kind : nil
         )
       }
-
-      collapseInterBlockBlankLines(
-        between: block.children,
-        nsText: nsText,
-        textLength: textLength,
-        accumulator: &accumulator
-      )
 
     case .listItem(let syntax):
       renderListItem(
@@ -659,10 +663,16 @@ enum MarkdownRenderer {
     }
 
     let styledRange = listStyledRange(for: block, lineStart: lineStart)
+    // When this list item has a soft-broken continuation line, the marker
+    // line must have zero trailing paragraph spacing so the continuation
+    // sits flush below it. Trailing spacing for the whole item then comes
+    // from the continuation-line paragraph style applied below.
+    let hasSoftBreakInItem =
+      !softBreakOffsets(within: styledRange, accumulator: accumulator).isEmpty
     let paragraphStyle = NSMutableParagraphStyle()
     paragraphStyle.firstLineHeadIndent = firstLineIndent
     paragraphStyle.headIndent = contentIndent
-    paragraphStyle.paragraphSpacing = style.listItemSpacing
+    paragraphStyle.paragraphSpacing = hasSoftBreakInItem ? 0 : style.listItemSpacing
     paragraphStyle.lineHeightMultiple = style.lineHeightMultiple
 
     accumulator.styledRanges.append(
@@ -791,13 +801,6 @@ enum MarkdownRenderer {
         )
       }
     }
-
-    collapseInterBlockBlankLines(
-      between: block.children,
-      nsText: nsText,
-      textLength: textLength,
-      accumulator: &accumulator
-    )
   }
 
   // MARK: - Inline Rendering
@@ -870,8 +873,75 @@ enum MarkdownRenderer {
     style: MarkdownStyle = .default,
     accumulator: inout RenderAccumulator
   ) {
+    // Soft / hard breaks (`SoftBreak` / `LineBreak` AST nodes) live as
+    // mid-paragraph `\n`s in the source. TK2 splits source on `\n` regardless,
+    // so the AST paragraph becomes multiple `NSTextParagraph` elements. To
+    // make them render as one visual paragraph (no inter-paragraph gap)
+    // while keeping 1:1 element ↔ source-paragraph correspondence (so cursor
+    // navigation works), we emit one StyledRange per sub-segment with
+    // `paragraphSpacing = 0` between segments.
+    let breakOffsets = softBreakOffsets(within: range, accumulator: accumulator)
+
+    if breakOffsets.isEmpty {
+      appendParagraphStyleSegment(
+        range: range, context: context, font: font, color: color,
+        paragraphSpacingBefore: paragraphSpacingBefore,
+        paragraphSpacing: paragraphSpacing,
+        style: style, accumulator: &accumulator)
+      return
+    }
+
+    var segmentStart = range.location
+    let rangeEnd = range.location + range.length
+    for (i, breakOffset) in breakOffsets.enumerated() {
+      // The `\n` belongs to the segment ending here.
+      let segmentEnd = breakOffset + 1
+      let segmentRange = NSRange(
+        location: segmentStart, length: segmentEnd - segmentStart)
+      appendParagraphStyleSegment(
+        range: segmentRange, context: context, font: font, color: color,
+        paragraphSpacingBefore: i == 0 ? paragraphSpacingBefore : 0,
+        paragraphSpacing: 0,
+        style: style, accumulator: &accumulator)
+      segmentStart = segmentEnd
+    }
+    if segmentStart < rangeEnd {
+      let finalRange = NSRange(
+        location: segmentStart, length: rangeEnd - segmentStart)
+      appendParagraphStyleSegment(
+        range: finalRange, context: context, font: font, color: color,
+        paragraphSpacingBefore: 0,
+        paragraphSpacing: paragraphSpacing,
+        style: style, accumulator: &accumulator)
+    }
+  }
+
+  private static func softBreakOffsets(
+    within range: NSRange, accumulator: RenderAccumulator
+  ) -> [Int] {
+    guard !accumulator.lineBreakIndexes.isEmpty, range.length > 0 else { return [] }
+    var offsets: [Int] = []
+    for i in range.location..<(range.location + range.length) {
+      if accumulator.lineBreakIndexes.contains(i) {
+        offsets.append(i)
+      }
+    }
+    return offsets
+  }
+
+  private static func appendParagraphStyleSegment(
+    range: NSRange,
+    context: BlockRenderContext,
+    font: NSFont,
+    color: NSColor,
+    paragraphSpacingBefore: CGFloat,
+    paragraphSpacing: CGFloat,
+    style: MarkdownStyle,
+    accumulator: inout RenderAccumulator
+  ) {
     let paragraphStyle = NSMutableParagraphStyle()
-    paragraphStyle.firstLineHeadIndent = context.visibleQuoteWidth > 0 ? context.quoteAlignIndent : context.hiddenIndent
+    paragraphStyle.firstLineHeadIndent =
+      context.visibleQuoteWidth > 0 ? context.quoteAlignIndent : context.hiddenIndent
     paragraphStyle.headIndent = context.hiddenIndent + context.visibleQuoteWidth
     paragraphStyle.paragraphSpacingBefore = paragraphSpacingBefore
     paragraphStyle.paragraphSpacing = paragraphSpacing
@@ -1129,6 +1199,108 @@ enum MarkdownRenderer {
         attributes: [.kern: gtKernOverride]))
   }
 
+  /// Walk inter-block gaps recursively. For each gap of `N` `\n`s, hide
+  /// `max(0, N - 1 - max(0, N/2 - 1))` source paragraphs so only
+  /// `max(0, N/2 - 1)` "blank" paragraphs remain in the displayed
+  /// enumeration — implementing the AGENTS.md rule that every two source
+  /// `\n`s produce one paragraph break.
+  private static func absorbInterBlockGaps(
+    blocks: [MarkdownBlock],
+    nsText: NSString,
+    textLength: Int,
+    hiddenIndexes: inout IndexSet
+  ) {
+    for i in 0..<blocks.count {
+      // Gap between this block and the next sibling.
+      if i + 1 < blocks.count {
+        let prevEnd = blocks[i].range.location + blocks[i].range.length
+        let nextStart = blocks[i + 1].range.location
+        if nextStart > prevEnd {
+          absorbGap(
+            startOffset: prevEnd,
+            endOffset: nextStart,
+            nsText: nsText,
+            textLength: textLength,
+            hiddenIndexes: &hiddenIndexes
+          )
+        }
+      }
+      // Recurse into children (blockquote, lists, list items).
+      if !blocks[i].children.isEmpty {
+        absorbInterBlockGaps(
+          blocks: blocks[i].children,
+          nsText: nsText,
+          textLength: textLength,
+          hiddenIndexes: &hiddenIndexes
+        )
+      }
+    }
+  }
+
+  /// Hide source bytes inside the inter-block gap `[startOffset, endOffset)`
+  /// so the displayed enumeration shows the right number of empty
+  /// paragraphs. The gap's *first* `\n` (when present) is the preceding
+  /// block's paragraph separator and is left alone — only the additional
+  /// `\n`-only source paragraphs are candidates for absorption.
+  private static func absorbGap(
+    startOffset: Int,
+    endOffset: Int,
+    nsText: NSString,
+    textLength: Int,
+    hiddenIndexes: inout IndexSet
+  ) {
+    let safeEnd = min(endOffset, textLength)
+    guard safeEnd > startOffset else { return }
+
+    // Walk gap `\n`s. The first one (if startOffset is on a `\n`) is the
+    // preceding block's paragraph separator, owned by the block's TK source
+    // paragraph; skip it. Each subsequent `\n` is a one-character empty
+    // source paragraph that is a candidate for absorption.
+    var pos = startOffset
+    var sawSeparator = false
+    var blankParagraphs: [NSRange] = []
+    while pos < safeEnd {
+      let ch = nsText.character(at: pos)
+      if ch == UInt16(0x000A) {
+        if sawSeparator {
+          blankParagraphs.append(NSRange(location: pos, length: 1))
+        } else {
+          sawSeparator = true
+        }
+        pos += 1
+      } else {
+        // Non-blank content in the gap (rare; e.g. blockquote prefix-only
+        // line preceding a nested block). Skip to the next line.
+        while pos < safeEnd, nsText.character(at: pos) != UInt16(0x000A) {
+          pos += 1
+        }
+        if pos < safeEnd { pos += 1 }
+      }
+    }
+
+    // Per AGENTS.md goal #1: every two source `\n`s after the first pair
+    // produces one new visible empty paragraph. The first pair is the
+    // paragraph break itself (rendered as the natural inter-paragraph gap,
+    // 0 visible empties). Each additional pair of `\n`s adds one empty
+    // paragraph; an odd orphan `\n` is absorbed (added to hiddenIndexes)
+    // so it doesn't bump the count by half a paragraph.
+    //
+    //   N (\n in gap, inclusive of separator)  →  visibleEmpties
+    //                                       2  →  0
+    //                                    3, 4  →  1
+    //                                    5, 6  →  2
+    //                                    7, 8  →  3
+    //                                          ⋮
+    let gapNewlines = blankParagraphs.count
+    let totalNewlines = gapNewlines + (sawSeparator ? 1 : 0)
+    let visibleEmpties = max(0, totalNewlines / 2 - 1)
+    let toAbsorb = max(0, gapNewlines - visibleEmpties)
+
+    for paragraph in blankParagraphs.prefix(toAbsorb) {
+      hiddenIndexes.insert(integersIn: paragraph.location..<(paragraph.location + paragraph.length))
+    }
+  }
+
   private static func skipQuotePrefixes(in nsText: NSString, from start: Int, limit: Int) -> Int {
     var pos = start
     while pos < limit {
@@ -1225,74 +1397,6 @@ enum MarkdownRenderer {
     let safeRange = clamp(range, to: textLength)
     guard safeRange.length > 0 else { return 0 }
     return style.textWidth(nsText.substring(with: safeRange))
-  }
-
-  // MARK: - Blank Line Collapsing
-
-  /// Collapse the first blank line in gaps between sibling blocks so that
-  /// `\n\n` paragraph separators render identically to the old single-`\n` behavior.
-  /// Subsequent blank lines in the same gap remain visible, preserving the user's
-  /// ability to create intentional visual space.
-  private static func collapseInterBlockBlankLines(
-    between blocks: [MarkdownBlock],
-    nsText: NSString,
-    textLength: Int,
-    accumulator: inout RenderAccumulator
-  ) {
-    guard blocks.count >= 2 else { return }
-
-    for i in 1..<blocks.count {
-      let prevEnd = blocks[i - 1].range.location + blocks[i - 1].range.length
-      let nextStart = blocks[i].range.location
-
-      guard nextStart > prevEnd else { continue }
-
-      collapseFirstBlankLine(
-        in: NSRange(location: prevEnd, length: nextStart - prevEnd),
-        nsText: nsText,
-        textLength: textLength,
-        accumulator: &accumulator
-      )
-    }
-  }
-
-  /// Find the first blank line (only whitespace and `>` markers) in the given range
-  /// and mark its characters as collapsed newlines so the glyph delegate sets them to
-  /// `.null`, causing the line fragment to collapse to zero height.
-  private static func collapseFirstBlankLine(
-    in range: NSRange,
-    nsText: NSString,
-    textLength: Int,
-    accumulator: inout RenderAccumulator
-  ) {
-    let end = min(range.location + range.length, textLength)
-    var pos = range.location
-
-    while pos < end {
-      let lineRange = nsText.lineRange(for: NSRange(location: pos, length: 0))
-
-      // Only consider lines that start at or after the gap start.
-      // Lines extending before the gap are content lines, not blank lines.
-      if lineRange.location >= range.location && lineRange.length > 0 {
-        let lineText = nsText.substring(with: lineRange)
-        let stripped = lineText
-          .replacingOccurrences(of: ">", with: "")
-          .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if stripped.isEmpty {
-          // Blank line — mark all characters as collapsed so the line fragment
-          // has no visible glyphs and collapses to zero height.
-          for i in lineRange.location..<(lineRange.location + lineRange.length) {
-            accumulator.collapsedNewlineIndexes.insert(i)
-          }
-          return  // Only collapse the first blank line in each gap.
-        }
-      }
-
-      let nextPos = lineRange.location + lineRange.length
-      if nextPos <= pos { break }
-      pos = nextPos
-    }
   }
 
   static func cursorOverlaps(

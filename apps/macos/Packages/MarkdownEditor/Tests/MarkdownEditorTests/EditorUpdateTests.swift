@@ -54,10 +54,14 @@ struct EditorUpdateTests {
 
   @Test("Insert newline into empty document")
   func insertNewlineEmpty() {
+    // Per the snap-to-even-trailing-`\n` Enter policy: empty doc has 0
+    // trailing `\n` (even), so Enter inserts `\n\n` (paragraph break) — the
+    // user lands at the start of a fresh paragraph. Soft-break-only behavior
+    // is reachable via Shift+Enter.
     let state = EditorState()
     let result = EditorUpdate.update(state, event: .insertNewline)
-    #expect(result.markdown == "\n")
-    #expect(result.selection == .cursor(1))
+    #expect(result.markdown == "\n\n")
+    #expect(result.selection == .cursor(2))
   }
 
   @Test("Insert newline at end of text")

@@ -4,6 +4,12 @@ import AppKit
 struct MarkdownDocument {
   let blocks: [MarkdownBlock]
   let inlineNodes: [InlineSyntaxNode]
+  /// Source-character offsets of `\n` characters that originate from
+  /// `SoftBreak` / `LineBreak` AST nodes inside a single Paragraph. The
+  /// renderer marks these for display-time substitution with `U+2028 LINE
+  /// SEPARATOR` so TextKit treats them as in-paragraph line breaks rather
+  /// than paragraph boundaries.
+  let lineBreakIndexes: IndexSet
 }
 
 /// A block-level markdown construct.
