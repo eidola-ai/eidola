@@ -1,16 +1,17 @@
 import AppKit
 
-/// Phase 1 of the TextKit 2 migration: applies the subset of `RenderSpec` that
-/// requires no custom layout manager, no glyph hiding, no custom fragments, and
-/// no rendering attributes. Equivalent to `RenderApplicator` for body-text-only
-/// rendering.
+/// TextKit 2 renderer-side effect surface. Mirrors `RenderApplicator` for the
+/// TK2 path; consumes a `RenderSpec` and writes it through three subsystems:
 ///
-/// Deferred features (each marked TODO Phase N inline):
-/// - Phase 2 (NSTextContentStorage delegate): hiddenIndexes, bulletIndexes,
-///   uncheckedCheckboxIndexes, checkedCheckboxIndexes, collapsedNewlineIndexes
-/// - Phase 3 (custom NSTextLayoutFragment subclasses): codeBlockCharacterRanges,
-///   blockquoteCharacterRanges
-/// - Phase 4 (NSTextLayoutManager.setRenderingAttributes): temporaryAttributes
+/// - Text-storage attributes (base + styled ranges + font traits) — same as
+///   TK1, modifies `NSTextStorage` directly.
+/// - Content-storage delegate (`TextKit2ContentStorageDelegate`) — receives
+///   the hide / bullet / checkbox index sets and rebuilds display paragraphs.
+/// - Layout-manager delegate (`TextKit2LayoutManagerDelegate`) — receives the
+///   code-block / blockquote decoration ranges and vends configured
+///   `TextKit2LayoutFragment` instances.
+/// - Layout-manager rendering attributes (`setRenderingAttributes(_:for:)`)
+///   — receives `temporaryAttributes` for cursor-driven delimiter coloring.
 @MainActor
 enum TextKit2RenderApplicator {
 
@@ -91,19 +92,39 @@ enum TextKit2RenderApplicator {
       clipView.setBoundsOrigin(origin)
     }
 
-    // TODO Phase 4: apply spec.temporaryAttributes via
-    // NSTextLayoutManager.setRenderingAttributes(_:for:) — the cursor-driven
-    // delimiter coloring path. Spike 3 confirmed the imperative setter is the
-    // correct API on AppKit (the validator closure is one-shot per fragment).
+    // Phase 4: apply rendering-only attributes (delimiter dimming when the
+    // cursor is inside a markdown construct). Spike 3 found that AppKit's
+    // `renderingAttributesValidator` closure is one-shot per fragment and
+    // selection changes do not refire it; the imperative
+    // `setRenderingAttributes(_:for:)` driven from this path is the correct
+    // replacement for TK1's `addTemporaryAttributes`.
+    //
+    // We clear `.foregroundColor` over the whole document first so attrs from
+    // a prior render whose ranges are no longer in the spec don't linger.
+    // (`setRenderingAttributes` overwrites within the new range only.)
+    if let tlm = textView.textLayoutManager,
+      let storage = textView.textContentStorage
+    {
+      tlm.removeRenderingAttribute(.foregroundColor, for: tlm.documentRange)
+      for tempAttr in spec.temporaryAttributes {
+        guard
+          let location = storage.location(
+            storage.documentRange.location, offsetBy: tempAttr.range.location),
+          let end = storage.location(location, offsetBy: tempAttr.range.length),
+          let textRange = NSTextRange(location: location, end: end)
+        else { continue }
+        tlm.setRenderingAttributes(tempAttr.attributes, for: textRange)
+      }
+    }
   }
 
-  /// Cursor-only update. The TK1 applicator avoids re-touching all attributes
-  /// on cursor moves because temporary attributes set on the layout manager
-  /// must survive the update. The TK2 path doesn't have that constraint until
-  /// Phase 4 introduces rendering attributes, so for now we re-run the full
-  /// `apply` to refresh the delegate state and trigger paragraph rebuild.
-  /// Phase 4 will optimize this to invalidate only the changed paragraphs
-  /// and update rendering attributes incrementally.
+  /// Cursor-only update. Re-runs the full `apply` so that index sets, fragment
+  /// configuration, and rendering attributes all refresh together. The TK1
+  /// applicator splits this path for performance (avoid full attribute reset
+  /// on every cursor move), but on TK2 the full path is cheap enough — Spike 3
+  /// measured ~62µs per cursor move with imperative rendering-attribute writes,
+  /// well under a frame. A future optimization could narrow rebuild to only
+  /// paragraphs whose hidden / temp-attr state changed; not warranted yet.
   static func applyCursorUpdate(
     _ spec: RenderSpec,
     previousHidden: IndexSet,
