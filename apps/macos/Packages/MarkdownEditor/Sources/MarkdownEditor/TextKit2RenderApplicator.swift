@@ -109,6 +109,34 @@ enum TextKit2RenderApplicator {
           "after_length": postInvalidateSel.length,
         ])
       }
+
+      // Force eager full-document layout so every fragment reaches
+      // `.layoutAvailable` before any subsequent user interaction. TK2's
+      // lazy layout otherwise leaves off-viewport paragraphs at
+      // `.estimatedUsageBounds`, where their height is a coarse font-metric
+      // estimate. When a cursor-driven interaction (click, arrow-key
+      // scroll-to-cursor, word/line jump) later forces layout for those
+      // fragments, the realized heights replace the estimates and
+      // `usageBoundsForTextContainer.height` snaps to the new value. The
+      // enclosing `NSScrollView` reads that as a document-size change and
+      // jumps the scroller thumb — the user-visible "scrollbar jump" bug.
+      //
+      // Cost: bounded by document size. Markdown documents the editor
+      // handles are small enough (kilobytes, not megabytes) that the
+      // full-document layout is well under one frame and not noticeable.
+      // If a future use-case needs streaming-render of long-form content,
+      // narrow this to "only the laid-out region plus a buffer" — but
+      // every cursor move already runs `apply` so the cost has to stay
+      // proportional to viewport, not document.
+      let preBoundsHeight = tlm.usageBoundsForTextContainer.height
+      tlm.ensureLayout(for: tlm.documentRange)
+      let postBoundsHeight = tlm.usageBoundsForTextContainer.height
+      if abs(postBoundsHeight - preBoundsHeight) > 0.5 {
+        DebugTrace.log("apply.ensureLayout.bounds_changed", [
+          "before_height": preBoundsHeight,
+          "after_height": postBoundsHeight,
+        ])
+      }
     }
 
     if let origin = savedOrigin, let clipView {
