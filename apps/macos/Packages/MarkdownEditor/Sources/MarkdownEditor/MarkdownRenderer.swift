@@ -315,13 +315,30 @@ enum MarkdownRenderer {
       let boxOrigin = context.hiddenIndent + context.visibleQuoteWidth
       let paragraphRange = nsText.lineRange(for: safeRange)
 
+      // TK2 splits the code block on `\n` into one fragment per source line.
+      // Each fragment inherits this paragraph style, so any non-zero
+      // `paragraphSpacing` / `paragraphSpacingBefore` produces a visible gap
+      // between adjacent content fragments — the per-fragment background
+      // fill stops at the fragment frame, leaving the inter-paragraph gap
+      // uncovered and visually breaking the code block into bands.
+      //
+      // Keep inter-content spacing at 0 so content fragments are flush. The
+      // outer spacing (above the opening fence, below the closing fence) is
+      // supplied by the fence-line paragraph styles applied below; the small
+      // fence↔content gap is set by `codeFenceSpacing` on the fence sides.
       let paragraphStyle = NSMutableParagraphStyle()
       paragraphStyle.firstLineHeadIndent = insideQuote ? context.quoteAlignIndent : textOrigin
       paragraphStyle.headIndent = textOrigin
       paragraphStyle.tailIndent = -12
-      paragraphStyle.paragraphSpacing = style.codeBlockSpacing
-      paragraphStyle.paragraphSpacingBefore = style.codeBlockSpacing
+      paragraphStyle.paragraphSpacing = 0
+      paragraphStyle.paragraphSpacingBefore = 0
       paragraphStyle.lineHeightMultiple = style.lineHeightMultiple
+      // Phase 1 of the no-wrap code-block feature: clip long lines at the
+      // container edge instead of wrapping them. The fence-line paragraph
+      // styles below intentionally keep their default wrapping behavior
+      // because fences themselves never get long; the visible horizontal-
+      // scroll path will arrive in Phase 2 via NSTextAttachmentViewProvider.
+      paragraphStyle.lineBreakMode = .byClipping
 
       accumulator.styledRanges.append(
         RenderSpec.StyledRange(

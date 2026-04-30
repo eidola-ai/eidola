@@ -144,6 +144,63 @@ struct CodeBlockRenderTests {
     #expect(codeStyled != nil, "Code block should have paragraph style with head indent")
   }
 
+  // MARK: - No-wrap (Phase 1)
+
+  @Test("Code block content paragraph style uses .byClipping line break mode")
+  func codeBlockContentLineBreakModeIsClipping() {
+    // The content paragraph style is the one applied to the inter-fence
+    // line range and identifiable by tailIndent == -12 + paragraphSpacing == 0.
+    // Fence-line paragraph styles use the codeFenceFont and their paragraph
+    // spacing differs, so we filter them out by checking paragraphSpacing.
+    let text = "```\nlet x = 42\nlet y = 7\n```"
+    let cursorRange = NSRange(location: 0, length: 0)
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+
+    let contentStyles = spec.styledRanges.compactMap { range -> NSParagraphStyle? in
+      guard let ps = range.attributes[.paragraphStyle] as? NSParagraphStyle else { return nil }
+      // Code-block content paragraph style: tailIndent -12, both paragraph
+      // spacings 0 (so adjacent content fragments stay flush).
+      guard ps.tailIndent == -12,
+        ps.paragraphSpacing == 0,
+        ps.paragraphSpacingBefore == 0
+      else { return nil }
+      return ps
+    }
+    #expect(!contentStyles.isEmpty, "Should find at least one code-block content paragraph style")
+    for ps in contentStyles {
+      #expect(
+        ps.lineBreakMode == .byClipping,
+        "Code-block content paragraph style must use .byClipping so long lines clip at the container edge instead of wrapping (Phase 1 of the no-wrap feature)")
+    }
+  }
+
+  @Test("Code block fence paragraph styles keep default wrapping behavior")
+  func codeBlockFenceLineBreakModeIsNotClipping() {
+    // Fence-line paragraph styles are identifiable by codeBlockSpacing on
+    // the outer side (paragraphSpacingBefore for opening, paragraphSpacing
+    // for closing) and codeFenceSpacing on the inner side. Either way they
+    // have a non-zero paragraph spacing, distinguishing them from content.
+    let text = "```\nlet x = 42\n```"
+    let cursorRange = NSRange(location: 0, length: 0)
+    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+
+    let fenceStyles = spec.styledRanges.compactMap { range -> NSParagraphStyle? in
+      guard let ps = range.attributes[.paragraphStyle] as? NSParagraphStyle else { return nil }
+      // Fence-line paragraph styles: tailIndent -12 like content, but
+      // paragraphSpacing or paragraphSpacingBefore non-zero.
+      guard ps.tailIndent == -12,
+        ps.paragraphSpacing != 0 || ps.paragraphSpacingBefore != 0
+      else { return nil }
+      return ps
+    }
+    #expect(!fenceStyles.isEmpty, "Should find fence-line paragraph styles")
+    for ps in fenceStyles {
+      #expect(
+        ps.lineBreakMode != .byClipping,
+        "Fence-line paragraph style should keep default wrapping behavior (fences themselves never get long, and clipping them would be visually surprising)")
+    }
+  }
+
   // MARK: - Code block with language hint
 
   @Test("Code block with language hint: fences hidden when cursor outside")
