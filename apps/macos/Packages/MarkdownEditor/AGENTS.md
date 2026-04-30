@@ -318,6 +318,42 @@ cleanly, no drift correction is needed, and the per-paragraph
 display→source maps were removed from the hit-test and word-navigation
 paths. See `TextKit2ContentStorageDelegate` for the substitution rules.
 
+### Scrollbar-jump-after-cursor-move bug — fixed (2026-04)
+
+User-reported bug: load a long markdown document, scroll away from the
+top, then click somewhere or press up/down arrows or word/line-jump
+shortcuts (Option/Cmd + arrows). The scrollbar thumb jumps and sometimes
+changes height — as if the document's overall height just changed. Plain
+left/right arrows DON'T trigger the jump.
+
+Root cause: TK2 lays out paragraphs lazily. Off-viewport paragraphs sit
+at `NSTextLayoutFragment.State.estimatedUsageBounds`, where height is a
+coarse font-metric estimate. The applicator's `apply` only called
+`invalidateLayout(for: documentRange)` — invalidating the cache without
+forcing a relayout, so `usageBoundsForTextContainer.height` was effectively
+still the laid-out region's height plus estimates for everything else.
+When a cursor-driven interaction (click → hit-test, arrow → scroll-to-cursor,
+word jump → ditto) later forced layout for newly-targeted paragraphs,
+their realized heights replaced the estimates, the bounds height snapped
+to the new value, and `NSScrollView` updated the scroller thumb in
+response — visible as a "jump." Plain L/R arrows didn't jump because they
+operate within already-laid-out fragments and never expose the gap. The
+gap measured >2400 pt for a 60-paragraph document with a 200pt viewport;
+see `Tests/.../ScrollbarStabilityTests.swift:usage_bounds_stable_after_initial_apply`
+for the smoking-gun assertion.
+
+Fix: append `tlm.ensureLayout(for: tlm.documentRange)` to
+`TextKit2RenderApplicator.apply` immediately after the existing
+`invalidateLayout`. This forces every fragment to `.layoutAvailable`
+before any subsequent interaction can expose the estimation gap, so
+bounds are stable from the very first render. Cost is bounded by document
+size; for the markdown documents this editor handles (kilobytes) it stays
+well under one frame (P95 cursor-move cost <16ms on a 60-paragraph doc).
+If a future use-case streams long-form content where this becomes too
+expensive, narrow the ensureLayout to a viewport-plus-buffer region —
+but bear in mind every cursor move already runs `apply`, so the cost has
+to stay proportional to viewport, not document.
+
 ## Supported Constructs
 
 | Construct | Parser | Renderer | Keyboard | Tests |
