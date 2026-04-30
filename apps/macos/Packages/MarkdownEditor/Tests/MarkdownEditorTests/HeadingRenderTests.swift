@@ -75,13 +75,20 @@ struct HeadingCursorOverlapTests {
 
   @Test("Cursor at end of heading line before newline with body paragraph")
   func cursorAtEndOfHeadingBeforeNewlineWithBody() {
-    // Same bug but with a blank line separator (common markdown pattern)
+    // Same bug but with a blank line separator (common markdown pattern).
+    // The heading delimiter (`# ` at offsets 0..1) must NOT be in
+    // hiddenIndexes when the cursor is on the heading line — it should be
+    // dimmed via temporaryAttributes instead. (Note: under the per-pair
+    // newline absorption rule the gap `\n` between blocks may itself be
+    // absorbed into hiddenIndexes; that's expected and unrelated to the
+    // delimiter-visibility concern this test pins.)
     let text = "# Hello\n\nBody text"
     let cursorRange = NSRange(location: 7, length: 0)
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
+    let delimiterRange = IndexSet(integersIn: 0..<2)
     #expect(
-      spec.hiddenIndexes.isEmpty,
+      spec.hiddenIndexes.intersection(delimiterRange).isEmpty,
       "Heading delimiter should be visible at end of heading before \\n even with blank line after")
     #expect(!spec.temporaryAttributes.isEmpty)
   }

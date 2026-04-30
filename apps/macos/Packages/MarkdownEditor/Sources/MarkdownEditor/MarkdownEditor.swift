@@ -341,20 +341,11 @@ public struct MarkdownEditor: NSViewRepresentable {
         }
       }
 
-      // Normalize soft line breaks in pasted/imported text.
-      // Return key is handled by doCommandBy (which returns true, preventing
-      // this method from being called), so \n here comes from paste, drag-drop,
-      // or other multi-character input — not from user pressing Return.
-      if let text = replacementString, text.contains("\n"), text.count > 1 {
-        let normalized = EditorUpdate.normalizeSoftLineBreaks(in: text)
-        if normalized != text {
-          processEvent(.paste(normalized), textView: textView)
-          return false
-        }
-      }
-
       // Allow NSTextView to handle the edit natively.
       // textDidChange will sync state and re-render attributes.
+      // Pasted hard-wrapped paragraphs preserve their source `\n`s; the
+      // content-storage delegate substitutes soft-break newlines with
+      // U+2028 LINE SEPARATOR at display time so wrapping looks correct.
       return true
     }
 
@@ -425,12 +416,12 @@ public struct MarkdownEditor: NSViewRepresentable {
       let prevBullets = lastSpec?.bulletIndexes ?? IndexSet()
       let prevUncheckedCheckboxes = lastSpec?.uncheckedCheckboxIndexes ?? IndexSet()
       let prevCheckedCheckboxes = lastSpec?.checkedCheckboxIndexes ?? IndexSet()
-      let prevCollapsedNewlines = lastSpec?.collapsedNewlineIndexes ?? IndexSet()
+      let prevLineBreaks = lastSpec?.lineBreakIndexes ?? IndexSet()
       TextKit2RenderApplicator.applyCursorUpdate(
         spec, previousHidden: prevHidden, previousBullets: prevBullets,
         previousUncheckedCheckboxes: prevUncheckedCheckboxes,
         previousCheckedCheckboxes: prevCheckedCheckboxes,
-        previousCollapsedNewlines: prevCollapsedNewlines, to: textView)
+        previousLineBreaks: prevLineBreaks, to: textView)
       lastSpec = spec
       isProcessingEvent = false
     }

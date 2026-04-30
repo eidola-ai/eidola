@@ -86,8 +86,10 @@ struct LineBreakVisualTests {
 
   // MARK: - Shift+Return outside list
 
-  @Test("Shift+Return outside list is paragraph break visual")
+  @Test("Shift+Return outside list is a soft break visual")
   func shiftReturnOutsideListVisual() {
+    // Hybrid newline policy: Shift+Enter inserts `\n` (soft break, in-paragraph
+    // line break visual), Enter inserts `\n\n` (paragraph break with gap).
     var events: [EditorEvent] = []
     for c in "Hello" { events.append(.insertText(String(c))) }
     events.append(.insertLineBreak)
@@ -100,7 +102,7 @@ struct LineBreakVisualTests {
       size: NSSize(width: 600, height: 200))
 
     let finalState = results.last!.state
-    #expect(finalState.markdown == "Hello\n\nWorld")
+    #expect(finalState.markdown == "Hello\nWorld")
 
     let fm = FileManager.default
     for r in results {

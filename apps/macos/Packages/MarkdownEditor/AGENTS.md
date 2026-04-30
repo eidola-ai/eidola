@@ -1,5 +1,30 @@
 # MarkdownEditor — Agent Development Guide
 
+## Foundational Goals
+
+These are the load-bearing commitments of the editor. Every behavior, rule, and design choice below should be evaluated against these. When in doubt, return here.
+
+### 1. Valid, compliant markdown
+
+- Everything produced by the editor MUST be valid markdown, and MUST be rendered correctly according to the CommonMark spec unless explicitly noted in an exception.
+- The editor MAY choose to normalize the markdown representation of features. Normalizations SHOULD be applied to the content regardless of input type (manual editing, paste, etc.) unless otherwise noted in an exception.
+- **Exceptions:**
+  - The CommonMark spec collapses any number of consecutive newlines into a single paragraph break. The editor MUST treat every two newlines as a new "empty" paragraph to allow user-controlled visual separation while editing.
+  - The editor MAY opt into rendering behavior that is not compliant or normalized **only when** doing so is necessary for a smooth editing experience **and** the non-compliant behavior is conditional on cursor position during active editing. For example, a `-` at the start of a new line might display literally while followed by the cursor, rather than immediately being normalized from a setext heading into an ATX heading.
+
+### 2. A single editable document
+
+- The editing flow MUST treat the editable value as a single document where selections can cross spans and blocks.
+- A user should be able to "think" in markdown and interact with it accordingly:
+  - Invisible characters MUST be handled thoughtfully based on cursor position.
+  - Selected content SHOULD expose its raw markdown when appropriate.
+  - Jitters and changes in line height MUST be minimized.
+
+### 3. Block composability
+
+- Non-leaf block components (lists of all types, blockquotes) MUST be nestable. It MUST be possible to nest arbitrary depths and combinations of these.
+- Leaf block components (code blocks, math) MUST avoid all markdown normalization and custom editor behavior within their contents.
+
 ## Target Behavior
 
 This editor aims to match the inline WYSIWYG behavior of **Obsidian** and **Milkdown**. The core UX principle:
@@ -10,7 +35,7 @@ This editor aims to match the inline WYSIWYG behavior of **Obsidian** and **Milk
 
 1. **Delimiters hide when the cursor is outside the construct.** For example, `# ` before a heading disappears — the user sees only the large-font heading text. `**` around bold text disappears — the user sees bold text without asterisks.
 
-2. **Delimiters reveal when the cursor enters the construct.** When the cursor moves into a heading line, the `# ` prefix reappears (dimmed) so the user can edit or delete it. Same for `**`, `` ` ``, `[](url)`, etc.
+2. **Delimiters reveal when the cursor — or an active selection — enters the construct.** When the cursor moves into (or a selection range overlaps) a heading line, the `# ` prefix reappears (dimmed) so the user can see, edit, delete, or copy the raw markdown source. Same for `**`, `` ` ``, `[](url)`, etc.
 
 3. **Formatting applies to content, not delimiters (except paragraph style).** The heading text is large/bold. The `# ` prefix, when visible, is shown in a dimmed color but at the heading's font size — it shares the heading line's paragraph style so there is no jarring size mismatch within the line.
 
@@ -116,6 +141,12 @@ EditorState + EditorEvent  →  EditorUpdate.update()  →  new EditorState
 - **Leading whitespace in nested list items is always hidden** — paragraph style controls indentation, not source spaces.
 - **Continuation line whitespace is always hidden** — same reason.
 - **The `.controlCharacter` glyph property** (not `.null`) is used for the first hidden character at paragraph boundaries to preserve paragraph spacing calculations.
+
+### Architecture Lessons (don't relearn the hard way)
+
+- **Trust TK2's element model; manipulate spacing, not display merging.** TK2's cursor navigation, hit-testing, and selection enumeration all operate on `NSTextElement` ranges, which are 1:1 with source-`\n`-bounded paragraphs. Any approach that tries to coalesce multiple source paragraphs into one displayed paragraph (e.g., substituting `\n` with `U+2028 LINE SEPARATOR` and returning a single merged `NSTextParagraph`) breaks navigation: absorbed elements become "non-represented", the cursor can't enter their content, and right-arrow jumps over their characters entirely. The fix for soft / hard line breaks is per-paragraph spacing (each source paragraph keeps its own element with `paragraphSpacing = 0` between soft-break-coupled segments). The U+2028 trick looks great on paper — and the discovery / articulation phases recommended it — but burned ~70 minutes of agent iteration before the fundamental clash with TK2's element model surfaced. Don't revisit unless TK2 grows an API for source-vs-display element coalescing.
+- **Soft / hard breaks are an `NSAttributedString.paragraphStyle` problem, not an `NSTextContentStorageDelegate` substitution problem.** The renderer's `applyParagraphStyle` (and the list-item style in `renderListItem`) split styled ranges at each soft-break `\n` and apply `paragraphSpacing = 0` to non-final segments and `paragraphSpacingBefore = 0` to non-first segments. The content delegate stays simple (just hide / bullet / checkbox substitution) and ignores `lineBreakIndexes` entirely — it's a renderer-side concern.
+- **`NSTextContentStorage.delegate` is `NSTextContentStorageDelegate?`, but its inherited `NSTextContentManager` has its own delegate slot of type `NSTextContentManagerDelegate?`.** They are sibling protocols, not inheritance. To use both delegate hooks (e.g., `textParagraphWith:` AND `shouldEnumerate:`), the same object must conform to both protocols and you must set both delegate properties — or rely on the storage subclass dispatching both hooks to its single `.delegate` (which it does in practice for our usage; verified empirically).
 
 ## Testing Harness
 
