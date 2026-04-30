@@ -810,6 +810,37 @@ enum EditorUpdate {
         }
       }
 
+      // Match ATX heading prefix: `#`, `##`, ..., `######` followed by a single
+      // space. parsePrefix doesn't classify `#` as a structural component
+      // because heading delimiters can't nest (unlike blockquotes / list
+      // markers), but for delete-as-a-unit purposes the rendered `# ` behaves
+      // identically: the user sees the heading text without the prefix when
+      // the cursor is outside, and a single backspace at the visual start of
+      // the heading text should demote the heading to a body paragraph in one
+      // step rather than silently deleting the hidden space first. Goal #2
+      // ("invisible characters MUST be handled thoughtfully") makes the
+      // whole-unit deletion the consistent choice across all delimiter-based
+      // constructs.
+      if posInLine > 0 {
+        let lineNS = lineText as NSString
+        var hashEnd = 0
+        while hashEnd < lineNS.length && lineNS.character(at: hashEnd) == 0x0023 /* # */ {
+          hashEnd += 1
+        }
+        if hashEnd >= 1 && hashEnd <= 6
+          && hashEnd < lineNS.length
+          && lineNS.character(at: hashEnd) == 0x0020 /* space */
+          && posInLine == hashEnd + 1
+        {
+          let markerAbsRange = NSRange(
+            location: lineRange.location,
+            length: hashEnd + 1)
+          let newMarkdown = nsMarkdown.replacingCharacters(in: markerAbsRange, with: "")
+          return EditorState(
+            markdown: newMarkdown, selection: .cursor(markerAbsRange.location))
+        }
+      }
+
       // Backspace deletes ONE character at a time even at a `\n\n` paragraph
       // boundary. Backing over a paragraph break removes one `\n`, leaving the
       // other as a soft break — the visual gap collapses to an in-paragraph
