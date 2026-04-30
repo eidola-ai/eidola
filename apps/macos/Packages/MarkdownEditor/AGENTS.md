@@ -81,7 +81,7 @@ EditorState + EditorEvent  →  EditorUpdate.update()  →  new EditorState
                                                               ↓
                                                     MarkdownRenderer.render()  →  RenderSpec
                                                               ↓
-                                                    RenderApplicator.apply()  →  NSTextView
+                                                    TextKit2RenderApplicator.apply()  →  NSTextView
 ```
 
 ### Core Types
@@ -93,7 +93,7 @@ EditorState + EditorEvent  →  EditorUpdate.update()  →  new EditorState
 | `EditorUpdate` | `EditorUpdate.swift` | Pure function: `update(state, event) -> state` + post-processing (ordinal renumbering, setext normalization) |
 | `MarkdownRenderer` | `MarkdownRenderer.swift` | Pure function: `render(state) -> RenderSpec` |
 | `RenderSpec` | `RenderSpec.swift` | Rendering instructions (attributes, hidden glyphs, bullet/checkbox indexes, code block ranges) |
-| `RenderApplicator` | `RenderApplicator.swift` | Imperative shell: applies RenderSpec to NSTextView |
+| `TextKit2RenderApplicator` | `TextKit2RenderApplicator.swift` | Imperative shell: applies RenderSpec to NSTextView via the TextKit 2 stack |
 
 ### Supporting Types
 
@@ -103,8 +103,10 @@ EditorState + EditorEvent  →  EditorUpdate.update()  →  new EditorState
 | `SyntaxNode` | `SyntaxNode.swift` | Parsed markdown construct with ranges and type |
 | `SourceRangeConverter` | `SourceRangeConverter.swift` | UTF-8 ↔ UTF-16 offset conversion |
 | `MarkdownStyle` | `MarkdownStyle.swift` | Theme: fonts, colors, paragraph styles for all constructs |
-| `GlyphHidingLayoutManagerDelegate` | `GlyphHidingLayoutManagerDelegate.swift` | NSLayoutManager delegate: glyph suppression (`.null`/`.controlCharacter`), bullet/checkbox substitution |
-| `CodeBlockBackgroundLayoutManager` | `CodeBlockBackgroundLayoutManager.swift` | NSLayoutManager subclass: draws full-width code block backgrounds |
+| `TextKit2ContentStorageDelegate` | `TextKit2ContentStorageDelegate.swift` | NSTextContentStorageDelegate: vends display paragraphs with hidden / bullet / checkbox / collapsed-newline substitutions |
+| `TextKit2LayoutManagerDelegate` | `TextKit2LayoutManagerDelegate.swift` | NSTextLayoutManagerDelegate: vends `TextKit2LayoutFragment` per paragraph with code-block / blockquote decoration data |
+| `TextKit2LayoutFragment` | `TextKit2LayoutFragment.swift` | NSTextLayoutFragment subclass: draws full-width code-block backgrounds and blockquote left borders |
+| `TextKit2MarkdownTextView` | `TextKit2MarkdownTextView.swift` | NSTextView subclass: hit-test intercept that maps clicks past hidden prefix characters |
 | `MarkdownEditor` | `MarkdownEditor.swift` | SwiftUI NSViewRepresentable shell (thin) |
 
 ### Key Principles
@@ -122,7 +124,7 @@ EditorState + EditorEvent  →  EditorUpdate.update()  →  new EditorState
 The harness accepts an initial `EditorState` and a sequence of `EditorEvent`s. After each event, it:
 
 1. Runs `EditorUpdate.update()` to get the new state
-2. Renders the state via `MarkdownRenderer` + `RenderApplicator`
+2. Renders the state via `MarkdownRenderer` + `TextKit2RenderApplicator`
 3. Captures a bitmap snapshot (PNG)
 4. Saves the image to `test-artifacts/<testName>/`
 5. Writes a `manifest.md` with state at each step
@@ -197,9 +199,9 @@ Update implementation, run tests, re-read images, iterate until correct.
 | Markdown parsing (new construct types) | `MarkdownParser.swift` + `SyntaxNode.swift` |
 | Visual styling (fonts, colors, spacing) | `MarkdownStyle.swift` |
 | Delimiter hiding/revealing logic | `MarkdownRenderer.swift` |
-| Glyph suppression/substitution | `GlyphHidingLayoutManagerDelegate.swift` |
-| Full-width background drawing | `CodeBlockBackgroundLayoutManager.swift` |
-| Attribute application to NSTextView | `RenderApplicator.swift` |
+| Glyph suppression/substitution | `TextKit2ContentStorageDelegate.swift` |
+| Full-width background drawing | `TextKit2LayoutFragment.swift` (vended by `TextKit2LayoutManagerDelegate.swift`) |
+| Attribute application to NSTextView | `TextKit2RenderApplicator.swift` |
 | Post-processing (renumbering, normalization) | `EditorUpdate.swift` |
 
 ### Build & Test
@@ -240,13 +242,15 @@ Sources/MarkdownEditor/
 ├── EditorUpdate.swift                     # Pure state transitions + post-processing
 ├── MarkdownRenderer.swift                 # Pure render function (state → RenderSpec)
 ├── RenderSpec.swift                       # Rendering specification
-├── RenderApplicator.swift                 # Applies spec to NSTextView
+├── TextKit2RenderApplicator.swift         # Applies spec to NSTextView (TextKit 2 stack)
 ├── MarkdownParser.swift                   # AST walker → [SyntaxNode]
 ├── SyntaxNode.swift                       # Parsed construct with ranges
 ├── SourceRangeConverter.swift             # UTF-8 ↔ UTF-16
 ├── MarkdownStyle.swift                    # Theme (fonts, colors, paragraph styles)
-├── GlyphHidingLayoutManagerDelegate.swift # Glyph suppression + bullet/checkbox substitution
-├── CodeBlockBackgroundLayoutManager.swift # Full-width code block backgrounds
+├── TextKit2ContentStorageDelegate.swift   # Display-paragraph substitution (hide / bullet / checkbox)
+├── TextKit2LayoutManagerDelegate.swift    # Vends TextKit2LayoutFragment per paragraph
+├── TextKit2LayoutFragment.swift           # Code-block backgrounds + blockquote borders
+├── TextKit2MarkdownTextView.swift         # Hit-test intercept for hidden-prefix translation
 └── MarkdownEditor.swift                   # SwiftUI NSViewRepresentable shell
 
 Sources/MarkdownEditorDemo/

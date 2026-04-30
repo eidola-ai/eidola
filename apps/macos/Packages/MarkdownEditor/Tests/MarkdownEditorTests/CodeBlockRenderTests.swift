@@ -31,7 +31,7 @@ struct CodeBlockRenderTests {
     let cursorRange = NSRange(location: 0, length: 0)
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    // Background is drawn by CodeBlockBackgroundLayoutManager using
+    // Background is drawn by TextKit2LayoutFragment using
     // codeBlockCharacterRanges, not via .backgroundColor on styled ranges.
     #expect(!spec.codeBlockCharacterRanges.isEmpty, "Code block should have character ranges for background drawing")
     #expect(

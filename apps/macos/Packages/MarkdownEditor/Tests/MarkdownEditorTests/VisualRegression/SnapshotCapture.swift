@@ -4,9 +4,9 @@ import AppKit
 
 /// Captures bitmap snapshots of markdown rendered into an NSTextView.
 ///
-/// Uses `NSLayoutManager.drawGlyphs/drawBackground` directly into a bitmap context,
-/// bypassing the need for a window. This also naturally excludes the cursor blink,
-/// since the insertion point is drawn by NSTextView, not NSLayoutManager.
+/// Uses `NSTextView.cacheDisplay(in:to:)` to render the view into a bitmap,
+/// bypassing the need for an on-screen window. This naturally excludes the
+/// cursor blink — the insertion point is drawn separately by NSTextView.
 @MainActor
 enum SnapshotCapture {
 
@@ -36,7 +36,7 @@ enum SnapshotCapture {
     textView.setSelectedRange(cursorRange)
 
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange, style: style)
-    RenderApplicator.apply(spec, to: textView)
+    TextKit2RenderApplicator.apply(spec, to: textView)
   }
 
   /// Render the current state of components to a bitmap.
@@ -45,13 +45,28 @@ enum SnapshotCapture {
     size: NSSize = NSSize(width: 600, height: 400)
   ) -> NSBitmapImageRep {
     let textView = components.textView
-    let layoutManager = components.layoutManager
-    let textLength = components.textStorage.length
 
-    // Force synchronous layout
-    if textLength > 0 {
-      layoutManager.ensureLayout(forCharacterRange: NSRange(location: 0, length: textLength))
+    // Force a full TK2 re-layout. We invalidate first because layout
+    // fragments are cached per text element; without explicit invalidation
+    // they retain Y positions from a prior `apply` whose hidden-prefix /
+    // bullet / checkbox state differed (the content delegate's display
+    // string updates, but the cached layout-fragment frame doesn't).
+    if let tlm = textView.textLayoutManager {
+      tlm.invalidateLayout(for: tlm.documentRange)
+      tlm.ensureLayout(for: tlm.documentRange)
+      // Re-run the viewport layout controller so any visible fragments are
+      // re-positioned against the just-recomputed content, and the text
+      // view's internal frame matches the laid-out content height.
+      tlm.textViewportLayoutController.layoutViewport()
     }
+
+    // Reset the textView's bounds origin to (0, 0) so cacheDisplay captures
+    // from the document top. Without a scroll view, the harness has no clip
+    // view to anchor scroll position; previous TK2 viewport layouts (or the
+    // text view's auto-grow when content exceeds the requested bitmap
+    // height) can leave bounds origin non-zero.
+    let captureRect = NSRect(origin: .zero, size: size)
+    textView.setBoundsOrigin(.zero)
 
     // Deselect to avoid cursor rendering artifacts
     let savedSelection = textView.selectedRange()
@@ -74,7 +89,7 @@ enum SnapshotCapture {
       bitsPerPixel: 0
     )!
 
-    textView.cacheDisplay(in: textView.bounds, to: bitmapRep)
+    textView.cacheDisplay(in: captureRect, to: bitmapRep)
 
     // Restore selection
     textView.setSelectedRange(savedSelection)

@@ -34,57 +34,33 @@ struct ParagraphSpacingTests {
       "Same cursor position should produce identical rendering")
   }
 
-  @Test("Heading line fragment rect is stable via layout manager")
+  @Test("Heading line fragment rect is stable via TK2 layout fragments")
   func headingLineFragmentRectStable() {
-    // Use the layout manager directly to check line fragment positioning
+    // Use TK2 layout fragments directly to check line fragment positioning.
     let markdown = "Some body text\n### Features"
     let size = NSSize(width: 600, height: 200)
 
     let components = MarkdownTextViewFactory.create(size: size)
-    let layoutManager = components.layoutManager
 
     // Render with cursor inside heading (delimiters visible)
     SnapshotCapture.apply(text: markdown, cursorPosition: 19, to: components)
-    layoutManager.ensureLayout(
-      forCharacterRange: NSRange(location: 0, length: (markdown as NSString).length))
-
-    let glyphIndex = layoutManager.glyphIndexForCharacter(at: 19)
-    var insideRange = NSRange()
-    let insideRect = layoutManager.lineFragmentRect(
-      forGlyphAt: glyphIndex, effectiveRange: &insideRange)
-    let insideUsed = layoutManager.lineFragmentUsedRect(
-      forGlyphAt: glyphIndex, effectiveRange: nil)
+    let insideFrame = headingFragmentFrame(in: components.textView, sourceOffset: 19)
 
     // Render with cursor outside heading (delimiters hidden)
     SnapshotCapture.apply(text: markdown, cursorPosition: 5, to: components)
-    layoutManager.ensureLayout(
-      forCharacterRange: NSRange(location: 0, length: (markdown as NSString).length))
+    let outsideFrame = headingFragmentFrame(in: components.textView, sourceOffset: 19)
 
-    let glyphIndex2 = layoutManager.glyphIndexForCharacter(at: 19)
-    var outsideRange = NSRange()
-    let outsideRect = layoutManager.lineFragmentRect(
-      forGlyphAt: glyphIndex2, effectiveRange: &outsideRange)
-    let outsideUsed = layoutManager.lineFragmentUsedRect(
-      forGlyphAt: glyphIndex2, effectiveRange: nil)
-
-    let yShift = abs(insideRect.origin.y - outsideRect.origin.y)
+    let yShift = abs(insideFrame.origin.y - outsideFrame.origin.y)
     #expect(
       yShift < 1.0,
-      "Heading line fragment Y should not shift. Inside: \(insideRect.origin.y), Outside: \(outsideRect.origin.y), Shift: \(yShift)"
+      "Heading line fragment Y should not shift. Inside: \(insideFrame.origin.y), Outside: \(outsideFrame.origin.y), Shift: \(yShift)"
     )
 
-    // The heading line fragment should also have the same height (including paragraphSpacingBefore)
-    let heightShift = abs(insideRect.size.height - outsideRect.size.height)
+    // The heading fragment should also have the same height (including paragraphSpacingBefore).
+    let heightShift = abs(insideFrame.size.height - outsideFrame.size.height)
     #expect(
       heightShift < 1.0,
-      "Heading line fragment height should not shift. Inside: \(insideRect.size.height), Outside: \(outsideRect.size.height), Shift: \(heightShift)"
-    )
-
-    // The used rect's Y position (which includes paragraphSpacingBefore offset) should be consistent
-    let usedYShift = abs(insideUsed.origin.y - outsideUsed.origin.y)
-    #expect(
-      usedYShift < 1.0,
-      "Heading used rect Y should not shift. Inside: \(insideUsed.origin.y), Outside: \(outsideUsed.origin.y), Shift: \(usedYShift)"
+      "Heading line fragment height should not shift. Inside: \(insideFrame.size.height), Outside: \(outsideFrame.size.height), Shift: \(heightShift)"
     )
   }
 
@@ -97,29 +73,48 @@ struct ParagraphSpacingTests {
     let size = NSSize(width: 600, height: 200)
 
     let components = MarkdownTextViewFactory.create(size: size)
-    let layoutManager = components.layoutManager
 
-    // Cursor inside italic
+    // Cursor inside italic — char index 13 is 'T' in "This"
     SnapshotCapture.apply(text: markdown, cursorPosition: 15, to: components)
-    layoutManager.ensureLayout(
-      forCharacterRange: NSRange(location: 0, length: (markdown as NSString).length))
-    // char at index 13 is 'T' in "This"
-    let glyph1 = layoutManager.glyphIndexForCharacter(at: 13)
-    var range1 = NSRange()
-    let rect1 = layoutManager.lineFragmentRect(forGlyphAt: glyph1, effectiveRange: &range1)
+    let insideFrame = headingFragmentFrame(in: components.textView, sourceOffset: 13)
 
     // Cursor outside italic
     SnapshotCapture.apply(text: markdown, cursorPosition: 5, to: components)
-    layoutManager.ensureLayout(
-      forCharacterRange: NSRange(location: 0, length: (markdown as NSString).length))
-    let glyph2 = layoutManager.glyphIndexForCharacter(at: 13)
-    var range2 = NSRange()
-    let rect2 = layoutManager.lineFragmentRect(forGlyphAt: glyph2, effectiveRange: &range2)
+    let outsideFrame = headingFragmentFrame(in: components.textView, sourceOffset: 13)
 
-    let yShift = abs(rect1.origin.y - rect2.origin.y)
+    let yShift = abs(insideFrame.origin.y - outsideFrame.origin.y)
     #expect(
       yShift < 1.0,
-      "Italic line fragment Y should not shift. Inside: \(rect1.origin.y), Outside: \(rect2.origin.y), Shift: \(yShift)"
+      "Italic line fragment Y should not shift. Inside: \(insideFrame.origin.y), Outside: \(outsideFrame.origin.y), Shift: \(yShift)"
     )
+  }
+
+  // MARK: - Helpers
+
+  /// Return the layout-fragment frame (container coordinates) for the
+  /// paragraph containing the source offset `sourceOffset`. Forces full
+  /// document layout first.
+  private func headingFragmentFrame(in textView: NSTextView, sourceOffset: Int) -> CGRect {
+    guard let tlm = textView.textLayoutManager,
+      let cs = textView.textContentStorage
+    else {
+      return .zero
+    }
+    tlm.ensureLayout(for: tlm.documentRange)
+
+    var found: CGRect = .zero
+    tlm.enumerateTextLayoutFragments(
+      from: tlm.documentRange.location, options: [.ensuresLayout]
+    ) { frag in
+      guard let elementRange = frag.textElement?.elementRange else { return true }
+      let start = cs.offset(from: cs.documentRange.location, to: elementRange.location)
+      let length = cs.offset(from: elementRange.location, to: elementRange.endLocation)
+      if sourceOffset >= start && sourceOffset < start + length {
+        found = frag.layoutFragmentFrame
+        return false
+      }
+      return true
+    }
+    return found
   }
 }

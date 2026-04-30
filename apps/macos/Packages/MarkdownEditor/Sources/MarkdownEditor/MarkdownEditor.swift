@@ -9,59 +9,50 @@ import SwiftUI
 /// 2. User interactions are converted to `EditorEvent` values
 /// 3. `EditorUpdate.update(state, event)` produces the next state
 /// 4. `MarkdownRenderer.render(state)` produces a `RenderSpec`
-/// 5. `RenderApplicator.apply(spec, textView)` updates the view
+/// 5. `TextKit2RenderApplicator.apply(spec, textView)` updates the view
 public struct MarkdownEditor: NSViewRepresentable {
   @Binding var state: EditorState
   @Environment(\.markdownStyle) private var style
-  private let useTextKit2: Bool
 
-  public init(state: Binding<EditorState>, useTextKit2: Bool = false) {
+  public init(state: Binding<EditorState>) {
     self._state = state
-    self.useTextKit2 = useTextKit2
   }
 
   public func makeNSView(context: Context) -> NSScrollView {
-    let scrollView: NSScrollView
-    let textView: NSTextView
-    if useTextKit2 {
-      // NSTextView(usingTextLayoutManager:) is the only reliable way to get a
-      // TK2 stack with textStorage and textContentStorage properly linked
-      // (Phase 2 testing). It returns NSTextView, not our subclass, so we
-      // upgrade the class via the Objective-C runtime. Safe because
-      // TextKit2MarkdownTextView adds no stored properties — only an
-      // overridden characterIndexForInsertion(at:) — so memory layout matches.
-      let tk2TextView = NSTextView(usingTextLayoutManager: true)
-      object_setClass(tk2TextView, TextKit2MarkdownTextView.self)
-      tk2TextView.minSize = NSSize(width: 0, height: 0)
-      tk2TextView.maxSize = NSSize(
-        width: CGFloat.greatestFiniteMagnitude,
-        height: CGFloat.greatestFiniteMagnitude)
-      tk2TextView.isVerticallyResizable = true
-      tk2TextView.isHorizontallyResizable = false
-      tk2TextView.textContentStorage?.delegate =
-        context.coordinator.textKit2ContentStorageDelegate
-      tk2TextView.textLayoutManager?.delegate =
-        context.coordinator.textKit2LayoutManagerDelegate
-      // Observe frame changes so the layout-manager delegate's
-      // `containerWidth` (and any vended fragment's full-width background)
-      // stays in sync when the text container resizes. Cheaper than running a
-      // full re-render: we just push the new width into the delegate and
-      // invalidate layout to force fragment re-vending. The first render
-      // populates the width via the same path inside `apply()`.
-      tk2TextView.postsFrameChangedNotifications = true
-      context.coordinator.observeTextViewFrameChanges(tk2TextView)
-      textView = tk2TextView
+    // NSTextView(usingTextLayoutManager:) is the only reliable way to get a
+    // TK2 stack with textStorage and textContentStorage properly linked
+    // (Phase 2 testing). It returns NSTextView, not our subclass, so we
+    // upgrade the class via the Objective-C runtime. Safe because
+    // TextKit2MarkdownTextView adds no stored properties — only an
+    // overridden characterIndexForInsertion(at:) — so memory layout matches.
+    let textView = NSTextView(usingTextLayoutManager: true)
+    object_setClass(textView, TextKit2MarkdownTextView.self)
+    textView.minSize = NSSize(width: 0, height: 0)
+    textView.maxSize = NSSize(
+      width: CGFloat.greatestFiniteMagnitude,
+      height: CGFloat.greatestFiniteMagnitude)
+    textView.isVerticallyResizable = true
+    textView.isHorizontallyResizable = false
+    textView.textContentStorage?.delegate =
+      context.coordinator.textKit2ContentStorageDelegate
+    textView.textLayoutManager?.delegate =
+      context.coordinator.textKit2LayoutManagerDelegate
+    // Observe frame changes so the layout-manager delegate's
+    // `containerWidth` (and any vended fragment's full-width background)
+    // stays in sync when the text container resizes. Cheaper than running a
+    // full re-render: we just push the new width into the delegate and
+    // invalidate layout to force fragment re-vending. The first render
+    // populates the width via the same path inside `apply()`.
+    textView.postsFrameChangedNotifications = true
+    context.coordinator.observeTextViewFrameChanges(textView)
 
-      scrollView = NSScrollView()
-      scrollView.borderType = .noBorder
-      scrollView.hasVerticalScroller = true
-      scrollView.hasHorizontalScroller = false
-      scrollView.autohidesScrollers = true
-      scrollView.documentView = textView
-    } else {
-      scrollView = NSTextView.scrollableTextView()
-      textView = scrollView.documentView as! NSTextView
-    }
+    let scrollView = NSScrollView()
+    scrollView.borderType = .noBorder
+    scrollView.hasVerticalScroller = true
+    scrollView.hasHorizontalScroller = false
+    scrollView.autohidesScrollers = true
+    scrollView.documentView = textView
+
     context.coordinator.style = style
     context.coordinator.configure(textView)
     context.coordinator.syncToTextView(state, textView: textView)
@@ -80,17 +71,15 @@ public struct MarkdownEditor: NSViewRepresentable {
   }
 
   public func makeCoordinator() -> Coordinator {
-    Coordinator(state: $state, style: style, useTextKit2: useTextKit2)
+    Coordinator(state: $state, style: style)
   }
 
   @MainActor
   public final class Coordinator: NSObject, NSTextViewDelegate {
     var state: Binding<EditorState>
     var style: MarkdownStyle
-    let useTextKit2: Bool
     var isProcessingEvent = false
     var lastSpec: RenderSpec?
-    private let glyphDelegate = GlyphHidingLayoutManagerDelegate()
     /// Held by the Coordinator so it persists for the text view's lifetime
     /// (NSTextContentStorage holds its delegate weakly).
     let textKit2ContentStorageDelegate = TextKit2ContentStorageDelegate()
@@ -106,10 +95,9 @@ public struct MarkdownEditor: NSViewRepresentable {
     /// teardown — only ever assigned on the main actor.
     private nonisolated(unsafe) var tk2FrameObserver: Any?
 
-    init(state: Binding<EditorState>, style: MarkdownStyle = .default, useTextKit2: Bool = false) {
+    init(state: Binding<EditorState>, style: MarkdownStyle = .default) {
       self.state = state
       self.style = style
-      self.useTextKit2 = useTextKit2
     }
 
     deinit {
@@ -138,8 +126,7 @@ public struct MarkdownEditor: NSViewRepresentable {
     }
 
     private func refreshTextKit2ContainerWidth(_ textView: NSTextView) {
-      guard useTextKit2,
-        let tlm = textView.textLayoutManager,
+      guard let tlm = textView.textLayoutManager,
         let width = tlm.textContainer?.size.width,
         width > 0,
         width < CGFloat.greatestFiniteMagnitude
@@ -181,23 +168,6 @@ public struct MarkdownEditor: NSViewRepresentable {
       textView.textContainer?.widthTracksTextView = true
       textView.textContainer?.containerSize = NSSize(
         width: 0, height: CGFloat.greatestFiniteMagnitude)
-
-      // TK1 only: replace the default NSLayoutManager with our custom subclass
-      // that draws full-width backgrounds for code blocks. The TK2 path uses
-      // NSTextLayoutManager (will get custom NSTextLayoutFragment subclasses
-      // in Phase 3) and doesn't expose an NSLayoutManager.
-      if !useTextKit2,
-        let textContainer = textView.textContainer,
-        let textStorage = textView.textStorage,
-        let oldLayoutManager = textView.layoutManager
-      {
-        textStorage.removeLayoutManager(oldLayoutManager)
-        let codeBlockLM = CodeBlockBackgroundLayoutManager()
-        codeBlockLM.delegate = glyphDelegate
-        codeBlockLM.allowsNonContiguousLayout = true
-        codeBlockLM.addTextContainer(textContainer)
-        textStorage.addLayoutManager(codeBlockLM)
-      }
     }
 
     /// Apply editor state to the text view (full sync).
@@ -222,11 +192,7 @@ public struct MarkdownEditor: NSViewRepresentable {
       textView.setSelectedRange(editorState.selection.nsRange)
 
       let spec = MarkdownRenderer.render(state: editorState, style: style)
-      if useTextKit2 {
-        TextKit2RenderApplicator.apply(spec, to: textView)
-      } else {
-        RenderApplicator.apply(spec, to: textView)
-      }
+      TextKit2RenderApplicator.apply(spec, to: textView)
       lastSpec = spec
     }
 
@@ -251,11 +217,7 @@ public struct MarkdownEditor: NSViewRepresentable {
       textView.setSelectedRange(newState.selection.nsRange)
 
       let spec = MarkdownRenderer.render(state: newState, style: style)
-      if useTextKit2 {
-        TextKit2RenderApplicator.apply(spec, to: textView)
-      } else {
-        RenderApplicator.apply(spec, to: textView)
-      }
+      TextKit2RenderApplicator.apply(spec, to: textView)
       lastSpec = spec
     }
 
@@ -431,11 +393,7 @@ public struct MarkdownEditor: NSViewRepresentable {
 
       // Re-render attributes.
       let spec = MarkdownRenderer.render(state: newState, style: style)
-      if useTextKit2 {
-        TextKit2RenderApplicator.apply(spec, to: textView)
-      } else {
-        RenderApplicator.apply(spec, to: textView)
-      }
+      TextKit2RenderApplicator.apply(spec, to: textView)
       lastSpec = spec
     }
 
@@ -468,19 +426,11 @@ public struct MarkdownEditor: NSViewRepresentable {
       let prevUncheckedCheckboxes = lastSpec?.uncheckedCheckboxIndexes ?? IndexSet()
       let prevCheckedCheckboxes = lastSpec?.checkedCheckboxIndexes ?? IndexSet()
       let prevCollapsedNewlines = lastSpec?.collapsedNewlineIndexes ?? IndexSet()
-      if useTextKit2 {
-        TextKit2RenderApplicator.applyCursorUpdate(
-          spec, previousHidden: prevHidden, previousBullets: prevBullets,
-          previousUncheckedCheckboxes: prevUncheckedCheckboxes,
-          previousCheckedCheckboxes: prevCheckedCheckboxes,
-          previousCollapsedNewlines: prevCollapsedNewlines, to: textView)
-      } else {
-        RenderApplicator.applyCursorUpdate(
-          spec, previousHidden: prevHidden, previousBullets: prevBullets,
-          previousUncheckedCheckboxes: prevUncheckedCheckboxes,
-          previousCheckedCheckboxes: prevCheckedCheckboxes,
-          previousCollapsedNewlines: prevCollapsedNewlines, to: textView)
-      }
+      TextKit2RenderApplicator.applyCursorUpdate(
+        spec, previousHidden: prevHidden, previousBullets: prevBullets,
+        previousUncheckedCheckboxes: prevUncheckedCheckboxes,
+        previousCheckedCheckboxes: prevCheckedCheckboxes,
+        previousCollapsedNewlines: prevCollapsedNewlines, to: textView)
       lastSpec = spec
       isProcessingEvent = false
     }

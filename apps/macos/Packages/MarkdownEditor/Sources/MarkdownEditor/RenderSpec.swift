@@ -3,7 +3,7 @@ import AppKit
 /// Complete rendering specification for a markdown document at a given cursor position.
 ///
 /// Produced by `MarkdownRenderer.render()` (pure function).
-/// Consumed by `RenderApplicator.apply()` (imperative shell).
+/// Consumed by `TextKit2RenderApplicator.apply()` (imperative shell).
 ///
 /// The same `(text, cursorRange)` input must always produce an equivalent `RenderSpec`.
 struct RenderSpec {
@@ -38,7 +38,7 @@ struct RenderSpec {
   let temporaryAttributes: [StyledRange]
 
   /// Character ranges that should receive full-width code block background drawing.
-  /// Consumed by `CodeBlockBackgroundLayoutManager` to draw backgrounds that span the
+  /// Consumed by `TextKit2LayoutFragment` to draw backgrounds that span the
   /// entire text container width, regardless of glyph visibility.
   let codeBlockCharacterRanges: [CodeBlockDecoration]
 

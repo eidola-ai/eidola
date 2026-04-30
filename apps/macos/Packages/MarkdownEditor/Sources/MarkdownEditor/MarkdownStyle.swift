@@ -147,8 +147,8 @@ public struct MarkdownStyle: Equatable, @unchecked Sendable {
     paragraphStyle.paragraphSpacing = codeBlockSpacing
     paragraphStyle.paragraphSpacingBefore = codeBlockSpacing
     // Note: .backgroundColor is NOT set here. Full-width code block backgrounds
-    // are drawn by CodeBlockBackgroundLayoutManager, which uses the line fragment
-    // rect (full container width) instead of the glyph extent. This ensures
+    // are drawn by TextKit2LayoutFragment, which uses the layout-fragment
+    // frame (full container width) instead of the glyph extent. This ensures
     // hidden fence lines get the same background as content lines.
     return [
       .font: codeFont,
