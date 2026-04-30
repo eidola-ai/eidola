@@ -24,6 +24,10 @@ let package = Package(
       name: "MarkdownEditorDemo",
       dependencies: ["MarkdownEditor"]
     ),
+    .executableTarget(
+      name: "MarkdownEditorScript",
+      dependencies: ["MarkdownEditor"]
+    ),
     .testTarget(
       name: "MarkdownEditorTests",
       dependencies: ["MarkdownEditor"]
