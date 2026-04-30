@@ -398,15 +398,6 @@ public struct MarkdownEditor: NSViewRepresentable {
       // cursor update here — textDidChange will handle the full resync.
       guard textView.string == state.wrappedValue.markdown else { return }
 
-      // Capture the cursor the caller actually intends. `apply` below mutates
-      // the content delegate's hiddenIndexes (so `**` flips visibility on a
-      // boundary cross), records a full-document edit action, and invalidates
-      // layout. Any of those can cause TK2 to "preserve the visual cursor"
-      // by re-snapping the cursor to a different source offset. We carry the
-      // intended source position across the apply and re-set it if drift
-      // happened — no apparent drift is harmless (the re-set is a no-op),
-      // and the guard against drift is the user-facing fix for cursor jumps
-      // when crossing construct boundaries that toggle delimiter visibility.
       let intendedRange = textView.selectedRange()
       DebugTrace.log("selection.before", [
         "location": intendedRange.location,
@@ -421,7 +412,20 @@ public struct MarkdownEditor: NSViewRepresentable {
           head: intendedRange.location + intendedRange.length)
       }
 
-      // Only update rendering (glyph visibility), don't change text
+      // Only update rendering (glyph visibility), don't change text.
+      //
+      // Note: a drift-correction guard used to live here, defending against
+      // TK2 "preserving the visual cursor" by re-snapping it to a different
+      // source offset across the layout invalidation triggered by `apply`.
+      // The drift was a symptom of the content delegate vending paragraphs
+      // whose display length differed from the source length — TK2 then
+      // computed cursor positions in display coordinates and the visual
+      // position drifted relative to the source position the caller set.
+      // The length-matching invariant in `TextKit2ContentStorageDelegate`
+      // (display.length == source.length via ZWSP / glyph substitution)
+      // removes the underlying mismatch, so the guard became unreachable
+      // — verified end-to-end via the scripted runner against the original
+      // user-reported repro.
       isProcessingEvent = true
       state.wrappedValue = EditorState(
         markdown: state.wrappedValue.markdown, selection: selection)
@@ -439,23 +443,6 @@ public struct MarkdownEditor: NSViewRepresentable {
         previousLineBreaks: prevLineBreaks, to: textView)
       lastSpec = spec
 
-      // Drift guard: if apply moved the cursor (TK2 visual-position-preserve
-      // heuristic, or anything else), restore it to the position the caller
-      // set. `isProcessingEvent` is still true here so the re-set's
-      // selection-change notification is ignored — no recursion, no extra
-      // apply.
-      let postApplyRange = textView.selectedRange()
-      if postApplyRange.location != intendedRange.location
-        || postApplyRange.length != intendedRange.length
-      {
-        DebugTrace.log("selection.drift_corrected", [
-          "intended_location": intendedRange.location,
-          "intended_length": intendedRange.length,
-          "drifted_location": postApplyRange.location,
-          "drifted_length": postApplyRange.length,
-        ])
-        textView.setSelectedRange(intendedRange)
-      }
       DebugTrace.log("selection.after", [
         "location": textView.selectedRange().location,
         "length": textView.selectedRange().length,

@@ -5,20 +5,21 @@ import Testing
 
 @testable import MarkdownEditor
 
-/// Selection / navigation across constructs whose displayed paragraph length
-/// differs from the source range length. The content delegate hides
-/// delimiters and substitutes glyphs (bullets / checkboxes), which would
-/// otherwise let TK2's display-coordinate hit-test and arrow-key logic
-/// strand the cursor on hidden characters or skip past them entirely.
+/// Selection / navigation across constructs whose source ranges contain
+/// hidden delimiters or substituted glyphs (bullets, checkboxes). The
+/// content delegate now preserves the length-matching invariant
+/// (`display.length == source.length`), so TK2's hit-test and selection
+/// navigation operate on real source offsets — the contract these tests
+/// pin is purely about cursor-stops-on-visible behavior.
 ///
-/// These tests pin the contract that:
-///   1. Clicks land on the visible glyph the user actually clicked.
-///   2. Arrow keys traverse hidden runs as a single atomic step (the cursor
-///      never lands on a hidden char).
-///   3. Shift+arrow extends one source step at a time across the same
-///      hidden runs — bidirectional, no lost characters.
-///   4. The Phase 2.5 paragraph-start translation continues to work.
-///   5. The soft-break cursor walk continues to work.
+/// 1. Display strings reflect the substitutions (ZWSP for hidden, • for
+///    bullet, ☐ / ☒ for checkboxes) and have the same length as their
+///    source range.
+/// 2. Arrow keys traverse hidden runs as a single atomic step (the cursor
+///    never lands on a hidden char).
+/// 3. Shift+arrow extends one source step at a time across the same
+///    hidden runs — bidirectional, no lost characters.
+/// 4. The soft-break cursor walk continues to work.
 @Suite("Selection Navigation")
 @MainActor
 struct SelectionNavigationTests {
@@ -155,35 +156,47 @@ struct SelectionNavigationTests {
     }
   }
 
-  // MARK: - 1. Bug 1: mid-paragraph click on bolded "C" lands on C
+  // MARK: - 1. Bug 1: visible glyph display offsets equal source offsets
 
+  /// Pre-refactor: the content delegate vended a *shorter* display string
+  /// (hidden chars removed), so TK2's hit-test returned a display offset
+  /// that didn't equal the source position. The override
+  /// `translateHitTestIndex` walked a per-paragraph display→source map.
+  ///
+  /// Post-refactor: the delegate vends a length-matching display string
+  /// (hidden chars become zero-width `U+200B` so they take up a UTF-16 unit
+  /// without taking visual space). The display offset of every visible
+  /// glyph equals its source offset, so TK2's hit-test returns the right
+  /// source position directly — no translation override needed.
+  ///
+  /// This test pins the invariant: in `"A **B** C D E F G"` with cursor
+  /// outside the bold, the displayed paragraph has the same length as the
+  /// source and its visible glyphs land at their source offsets. The actual
+  /// click→glyph mapping is exercised end-to-end by the runner; here we
+  /// just verify the structural property the hit-test relies on.
   @Test
-  func click_on_C_in_bolded_word_lands_on_C() {
-    // Source: A=0 ' '=1 *=2 *=3 B=4 *=5 *=6 ' '=7 C=8 ' '=9 D=10 ...
-    // Display when cursor outside [2..7]: "A B C D E F G" (length 13).
-    // TK2's hit-test reports display offsets in source-coordinate clothing
-    // (paragraph.elementRange.location + display_offset). For a click on
-    // visual "C" (display offset 4), TK2 returns source 4 — which without
-    // translation would be 'B', or with the cursor moving land at
-    // source 5 (a hidden `*`) per the user-reported bug.
+  func display_paragraph_length_matches_source_length_with_hidden_bold() {
     let md = "A **B** C D E F G"
     let rig = Self.make(markdown: md, cursorPosition: (md as NSString).length)
+    Self.snapshot(rig, name: "01-bold-hidden", size: NSSize(width: 600, height: 100))
 
-    // Display offset of 'C' is 4 (after "A B " = 4 chars).
-    // The hit-test translates that through displayToSourceMap = [0,1,4,7,8,9,...]
-    // to source 8 ('C').
-    let translated = rig.textView.translateHitTestIndex(4)
-    #expect(translated == 8, "expected click on C → source 8, got \(translated)")
-    Self.snapshot(rig, name: "01-click-on-C", size: NSSize(width: 600, height: 100))
-  }
-
-  @Test
-  func click_on_B_in_bolded_word_lands_on_B() {
-    let md = "A **B** C D E F G"
-    let rig = Self.make(markdown: md, cursorPosition: (md as NSString).length)
-    // Display offset of 'B' is 2; map[2] = 4.
-    let translated = rig.textView.translateHitTestIndex(2)
-    #expect(translated == 4, "expected click on B → source 4, got \(translated)")
+    // Walk the laid-out paragraphs and verify every one has display.length
+    // == source.length.
+    let cs = rig.storage
+    rig.layout.enumerateTextLayoutFragments(
+      from: rig.layout.documentRange.location, options: []
+    ) { frag in
+      guard let element = frag.textElement,
+        let paragraph = element as? NSTextParagraph,
+        let elemRange = element.elementRange
+      else { return true }
+      let length = cs.offset(from: elemRange.location, to: elemRange.endLocation)
+      let displayLen = (paragraph.attributedString.string as NSString).length
+      #expect(
+        displayLen == length,
+        "display length \(displayLen) must equal source length \(length)")
+      return true
+    }
   }
 
   // MARK: - 2. Bug 2: arrow keys walk one source-visible char per press
@@ -272,17 +285,40 @@ struct SelectionNavigationTests {
       "expected [4, 8); got [\(r2.location), \(r2.location + r2.length))")
   }
 
-  // MARK: - 4. Phase 2.5 hit-test pinning (paragraph-start translation)
+  // MARK: - 4. Heading paragraph: length-matching invariant + visible H
 
+  /// `# Heading\n\nbody` — heading paragraph has hidden `# ` (positions 0, 1).
+  /// Post-refactor those hidden chars become two ZWSPs in the display
+  /// string, so the displayed paragraph reads `\u{200B}\u{200B}Heading\n`
+  /// (length 12, equal to source length). The visible 'H' sits at display
+  /// offset 2 == source offset 2, so a real click on H lands on source 2
+  /// without any translation override.
   @Test
-  func paragraph_start_click_still_translates_past_hidden_prefix() {
-    // `# Heading\n\nbody` — heading paragraph hidden prefix `# ` (length 2).
-    // A click reported by TK2 at source 0 (paragraph start) translates to
-    // display offset 0 → source 2 ('H').
+  func heading_display_starts_with_two_zwsps_then_visible_text() {
     let md = "# Heading\n\nbody"
     let bodyOffset = ("# Heading\n\n" as NSString).length
     let rig = Self.make(markdown: md, cursorPosition: bodyOffset)
-    #expect(rig.textView.translateHitTestIndex(0) == 2)
+
+    // Find the heading paragraph and inspect its display string.
+    let cs = rig.storage
+    var headingDisplay: String?
+    rig.layout.enumerateTextLayoutFragments(
+      from: rig.layout.documentRange.location, options: []
+    ) { frag in
+      guard let element = frag.textElement,
+        let paragraph = element as? NSTextParagraph,
+        let elemRange = element.elementRange
+      else { return true }
+      let start = cs.offset(from: cs.documentRange.location, to: elemRange.location)
+      if start == 0 {
+        headingDisplay = paragraph.attributedString.string
+        return false
+      }
+      return true
+    }
+    #expect(
+      headingDisplay == "\u{200B}\u{200B}Heading\n",
+      "got: \(String(describing: headingDisplay))")
   }
 
   // MARK: - 5. Soft break walk (regression pin)
@@ -307,21 +343,40 @@ struct SelectionNavigationTests {
   // MARK: - 6. List-item bullet substitution navigation
 
   @Test
-  func right_arrow_into_list_item_from_outside_skips_hidden_marker_space() {
+  func list_item_displays_bullet_then_visible_text() {
     // `- item\n\nbody`. Place the cursor in the body paragraph so the
-    // list item's `- ` is in bullet-substitution mode (display "• item")
-    // — source 0 (`-`) is a bullet glyph, source 1 (` `) is hidden.
-    //
-    // A click on the visible `i` of "item" (display offset 2 within the
-    // displayed paragraph "• item\n") translates through displayToSource
-    // = [0, 2, 3, 4, 5, 6] to source 2 ('i').
+    // list item's `-` is in bullet-substitution mode. Source 0 (`-`)
+    // becomes `•` (1-for-1); source 1 (` `) passes through as a real
+    // space (the renderer only hides marker chars *between* the marker
+    // and the first content char, so a single trailing space stays
+    // visible). Display string is `• item\n` (length 7 == source length 7).
     let md = "- item\n\nbody"
     let bodyOffset = ("- item\n\n" as NSString).length
     let rig = Self.make(markdown: md, cursorPosition: bodyOffset)
-    let translated = rig.textView.translateHitTestIndex(2)
+
+    let cs = rig.storage
+    var firstParagraphDisplay: String?
+    rig.layout.enumerateTextLayoutFragments(
+      from: rig.layout.documentRange.location, options: []
+    ) { frag in
+      guard let element = frag.textElement,
+        let paragraph = element as? NSTextParagraph,
+        let elemRange = element.elementRange
+      else { return true }
+      let start = cs.offset(from: cs.documentRange.location, to: elemRange.location)
+      if start == 0 {
+        firstParagraphDisplay = paragraph.attributedString.string
+        return false
+      }
+      return true
+    }
     #expect(
-      translated == 2,
-      "expected click on 'i' (display offset 2) to translate to source 2; got \(translated)")
+      firstParagraphDisplay == "\u{2022} item\n",
+      "got: \(String(describing: firstParagraphDisplay))")
+    // Length-matching invariant: display length == source length.
+    let displayLen = ((firstParagraphDisplay ?? "") as NSString).length
+    let sourceLen = ("- item\n" as NSString).length
+    #expect(displayLen == sourceLen, "display \(displayLen) vs source \(sourceLen)")
   }
 
   @Test

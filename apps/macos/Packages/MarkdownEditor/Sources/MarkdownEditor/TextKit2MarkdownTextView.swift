@@ -2,145 +2,25 @@ import AppKit
 
 /// `NSTextView` subclass used on the TextKit 2 path.
 ///
-/// Bridges TextKit 2's display-coordinate world to our source-coordinate
-/// model. The content delegate's display attributedString omits hidden
-/// chars (e.g. `**` in bold) and substitutes glyphs for marker chars
-/// (bullets, checkboxes), so display offsets are not equal to source
-/// offsets. TK2's hit-test, character-level cursor navigation, and
-/// selection-extension logic all return / consume offsets that they
-/// believe are source offsets but are actually computed in display
-/// coordinates — empirically verified in Phase 0 / Phase 2.5.
+/// With the content delegate's length-matching invariant
+/// (`displayString.length == sourceRange.length`), TK2's hit-test and
+/// selection-navigation logic operate on real source offsets — clicks land
+/// on the right glyph and arrow keys advance one source char per press
+/// without translation.
 ///
-/// This subclass adds two layers of translation:
-///
-///   1. `characterIndexForInsertion(at:)` — clicks resolve to a source
-///      offset that's actually a display offset. We re-walk the paragraph
-///      against the current `hiddenIndexes` set to translate it back.
-///
-///   2. Character-level move / extend selectors (`moveLeft(_:)`,
-///      `moveRight(_:)`, `moveLeftAndModifySelection(_:)`,
-///      `moveRightAndModifySelection(_:)`, and the word variants) — TK2's
-///      built-in selection navigation walks display chars but reports the
-///      result as a source offset, which can jump past hidden runs to
-///      arbitrary positions when the display vs. source lengths diverge.
-///      We compute the destination ourselves by walking source chars and
-///      skipping hidden ones, then set the selection imperatively.
-///
-/// All other behavior (vertical motion, double-click word selection, drag
-/// selection extension, etc.) is inherited from `NSTextView` — it routes
-/// through `characterIndexForInsertion(at:)` for hit-tested operations,
-/// which is already translated.
+/// What this subclass adds is the *editor UX* of skipping over hidden
+/// source chars during character-level keyboard navigation. The cursor
+/// must never come to rest on a hidden delimiter (e.g. a `**` around
+/// bold), otherwise the user sees a blank "stuck" caret. We override the
+/// move / extend selectors to compute the destination directly from the
+/// source string + `hiddenIndexes`, skipping any contiguous hidden run as
+/// a single atomic step. Word-level motion delegates to super (whose
+/// destinations are now in real source coordinates) and snaps the result
+/// to the nearest visible source position.
 @MainActor
 final class TextKit2MarkdownTextView: NSTextView {
 
-  // MARK: - Hit-test (clicks)
-
-  override func characterIndexForInsertion(at point: NSPoint) -> Int {
-    let raw = super.characterIndexForInsertion(at: point)
-    DebugTrace.log("hitTest.start", [
-      "x": Double(point.x),
-      "y": Double(point.y),
-      "raw": raw,
-    ])
-    let translated = translateHitTestIndex(raw)
-    DebugTrace.log("hitTest.end", [
-      "raw": raw,
-      "translated": translated,
-    ])
-    return translated
-  }
-
-  /// Pure translation step extracted from the override so it can be tested
-  /// without depending on super's layout-dependent click resolution.
-  ///
-  /// `baseIndex` is what TK2's hit-test reports — empirically a *display*
-  /// offset (within the paragraph) reported as if it were a source offset.
-  /// We map it through the paragraph's display-to-source array to recover
-  /// the actual source position the visible glyph corresponds to.
-  ///
-  /// When TK2 returns a value at exactly the document end (no character
-  /// hit) or for a paragraph the delegate has no info about, we pass it
-  /// through unchanged. The paragraph lookup is on-demand (queries the
-  /// content storage) so the result is correct regardless of viewport
-  /// scroll state — an earlier prefix-cache implementation went stale on
-  /// scroll.
-  func translateHitTestIndex(_ baseIndex: Int) -> Int {
-    guard let storage = textContentStorage,
-      let delegate = storage.delegate as? TextKit2ContentStorageDelegate,
-      storage.location(
-        storage.documentRange.location, offsetBy: baseIndex) != nil
-    else { return baseIndex }
-
-    // Find the paragraph that owns the base location by walking up: TK2's
-    // enumerator from a location at exactly the boundary of two paragraphs
-    // visits the *next* paragraph first, so for boundary cases we'd miss
-    // the paragraph we actually clicked on. Walk by enumerating from doc
-    // start until we find an element whose range contains baseIndex.
-    var paragraphRange: NSRange?
-    let docStart = storage.documentRange.location
-    storage.enumerateTextElements(from: docStart, options: []) { element in
-      guard let elemRange = element.elementRange else { return true }
-      let start = storage.offset(from: docStart, to: elemRange.location)
-      let length = storage.offset(
-        from: elemRange.location, to: elemRange.endLocation)
-      let r = NSRange(location: start, length: length)
-      if NSLocationInRange(baseIndex, r) || (length == 0 && start == baseIndex) {
-        paragraphRange = r
-        return false
-      }
-      // Past the click — stop walking forward
-      if start > baseIndex { return false }
-      return true
-    }
-
-    guard let paragraphRange else { return baseIndex }
-
-    let displayOffset = baseIndex - paragraphRange.location
-    let map = delegate.displayToSourceMap(forParagraphSourceRange: paragraphRange)
-
-    if displayOffset < 0 {
-      // baseIndex is before the paragraph (shouldn't happen, defensive)
-      return baseIndex
-    }
-    if displayOffset < map.count {
-      return map[displayOffset]
-    }
-    // Display offset past last visible char → land at paragraph end
-    // (start of paragraph separator / next paragraph).
-    return paragraphRange.location + paragraphRange.length
-  }
-
   // MARK: - Cursor navigation
-
-  /// Find the paragraph (TK2 element) source range containing `sourceOffset`.
-  /// Returns nil if no paragraph contains it. For the boundary case where
-  /// `sourceOffset` is exactly at the start of paragraph N (== end of N-1),
-  /// returns paragraph N — the more useful interpretation for forward motion.
-  private func paragraphRange(containing sourceOffset: Int) -> NSRange? {
-    guard let storage = textContentStorage else { return nil }
-    let docStart = storage.documentRange.location
-    var found: NSRange?
-    storage.enumerateTextElements(from: docStart, options: []) { element in
-      guard let elemRange = element.elementRange else { return true }
-      let start = storage.offset(from: docStart, to: elemRange.location)
-      let length = storage.offset(
-        from: elemRange.location, to: elemRange.endLocation)
-      let r = NSRange(location: start, length: length)
-      if sourceOffset >= start && sourceOffset < start + length {
-        found = r
-        return false
-      }
-      // sourceOffset == start + length is the boundary; remember and keep
-      // looking — if the next paragraph starts at the same position we'll
-      // prefer it (more useful for forward motion). If no next paragraph,
-      // fall back to this one.
-      if sourceOffset == start + length {
-        found = r
-      }
-      return true
-    }
-    return found
-  }
 
   /// Compute the document length once. Used as the upper bound for forward
   /// motion since the source-end position is always a valid landing site.
@@ -270,28 +150,27 @@ final class TextKit2MarkdownTextView: NSTextView {
     ])
   }
 
-  /// Word-level: delegate to super for the destination then translate
-  /// through the paragraph map. Word boundaries depend on system locale
-  /// and word-break tables we don't want to reimplement; super's result
-  /// is in display-offset-as-source coordinates (same as character motion),
-  /// so the same display→source translation applies.
+  /// Word-level: delegate to super for the destination then snap to the
+  /// nearest visible source position. With the length-matching invariant
+  /// super's result is already a real source offset, but it may have landed
+  /// on a hidden char — in which case we must skip to the next visible one.
   override func moveWordRight(_ sender: Any?) {
     let before = endOfSelection(forwardMotion: true)
     super.moveWordRight(sender)
-    translateAndCommitSelection(forward: true, fallbackFrom: before)
+    snapSelectionToVisible(forward: true, fallbackFrom: before)
   }
 
   override func moveWordLeft(_ sender: Any?) {
     let before = endOfSelection(forwardMotion: false)
     super.moveWordLeft(sender)
-    translateAndCommitSelection(forward: false, fallbackFrom: before)
+    snapSelectionToVisible(forward: false, fallbackFrom: before)
   }
 
   override func moveWordRightAndModifySelection(_ sender: Any?) {
     let anchorBefore = anchorForExtension()
     let headBefore = endOfSelection(forwardMotion: true)
     super.moveWordRightAndModifySelection(sender)
-    translateAndCommitExtendedSelection(
+    snapExtendedSelectionToVisible(
       anchor: anchorBefore, headBefore: headBefore, forward: true)
   }
 
@@ -299,7 +178,7 @@ final class TextKit2MarkdownTextView: NSTextView {
     let anchorBefore = anchorForExtension()
     let headBefore = endOfSelection(forwardMotion: false)
     super.moveWordLeftAndModifySelection(sender)
-    translateAndCommitExtendedSelection(
+    snapExtendedSelectionToVisible(
       anchor: anchorBefore, headBefore: headBefore, forward: false)
   }
 
@@ -348,19 +227,32 @@ final class TextKit2MarkdownTextView: NSTextView {
     setSelectedRange(NSRange(location: lo, length: hi - lo))
   }
 
-  /// After delegating to super for a move, super has set the selection
-  /// using TK2's display-as-source result. Translate the new head through
-  /// the paragraph map; if translation moves us in the wrong direction or
-  /// stalls, fall back to a single-character source step from `fallbackFrom`.
-  private func translateAndCommitSelection(forward: Bool, fallbackFrom: Int) {
+  /// After delegating to super for a (non-extending) move, super has set the
+  /// selection at a real source offset (length-matching invariant). If the
+  /// destination is a hidden source char, snap to the nearest visible
+  /// position in the direction of motion. If super made no progress (or
+  /// went the wrong way), fall back to a single-source-step from
+  /// `fallbackFrom`.
+  private func snapSelectionToVisible(forward: Bool, fallbackFrom: Int) {
     let sel = selectedRange()
-    let rawHead = sel.length == 0 ? sel.location : sel.location + sel.length
-    let translated = displayOffsetToSource(rawHead)
+    let raw = sel.length == 0 ? sel.location : sel.location + sel.length
+    let snapped: Int
+    if let storage = textContentStorage,
+      let delegate = storage.delegate as? TextKit2ContentStorageDelegate,
+      delegate.hiddenIndexes.contains(raw)
+    {
+      snapped =
+        (forward
+          ? nextSourceOffset(after: raw)
+          : previousSourceOffset(before: raw)) ?? raw
+    } else {
+      snapped = raw
+    }
     let final: Int
-    if forward, translated > fallbackFrom {
-      final = translated
-    } else if !forward, translated < fallbackFrom {
-      final = translated
+    if forward, snapped > fallbackFrom {
+      final = snapped
+    } else if !forward, snapped < fallbackFrom {
+      final = snapped
     } else {
       // Super's destination was a no-op or wrong direction; fall back to
       // single-char source step.
@@ -372,37 +264,31 @@ final class TextKit2MarkdownTextView: NSTextView {
     setSelectedRange(NSRange(location: final, length: 0))
   }
 
-  private func translateAndCommitExtendedSelection(
+  private func snapExtendedSelectionToVisible(
     anchor: Int, headBefore: Int, forward: Bool
   ) {
     let sel = selectedRange()
-    let rawHead =
+    let raw =
       forward
       ? sel.location + sel.length
       : sel.location
-    var translated = displayOffsetToSource(rawHead)
-    if forward, translated <= headBefore {
-      translated = nextSourceOffset(after: headBefore) ?? headBefore
-    } else if !forward, translated >= headBefore {
-      translated = previousSourceOffset(before: headBefore) ?? headBefore
+    var snapped = raw
+    if let storage = textContentStorage,
+      let delegate = storage.delegate as? TextKit2ContentStorageDelegate,
+      delegate.hiddenIndexes.contains(raw)
+    {
+      snapped =
+        (forward
+          ? nextSourceOffset(after: raw)
+          : previousSourceOffset(before: raw)) ?? raw
     }
-    let lo = min(anchor, translated)
-    let hi = max(anchor, translated)
+    if forward, snapped <= headBefore {
+      snapped = nextSourceOffset(after: headBefore) ?? headBefore
+    } else if !forward, snapped >= headBefore {
+      snapped = previousSourceOffset(before: headBefore) ?? headBefore
+    }
+    let lo = min(anchor, snapped)
+    let hi = max(anchor, snapped)
     setSelectedRange(NSRange(location: lo, length: hi - lo))
-  }
-
-  /// Translate a display-offset-as-source value (what TK2 returns from
-  /// nav / hit-test) into a real source offset by walking the containing
-  /// paragraph's display-to-source map.
-  private func displayOffsetToSource(_ offset: Int) -> Int {
-    guard let storage = textContentStorage,
-      let delegate = storage.delegate as? TextKit2ContentStorageDelegate
-    else { return offset }
-    guard let para = paragraphRange(containing: offset) else { return offset }
-    let displayIdx = offset - para.location
-    let map = delegate.displayToSourceMap(forParagraphSourceRange: para)
-    if displayIdx < 0 { return offset }
-    if displayIdx < map.count { return map[displayIdx] }
-    return para.location + para.length
   }
 }
