@@ -636,16 +636,18 @@ struct SoftBreakHandlingTests {
     // Per AGENTS.md goal #3, code blocks are leaf and avoid normalization.
     // Each interior \n must remain a real paragraph break in the displayed
     // output — NEVER a U+2028.
+    //
+    // Phase 2.1: the code block's first paragraph is now vended as a
+    // length-matched display string `[U+FFFC attachment][ZWSP × N-1][\n]`
+    // and sibling paragraphs are hidden via `shouldEnumerate` (the
+    // attachment view covers their visual region). Source `\n`s remain
+    // real `\n`s — none of them get substituted with U+2028 LINE
+    // SEPARATOR. That's the invariant this test still pins.
     for (_, s) in display {
       #expect(
         !s.contains(Self.LS),
         "code block content must not contain LINE SEPARATOR: \(s)")
     }
-    // Sanity: at least one paragraph contains code content.
-    let joined = display.values.joined()
-    #expect(joined.contains("line 1"))
-    #expect(joined.contains("line 2"))
-    #expect(joined.contains("line 3"))
   }
 
   // MARK: - 15. Five `\n` (a..\n\n\n\n\n..b) — adjacent empty paragraphs

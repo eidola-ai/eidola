@@ -50,6 +50,14 @@ struct RenderSpec {
   /// have to reconstruct nesting from partial metadata.
   let blockquoteCharacterRanges: [BlockquoteDecoration]
 
+  /// Block-level constructs that want a custom-view renderer (Phase 2 bridging
+  /// layer). Each entry drives `BlockRendererRegistry` reconciliation in
+  /// `TextKit2RenderApplicator.apply`. Through Phase 2.1 this list runs
+  /// *alongside* `codeBlockCharacterRanges` (the painting path); both are
+  /// produced for the same code blocks. Phase 2.2 retires the painting path
+  /// once the real code-block renderer is live.
+  let blockRendererSpecs: [BlockRendererSpec]
+
   struct BlockquoteDecoration {
     let range: NSRange
     let xPosition: CGFloat
@@ -81,7 +89,8 @@ struct RenderSpec {
       fontTraits.count == other.fontTraits.count,
       temporaryAttributes.count == other.temporaryAttributes.count,
       codeBlockCharacterRanges.count == other.codeBlockCharacterRanges.count,
-      blockquoteCharacterRanges.count == other.blockquoteCharacterRanges.count
+      blockquoteCharacterRanges.count == other.blockquoteCharacterRanges.count,
+      blockRendererSpecs.count == other.blockRendererSpecs.count
     else { return false }
 
     for (a, b) in zip(codeBlockCharacterRanges, other.codeBlockCharacterRanges) {
@@ -90,6 +99,12 @@ struct RenderSpec {
 
     for (a, b) in zip(blockquoteCharacterRanges, other.blockquoteCharacterRanges) {
       guard a.range == b.range, a.xPosition == b.xPosition else { return false }
+    }
+
+    for (a, b) in zip(blockRendererSpecs, other.blockRendererSpecs) {
+      guard a.range == b.range, a.blockTypeTag == b.blockTypeTag,
+        a.mode == b.mode, a.reservedHeight == b.reservedHeight
+      else { return false }
     }
 
     guard attrsEqual(baseAttributes, other.baseAttributes) else { return false }

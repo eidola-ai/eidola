@@ -18,6 +18,13 @@ final class TextKit2LayoutManagerDelegate: NSObject, @MainActor NSTextLayoutMana
   var codeBlockCharacterRanges: [RenderSpec.CodeBlockDecoration] = []
   var blockquoteCharacterRanges: [RenderSpec.BlockquoteDecoration] = []
 
+  /// Phase 2 bridging-layer: spec ranges that drive block-renderer hosts.
+  /// When vending a fragment for the FIRST paragraph of one of these
+  /// ranges, the delegate flips `containsBlockAttachment` on the fragment
+  /// so its `renderingSurfaceBounds` widens to encompass the attachment
+  /// view (which can be much taller than the host glyph line).
+  var blockRendererSpecs: [BlockRendererSpec] = []
+
   /// Container width in points. Updated by `apply()` and on container
   /// resize. Vended fragments use this to draw a full-width background up
   /// to the right edge.
@@ -65,6 +72,17 @@ final class TextKit2LayoutManagerDelegate: NSObject, @MainActor NSTextLayoutMana
         .map { $0.xPosition }
       if !borders.isEmpty {
         fragment.blockquoteBorderXPositions = borders
+      }
+
+      // Block-renderer attachment: only the FIRST paragraph of a spec range
+      // carries the U+FFFC attachment, so widen the surface bounds only on
+      // that paragraph. Sibling paragraphs are hidden by the content
+      // delegate's `shouldEnumerate` and never reach this hook.
+      if let spec = blockRendererSpecs.first(where: {
+        $0.range.location == paragraphSource.location
+      }) {
+        fragment.containsBlockAttachment = true
+        fragment.blockAttachmentReservedHeight = spec.reservedHeight
       }
     }
 

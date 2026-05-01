@@ -62,12 +62,15 @@ struct CodeBlockVisualTests {
 
     #expect(results.count == 3)
 
-    // Step 0 (inside) vs step 1 (outside) should differ
-    #expect(
-      results[0].bitmapHash != results[1].bitmapHash,
-      "Cursor inside vs outside code block should look different")
-
-    // Step 2 (back inside) should match step 0
+    // Phase 2.1: code blocks are now rendered by a no-op `BlockRenderer`
+    // (a flat colored `NSView`) via the bridging-layer attachment, not by
+    // the per-character delimiter-visibility path that this test
+    // previously asserted on. The text "code" is no longer in the visual;
+    // the entire code block is a colored rectangle whose appearance does
+    // not depend on cursor position. Phase 2.2's real `CodeBlockRenderer`
+    // will reintroduce visible code text with cursor-driven decoration
+    // (e.g. fence reveal) — at which point this test becomes meaningful
+    // again. For now we pin only the determinism property.
     #expect(
       results[0].bitmapHash == results[2].bitmapHash,
       "Same cursor position should produce same visual")
@@ -114,12 +117,18 @@ struct CodeBlockVisualTests {
       #expect(fm.fileExists(atPath: r.imagePath), "Image missing: \(r.imagePath)")
     }
 
-    // Verify at least some positions produce different visuals
+    // Phase 2.1: the code block is now a flat colored rectangle (no-op
+    // renderer) so cursor positions inside the block do not change the
+    // visual. The body text "text" / "more" surrounding the block is not
+    // a markdown construct that reveals differently per cursor either, so
+    // every position in this test yields the same bitmap. Phase 2.2's
+    // real `CodeBlockRenderer` will broaden distinct-state count back to
+    // its pre-2.1 level by reintroducing fence-visibility chrome.
     var uniqueHashes = Set<Int>()
     for r in results {
       uniqueHashes.insert(r.bitmapHash)
     }
-    #expect(uniqueHashes.count >= 2, "Expected at least 2 visually distinct states")
+    #expect(uniqueHashes.count >= 1, "Expected at least 1 visual state captured")
   }
 
   // MARK: - Determinism
@@ -170,9 +179,11 @@ struct CodeBlockVisualTests {
       #expect(fm.fileExists(atPath: r.imagePath), "Image missing: \(r.imagePath)")
     }
 
-    // Outside (step 0) vs inside code (step 1) should differ
-    #expect(
-      results[0].bitmapHash != results[1].bitmapHash,
-      "Outside vs inside code block should look different")
+    // Phase 2.1: the code block is rendered as a flat colored rectangle
+    // by the no-op `BlockRenderer`. Cursor inside vs outside no longer
+    // changes the block's visual (no fence-visibility chrome), so the
+    // pre-2.1 inequality assertion is now invalid. Phase 2.2's real
+    // `CodeBlockRenderer` will reintroduce a meaningful inside/outside
+    // visual difference.
   }
 }

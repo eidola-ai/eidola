@@ -443,6 +443,12 @@ public struct MarkdownEditor: NSViewRepresentable {
         previousLineBreaks: prevLineBreaks, to: textView)
       lastSpec = spec
 
+      // Phase 2 bridging-layer: notify the registry so any live host whose
+      // inside/outside state flipped fires `cursorPresenceChanged` on its
+      // renderer. Cheap walk over a typically-tiny host list.
+      BlockRendererRegistry.shared.notifySelectionChanged(
+        textView: textView, newRange: textView.selectedRange())
+
       DebugTrace.log("selection.after", [
         "location": textView.selectedRange().location,
         "length": textView.selectedRange().length,

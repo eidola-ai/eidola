@@ -25,6 +25,7 @@ enum MarkdownRenderer {
     var temporaryAttributes: [RenderSpec.StyledRange] = []
     var codeBlockCharacterRanges: [RenderSpec.CodeBlockDecoration] = []
     var blockquoteCharacterRanges: [RenderSpec.BlockquoteDecoration] = []
+    var blockRendererSpecs: [BlockRendererSpec] = []
   }
 
   static func render(
@@ -52,7 +53,8 @@ enum MarkdownRenderer {
         lineBreakIndexes: IndexSet(),
         temporaryAttributes: [],
         codeBlockCharacterRanges: [],
-        blockquoteCharacterRanges: []
+        blockquoteCharacterRanges: [],
+        blockRendererSpecs: []
       )
     }
 
@@ -72,7 +74,8 @@ enum MarkdownRenderer {
         lineBreakIndexes: IndexSet(),
         temporaryAttributes: [],
         codeBlockCharacterRanges: [],
-        blockquoteCharacterRanges: []
+        blockquoteCharacterRanges: [],
+        blockRendererSpecs: []
       )
     }
 
@@ -152,7 +155,8 @@ enum MarkdownRenderer {
       lineBreakIndexes: accumulator.lineBreakIndexes,
       temporaryAttributes: accumulator.temporaryAttributes,
       codeBlockCharacterRanges: accumulator.codeBlockCharacterRanges,
-      blockquoteCharacterRanges: accumulator.blockquoteCharacterRanges
+      blockquoteCharacterRanges: accumulator.blockquoteCharacterRanges,
+      blockRendererSpecs: accumulator.blockRendererSpecs
     )
   }
 
@@ -419,6 +423,39 @@ enum MarkdownRenderer {
 
       accumulator.codeBlockCharacterRanges.append(
         RenderSpec.CodeBlockDecoration(range: safeRange, xOrigin: boxOrigin))
+
+      // Phase 2.1: emit a BlockRendererSpec alongside the painting decoration
+      // so the bridging-layer infrastructure can reconcile a per-block host
+      // and its custom-view renderer (no-op renderer through 2.1, real
+      // CodeBlockRenderer in 2.2). The painting path stays active so the
+      // code-block background and font styling continue to render correctly
+      // until the renderer takes over.
+      //
+      // Reserved height is estimated from font metrics: one line per source
+      // paragraph in the block range, sized at the code font's natural
+      // line height. The applicator never consults the live renderer for
+      // sizing — this estimate is what AppKit uses for layout.
+      let lineCount: Int = {
+        var count = 1
+        let endOffset = min(safeRange.location + safeRange.length, textLength)
+        var i = safeRange.location
+        while i < endOffset {
+          if nsText.character(at: i) == UInt16(0x000A), i + 1 < endOffset {
+            count += 1
+          }
+          i += 1
+        }
+        return count
+      }()
+      let reservedHeight = CGFloat(lineCount) * style.codeFont.boundingRectForFont.height
+        * style.lineHeightMultiple
+      accumulator.blockRendererSpecs.append(
+        BlockRendererSpec(
+          range: safeRange,
+          blockTypeTag: .codeBlock,
+          mode: .editInPlace,
+          reservedHeight: reservedHeight
+        ))
 
       var delimiterRanges = [openingFenceRange]
       if let closingFenceRange {
