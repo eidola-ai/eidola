@@ -44,6 +44,8 @@ enum TextKit2RenderApplicator {
       delegate.uncheckedCheckboxIndexes = spec.uncheckedCheckboxIndexes
       delegate.checkedCheckboxIndexes = spec.checkedCheckboxIndexes
       delegate.lineBreakIndexes = spec.lineBreakIndexes
+      delegate.blockRendererSpecs = spec.blockRendererSpecs
+      delegate.textView = textView
     }
 
     // Phase 3: write the per-paragraph decoration ranges (code block bg,
@@ -56,6 +58,7 @@ enum TextKit2RenderApplicator {
     {
       layoutDelegate.codeBlockCharacterRanges = spec.codeBlockCharacterRanges
       layoutDelegate.blockquoteCharacterRanges = spec.blockquoteCharacterRanges
+      layoutDelegate.blockRendererSpecs = spec.blockRendererSpecs
       if let containerWidth = textView.textLayoutManager?.textContainer?.size.width,
         containerWidth > 0,
         containerWidth < CGFloat.greatestFiniteMagnitude
@@ -63,6 +66,17 @@ enum TextKit2RenderApplicator {
         layoutDelegate.containerWidth = containerWidth
       }
     }
+
+    // Phase 2 bridging-layer: reconcile the registry's live host table for
+    // this text view against the new spec list. New ranges get fresh hosts
+    // built from the registered factory; retired ranges have their hosts
+    // disposed; existing hosts get `updateSpec(_:)`. This MUST happen
+    // before the content-delegate paragraph rebuild below so that when the
+    // delegate vends an attachment-paragraph, the corresponding host
+    // exists in the registry and the attachment can resolve its view via
+    // `BlockAttachment.viewProvider(for:...)`.
+    BlockRendererRegistry.shared.reconcile(
+      for: textView, specs: spec.blockRendererSpecs)
 
     // Save scroll position — full-range attribute reset triggers layout
     // invalidation that can momentarily displace the scroll origin.

@@ -59,6 +59,23 @@ final class TextKit2ContentStorageDelegate: NSObject,
   /// has a stable target.
   var lineBreakIndexes: IndexSet = IndexSet()
 
+  /// Phase 2 bridging-layer: block-level renderer specs. The first
+  /// paragraph of every spec range is vended as a length-matched display
+  /// string `[U+FFFC attachment][ZWSP × (length - 1)][\n]`. Sibling
+  /// paragraphs (those whose source range is wholly inside the spec range
+  /// but does not start at it) are hidden via `shouldEnumerate` so the
+  /// attachment view covers their visual region.
+  ///
+  /// Weak-coupled to `BlockRendererRegistry`: the attachment carries a
+  /// back-reference to the host the registry's reconciliation built for
+  /// the same range.
+  var blockRendererSpecs: [BlockRendererSpec] = []
+
+  /// Weak link to the text view used for resolving hosts. Set by the
+  /// applicator on every `apply()`. The text view owns the registry
+  /// entries keyed by its identity.
+  weak var textView: NSTextView?
+
   // MARK: - Substitution glyphs
 
   private static let bulletString = "\u{2022}"  // •
@@ -83,6 +100,24 @@ final class TextKit2ContentStorageDelegate: NSObject,
     paragraphBuildCount += 1
     guard let attr = textContentStorage.attributedString else { return nil }
     guard NSMaxRange(range) <= attr.length else { return nil }
+
+    // Phase 2 bridging-layer: if this paragraph is the FIRST paragraph of a
+    // block-renderer spec range, vend an attachment-bearing display string.
+    // The first paragraph hosts the U+FFFC attachment glyph; subsequent
+    // paragraphs in the same spec range are hidden from layout via the
+    // `shouldEnumerate` hook below — the attachment view covers their
+    // visual region. Length-matching invariant holds: the attachment
+    // paragraph's display string is exactly `range.length` UTF-16 units
+    // (one U+FFFC + (range.length - 2) ZWSPs + one `\n`, or analogous
+    // when there's no trailing newline).
+    if let spec = blockRendererSpecs.first(where: { $0.range.location == range.location }) {
+      if let p = buildAttachmentParagraph(
+        sourceRange: range, spec: spec, attr: attr)
+      {
+        return p
+      }
+    }
+
     let source = attr.attributedSubstring(from: range)
 
     // Identify the trailing paragraph separator (a `\n`) so we can guarantee
@@ -156,6 +191,94 @@ final class TextKit2ContentStorageDelegate: NSObject,
     return NSTextParagraph(attributedString: display)
   }
 
+  /// Build the attachment-bearing display paragraph for the FIRST paragraph
+  /// of a block-renderer spec range. The display string layout is:
+  ///
+  ///     [U+FFFC attachment] [ZWSP × (range.length - 1 - trailingNewline?1:0)] [\n]?
+  ///
+  /// Total UTF-16 length equals `range.length`, preserving the length-
+  /// matching invariant for this paragraph.
+  ///
+  /// The attachment carries a back-reference to the host (resolved via
+  /// `BlockRendererRegistry.shared.host(for:atSourceOffset:)`), which the
+  /// view provider uses on `loadView()` to vend the renderer's view.
+  /// Returns `nil` if no live host exists for the spec — in which case the
+  /// caller falls through to the regular per-character substitution path.
+  private func buildAttachmentParagraph(
+    sourceRange range: NSRange,
+    spec: BlockRendererSpec,
+    attr: NSAttributedString
+  ) -> NSTextParagraph? {
+    guard let textView,
+      let host = BlockRendererRegistry.shared.host(
+        for: textView, atSourceOffset: spec.range.location)
+    else { return nil }
+
+    let source = attr.attributedSubstring(from: range)
+    let srcNS = source.string as NSString
+    let endsWithNewline =
+      srcNS.length > 0 && srcNS.character(at: srcNS.length - 1) == UInt16(0x0A)
+    let firstAttrs = source.attributes(at: 0, effectiveRange: nil)
+
+    // Build the attachment-glyph attributes: copy the source paragraph's
+    // existing attributes (head indent, font, color, etc.) but override the
+    // paragraph style to pin the line containing the U+FFFC at exactly
+    // `spec.reservedHeight` points tall.
+    //
+    // Why this is necessary: TK2 does NOT auto-grow the line containing an
+    // attachment to match `attachmentBounds.height`. Without the
+    // line-height pin, the line stays at the code font's natural height and
+    // the attachment view's frame extends UPWARD over preceding paragraphs
+    // (the attachment is anchored at the natural line's baseline). Forcing
+    // `minimumLineHeight == maximumLineHeight == reservedHeight` makes TK2
+    // reserve the full vertical region inside the line itself, so siblings
+    // above the block don't get overlapped.
+    let attachmentParaStyle: NSParagraphStyle = {
+      let base = (firstAttrs[.paragraphStyle] as? NSParagraphStyle) ?? .default
+      let mutable = (base.mutableCopy() as? NSMutableParagraphStyle) ?? NSMutableParagraphStyle()
+      mutable.minimumLineHeight = spec.reservedHeight
+      mutable.maximumLineHeight = spec.reservedHeight
+      return mutable
+    }()
+    var attachmentAttrs = firstAttrs
+    attachmentAttrs[.paragraphStyle] = attachmentParaStyle
+
+    let display = NSMutableAttributedString()
+    // Use the host's cached attachment so view-provider identity is stable
+    // across the inevitable re-vends (every selection / edit triggers a
+    // paragraph rebuild). A fresh `BlockAttachment` here would make AppKit
+    // drop the embedded view and substitute the default placeholder icon.
+    let attachment = host.ensureAttachment()
+    display.append(NSAttributedString(attachment: attachment))
+    // Apply the line-height-overriding attributes to the U+FFFC glyph.
+    display.addAttributes(attachmentAttrs, range: NSRange(location: 0, length: 1))
+
+    let padCount = max(0, range.length - 1 - (endsWithNewline ? 1 : 0))
+    if padCount > 0 {
+      display.append(
+        NSAttributedString(
+          string: String(repeating: Self.zeroWidthSpace, count: padCount),
+          attributes: firstAttrs))
+    }
+
+    if endsWithNewline {
+      // Pin the trailing newline to the same line height too — otherwise the
+      // paragraph separator can establish a smaller line above/below the
+      // attachment region and the layout fragment's reported height drifts
+      // off `reservedHeight`.
+      let nlChar = source.attributedSubstring(
+        from: NSRange(location: srcNS.length - 1, length: 1))
+      let nlMutable = NSMutableAttributedString(attributedString: nlChar)
+      nlMutable.addAttribute(
+        .paragraphStyle,
+        value: attachmentParaStyle,
+        range: NSRange(location: 0, length: nlMutable.length))
+      display.append(nlMutable)
+    }
+
+    return NSTextParagraph(attributedString: display)
+  }
+
   // MARK: - NSTextContentManagerDelegate
 
   /// Hide source paragraphs whose entire content has been absorbed into
@@ -165,11 +288,20 @@ final class TextKit2ContentStorageDelegate: NSObject,
   /// separator. Returning `false` here tells `enumerateTextElements` to
   /// skip the element entirely — it contributes no layout.
   ///
-  /// This is the SINGLE exception to the length-matching invariant: the
-  /// element isn't vended at all, so there's no displayed paragraph for
-  /// the cursor to land in. Forward / backward arrow-key motion still
-  /// strides past the absorbed source chars because they're in
-  /// `hiddenIndexes` and the move overrides skip them.
+  /// Also hides "sibling" paragraphs of a block-renderer spec range — i.e.
+  /// paragraphs whose source range falls inside a spec range but does NOT
+  /// start at the spec's `range.location`. The first paragraph of the
+  /// range carries the U+FFFC attachment whose view covers the whole
+  /// block's visual region; the siblings would otherwise contribute their
+  /// own lines below it. This is the same "fully hidden via shouldEnumerate"
+  /// exception to the length-matching invariant the inter-block-gap
+  /// absorption uses.
+  ///
+  /// Forward / backward arrow-key motion still strides past the absorbed
+  /// source chars because they're in `hiddenIndexes` (or, for sibling
+  /// paragraphs, the move overrides walk source positions and the
+  /// attachment paragraph's vended display covers the first source
+  /// paragraph's range only — Phase 2.2 adds the in-block selection-snap).
   func textContentManager(
     _ textContentManager: NSTextContentManager,
     shouldEnumerate textElement: NSTextElement,
@@ -183,6 +315,18 @@ final class TextKit2ContentStorageDelegate: NSObject,
     let elementLength = storage.offset(
       from: elementRange.location, to: elementRange.endLocation)
     guard elementLength > 0 else { return true }
+
+    // Sibling-paragraph hide for block-renderer specs: the FIRST paragraph
+    // of a spec range carries the attachment and should be enumerated;
+    // every subsequent paragraph inside the same range is hidden.
+    for spec in blockRendererSpecs {
+      if elementOffset > spec.range.location
+        && elementOffset < spec.range.location + spec.range.length
+      {
+        return false
+      }
+    }
+
     for i in 0..<elementLength {
       if !hiddenIndexes.contains(elementOffset + i) {
         return true

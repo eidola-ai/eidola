@@ -331,6 +331,49 @@ final class TextKit2MarkdownTextView: NSTextView {
     setSelectedRange(NSRange(location: final, length: 0))
   }
 
+  // MARK: - Block-renderer selection snap (Phase 2 bridging-layer)
+
+  /// Expand `proposed` to either fully include or fully exclude any
+  /// `cursorConditional` block-renderer range it partially overlaps. Used
+  /// by `setSelectedRange` and the mouse-drag path so selection cannot
+  /// stop in the middle of a rendered visual (an image, a math block) —
+  /// it must include the whole block or none of it.
+  ///
+  /// For Phase 2.1 the only registered renderer is the no-op `.codeBlock`
+  /// renderer, which uses `editInPlace` mode, so this helper is dormant
+  /// (the registry lookup returns `nil` and `proposed` is returned
+  /// unchanged). Phase 2.2 / image renderer activates it by registering
+  /// a `cursorConditional` renderer.
+  func snapSelectionAcrossBlockBoundaries(proposed: NSRange) -> NSRange {
+    guard let blockRange = BlockRendererRegistry.shared
+      .cursorConditionalRange(for: self, overlapping: proposed)
+    else { return proposed }
+
+    let proposedEnd = proposed.location + proposed.length
+    let blockEnd = blockRange.location + blockRange.length
+    let containedFully =
+      proposed.location <= blockRange.location && proposedEnd >= blockEnd
+    if containedFully { return proposed }
+
+    // Partial overlap. Decide direction by which endpoint of `proposed`
+    // sits outside the block; expand the inside endpoint to the matching
+    // block edge.
+    if proposed.location < blockRange.location {
+      // Selection extends INTO the block from the left → grow to include
+      // the whole block.
+      let newEnd = max(proposedEnd, blockEnd)
+      return NSRange(location: proposed.location, length: newEnd - proposed.location)
+    } else if proposedEnd > blockEnd {
+      // Selection extends INTO the block from the right → grow leftward.
+      let newStart = min(proposed.location, blockRange.location)
+      return NSRange(location: newStart, length: proposedEnd - newStart)
+    } else {
+      // Wholly inside the block but not covering it. Expand to cover the
+      // whole block (selection started inside — extend to encompass).
+      return blockRange
+    }
+  }
+
   private func snapExtendedSelectionToVisible(
     anchor: Int, headBefore: Int, forward: Bool
   ) {

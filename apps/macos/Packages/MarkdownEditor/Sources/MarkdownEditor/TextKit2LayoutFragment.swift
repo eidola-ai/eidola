@@ -44,6 +44,18 @@ final class TextKit2LayoutFragment: NSTextLayoutFragment {
   /// at vend time and on container resize.
   nonisolated(unsafe) var containerWidth: CGFloat = 0
 
+  /// Phase 2 bridging-layer: set by the layout-manager delegate when this
+  /// fragment vends a paragraph that contains a `BlockAttachment`. When
+  /// `true`, `renderingSurfaceBounds` widens to encompass the attachment's
+  /// reserved region (which can be substantially taller than the host
+  /// glyph line) so AppKit doesn't clip the embedded view's redraw.
+  nonisolated(unsafe) var containsBlockAttachment: Bool = false
+
+  /// Reserved height of the attachment, in points. Carried alongside
+  /// `containsBlockAttachment` so the surface-bounds widening can size
+  /// itself even before the attachment view has reported its frame.
+  nonisolated(unsafe) var blockAttachmentReservedHeight: CGFloat = 0
+
   // MARK: - Style
 
   /// Mirrors `CodeBlockBackgroundLayoutManager`'s default — translucent so
@@ -126,7 +138,10 @@ final class TextKit2LayoutFragment: NSTextLayoutFragment {
 
   override var renderingSurfaceBounds: CGRect {
     let glyphBounds = super.renderingSurfaceBounds
-    guard codeBlockOrigin != nil || !blockquoteBorderXPositions.isEmpty else {
+    guard codeBlockOrigin != nil
+      || !blockquoteBorderXPositions.isEmpty
+      || containsBlockAttachment
+    else {
       return glyphBounds
     }
 
@@ -138,11 +153,16 @@ final class TextKit2LayoutFragment: NSTextLayoutFragment {
     let localOriginX = -frame.origin.x
     let snappedLocalY = round(frame.origin.y) - frame.origin.y
     let snappedHeight = max(0, round(frame.origin.y + frame.height) - round(frame.origin.y))
+    // When the fragment hosts a block attachment, the attachment's view
+    // can be much taller than the host glyph line. Widen the height to
+    // the spec's reserved region so AppKit's clip doesn't truncate the
+    // embedded view's redraw region.
+    let attachmentHeight: CGFloat = containsBlockAttachment ? blockAttachmentReservedHeight : 0
     let widened = CGRect(
       x: localOriginX,
       y: min(glyphBounds.minY, snappedLocalY),
       width: max(containerWidth, glyphBounds.maxX - localOriginX),
-      height: max(snappedHeight, glyphBounds.height))
+      height: max(snappedHeight, glyphBounds.height, attachmentHeight))
     return widened.union(glyphBounds)
   }
 }
