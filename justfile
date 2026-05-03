@@ -92,6 +92,16 @@ check:
     cargo fmt --check
     git ls-files '*.swift' | xargs swift format lint --strict
 
+# Render gpui views to PNGs in apps/gui/tests/snapshots/ — local-only debug
+# aid (gitignored), not a regression gate. Pixel diffs aren't bit-stable
+# across machines, so committed regression checks live in tests/behavior.rs.
+render-snapshots *args:
+    cargo test -p eidola-gui --test visual {{ args }}
+
+# Accept the current rendered output as the new local visual baseline.
+render-snapshots-update:
+    UPDATE_SNAPSHOTS=1 cargo test -p eidola-gui --test visual
+
 # Run all tests (Rust + Swift on macOS)
 test:
     #!/usr/bin/env bash

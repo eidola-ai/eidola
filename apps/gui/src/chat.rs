@@ -24,12 +24,43 @@ pub struct ChatView {
     core: Entity<Core>,
     prompt_state: Entity<InputState>,
     space_id: Option<String>,
-    messages: Vec<SpaceMessage>,
-    thinking: bool,
+    /// Conversation history shown in the scroll view. `pub` so snapshot tests
+    /// can render the view in a populated state without driving async chat.
+    pub messages: Vec<SpaceMessage>,
+    /// Whether to show the "Thinking…" indicator. `pub` for tests; production
+    /// code only flips this from inside `submit`.
+    pub thinking: bool,
     error: Option<String>,
 
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+impl ChatView {
+    /// The focus handle the view tracks. Exposed so behavior tests can dispatch
+    /// actions through it the same way real keystrokes would.
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
+    /// Test-only access to the prompt input state, for behavior tests that
+    /// want to populate it the way a typing user would.
+    #[doc(hidden)]
+    pub fn prompt_state_for_test(&self) -> Entity<InputState> {
+        self.prompt_state.clone()
+    }
+
+    /// Test-only setter for snapshot tests.
+    #[doc(hidden)]
+    pub fn set_messages_for_test(&mut self, messages: Vec<SpaceMessage>) {
+        self.messages = messages;
+    }
+
+    /// Test-only setter for snapshot tests.
+    #[doc(hidden)]
+    pub fn set_thinking_for_test(&mut self, thinking: bool) {
+        self.thinking = thinking;
+    }
 }
 
 impl ChatView {
@@ -86,7 +117,12 @@ impl ChatView {
         self.error = None;
         cx.notify();
 
-        let app_core = self.core.read(cx).app_core();
+        let Some(app_core) = self.core.read(cx).app_core() else {
+            // Stub core (behavior tests): the local state update above has
+            // already happened; without a real backend there is nothing more
+            // to do.
+            return;
+        };
         let space_id = self.space_id.clone();
 
         cx.spawn(async move |this: WeakEntity<Self>, cx| {

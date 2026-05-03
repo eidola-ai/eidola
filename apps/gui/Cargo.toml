@@ -21,3 +21,19 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 
 eidola-app-core = { path = "../../crates/eidola-app-core" }
 tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+# Pulls in `VisualTestAppContext` and `Window::render_to_image`. Cargo unifies
+# this with the regular `gpui` dep, so feature flags merge for dev/test builds.
+gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support", "font-kit"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[test]]
+name = "visual"
+path = "tests/visual.rs"
+# Skip libtest's worker-thread harness — VisualTestAppContext talks to AppKit
+# and must run on the main thread. With `harness = false` the test binary's
+# `fn main()` runs directly, on whatever thread cargo invokes it on (the OS
+# main thread for `cargo test --test visual` on macOS).
+harness = false

@@ -16,7 +16,9 @@ use tokio::sync::oneshot;
 /// `Entity<Core>` can read the latest value via `.read(cx)` and re-render on
 /// `cx.notify()`.
 pub struct Core {
-    inner: Arc<AppCore>,
+    /// Real backend. `None` only in snapshot/visual tests, where views are
+    /// rendered against a fixed cached state and never trigger async work.
+    inner: Option<Arc<AppCore>>,
 
     pub config_state: Option<ConfigState>,
     pub balances: Option<BalancesResult>,
@@ -39,7 +41,7 @@ impl Core {
         let config_state = Some(inner.config_state());
 
         cx.new(|_| Self {
-            inner,
+            inner: Some(inner),
             config_state,
             balances: None,
             prices: Vec::new(),
@@ -50,16 +52,36 @@ impl Core {
         })
     }
 
+    /// Builds a `Core` with no real backend, for use in snapshot tests.
+    /// Tests mutate the public state fields directly to set up the scene to
+    /// render. Calling any method that needs the backend will panic.
+    pub fn stub() -> Self {
+        Self {
+            inner: None,
+            config_state: None,
+            balances: None,
+            prices: Vec::new(),
+            credentials: Vec::new(),
+            models: Vec::new(),
+            error_message: None,
+            busy: false,
+        }
+    }
+
     /// Direct access to the underlying `AppCore`. Use this when a view needs
     /// to spawn its own async work (e.g. chat completion) on the core's
-    /// runtime without going through a cached field on `Core`.
-    pub fn app_core(&self) -> Arc<AppCore> {
+    /// runtime without going through a cached field on `Core`. Returns `None`
+    /// for stub cores (snapshot/behavior tests); callers should treat that as
+    /// "do the local state update but skip any backend work".
+    pub fn app_core(&self) -> Option<Arc<AppCore>> {
         self.inner.clone()
     }
 
     fn refresh_config(&mut self, cx: &mut Context<Self>) {
-        self.config_state = Some(self.inner.config_state());
-        cx.notify();
+        if let Some(inner) = self.inner.as_ref() {
+            self.config_state = Some(inner.config_state());
+            cx.notify();
+        }
     }
 
     fn set_error(&mut self, err: AppError, cx: &mut Context<Self>) {
@@ -79,7 +101,10 @@ impl Core {
     // ------------------------------------------------------------------
 
     pub fn set_base_url(&mut self, url: String, cx: &mut Context<Self>) {
-        match self.inner.set_base_url(url) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        match inner.set_base_url(url) {
             Ok(()) => self.refresh_config(cx),
             Err(e) => self.set_error(e, cx),
         }
@@ -87,7 +112,10 @@ impl Core {
 
     #[allow(dead_code)]
     pub fn set_attestation_url(&mut self, url: String, cx: &mut Context<Self>) {
-        match self.inner.set_attestation_url(url) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        match inner.set_attestation_url(url) {
             Ok(()) => self.refresh_config(cx),
             Err(e) => self.set_error(e, cx),
         }
@@ -95,14 +123,20 @@ impl Core {
 
     #[allow(dead_code)]
     pub fn set_account_credentials(&mut self, id: String, secret: String, cx: &mut Context<Self>) {
-        match self.inner.set_account_credentials(id, secret) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        match inner.set_account_credentials(id, secret) {
             Ok(()) => self.refresh_config(cx),
             Err(e) => self.set_error(e, cx),
         }
     }
 
     pub fn reset_account(&mut self, cx: &mut Context<Self>) {
-        match self.inner.reset_account() {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        match inner.reset_account() {
             Ok(()) => self.refresh_config(cx),
             Err(e) => self.set_error(e, cx),
         }
@@ -113,7 +147,9 @@ impl Core {
     // ------------------------------------------------------------------
 
     pub fn create_account(&mut self, cx: &mut Context<Self>) {
-        let core = self.inner.clone();
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
         self.spawn(
             cx,
             move || async move { core.account_create().await },
@@ -125,7 +161,9 @@ impl Core {
     }
 
     pub fn fetch_balances(&mut self, cx: &mut Context<Self>) {
-        let core = self.inner.clone();
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
         self.spawn(
             cx,
             move || async move { core.account_balances().await },
@@ -140,7 +178,9 @@ impl Core {
     }
 
     pub fn fetch_prices(&mut self, cx: &mut Context<Self>) {
-        let core = self.inner.clone();
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
         self.spawn(
             cx,
             move || async move { core.account_prices().await },
@@ -155,7 +195,9 @@ impl Core {
     }
 
     pub fn fetch_credentials(&mut self, cx: &mut Context<Self>) {
-        let core = self.inner.clone();
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
         self.spawn(
             cx,
             move || async move { core.wallet_credentials().await },
@@ -170,7 +212,9 @@ impl Core {
     }
 
     pub fn fetch_models(&mut self, cx: &mut Context<Self>) {
-        let core = self.inner.clone();
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
         self.spawn(
             cx,
             move || async move { core.available_models().await },
@@ -185,8 +229,10 @@ impl Core {
     }
 
     pub fn allocate_credits(&mut self, credits: i64, cx: &mut Context<Self>) {
-        let core = self.inner.clone();
-        let core_for_then = self.inner.clone();
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
+        let core_for_then = core.clone();
         self.spawn(
             cx,
             move || async move { core.account_allocate(credits).await },
@@ -239,11 +285,15 @@ impl Core {
         if self.busy {
             return;
         }
+        let Some(inner) = self.inner.as_ref() else {
+            // Stub core (snapshot tests) — no backend to drive.
+            return;
+        };
         self.busy = true;
         self.error_message = None;
         cx.notify();
 
-        let handle = self.inner.runtime().handle().clone();
+        let handle = inner.runtime().handle().clone();
         let (tx, rx) = oneshot::channel();
         handle.spawn(async move {
             let res = make_fut().await;
