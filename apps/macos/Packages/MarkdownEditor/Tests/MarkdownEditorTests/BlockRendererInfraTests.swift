@@ -368,8 +368,10 @@ struct BlockRendererInfraTests {
     let renderer = CountingRenderer()
     BlockRendererRegistry.shared.register(.codeBlock) { renderer }
     defer {
-      // Restore the no-op renderer for subsequent tests.
-      BlockRendererRegistry.shared.register(.codeBlock) { NoopBlockRenderer() }
+      // Restore the production renderer for subsequent tests. (Pre-2.2
+      // this restored `NoopBlockRenderer`, which was the default through
+      // Phase 2.1; 2.2 replaces it with `CodeBlockRenderer`.)
+      BlockRendererRegistry.shared.register(.codeBlock) { CodeBlockRenderer() }
     }
 
     let c = Self.makeComponents()

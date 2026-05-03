@@ -28,18 +28,6 @@ let package = Package(
       name: "MarkdownEditorScript",
       dependencies: ["MarkdownEditor"]
     ),
-    .executableTarget(
-      name: "BlockRendererSpikeS1"
-    ),
-    .executableTarget(
-      name: "BlockRendererSpikeS1_1"
-    ),
-    .executableTarget(
-      name: "BlockRendererSpikeS2"
-    ),
-    .executableTarget(
-      name: "BlockRendererSpikeS3"
-    ),
     .testTarget(
       name: "MarkdownEditorTests",
       dependencies: ["MarkdownEditor"]

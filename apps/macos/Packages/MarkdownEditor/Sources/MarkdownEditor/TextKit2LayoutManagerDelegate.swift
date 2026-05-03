@@ -15,7 +15,6 @@ final class TextKit2LayoutManagerDelegate: NSObject, @MainActor NSTextLayoutMana
 
   // MARK: - Spec inputs (written by TextKit2RenderApplicator)
 
-  var codeBlockCharacterRanges: [RenderSpec.CodeBlockDecoration] = []
   var blockquoteCharacterRanges: [RenderSpec.BlockquoteDecoration] = []
 
   /// Phase 2 bridging-layer: spec ranges that drive block-renderer hosts.
@@ -56,13 +55,6 @@ final class TextKit2LayoutManagerDelegate: NSObject, @MainActor NSTextLayoutMana
       let start = contentManager.offset(from: documentRange.location, to: elementRange.location)
       let length = contentManager.offset(from: elementRange.location, to: elementRange.endLocation)
       let paragraphSource = NSRange(location: start, length: length)
-
-      // Code block: at most one decoration covers any given paragraph.
-      if let codeDecoration = codeBlockCharacterRanges.first(where: {
-        rangesOverlap($0.range, paragraphSource)
-      }) {
-        fragment.codeBlockOrigin = codeDecoration.xOrigin
-      }
 
       // Blockquote: multiple nesting levels can overlap one paragraph; each
       // produces its own left-border line.

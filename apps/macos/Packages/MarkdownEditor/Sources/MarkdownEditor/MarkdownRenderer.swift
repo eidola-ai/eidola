@@ -23,7 +23,6 @@ enum MarkdownRenderer {
     var checkedCheckboxIndexes = IndexSet()
     var lineBreakIndexes = IndexSet()
     var temporaryAttributes: [RenderSpec.StyledRange] = []
-    var codeBlockCharacterRanges: [RenderSpec.CodeBlockDecoration] = []
     var blockquoteCharacterRanges: [RenderSpec.BlockquoteDecoration] = []
     var blockRendererSpecs: [BlockRendererSpec] = []
   }
@@ -52,7 +51,6 @@ enum MarkdownRenderer {
         checkedCheckboxIndexes: IndexSet(),
         lineBreakIndexes: IndexSet(),
         temporaryAttributes: [],
-        codeBlockCharacterRanges: [],
         blockquoteCharacterRanges: [],
         blockRendererSpecs: []
       )
@@ -73,7 +71,6 @@ enum MarkdownRenderer {
         checkedCheckboxIndexes: IndexSet(),
         lineBreakIndexes: IndexSet(),
         temporaryAttributes: [],
-        codeBlockCharacterRanges: [],
         blockquoteCharacterRanges: [],
         blockRendererSpecs: []
       )
@@ -154,7 +151,6 @@ enum MarkdownRenderer {
       checkedCheckboxIndexes: accumulator.checkedCheckboxIndexes,
       lineBreakIndexes: accumulator.lineBreakIndexes,
       temporaryAttributes: accumulator.temporaryAttributes,
-      codeBlockCharacterRanges: accumulator.codeBlockCharacterRanges,
       blockquoteCharacterRanges: accumulator.blockquoteCharacterRanges,
       blockRendererSpecs: accumulator.blockRendererSpecs
     )
@@ -311,130 +307,23 @@ enum MarkdownRenderer {
         accumulator: &accumulator
       )
 
-    case .codeBlock(_, _, let openingFenceRange, let closingFenceRange):
-      let cursorInside = cursorOverlaps(cursorRange, node: safeRange, textLength: textLength)
-      let insideQuote = context.visibleQuoteWidth > 0
-      let localInset: CGFloat = 12
-      let textOrigin = context.hiddenIndent + context.visibleQuoteWidth + localInset
-      let boxOrigin = context.hiddenIndent + context.visibleQuoteWidth
-      let paragraphRange = nsText.lineRange(for: safeRange)
-
-      // TK2 splits the code block on `\n` into one fragment per source line.
-      // Each fragment inherits this paragraph style, so any non-zero
-      // `paragraphSpacing` / `paragraphSpacingBefore` produces a visible gap
-      // between adjacent content fragments — the per-fragment background
-      // fill stops at the fragment frame, leaving the inter-paragraph gap
-      // uncovered and visually breaking the code block into bands.
+    case .codeBlock(_, _, _, _):
+      // Phase 2.2: code blocks are rendered exclusively by the embedded
+      // `CodeBlockRenderer` (an `NSScrollView { NSTextView }` subtree
+      // anchored to a `BlockAttachment`). The renderer paints its own
+      // background, font, and line-height; the surrounding source
+      // paragraphs are entirely covered by the attachment's reserved
+      // region (the FIRST paragraph carries the U+FFFC glyph; the SIBLING
+      // paragraphs are hidden via `shouldEnumerate` in the content-storage
+      // delegate). Consequently this branch emits nothing for the legacy
+      // styled-range / fence-visibility / per-line paragraph-style path —
+      // every visual concern for the block is the renderer's responsibility.
       //
-      // Keep inter-content spacing at 0 so content fragments are flush. The
-      // outer spacing (above the opening fence, below the closing fence) is
-      // supplied by the fence-line paragraph styles applied below; the small
-      // fence↔content gap is set by `codeFenceSpacing` on the fence sides.
-      let paragraphStyle = NSMutableParagraphStyle()
-      paragraphStyle.firstLineHeadIndent = insideQuote ? context.quoteAlignIndent : textOrigin
-      paragraphStyle.headIndent = textOrigin
-      paragraphStyle.tailIndent = -12
-      paragraphStyle.paragraphSpacing = 0
-      paragraphStyle.paragraphSpacingBefore = 0
-      paragraphStyle.lineHeightMultiple = style.lineHeightMultiple
-      // Phase 1 of the no-wrap code-block feature: clip long lines at the
-      // container edge instead of wrapping them. The fence-line paragraph
-      // styles below intentionally keep their default wrapping behavior
-      // because fences themselves never get long; the visible horizontal-
-      // scroll path will arrive in Phase 2 via NSTextAttachmentViewProvider.
-      paragraphStyle.lineBreakMode = .byClipping
-
-      accumulator.styledRanges.append(
-        RenderSpec.StyledRange(
-          range: paragraphRange,
-          attributes: [
-            .paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle,
-          ]))
-
-      accumulator.styledRanges.append(
-        RenderSpec.StyledRange(
-          range: safeRange,
-          attributes: [
-            .font: style.codeFont,
-            .foregroundColor: context.foregroundColor,
-          ]))
-
-      // safeRange is contiguous and includes blockquote prefix characters
-      // (> and whitespace) on continuation lines when inside a blockquote.
-      // Always override these prefix characters to baseFont so they have
-      // consistent line height whether the > is visible or hidden — hidden
-      // paragraph-start characters become ZWSP .controlCharacter glyphs that
-      // still participate in line height, so using codeFont here would cause
-      // a vertical shift when the cursor enters/leaves the blockquote.
-      // When inside a visible blockquote, also override the innermost > kern
-      // to include localInset so code text stays at the same position
-      // regardless of cursor location.
-      let firstLineStart = nsText.lineRange(
-        for: NSRange(location: safeRange.location, length: 0)).location
-      let prefixLength = safeRange.location - firstLineStart
-      if prefixLength > 0 {
-        let end = min(safeRange.location + safeRange.length, textLength)
-
-        if insideQuote {
-          // Override innermost > kern on the first line
-          applyCodeBlockGtKernOverride(
-            lineStart: firstLineStart,
-            prefixLength: prefixLength,
-            localInset: localInset,
-            textLength: textLength,
-            nsText: nsText,
-            style: style,
-            accumulator: &accumulator
-          )
-        }
-
-        var pos = safeRange.location
-        // Skip to the second line within safeRange
-        while pos < end {
-          if nsText.character(at: pos) == UInt16(0x000A) { pos += 1; break }
-          pos += 1
-        }
-        // For each subsequent line, override code font on the prefix portion
-        // and (when visible) override innermost > kern for correct spacing
-        while pos < end {
-          let prefixEnd = min(pos + prefixLength, end)
-          accumulator.styledRanges.append(
-            RenderSpec.StyledRange(
-              range: NSRange(location: pos, length: prefixEnd - pos),
-              attributes: [.font: style.baseFont]))
-          if insideQuote {
-            applyCodeBlockGtKernOverride(
-              lineStart: pos,
-              prefixLength: prefixLength,
-              localInset: localInset,
-              textLength: textLength,
-              nsText: nsText,
-              style: style,
-              accumulator: &accumulator
-            )
-          }
-          // Advance to next line
-          while pos < end {
-            if nsText.character(at: pos) == UInt16(0x000A) { pos += 1; break }
-            pos += 1
-          }
-        }
-      }
-
-      accumulator.codeBlockCharacterRanges.append(
-        RenderSpec.CodeBlockDecoration(range: safeRange, xOrigin: boxOrigin))
-
-      // Phase 2.1: emit a BlockRendererSpec alongside the painting decoration
-      // so the bridging-layer infrastructure can reconcile a per-block host
-      // and its custom-view renderer (no-op renderer through 2.1, real
-      // CodeBlockRenderer in 2.2). The painting path stays active so the
-      // code-block background and font styling continue to render correctly
-      // until the renderer takes over.
-      //
-      // Reserved height is estimated from font metrics: one line per source
-      // paragraph in the block range, sized at the code font's natural
-      // line height. The applicator never consults the live renderer for
-      // sizing — this estimate is what AppKit uses for layout.
+      // Reserved height is estimated from font metrics: one line per
+      // source paragraph in the block range, sized at the code font's
+      // natural line height. The applicator never consults the live
+      // renderer for sizing — this estimate is what AppKit uses for
+      // layout.
       let lineCount: Int = {
         var count = 1
         let endOffset = min(safeRange.location + safeRange.length, textLength)
@@ -456,63 +345,6 @@ enum MarkdownRenderer {
           mode: .editInPlace,
           reservedHeight: reservedHeight
         ))
-
-      var delimiterRanges = [openingFenceRange]
-      if let closingFenceRange {
-        delimiterRanges.append(closingFenceRange)
-      }
-      applyDelimiterVisibility(
-        delimiterRanges: delimiterRanges,
-        cursorInNode: cursorInside,
-        textLength: textLength,
-        style: style,
-        hiddenIndexes: &accumulator.hiddenIndexes,
-        temporaryAttributes: &accumulator.temporaryAttributes
-      )
-
-      // Apply smaller font and tighter spacing to fence lines so they take
-      // up less visual space than the code content.
-      do {
-        let openLineRange = clamp(
-          nsText.lineRange(for: clamp(openingFenceRange, to: textLength)), to: textLength)
-
-        // Opening fence: smaller font, tight spacing after (before first code line).
-        let openPS = NSMutableParagraphStyle()
-        openPS.firstLineHeadIndent = insideQuote ? context.quoteAlignIndent : textOrigin
-        openPS.headIndent = textOrigin
-        openPS.tailIndent = -12
-        openPS.paragraphSpacing = style.codeFenceSpacing
-        openPS.paragraphSpacingBefore = style.codeBlockSpacing
-        openPS.lineHeightMultiple = style.lineHeightMultiple
-        accumulator.styledRanges.append(
-          RenderSpec.StyledRange(
-            range: openLineRange,
-            attributes: [
-              .font: style.codeFenceFont,
-              .paragraphStyle: openPS.copy() as! NSParagraphStyle,
-            ]))
-
-        if let closingFenceRange {
-          let closeLineRange = clamp(
-            nsText.lineRange(for: clamp(closingFenceRange, to: textLength)), to: textLength)
-
-          // Closing fence: tight spacing before (after last code line), smaller font.
-          let closePS = NSMutableParagraphStyle()
-          closePS.firstLineHeadIndent = insideQuote ? context.quoteAlignIndent : textOrigin
-          closePS.headIndent = textOrigin
-          closePS.tailIndent = -12
-          closePS.paragraphSpacing = style.codeBlockSpacing
-          closePS.paragraphSpacingBefore = style.codeFenceSpacing
-          closePS.lineHeightMultiple = style.lineHeightMultiple
-          accumulator.styledRanges.append(
-            RenderSpec.StyledRange(
-              range: closeLineRange,
-              attributes: [
-                .font: style.codeFenceFont,
-                .paragraphStyle: closePS.copy() as! NSParagraphStyle,
-              ]))
-        }
-      }
 
     case .thematicBreak:
       // Use a content range (excluding trailing newline) for cursor detection
@@ -1223,34 +1055,6 @@ enum MarkdownRenderer {
         pos += 1
       }
     }
-  }
-
-  /// Finds the last `>` in a code block line's prefix and overrides its kern
-  /// to include localInset. Uses the correct glyph width depending on whether
-  /// the `>` is space-replaced (cursor outside that blockquote) or visible.
-  private static func applyCodeBlockGtKernOverride(
-    lineStart: Int,
-    prefixLength: Int,
-    localInset: CGFloat,
-    textLength: Int,
-    nsText: NSString,
-    style: MarkdownStyle,
-    accumulator: inout RenderAccumulator
-  ) {
-    let prefixEnd = min(lineStart + prefixLength, textLength)
-    // Scan the prefix to find the last > character
-    var lastGtPos: Int? = nil
-    for i in lineStart..<prefixEnd {
-      if nsText.character(at: i) == UInt16(0x003E) {
-        lastGtPos = i
-      }
-    }
-    guard let gtPos = lastGtPos else { return }
-    let gtKernOverride = style.blockquoteIndent + localInset - style.textWidth(">")
-    accumulator.styledRanges.append(
-      RenderSpec.StyledRange(
-        range: NSRange(location: gtPos, length: 1),
-        attributes: [.kern: gtKernOverride]))
   }
 
   /// Walk inter-block gaps recursively. For each gap of `N` `\n`s, hide

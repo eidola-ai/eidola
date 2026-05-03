@@ -476,26 +476,49 @@ struct NestingStressTests {
     }
   }
 
-  @Test("Render: code block inside list has positive x origin")
-  func renderCodeBlockInsideListHasBaseIndent() {
+  @Test("Render: code block inside list still emits a BlockRendererSpec")
+  func renderCodeBlockInsideListEmitsSpec() {
+    // Pre-2.2 this test asserted that a list-nested code block produced
+    // a `codeBlockCharacterRanges` decoration with `xOrigin > 0` (the
+    // legacy painting path needed an x-origin to know where to start
+    // its full-width background fill, indented past the list marker).
+    // Post-2.2 the painting path is gone — code blocks are rendered by
+    // the embedded `CodeBlockRenderer`'s own `NSTextView`, whose
+    // horizontal position is determined by the attachment paragraph's
+    // `firstLineHeadIndent` (set via the regular list / blockquote
+    // indent machinery) rather than a per-decoration x-origin. The new
+    // invariant is just that the spec is emitted at all.
     let text = "- Item\n  ```\n  code\n  ```\n\nBody"
     let cursorRange = NSRange(location: (text as NSString).length - 1, length: 0)
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    #expect(!spec.codeBlockCharacterRanges.isEmpty, "Should have code block range")
-    if let cbRange = spec.codeBlockCharacterRanges.first {
-      #expect(cbRange.xOrigin > 0, "Code block inside list should have positive x origin")
+    #expect(
+      !spec.blockRendererSpecs.isEmpty,
+      "list-nested code block should still emit a BlockRendererSpec for the registry to reconcile a host against")
+    if let rendererSpec = spec.blockRendererSpecs.first {
+      #expect(rendererSpec.blockTypeTag == .codeBlock)
+      #expect(rendererSpec.mode == .editInPlace)
     }
   }
 
-  @Test("Render: nested code block inside list reveals both fences when cursor is inside")
-  func renderNestedCodeBlockInsideListRevealsBothFences() {
+  @Test("Render: nested code block inside list does not emit hidden-index entries for fences")
+  func renderNestedCodeBlockInsideListDoesNotHideFences() {
+    // Pre-2.2 this test asserted that the fence chars stayed out of
+    // `hiddenIndexes` ONLY when the cursor was inside the code block —
+    // outside, the legacy renderer hid the backticks. Post-2.2 the
+    // entire code-block range is owned by the embedded renderer, so
+    // fence chars are never added to `hiddenIndexes` regardless of
+    // cursor position. The new invariant is the unconditional absence.
     let text = "- Item\n  ```\n  code\n  ```\n\nBody"
-    let cursorRange = NSRange(location: 16, length: 0)  // inside code content
-    let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
-
-    for idx in [9, 10, 11, 22, 23, 24] {
-      #expect(!spec.hiddenIndexes.contains(idx), "Fence character at \(idx) should stay visible when cursor is inside nested code block")
+    let cursorOutside = NSRange(location: (text as NSString).length - 1, length: 0)
+    let cursorInside = NSRange(location: 16, length: 0)
+    for cursorRange in [cursorOutside, cursorInside] {
+      let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
+      for idx in [9, 10, 11, 22, 23, 24] {
+        #expect(
+          !spec.hiddenIndexes.contains(idx),
+          "Fence character at \(idx) must not be hidden — embedded renderer owns code-block visibility regardless of cursor (cursor=\(cursorRange))")
+      }
     }
   }
 
@@ -526,15 +549,18 @@ struct NestingStressTests {
     }
   }
 
-  @Test("Render: top-level code block has zero x origin")
-  func renderTopLevelCodeBlockHasZeroBaseIndent() {
+  @Test("Render: top-level code block emits exactly one BlockRendererSpec")
+  func renderTopLevelCodeBlockEmitsOneSpec() {
+    // Pre-2.2 this test asserted that a top-level code block produced a
+    // `codeBlockCharacterRanges` decoration with `xOrigin == 0` (the
+    // legacy painted background started at x=0 for top-level code).
+    // Post-2.2 there is no painted background; the new invariant is
+    // simply that the bridging-layer spec is emitted.
     let text = "```\ncode\n```\n\nBody"
     let cursorRange = NSRange(location: (text as NSString).length - 1, length: 0)
     let spec = MarkdownRenderer.render(text: text, cursorRange: cursorRange)
 
-    #expect(!spec.codeBlockCharacterRanges.isEmpty)
-    if let cbRange = spec.codeBlockCharacterRanges.first {
-      #expect(cbRange.xOrigin == 0, "Top-level code block should have zero x origin")
-    }
+    #expect(spec.blockRendererSpecs.count == 1)
+    #expect(spec.blockRendererSpecs.first?.blockTypeTag == .codeBlock)
   }
 }

@@ -223,21 +223,32 @@ final class TextKit2ContentStorageDelegate: NSObject,
     // Build the attachment-glyph attributes: copy the source paragraph's
     // existing attributes (head indent, font, color, etc.) but override the
     // paragraph style to pin the line containing the U+FFFC at exactly
-    // `spec.reservedHeight` points tall.
+    // the attachment's actual height — the renderer's measured intrinsic
+    // height when present, falling back to `spec.reservedHeight`.
     //
     // Why this is necessary: TK2 does NOT auto-grow the line containing an
     // attachment to match `attachmentBounds.height`. Without the
     // line-height pin, the line stays at the code font's natural height and
     // the attachment view's frame extends UPWARD over preceding paragraphs
     // (the attachment is anchored at the natural line's baseline). Forcing
-    // `minimumLineHeight == maximumLineHeight == reservedHeight` makes TK2
-    // reserve the full vertical region inside the line itself, so siblings
-    // above the block don't get overlapped.
+    // `minimumLineHeight == maximumLineHeight == attachmentHeight` makes
+    // TK2 reserve the full vertical region inside the line itself, so
+    // siblings above the block don't get overlapped.
+    //
+    // Reading `host.intrinsicContentHeight` here keeps this paragraph
+    // style in lock-step with what `BlockAttachment.attachmentBounds`
+    // returns — when the user adds lines inside the embedded view and
+    // the renderer publishes a new intrinsic height, the attachment's
+    // line grows along with the attachment's bounds. Falling back to
+    // `spec.reservedHeight` covers the initial render (before the
+    // renderer has measured) and `cursorConditional` blocks that never
+    // publish an intrinsic height.
+    let attachmentHeight = host.intrinsicContentHeight ?? spec.reservedHeight
     let attachmentParaStyle: NSParagraphStyle = {
       let base = (firstAttrs[.paragraphStyle] as? NSParagraphStyle) ?? .default
       let mutable = (base.mutableCopy() as? NSMutableParagraphStyle) ?? NSMutableParagraphStyle()
-      mutable.minimumLineHeight = spec.reservedHeight
-      mutable.maximumLineHeight = spec.reservedHeight
+      mutable.minimumLineHeight = attachmentHeight
+      mutable.maximumLineHeight = attachmentHeight
       return mutable
     }()
     var attachmentAttrs = firstAttrs

@@ -40,32 +40,21 @@ struct RenderSpec {
   /// Applied via `NSLayoutManager.addTemporaryAttributes` — they don't affect the text storage.
   let temporaryAttributes: [StyledRange]
 
-  /// Character ranges that should receive full-width code block background drawing.
-  /// Consumed by `TextKit2LayoutFragment` to draw backgrounds that span the
-  /// entire text container width, regardless of glyph visibility.
-  let codeBlockCharacterRanges: [CodeBlockDecoration]
-
   /// Character ranges that should receive a left border for blockquote visual indication.
   /// Each entry carries the exact x-position for the border, so drawing does not
   /// have to reconstruct nesting from partial metadata.
   let blockquoteCharacterRanges: [BlockquoteDecoration]
 
-  /// Block-level constructs that want a custom-view renderer (Phase 2 bridging
-  /// layer). Each entry drives `BlockRendererRegistry` reconciliation in
-  /// `TextKit2RenderApplicator.apply`. Through Phase 2.1 this list runs
-  /// *alongside* `codeBlockCharacterRanges` (the painting path); both are
-  /// produced for the same code blocks. Phase 2.2 retires the painting path
-  /// once the real code-block renderer is live.
+  /// Block-level constructs that want a custom-view renderer (Phase 2
+  /// bridging layer). Each entry drives `BlockRendererRegistry`
+  /// reconciliation in `TextKit2RenderApplicator.apply`. As of Phase 2.2
+  /// code blocks are rendered exclusively through this path — the legacy
+  /// `codeBlockCharacterRanges` painting branch has been retired.
   let blockRendererSpecs: [BlockRendererSpec]
 
   struct BlockquoteDecoration {
     let range: NSRange
     let xPosition: CGFloat
-  }
-
-  struct CodeBlockDecoration {
-    let range: NSRange
-    let xOrigin: CGFloat
   }
 
   struct StyledRange {
@@ -88,14 +77,9 @@ struct RenderSpec {
       styledRanges.count == other.styledRanges.count,
       fontTraits.count == other.fontTraits.count,
       temporaryAttributes.count == other.temporaryAttributes.count,
-      codeBlockCharacterRanges.count == other.codeBlockCharacterRanges.count,
       blockquoteCharacterRanges.count == other.blockquoteCharacterRanges.count,
       blockRendererSpecs.count == other.blockRendererSpecs.count
     else { return false }
-
-    for (a, b) in zip(codeBlockCharacterRanges, other.codeBlockCharacterRanges) {
-      guard a.range == b.range, a.xOrigin == b.xOrigin else { return false }
-    }
 
     for (a, b) in zip(blockquoteCharacterRanges, other.blockquoteCharacterRanges) {
       guard a.range == b.range, a.xPosition == b.xPosition else { return false }

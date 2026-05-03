@@ -91,14 +91,23 @@ public final class BlockAttachment: NSTextAttachment {
     characterIndex charIndex: Int
   ) -> CGRect {
     let width = textContainer?.size.width ?? lineFrag.width
-    // Read the reserved height live from the host on every call — the host's
-    // spec is updated by `BlockRendererRegistry.reconcile` whenever the
-    // markdown source grows or shrinks (e.g. typing more lines into a code
-    // block extends the reserved region). Caching the value at attachment
-    // construction time froze the bounds at the first-seen height and made
-    // incremental renders disagree with fresh renders for the same content.
+    // Read the live height from the host on every call. Prefer the
+    // renderer's measured `intrinsicContentHeight` when available — for
+    // `editInPlace` blocks (code blocks) it tracks the embedded view's
+    // current `usedRect` and grows as the user adds lines inside the
+    // block. Fall back to `spec.reservedHeight` (the parser's pre-layout
+    // estimate from line count) for the initial render before the
+    // renderer has measured, and for `cursorConditional` blocks that
+    // never publish an intrinsic height. Caching either value at
+    // attachment construction time would freeze the bounds at the
+    // first-seen height and make incremental renders disagree with
+    // fresh renders for the same content — and worse, leave the
+    // embedded view drawing past its reserved region, on top of outer
+    // paragraphs below.
     let weakHost = host
-    let height = MainActor.assumeIsolated { weakHost?.spec.reservedHeight ?? 0 }
+    let height = MainActor.assumeIsolated {
+      weakHost?.intrinsicContentHeight ?? weakHost?.spec.reservedHeight ?? 0
+    }
     return CGRect(x: 0, y: 0, width: width, height: height)
   }
 }

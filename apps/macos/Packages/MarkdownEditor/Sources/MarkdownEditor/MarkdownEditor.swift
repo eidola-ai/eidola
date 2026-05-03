@@ -95,6 +95,14 @@ public struct MarkdownEditor: NSViewRepresentable {
     /// teardown — only ever assigned on the main actor.
     private nonisolated(unsafe) var tk2FrameObserver: Any?
 
+    /// Weak back-reference to the bound text view, captured in
+    /// `configure(_:)`. Used by `deinit` to drop any block-renderer hosts
+    /// the registry is holding for this text view so the renderers'
+    /// embedded views (and their AppKit subview trees) get torn down
+    /// alongside the Coordinator. `nonisolated(unsafe)` so the
+    /// non-isolated deinit can read it.
+    private nonisolated(unsafe) weak var boundTextView: NSTextView?
+
     init(state: Binding<EditorState>, style: MarkdownStyle = .default) {
       self.state = state
       self.style = style
@@ -103,6 +111,19 @@ public struct MarkdownEditor: NSViewRepresentable {
     deinit {
       if let token = tk2FrameObserver {
         NotificationCenter.default.removeObserver(token)
+      }
+      // Tear down any block-renderer hosts the registry is holding for
+      // the bound text view; otherwise the registry's per-text-view host
+      // table leaks until the next render against a different text view
+      // (which never happens for a one-off Coordinator). SwiftUI
+      // Coordinators always deinit on the main thread, so an
+      // `assumeIsolated` here is safe and lets the cleanup run
+      // synchronously — tests rely on the post-deinit invariant that the
+      // host count for the dropped text view is zero.
+      if let textView = boundTextView {
+        MainActor.assumeIsolated {
+          BlockRendererRegistry.shared.dropAll(for: textView)
+        }
       }
     }
 
@@ -153,6 +174,8 @@ public struct MarkdownEditor: NSViewRepresentable {
 
     func configure(_ textView: NSTextView) {
       textView.delegate = self
+      // Capture a weak ref so `deinit` can drop the registry's hosts.
+      boundTextView = textView
       textView.font = MarkdownStyle.default.baseFont
       textView.isHorizontallyResizable = false
       textView.isAutomaticQuoteSubstitutionEnabled = false

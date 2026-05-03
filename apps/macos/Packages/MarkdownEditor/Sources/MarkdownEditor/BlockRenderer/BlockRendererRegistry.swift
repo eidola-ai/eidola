@@ -36,12 +36,20 @@ public final class BlockRendererRegistry {
   /// stable identity within a text view).
   private var hostsByTextView: [ObjectIdentifier: [Int: BlockRenderHost]] = [:]
 
+  /// Per-text-view cache of the last spec list `reconcile` actually
+  /// processed. The applicator consults this for an equality check before
+  /// calling `reconcile` so a no-op apply (selection-only update where the
+  /// spec list hasn't changed) doesn't churn the host table or notify
+  /// renderers spuriously.
+  private var lastReconciledSpecsByTextView: [ObjectIdentifier: [BlockRendererSpec]] = [:]
+
   init() {
-    // The no-op renderer is the default `.codeBlock` adapter through Phase
-    // 2.1. Phase 2.2 swaps in the real `CodeBlockRenderer`. Registering at
-    // singleton-init time keeps the registry ready before any text view
-    // exists.
-    register(.codeBlock) { NoopBlockRenderer() }
+    // The real `CodeBlockRenderer` (Phase 2.2) hosts an embedded
+    // `NSScrollView { NSTextView }` for the code-block source. Registered
+    // at singleton-init time so the registry is ready before any text
+    // view exists. Tests / spikes that need to override this re-register
+    // their own factory and restore in `defer`.
+    register(.codeBlock) { CodeBlockRenderer() }
   }
 
   // MARK: - Factory registration
@@ -61,6 +69,48 @@ public final class BlockRendererRegistry {
 
   // MARK: - Host reconciliation
 
+  /// Diagnostic counter incremented each time `reconcile(for:specs:)`
+  /// actually executes its host-table mutation pass. Tests use this to
+  /// assert that the dedup short-circuit in
+  /// `reconcileIfChanged(for:specs:)` is firing.
+  private(set) var reconcileExecutionCount: Int = 0
+
+  /// Reconcile only when `specs` differ from the last-applied list for
+  /// `textView`. Otherwise no-op. The applicator calls this on every
+  /// `apply()` (including selection-only updates that don't actually
+  /// change the spec list) so the equality check needs to be cheap —
+  /// hence comparison on (range, tag, mode, reservedHeight) rather than
+  /// the renderer-opaque `payload`.
+  @discardableResult
+  public func reconcileIfChanged(
+    for textView: NSTextView, specs: [BlockRendererSpec]
+  ) -> [BlockRenderHost] {
+    let key = ObjectIdentifier(textView)
+    if let last = lastReconciledSpecsByTextView[key],
+      Self.specListsEqual(last, specs)
+    {
+      // No change → return the existing hosts without touching the table.
+      let table = hostsByTextView[key] ?? [:]
+      return table.keys.sorted().compactMap { table[$0] }
+    }
+    lastReconciledSpecsByTextView[key] = specs
+    return reconcile(for: textView, specs: specs)
+  }
+
+  private static func specListsEqual(
+    _ a: [BlockRendererSpec], _ b: [BlockRendererSpec]
+  ) -> Bool {
+    guard a.count == b.count else { return false }
+    for (l, r) in zip(a, b) {
+      guard l.range == r.range,
+        l.blockTypeTag == r.blockTypeTag,
+        l.mode == r.mode,
+        l.reservedHeight == r.reservedHeight
+      else { return false }
+    }
+    return true
+  }
+
   /// Reconcile the registry's live hosts for `textView` against `specs`.
   ///
   /// - Hosts whose `spec.range.location` no longer appears in `specs` are
@@ -78,6 +128,7 @@ public final class BlockRendererRegistry {
   public func reconcile(
     for textView: NSTextView, specs: [BlockRendererSpec]
   ) -> [BlockRenderHost] {
+    reconcileExecutionCount += 1
     let key = ObjectIdentifier(textView)
     var hosts = hostsByTextView[key] ?? [:]
 
@@ -122,6 +173,7 @@ public final class BlockRendererRegistry {
       for host in hosts.values { host.dispose() }
     }
     hostsByTextView.removeValue(forKey: key)
+    lastReconciledSpecsByTextView.removeValue(forKey: key)
   }
 
   // MARK: - Selection notifications

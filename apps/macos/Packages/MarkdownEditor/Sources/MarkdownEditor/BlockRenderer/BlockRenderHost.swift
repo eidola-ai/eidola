@@ -71,6 +71,30 @@ public final class BlockRenderHost {
   /// `cursorPresenceChanged` only on transitions.
   internal var lastInside: Bool = false
 
+  /// Height the renderer's measured intrinsic content actually occupies,
+  /// once it has measured itself. Distinct from `spec.reservedHeight`
+  /// which is the parser's pre-layout estimate from line count. The
+  /// attachment reads this when present, falling back to
+  /// `spec.reservedHeight` for the initial render before the renderer
+  /// has measured.
+  ///
+  /// Phase 2.2 shipped with `reservedHeight` as a fixed value; for
+  /// `editInPlace` renderers (code blocks) that proved unworkable —
+  /// adding lines inside the embedded view would push the embedded
+  /// content past the reserved region, drawing on top of outer
+  /// paragraphs below. The `editInPlace` flow now writes the measured
+  /// height here after each edit, the attachment reads it on every
+  /// `attachmentBounds` query, and `updateIntrinsicContentHeight(_:)`
+  /// invalidates the layout fragment so TK2 re-queries bounds and the
+  /// outer flow reflows. `cursorConditional` renderers (math, diagrams,
+  /// embeds) keep the fixed-region semantic from the original design —
+  /// their visual dimensions don't change between edits.
+  ///
+  /// `nonisolated(unsafe)` because the attachment's `attachmentBounds`
+  /// override is inherited as nonisolated; in practice all access is on
+  /// the main thread.
+  nonisolated(unsafe) public var intrinsicContentHeight: CGFloat?
+
   // MARK: - Init / lifecycle
 
   init(
@@ -185,6 +209,38 @@ public final class BlockRenderHost {
     guard let textView, let window = textView.window else { return }
     window.makeFirstResponder(textView)
     window.sendEvent(event)
+  }
+
+  /// Called by the renderer after measuring its embedded view's
+  /// content height. Stores the value AND invalidates the attachment
+  /// paragraph's layout fragment in the main text view's TK2 layout
+  /// manager so TK2 re-queries `attachmentBounds` and the outer flow
+  /// reflows to make room for the new height.
+  ///
+  /// No-ops if the height is unchanged (avoids the layout-invalidation
+  /// re-entrancy storm a per-character measurement would trigger when
+  /// the user holds down a key and the embedded view's `usedRect`
+  /// height stays flat across multiple keystrokes inside the same
+  /// line).
+  public func updateIntrinsicContentHeight(_ height: CGFloat) {
+    if let existing = intrinsicContentHeight, abs(existing - height) < 0.5 {
+      return
+    }
+    intrinsicContentHeight = height
+    guard let textView, let tlm = textView.textLayoutManager,
+      let cs = textView.textContentStorage
+    else { return }
+    // Convert the host's source range to a TK2 NSTextRange and
+    // invalidate the layout for that range. TK2 will re-vend the
+    // affected fragment(s) and re-query `attachmentBounds` on the next
+    // layout pass — that's what propagates the new height into the
+    // outer flow.
+    let docStart = cs.documentRange.location
+    guard let start = cs.location(docStart, offsetBy: spec.range.location),
+      let end = cs.location(start, offsetBy: spec.range.length),
+      let range = NSTextRange(location: start, end: end)
+    else { return }
+    tlm.invalidateLayout(for: range)
   }
 
   // MARK: - Helpers

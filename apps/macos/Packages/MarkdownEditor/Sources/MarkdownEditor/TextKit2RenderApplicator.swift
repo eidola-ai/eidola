@@ -48,15 +48,18 @@ enum TextKit2RenderApplicator {
       delegate.textView = textView
     }
 
-    // Phase 3: write the per-paragraph decoration ranges (code block bg,
-    // blockquote left borders) into the layout-manager delegate. The
-    // delegate vends a `TextKit2LayoutFragment` per paragraph configured
-    // with the matching decorations; the actual painting happens in the
-    // fragment's `draw(at:in:)` override.
+    // Phase 3: write the per-paragraph decoration ranges (blockquote left
+    // borders) plus the block-renderer attachment spec into the layout-
+    // manager delegate. The delegate vends a `TextKit2LayoutFragment` per
+    // paragraph configured with the matching decorations; the actual
+    // blockquote-border painting happens in the fragment's `draw(at:in:)`
+    // override. Code-block backgrounds are no longer the layout fragment's
+    // concern (Phase 2.2 retired the painting path) — the embedded
+    // `CodeBlockRenderer` paints its own background inside the
+    // attachment view.
     if let layoutDelegate = textView.textLayoutManager?.delegate
       as? TextKit2LayoutManagerDelegate
     {
-      layoutDelegate.codeBlockCharacterRanges = spec.codeBlockCharacterRanges
       layoutDelegate.blockquoteCharacterRanges = spec.blockquoteCharacterRanges
       layoutDelegate.blockRendererSpecs = spec.blockRendererSpecs
       if let containerWidth = textView.textLayoutManager?.textContainer?.size.width,
@@ -75,7 +78,12 @@ enum TextKit2RenderApplicator {
     // delegate vends an attachment-paragraph, the corresponding host
     // exists in the registry and the attachment can resolve its view via
     // `BlockAttachment.viewProvider(for:...)`.
-    BlockRendererRegistry.shared.reconcile(
+    //
+    // `reconcileIfChanged` short-circuits when `spec.blockRendererSpecs`
+    // is identical to the last applied list (range + tag + mode +
+    // reservedHeight) — selection-only updates re-run apply but rarely
+    // touch the spec list, so this saves work on the hot path.
+    BlockRendererRegistry.shared.reconcileIfChanged(
       for: textView, specs: spec.blockRendererSpecs)
 
     // Save scroll position — full-range attribute reset triggers layout
