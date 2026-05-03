@@ -1,0 +1,23 @@
+[package]
+name = "eidola-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "eidola-gui"
+path = "src/main.rs"
+
+[dependencies]
+# gpui-component pulls gpui/gpui_platform from zed-industries/zed without a rev,
+# so we mirror that spec exactly to avoid resolving two copies of gpui.
+# Cargo.lock is the canonical pin for the resolved zed commit.
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
+
+eidola-app-core = { path = "../../crates/eidola-app-core" }
+tokio = { version = "1", features = ["sync"] }

@@ -37,6 +37,9 @@ build system:
       cli)
         cargo build -p eidola-cli
         ;;
+      gui)
+        cargo build -p eidola-gui
+        ;;
       macos)
         if [[ "$(uname -s)" != "Darwin" ]]; then
           echo "error: macOS app can only be built on macOS" >&2
@@ -48,7 +51,7 @@ build system:
         ./scripts/package-macos-app.sh
         ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, macos)" >&2
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, macos)" >&2
         exit 1
         ;;
     esac
@@ -64,6 +67,9 @@ run system *args:
       cli)
         cargo run -p eidola-cli -- {{ args }}
         ;;
+      gui)
+        cargo run -p eidola-gui -- {{ args }}
+        ;;
       macos)
         if [[ "$(uname -s)" != "Darwin" ]]; then
           echo "error: macOS app can only run on macOS" >&2
@@ -73,7 +79,7 @@ run system *args:
         open "apps/macos/build/Eidola.app" {{ args }}
         ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, macos)" >&2
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, macos)" >&2
         exit 1
         ;;
     esac
