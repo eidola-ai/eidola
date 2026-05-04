@@ -7,6 +7,7 @@ pub mod chat;
 pub mod core;
 pub mod general;
 pub mod settings;
+pub mod theme;
 pub mod wallet;
 
 use gpui::{
@@ -36,6 +37,7 @@ pub fn run() {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
+            theme::install(cx);
 
             let core = Core::new(cx);
             cx.set_global(AppGlobal { core: core.clone() });
@@ -132,6 +134,7 @@ async fn open_main_window(core: Entity<Core>, cx: &mut AsyncApp) {
     };
 
     let _ = cx.open_window(opts, |window, cx| {
+        theme::observe_window_appearance(window);
         let view = cx.new(|cx| ChatView::new(core.clone(), window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
@@ -153,6 +156,7 @@ async fn open_settings_window(core: Entity<Core>, cx: &mut AsyncApp) {
     };
 
     let _ = cx.open_window(opts, |window, cx| {
+        theme::observe_window_appearance(window);
         let view = cx.new(|cx| SettingsView::new(core.clone(), window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });

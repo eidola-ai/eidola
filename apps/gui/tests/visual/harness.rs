@@ -72,7 +72,10 @@ impl Snapshots {
 
         let platform = gpui_platform::current_platform(false);
         let mut cx = VisualTestAppContext::with_asset_source(platform, Arc::new(Assets));
-        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            eidola_gui::theme::install(cx);
+        });
 
         let total = self.cases.len();
         let mut written: Vec<&'static str> = Vec::new();

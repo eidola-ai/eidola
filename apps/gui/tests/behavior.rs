@@ -15,6 +15,7 @@ use eidola_gui::chat::{ChatView, Send};
 use eidola_gui::core::Core;
 use eidola_gui::wallet::WalletView;
 use gpui::{AppContext, Entity, TestAppContext, WindowOptions};
+use gpui_component::Theme;
 
 // ---------------------------------------------------------------------------
 // Core fixture
@@ -67,6 +68,22 @@ fn core_stub_async_methods_are_noops(cx: &mut TestAppContext) {
         assert!(c.balances.is_none());
         assert!(c.prices.is_empty());
         assert!(c.credentials.is_empty());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn circadian_themes_install(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        eidola_gui::theme::install(cx);
+
+        let theme = Theme::global(cx);
+        assert_eq!(theme.light_theme.name.as_ref(), "Circadian Day");
+        assert_eq!(theme.dark_theme.name.as_ref(), "Circadian Night");
     });
 }
 
@@ -208,8 +225,10 @@ fn open_view<V: gpui::Render + 'static>(
     cx.update(|cx| {
         // Idempotent — gpui-component installs its `Theme` and other globals
         // here. View construction reads them via `cx.theme()`, so the init
-        // must happen before `cx.open_window`.
+        // must happen before `cx.open_window`. Circadian goes on top so any
+        // colour-bearing assertions match production.
         gpui_component::init(cx);
+        eidola_gui::theme::install(cx);
         cx.open_window(WindowOptions::default(), |window, cx| build(window, cx))
             .expect("open test window")
     })
