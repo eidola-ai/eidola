@@ -72,6 +72,46 @@ fn register_chat(s: &mut Snapshots) {
         },
     );
 
+    s.add(
+        "chat_with_markdown",
+        size(px(900.), px(640.)),
+        |window, cx| {
+            let core = cx.new(|_| {
+                let mut c = Core::stub();
+                c.config_state = Some(stub_config_state(true));
+                c
+            });
+            cx.new(|cx| {
+                let view = ChatView::new(core, window, cx);
+                view_with_messages(
+                    view,
+                    vec![
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "Show me how to register a tokio runtime in a small Rust \
+                                program, with a heading, a list, and a code fence."
+                                .into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content: "## Registering a runtime\n\nYou have two convenient \
+                                options:\n\n1. **Macro** — `#[tokio::main]` rewrites `main` for \
+                                you.\n2. **Manual** — build a `Runtime` and call `block_on`.\n\n\
+                                Manual setup, for when you need fine control:\n\n```rust\n\
+                                use tokio::runtime::Runtime;\n\nfn main() {\n    let rt = \
+                                Runtime::new().expect(\"build runtime\");\n    rt.block_on(async \
+                                {\n        println!(\"hello from tokio\");\n    });\n}\n```\n\n\
+                                The macro form is shorter, but the manual form makes the \
+                                runtime's *lifetime* explicit — useful when you want to share \
+                                one runtime across an FFI boundary."
+                                .into(),
+                        },
+                    ],
+                )
+            })
+        },
+    );
+
     s.add("chat_thinking", size(px(900.), px(640.)), |window, cx| {
         let core = stub_core_with_config(cx);
         cx.new(|cx| {

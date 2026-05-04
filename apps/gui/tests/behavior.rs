@@ -10,7 +10,7 @@
 //!    keystrokes take in production.
 //! 4. Assert against the view/core's public state with `read_with`.
 
-use eidola_app_core::{BalancesResult, ConfigState, CredentialInfo};
+use eidola_app_core::{BalancesResult, ConfigState, CredentialInfo, SpaceMessage};
 use eidola_gui::chat::{ChatView, Send};
 use eidola_gui::core::Core;
 use eidola_gui::wallet::WalletView;
@@ -188,6 +188,43 @@ fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
         assert_eq!(v.messages[0].role, "user");
         assert_eq!(v.messages[0].content, "hi there");
         assert!(v.thinking, "submit should mark thinking=true");
+    });
+}
+
+#[gpui::test]
+fn chat_renders_markdown_messages_without_panicking(cx: &mut TestAppContext) {
+    // Markdown bodies (headings, lists, fenced code) flow through
+    // `TextView::markdown` rather than a plain `SharedString`. This guards
+    // against the markdown plumbing breaking the per-message invariants —
+    // each `SpaceMessage` is still exactly one row in the chat, regardless
+    // of how many block elements its content parses into.
+    let core = stub_core_with_config(cx);
+    let window = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(core.clone(), window, cx))
+    });
+    let view = root(&window, cx);
+
+    view.update(cx, |v, _cx| {
+        v.set_messages_for_test(vec![
+            SpaceMessage {
+                role: "user".into(),
+                content: "What does this code do?".into(),
+            },
+            SpaceMessage {
+                role: "assistant".into(),
+                content: "# Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
+            },
+        ]);
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.messages.len(),
+            2,
+            "markdown content must not multiply messages"
+        );
+        assert_eq!(v.messages[1].role, "assistant");
     });
 }
 

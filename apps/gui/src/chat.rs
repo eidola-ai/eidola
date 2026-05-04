@@ -8,8 +8,10 @@ use gpui_component::{
     ActiveTheme, Disableable, IconName,
     button::{Button, ButtonVariants},
     h_flex,
+    highlighter::HighlightTheme,
     input::{Input, InputState},
     label::Label,
+    text::{TextView, TextViewStyle},
     v_flex,
 };
 
@@ -193,6 +195,7 @@ impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
+        let markdown_style = markdown_style(theme.mode.is_dark());
         let mut messages_col = v_flex().w_full().gap_0().pt(TITLE_BAR_RESERVE);
         for (idx, msg) in self.messages.iter().enumerate() {
             let bg = match msg.role.as_str() {
@@ -204,15 +207,25 @@ impl Render for ChatView {
                 "error" => theme.danger,
                 _ => theme.foreground,
             };
+            let body: gpui::AnyElement = if msg.role == "error" {
+                // Errors are short, plain strings rendered into an already
+                // styled banner — markdown would only mis-format them.
+                SharedString::from(msg.content.clone()).into_any_element()
+            } else {
+                TextView::markdown(("msg", idx), msg.content.clone())
+                    .selectable(true)
+                    .style(markdown_style.clone())
+                    .into_any_element()
+            };
             messages_col = messages_col.child(
                 div()
-                    .id(("msg", idx))
+                    .id(("msg-row", idx))
                     .w_full()
                     .px_5()
                     .py_3()
                     .bg(bg)
                     .text_color(fg)
-                    .child(SharedString::from(msg.content.clone())),
+                    .child(body),
             );
         }
 
@@ -279,6 +292,22 @@ impl Render for ChatView {
                     ),
             )
             .child(title_bar_overlay(cx))
+    }
+}
+
+/// `TextViewStyle` for chat message bodies. The `is_dark` flag and matching
+/// `HighlightTheme` are wired off the active Circadian mode so fenced code
+/// blocks render against a backdrop that matches the rest of the chrome.
+fn markdown_style(is_dark: bool) -> TextViewStyle {
+    let highlight = if is_dark {
+        HighlightTheme::default_dark().clone()
+    } else {
+        HighlightTheme::default_light().clone()
+    };
+    TextViewStyle {
+        is_dark,
+        highlight_theme: highlight,
+        ..TextViewStyle::default()
     }
 }
 
