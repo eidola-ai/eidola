@@ -11,21 +11,29 @@ pub mod theme;
 pub mod wallet;
 
 use gpui::{
-    App, AppContext, AsyncApp, Bounds, Entity, KeyBinding, Menu, MenuItem, TitlebarOptions,
-    WindowBounds, WindowKind, WindowOptions, point, px, size,
+    App, AppContext, Bounds, Entity, KeyBinding, Menu, MenuItem, OsAction, TitlebarOptions,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px, size,
 };
 use gpui_component::Root;
 use gpui_component_assets::Assets;
 
-use crate::actions::{About, OpenSettings, Quit};
+use crate::actions::{
+    About, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenSettings, Quit, ShowAll, Zoom,
+};
 use crate::chat::ChatView;
 use crate::core::Core;
 use crate::settings::SettingsView;
 
-/// Application-scoped state — currently just the shared `Core`. Stored as a
-/// gpui global so action handlers (which only get `&mut App`) can reach it.
+/// Application-scoped state. Stored as a gpui global so action handlers
+/// (which only get `&mut App`) can reach it.
 struct AppGlobal {
     core: Entity<Core>,
+    /// The single Settings window, if it's currently open. Used to enforce
+    /// the macOS-typical singleton: re-invoking `OpenSettings` raises the
+    /// existing window instead of opening another. We don't actively clear
+    /// this on close — `try_focus_existing_settings` checks the cached id
+    /// against `cx.windows()` each time and self-heals a stale handle.
+    settings_window: Option<WindowHandle<Root>>,
 }
 
 impl gpui::Global for AppGlobal {}
@@ -33,24 +41,52 @@ impl gpui::Global for AppGlobal {}
 /// Run the GUI application. The binary's `fn main()` is a thin shim around
 /// this; tests do not call this — they use `tests/visual.rs` instead.
 pub fn run() {
-    gpui_platform::application()
-        .with_assets(Assets)
-        .run(move |cx: &mut App| {
-            gpui_component::init(cx);
-            theme::install(cx);
+    let application = gpui_platform::application().with_assets(Assets);
 
-            let core = Core::new(cx);
-            cx.set_global(AppGlobal { core: core.clone() });
+    // Standard macOS: clicking the dock icon when the app has no open
+    // windows should create one. Without this, closing the last window
+    // leaves the app running but unreachable. `on_reopen` is on the
+    // `Application` builder (registered before launch), not on `App`, and
+    // returns `&Self` rather than `Self` so we can't chain it before
+    // `run()` (which consumes by value).
+    application.on_reopen(|cx: &mut App| {
+        if cx.windows().is_empty() {
+            open_main_window(cx);
+        }
+    });
 
-            install_menus(cx);
-            install_keybindings(cx);
-            install_action_handlers(cx);
+    application.run(move |cx: &mut App| {
+        gpui_component::init(cx);
+        theme::install(cx);
 
-            cx.spawn(async move |cx: &mut AsyncApp| {
-                open_main_window(core, cx).await;
-            })
-            .detach();
+        let core = Core::new(cx);
+        cx.set_global(AppGlobal {
+            core,
+            settings_window: None,
         });
+
+        // Order matters: `cx.set_menus` snapshots the keymap when it builds
+        // NSMenuItems and attaches each item's `keyEquivalent` from
+        // `keymap.bindings_for_action(action)`. If we set menus before
+        // binding keys, the keymap is empty at lookup time, no keystroke is
+        // attached, and macOS can't intercept the shortcut at the menu
+        // level — which then breaks ⌘N / ⌘Q etc. when no window has key
+        // focus (the only path that *requires* the menu-level intercept;
+        // with a window focused, gpui's per-window binding dispatch
+        // handles it independently). Diagnostic signal: items appear in
+        // the menu without their shortcut text on the right side.
+        install_keybindings(cx);
+        install_menus(cx);
+        install_action_handlers(cx);
+
+        // Bring the app to the foreground at launch. Mirrors Zed; ensures
+        // macOS treats us as the active app from frame 0 so the menu bar
+        // / key-equivalent dispatch is fully wired before the user
+        // interacts with anything.
+        cx.activate(true);
+
+        open_main_window(cx);
+    });
 }
 
 fn install_menus(cx: &mut App) {
@@ -62,31 +98,76 @@ fn install_menus(cx: &mut App) {
                 MenuItem::Separator,
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::Separator,
+                MenuItem::action("Hide Eidola", Hide),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::Separator,
                 MenuItem::action("Quit", Quit),
             ],
             disabled: false,
         },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("New Space", NewSpace),
+                MenuItem::Separator,
+                MenuItem::action("Close Window", CloseWindow),
+            ],
+            disabled: false,
+        },
+        // `os_action` ties Edit-menu items to the standard macOS selectors
+        // (cut:, copy:, paste:, selectAll:), so the OS routes them through
+        // the responder chain to whatever has focus — including system
+        // textfields in save panels and the like. Undo/Redo are kept on
+        // `handleGPUIMenuItem:` because gpui-macos disables the OS undo:/redo:
+        // selectors when there's no NSTextView/NSTextField responder.
         Menu {
             name: "Edit".into(),
             items: vec![
                 MenuItem::action("Undo", gpui_component::input::Undo),
                 MenuItem::action("Redo", gpui_component::input::Redo),
                 MenuItem::Separator,
-                MenuItem::action("Cut", gpui_component::input::Cut),
-                MenuItem::action("Copy", gpui_component::input::Copy),
-                MenuItem::action("Paste", gpui_component::input::Paste),
+                MenuItem::os_action("Cut", gpui_component::input::Cut, OsAction::Cut),
+                MenuItem::os_action("Copy", gpui_component::input::Copy, OsAction::Copy),
+                MenuItem::os_action("Paste", gpui_component::input::Paste, OsAction::Paste),
                 MenuItem::Separator,
-                MenuItem::action("Select All", gpui_component::input::SelectAll),
+                MenuItem::os_action(
+                    "Select All",
+                    gpui_component::input::SelectAll,
+                    OsAction::SelectAll,
+                ),
+            ],
+            disabled: false,
+        },
+        // Naming this menu "Window" causes gpui_macos to call
+        // `app.setWindowsMenu_(menu)`, which tells AppKit "this is the
+        // canonical macOS Window menu". AppKit auto-populates it with the
+        // open-window switcher and treats the app as fully wired up — which
+        // matters for keystroke / menu-equivalent dispatch in edge cases
+        // like ⌘Tab back to the app or having no window key.
+        Menu {
+            name: "Window".into(),
+            items: vec![
+                MenuItem::action("Minimize", Minimize),
+                MenuItem::action("Zoom", Zoom),
             ],
             disabled: false,
         },
     ]);
+
+    // Standard macOS dock menu: right-click the dock icon → "New Space".
+    cx.set_dock_menu(vec![MenuItem::action("New Space", NewSpace)]);
 }
 
 fn install_keybindings(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("cmd-n", NewSpace, None),
+        KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-h", Hide, None),
+        KeyBinding::new("alt-cmd-h", HideOthers, None),
+        KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-enter", crate::chat::Send, Some("ChatView")),
     ]);
 }
@@ -101,19 +182,95 @@ fn install_action_handlers(cx: &mut App) {
     });
 
     cx.on_action(|_: &OpenSettings, cx: &mut App| {
-        let core = cx.global::<AppGlobal>().core.clone();
-        cx.spawn(async move |cx: &mut AsyncApp| {
-            open_settings_window(core, cx).await;
-        })
-        .detach();
+        // Singleton: raise the existing window if it's still alive,
+        // otherwise open a fresh one. We do this *synchronously* so the
+        // handle is stored before the action handler returns — earlier
+        // we used `cx.spawn` for this and a fast second click could fire
+        // the next handler before the spawned task had stored the handle,
+        // producing two windows.
+        if try_focus_existing_settings(cx) {
+            return;
+        }
+        open_settings_window(cx);
     });
+
+    cx.on_action(|_: &NewSpace, cx: &mut App| {
+        open_main_window(cx);
+    });
+
+    // macOS standard App-menu actions. Without these registered, AppKit
+    // may treat the app menu as incomplete in the no-window-focused state
+    // and skip menu-equivalent dispatch.
+    cx.on_action(|_: &Hide, cx: &mut App| cx.hide());
+    cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
+    cx.on_action(|_: &ShowAll, cx: &mut App| cx.unhide_other_apps());
+
+    // Window menu standards. Both need a focused window — `cx.defer` so we
+    // run after the current dispatch's window-update completes; without
+    // it, `handle.update(cx, ...)` on the same window we were dispatched
+    // inside fails (slot is taken) and `.ok()` silently swallows the Err.
+    cx.on_action(|_: &Minimize, cx: &mut App| {
+        let Some(handle) = cx.active_window() else {
+            return;
+        };
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, _| window.minimize_window())
+                .ok();
+        });
+    });
+    cx.on_action(|_: &Zoom, cx: &mut App| {
+        let Some(handle) = cx.active_window() else {
+            return;
+        };
+        cx.defer(move |cx| {
+            handle.update(cx, |_, window, _| window.zoom_window()).ok();
+        });
+    });
+
+    // `CloseWindow` is intentionally NOT registered as a global handler.
+    // Each view registers its own listener via `.on_action(cx.listener(…))`
+    // (see `chat::ChatView` and `settings::SettingsView`). With per-view
+    // registration, `is_action_available` returns true only when a window
+    // with the listener is alive — so macOS auto-greys "Close Window" in
+    // the menu when no window is open, which is the correct behavior.
+}
+
+/// Try to bring the existing Settings window forward. Returns `true` if a
+/// live Settings window was raised, `false` otherwise.
+///
+/// The liveness check matches the cached id against `cx.windows()` — the
+/// authoritative list of live windows. (We can't use the cleaner Zed-style
+/// `cx.windows().find_map(downcast::<SettingsView>)` because both our
+/// chat and settings windows wrap their views in `gpui_component::Root`,
+/// which is required by `Root::read` calls inside the `Input` widget — so
+/// they're not distinguishable by root view type.) A stale id self-heals
+/// here: if the cached window was closed, the containment check fails and
+/// we clear the cache.
+fn try_focus_existing_settings(cx: &mut App) -> bool {
+    let Some(handle) = cx.global::<AppGlobal>().settings_window else {
+        return false;
+    };
+    let alive = cx
+        .windows()
+        .iter()
+        .any(|w| w.window_id() == handle.window_id());
+    if !alive {
+        cx.global_mut::<AppGlobal>().settings_window = None;
+        return false;
+    }
+    handle
+        .update(cx, |_, window, _| window.activate_window())
+        .ok();
+    true
 }
 
 /// Edge-to-edge titlebar: macOS extends the content view under the
 /// traffic-light buttons and stops painting a separate titlebar background.
 /// Each view is responsible for leaving room at the top so the lights don't
-/// land on real UI — see `chat::TITLE_BAR_RESERVE` and `settings.rs`'s
-/// `MACOS_TRAFFIC_LIGHTS_RESERVE` for the two patterns we use.
+/// land on real UI — see `chat::TITLE_BAR_RESERVE` (vertical reserve + fade
+/// gradient) and `settings::TAB_STRIP_LEFT_PAD` (horizontal pad — the tab
+/// row doubles as the title bar).
 fn transparent_titlebar() -> TitlebarOptions {
     TitlebarOptions {
         title: None,
@@ -133,8 +290,9 @@ fn centered_window_bounds(cx: &mut App, w: f32, h: f32) -> Option<WindowBounds> 
     )))
 }
 
-async fn open_main_window(core: Entity<Core>, cx: &mut AsyncApp) {
-    let bounds = cx.update(|cx| centered_window_bounds(cx, 900., 640.));
+fn open_main_window(cx: &mut App) {
+    let core = cx.global::<AppGlobal>().core.clone();
+    let bounds = centered_window_bounds(cx, 900., 640.);
 
     let opts = WindowOptions {
         window_bounds: bounds,
@@ -149,10 +307,18 @@ async fn open_main_window(core: Entity<Core>, cx: &mut AsyncApp) {
         let view = cx.new(|cx| ChatView::new(core.clone(), window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
+
+    // Bring the app forward so the new window comes to the front, even when
+    // the action originated from another app's context (e.g. the dock
+    // right-click menu while a different app is foreground). `focus: true`
+    // in WindowOptions makes the window key within our app, but doesn't
+    // by itself activate the app vs other apps.
+    cx.activate(true);
 }
 
-async fn open_settings_window(core: Entity<Core>, cx: &mut AsyncApp) {
-    let bounds = cx.update(|cx| centered_window_bounds(cx, 560., 480.));
+fn open_settings_window(cx: &mut App) {
+    let core = cx.global::<AppGlobal>().core.clone();
+    let bounds = centered_window_bounds(cx, 560., 480.);
 
     let opts = WindowOptions {
         window_bounds: bounds,
@@ -162,9 +328,13 @@ async fn open_settings_window(core: Entity<Core>, cx: &mut AsyncApp) {
         ..Default::default()
     };
 
-    let _ = cx.open_window(opts, |window, cx| {
+    let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
         let view = cx.new(|cx| SettingsView::new(core.clone(), window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
+
+    if let Ok(handle) = handle {
+        cx.global_mut::<AppGlobal>().settings_window = Some(handle);
+    }
 }

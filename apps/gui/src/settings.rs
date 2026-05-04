@@ -1,6 +1,6 @@
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window, div,
+    AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
+    Render, StatefulInteractiveElement, Styled, Window, div,
 };
 use gpui_component::{
     ActiveTheme,
@@ -9,6 +9,7 @@ use gpui_component::{
 };
 
 use crate::account::AccountView;
+use crate::actions::CloseWindow;
 use crate::core::Core;
 use crate::general::GeneralView;
 use crate::wallet::WalletView;
@@ -35,6 +36,11 @@ pub struct SettingsView {
     general: Entity<GeneralView>,
     account: Entity<AccountView>,
     wallet: Entity<WalletView>,
+    /// Focus handle the root v_flex tracks. We attach `CloseWindow`'s
+    /// listener to the v_flex; the focused node has to be at-or-below
+    /// that v_flex for the listener to be in the dispatch path, so we
+    /// `focus()` the handle on construction.
+    focus_handle: FocusHandle,
 }
 
 impl SettingsView {
@@ -43,11 +49,15 @@ impl SettingsView {
         let account = cx.new(|cx| AccountView::new(core.clone(), window, cx));
         let wallet = cx.new(|cx| WalletView::new(core, window, cx));
 
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
+
         Self {
             selected: Tab::General,
             general,
             account,
             wallet,
+            focus_handle,
         }
     }
 
@@ -86,6 +96,10 @@ impl Render for SettingsView {
         };
 
         v_flex()
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
+                window.remove_window();
+            }))
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)

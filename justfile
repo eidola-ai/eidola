@@ -39,6 +39,13 @@ build system:
         ;;
       gui)
         cargo build -p eidola-gui
+        # On macOS, also assemble a proper .app bundle. AppKit needs an
+        # Info.plist alongside the binary to treat the process as a real
+        # app (vs. a command-line tool); otherwise menu key-equivalent
+        # dispatch breaks when no window has key focus.
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+          ./scripts/package-gui-app.sh debug
+        fi
         ;;
       macos)
         if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -68,7 +75,18 @@ run system *args:
         cargo run -p eidola-cli -- {{ args }}
         ;;
       gui)
-        cargo run -p eidola-gui -- {{ args }}
+        # Build + assemble the .app, then `open` it so AppKit launches us
+        # in app-mode (full menu / key-equivalent dispatch). `cargo run`
+        # alone would launch the bare binary, which AppKit treats as a
+        # tool — visible in the menu bar showing "eidola-gui" instead of
+        # "Eidola" and breaking ⌘N / ⌘Q etc. when no window has key
+        # focus. On non-macOS we fall back to `cargo run`.
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+          just build gui
+          open -W "apps/gui/build/Eidola.app" --args {{ args }}
+        else
+          cargo run -p eidola-gui -- {{ args }}
+        fi
         ;;
       macos)
         if [[ "$(uname -s)" != "Darwin" ]]; then

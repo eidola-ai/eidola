@@ -13,6 +13,7 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::actions::CloseWindow;
 use crate::core::Core;
 
 /// Default model to send to the inference endpoint.
@@ -89,6 +90,11 @@ impl ChatView {
         });
 
         let focus_handle = cx.focus_handle();
+        // Focus the view by default so action listeners attached to the
+        // root v_flex (notably `CloseWindow`) are in the dispatch path
+        // before the user has clicked anything. Clicking into the input
+        // moves focus down naturally.
+        focus_handle.focus(window, cx);
 
         // Kick off model loading so the chat can dispatch as soon as possible.
         core.update(cx, |core, cx| core.fetch_models(cx));
@@ -239,6 +245,9 @@ impl Render for ChatView {
             .key_context("ChatView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
+                window.remove_window();
+            }))
             .relative()
             .size_full()
             .bg(theme.background)
