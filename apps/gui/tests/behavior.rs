@@ -14,8 +14,8 @@ use eidola_app_core::{BalancesResult, ConfigState, CredentialInfo, SpaceMessage}
 use eidola_gui::chat::{ChatView, Send};
 use eidola_gui::core::Core;
 use eidola_gui::wallet::WalletView;
-use gpui::{AppContext, Entity, TestAppContext, WindowOptions};
-use gpui_component::Theme;
+use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
+use gpui_component::{Root, Theme};
 
 // ---------------------------------------------------------------------------
 // Core fixture
@@ -105,13 +105,12 @@ fn wallet_view_constructs_against_stub_core(cx: &mut TestAppContext) {
         })
     });
 
-    let window = open_view(cx, |window, cx| {
+    let (_window, _view) = open_view(cx, |window, cx| {
         cx.new(|cx| WalletView::new(core.clone(), window, cx))
     });
 
     // Construction calls `core.fetch_credentials(cx)` which is a no-op on a
     // stub. The view should sit there harmlessly.
-    let _ = root(&window, cx);
     cx.run_until_parked();
 
     core.read_with(cx, |c, _| {
@@ -131,17 +130,16 @@ fn wallet_view_constructs_against_stub_core(cx: &mut TestAppContext) {
 #[gpui::test]
 fn chat_submit_with_empty_prompt_is_noop(cx: &mut TestAppContext) {
     let core = stub_core_with_config(cx);
-    let window = open_view(cx, |window, cx| {
+    let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| ChatView::new(core.clone(), window, cx))
     });
-    let view = root(&window, cx);
 
     view.read_with(cx, |v, _| {
         assert!(v.messages.is_empty());
         assert!(v.streaming.is_none());
     });
 
-    dispatch_send(&view, &window, cx);
+    dispatch_send(&view, window, cx);
 
     view.read_with(cx, |v, _| {
         assert!(
@@ -158,10 +156,9 @@ fn chat_submit_with_empty_prompt_is_noop(cx: &mut TestAppContext) {
 #[gpui::test]
 fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
     let core = stub_core_with_config(cx);
-    let window = open_view(cx, |window, cx| {
+    let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| ChatView::new(core.clone(), window, cx))
     });
-    let view = root(&window, cx);
 
     // Populate the prompt input the same way a user would, then dispatch the
     // Send action through the focus handle — exercising `submit`'s real path
@@ -169,7 +166,7 @@ fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
     // backend, so submit early-returns after the local state mutations,
     // leaving `messages` and `thinking` populated.
     let prompt_state = view.read_with(cx, |v, _| v.prompt_state_for_test());
-    cx.update_window(window.into(), |_, window, cx| {
+    cx.update_window(window, |_, window, cx| {
         prompt_state.update(cx, |state, cx| {
             state.set_value("hi there", window, cx);
         });
@@ -177,7 +174,7 @@ fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
     .unwrap();
 
     let focus = view.read_with(cx, |v, _| v.focus_handle());
-    cx.update_window(window.into(), |_, window, cx| {
+    cx.update_window(window, |_, window, cx| {
         focus.dispatch_action(&Send, window, cx);
     })
     .unwrap();
@@ -206,10 +203,9 @@ fn chat_renders_markdown_messages_without_panicking(cx: &mut TestAppContext) {
     // each `SpaceMessage` is still exactly one row in the chat, regardless
     // of how many block elements its content parses into.
     let core = stub_core_with_config(cx);
-    let window = open_view(cx, |window, cx| {
+    let (_window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| ChatView::new(core.clone(), window, cx))
     });
-    let view = root(&window, cx);
 
     view.update(cx, |v, _cx| {
         v.set_messages_for_test(vec![
@@ -262,10 +258,18 @@ fn stub_core_with_config(cx: &mut TestAppContext) -> Entity<Core> {
     })
 }
 
+/// Open a window whose root is `gpui_component::Root` wrapping the inner
+/// view, the same way production does (`lib.rs::open_main_window`). The
+/// `Root` wrapper is required by `gpui_component::Input`: a focused input's
+/// `on_blur` calls `Root::update`, which panics if the window root isn't a
+/// `Root`. ChatView focuses its input on construction, so opening it
+/// without `Root` would panic the moment the test process closes the
+/// window. Returns both the `AnyWindowHandle` (for action dispatch /
+/// window updates) and the inner `Entity<V>` (for state assertions).
 fn open_view<V: gpui::Render + 'static>(
     cx: &mut TestAppContext,
     build: impl FnOnce(&mut gpui::Window, &mut gpui::App) -> Entity<V>,
-) -> gpui::WindowHandle<V> {
+) -> (AnyWindowHandle, Entity<V>) {
     cx.update(|cx| {
         // Idempotent — gpui-component installs its `Theme` and other globals
         // here. View construction reads them via `cx.theme()`, so the init
@@ -273,25 +277,22 @@ fn open_view<V: gpui::Render + 'static>(
         // colour-bearing assertions match production.
         gpui_component::init(cx);
         eidola_gui::theme::install(cx);
-        cx.open_window(WindowOptions::default(), |window, cx| build(window, cx))
-            .expect("open test window")
+
+        let mut inner: Option<Entity<V>> = None;
+        let window = cx
+            .open_window(WindowOptions::default(), |window, cx| {
+                let view = build(window, cx);
+                inner = Some(view.clone());
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .expect("open test window");
+        (window.into(), inner.expect("build closure produced a view"))
     })
 }
 
-fn root<V: gpui::Render + 'static>(
-    window: &gpui::WindowHandle<V>,
-    cx: &mut TestAppContext,
-) -> Entity<V> {
-    cx.update(|cx| window.root(cx).expect("window root"))
-}
-
-fn dispatch_send(
-    view: &Entity<ChatView>,
-    window: &gpui::WindowHandle<ChatView>,
-    cx: &mut TestAppContext,
-) {
+fn dispatch_send(view: &Entity<ChatView>, window: AnyWindowHandle, cx: &mut TestAppContext) {
     let focus = view.read_with(cx, |v, _| v.focus_handle());
-    cx.update_window((*window).into(), |_, window, cx| {
+    cx.update_window(window, |_, window, cx| {
         focus.dispatch_action(&Send, window, cx);
     })
     .unwrap();

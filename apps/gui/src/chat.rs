@@ -7,11 +7,11 @@ use gpui::{
     WeakEntity, Window, actions, div, linear_color_stop, linear_gradient, px, relative, rems,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, IconName,
+    ActiveTheme, IconName,
     button::{Button, ButtonVariants},
     h_flex,
     highlighter::HighlightTheme,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     label::Label,
     text::{TextView, TextViewStyle},
     v_flex,
@@ -136,14 +136,45 @@ impl ChatView {
 impl ChatView {
     pub fn new(core: Entity<Core>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let prompt_state = cx.new(|cx| {
+            // `auto_grow` with a deliberately huge upper bound is the way we
+            // disable the input's internal scrollbar: the bound caps `rows`
+            // (which becomes the input's auto-height), so as long as the
+            // user can't realistically type 10,000 wrapped lines in one
+            // turn, the input keeps growing with content and the *outer*
+            // scroll container handles overflow as one continuous unit.
+            // This is the journal model — the editor isn't a fixed pane,
+            // it's the page itself.
             InputState::new(window, cx)
                 .multi_line(true)
-                .auto_grow(1, 8)
-                .placeholder("Ask anything…")
+                .auto_grow(1, 10_000)
+                .placeholder("Begin writing…")
         });
 
         let focus_handle = cx.focus_handle();
-        focus_handle.focus(window, cx);
+
+        // Focus the input so the user can start typing immediately, like
+        // opening a fresh journal page. The view's `focus_handle` is still
+        // tracked on the root v_flex (behavior tests dispatch `Send`
+        // through it), but production focus lives on the input itself —
+        // which is the right cursor home for a "letter writing" feel.
+        prompt_state.update(cx, |state, cx| state.focus(window, cx));
+
+        // ⌘↩ on macOS lands inside the focused Input, which has its own
+        // `secondary-enter` binding (gpui-component/.../input/state.rs:129):
+        // it inserts a newline and emits `InputEvent::PressEnter { secondary
+        // = true }`. The ChatView keybinding `cmd-enter → Send` therefore
+        // never reaches us when the input has focus. Catch the event here
+        // and trigger submit; `submit` trims the trailing newline before
+        // forwarding the prompt upstream.
+        let subscriptions = vec![cx.subscribe_in(
+            &prompt_state,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { secondary: true }) {
+                    this.submit(&Send, window, cx);
+                }
+            },
+        )];
 
         core.update(cx, |core, cx| core.fetch_models(cx));
 
@@ -155,7 +186,7 @@ impl ChatView {
             streaming: None,
             error: None,
             focus_handle,
-            _subscriptions: Vec::new(),
+            _subscriptions: subscriptions,
         }
     }
 
@@ -314,14 +345,23 @@ impl ChatView {
 impl EventEmitter<()> for ChatView {}
 
 impl Render for ChatView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let markdown_style = markdown_style(theme.mode.is_dark());
 
-        // Trailing pb_8 on the column gives the final row breath above the
-        // input border; without it the last paragraph sat hard against the
-        // input chrome. The pt(TITLE_BAR_RESERVE) handles the leading edge.
-        let mut messages_col = v_flex().w_full().gap_0().pt(TITLE_BAR_RESERVE).pb_8();
+        // The composer carries a bottom padding of half the viewport
+        // height (computed here, applied below) so the cursor never sits
+        // pinned to the bottom edge of the window. As the user types and
+        // the cursor moves down, the parent scroll follows; the half-page
+        // of empty space below keeps the active line in the comfortable
+        // reading zone — the "writing surface scrolls under your hand"
+        // feel of long-form note tools.
+        let composer_pb = window.viewport_size().height * 0.5;
+
+        // pt(TITLE_BAR_RESERVE) handles the leading edge under the
+        // traffic lights. No trailing pb on the column itself: the
+        // composer's own pb (above) carries the bottom breath.
+        let mut messages_col = v_flex().w_full().gap_0().pt(TITLE_BAR_RESERVE);
         for (idx, entry) in self.messages.iter().enumerate() {
             let msg = &entry.message;
 
@@ -329,16 +369,25 @@ impl Render for ChatView {
             // name — replaces the per-row background tinting that used to
             // distinguish speakers. Errors still use `theme.danger` for the
             // label so the chrome itself signals the role.
-            let label_color = if msg.role == "error" {
-                theme.danger
-            } else {
-                theme.muted_foreground
-            };
-            messages_col = messages_col.child(chapter_delim(
-                participant_label(&msg.role),
-                theme.border,
-                label_color,
-            ));
+            //
+            // The very first message in a conversation has no leading
+            // delim: the user's text is always the *start* of the page
+            // (no header introducing it), and the second turn's delim
+            // (e.g. "Eidola") is what first signals a speaker change.
+            // Subsequent same-speaker messages still get their delim so
+            // the rhythm is preserved across turns.
+            if idx > 0 {
+                let label_color = if msg.role == "error" {
+                    theme.danger
+                } else {
+                    theme.muted_foreground
+                };
+                messages_col = messages_col.child(chapter_delim(
+                    participant_label(&msg.role),
+                    theme.border,
+                    label_color,
+                ));
+            }
 
             let fg = if msg.role == "error" {
                 theme.danger
@@ -535,6 +584,43 @@ impl Render for ChatView {
             );
         }
 
+        // The composing input lives at the foot of the scroll, styled into
+        // the same prose column the body uses, with no border/background
+        // (`appearance(false)`) so it reads as a continuation of the page
+        // rather than a separate chrome element. A "You" chapter delim
+        // sits above it whenever there's preceding content, mirroring the
+        // way earlier turns are introduced; on a fresh, empty page the
+        // delim is omitted so the cursor sits cleanly at the top.
+        //
+        // The input grows freely with content via `auto_grow(1, 10_000)`
+        // — the cap is large enough that no realistic prompt hits it, so
+        // the input's internal scrollbar never engages and the outer
+        // `overflow_y_scroll` div handles all of it (input + preceding
+        // messages) as one continuous unit.
+        let has_preceding =
+            !self.messages.is_empty() || self.streaming.is_some() || self.error.is_some();
+        if has_preceding {
+            messages_col = messages_col.child(chapter_delim(
+                participant_label("user"),
+                theme.border,
+                theme.muted_foreground,
+            ));
+        }
+        messages_col = messages_col.child(
+            div().w_full().px_5().child(
+                prose_row().child(
+                    prose().child(
+                        Input::new(&self.prompt_state)
+                            .appearance(false)
+                            .text_size(PROSE_FONT_SIZE)
+                            .line_height(relative(PROSE_LINE_HEIGHT))
+                            .p_0()
+                            .pb(composer_pb),
+                    ),
+                ),
+            ),
+        );
+
         v_flex()
             .key_context("ChatView")
             .track_focus(&self.focus_handle)
@@ -553,25 +639,6 @@ impl Render for ChatView {
                     .flex_1()
                     .overflow_y_scroll()
                     .child(messages_col),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .px_4()
-                    .py_3()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(div().flex_1().child(Input::new(&self.prompt_state)))
-                    .child(
-                        Button::new("send")
-                            .primary()
-                            .icon(IconName::ArrowUp)
-                            .disabled(self.streaming.is_some())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.submit(&Send, window, cx);
-                            })),
-                    ),
             )
             .child(title_bar_overlay(cx))
     }
