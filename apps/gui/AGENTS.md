@@ -35,7 +35,9 @@ Two `ThemeConfig`s, "Circadian Day" (Light) and "Circadian Night" (Dark), instal
 
 The starting palette is lifted from the marketing site (`../www.eidola.ai/index.html`); treat it as a historical seed, not a contract.
 
-**Body font is Newsreader** (variable TTF, SIL OFL 1.1) — bundled at `apps/gui/assets/fonts/Newsreader.ttf` + `Newsreader-Italic.ttf` and embedded into the binary via `include_bytes!`, then registered with `cx.text_system().add_fonts`. License at `assets/fonts/OFL.txt`. gpui's macOS text system loads TTF/OTF only — the website's WOFF2 files won't work, which is why we ship the canonical TTFs from `google/fonts`.
+**Body font is Newsreader 16pt** (SIL OFL 1.1) — five static TTF instances (Regular, Italic, SemiBold, Bold, BoldItalic) from `productiontype/Newsreader`, bundled in `apps/gui/assets/fonts/Newsreader16pt-*.ttf`, embedded via `include_bytes!`, and registered with `cx.text_system().add_fonts`. License at `assets/fonts/OFL.txt`.
+
+We ship statics rather than the variable upright + italic because **gpui's macOS text system does not apply variable-font weight axes**: `gpui_macos::text_system::add_fonts` registers each TTF as one face with the properties of its default instance, and `font_kit::matching::find_best_match` picks the closest face per weight request. With only the variable TTFs registered, every weight request — `**strong**` (BOLD), headings (SEMIBOLD/BOLD), etc. — resolved to the Regular default and rendered un-bold. Five static faces make `find_best_match` pick correctly. Family name in the theme is `"Newsreader 16pt"` (the typographic family — nid 16 — that all five faces report; SemiBold sets nid 16 explicitly to override its nid 1 = `Newsreader 16pt SemiBold`, the canonical workaround for the Windows OS/2 4-style-per-family limit).
 
 ## Window model
 

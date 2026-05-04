@@ -11,11 +11,23 @@
 //! (`www.eidola.ai/index.html`). It will drift; treat the website as the
 //! historical seed, not a contract.
 //!
-//! The body font is **Newsreader** (Google Fonts, SIL OFL 1.1), shipped as
-//! variable TTFs in `assets/fonts/` and embedded into the binary. gpui's
-//! macOS text system loads TTF/OTF only — the website's WOFF2 files won't
-//! work, so we ship the canonical TTFs from `google/fonts`. License text is
-//! at `assets/fonts/OFL.txt`.
+//! The body font is **Newsreader** (SIL OFL 1.1), shipped as the upstream
+//! `productiontype/Newsreader` 16pt static instances and embedded into the
+//! binary. We ship five faces — Regular / Italic / SemiBold / Bold /
+//! BoldItalic — because gpui's macOS text system does **not** apply
+//! variable-font weight axes: each registered TTF is one face with the
+//! properties of its default instance, and `font_kit::matching::find_best_match`
+//! picks the closest face per weight request. With only a variable upright +
+//! italic registered, every weight request resolved to Regular; with the
+//! statics it resolves correctly (heading SEMIBOLD, **bold** BOLD, etc.).
+//!
+//! Family names: the 16pt statics report `Newsreader 16pt` as their
+//! typographic family (nid 16 — the SemiBold needs nid 16 to override its
+//! nid 1 = `Newsreader 16pt SemiBold`, which is the canonical workaround for
+//! the OS/2 4-style-per-family limit on Windows). The variable TTFs from
+//! `google/fonts` reported the family as `Newsreader` and were a different
+//! family bucket; we no longer ship them. License text is at
+//! `assets/fonts/OFL.txt`.
 
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -23,14 +35,24 @@ use std::rc::Rc;
 use gpui::{App, SharedString, Window};
 use gpui_component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 
-/// Body font family. Must match the family name embedded in the bundled TTFs;
-/// font-kit reads this from the `name` table.
-const FONT_FAMILY: &str = "Newsreader";
+/// Body font family. Must match the family name embedded in the bundled TTFs.
+/// CoreText returns the typographic family (nid 16) when set, otherwise nid 1;
+/// for our 16pt statics that resolves to `Newsreader 16pt` for every face.
+const FONT_FAMILY: &str = "Newsreader 16pt";
 
-/// Variable upright (200–800 weight, 6–72 optical size).
-const NEWSREADER_TTF: &[u8] = include_bytes!("../assets/fonts/Newsreader.ttf");
-/// Variable italic (matching axes).
-const NEWSREADER_ITALIC_TTF: &[u8] = include_bytes!("../assets/fonts/Newsreader-Italic.ttf");
+/// 16pt static instances from `productiontype/Newsreader`. Five faces are the
+/// minimum to make markdown bold/italic/heading weights render correctly:
+/// `find_best_match` picks SemiBold for h2-h5, Bold for h1 and **strong**,
+/// BoldItalic for ***bold-italic***, Italic for `*emphasis*`, Regular for
+/// body. Without a SemiBold the headings would still bold-fall-back; we ship
+/// it for the visual cue between heading and body.
+const NEWSREADER_REGULAR_TTF: &[u8] = include_bytes!("../assets/fonts/Newsreader16pt-Regular.ttf");
+const NEWSREADER_ITALIC_TTF: &[u8] = include_bytes!("../assets/fonts/Newsreader16pt-Italic.ttf");
+const NEWSREADER_SEMIBOLD_TTF: &[u8] =
+    include_bytes!("../assets/fonts/Newsreader16pt-SemiBold.ttf");
+const NEWSREADER_BOLD_TTF: &[u8] = include_bytes!("../assets/fonts/Newsreader16pt-Bold.ttf");
+const NEWSREADER_BOLD_ITALIC_TTF: &[u8] =
+    include_bytes!("../assets/fonts/Newsreader16pt-BoldItalic.ttf");
 
 /// Install the Circadian themes onto the global `Theme` and apply whichever
 /// matches the current OS appearance. Call once after `gpui_component::init`.
@@ -50,8 +72,11 @@ fn load_fonts(cx: &App) {
     // beyond a small bookkeeping cost, so tests that build multiple `App`s
     // (and therefore re-run `install`) don't need to guard.
     let result = cx.text_system().add_fonts(vec![
-        Cow::Borrowed(NEWSREADER_TTF),
+        Cow::Borrowed(NEWSREADER_REGULAR_TTF),
         Cow::Borrowed(NEWSREADER_ITALIC_TTF),
+        Cow::Borrowed(NEWSREADER_SEMIBOLD_TTF),
+        Cow::Borrowed(NEWSREADER_BOLD_TTF),
+        Cow::Borrowed(NEWSREADER_BOLD_ITALIC_TTF),
     ]);
     if let Err(e) = result {
         // Don't panic the app over a font failure — fall back to the system
