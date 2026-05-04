@@ -292,7 +292,22 @@ fn centered_window_bounds(cx: &mut App, w: f32, h: f32) -> Option<WindowBounds> 
 
 fn open_main_window(cx: &mut App) {
     let core = cx.global::<AppGlobal>().core.clone();
-    let bounds = centered_window_bounds(cx, 900., 640.);
+
+    // Square chat window. Side = 90% of the smaller display dimension,
+    // capped at 800px. A square frames the chat as a writing surface —
+    // a sheet of paper, not a wide chat pane — and the cap keeps the
+    // prose column from feeling lost in the middle of a 4K display. If
+    // there's no primary display (rare; offscreen render contexts), we
+    // fall back to the cap.
+    let side = match cx.primary_display() {
+        Some(d) => {
+            let s = d.bounds().size;
+            let smaller = f32::min(s.width.as_f32(), s.height.as_f32());
+            (smaller * 0.9).min(705.0)
+        }
+        None => 820.0,
+    };
+    let bounds = centered_window_bounds(cx, side, side);
 
     let opts = WindowOptions {
         window_bounds: bounds,
