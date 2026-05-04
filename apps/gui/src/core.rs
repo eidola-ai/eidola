@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AccountCreateResult, AllocateResult, AppCore, BalancesResult, ChatResult, ConfigState,
-    CredentialInfo, ModelInfo, PriceInfo, SpaceMessage,
+    AccountCreateResult, AllocateResult, AppCore, BalancesResult, ChatResult, ChatStreamEvent,
+    ConfigState, CredentialInfo, ModelInfo, PriceInfo, SpaceMessage,
 };
 use gpui::{App, AppContext, AsyncApp, Context, Entity, Task, WeakEntity};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// Reactive wrapper around `AppCore`.
 ///
@@ -343,6 +343,34 @@ impl Core {
             let _ = tx.send(res);
         });
         rx
+    }
+
+    /// Streaming chat. Spawns the streaming chat call on the core's tokio
+    /// runtime and returns:
+    ///
+    /// - an `UnboundedReceiver<ChatStreamEvent>` for incremental
+    ///   reasoning/content deltas (closes when the stream finishes), and
+    /// - a `oneshot::Receiver<Result<ChatResult, AppError>>` for the
+    ///   terminal outcome.
+    ///
+    /// The two are drained from gpui's main-thread context (see
+    /// `chat::ChatView::submit_streaming`).
+    pub fn chat_stream(
+        core: Arc<AppCore>,
+        prompt: String,
+        model: String,
+        space_id: Option<String>,
+    ) -> (
+        mpsc::UnboundedReceiver<ChatStreamEvent>,
+        oneshot::Receiver<Result<ChatResult, AppError>>,
+    ) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let res = core.chat_stream(prompt, model, space_id, event_tx).await;
+            let _ = done_tx.send(res);
+        });
+        (event_rx, done_rx)
     }
 }
 

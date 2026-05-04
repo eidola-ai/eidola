@@ -2415,6 +2415,7 @@ dependencies = [
  "blake3",
  "der",
  "dirs",
+ "futures-util",
  "rand_core 0.6.4",
  "reqwest 0.13.2",
  "rustls",
@@ -2440,6 +2441,7 @@ dependencies = [
  "clap",
  "eidola-app-core",
  "open",
+ "tokio",
 ]
 
 [[package]]

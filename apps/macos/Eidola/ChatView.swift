@@ -88,7 +88,7 @@ struct ChatView: View {
     Task {
       do {
         let result = try await core.chat(
-          prompt: text, model: "glm-5-1", spaceId: spaceId)
+          prompt: text, model: "gemma4-31b", spaceId: spaceId)
         spaceId = result.spaceId
         messages = try await core.getSpaceMessages(spaceId: result.spaceId)
       } catch {

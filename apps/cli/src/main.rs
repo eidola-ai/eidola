@@ -1,8 +1,8 @@
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 
 use clap::{Parser, Subcommand};
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, config};
+use eidola_app_core::{AppCore, ChatStreamEvent, config};
 
 #[derive(Parser)]
 #[command(name = "eidola", about = "Eidola CLI")]
@@ -370,8 +370,56 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             space,
         }) => {
             let model = model.unwrap_or_else(|| "gemma4-31b".to_string());
-            let result = core.chat(prompt, model.clone(), space).await?;
-            println!("{}", result.content);
+
+            // Stream chunks straight to stdout. Reasoning goes to stderr
+            // (dim, prefixed with "thinking: ") so a piped stdout still
+            // captures only the final answer text.
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            let chat_fut = core.chat_stream(prompt, model.clone(), space, tx);
+
+            // Pump events while chat_fut runs. We `tokio::join!` the two
+            // halves so events drain in real time rather than only after
+            // the request future awaits a yield point.
+            let printer = async move {
+                let mut stdout = std::io::stdout().lock();
+                let mut stderr = std::io::stderr().lock();
+                let stderr_is_tty = std::io::stderr().is_terminal();
+                let mut in_reasoning = false;
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        ChatStreamEvent::ContentDelta(text) => {
+                            if in_reasoning {
+                                let _ = writeln!(stderr);
+                                if stderr_is_tty {
+                                    let _ = write!(stderr, "\x1b[0m");
+                                }
+                                in_reasoning = false;
+                            }
+                            let _ = stdout.write_all(text.as_bytes());
+                            let _ = stdout.flush();
+                        }
+                        ChatStreamEvent::ReasoningDelta(text) => {
+                            if !in_reasoning {
+                                if stderr_is_tty {
+                                    let _ = write!(stderr, "\x1b[2mthinking: ");
+                                } else {
+                                    let _ = write!(stderr, "thinking: ");
+                                }
+                                in_reasoning = true;
+                            }
+                            let _ = stderr.write_all(text.as_bytes());
+                            let _ = stderr.flush();
+                        }
+                    }
+                }
+                if in_reasoning && stderr_is_tty {
+                    let _ = write!(stderr, "\x1b[0m");
+                }
+                let _ = writeln!(stdout);
+            };
+
+            let (result, ()) = tokio::join!(chat_fut, printer);
+            let result = result?;
             eprintln!(
                 "---\nspace: {}  model: {}  tokens: {}/{}",
                 result.space_id,

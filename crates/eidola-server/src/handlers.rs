@@ -4,7 +4,8 @@ use std::convert::Infallible;
 
 use anonymous_credit_tokens::{Scalar, SpendProof, credit_to_scalar, scalar_to_credit};
 use axum::Json;
-use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Request, State};
 use axum::response::IntoResponse;
 use axum::response::Sse;
 use axum::response::sse::{Event, KeepAlive};
@@ -12,6 +13,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use opentelemetry::KeyValue;
 use rand_core::OsRng;
+use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, warn};
@@ -280,7 +282,7 @@ fn validate_request(
 pub async fn chat_completions(
     TokenAuth(act): TokenAuth,
     State(state): State<AppState>,
-    Json(request): Json<ChatCompletionRequest>,
+    LoggedJson(request): LoggedJson<ChatCompletionRequest>,
 ) -> Result<axum::response::Response, ServerError> {
     // Phase 1: Verify the ACT cryptographically. Errors here mean the token
     // is invalid/malformed — no nullifier recorded, no refund needed.
@@ -636,4 +638,49 @@ async fn handle_streaming_request(
     Ok(Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response())
+}
+
+/// `Json<T>` wrapper that logs the rejection reason at warn level on
+/// failure, before returning the same response axum would have returned.
+///
+/// Why we need this: `Json<T>` rejections fail the request before the
+/// handler runs (the extractor runs first), so handler-level logging
+/// can't see them. With `#[serde(deny_unknown_fields)]` on
+/// `ChatCompletionRequest`, an unrecognized field — for instance a
+/// client sending an OpenAI-extension key the server hasn't added —
+/// becomes a 422 with no log entry, and the client sees an opaque
+/// "(422): unknown error". This wrapper makes those failures visible
+/// to operators.
+///
+/// **Privacy:** the rejection error message produced by axum + serde is
+/// **structural only** — it names the offending field and the kind of
+/// error ("unknown field `foo`", "missing field `model`", "expected u32
+/// at line N column M") and does not include the user's prompt or any
+/// other request body content. We log only that error string. Body
+/// bytes are owned by axum's extractor and never reach the log path.
+pub struct LoggedJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for LoggedJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = JsonRejection;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => {
+                // Field-shape diagnostic only — the source error from
+                // axum/serde names the field but never echoes the body
+                // value. Safe to log.
+                warn!(
+                    target = std::any::type_name::<T>(),
+                    "request body rejected: {rejection}"
+                );
+                Err(rejection)
+            }
+        }
+    }
 }

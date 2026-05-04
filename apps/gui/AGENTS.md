@@ -39,6 +39,24 @@ The starting palette is lifted from the marketing site (`../www.eidola.ai/index.
 
 We ship statics rather than the variable upright + italic because **gpui's macOS text system does not apply variable-font weight axes**: `gpui_macos::text_system::add_fonts` registers each TTF as one face with the properties of its default instance, and `font_kit::matching::find_best_match` picks the closest face per weight request. With only the variable TTFs registered, every weight request — `**strong**` (BOLD), headings (SEMIBOLD/BOLD), etc. — resolved to the Regular default and rendered un-bold. Five static faces make `find_best_match` pick correctly. Family name in the theme is `"Newsreader 16pt"` (the typographic family — nid 16 — that all five faces report; SemiBold sets nid 16 explicitly to override its nid 1 = `Newsreader 16pt SemiBold`, the canonical workaround for the Windows OS/2 4-style-per-family limit).
 
+## Streaming chat
+
+`ChatView` drives chat via `Core::chat_stream` (which wraps `AppCore::chat_stream` from `crates/eidola-app-core/`). The core's streaming method posts `stream: true` to the OpenAI-compatible upstream and forwards each SSE chunk's `delta.content` as `ChatStreamEvent::ContentDelta` and `delta.reasoning_content` / `delta.reasoning` (vLLM-style) as `ChatStreamEvent::ReasoningDelta`. The terminal `ChatResult` is the function's return value, not an event — the channel just closes.
+
+While streaming, `ChatView::streaming: Option<StreamingResponse>` holds the live `reasoning` + `content` buffers and a disclosure-`expanded` flag. It renders as a single row below the user message: a clickable "Thinking…" / "Answering…" / "Thinking (N chars)" header (a `Button` styled with a chevron), the reasoning body when expanded, and the partial markdown content as it grows. On `Done`, `streaming` is dropped and `messages` is re-fetched from the space — only the final content is persisted; reasoning is ephemeral by design (it is not written to the local DB).
+
+`AppCore::chat_stream` is **Rust-only**. It's not exposed via UniFFI — the SwiftUI macOS app keeps using the blocking `chat()`. Wiring it to Swift later would mean a UniFFI `callback_interface` for the event sink. The CLI uses streaming too: `apps/cli/src/main.rs` pumps `ContentDelta` to stdout and `ReasoningDelta` to stderr (dimmed and prefixed with `thinking: ` when stderr is a TTY) so a piped stdout still captures only the final answer.
+
+Refund handling for streaming differs from blocking only in *where* the refund token comes from: SSE responses have no inline JSON body to carry it, so the streaming path always goes through the `/v1/credentials/refund` recovery endpoint after the stream ends. Same recovery endpoint as the existing network-error fallback in the blocking `chat()`.
+
+## Tail-on-bottom scroll
+
+`ChatView` holds a `gpui::ScrollHandle` on the messages-list scroll div (`.track_scroll(&self.scroll_handle)`). Tail policy: if the user is at the bottom (within `TAIL_TOLERANCE = 24px`) just before a content mutation, we re-pin them to the new bottom afterward; if they've scrolled up, we leave their position alone.
+
+The non-obvious bit is the *timing* of the re-pin. `set_offset(-max_offset)` writes a value the next paint reads — but `max_offset` is recomputed *during* paint, after layout. So `cx.defer` (which fires at end-of-effect-cycle, **before** the next paint) sees the stale `max_offset` and undershoots by one chunk's height. `Window::on_next_frame` runs at the start of the *next* frame — i.e. *after* the paint that reflects the latest content — so `max_offset` has already been updated. `ChatView::schedule_tail` uses `on_next_frame`. Diagnostic signal if this regresses: tail looks "sticky-but-one-chunk-behind" — auto-scroll lags the most recent token by exactly one render.
+
+User-initiated submit is a special case: `submit` always sets `pending_tail = true` regardless of where the user was, so a fresh prompt brings the new exchange into view even if the user had been scrolled up — matching ChatGPT/Claude convention.
+
 ## Window model
 
 **Chat windows are non-singleton.** Every `NewSpace` invocation opens a fresh `ChatView`, each owning its own `space_id` so they're independent conversations sharing the same `Core`. `open_main_window` calls `cx.activate(true)` after `cx.open_window` so a window opened from another app's context (dock right-click while a different app is foreground) brings Eidola to the front rather than opening behind.

@@ -125,6 +125,23 @@ pub struct ModelInfo {
     pub context_length: u64,
 }
 
+/// Incremental events emitted by `AppCore::chat_stream`. The terminal
+/// outcome is the function's `Result<ChatResult, AppError>` return value;
+/// senders close their channel when the function returns.
+///
+/// Not exposed via UniFFI — streaming is Rust-only today (CLI + gpui app).
+/// The Swift macOS app keeps using the blocking `chat()`. If we want to
+/// expose streaming to Swift later, the natural shape is a UniFFI
+/// `callback_interface`.
+#[derive(Clone, Debug)]
+pub enum ChatStreamEvent {
+    /// A piece of the model's reasoning ("thinking") output. Append to a
+    /// running buffer; treat empty events as no-ops.
+    ReasoningDelta(String),
+    /// A piece of the assistant's answer text. Append to a running buffer.
+    ContentDelta(String),
+}
+
 // ============================================================================
 // Default directory helpers (exported via UniFFI for use from Swift)
 // ============================================================================
@@ -1043,14 +1060,9 @@ impl Inner {
         .await?;
 
         if !status.is_success() {
-            let error_msg = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
             return Err(AppError::Server {
                 status: status.as_u16(),
-                message: error_msg.to_string(),
+                message: parse_server_error_message(&response_text),
             });
         }
 
@@ -1063,6 +1075,520 @@ impl Inner {
             credits_charged: charge_credits as i64,
         })
     }
+
+    /// Streaming counterpart to `chat`. Mirrors the same setup (ACT token,
+    /// DB action insertion, prior-context assembly) and post-stream cleanup
+    /// (refund recovery, DB persistence of the inference action and content
+    /// blocks), but sends `stream: true` upstream and forwards each SSE chunk
+    /// to `sender` as it arrives.
+    ///
+    /// Reasoning shape: we accept both `delta.reasoning_content` (OpenAI-style
+    /// extension used by some providers) and `delta.reasoning` (vLLM's
+    /// extension). Either form is forwarded as `ReasoningDelta`. Unknown
+    /// fields are ignored — if Tinfoil's upstream uses a third spelling, the
+    /// thinking section will simply stay empty until we adapt.
+    ///
+    /// Refund handling differs from `chat` only in *where* the refund token
+    /// comes from: SSE responses have no inline body to carry it, so we
+    /// always go through the `/v1/credentials/refund` recovery endpoint
+    /// after the stream ends. The credential is left in `pre_credential`
+    /// state until that recovery completes, same as today's network-error
+    /// path.
+    #[allow(clippy::too_many_arguments)]
+    async fn chat_stream(
+        &self,
+        prompt: &str,
+        model: &str,
+        space_id: Option<&str>,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        use futures_util::StreamExt;
+
+        let cfg = self.load_config();
+        let base_url = self.require_base_url(&cfg)?;
+        let now = now_ms();
+
+        let db_conn = self.db_conn().await?;
+        let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
+
+        let attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let log_clone = attestation_log.clone();
+        let observer: Option<tinfoil_verifier::AttestationObserver> = Some(Arc::new(
+            move |att: tinfoil_verifier::VerifiedAttestation| {
+                log_clone.lock().unwrap().push(att);
+            },
+        ));
+
+        let client = self.build_client(&cfg, observer).await?;
+
+        let models = fetch_models(&client, base_url).await?;
+        let mut connection_id =
+            flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?;
+
+        let model_entry =
+            models
+                .data
+                .iter()
+                .find(|m| m.id == model)
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("model not found: {model}"),
+                })?;
+
+        let max_completion_tokens = (model_entry.context_length).min(4096) as u32;
+
+        let user_participant_id =
+            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+        let model_participant_id =
+            db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
+
+        let space_id = if let Some(sid) = space_id {
+            db::get_space(&db_conn, sid)
+                .await?
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("space not found: {sid}"),
+                })?;
+            let _ =
+                db::insert_space_participant(&db_conn, sid, &model_participant_id, "member", now)
+                    .await;
+            sid.to_string()
+        } else {
+            let sid = Uuid::now_v7().to_string();
+            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
+            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
+                .await?;
+            db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
+                .await?;
+            sid
+        };
+
+        let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
+        let prior_messages = actions_to_messages(&prior_action_rows);
+
+        let total_prompt_bytes: u128 = prior_messages
+            .iter()
+            .map(|m| m.content.len() as u128)
+            .sum::<u128>()
+            + prompt.len() as u128;
+
+        let sf = model_entry.pricing.per_prompt_token.scale_factor as u128;
+        let prompt_rate = model_entry.pricing.per_prompt_token.value as u128;
+        let prompt_credits = (total_prompt_bytes * prompt_rate).div_ceil(sf);
+        let completion_rate = model_entry.pricing.per_completion_token.value as u128;
+        let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
+        let charge_credits = prompt_credits + completion_credits;
+
+        if charge_credits == 0 {
+            return Err(AppError::Credential {
+                message: "computed charge is zero — model pricing may be missing".into(),
+            });
+        }
+
+        let cred = db::find_spendable_credential(&db_conn, charge_credits as i64)
+            .await?
+            .ok_or_else(|| AppError::Credential {
+                message: "no credential with sufficient credits found".into(),
+            })?;
+
+        let credit_token =
+            CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
+                message: format!("failed to decode credential: {e}"),
+            })?;
+        let public_key =
+            PublicKey::from_cbor(&cred.public_key_data).map_err(|e| AppError::Credential {
+                message: format!("failed to decode public key: {e}"),
+            })?;
+
+        let params = params_from_domain_separator(cfg.domain_separator())?;
+
+        let charge_scalar =
+            credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
+                message: format!("invalid charge amount: {e:?}"),
+            })?;
+        let (spend_proof, pre_refund) = credit_token
+            .prove_spend::<128>(&params, charge_scalar, OsRng)
+            .map_err(|e| AppError::Credential {
+                message: format!("failed to create spend proof: {e:?}"),
+            })?;
+
+        let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode pre_refund: {e}"),
+        })?;
+        let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode spend proof: {e}"),
+        })?;
+        let pre_cred_id = Uuid::now_v7().to_string();
+        db::insert_pre_credential_refund(
+            &db_conn,
+            &pre_cred_id,
+            &cred.nonce,
+            &cred.issuer_key_id,
+            &pre_refund_cbor,
+            charge_credits as i64,
+            now,
+        )
+        .await?;
+
+        let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
+        let challenge_digest = compute_challenge_digest();
+
+        let mut token_bytes = Vec::new();
+        token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+        token_bytes.extend_from_slice(&challenge_digest);
+        token_bytes.extend_from_slice(&issuer_key_hash);
+        token_bytes.extend_from_slice(&spend_proof_cbor);
+
+        let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
+        let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+
+        let last_action_id = db::last_action_in_space(&db_conn, &space_id).await?;
+
+        let user_action_id = Uuid::now_v7().to_string();
+        db::insert_action(
+            &db_conn,
+            &db::ActionEntry {
+                id: user_action_id.clone(),
+                space_id: space_id.clone(),
+                participant_id: user_participant_id,
+                action_type: "user_input".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at: now,
+            },
+        )
+        .await?;
+        db::insert_text_content_block(
+            &db_conn,
+            &Uuid::now_v7().to_string(),
+            &user_action_id,
+            0,
+            "text",
+            prompt,
+        )
+        .await?;
+
+        if let Some(ref ante_id) = last_action_id {
+            db::insert_action_antecedent(&db_conn, &user_action_id, ante_id, 0).await?;
+        }
+
+        let mut messages: Vec<serde_json::Value> = prior_messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
+        messages.push(serde_json::json!({"role": "user", "content": prompt}));
+
+        // No `stream_options` here — the server unconditionally sets
+        // `include_usage: true` when forwarding the streaming request
+        // upstream, since accurate per-token refunds depend on it.
+        // Sending it from the client is harmless (the server ignores
+        // and overrides the value), but it's also unnecessary, so we
+        // keep our outgoing request minimal.
+        let request_body_json = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "max_completion_tokens": max_completion_tokens,
+            "stream": true,
+        });
+        let request_at = now_ms();
+
+        let chat_result = client
+            .post(format!("{base_url}/v1/chat/completions"))
+            .header("Authorization", &auth_value)
+            .header("Accept", "text/event-stream")
+            .json(&request_body_json)
+            .send()
+            .await;
+
+        let resp = match chat_result {
+            Ok(resp) => {
+                if let Some(new_cid) =
+                    flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now)
+                        .await?
+                {
+                    connection_id = Some(new_cid);
+                }
+                resp
+            }
+            Err(e) => {
+                let original_err = AppError::from_request(e);
+                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
+                    let _ = process_refund(
+                        &refund_obj,
+                        &params,
+                        &spend_proof,
+                        &pre_refund,
+                        &public_key,
+                        &db_conn,
+                        &pre_cred_id,
+                        cred.generation + 1,
+                        now,
+                    )
+                    .await;
+                }
+                return Err(original_err);
+            }
+        };
+
+        let status = resp.status();
+
+        // Non-2xx: server returned an error body (typically JSON, not SSE).
+        // Read it normally so we can surface a useful message.
+        if !status.is_success() {
+            let response_text = resp.text().await.unwrap_or_default();
+            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
+                let _ = process_refund(
+                    &refund_obj,
+                    &params,
+                    &spend_proof,
+                    &pre_refund,
+                    &public_key,
+                    &db_conn,
+                    &pre_cred_id,
+                    cred.generation + 1,
+                    now,
+                )
+                .await;
+            }
+            db::insert_request(
+                &db_conn,
+                &db::Request {
+                    id: Uuid::now_v7().to_string(),
+                    connection_id,
+                    action_id: None,
+                    method: "POST".to_string(),
+                    path: "/v1/chat/completions".to_string(),
+                    request_headers: None,
+                    request_body: Some(request_body_json.to_string().into_bytes()),
+                    response_status: Some(status.as_u16() as i64),
+                    response_headers: None,
+                    response_body: Some(response_text.as_bytes().to_vec()),
+                    request_at,
+                    response_at: Some(now_ms()),
+                    duration_ms: Some(now_ms() - request_at),
+                    error: None,
+                    credential_nonce: Some(cred.nonce.clone()),
+                    created_at: now_ms(),
+                },
+            )
+            .await?;
+            return Err(AppError::Server {
+                status: status.as_u16(),
+                message: parse_server_error_message(&response_text),
+            });
+        }
+
+        // Consume the SSE body. We accumulate bytes in a small buffer and
+        // split on the SSE event boundary `\n\n`. Each event is a sequence
+        // of `field: value\n` lines; we only care about `data:` lines (the
+        // chunk JSON) and the sentinel `[DONE]`.
+        let mut byte_stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut full_content = String::new();
+        let mut full_reasoning = String::new();
+        let mut input_tokens: Option<i64> = None;
+        let mut output_tokens: Option<i64> = None;
+        let mut response_buf: Vec<u8> = Vec::new();
+        let mut finished = false;
+
+        while let Some(chunk) = byte_stream.next().await {
+            let bytes = chunk.map_err(|e| AppError::Network {
+                message: format!("stream read failed: {e}"),
+            })?;
+            // Keep the raw bytes for the request log so we can debug
+            // upstream behaviour the same way as the non-streaming path.
+            response_buf.extend_from_slice(&bytes);
+            buf.extend_from_slice(&bytes);
+
+            while let Some(pos) = find_event_boundary(&buf) {
+                let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
+                // Drop the boundary itself (\n\n or \r\n\r\n).
+                let boundary_len = if buf.starts_with(b"\r\n\r\n") { 4 } else { 2 };
+                if buf.len() >= boundary_len {
+                    buf.drain(..boundary_len);
+                }
+                let event_str = match std::str::from_utf8(&event_bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                for line in event_str.lines() {
+                    let line = line.trim_end_matches('\r');
+                    let Some(payload) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let payload = payload.trim_start();
+                    if payload == "[DONE]" {
+                        finished = true;
+                        continue;
+                    }
+                    let json: serde_json::Value = match serde_json::from_str(payload) {
+                        Ok(v) => v,
+                        Err(_) => continue, // ignore comments/heartbeats
+                    };
+
+                    if let Some(usage) = json.get("usage") {
+                        if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
+                            input_tokens = Some(v);
+                        }
+                        if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
+                            output_tokens = Some(v);
+                        }
+                    }
+
+                    let Some(delta) = json
+                        .get("choices")
+                        .and_then(|c| c.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|c| c.get("delta"))
+                    else {
+                        continue;
+                    };
+
+                    if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                        && !text.is_empty()
+                    {
+                        full_content.push_str(text);
+                        let _ = sender.send(ChatStreamEvent::ContentDelta(text.to_string()));
+                    }
+
+                    // OpenAI o1-style ("reasoning_content") and vLLM-style
+                    // ("reasoning"). Either form is forwarded as a
+                    // ReasoningDelta; we tolerate providers that emit one,
+                    // both, or neither.
+                    for key in ["reasoning_content", "reasoning"] {
+                        if let Some(text) = delta.get(key).and_then(|v| v.as_str())
+                            && !text.is_empty()
+                        {
+                            full_reasoning.push_str(text);
+                            let _ = sender.send(ChatStreamEvent::ReasoningDelta(text.to_string()));
+                        }
+                    }
+                }
+            }
+
+            if finished {
+                break;
+            }
+        }
+        let response_at = now_ms();
+
+        if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
+            let _ = process_refund(
+                &refund_obj,
+                &params,
+                &spend_proof,
+                &pre_refund,
+                &public_key,
+                &db_conn,
+                &pre_cred_id,
+                cred.generation + 1,
+                now,
+            )
+            .await;
+        }
+
+        let inference_action_id = Uuid::now_v7().to_string();
+        db::insert_action(
+            &db_conn,
+            &db::ActionEntry {
+                id: inference_action_id.clone(),
+                space_id: space_id.clone(),
+                participant_id: model_participant_id,
+                action_type: "inference".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: Some(model.to_string()),
+                input_tokens,
+                output_tokens,
+                credits_consumed: Some(charge_credits as i64),
+                created_at: now_ms(),
+            },
+        )
+        .await?;
+        db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0).await?;
+
+        let context_assembly_id = Uuid::now_v7().to_string();
+        db::insert_context_assembly(
+            &db_conn,
+            &context_assembly_id,
+            &inference_action_id,
+            None,
+            input_tokens,
+            false,
+            now_ms(),
+        )
+        .await?;
+
+        let prior_action_ids = db::space_action_ids(&db_conn, &space_id).await?;
+        for (pos, aid) in prior_action_ids.iter().enumerate() {
+            if aid != &inference_action_id {
+                db::insert_context_assembly_action(&db_conn, &context_assembly_id, aid, pos as i64)
+                    .await?;
+            }
+        }
+
+        if !full_content.is_empty() {
+            db::insert_text_content_block(
+                &db_conn,
+                &Uuid::now_v7().to_string(),
+                &inference_action_id,
+                0,
+                "text",
+                &full_content,
+            )
+            .await?;
+        }
+
+        db::insert_request(
+            &db_conn,
+            &db::Request {
+                id: Uuid::now_v7().to_string(),
+                connection_id,
+                action_id: Some(inference_action_id),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                request_headers: None,
+                request_body: Some(request_body_json.to_string().into_bytes()),
+                response_status: Some(status.as_u16() as i64),
+                response_headers: None,
+                response_body: Some(response_buf),
+                request_at,
+                response_at: Some(response_at),
+                duration_ms: Some(response_at - request_at),
+                error: None,
+                credential_nonce: Some(cred.nonce.clone()),
+                created_at: now_ms(),
+            },
+        )
+        .await?;
+
+        Ok(ChatResult {
+            space_id,
+            content: full_content,
+            model: model.to_string(),
+            input_tokens,
+            output_tokens,
+            credits_charged: charge_credits as i64,
+        })
+    }
+}
+
+/// Find the byte offset of the next SSE event boundary (`\n\n` or
+/// `\r\n\r\n`) in `buf`, if any. Returns the position *before* the boundary
+/// — i.e. the length of the next event's body.
+fn find_event_boundary(buf: &[u8]) -> Option<usize> {
+    for i in 0..buf.len() {
+        if buf[i..].starts_with(b"\r\n\r\n") {
+            return Some(i);
+        }
+        if buf[i..].starts_with(b"\n\n") {
+            return Some(i);
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -1084,6 +1610,31 @@ pub struct AppCore {
 impl AppCore {
     pub fn runtime(&self) -> &tokio::runtime::Runtime {
         &self.runtime
+    }
+
+    /// Streaming chat. Pushes incremental `ChatStreamEvent`s through
+    /// `sender` and returns the finalized `ChatResult` when the upstream
+    /// stream closes. Drops `sender` on return so receivers see channel
+    /// closure as the natural "done" signal.
+    ///
+    /// Rust-only: not exposed via UniFFI. The Swift macOS app keeps using
+    /// the blocking `chat()`. See [`ChatStreamEvent`].
+    pub async fn chat_stream(
+        &self,
+        prompt: String,
+        model: String,
+        space_id: Option<String>,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .chat_stream(&prompt, &model, space_id.as_deref(), sender)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
     }
 }
 
@@ -1551,14 +2102,12 @@ async fn recover_refund(
         })?;
 
     if !status.is_success() {
-        let msg = body
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error");
         return Err(AppError::Server {
             status: status.as_u16(),
-            message: format!("refund recovery failed: {msg}"),
+            message: format!(
+                "refund recovery failed: {}",
+                parse_server_error_message(&body_text)
+            ),
         });
     }
 
@@ -1733,7 +2282,21 @@ fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError>
     if status.is_success() {
         return Ok(());
     }
-    let message = serde_json::from_str::<serde_json::Value>(body)
+    Err(AppError::Server {
+        status: status.as_u16(),
+        message: parse_server_error_message(body),
+    })
+}
+
+/// Best-effort extraction of a human-readable error message from a
+/// non-2xx response body. Tries the OpenAI-shaped `{"error":{"message":"..."}}`
+/// envelope first; falls back to the raw body text (trimmed and
+/// length-capped — axum's body-extractor rejection bodies are plain
+/// text, not JSON, and were previously bucketed to "unknown error" by
+/// the old JSON-only path); finally falls back to a literal "unknown
+/// error" only when the body is empty.
+pub(crate) fn parse_server_error_message(body: &str) -> String {
+    if let Some(msg) = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| {
             v.get("error")
@@ -1741,11 +2304,22 @@ fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError>
                 .and_then(|m| m.as_str())
                 .map(String::from)
         })
-        .unwrap_or_else(|| body.to_string());
-    Err(AppError::Server {
-        status: status.as_u16(),
-        message,
-    })
+    {
+        return msg;
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "unknown error".to_string();
+    }
+    // Cap the message so a chatty rejection body doesn't blow up the UI.
+    const MAX_LEN: usize = 500;
+    if trimmed.len() > MAX_LEN {
+        let mut capped: String = trimmed.chars().take(MAX_LEN).collect();
+        capped.push('…');
+        capped
+    } else {
+        trimmed.to_string()
+    }
 }
 
 async fn fetch_models(

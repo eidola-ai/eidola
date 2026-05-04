@@ -9,7 +9,7 @@ use eidola_app_core::{
     SpaceMessage,
 };
 use eidola_gui::account::AccountView;
-use eidola_gui::chat::ChatView;
+use eidola_gui::chat::{ChatView, StreamingResponse};
 use eidola_gui::core::Core;
 use eidola_gui::general::GeneralView;
 use eidola_gui::settings::SettingsView;
@@ -116,9 +116,90 @@ fn register_chat(s: &mut Snapshots) {
         let core = stub_core_with_config(cx);
         cx.new(|cx| {
             let view = ChatView::new(core, window, cx);
-            view_thinking(view)
+            // Empty streaming response — renders the collapsed "Thinking…"
+            // header with no body yet, the moment after the user submits.
+            view_streaming(view, StreamingResponse::default())
         })
     });
+
+    s.add(
+        "chat_finalized_with_thinking",
+        size(px(900.), px(640.)),
+        |window, cx| {
+            // Reasoning persists past the stream end: a finalized
+            // assistant message exposes a "Thinking" disclosure that
+            // the user can re-open. Rendered here in the expanded
+            // state to verify the layout when the thinking body is
+            // visible alongside the answer.
+            let core = stub_core_with_config(cx);
+            cx.new(|cx| {
+                let mut view = ChatView::new(core, window, cx);
+                view.set_messages_for_test(vec![
+                    SpaceMessage {
+                        role: "user".into(),
+                        content: "What's a Hilbert space, in one paragraph?".into(),
+                    },
+                    SpaceMessage {
+                        role: "assistant".into(),
+                        content: "A **Hilbert space** is a complete inner-product space — a \
+                            vector space equipped with an inner product whose induced norm \
+                            makes it a Banach space. The completeness lets you reason about \
+                            limits of Cauchy sequences (essential for things like Fourier \
+                            analysis), and the inner product gives you geometry: angles, \
+                            orthogonality, projections."
+                            .into(),
+                    },
+                ]);
+                view.set_reasoning_for_test(
+                    1,
+                    "The user wants a one-paragraph definition. I should hit: vector space \
+                        + inner product, the induced norm, and completeness. Mention Fourier \
+                        as an application motivator. Skip the formal axioms — they're not \
+                        what 'in one paragraph' is asking for."
+                        .into(),
+                    true,
+                );
+                view
+            })
+        },
+    );
+
+    s.add(
+        "chat_streaming_partial",
+        size(px(900.), px(640.)),
+        |window, cx| {
+            let core = stub_core_with_config(cx);
+            cx.new(|cx| {
+                let view = ChatView::new(core, window, cx);
+                let view = view_with_messages(
+                    view,
+                    vec![SpaceMessage {
+                        role: "user".into(),
+                        content: "Why is the sky blue?".into(),
+                    }],
+                );
+                view_streaming(
+                    view,
+                    StreamingResponse {
+                        reasoning: "Let me think about Rayleigh scattering. Short \
+                            wavelengths interact more strongly with air molecules \
+                            than long wavelengths, so blue light gets scattered in \
+                            all directions while red passes through more directly.\n\n\
+                            I should mention the Sun's spectrum and human vision \
+                            response too — but keep it tight."
+                            .into(),
+                        content: "The sky looks blue because of **Rayleigh scattering**. \
+                            Sunlight is white, but as it passes through Earth's \
+                            atmosphere, shorter (blue) wavelengths scatter more strongly \
+                            than longer (red) ones, so blue light reaches your"
+                            .into(),
+                        expanded: true,
+                        error: None,
+                    },
+                )
+            })
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -302,8 +383,8 @@ fn view_with_messages(view: ChatView, messages: Vec<SpaceMessage>) -> ChatView {
     view
 }
 
-fn view_thinking(view: ChatView) -> ChatView {
+fn view_streaming(view: ChatView, streaming: StreamingResponse) -> ChatView {
     let mut view = view;
-    view.set_thinking_for_test(true);
+    view.set_streaming_for_test(Some(streaming));
     view
 }

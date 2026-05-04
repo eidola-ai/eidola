@@ -33,9 +33,30 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream: bool,
 
+    /// Streaming options. The OpenAI-compatible field; we accept it for
+    /// API parity with clients that already set it (e.g. an SDK setting
+    /// `include_usage: true` to capture token counts in the final chunk).
+    /// Note: the server overrides `include_usage` to `true` for any
+    /// streaming request before forwarding upstream — usage is required
+    /// for accurate per-token refunds and isn't a client choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+
     /// Up to 4 sequences where the API will stop generating.
     #[serde(default)]
     pub stop: Option<StopSequence>,
+}
+
+/// OpenAI-compatible streaming options.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StreamOptions {
+    /// Include token-usage statistics in the final stream chunk. The
+    /// server forces this on for upstream calls so it can compute
+    /// accurate refunds; the field exists here only to round-trip
+    /// honest clients.
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 /// Stop sequence can be a single string or array of strings.
@@ -197,6 +218,16 @@ pub struct Choice {
 pub struct AssistantMessage {
     pub role: Role,
     pub content: Option<String>,
+
+    /// Reasoning ("thinking") output from models that emit it. Two
+    /// spellings are in the wild: OpenAI o-series and many compatible
+    /// gateways use `reasoning_content`; vLLM uses `reasoning`. We
+    /// faithfully round-trip whichever the upstream sent so clients can
+    /// pick. Both stay `None` for non-thinking models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// The reason the model stopped generating.
@@ -276,6 +307,16 @@ pub struct ChunkDelta {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+
+    /// Reasoning ("thinking") deltas — same dual spelling as
+    /// `AssistantMessage`. Without these fields here, serde silently
+    /// drops the upstream `reasoning_content` / `reasoning` keys during
+    /// deserialization and the client only ever sees `delta.content`.
+    /// Round-trip whatever the upstream emits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// A list of available models.
@@ -540,6 +581,8 @@ mod tests {
                 message: AssistantMessage {
                     role: Role::Assistant,
                     content: Some("Hello!".to_string()),
+                    reasoning_content: None,
+                    reasoning: None,
                 },
                 finish_reason: Some(FinishReason::Stop),
             }],
@@ -568,6 +611,8 @@ mod tests {
                 delta: ChunkDelta {
                     role: Some(Role::Assistant),
                     content: None,
+                    reasoning_content: None,
+                    reasoning: None,
                 },
                 finish_reason: None,
             }],

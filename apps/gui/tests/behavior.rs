@@ -138,7 +138,7 @@ fn chat_submit_with_empty_prompt_is_noop(cx: &mut TestAppContext) {
 
     view.read_with(cx, |v, _| {
         assert!(v.messages.is_empty());
-        assert!(!v.thinking);
+        assert!(v.streaming.is_none());
     });
 
     dispatch_send(&view, &window, cx);
@@ -149,8 +149,8 @@ fn chat_submit_with_empty_prompt_is_noop(cx: &mut TestAppContext) {
             "submit with empty prompt must not append a message"
         );
         assert!(
-            !v.thinking,
-            "submit with empty prompt must not enter thinking state"
+            v.streaming.is_none(),
+            "submit with empty prompt must not start a streaming response"
         );
     });
 }
@@ -185,9 +185,16 @@ fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
 
     view.read_with(cx, |v, _| {
         assert_eq!(v.messages.len(), 1, "submit should append the user message");
-        assert_eq!(v.messages[0].role, "user");
-        assert_eq!(v.messages[0].content, "hi there");
-        assert!(v.thinking, "submit should mark thinking=true");
+        assert_eq!(v.messages[0].message.role, "user");
+        assert_eq!(v.messages[0].message.content, "hi there");
+        assert!(
+            v.streaming.is_some(),
+            "submit should enter streaming state with an empty StreamingResponse"
+        );
+        let s = v.streaming.as_ref().unwrap();
+        assert!(s.reasoning.is_empty());
+        assert!(s.content.is_empty());
+        assert!(!s.expanded);
     });
 }
 
@@ -224,7 +231,7 @@ fn chat_renders_markdown_messages_without_panicking(cx: &mut TestAppContext) {
             2,
             "markdown content must not multiply messages"
         );
-        assert_eq!(v.messages[1].role, "assistant");
+        assert_eq!(v.messages[1].message.role, "assistant");
     });
 }
 

@@ -999,10 +999,28 @@ async fn handle_proxy(
         Ok(resp) => {
             let status = resp.status();
             let resp_headers = resp.headers().clone();
-            let resp_body = resp.bytes().await.unwrap_or_default();
 
-            let mut response = (status, resp_body).into_response();
+            // Forward the upstream body as a *stream*. We previously
+            // collected `resp.bytes().await` into a single buffer, which
+            // worked for short JSON responses but broke streaming
+            // (`text/event-stream`) traffic — the shim would wait until
+            // the upstream's stream ended before sending a single byte
+            // to the client. On a long generation the client's TCP
+            // connection would die waiting and report "connection closed
+            // before message completed", with no eidola-server log
+            // entry because the server was happily emitting chunks the
+            // shim never forwarded.
+            let body = Body::from_stream(resp.bytes_stream());
+
+            let mut response = (status, body).into_response();
+            // `Body::from_stream` is chunked transfer encoding by the
+            // time it reaches the client; drop any upstream
+            // content-length / transfer-encoding headers so axum's
+            // body layer sets them correctly for the streamed body.
             for (name, value) in &resp_headers {
+                if name == "content-length" || name == "transfer-encoding" {
+                    continue;
+                }
                 response.headers_mut().insert(name, value.clone());
             }
             response

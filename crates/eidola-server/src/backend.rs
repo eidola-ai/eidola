@@ -426,9 +426,18 @@ impl ChatBackend for TinfoilBackend {
     ) -> Result<mpsc::Receiver<Result<BackendStreamEvent, ServerError>>, ServerError> {
         let url = format!("{}/chat/completions", self.base_url);
 
-        // Ensure stream=true in the forwarded request
+        // Ensure stream=true in the forwarded request, and force
+        // include_usage on so the upstream emits a final usage chunk.
+        // We need usage to compute the per-token refund; without it we'd
+        // default to a zero refund and effectively bill the client the
+        // worst-case `charge_credits` for every streaming request. This
+        // is server policy, not a client choice — we override whatever
+        // the caller set.
         let mut stream_request = request.clone();
         stream_request.stream = true;
+        stream_request.stream_options = Some(crate::types::StreamOptions {
+            include_usage: true,
+        });
 
         let response = self
             .client
@@ -497,10 +506,16 @@ impl ChatBackend for TinfoilBackend {
                                     }
                                 }
                                 Err(e) => {
+                                    // Privacy: a parse failure is a structural
+                                    // problem, not a content one. We log the
+                                    // error message and the data length only —
+                                    // never `data` itself, since SSE chunks
+                                    // carry model output deltas that can
+                                    // indirectly reflect prompt content.
                                     tracing::warn!(
-                                        "Failed to parse SSE chunk: {} - data: {}",
-                                        e,
-                                        data
+                                        data_len = data.len(),
+                                        "Failed to parse SSE chunk: {}",
+                                        e
                                     );
                                 }
                             }
