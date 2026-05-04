@@ -109,6 +109,21 @@ fn install_action_handlers(cx: &mut App) {
     });
 }
 
+/// Edge-to-edge titlebar: macOS extends the content view under the
+/// traffic-light buttons and stops painting a separate titlebar background.
+/// Each view is responsible for leaving room at the top so the lights don't
+/// land on real UI — see `chat::TITLE_BAR_RESERVE` and `settings.rs`'s
+/// `MACOS_TRAFFIC_LIGHTS_RESERVE` for the two patterns we use.
+fn transparent_titlebar() -> TitlebarOptions {
+    TitlebarOptions {
+        title: None,
+        appears_transparent: true,
+        // Vertically centered in the 36px title-bar reserve, tuned by eye to
+        // match macOS-native lift (centers the ~12px buttons around y≈17).
+        traffic_light_position: Some(point(px(14.), px(11.))),
+    }
+}
+
 fn centered_window_bounds(cx: &mut App, w: f32, h: f32) -> Option<WindowBounds> {
     let display = cx.primary_display()?;
     let center = display.bounds().center();
@@ -123,11 +138,7 @@ async fn open_main_window(core: Entity<Core>, cx: &mut AsyncApp) {
 
     let opts = WindowOptions {
         window_bounds: bounds,
-        titlebar: Some(TitlebarOptions {
-            title: Some("Eidola".into()),
-            appears_transparent: false,
-            traffic_light_position: Some(point(px(10.), px(10.))),
-        }),
+        titlebar: Some(transparent_titlebar()),
         kind: WindowKind::Normal,
         window_min_size: Some(size(px(480.), px(360.))),
         ..Default::default()
@@ -145,11 +156,7 @@ async fn open_settings_window(core: Entity<Core>, cx: &mut AsyncApp) {
 
     let opts = WindowOptions {
         window_bounds: bounds,
-        titlebar: Some(TitlebarOptions {
-            title: Some("Eidola Settings".into()),
-            appears_transparent: false,
-            traffic_light_position: Some(point(px(10.), px(10.))),
-        }),
+        titlebar: Some(transparent_titlebar()),
         kind: WindowKind::Normal,
         window_min_size: Some(size(px(420.), px(320.))),
         ..Default::default()

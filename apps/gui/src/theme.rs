@@ -11,23 +11,53 @@
 //! (`www.eidola.ai/index.html`). It will drift; treat the website as the
 //! historical seed, not a contract.
 //!
-//! Font remains `.SystemUIFont` for now; switching to Newsreader requires
-//! bundling the font files and loading them via `cx.text_system().add_fonts`.
+//! The body font is **Newsreader** (Google Fonts, SIL OFL 1.1), shipped as
+//! variable TTFs in `assets/fonts/` and embedded into the binary. gpui's
+//! macOS text system loads TTF/OTF only — the website's WOFF2 files won't
+//! work, so we ship the canonical TTFs from `google/fonts`. License text is
+//! at `assets/fonts/OFL.txt`.
 
+use std::borrow::Cow;
 use std::rc::Rc;
 
 use gpui::{App, SharedString, Window};
 use gpui_component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 
+/// Body font family. Must match the family name embedded in the bundled TTFs;
+/// font-kit reads this from the `name` table.
+const FONT_FAMILY: &str = "Newsreader";
+
+/// Variable upright (200–800 weight, 6–72 optical size).
+const NEWSREADER_TTF: &[u8] = include_bytes!("../assets/fonts/Newsreader.ttf");
+/// Variable italic (matching axes).
+const NEWSREADER_ITALIC_TTF: &[u8] = include_bytes!("../assets/fonts/Newsreader-Italic.ttf");
+
 /// Install the Circadian themes onto the global `Theme` and apply whichever
 /// matches the current OS appearance. Call once after `gpui_component::init`.
 pub fn install(cx: &mut App) {
+    load_fonts(cx);
+
     {
         let theme = Theme::global_mut(cx);
         theme.light_theme = Rc::new(circadian_day());
         theme.dark_theme = Rc::new(circadian_night());
     }
     Theme::sync_system_appearance(None, cx);
+}
+
+fn load_fonts(cx: &App) {
+    // Idempotent at the gpui layer: re-adding the same family is a no-op
+    // beyond a small bookkeeping cost, so tests that build multiple `App`s
+    // (and therefore re-run `install`) don't need to guard.
+    let result = cx.text_system().add_fonts(vec![
+        Cow::Borrowed(NEWSREADER_TTF),
+        Cow::Borrowed(NEWSREADER_ITALIC_TTF),
+    ]);
+    if let Err(e) = result {
+        // Don't panic the app over a font failure — fall back to the system
+        // UI font (which `ThemeConfig::font_family = None` resolves to).
+        eprintln!("eidola-gui: failed to register Newsreader fonts: {e}");
+    }
 }
 
 /// Subscribe a window to OS appearance changes so Light/Dark switches at the
@@ -50,6 +80,7 @@ fn circadian_day() -> ThemeConfig {
         is_default: true,
         name: SharedString::new_static("Circadian Day"),
         mode: ThemeMode::Light,
+        font_family: Some(SharedString::new_static(FONT_FAMILY)),
         radius: Some(8),
         radius_lg: Some(12),
         shadow: Some(true),
@@ -142,6 +173,7 @@ fn circadian_night() -> ThemeConfig {
         is_default: true,
         name: SharedString::new_static("Circadian Night"),
         mode: ThemeMode::Dark,
+        font_family: Some(SharedString::new_static(FONT_FAMILY)),
         radius: Some(8),
         radius_lg: Some(12),
         shadow: Some(true),

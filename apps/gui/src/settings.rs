@@ -13,6 +13,16 @@ use crate::core::Core;
 use crate::general::GeneralView;
 use crate::wallet::WalletView;
 
+/// Left padding for the tab strip on macOS, large enough to clear the traffic
+/// lights that sit at `point(14, 14)` and span ~68px wide. The tab row doubles
+/// as the window's title bar — the lights live to the left of the tabs on a
+/// shared band of `theme.background`. Matches gpui-component's own
+/// `TITLE_BAR_LEFT_PADDING` (80px) for consistency with the platform norm.
+#[cfg(target_os = "macos")]
+const TAB_STRIP_LEFT_PAD: gpui::Pixels = gpui::px(80.);
+#[cfg(not(target_os = "macos"))]
+const TAB_STRIP_LEFT_PAD: gpui::Pixels = gpui::px(12.);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     General,
@@ -83,7 +93,8 @@ impl Render for SettingsView {
                 h_flex()
                     .w_full()
                     .gap_2()
-                    .px_3()
+                    .pl(TAB_STRIP_LEFT_PAD)
+                    .pr_3()
                     .py_2()
                     .border_b_1()
                     .border_color(theme.border)

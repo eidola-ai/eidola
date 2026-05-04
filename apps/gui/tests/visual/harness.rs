@@ -1,15 +1,17 @@
 //! Snapshot test harness for gpui views.
 //!
-//! Runs each registered case on a `VisualTestAppContext` (real Metal renderer,
-//! offscreen window, deterministic dispatch), captures the resulting image,
-//! and compares it byte-for-byte against a golden PNG in `tests/snapshots/`.
+//! Renders each case **twice** — once with `Circadian Day` (Light) and once
+//! with `Circadian Night` (Dark) — and writes `<name>-day.png` /
+//! `<name>-night.png` into `tests/snapshots/`. The harness drives theme mode
+//! itself rather than reading the OS appearance, so the output is the same
+//! whether the developer's machine is in Light or Dark mode.
 //!
-//! Behavior:
+//! Behavior per (case, mode):
 //! - If the golden does not exist, the new image is written as the golden and
 //!   the case is reported as `written`.
 //! - If `UPDATE_SNAPSHOTS=1` is set, the golden is overwritten.
-//! - Otherwise, a mismatch writes a sibling `<name>.new.png` for review and
-//!   the case fails.
+//! - Otherwise, a mismatch writes a sibling `<name>-<mode>.new.png` for
+//!   review and the case fails.
 //!
 //! The runner exits with a non-zero status if any case failed.
 
@@ -17,17 +19,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{AppContext, Entity, Pixels, Render, Size, VisualTestAppContext};
-use gpui_component::Root;
+use gpui_component::{Root, Theme, ThemeMode};
 use gpui_component_assets::Assets;
 use image::RgbaImage;
 
-type BuildRoot = Box<dyn FnOnce(&mut gpui::Window, &mut gpui::App) -> Entity<Root>>;
+/// Build closure: must be `Fn` so the harness can invoke it once per mode.
+/// Cases capture nothing reusable — they construct fresh entities each call.
+type BuildRoot = Box<dyn Fn(&mut gpui::Window, &mut gpui::App) -> Entity<Root>>;
 
 struct Case {
     name: &'static str,
     size: Size<Pixels>,
     build: BuildRoot,
 }
+
+const MODES: &[(ThemeMode, &str)] = &[(ThemeMode::Light, "day"), (ThemeMode::Dark, "night")];
 
 pub struct Snapshots {
     cases: Vec<Case>,
@@ -49,11 +55,13 @@ impl Snapshots {
     }
 
     /// Register a snapshot case. The closure builds the root view of the
-    /// window; the harness wraps it in a `Root` and captures the result.
+    /// window; the harness wraps it in a `Root` and captures the result. The
+    /// closure must be `Fn`: the harness invokes it once per theme mode, with
+    /// fresh entities each time.
     pub fn add<V, F>(&mut self, name: &'static str, size: Size<Pixels>, build: F)
     where
         V: Render + 'static,
-        F: FnOnce(&mut gpui::Window, &mut gpui::App) -> Entity<V> + 'static,
+        F: Fn(&mut gpui::Window, &mut gpui::App) -> Entity<V> + 'static,
     {
         self.cases.push(Case {
             name,
@@ -77,50 +85,53 @@ impl Snapshots {
             eidola_gui::theme::install(cx);
         });
 
-        let total = self.cases.len();
-        let mut written: Vec<&'static str> = Vec::new();
-        let mut failed: Vec<&'static str> = Vec::new();
+        let total = self.cases.len() * MODES.len();
+        let mut written: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         let mut passed: usize = 0;
 
         for case in self.cases {
-            let path = self.snapshot_dir.join(format!("{}.png", case.name));
-            let new_path = self.snapshot_dir.join(format!("{}.new.png", case.name));
+            for (mode, suffix) in MODES.iter().copied() {
+                let label = format!("{}-{}", case.name, suffix);
+                let path = self.snapshot_dir.join(format!("{label}.png"));
+                let new_path = self.snapshot_dir.join(format!("{label}.new.png"));
 
-            // Always remove a stale .new.png from a previous run.
-            let _ = std::fs::remove_file(&new_path);
+                // Always remove a stale .new.png from a previous run.
+                let _ = std::fs::remove_file(&new_path);
 
-            let img = render_case(&mut cx, case.size, case.build);
+                cx.update(|cx| Theme::change(mode, None, cx));
+                let img = render_case(&mut cx, case.size, case.build.as_ref());
 
-            if !path.exists() || self.update {
-                img.save(&path).expect("write golden snapshot");
-                written.push(case.name);
-                println!("  written  {}", case.name);
-                continue;
-            }
-
-            let golden = match image::open(&path) {
-                Ok(img) => img.to_rgba8(),
-                Err(e) => {
-                    eprintln!("  fail     {} (cannot read golden: {e})", case.name);
-                    failed.push(case.name);
+                if !path.exists() || self.update {
+                    img.save(&path).expect("write golden snapshot");
+                    written.push(label.clone());
+                    println!("  written  {label}");
                     continue;
                 }
-            };
 
-            if images_equal(&img, &golden) {
-                passed += 1;
-                println!("  ok       {}", case.name);
-            } else {
-                img.save(&new_path).expect("write .new.png");
-                failed.push(case.name);
-                println!(
-                    "  fail     {}  (review {})",
-                    case.name,
-                    new_path
-                        .strip_prefix(env!("CARGO_MANIFEST_DIR"))
-                        .unwrap_or(&new_path)
-                        .display()
-                );
+                let golden = match image::open(&path) {
+                    Ok(img) => img.to_rgba8(),
+                    Err(e) => {
+                        eprintln!("  fail     {label} (cannot read golden: {e})");
+                        failed.push(label);
+                        continue;
+                    }
+                };
+
+                if images_equal(&img, &golden) {
+                    passed += 1;
+                    println!("  ok       {label}");
+                } else {
+                    img.save(&new_path).expect("write .new.png");
+                    failed.push(label.clone());
+                    println!(
+                        "  fail     {label}  (review {})",
+                        new_path
+                            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                            .unwrap_or(&new_path)
+                            .display()
+                    );
+                }
             }
         }
 
@@ -143,7 +154,11 @@ impl Snapshots {
     }
 }
 
-fn render_case(cx: &mut VisualTestAppContext, size: Size<Pixels>, build: BuildRoot) -> RgbaImage {
+fn render_case(
+    cx: &mut VisualTestAppContext,
+    size: Size<Pixels>,
+    build: &dyn Fn(&mut gpui::Window, &mut gpui::App) -> Entity<Root>,
+) -> RgbaImage {
     let window = cx
         .open_offscreen_window(size, |window, cx| build(window, cx))
         .expect("open offscreen window");

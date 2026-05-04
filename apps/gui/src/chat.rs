@@ -2,7 +2,7 @@ use eidola_app_core::SpaceMessage;
 use gpui::{
     AppContext, Context, Entity, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    WeakEntity, Window, actions, div,
+    WeakEntity, Window, actions, div, linear_color_stop, linear_gradient,
 };
 use gpui_component::{
     ActiveTheme, Disableable, IconName,
@@ -17,6 +17,22 @@ use crate::core::Core;
 
 /// Default model to send to the inference endpoint.
 const DEFAULT_MODEL: &str = "glm-5-1";
+
+/// Vertical space reserved at the top of the window for the macOS traffic
+/// lights. The window has a transparent titlebar (see
+/// `lib.rs::transparent_titlebar`), so the OS draws the lights without
+/// painting a separate titlebar background. This reserve does two things:
+///
+/// 1. Pads the messages list so the first message sits below the lights at
+///    rest.
+/// 2. Hosts a `theme.background → transparent` gradient overlay
+///    (`render_title_bar_overlay`) painted on top of the scroll area, so
+///    messages scrolling up under the band fade out smoothly into the chrome
+///    instead of clipping at a hard edge.
+#[cfg(target_os = "macos")]
+const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
+#[cfg(not(target_os = "macos"))]
+const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 
 actions!(chat, [Send]);
 
@@ -171,7 +187,7 @@ impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        let mut messages_col = v_flex().w_full().gap_0();
+        let mut messages_col = v_flex().w_full().gap_0().pt(TITLE_BAR_RESERVE);
         for (idx, msg) in self.messages.iter().enumerate() {
             let bg = match msg.role.as_str() {
                 "user" => theme.background,
@@ -223,6 +239,7 @@ impl Render for ChatView {
             .key_context("ChatView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::submit))
+            .relative()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
@@ -252,5 +269,25 @@ impl Render for ChatView {
                             })),
                     ),
             )
+            .child(title_bar_overlay(cx))
     }
+}
+
+/// Title-bar overlay: a gradient that fades from full `theme.background` at
+/// the top to fully transparent at the bottom of the reserve. Painted over
+/// the scroll area (positioned absolutely, last child wins z-order in gpui),
+/// so messages scrolling up under it dissolve smoothly instead of clipping.
+fn title_bar_overlay(cx: &gpui::App) -> impl IntoElement {
+    let bg = cx.theme().background;
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .h(TITLE_BAR_RESERVE)
+        .bg(linear_gradient(
+            180.,
+            linear_color_stop(bg, 0.0),
+            linear_color_stop(bg.opacity(0.0), 1.0),
+        ))
 }
