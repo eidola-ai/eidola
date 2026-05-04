@@ -315,6 +315,23 @@ fn markdown_style(is_dark: bool) -> TextViewStyle {
 /// the top to fully transparent at the bottom of the reserve. Painted over
 /// the scroll area (positioned absolutely, last child wins z-order in gpui),
 /// so messages scrolling up under it dissolve smoothly instead of clipping.
+///
+/// Two non-aesthetic modifiers tame the title-bar band:
+///
+/// - `.cursor_default()` sets the platform cursor to `Arrow` over the band
+///   *and* causes gpui to register a hitbox here
+///   (`Interactivity::should_insert_hitbox` includes
+///   `style.mouse_cursor.is_some()`). Without it, the text below keeps
+///   winning the cursor-style lookup and the I-beam shows over the band.
+/// - `.block_mouse_except_scroll()` upgrades that hitbox to swallow click
+///   and drag events so a double-click-drag in the band doesn't fall
+///   through to `TextView`'s selectable handler and start a text
+///   selection underneath. Scroll passes through, so wheel-scrolling
+///   while the cursor is in the band still scrolls the chat.
+///
+/// macOS native titlebar behavior (drag, double-click-to-zoom) is handled
+/// by AppKit at the NSWindow layer before the gpui content view is asked,
+/// so blocking mouse on the gpui side doesn't disturb it.
 fn title_bar_overlay(cx: &gpui::App) -> impl IntoElement {
     let bg = cx.theme().background;
     div()
@@ -323,6 +340,8 @@ fn title_bar_overlay(cx: &gpui::App) -> impl IntoElement {
         .left_0()
         .right_0()
         .h(TITLE_BAR_RESERVE)
+        .cursor_default()
+        .block_mouse_except_scroll()
         .bg(linear_gradient(
             180.,
             linear_color_stop(bg, 0.0),
