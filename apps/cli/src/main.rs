@@ -369,7 +369,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             model,
             space,
         }) => {
-            let model = model.unwrap_or_else(|| "glm-5-1".to_string());
+            let model = model.unwrap_or_else(|| "gemma4-31b".to_string());
             let result = core.chat(prompt, model.clone(), space).await?;
             println!("{}", result.content);
             eprintln!(
