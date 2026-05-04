@@ -36,6 +36,133 @@ fn register_chat(s: &mut Snapshots) {
         cx.new(|cx| ChatView::new(core, window, cx))
     });
 
+    // Narrow window — guards that the chapter delimiter tracks the prose
+    // body's width edge-for-edge. Earlier the delim sized itself
+    // independently and rendered small + left-aligned when the window was
+    // narrower than the prose max-width cap. Snapshot here is wider than
+    // the rule's hairline so a regression would be obvious.
+    s.add(
+        "chat_with_messages_narrow",
+        size(px(480.), px(520.)),
+        |window, cx| {
+            let core = stub_core_with_config(cx);
+            cx.new(|cx| {
+                let view = ChatView::new(core, window, cx);
+                view_with_messages(
+                    view,
+                    vec![
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "Quick check?".into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content: "Yes — everything looks fine on the latest deploy.".into(),
+                        },
+                    ],
+                )
+            })
+        },
+    );
+
+    // "Mid" width — wider than the prose max-width cap (640px) but well
+    // short of the original 900px reference. This is the size where the
+    // earlier flex-1-rules implementation collapsed: prose's max-w bound,
+    // but the inner h_flex's flex-1 rules had no definite parent width to
+    // grow into and rendered as a left-aligned label with no rules.
+    // 680px logical width — exactly the size where the user observed
+    // the delim outer container collapsing to content width in the live
+    // app (1360 physical at 2x DPR). The bug shows the outer `RED` debug
+    // border shrunk to wrap the absolute rule + label rather than
+    // stretching to the row width. Earlier we used a plain `div()` here
+    // and the offscreen renderer happened not to reproduce; switching
+    // the outer to `v_flex()` (matching the message row) made the live
+    // app and the test both stretch correctly.
+    s.add(
+        "chat_with_messages_breakpoint",
+        size(px(680.), px(640.)),
+        |window, cx| {
+            let core = stub_core_with_config(cx);
+            cx.new(|cx| {
+                let view = ChatView::new(core, window, cx);
+                view_with_messages(
+                    view,
+                    vec![
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "Breakpoint check.".into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content: "Delim outer should stretch to full row width regardless \
+                                of the prose column being narrower."
+                                .into(),
+                        },
+                    ],
+                )
+            })
+        },
+    );
+
+    // Live-app width — mirrors the size where the user reported the
+    // delim breaking with rules visible only on the left side. If this
+    // reproduces locally, the bug is in our layout code; if it doesn't,
+    // there's something the offscreen renderer does differently from
+    // the live app harness.
+    s.add(
+        "chat_with_messages_live",
+        size(px(1400.), px(1000.)),
+        |window, cx| {
+            let core = stub_core_with_config(cx);
+            cx.new(|cx| {
+                let view = ChatView::new(core, window, cx);
+                view_with_messages(
+                    view,
+                    vec![
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "Live width check.".into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content: "If you can see this rule extending past the label on both \
+                                left and right, the layout is correct at the user's reported \
+                                window width."
+                                .into(),
+                        },
+                    ],
+                )
+            })
+        },
+    );
+
+    s.add(
+        "chat_with_messages_mid",
+        size(px(820.), px(640.)),
+        |window, cx| {
+            let core = stub_core_with_config(cx);
+            cx.new(|cx| {
+                let view = ChatView::new(core, window, cx);
+                view_with_messages(
+                    view,
+                    vec![
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "Mid-width check.".into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content:
+                                "Hairline rule should span the full prose column width with the \
+                            label centered and masking the line behind it."
+                                    .into(),
+                        },
+                    ],
+                )
+            })
+        },
+    );
+
     s.add(
         "chat_with_messages",
         size(px(900.), px(640.)),
