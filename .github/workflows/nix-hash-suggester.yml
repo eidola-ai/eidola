@@ -1,14 +1,25 @@
 name: Nix Hash Suggester
 
+# Triggered by the CI workflow's completion so it can read failure logs and
+# post a review back on the originating PR. workflow_run is the only event
+# that grants both. See zizmor ignore on the trigger below.
 on:
   workflow_run:
     # This workflow runs when the workflow with the name "CI" completes.
-    workflows: ["CI"]
+    workflows: ["CI"] # zizmor: ignore[dangerous-triggers]
     types:
       - completed
 
+# Cancel superseded runs for the same triggering CI run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+permissions: {}
+
 jobs:
   suggest-fix:
+    name: Suggest flake.nix sha256 update
     # This job only runs for failed pull requests created by Dependabot.
     if: >
       github.event.workflow_run.event == 'pull_request' &&
@@ -16,9 +27,7 @@ jobs:
       github.event.workflow_run.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
-      # Required to post a review on the pull request.
-      pull-requests: write
-      # Required to check out the repository content.
+      pull-requests: write # post a review with a line-specific sha256 suggestion
       contents: read
 
     steps:
@@ -40,17 +49,18 @@ jobs:
         if: steps.get-pr-number.outputs.pr_number
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           # Get the ID of the 'Build all platforms' job from the failed workflow
-          JOB_ID=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" -q '.jobs[] | select(.name == "Apple builds") | .id')
+          JOB_ID=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" -q '.jobs[] | select(.name == "Apple builds") | .id')
           if [[ -z "$JOB_ID" ]]; then
             echo "Could not find 'Apple builds' job in the failed workflow."
             exit 0
           fi
 
           # Download the logs for that job
-          gh api "repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job-logs.zip
+          gh api "repos/${REPO}/actions/jobs/${JOB_ID}/logs" > job-logs.zip
           unzip -o job-logs.zip
 
           # Nix's hash mismatch error is very predictable. We search for the "got:" line.
@@ -70,11 +80,13 @@ jobs:
         if: steps.parse-logs.outputs.is_hash_failure == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.get-pr-number.outputs.pr_number }}
           NEW_HASH: ${{ steps.parse-logs.outputs.new_hash }}
         run: |
           # Fetch flake.nix content via API to avoid checking out untrusted code
-          gh api "repos/${{ github.repository }}/contents/flake.nix?ref=$(gh pr view "$PR_NUMBER" --json headRefName -q .headRefName)" \
+          HEAD_REF=$(gh pr view "$PR_NUMBER" --json headRefName -q .headRefName)
+          gh api "repos/${REPO}/contents/flake.nix?ref=${HEAD_REF}" \
             -q '.content' | base64 -d > flake.nix
 
           # Find the line content and number of the first sha256 to be replaced
@@ -103,7 +115,7 @@ jobs:
           # Post a review on the PR with a line-specific suggestion
           gh api --silent \
             -X POST \
-            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+            "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
             -f event='COMMENT' \
             -f body="$REVIEW_BODY" \
             --field "comments[0][path]=flake.nix" \
