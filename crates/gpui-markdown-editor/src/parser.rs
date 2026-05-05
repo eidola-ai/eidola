@@ -232,6 +232,12 @@ impl<'a> Walker<'a> {
         while p < end && bytes[p] == fence_char {
             p += 1;
         }
+        // End of the fence-char run is also the start of any info
+        // string. The renderer hides the fence run when the cursor
+        // is outside the construct *but* keeps the info string
+        // visible (so a reader sees the language tag), so the two
+        // halves of the opener line need separate ranges.
+        let opener_fence_end = p;
         // Info string + rest of opening line. The opener delimiter
         // ends *before* the trailing `\n` so it stays on a single
         // line, matching how the closer delimiter is shaped (also
@@ -247,6 +253,18 @@ impl<'a> Walker<'a> {
             p + 1
         } else {
             p
+        };
+        // The info string is everything between the fence run and
+        // the trailing newline of the opener line. Pulldown's `lang`
+        // is this same span trimmed of leading/trailing whitespace —
+        // we keep the *un-trimmed* span here because the renderer
+        // shapes raw bytes (a reader expects to see exactly what
+        // they typed). `None` when empty, so the renderer can skip
+        // dim/visibility logic for blocks without an info string.
+        let info_string_range = if opener_fence_end < opener_end {
+            Some(opener_fence_end..opener_end)
+        } else {
+            None
         };
 
         // Closing fence: walk back from `end` over a trailing `\n`,
@@ -281,29 +299,36 @@ impl<'a> Walker<'a> {
 
         let lang = lang.map(|s| s.trim().to_string());
 
+        // The opener delimiter range covers *only* the fence-char run
+        // (e.g. ` ``` `, not ` ```rust `). The info string is
+        // tracked separately in `info_string_range` so the renderer
+        // can hide the fence chars when the cursor is outside the
+        // construct while keeping the info string visible.
+        let opener_fence = start..opener_fence_end;
+
         if has_closing_fence {
-            // Both opener and closer span their fence line *up to but
-            // not including* the trailing `\n` — they're per-line
-            // delimiters. `q` points at the closing line's
-            // post-fence trailing-whitespace boundary (i.e. its
-            // logical end before the trailing `\n`).
-            let opener = start..opener_end;
+            // The closer delimiter spans the closing fence line *up
+            // to but not including* the trailing `\n`. `q` points
+            // at the closing line's post-fence trailing-whitespace
+            // boundary (i.e. its logical end before the trailing
+            // `\n`).
             let closer = closing_indent_start..q;
             let content_range = after_opener_newline..closing_indent_start;
             NodeKind::CodeBlock {
                 lang,
                 content_range,
-                delimiter_ranges: vec![opener, closer],
+                delimiter_ranges: vec![opener_fence, closer],
+                info_string_range,
             }
         } else {
-            // Unterminated — one delimiter (the opener) and content
-            // runs to the end of the parser-reported range.
-            let opener = start..opener_end;
+            // Unterminated — one delimiter (the opener fence) and
+            // content runs to the end of the parser-reported range.
             let content_range = after_opener_newline..end;
             NodeKind::CodeBlock {
                 lang,
                 content_range,
-                delimiter_ranges: vec![opener],
+                delimiter_ranges: vec![opener_fence],
+                info_string_range,
             }
         }
     }
@@ -383,12 +408,17 @@ mod tests {
                 lang,
                 content_range,
                 delimiter_ranges,
+                info_string_range,
             } => {
                 assert_eq!(lang.as_deref(), Some("rust"));
                 assert_eq!(&src[content_range.clone()], "fn x() {}\n");
                 assert_eq!(delimiter_ranges.len(), 2);
-                assert_eq!(&src[delimiter_ranges[0].clone()], "```rust");
+                assert_eq!(&src[delimiter_ranges[0].clone()], "```");
                 assert_eq!(&src[delimiter_ranges[1].clone()], "```");
+                assert_eq!(
+                    info_string_range.as_ref().map(|r| &src[r.clone()]),
+                    Some("rust")
+                );
             }
             other => panic!("expected fenced code block, got {other:?}"),
         }
@@ -403,11 +433,13 @@ mod tests {
                 lang,
                 content_range,
                 delimiter_ranges,
+                info_string_range,
             } => {
                 assert_eq!(lang.as_deref(), Some(""));
                 assert_eq!(&src[content_range.clone()], "plain\n");
                 assert_eq!(&src[delimiter_ranges[0].clone()], "```");
                 assert_eq!(&src[delimiter_ranges[1].clone()], "```");
+                assert!(info_string_range.is_none());
             }
             other => panic!("expected fenced code block, got {other:?}"),
         }
@@ -422,11 +454,16 @@ mod tests {
                 lang,
                 content_range,
                 delimiter_ranges,
+                info_string_range,
             } => {
                 assert_eq!(lang.as_deref(), Some("js"));
                 assert_eq!(&src[content_range.clone()], "let x = 1;\n");
-                assert_eq!(&src[delimiter_ranges[0].clone()], "~~~js");
+                assert_eq!(&src[delimiter_ranges[0].clone()], "~~~");
                 assert_eq!(&src[delimiter_ranges[1].clone()], "~~~");
+                assert_eq!(
+                    info_string_range.as_ref().map(|r| &src[r.clone()]),
+                    Some("js")
+                );
             }
             other => panic!("expected fenced code block, got {other:?}"),
         }
@@ -443,11 +480,16 @@ mod tests {
                 lang,
                 content_range,
                 delimiter_ranges,
+                info_string_range,
             } => {
                 assert_eq!(lang.as_deref(), Some("rust"));
                 assert_eq!(&src[content_range.clone()], "fn x() {}\n");
                 assert_eq!(delimiter_ranges.len(), 1);
-                assert_eq!(&src[delimiter_ranges[0].clone()], "```rust");
+                assert_eq!(&src[delimiter_ranges[0].clone()], "```");
+                assert_eq!(
+                    info_string_range.as_ref().map(|r| &src[r.clone()]),
+                    Some("rust")
+                );
             }
             other => panic!("expected fenced code block, got {other:?}"),
         }

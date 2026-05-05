@@ -30,13 +30,24 @@ pub struct MarkdownStyle {
     /// Mono font size used for code blocks. Defaults to the theme's
     /// `mono_font_size`.
     pub mono_font_size: Pixels,
-    /// Background color of the rounded code-block fill. Defaults to
-    /// `theme.muted` so it sits visibly distinct from the body
-    /// background without dominating the page.
+    /// Background of the rounded outer code-block fill. The fence
+    /// rows (opening / closing fences) sit on this bg; the content
+    /// area gets `code_block_content_background` painted over it as
+    /// an inset strip. Defaults to `theme.muted`.
     pub code_block_background: Hsla,
+    /// Background of the inner content strip — slightly darker than
+    /// `code_block_background` so the code area reads as inset
+    /// inside the fence frame. Defaults to a 4% darker shade of
+    /// `code_block_background`.
+    pub code_block_content_background: Hsla,
     /// Inner padding (top, right, bottom, left equal) inside the code
     /// block fill, before content shaping.
     pub code_block_padding: Pixels,
+    /// Vertical breathing room between the fence rows and the content
+    /// area inside the code-block content strip. Inserted both above
+    /// the first content line and below the last so the code text
+    /// doesn't sit flush against the fence rows.
+    pub code_block_content_padding_y: Pixels,
     /// Corner radius of the code-block fill. Defaults to the theme's
     /// `radius`.
     pub code_block_radius: Pixels,
@@ -64,7 +75,9 @@ impl MarkdownStyle {
 
             mono_font_size: theme.mono_font_size,
             code_block_background: theme.muted,
+            code_block_content_background: shift_lightness(theme.muted, -0.04),
             code_block_padding: px(12.0),
+            code_block_content_padding_y: px(12.0),
             code_block_radius: theme.radius,
 
             text_color: theme.foreground,
@@ -114,8 +127,18 @@ impl MarkdownStyle {
         self
     }
 
+    pub fn code_block_content_padding_y(mut self, pad: Pixels) -> Self {
+        self.code_block_content_padding_y = pad;
+        self
+    }
+
     pub fn code_block_background(mut self, bg: Hsla) -> Self {
         self.code_block_background = bg;
+        self
+    }
+
+    pub fn code_block_content_background(mut self, bg: Hsla) -> Self {
+        self.code_block_content_background = bg;
         self
     }
 
@@ -144,4 +167,14 @@ impl MarkdownStyle {
     pub fn heading_is_bold(&self, level: u8) -> bool {
         level <= 2
     }
+}
+
+/// Shift the lightness of an HSLA color by `delta` (in the 0..=1
+/// space), clamping to the valid range. Negative values darken,
+/// positive values lighten. Used to derive the code-block content
+/// strip color from the outer fill so a Day/Night theme switch keeps
+/// them in proportion automatically.
+fn shift_lightness(mut color: Hsla, delta: f32) -> Hsla {
+    color.l = (color.l + delta).clamp(0.0, 1.0);
+    color
 }

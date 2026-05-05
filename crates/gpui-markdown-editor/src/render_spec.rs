@@ -25,6 +25,19 @@ pub struct RenderBlock {
     pub kind: BlockKind,
     pub inlines: Vec<InlineRun>,
     pub hidden_ranges: Vec<Range<usize>>,
+    /// Source ranges of *whole lines* that should be treated as
+    /// delimiter (fence) lines for layout purposes — they reserve
+    /// vertical space, paint outside the content scroll mask, and
+    /// don't translate with horizontal scroll. Code blocks list the
+    /// opener and closer fence lines here; other constructs leave
+    /// it empty.
+    ///
+    /// This is separate from `hidden_ranges` because a fence row
+    /// can have *partial* visibility (e.g. ` ```rust ` shows the
+    /// `rust` info string when the cursor is outside the construct
+    /// but hides the ` ``` `) — the line is still a fence row even
+    /// though its full extent isn't covered by a hidden range.
+    pub delimiter_lines: Vec<Range<usize>>,
 }
 
 impl RenderBlock {
@@ -34,6 +47,7 @@ impl RenderBlock {
             kind,
             inlines: Vec::new(),
             hidden_ranges: Vec::new(),
+            delimiter_lines: Vec::new(),
         }
     }
 

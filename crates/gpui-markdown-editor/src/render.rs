@@ -109,18 +109,55 @@ fn render_paragraph(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<Render
 }
 
 fn render_code_block(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<RenderBlock>) {
-    let (lang, delimiter_ranges) = match &node.kind {
+    let (lang, delimiter_ranges, info_string_range) = match &node.kind {
         NodeKind::CodeBlock {
             lang,
             delimiter_ranges,
+            info_string_range,
             ..
-        } => (lang.clone(), delimiter_ranges.clone()),
+        } => (
+            lang.clone(),
+            delimiter_ranges.clone(),
+            info_string_range.clone(),
+        ),
         _ => return,
     };
 
     let mut block = RenderBlock::new(node.range.clone(), BlockKind::CodeBlock { lang });
     let cursor_inside = cursor.overlaps(&node.range);
+
+    // Fence chars (` ``` ` / `~~~`) — hide-when-outside, dim-when-inside.
     apply_delimiter_visibility(&delimiter_ranges, cursor_inside, &mut block);
+
+    // Info string (the language tag after the opening fence). It's
+    // visible when the cursor is outside the construct (so a reader
+    // can still see the language at a glance) but dimmed when the
+    // cursor is inside (consistent with the fence treatment).
+    if let Some(info) = info_string_range.as_ref()
+        && cursor_inside
+    {
+        block.inlines.push(InlineRun {
+            source_range: info.clone(),
+            style: InlineStyle::dimmed(),
+        });
+    }
+
+    // Mark fence rows for layout. The opener line covers the fence
+    // chars *plus* any info string; the closer line is just its
+    // fence chars. The element layer uses these to keep fence rows
+    // pinned (no horizontal scroll), reserve vertical space for
+    // them, and paint them outside the content mask.
+    let opener_line_end = info_string_range
+        .as_ref()
+        .map(|r| r.end)
+        .unwrap_or_else(|| delimiter_ranges[0].end);
+    block
+        .delimiter_lines
+        .push(delimiter_ranges[0].start..opener_line_end);
+    if let Some(closer) = delimiter_ranges.get(1) {
+        block.delimiter_lines.push(closer.clone());
+    }
+
     // No inline children — code-block content is literal source bytes,
     // shaped in mono font by the element layer.
     out.push(block);
@@ -865,11 +902,16 @@ mod tests {
         let cursor = src.find("para").unwrap() + 1;
         let spec = render_with_cursor(src, cursor);
         let block = find_block(&spec, |b| matches!(b.kind, BlockKind::CodeBlock { .. }));
-        // Opener "```rust" = 0..7, closer "```" = 19..22 — both
-        // pre-newline so per-line hidden-range lookup matches them.
-        assert!(block.has_hidden_range(0..7));
+        // Opener fence "```" = 0..3, closer "```" = 19..22 — only the
+        // fence chars are hidden, so the info string ("rust" at 3..7)
+        // stays visible.
+        assert!(block.has_hidden_range(0..3));
         assert!(block.has_hidden_range(19..22));
-        assert!(!block.has_dimmed_range(0..7));
+        // Info string is NOT dimmed when cursor is outside; it
+        // renders with normal styling.
+        assert!(!block.has_dimmed_range(3..7));
+        // And it's NOT hidden either.
+        assert!(!block.has_hidden_range(3..7));
     }
 
     #[test]
@@ -878,9 +920,26 @@ mod tests {
         // Cursor inside the content.
         let spec = render_with_cursor(src, 10);
         let block = find_block(&spec, |b| matches!(b.kind, BlockKind::CodeBlock { .. }));
-        assert!(block.has_dimmed_range(0..7));
+        // Opener fence + info string + closer all dim when cursor is
+        // inside the construct.
+        assert!(block.has_dimmed_range(0..3));
+        assert!(block.has_dimmed_range(3..7));
         assert!(block.has_dimmed_range(19..22));
-        assert!(!block.has_hidden_range(0..7));
+        assert!(!block.has_hidden_range(0..3));
+    }
+
+    #[test]
+    fn fenced_code_block_marks_fence_rows_for_layout() {
+        // `delimiter_lines` lists whole fence-row ranges so the
+        // element layer can pin them outside horizontal scroll
+        // regardless of cursor position.
+        let src = "```rust\nlet x = 1;\n```";
+        let spec = render_with_cursor(src, 999);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::CodeBlock { .. }));
+        // Opener line covers fence + info string (0..7); closer
+        // is just its fence chars (19..22).
+        assert!(block.delimiter_lines.contains(&(0..7)));
+        assert!(block.delimiter_lines.contains(&(19..22)));
     }
 
     #[test]

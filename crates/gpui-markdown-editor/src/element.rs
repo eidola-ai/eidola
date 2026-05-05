@@ -82,6 +82,18 @@ pub struct LaidOutLine {
     /// Length == `line.text.len() + 1`; the trailing entry maps EOL to
     /// `source_range.end`.
     pub display_to_source: Vec<usize>,
+    /// True for code-block fence lines — the opening and closing
+    /// fences. Distinguishes them from content lines so paint can:
+    ///
+    /// * keep fence lines pinned (they don't translate with
+    ///   `code_block.scroll_x`);
+    /// * paint fences *outside* the content-area `with_content_mask`
+    ///   so they aren't clipped when the user scrolls horizontally;
+    /// * always reserve a row of vertical space for them, even when
+    ///   they're hidden (cursor outside the block) — without this
+    ///   the block would shrink/grow vertically as it gains/loses
+    ///   focus.
+    pub is_delimiter: bool,
 }
 
 impl LaidOutLine {
@@ -145,8 +157,8 @@ pub struct LaidOutBlock {
 
 pub struct PrepaintState {
     laid_out: LaidOutBlock,
-    cursor_quad: Option<gpui::PaintQuad>,
-    selection_quads: Vec<gpui::PaintQuad>,
+    cursor_quad: Option<TaggedQuad>,
+    selection_quads: Vec<TaggedQuad>,
     /// `Some` only for code blocks. Holds the geometry needed during
     /// paint to draw the rounded background, clip content to the
     /// visible band, and overlay the horizontal scrollbar.
@@ -155,7 +167,16 @@ pub struct PrepaintState {
 
 #[derive(Debug, Clone, Copy)]
 struct CodeBlockPaint {
+    /// Outer rounded fill (full block, fence rows + content strip).
     bg_bounds: Bounds<Pixels>,
+    /// Inner content strip — full-width band between the fence rows.
+    /// A second (slightly different) bg paints edge-to-edge here so
+    /// the content area visually inverts the fence frame.
+    content_strip: Bounds<Pixels>,
+    /// Sub-rectangle of `content_strip` inset by `inner_pad`
+    /// horizontally. Used as the `content_mask` for content lines so
+    /// long lines clip at the inner padding edge instead of leaking
+    /// past the rounded outer fill.
     content_clip: Bounds<Pixels>,
     content_width: Pixels,
     visible_width: Pixels,
@@ -227,6 +248,24 @@ impl Element for BlockElement {
                 for line in &lines {
                     h += line_height * ((line.line.wrap_boundaries().len() as f32) + 1.0);
                 }
+                // Code blocks insert vertical breathing room between
+                // each fence row and the adjacent content lines —
+                // contributes once at fence→content and once at
+                // content→fence (or once trailing if there's no
+                // closing fence). Non-code blocks have no
+                // delimiters and skip this entirely.
+                if is_code {
+                    let mut last_was_delim = true;
+                    for line in &lines {
+                        if line.is_delimiter != last_was_delim {
+                            h += style_clone.code_block_content_padding_y;
+                        }
+                        last_was_delim = line.is_delimiter;
+                    }
+                    if !last_was_delim {
+                        h += style_clone.code_block_content_padding_y;
+                    }
+                }
                 Size {
                     width: avail_w,
                     height: h,
@@ -280,14 +319,37 @@ impl Element for BlockElement {
 
         let mut lines: Vec<LaidOutLine> = Vec::new();
         let mut content_cursor_y = content_top;
-        // Track the widest shaped line so we can size the horizontal
-        // scrollbar / cap the scroll offset for code blocks.
-        let mut max_line_width = px(0.0);
+        // Track the widest *content* line — fence lines are pinned and
+        // never participate in overflow / scrollbar arithmetic.
+        let mut max_content_line_width = px(0.0);
+        // Vertical extent of the inner content strip. Tracked as the
+        // y just *after* the opener fence (where the strip's top
+        // edge sits) through the y just *before* the closer fence
+        // (where its bottom edge sits). Includes the per-side
+        // `code_block_content_padding_y` that breathes between the
+        // fence rows and the content.
+        let mut strip_top: Option<Pixels> = None;
+        let mut strip_bottom: Option<Pixels> = None;
+        let pad_y = style.code_block_content_padding_y;
+        let mut last_was_delim = true; // pretend "above the block" is a fence
         for sl in shaped {
+            // Insert breathing room at fence→content and
+            // content→fence transitions.
+            if is_code && sl.is_delimiter != last_was_delim {
+                if !sl.is_delimiter {
+                    // fence → content: top edge of strip lives here
+                    strip_top = Some(content_cursor_y);
+                }
+                content_cursor_y += pad_y;
+                if sl.is_delimiter {
+                    // content → fence: bottom edge of strip lives here
+                    strip_bottom = Some(content_cursor_y);
+                }
+            }
             let wrapped_h = line_height * ((sl.line.wrap_boundaries().len() as f32) + 1.0);
             let origin = point(content_left, content_cursor_y);
-            if sl.line.width() > max_line_width {
-                max_line_width = sl.line.width();
+            if !sl.is_delimiter && sl.line.width() > max_content_line_width {
+                max_content_line_width = sl.line.width();
             }
             lines.push(LaidOutLine {
                 line: sl.line,
@@ -296,8 +358,17 @@ impl Element for BlockElement {
                 wrapped_height: wrapped_h,
                 source_range: sl.source_range,
                 display_to_source: sl.display_to_source,
+                is_delimiter: sl.is_delimiter,
             });
             content_cursor_y += wrapped_h;
+            last_was_delim = sl.is_delimiter;
+        }
+        // Trailing content (no closing fence) — extend the strip to
+        // cover the trailing breathing room and advance the layout
+        // cursor so the block reserves the space.
+        if is_code && !last_was_delim {
+            content_cursor_y += pad_y;
+            strip_bottom = Some(content_cursor_y);
         }
 
         if lines.is_empty() {
@@ -312,6 +383,7 @@ impl Element for BlockElement {
                     wrapped_height: line_height,
                     source_range: self.block.source_range.clone(),
                     display_to_source: vec![self.block.source_range.start],
+                    is_delimiter: false,
                 });
                 content_cursor_y += line_height;
             }
@@ -323,9 +395,10 @@ impl Element for BlockElement {
             size(block_width, block_bottom - block_top),
         );
 
-        // Cap horizontal scroll: the rightmost edge of the widest line
-        // should never go further left than `visible_content_width`.
-        let max_scroll = (max_line_width - visible_content_width).max(px(0.0));
+        // Cap horizontal scroll: the rightmost edge of the widest
+        // content line should never go further left than
+        // `visible_content_width`.
+        let max_scroll = (max_content_line_width - visible_content_width).max(px(0.0));
         let scroll_x = scroll_offset.min(max_scroll).max(px(0.0));
         if is_code && scroll_x != scroll_offset {
             // Out-of-range cached scroll (e.g. content shrank) — clamp
@@ -336,14 +409,14 @@ impl Element for BlockElement {
                 editor.set_code_block_scroll(block_index, scroll_x);
             });
         }
-        // Translate every shaped-line origin by `-scroll_x` so the
-        // downstream code (cursor / selection geometry, hit-testing
-        // through `last_blocks`) sees positions in the *visible*
-        // coordinate space. The content_mask in `paint` clips anything
-        // that lands outside the visible band.
+        // Only *content* lines translate with horizontal scroll —
+        // fence lines stay pinned at `content_left`. The fence rows
+        // are a stable frame around the scrolling code area.
         if is_code && scroll_x > px(0.0) {
             for line in &mut lines {
-                line.origin.x -= scroll_x;
+                if !line.is_delimiter {
+                    line.origin.x -= scroll_x;
+                }
             }
         }
 
@@ -364,26 +437,41 @@ impl Element for BlockElement {
         if cursor_quad.is_none() && source.is_empty() && self.block_index == 0 {
             // Truly empty document — paint a cursor at the origin so the
             // user sees the editor is focused.
-            cursor_quad = Some(fill(
-                Bounds::new(bounds.origin, size(px(2.0), line_height)),
-                style.caret_color,
-            ));
+            cursor_quad = Some(TaggedQuad {
+                quad: fill(
+                    Bounds::new(bounds.origin, size(px(2.0), line_height)),
+                    style.caret_color,
+                ),
+                is_delimiter: false,
+            });
         }
 
-        // Code-block-specific paint state: bg quad bounds, the inner
-        // content rect (used as content_mask for clipping), and the
-        // scrollbar geometry if content overflows.
+        // Code-block paint state. `content_strip` is the darker
+        // background band — full block width edge-to-edge so the
+        // outer fence-frame bg shows only on the fence rows above
+        // and below. `content_clip` is the same rectangle: padding
+        // lives *inside* the scroll viewport (CSS-style), so content
+        // is free to scroll right up to the bg's edges. The padding
+        // shows as visible space at the leading edge when scroll=0
+        // and at the trailing edge when scroll=max — it's part of
+        // the scrollable inner content, not a clip outside the
+        // scroll. `content_left = bounds.origin.x + inner_pad`
+        // already places the unscrolled content inset from the left;
+        // `max_scroll = max_content_line_width - visible_content_width`
+        // already accounts for the symmetric trailing padding at
+        // max scroll.
         let code_block_paint = if is_code {
+            let strip_top = strip_top.unwrap_or(block_top + inner_pad);
+            let strip_bottom = strip_bottom.unwrap_or(block_bottom - inner_pad);
+            let strip_bounds = Bounds::new(
+                point(bounds.origin.x, strip_top),
+                size(block_width, strip_bottom - strip_top),
+            );
             Some(CodeBlockPaint {
                 bg_bounds: block_bounds,
-                content_clip: Bounds::new(
-                    point(bounds.origin.x + inner_pad, block_top + inner_pad),
-                    size(
-                        visible_content_width,
-                        block_bottom - block_top - inner_pad * 2.,
-                    ),
-                ),
-                content_width: max_line_width,
+                content_strip: strip_bounds,
+                content_clip: strip_bounds,
+                content_width: max_content_line_width,
                 visible_width: visible_content_width,
                 scroll_x,
             })
@@ -425,9 +513,14 @@ impl Element for BlockElement {
 
         let code_block_paint = prepaint.code_block_paint;
 
-        // Code blocks get a rounded background fill and clip their
-        // content to that fill (so long lines don't visually leak past
-        // the block's right edge into the next paragraph).
+        // Layered backgrounds for code blocks:
+        //
+        // 1. Outer rounded fill (`code_block_background`) — full
+        //    block. The rounded corners are visible only at the
+        //    fence rows, where this bg is uncovered.
+        // 2. Inner content strip (`code_block_content_background`) —
+        //    full-width band between the fence rows, no rounding.
+        //    This is what reads as the "code area".
         if let Some(cb) = &code_block_paint {
             window.paint_quad(quad(
                 cb.bg_bounds,
@@ -437,21 +530,87 @@ impl Element for BlockElement {
                 gpui::transparent_black(),
                 BorderStyle::default(),
             ));
+            if cb.content_strip.size.height > px(0.0) {
+                window.paint_quad(fill(
+                    cb.content_strip,
+                    self.style.code_block_content_background,
+                ));
+            }
         }
 
-        let mask = code_block_paint.as_ref().map(|cb| ContentMask {
-            bounds: cb.content_clip,
-        });
         let cursor_quad = prepaint.cursor_quad.take();
         let selection_quads = std::mem::take(&mut prepaint.selection_quads);
-        let lines: Vec<&LaidOutLine> = prepaint.laid_out.lines.iter().collect();
         let focused = focus_handle.is_focused(window);
 
-        window.with_content_mask(mask, |window| {
-            for q in selection_quads {
-                window.paint_quad(q);
+        // Split paint into delimiter and content phases. Fence-row
+        // text and the cursor / selection quads attached to fence
+        // rows paint *outside* the content mask so they stay visible
+        // regardless of horizontal scroll (fences are pinned in x).
+        // Content text and content-row cursor / selection paint
+        // *inside* the mask so long lines clip at the visible band's
+        // right edge. Non-code blocks have `code_block_paint == None`
+        // and skip the mask entirely.
+        if let Some(cb) = &code_block_paint {
+            let (delim_sel, content_sel): (Vec<_>, Vec<_>) =
+                selection_quads.into_iter().partition(|t| t.is_delimiter);
+            let (cursor_for_delim, cursor_for_content) = match cursor_quad {
+                Some(tq) if tq.is_delimiter => (Some(tq), None),
+                Some(tq) => (None, Some(tq)),
+                None => (None, None),
+            };
+
+            // Phase 1: delimiter lines + their cursor / selection,
+            // unmasked.
+            for tq in delim_sel {
+                window.paint_quad(tq.quad);
             }
-            for laid in &lines {
+            for laid in &prepaint.laid_out.lines {
+                if laid.is_delimiter {
+                    let _ = laid.line.paint(
+                        laid.origin,
+                        laid.row_height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            if focused && let Some(tq) = cursor_for_delim {
+                window.paint_quad(tq.quad);
+            }
+
+            // Phase 2: content lines + their cursor / selection,
+            // masked to the content strip.
+            let mask = ContentMask {
+                bounds: cb.content_clip,
+            };
+            window.with_content_mask(Some(mask), |window| {
+                for tq in content_sel {
+                    window.paint_quad(tq.quad);
+                }
+                for laid in &prepaint.laid_out.lines {
+                    if !laid.is_delimiter {
+                        let _ = laid.line.paint(
+                            laid.origin,
+                            laid.row_height,
+                            gpui::TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+                if focused && let Some(tq) = cursor_for_content {
+                    window.paint_quad(tq.quad);
+                }
+            });
+        } else {
+            // Non-code blocks: no mask, no split.
+            for tq in selection_quads {
+                window.paint_quad(tq.quad);
+            }
+            for laid in &prepaint.laid_out.lines {
                 let _ = laid.line.paint(
                     laid.origin,
                     laid.row_height,
@@ -461,10 +620,10 @@ impl Element for BlockElement {
                     cx,
                 );
             }
-            if focused && let Some(q) = cursor_quad {
-                window.paint_quad(q);
+            if focused && let Some(tq) = cursor_quad {
+                window.paint_quad(tq.quad);
             }
-        });
+        }
 
         // Horizontal scrollbar overlay — only when the code block has
         // overflow. A thin track at the bottom of the bg fill, with a
@@ -537,11 +696,20 @@ impl Element for BlockElement {
 }
 
 fn paint_horizontal_scrollbar(window: &mut Window, cb: &CodeBlockPaint, style: &MarkdownStyle) {
-    let track_h = px(4.0);
-    let track_pad = px(4.0);
-    let track_y = cb.bg_bounds.bottom() - track_h - track_pad;
-    let track_left = cb.bg_bounds.left() + track_pad;
-    let track_right = cb.bg_bounds.right() - track_pad;
+    let track_h = px(3.0);
+    // Sit on the seam between the content strip and the closing fence
+    // row — `track_y` is the strip's bottom edge, so the bar occupies
+    // the top sliver of the closing fence row. This puts the
+    // scrollbar visually adjacent to the scrollable region without
+    // overlapping the content baseline above or floating loose at
+    // the bottom of the outer fill.
+    let track_y = cb.content_strip.bottom();
+    // Align the scrollbar with the content text (which paints inset
+    // by `inner_pad`), not the dark bg's edges. Without this the
+    // scrollbar would extend `inner_pad` further than the code on
+    // each side.
+    let track_left = cb.content_clip.left();
+    let track_right = cb.content_clip.right();
     let track_w = (track_right - track_left).max(px(1.0));
 
     // Thumb: proportional to visible / content, offset by scroll
@@ -627,6 +795,7 @@ struct ShapedLine {
     line: Arc<WrappedLine>,
     source_range: Range<usize>,
     display_to_source: Vec<usize>,
+    is_delimiter: bool,
 }
 
 /// One block, one logical line at a time. For each line we build the display
@@ -665,10 +834,13 @@ fn shape_block_lines(
                 line,
                 source_range: block.source_range.clone(),
                 display_to_source: vec![block.source_range.start],
+                is_delimiter: false,
             });
         }
         return out;
     }
+
+    let block_is_code = matches!(block.kind, BlockKind::CodeBlock { .. });
 
     for raw_line in block_text.split_inclusive('\n') {
         let raw_end = cursor + raw_line.len();
@@ -680,17 +852,25 @@ fn shape_block_lines(
         let (display_text, display_to_source) =
             build_display_line(source, &logical_source_range, block);
 
-        // Hide-driven elision: if the source line had visible content
-        // (non-empty logical range) but every byte was hidden, drop
-        // the line entirely instead of emitting an empty shaped row.
-        // Without this, hiding a code block's opening fence
-        // (`build_display_line` returns "") would still consume one
-        // visible row of vertical space inside the block. Lines that
-        // were *originally* empty in source (e.g. a blank line in a
-        // paragraph or between content lines of a code block) keep
-        // emitting one row — that's the user's intent.
+        // Code-block fence detection: the line's *full* logical
+        // content is covered by either a hidden range (cursor
+        // outside) or a dimmed inline run (cursor inside). For
+        // headings the prefix `# ` is a delimiter range too, but it
+        // doesn't cover the whole line — only fences do — so the
+        // full-coverage check is a precise fence test inside code
+        // blocks.
+        let is_delimiter = block_is_code
+            && logical_source_range.start < logical_source_range.end
+            && line_is_fully_in_a_delimiter(&logical_source_range, block);
+
+        // Hide-driven elision: if the line had visible source content
+        // but every byte was hidden, drop the line — *unless* it's a
+        // code-block delimiter, where we want the row to keep
+        // reserving its space (so the block's height stays stable as
+        // the cursor moves in/out and the fence rows can host a
+        // distinct background).
         let was_empty_in_source = logical_source_range.start == logical_source_range.end;
-        if display_text.is_empty() && !was_empty_in_source {
+        if display_text.is_empty() && !was_empty_in_source && !is_delimiter {
             cursor = raw_end;
             if !trailing_nl {
                 break;
@@ -715,6 +895,7 @@ fn shape_block_lines(
                 line,
                 source_range: line_source_range,
                 display_to_source,
+                is_delimiter,
             });
         }
         cursor = raw_end;
@@ -741,6 +922,7 @@ fn shape_block_lines(
                 line: empty_line,
                 source_range: block.source_range.end..block.source_range.end,
                 display_to_source: vec![block.source_range.end],
+                is_delimiter: false,
             });
         }
     }
@@ -761,6 +943,21 @@ fn ends_with_hard_break(s: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Does the shaped `line` fall on a delimiter (fence) row of the
+/// block? The render layer lists those line ranges in
+/// `block.delimiter_lines`; this checks whether the shaped line's
+/// logical content range is covered by any of them. For code blocks
+/// the fence rows are listed regardless of cursor position, so a
+/// fence row with a partially-visible info string (` ```rust ` with
+/// the cursor outside) still flags as a delimiter line for layout
+/// purposes.
+fn line_is_fully_in_a_delimiter(line: &Range<usize>, block: &RenderBlock) -> bool {
+    block
+        .delimiter_lines
+        .iter()
+        .any(|d| d.start <= line.start && d.end >= line.end)
 }
 
 fn build_display_line(
@@ -904,20 +1101,32 @@ fn base_weight_for_block(kind: &BlockKind, style: &MarkdownStyle) -> FontWeight 
 
 // ---------- Cursor / selection ----------
 
+/// A paint quad tagged by which kind of line it belongs to. Code
+/// blocks paint delimiter quads outside the content mask (so fence-row
+/// cursors / selections aren't clipped) and content quads inside the
+/// mask (so they share the content area's clipping rectangle). For
+/// non-code blocks every quad is `is_delimiter == false` and both
+/// branches paint the same way.
+#[derive(Clone)]
+struct TaggedQuad {
+    quad: gpui::PaintQuad,
+    is_delimiter: bool,
+}
+
 fn build_caret_and_selection(
     block: &LaidOutBlock,
     selection: Selection,
     style: &MarkdownStyle,
     is_last_block: bool,
     next_block_start: Option<usize>,
-) -> (Option<gpui::PaintQuad>, Vec<gpui::PaintQuad>) {
+) -> (Option<TaggedQuad>, Vec<TaggedQuad>) {
     let cursor_offset = selection.head();
     let cursor_color = style.caret_color;
     let selection_color = style.selection_color;
 
-    let mut cursor: Option<gpui::PaintQuad> = None;
-    let mut boundary_fallback: Option<gpui::PaintQuad> = None;
-    let mut sel_quads: Vec<gpui::PaintQuad> = Vec::new();
+    let mut cursor: Option<TaggedQuad> = None;
+    let mut boundary_fallback: Option<TaggedQuad> = None;
+    let mut sel_quads: Vec<TaggedQuad> = Vec::new();
 
     let sel_range = selection.selection_range();
     let has_selection = sel_range.start != sel_range.end;
@@ -939,10 +1148,13 @@ fn build_caret_and_selection(
                 let local = line.local_position_for_source_offset(cursor_offset);
                 let x = line.origin.x + local.x;
                 let y = line.origin.y + local.y;
-                let quad = fill(
-                    Bounds::new(point(x, y), size(px(2.0), line.row_height)),
-                    cursor_color,
-                );
+                let quad = TaggedQuad {
+                    quad: fill(
+                        Bounds::new(point(x, y), size(px(2.0), line.row_height)),
+                        cursor_color,
+                    ),
+                    is_delimiter: line.is_delimiter,
+                };
                 if strict {
                     cursor = Some(quad);
                 } else {
@@ -975,8 +1187,14 @@ fn paint_selection_for_line(
     hi: usize,
     line_hi: usize,
     color: gpui::Hsla,
-    out: &mut Vec<gpui::PaintQuad>,
+    out: &mut Vec<TaggedQuad>,
 ) {
+    let push = |q: gpui::PaintQuad, out: &mut Vec<TaggedQuad>| {
+        out.push(TaggedQuad {
+            quad: q,
+            is_delimiter: line.is_delimiter,
+        });
+    };
     let start = line.local_position_for_source_offset(lo);
     let end = line.local_position_for_source_offset(hi);
     let row_height = line.row_height;
@@ -986,10 +1204,13 @@ fn paint_selection_for_line(
         let x0 = line.origin.x + start.x;
         let x1 = line.origin.x + end.x + eol_pad;
         let y0 = line.origin.y + start.y;
-        out.push(fill(
-            Bounds::from_corners(point(x0, y0), point(x1, y0 + row_height)),
-            color,
-        ));
+        push(
+            fill(
+                Bounds::from_corners(point(x0, y0), point(x1, y0 + row_height)),
+                color,
+            ),
+            out,
+        );
         return;
     }
 
@@ -999,33 +1220,42 @@ fn paint_selection_for_line(
     let end_row = (f32::from(end.y) / f32::from(row_height)).round() as usize;
 
     let y_start = line.origin.y + start.y;
-    out.push(fill(
-        Bounds::from_corners(
-            point(line.origin.x + start.x, y_start),
-            point(line.origin.x + line_width, y_start + row_height),
+    push(
+        fill(
+            Bounds::from_corners(
+                point(line.origin.x + start.x, y_start),
+                point(line.origin.x + line_width, y_start + row_height),
+            ),
+            color,
         ),
-        color,
-    ));
+        out,
+    );
 
     for row in (start_row + 1)..end_row.min(row_count) {
         let y = line.origin.y + row_height * (row as f32);
-        out.push(fill(
-            Bounds::from_corners(
-                point(line.origin.x, y),
-                point(line.origin.x + line_width, y + row_height),
+        push(
+            fill(
+                Bounds::from_corners(
+                    point(line.origin.x, y),
+                    point(line.origin.x + line_width, y + row_height),
+                ),
+                color,
             ),
-            color,
-        ));
+            out,
+        );
     }
 
     let y_end = line.origin.y + end.y;
-    out.push(fill(
-        Bounds::from_corners(
-            point(line.origin.x, y_end),
-            point(line.origin.x + end.x + eol_pad, y_end + row_height),
+    push(
+        fill(
+            Bounds::from_corners(
+                point(line.origin.x, y_end),
+                point(line.origin.x + end.x + eol_pad, y_end + row_height),
+            ),
+            color,
         ),
-        color,
-    ));
+        out,
+    );
 }
 
 /// Decide whether a block claims the cursor at `cursor_offset`. A block
