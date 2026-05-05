@@ -6,16 +6,28 @@ on:
     - cron: "0 */6 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+# Only one run at a time; if a scheduled tick overlaps with a manual run,
+# let the running one finish.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
 
 jobs:
   check-measurements:
+    name: Update Tinfoil measurements
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write # push the measurements/<tag> branch with the updated file
+      pull-requests: write # open the PR proposing the measurement update
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # zizmor: ignore[artipacked]
+        # The "Create pull request" step below uses `git push` with the
+        # persisted GITHUB_TOKEN credential helper. Disabling persistence here
+        # would require a manual remote rewrite to keep the push working.
 
       - name: Fetch latest Tinfoil release
         id: release
@@ -60,9 +72,9 @@ jobs:
         id: sigstore
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.release.outputs.artifact_hash }}
         run: |
           REPO="tinfoilsh/confidential-model-router"
-          DIGEST="${{ steps.release.outputs.artifact_hash }}"
 
           LOG_INDEX=$(gh api "repos/${REPO}/attestations/sha256:${DIGEST}" \
             --jq '.attestations[0].bundle.verificationMaterial.tlogEntries[0].logIndex')
@@ -71,10 +83,11 @@ jobs:
 
       - name: Check if measurements are already known
         id: check
+        env:
+          SNP: ${{ steps.release.outputs.snp }}
+          RTMR1: ${{ steps.release.outputs.rtmr1 }}
+          RTMR2: ${{ steps.release.outputs.rtmr2 }}
         run: |
-          SNP="${{ steps.release.outputs.snp }}"
-          RTMR1="${{ steps.release.outputs.rtmr1 }}"
-          RTMR2="${{ steps.release.outputs.rtmr2 }}"
           FILE="crates/eidola-server/src/measurements.rs"
           if grep -qF "${SNP}" "${FILE}" \
              && grep -qF "${RTMR1}" "${FILE}" \
