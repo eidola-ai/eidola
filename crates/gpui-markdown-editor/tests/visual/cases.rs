@@ -129,6 +129,19 @@ pub fn register(s: &mut Snapshots) {
             MarkdownEditor::with_state(state, window, cx)
         })
     });
+
+    // Trailing empty paragraph: pressing Enter at the end of "paragraph 1"
+    // produces "paragraph 1\n" with the cursor at byte 12. The render
+    // must show one empty trailing row anchoring the cursor.
+    s.add("trailing_empty_after_one_enter", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "paragraph 1\n".into(),
+                selection: Selection::Cursor(12),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
 }
 
 /// Build an editor whose cursor is placed inside `needle` (3 chars in, by

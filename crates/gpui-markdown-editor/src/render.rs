@@ -25,16 +25,20 @@
 //! emits one synthetic empty `Paragraph` block per "extra" newline so the
 //! cursor has visible empty rows to land on.
 //!
-//! Formulas — derived from "first `\n` in each kind of free zone is
-//! structural / a separator, the rest are empties":
+//! Formulas: pulldown-cmark folds one trailing `\n` into a paragraph's
+//! parser range. We *trim* each real block's `source_range` to its
+//! content extent before computing gaps — the folded `\n` then lives
+//! in the trailing free zone where the user expects to see it (one Enter
+//! at end of doc → one trailing empty row).
 //!
-//! - Leading run of `L` newlines: `max(0, L - 1)` empty paragraphs.
-//! - Inter-block run of `M` newlines (counted between *content*
-//!   boundaries, not parser ranges, so the trailing `\n` pulldown-cmark
-//!   sometimes folds into a paragraph's range doesn't cause off-by-one):
-//!   `max(0, M - 2)` empties (one for the prev's terminator, one for the
-//!   next's separator).
-//! - Trailing run of `T` newlines: `max(0, T - 1)` empties.
+//! With trimming applied, the formulas reduce to "every `\n` in a free
+//! zone is one empty paragraph, except the two `\n`s that structurally
+//! separate two real paragraphs":
+//!
+//! - Leading run of `L` newlines: `L` empty paragraphs.
+//! - Inter-block run of `M` newlines: `max(0, M - 2)` empties (the two
+//!   structural newlines that *are* the paragraph break in CommonMark).
+//! - Trailing run of `T` newlines: `T` empty paragraphs.
 //!
 //! Each synthetic block's `source_range` is exactly one `\n` byte, so a
 //! cursor at that offset hit-tests into it and a click in the empty row
@@ -284,21 +288,39 @@ fn inject_empty_paragraphs(source: &str, real_blocks: Vec<RenderBlock>) -> Vec<R
         return out;
     }
 
+    // Trim each real block's source_range to the block's content extent.
+    // pulldown-cmark folds one trailing `\n` into a paragraph's parser
+    // range; without trimming, the trailing `\n` would be invisible to
+    // the gap arithmetic (see the bug report: pressing Enter once at end
+    // of paragraph produced no visible change). After trimming, the gap
+    // arithmetic is uniform: every `\n` outside any block range is a
+    // free-zone newline, and the trim is a no-op for blocks the parser
+    // ranged tightly.
+    let mut real_blocks = real_blocks;
+    for block in &mut real_blocks {
+        let trimmed_start = block_content_start(bytes, &block.source_range);
+        let trimmed_end = block_content_end_excl(bytes, &block.source_range).max(trimmed_start);
+        block.source_range = trimmed_start..trimmed_end;
+    }
+
     let mut out: Vec<RenderBlock> = Vec::with_capacity(real_blocks.len() * 2);
 
-    // Leading gap.
-    let first_content = block_content_start(bytes, &real_blocks[0].source_range);
+    // Leading gap. No structural cost: there's no preceding paragraph
+    // for the leading `\n`s to be separating from, so each one is an
+    // empty paragraph above the first real block.
+    let first_content = real_blocks[0].source_range.start;
     let leading: Vec<usize> = (0..first_content).filter(|&p| bytes[p] == b'\n').collect();
-    let leading_empties = leading.len().saturating_sub(1);
-    for &p in leading.iter().take(leading_empties) {
+    for &p in &leading {
         out.push(empty_paragraph_block(p));
     }
 
-    // Real blocks, with inter-block empties before each.
+    // Real blocks, with inter-block empties before each. The first two
+    // `\n`s are the paragraph break itself (CommonMark's `\n\n`
+    // separator); the rest are empties.
     for (i, block) in real_blocks.iter().enumerate() {
         if i > 0 {
-            let prev_end = block_content_end_excl(bytes, &real_blocks[i - 1].source_range);
-            let next_start = block_content_start(bytes, &block.source_range);
+            let prev_end = real_blocks[i - 1].source_range.end;
+            let next_start = block.source_range.start;
             let positions: Vec<usize> = (prev_end..next_start)
                 .filter(|&p| bytes[p] == b'\n')
                 .collect();
@@ -312,15 +334,17 @@ fn inject_empty_paragraphs(source: &str, real_blocks: Vec<RenderBlock>) -> Vec<R
         out.push(block.clone());
     }
 
-    // Trailing gap.
-    let last = real_blocks.last().expect("checked non-empty above");
-    let last_end = block_content_end_excl(bytes, &last.source_range);
+    // Trailing gap. Symmetric to leading — no following paragraph to
+    // separate from, so every trailing `\n` is an empty paragraph.
+    let last_end = real_blocks
+        .last()
+        .expect("checked non-empty above")
+        .source_range
+        .end;
     let trailing: Vec<usize> = (last_end..bytes.len())
         .filter(|&p| bytes[p] == b'\n')
         .collect();
-    let trailing_empties = trailing.len().saturating_sub(1);
-    // Skip 1 (last's terminator). Take `trailing_empties`.
-    for &p in trailing.iter().skip(1).take(trailing_empties) {
+    for &p in &trailing {
         out.push(empty_paragraph_block(p));
     }
 
@@ -601,35 +625,75 @@ mod tests {
 
     #[test]
     fn leading_newlines_emit_empty_paragraphs() {
-        // `\n\np1` → 1 leading empty paragraph above `p1`.
+        // Each leading `\n` is one empty paragraph above the first real
+        // block. `\n\np1` → 2 leading empties (matches typewriter: 2
+        // Enters then content puts the cursor on line 3).
         let spec = render_with_cursor("\n\np1", 0);
-        assert_eq!(count_empty_blocks(&spec), 1);
-        assert_eq!(spec.blocks.len(), 2);
-        // First block is the empty; second is the real paragraph.
-        assert!(spec.blocks[0].inlines.is_empty());
+        assert_eq!(count_empty_blocks(&spec), 2);
+        assert_eq!(spec.blocks.len(), 3);
     }
 
     #[test]
-    fn single_leading_newline_no_empty() {
-        // `\np1` is just CommonMark trim — no extra space.
+    fn single_leading_newline_emits_one_empty() {
+        // One leading `\n` is one empty paragraph: the user pressed Enter
+        // once at the start of an empty doc, then typed content; the
+        // empty above is the line they were on before they typed.
         let spec = render_with_cursor("\np1", 0);
-        assert_eq!(count_empty_blocks(&spec), 0);
+        assert_eq!(count_empty_blocks(&spec), 1);
     }
 
     #[test]
     fn trailing_newlines_emit_empty_paragraphs() {
-        // `p1\n\n` → 1 trailing empty paragraph below `p1`.
+        // Each trailing `\n` is one empty paragraph below the last real
+        // block. Matches typewriter: every Enter past end-of-content
+        // leaves the cursor one line further down.
         let spec = render_with_cursor("p1\n\n", 0);
-        assert_eq!(count_empty_blocks(&spec), 1);
-        // ...and `p1\n\n\n` adds another.
-        let spec = render_with_cursor("p1\n\n\n", 0);
         assert_eq!(count_empty_blocks(&spec), 2);
+        let spec = render_with_cursor("p1\n\n\n", 0);
+        assert_eq!(count_empty_blocks(&spec), 3);
     }
 
     #[test]
-    fn single_trailing_newline_no_empty() {
-        let spec = render_with_cursor("p1\n", 0);
-        assert_eq!(count_empty_blocks(&spec), 0);
+    fn single_trailing_newline_emits_one_empty_paragraph() {
+        // Regression for the reported bug: pressing Enter once at the
+        // end of "paragraph 1" used to produce no visible change because
+        // pulldown-cmark folds the trailing `\n` into the paragraph's
+        // parser range. With trim + the new formula, that `\n` lives in
+        // the trailing free zone and renders as one empty paragraph
+        // (with the cursor on it after the keystroke).
+        let spec = render_with_cursor("paragraph 1\n", 0);
+        assert_eq!(count_empty_blocks(&spec), 1);
+        // The empty owns the trailing `\n` byte.
+        let trailing = spec
+            .blocks
+            .iter()
+            .filter(|b| {
+                matches!(b.kind, BlockKind::Paragraph)
+                    && b.source_range.start == 11
+                    && b.source_range.end == 12
+            })
+            .count();
+        assert_eq!(trailing, 1);
+    }
+
+    #[test]
+    fn paragraph_block_range_is_trimmed_of_trailing_newline() {
+        // Verify the trim happens — without it, the trailing-empty range
+        // would overlap the paragraph's range and the cursor at the
+        // boundary would land on the paragraph instead of the empty.
+        let spec = render_with_cursor("paragraph 1\n", 0);
+        let real = spec
+            .blocks
+            .iter()
+            .find(|b| !b.inlines.is_empty() || b.source_range.end - b.source_range.start > 1)
+            .or_else(|| {
+                // Fallback: real paragraph has range 0..11 (trimmed).
+                spec.blocks
+                    .iter()
+                    .find(|b| b.source_range.start == 0 && b.source_range.end == 11)
+            })
+            .expect("real paragraph block");
+        assert_eq!(real.source_range, 0..11);
     }
 
     #[test]

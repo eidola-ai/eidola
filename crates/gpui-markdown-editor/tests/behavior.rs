@@ -181,6 +181,41 @@ fn select_all_spans_document(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn enter_at_end_of_paragraph_creates_visible_trailing_empty(cx: &mut TestAppContext) {
+    // User-reported regression: pressing Enter at the end of the only
+    // paragraph used to produce no visible change. The source did pick
+    // up a trailing `\n` but pulldown-cmark folded it into the
+    // paragraph's range and the renderer never emitted a trailing empty.
+    let initial = EditorState {
+        markdown: "paragraph 1".into(),
+        selection: Selection::Cursor(11),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "paragraph 1\n");
+        assert_eq!(e.cursor_offset(), 12);
+    });
+
+    // Spec must contain the original paragraph *and* a synthetic empty
+    // paragraph anchoring the cursor at byte 12.
+    let spec = current_spec(cx, &editor);
+    assert!(
+        spec.blocks.len() >= 2,
+        "expected paragraph + trailing empty, got {} blocks",
+        spec.blocks.len()
+    );
+    let trailing_empty = spec
+        .blocks
+        .iter()
+        .find(|b| b.source_range == (11..12))
+        .expect("synthetic empty owning the trailing `\\n`");
+    assert!(matches!(trailing_empty.kind, BlockKind::Paragraph));
+    assert!(trailing_empty.inlines.is_empty());
+}
+
+#[gpui::test]
 fn empty_document_still_has_a_renderable_block(cx: &mut TestAppContext) {
     // Regression: deleting all content used to leave the spec with zero
     // blocks, so no `BlockElement::paint` ran and the editor stopped
