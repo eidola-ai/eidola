@@ -21,7 +21,7 @@ use gpui::{
 use smallvec::SmallVec;
 
 use crate::editor::MarkdownEditor;
-use crate::render_spec::{BlockKind, InlineStyle, RenderBlock};
+use crate::render_spec::{BlockKind, Container, InlineStyle, RenderBlock};
 use crate::state::Selection;
 use crate::style::MarkdownStyle;
 
@@ -208,6 +208,7 @@ impl Element for BlockElement {
         let spacing_above = spacing_above_for_block(&self.block.kind, &self.style);
         let inner_pad = block_inner_padding(&self.block.kind, &self.style);
         let is_code = is_code_block(&self.block.kind);
+        let container_indent = containers_left_indent(&self.block.containers, &self.style);
 
         let source = self.editor.read(cx).state.markdown.clone();
         style.size.width = relative(1.0).into();
@@ -224,15 +225,16 @@ impl Element for BlockElement {
                         _ => None,
                     })
                     .unwrap_or(px(f32::INFINITY));
+                // Container chain (blockquotes, future list-items)
+                // eats left indent — content shapes within the
+                // remaining width so soft-wrap lands at the visible
+                // right edge regardless of nesting depth.
+                let inner_w = (avail_w - container_indent).max(px(1.0));
                 // Code blocks don't soft-wrap — long lines extend off
                 // the right edge of the visible region and the user
                 // scrolls horizontally to see them. Other blocks wrap
-                // at the available width.
-                let wrap_w = if is_code {
-                    None
-                } else {
-                    Some(avail_w.max(px(1.0)))
-                };
+                // at the indented inner width.
+                let wrap_w = if is_code { None } else { Some(inner_w) };
                 let lines = shape_block_lines(
                     &source,
                     &block_clone,
@@ -300,21 +302,27 @@ impl Element for BlockElement {
         let spacing_above = spacing_above_for_block(&self.block.kind, &style);
         let inner_pad = block_inner_padding(&self.block.kind, &style);
         let is_code = is_code_block(&self.block.kind);
+        let container_indent = containers_left_indent(&self.block.containers, &style);
 
         let block_top = bounds.origin.y + spacing_above;
+        // `block_left` is the left edge of *this* leaf's visible
+        // region — `bounds.origin.x` shifted right by every
+        // container's indent. Per-level blockquote borders paint at
+        // `bounds.origin.x + i * blockquote_indent` (left of
+        // `block_left`); the code-block bg / content all sit at or
+        // right of `block_left`. Click-detection bounds still span
+        // the full incoming `bounds` so a click on the indent strip
+        // still hits this leaf.
+        let block_left = bounds.origin.x + container_indent;
         // Code blocks inset their content from the rounded background
         // fill by `inner_pad` on every edge. Non-code blocks have
         // `inner_pad == 0` and behave as before.
         let content_top = block_top + inner_pad;
-        let content_left = bounds.origin.x + inner_pad;
-        let block_width = bounds.size.width;
+        let content_left = block_left + inner_pad;
+        let block_width = (bounds.size.width - container_indent).max(px(1.0));
         let visible_content_width = (block_width - inner_pad * 2.).max(px(1.0));
 
-        let wrap_w = if is_code {
-            None
-        } else {
-            Some(block_width.max(px(1.0)))
-        };
+        let wrap_w = if is_code { None } else { Some(block_width) };
         let shaped = shape_block_lines(&source, &self.block, &style, font_size, wrap_w, window);
 
         let mut lines: Vec<LaidOutLine> = Vec::new();
@@ -390,9 +398,15 @@ impl Element for BlockElement {
         }
 
         let block_bottom = content_cursor_y + inner_pad;
+        // `block_bounds` covers this leaf's *full* width (including the
+        // container-indent strip on the left) so hit-testing routes
+        // clicks anywhere on the row to this leaf. The code-block
+        // background bounds below shrink to `block_left..block_left +
+        // block_width` so the bg only paints over the visible content
+        // band, not the indent strip.
         let block_bounds = Bounds::new(
             point(bounds.origin.x, block_top),
-            size(block_width, block_bottom - block_top),
+            size(bounds.size.width, block_bottom - block_top),
         );
 
         // Cap horizontal scroll: the rightmost edge of the widest
@@ -464,11 +478,19 @@ impl Element for BlockElement {
             let strip_top = strip_top.unwrap_or(block_top + inner_pad);
             let strip_bottom = strip_bottom.unwrap_or(block_bottom - inner_pad);
             let strip_bounds = Bounds::new(
-                point(bounds.origin.x, strip_top),
+                point(block_left, strip_top),
                 size(block_width, strip_bottom - strip_top),
             );
+            // Code-block bg only spans the leaf's visible width
+            // (right of any container indent), not the click-area
+            // bounds — otherwise the bg would paint over the
+            // blockquote indent strip and bury the border bar.
+            let bg_bounds = Bounds::new(
+                point(block_left, block_top),
+                size(block_width, block_bottom - block_top),
+            );
             Some(CodeBlockPaint {
-                bg_bounds: block_bounds,
+                bg_bounds,
                 content_strip: strip_bounds,
                 content_clip: strip_bounds,
                 content_width: max_content_line_width,
@@ -512,6 +534,30 @@ impl Element for BlockElement {
         }
 
         let code_block_paint = prepaint.code_block_paint;
+
+        // Per-level blockquote borders. Painted *first*, so any
+        // code-block bg or content paints over them only inside the
+        // already-indented content area (the bg is `block_left` to
+        // `block_left + block_width`, which starts to the right of
+        // every border bar). Each container that's a blockquote
+        // contributes one bar at `bounds.origin.x + i *
+        // blockquote_indent`. The bar spans this leaf's full vertical
+        // bounds — when two consecutive leaves share the same
+        // blockquote, their bars meet flush at the leaf boundary
+        // (paragraph_gap above leaf 2 is part of leaf 2's bounds, so
+        // the gap is covered by leaf 2's bar).
+        for (level, container) in self.block.containers.iter().enumerate() {
+            match container {
+                Container::BlockQuote { .. } => {
+                    let left = bounds.origin.x + self.style.blockquote_indent * (level as f32);
+                    let bar = Bounds::new(
+                        point(left, bounds.origin.y),
+                        size(self.style.blockquote_border_width, bounds.size.height),
+                    );
+                    window.paint_quad(fill(bar, self.style.blockquote_border_color));
+                }
+            }
+        }
 
         // Layered backgrounds for code blocks:
         //
@@ -789,6 +835,21 @@ fn is_code_block(kind: &BlockKind) -> bool {
     matches!(kind, BlockKind::CodeBlock { .. })
 }
 
+/// Cumulative left indent contributed by every container (blockquote,
+/// future list-items) that wraps this leaf. The leaf's content starts
+/// `containers_left_indent` inset from `bounds.origin.x`; per-level
+/// border bars sit at `bounds.origin.x + i * blockquote_indent` where
+/// `i` is the level's index in the containers chain (outermost = 0).
+fn containers_left_indent(containers: &[Container], style: &MarkdownStyle) -> Pixels {
+    let mut acc = px(0.0);
+    for c in containers {
+        match c {
+            Container::BlockQuote { .. } => acc += style.blockquote_indent,
+        }
+    }
+    acc
+}
+
 // ---------- Shaping ----------
 
 struct ShapedLine {
@@ -970,12 +1031,23 @@ fn build_display_line(
 
     let mut pos = line.start;
     while pos < line.end {
-        if let Some(h) = block
+        // Find the *furthest* hidden-range end that covers `pos`.
+        // Multiple hidden ranges can overlap on the same byte — the
+        // common case is a blockquote `> ` whose trailing space is
+        // also the leading space of a code-block closing fence's
+        // indent run. The previous `r.start == pos` predicate would
+        // pick whichever range happened to start at `pos`, advance to
+        // its end, then fail to skip the overlapping tail bytes of
+        // the longer range. Finding the maximum `r.end` over all
+        // ranges that cover `pos` skips the entire union in one step.
+        let cover_end = block
             .hidden_ranges
             .iter()
-            .find(|r| r.start == pos && r.end <= line.end)
-        {
-            pos = h.end;
+            .filter(|r| r.start <= pos && pos < r.end && r.end <= line.end)
+            .map(|r| r.end)
+            .max();
+        if let Some(end) = cover_end {
+            pos = end;
             continue;
         }
         let ch = source[pos..line.end]

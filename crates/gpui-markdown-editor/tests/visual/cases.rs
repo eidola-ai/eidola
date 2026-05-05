@@ -184,6 +184,67 @@ pub fn register(s: &mut Snapshots) {
         })
     });
 
+    // Blockquote — cursor outside (`> ` markers hidden, content
+    // indented behind a left border bar).
+    s.add("blockquote_cursor_outside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "Some intro.\n\n> A short quote.\n\nTrailing prose.".into(),
+                // Cursor in trailing prose.
+                selection: Selection::Cursor(34),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Blockquote — cursor inside (`> ` markers dimmed-visible).
+    s.add("blockquote_cursor_inside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "> A short quote.\nfollowing line.".into(),
+                // Cursor inside "quote".
+                selection: Selection::Cursor(8),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Two-deep nested blockquote — borders stack, both markers hide
+    // when cursor outside.
+    s.add("nested_blockquotes_outside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "Intro.\n\n> > Deep wisdom here.\n\nBody.".into(),
+                selection: Selection::Cursor(33),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Blockquote wrapping a heading — the heading's `# ` *and* the
+    // blockquote's `> ` both hide together.
+    s.add("blockquote_around_heading", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "> # Quoted heading\n\nBody.".into(),
+                selection: Selection::Cursor(22),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Code block inside a blockquote — the code-block bg paints
+    // *inside* the blockquote indent, not over the border bar.
+    s.add("code_block_inside_blockquote", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "> ```rust\n> let x = 1;\n> ```\n\nBody.".into(),
+                selection: Selection::Cursor(31),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
     // Trailing hard break: Shift+Enter at the end produces
     // `"paragraph 1  \n"`. Visually similar to the regular trailing
     // Enter but the empty trailing row sits *inside* the same paragraph

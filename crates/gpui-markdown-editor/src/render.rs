@@ -49,7 +49,7 @@
 
 use std::ops::Range;
 
-use crate::render_spec::{BlockKind, InlineRun, InlineStyle, RenderBlock, RenderSpec};
+use crate::render_spec::{BlockKind, Container, InlineRun, InlineStyle, RenderBlock, RenderSpec};
 use crate::state::{EditorState, Selection};
 use crate::syntax::{NodeKind, SyntaxNode};
 
@@ -57,7 +57,7 @@ pub fn render(state: &EditorState, tree: &[SyntaxNode]) -> RenderSpec {
     let cursor = CursorRange::from(&state.selection);
     let mut real_blocks = Vec::new();
     for node in tree {
-        render_node(node, cursor, &mut real_blocks);
+        render_node(node, cursor, &[], &mut real_blocks);
     }
     let blocks = inject_empty_paragraphs(&state.markdown, real_blocks);
     RenderSpec { blocks }
@@ -91,24 +91,115 @@ impl CursorRange {
     }
 }
 
-fn render_node(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<RenderBlock>) {
+fn render_node(
+    node: &SyntaxNode,
+    cursor: CursorRange,
+    containers: &[Container],
+    out: &mut Vec<RenderBlock>,
+) {
     match &node.kind {
-        NodeKind::Paragraph => render_paragraph(node, cursor, out),
-        NodeKind::Heading { .. } => render_heading(node, cursor, out),
-        NodeKind::CodeBlock { .. } => render_code_block(node, cursor, out),
+        NodeKind::Paragraph => render_paragraph(node, cursor, containers, out),
+        NodeKind::Heading { .. } => render_heading(node, cursor, containers, out),
+        NodeKind::CodeBlock { .. } => render_code_block(node, cursor, containers, out),
+        NodeKind::BlockQuote { prefix_ranges } => {
+            render_blockquote(node, prefix_ranges, cursor, containers, out)
+        }
         // Anything else at top level — nothing to do yet. (Future phases add
-        // handling for lists, blockquotes, etc.)
+        // handling for lists, etc.)
         _ => {}
     }
 }
 
-fn render_paragraph(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<RenderBlock>) {
+fn render_paragraph(
+    node: &SyntaxNode,
+    cursor: CursorRange,
+    containers: &[Container],
+    out: &mut Vec<RenderBlock>,
+) {
     let mut block = RenderBlock::new(node.range.clone(), BlockKind::Paragraph);
+    block.containers = containers.to_vec();
     collect_inlines(node, cursor, &mut block);
     out.push(block);
 }
 
-fn render_code_block(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<RenderBlock>) {
+/// Render a blockquote container.
+///
+/// We don't emit a `RenderBlock` for the blockquote itself — instead, every
+/// leaf block inside the blockquote (paragraph, heading, code block, or a
+/// nested blockquote's leaves) carries a `Container::BlockQuote` entry on
+/// its `containers` chain. The element layer applies the cumulative
+/// left-indent and paints per-level borders from that chain.
+///
+/// Per-line `>` markers belong to the leaf they introduce. After the
+/// children are rendered, we walk this blockquote's `prefix_ranges` and
+/// distribute each one to whichever leaf owns it (extending the leaf's
+/// `source_range` upward to swallow the marker if pulldown-cmark ranged
+/// the leaf to start *after* the marker, which it always does for the
+/// marker on the first line). The marker is then added to the leaf's
+/// `hidden_ranges` (cursor outside the blockquote) or as a dimmed
+/// `InlineRun` (cursor inside) — same shape as every other delimiter.
+fn render_blockquote(
+    node: &SyntaxNode,
+    prefix_ranges: &[Range<usize>],
+    cursor: CursorRange,
+    containers: &[Container],
+    out: &mut Vec<RenderBlock>,
+) {
+    let cursor_inside = cursor.overlaps(&node.range);
+    let mut child_chain = containers.to_vec();
+    child_chain.push(Container::BlockQuote { cursor_inside });
+
+    let start = out.len();
+    for child in &node.children {
+        render_node(child, cursor, &child_chain, out);
+    }
+
+    for prefix in prefix_ranges {
+        if let Some(leaf) = find_leaf_for_prefix(&mut out[start..], prefix) {
+            // Extend the leaf's source_range to swallow the prefix —
+            // pulldown ranges most leaves to start *after* the line's
+            // blockquote marker, so without this extension the marker
+            // falls outside the leaf entirely and the element layer
+            // can't hide / dim it.
+            if prefix.start < leaf.source_range.start {
+                leaf.source_range.start = prefix.start;
+            }
+            if cursor_inside {
+                leaf.inlines.push(InlineRun {
+                    source_range: prefix.clone(),
+                    style: InlineStyle::dimmed(),
+                });
+            } else {
+                leaf.hidden_ranges.push(prefix.clone());
+            }
+        }
+    }
+}
+
+/// Find the leaf in `slice` whose source range covers the byte at
+/// `prefix.end` — i.e. the first byte of content the prefix introduces.
+/// Pulldown ranges most leaves so they *start* exactly at that byte, so
+/// the predicate `start <= prefix.end < end` matches both (a) a
+/// multi-line leaf that contains the prefix mid-range and (b) the
+/// boundary case where the leaf begins right where the prefix ends. A
+/// stand-alone `>` line that isn't part of a parsed leaf is dropped —
+/// same convention the renderer already uses for bytes no leaf claims.
+fn find_leaf_for_prefix<'a>(
+    slice: &'a mut [RenderBlock],
+    prefix: &Range<usize>,
+) -> Option<&'a mut RenderBlock> {
+    let target = prefix.end;
+    slice
+        .iter_mut()
+        .find(|b| b.source_range.start <= target && target < b.source_range.end)
+}
+
+fn render_code_block(
+    node: &SyntaxNode,
+    cursor: CursorRange,
+    containers: &[Container],
+    out: &mut Vec<RenderBlock>,
+) {
     let (lang, delimiter_ranges, info_string_range) = match &node.kind {
         NodeKind::CodeBlock {
             lang,
@@ -124,6 +215,7 @@ fn render_code_block(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<Rende
     };
 
     let mut block = RenderBlock::new(node.range.clone(), BlockKind::CodeBlock { lang });
+    block.containers = containers.to_vec();
     let cursor_inside = cursor.overlaps(&node.range);
 
     // Fence chars (` ``` ` / `~~~`) — hide-when-outside, dim-when-inside.
@@ -163,7 +255,12 @@ fn render_code_block(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<Rende
     out.push(block);
 }
 
-fn render_heading(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<RenderBlock>) {
+fn render_heading(
+    node: &SyntaxNode,
+    cursor: CursorRange,
+    containers: &[Container],
+    out: &mut Vec<RenderBlock>,
+) {
     let (level, content_range, delimiter_ranges) = match &node.kind {
         NodeKind::Heading {
             level,
@@ -174,6 +271,7 @@ fn render_heading(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<RenderBl
     };
 
     let mut block = RenderBlock::new(node.range.clone(), BlockKind::Heading { level });
+    block.containers = containers.to_vec();
     let cursor_inside = cursor.overlaps(&node.range);
     apply_delimiter_visibility(&delimiter_ranges, cursor_inside, &mut block);
     collect_inlines_in_range(node, &content_range, cursor, &mut block);
@@ -957,6 +1055,160 @@ mod tests {
                 .all(|r| !r.style.bold && !r.style.italic),
             "code-block content must not be styled by inline markdown",
         );
+    }
+
+    // ---- Blockquotes -----------------------------------------------------
+
+    #[test]
+    fn blockquote_paragraph_emits_one_renderblock_with_container() {
+        // `> hi` parses as BlockQuote(Paragraph(hi)). The renderer
+        // emits one RenderBlock for the paragraph carrying a single
+        // BlockQuote container. The trailing "\n\nbody" puts the
+        // cursor truly outside the blockquote (boundary equality
+        // would otherwise count an end-of-blockquote cursor as
+        // "inside").
+        let src = "> hi\n\nbody";
+        let spec = render_with_cursor(src, src.len());
+        let blocks: Vec<_> = spec
+            .blocks
+            .iter()
+            .filter(|b| !b.containers.is_empty())
+            .collect();
+        assert_eq!(blocks.len(), 1);
+        let block = blocks[0];
+        assert!(matches!(block.kind, BlockKind::Paragraph));
+        assert_eq!(block.containers.len(), 1);
+        assert!(matches!(
+            block.containers[0],
+            Container::BlockQuote {
+                cursor_inside: false
+            }
+        ));
+    }
+
+    #[test]
+    fn blockquote_hides_marker_when_cursor_outside() {
+        // Paragraph at parser-range 2..5 ("hi\n") is extended to 0..5
+        // by the renderer so the marker `> ` at 0..2 falls inside its
+        // source_range — hidden because the cursor is outside.
+        let src = "> hi\n\nplain";
+        let spec = render_with_cursor(src, src.len());
+        let bq = spec
+            .blocks
+            .iter()
+            .find(|b| !b.containers.is_empty())
+            .expect("blockquote leaf");
+        assert!(bq.has_hidden_range(0..2));
+        assert_eq!(bq.source_range.start, 0);
+    }
+
+    #[test]
+    fn blockquote_dims_marker_when_cursor_inside() {
+        let src = "> hi\nbody";
+        // Cursor inside "hi" at byte 3.
+        let spec = render_with_cursor(src, 3);
+        let bq = spec
+            .blocks
+            .iter()
+            .find(|b| !b.containers.is_empty())
+            .expect("blockquote leaf");
+        assert!(bq.has_dimmed_range(0..2));
+        assert!(!bq.has_hidden_range(0..2));
+        assert!(matches!(
+            bq.containers[0],
+            Container::BlockQuote {
+                cursor_inside: true
+            }
+        ));
+    }
+
+    #[test]
+    fn blockquote_with_two_lines_attaches_both_markers_to_one_paragraph() {
+        // Two soft-broken lines parse as one paragraph; both line
+        // markers should attach to it.
+        let src = "> first\n> second\n";
+        let spec = render_with_cursor(src, 0);
+        let bq = spec
+            .blocks
+            .iter()
+            .find(|b| !b.containers.is_empty())
+            .expect("blockquote leaf");
+        // Cursor at 0 — boundary equality treats this as "inside",
+        // so markers dim rather than hide.
+        assert!(bq.has_dimmed_range(0..2));
+        assert!(bq.has_dimmed_range(8..10));
+        assert_eq!(bq.source_range.start, 0);
+    }
+
+    #[test]
+    fn nested_blockquote_emits_two_containers() {
+        let src = "> > deep\n\nbody";
+        let spec = render_with_cursor(src, src.len());
+        let bq = spec
+            .blocks
+            .iter()
+            .find(|b| !b.containers.is_empty())
+            .expect("blockquote leaf");
+        assert_eq!(bq.containers.len(), 2);
+        // Both levels are blockquotes (not just one nested under
+        // another category).
+        assert!(
+            bq.containers
+                .iter()
+                .all(|c| matches!(c, Container::BlockQuote { .. }))
+        );
+        // Both markers attach to the same paragraph leaf — outer
+        // marker at 0..2, inner marker at 2..4.
+        assert!(bq.has_hidden_range(0..2));
+        assert!(bq.has_hidden_range(2..4));
+        assert_eq!(bq.source_range.start, 0);
+    }
+
+    #[test]
+    fn nested_blockquote_dims_only_levels_the_cursor_is_inside() {
+        // Two-deep nest with cursor inside both levels: both markers
+        // dim. There is no positional ambiguity in `> > deep` — any
+        // cursor inside the source range is inside both nested
+        // blockquotes.
+        let src = "> > deep\n";
+        let spec = render_with_cursor(src, 6);
+        let bq = spec
+            .blocks
+            .iter()
+            .find(|b| !b.containers.is_empty())
+            .expect("blockquote leaf");
+        assert!(bq.has_dimmed_range(0..2));
+        assert!(bq.has_dimmed_range(2..4));
+    }
+
+    #[test]
+    fn blockquote_around_heading_keeps_heading_kind() {
+        // Cursor must be truly outside (not at the trailing-`\n`
+        // boundary) so the heading's `# ` delimiter hides rather than
+        // dims.
+        let src = "> # title\n\nbody";
+        let spec = render_with_cursor(src, src.len());
+        let bq = spec
+            .blocks
+            .iter()
+            .find(|b| !b.containers.is_empty())
+            .expect("blockquote leaf");
+        assert!(matches!(bq.kind, BlockKind::Heading { level: 1 }));
+        assert!(bq.has_hidden_range(2..4)); // "# "
+    }
+
+    #[test]
+    fn blockquote_around_heading_pads_marker_when_cursor_outside() {
+        let src = "> # title\n\nbody";
+        let spec = render_with_cursor(src, src.len());
+        let bq = spec
+            .blocks
+            .iter()
+            .find(|b| !b.containers.is_empty())
+            .expect("blockquote leaf");
+        // `> ` at 0..2 hides because the cursor is outside the
+        // blockquote (in "body").
+        assert!(bq.has_hidden_range(0..2));
     }
 
     #[test]

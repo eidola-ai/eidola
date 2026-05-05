@@ -52,6 +52,21 @@ pub struct MarkdownStyle {
     /// `radius`.
     pub code_block_radius: Pixels,
 
+    /// Total horizontal indent contributed by one blockquote level —
+    /// applied to the leaf content's left edge. Includes both the
+    /// border-bar width and the gap between the bar and content.
+    /// Nested blockquotes apply this indent cumulatively, one per
+    /// level. Mirrors `blockquoteIndent` in the Swift implementation.
+    pub blockquote_indent: Pixels,
+    /// Width of the per-level left border bar painted at the start of
+    /// the indent block. The bar sits at the level's left edge; the
+    /// content sits `blockquote_indent` further right.
+    pub blockquote_border_width: Pixels,
+    /// Color of the per-level left border bar. Defaults to the
+    /// theme's `border` so the bar reads as chrome rather than
+    /// content.
+    pub blockquote_border_color: Hsla,
+
     pub text_color: Hsla,
     pub delimiter_color: Hsla,
     pub background: Hsla,
@@ -79,6 +94,10 @@ impl MarkdownStyle {
             code_block_padding: px(12.0),
             code_block_content_padding_y: px(12.0),
             code_block_radius: theme.radius,
+
+            blockquote_indent: px(20.0),
+            blockquote_border_width: px(3.0),
+            blockquote_border_color: theme.border,
 
             text_color: theme.foreground,
             delimiter_color: theme.muted_foreground,
@@ -144,6 +163,21 @@ impl MarkdownStyle {
 
     pub fn code_block_radius(mut self, radius: Pixels) -> Self {
         self.code_block_radius = radius;
+        self
+    }
+
+    pub fn blockquote_indent(mut self, indent: Pixels) -> Self {
+        self.blockquote_indent = indent;
+        self
+    }
+
+    pub fn blockquote_border_width(mut self, width: Pixels) -> Self {
+        self.blockquote_border_width = width;
+        self
+    }
+
+    pub fn blockquote_border_color(mut self, color: Hsla) -> Self {
+        self.blockquote_border_color = color;
         self
     }
 

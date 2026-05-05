@@ -16,7 +16,9 @@ use gpui_markdown_editor::editor::{
     Backspace, Delete, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Right, SelectAll,
     ShiftEnter, ShiftRight, Up,
 };
-use gpui_markdown_editor::{BlockKind, EditorState, MarkdownEditor, RenderSpec, Selection};
+use gpui_markdown_editor::{
+    BlockKind, Container, EditorState, MarkdownEditor, RenderSpec, Selection,
+};
 
 fn open_editor(
     cx: &mut TestAppContext,
@@ -690,6 +692,136 @@ fn pasted_multiline_inside_code_block_keeps_single_newlines(cx: &mut TestAppCont
     editor.read_with(cx, |e, _| {
         assert_eq!(e.state.markdown, "```\nline1\nline2\nline3\n```");
     });
+}
+
+// ---------------------------------------------------------------------------
+// Blockquotes
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn blockquote_renders_a_paragraph_with_one_container(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "> hello\n\nbody".into(),
+        // Cursor in "body" — outside the blockquote.
+        selection: Selection::Cursor(11),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let bq = spec
+        .blocks
+        .iter()
+        .find(|b| !b.containers.is_empty())
+        .expect("a blockquote leaf");
+    assert_eq!(bq.containers.len(), 1);
+    assert!(matches!(bq.kind, BlockKind::Paragraph));
+    assert!(matches!(
+        bq.containers[0],
+        Container::BlockQuote {
+            cursor_inside: false
+        }
+    ));
+}
+
+#[gpui::test]
+fn typing_inside_blockquote_keeps_it_a_blockquote(cx: &mut TestAppContext) {
+    // The user types into a blockquote — the source still parses as a
+    // blockquote afterward (i.e. we don't accidentally promote a stray
+    // `\n` into `\n\n` and split the construct).
+    let initial = EditorState {
+        markdown: "> hello".into(),
+        selection: Selection::Cursor(7),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("!".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> hello!");
+        let spec = e.render_spec();
+        assert!(
+            spec.blocks.iter().any(|b| !b.containers.is_empty()),
+            "still rendered as a blockquote after typing",
+        );
+    });
+}
+
+#[gpui::test]
+fn nested_blockquotes_emit_two_containers(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "> > deep\n\nbody".into(),
+        // Cursor outside (in "body").
+        selection: Selection::Cursor(11),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let bq = spec
+        .blocks
+        .iter()
+        .find(|b| !b.containers.is_empty())
+        .expect("a blockquote leaf");
+    assert_eq!(bq.containers.len(), 2);
+    assert!(bq.containers.iter().all(|c| matches!(
+        c,
+        Container::BlockQuote {
+            cursor_inside: false
+        }
+    )));
+}
+
+#[gpui::test]
+fn cursor_inside_blockquote_marks_only_overlapping_levels(cx: &mut TestAppContext) {
+    // For `> > deep` any cursor inside the construct is inside both
+    // levels — there's no positional ambiguity. Both containers
+    // report cursor_inside = true.
+    let initial = EditorState {
+        markdown: "> > deep\n".into(),
+        selection: Selection::Cursor(6),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let bq = spec
+        .blocks
+        .iter()
+        .find(|b| !b.containers.is_empty())
+        .expect("a blockquote leaf");
+    assert!(bq.containers.iter().all(|c| matches!(
+        c,
+        Container::BlockQuote {
+            cursor_inside: true
+        }
+    )));
+}
+
+#[gpui::test]
+fn code_block_inside_blockquote_carries_blockquote_container(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "> ```\n> code\n> ```\n\nbody".into(),
+        // Cursor outside.
+        selection: Selection::Cursor(22),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let cb = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
+        .expect("a code-block leaf");
+    assert_eq!(cb.containers.len(), 1);
+    assert!(matches!(
+        cb.containers[0],
+        Container::BlockQuote {
+            cursor_inside: false
+        }
+    ));
 }
 
 #[gpui::test]

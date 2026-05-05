@@ -32,7 +32,7 @@ pub use editor::{
 pub use event::EditorEvent;
 pub use parser::parse;
 pub use render::render;
-pub use render_spec::{BlockKind, InlineRun, InlineStyle, RenderBlock, RenderSpec};
+pub use render_spec::{BlockKind, Container, InlineRun, InlineStyle, RenderBlock, RenderSpec};
 pub use state::{EditorState, Selection};
 pub use style::MarkdownStyle;
 pub use syntax::{NodeKind, SyntaxNode};

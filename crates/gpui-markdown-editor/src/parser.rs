@@ -77,6 +77,13 @@ impl<'a> Walker<'a> {
                 // works on the source bytes.
                 self.push_frame(SyntaxNode::new(NodeKind::Paragraph, range));
             }
+            Tag::BlockQuote(_) => {
+                // Alerts (Note / Tip / Important / Warning / Caution) are
+                // a GFM extension we don't render specially yet — they
+                // collapse to a plain blockquote.
+                let kind = self.blockquote_kind(&range);
+                self.push_frame(SyntaxNode::new(kind, range));
+            }
             Tag::Emphasis => {
                 let (delim, content) = self.symmetric_delimiters(&range, 1);
                 self.push_frame(SyntaxNode::new(
@@ -332,6 +339,81 @@ impl<'a> Walker<'a> {
             }
         }
     }
+
+    /// Build the `prefix_ranges` for a blockquote spanning `range`. Each
+    /// element is the `>` (and optional trailing space) that introduces
+    /// *this* blockquote level on a single line, in source order. Outer
+    /// blockquote markers belong to ancestor `BlockQuote` nodes — we
+    /// skip past `outer_depth` of them per line. Lazy continuation
+    /// lines (paragraph continuations without a `>` for this depth)
+    /// contribute no entry; the renderer treats them as regular content
+    /// lines, which is what CommonMark intends.
+    fn blockquote_kind(&self, range: &Range<usize>) -> NodeKind {
+        let outer_depth = self
+            .stack
+            .iter()
+            .filter(|f| matches!(f.node.kind, NodeKind::BlockQuote { .. }))
+            .count();
+        NodeKind::BlockQuote {
+            prefix_ranges: self.blockquote_prefix_ranges(range, outer_depth),
+        }
+    }
+
+    fn blockquote_prefix_ranges(
+        &self,
+        range: &Range<usize>,
+        outer_depth: usize,
+    ) -> Vec<Range<usize>> {
+        let bytes = self.source.as_bytes();
+        let mut out = Vec::new();
+        // pulldown-cmark gives a *nested* blockquote's range starting
+        // mid-line (right after the outer's `>` markers), so on the
+        // first line the inner range can begin at byte 2 even though
+        // the source line begins at byte 0. Walking back to the prior
+        // `\n` (or doc start) gives us the real line origin so the
+        // outer-depth skip walks past the same `>`s the parent node
+        // already claimed.
+        let mut p = range.start;
+        while p < range.end {
+            let mut line_start = p;
+            while line_start > 0 && bytes[line_start - 1] != b'\n' {
+                line_start -= 1;
+            }
+            let mut line_end = p.max(line_start);
+            while line_end < bytes.len() && bytes[line_end] != b'\n' {
+                line_end += 1;
+            }
+            let mut q = line_start;
+            let mut found = 0;
+            // CommonMark allows up to 3 leading spaces of indent before
+            // each `>`, plus an optional single trailing space the
+            // marker consumes.
+            loop {
+                let mut indent = 0;
+                while q < line_end && bytes[q] == b' ' && indent < 3 {
+                    q += 1;
+                    indent += 1;
+                }
+                if q < line_end && bytes[q] == b'>' {
+                    let marker_start = q;
+                    q += 1;
+                    if q < line_end && bytes[q] == b' ' {
+                        q += 1;
+                    }
+                    if found == outer_depth {
+                        out.push(marker_start..q);
+                        break;
+                    }
+                    found += 1;
+                } else {
+                    // Lazy continuation line — no marker for this depth.
+                    break;
+                }
+            }
+            p = line_end + 1;
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -493,6 +575,85 @@ mod tests {
             }
             other => panic!("expected fenced code block, got {other:?}"),
         }
+    }
+
+    // ---- Blockquotes ----------------------------------------------------
+
+    #[test]
+    fn parses_simple_blockquote_with_one_prefix_per_line() {
+        let src = "> first\n> second\n";
+        let nodes = parse(src);
+        assert_eq!(nodes.len(), 1);
+        match &first(&nodes).kind {
+            NodeKind::BlockQuote { prefix_ranges } => {
+                assert_eq!(prefix_ranges.len(), 2);
+                assert_eq!(&src[prefix_ranges[0].clone()], "> ");
+                assert_eq!(&src[prefix_ranges[1].clone()], "> ");
+            }
+            other => panic!("expected blockquote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_blockquote_records_only_its_own_marker() {
+        // `> > deep` — the outer blockquote owns the first `>`, the
+        // inner the second. Each node's prefix_ranges list contains
+        // exactly one entry, both on the same source line.
+        let src = "> > deep\n";
+        let nodes = parse(src);
+        assert_eq!(nodes.len(), 1);
+        let outer = first(&nodes);
+        match &outer.kind {
+            NodeKind::BlockQuote { prefix_ranges } => {
+                assert_eq!(prefix_ranges.len(), 1);
+                assert_eq!(&src[prefix_ranges[0].clone()], "> ");
+                assert_eq!(prefix_ranges[0], 0..2);
+            }
+            other => panic!("expected outer blockquote, got {other:?}"),
+        }
+        let inner = outer
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, NodeKind::BlockQuote { .. }))
+            .expect("inner blockquote child");
+        match &inner.kind {
+            NodeKind::BlockQuote { prefix_ranges } => {
+                assert_eq!(prefix_ranges.len(), 1);
+                assert_eq!(&src[prefix_ranges[0].clone()], "> ");
+                assert_eq!(prefix_ranges[0], 2..4);
+            }
+            other => panic!("expected inner blockquote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blockquote_with_marker_only_line_records_single_byte_range() {
+        // `>` followed by no space is still a valid marker. Range is
+        // 1 byte wide because there's no trailing space to consume.
+        let src = "> a\n>\n> b\n";
+        let nodes = parse(src);
+        match &first(&nodes).kind {
+            NodeKind::BlockQuote { prefix_ranges } => {
+                assert_eq!(prefix_ranges.len(), 3);
+                assert_eq!(&src[prefix_ranges[0].clone()], "> ");
+                assert_eq!(&src[prefix_ranges[1].clone()], ">");
+                assert_eq!(&src[prefix_ranges[2].clone()], "> ");
+            }
+            other => panic!("expected blockquote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blockquote_around_paragraph_keeps_paragraph_child() {
+        let src = "> hi\n";
+        let nodes = parse(src);
+        let bq = first(&nodes);
+        assert!(
+            bq.children
+                .iter()
+                .any(|c| matches!(c.kind, NodeKind::Paragraph)),
+            "blockquote must contain its inner paragraph as a child node",
+        );
     }
 
     #[test]

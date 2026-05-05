@@ -68,6 +68,17 @@ pub enum NodeKind {
         delimiter_ranges: Vec<ByteRange>,
         info_string_range: Option<ByteRange>,
     },
+    /// Blockquote container. Each entry in `prefix_ranges` is the `> `
+    /// (or `>`) marker that introduces *this* blockquote level on a
+    /// single line — one per line covered by the blockquote.
+    /// Outer-blockquote markers on the same line belong to the parent
+    /// `BlockQuote` node's `prefix_ranges`, not this one. Mirrors
+    /// `apps/macos/Packages/MarkdownEditor` `blockquotePrefixRanges`.
+    /// Children carry the inner block content (paragraphs, code
+    /// blocks, nested blockquotes, …).
+    BlockQuote {
+        prefix_ranges: Vec<ByteRange>,
+    },
     SoftBreak,
     HardBreak,
     Text,

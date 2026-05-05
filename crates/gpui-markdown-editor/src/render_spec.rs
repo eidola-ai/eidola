@@ -38,6 +38,26 @@ pub struct RenderBlock {
     /// but hides the ` ``` `) — the line is still a fence row even
     /// though its full extent isn't covered by a hidden range.
     pub delimiter_lines: Vec<Range<usize>>,
+    /// Container chain this leaf block sits inside, outermost first.
+    /// Empty for a top-level block; `[BlockQuote, BlockQuote]` for a
+    /// paragraph inside two nested blockquotes; `[BlockQuote,
+    /// ListItem, …]` once lists land. The element layer reads this
+    /// to compute cumulative left indent and to paint per-level
+    /// decorations (blockquote borders, list markers).
+    ///
+    /// One leaf block per visual block; the container chain is per
+    /// leaf. Sibling leaves of the same container repeat the chain
+    /// — that's intentional, so `inject_empty_paragraphs` (which
+    /// works on a flat list) doesn't have to know about nesting.
+    pub containers: Vec<Container>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Container {
+    /// One blockquote level wrapping this leaf. `cursor_inside` reflects
+    /// the cursor's position vs. the *blockquote's* source range (not
+    /// the leaf's), so all leaves of the same blockquote agree.
+    BlockQuote { cursor_inside: bool },
 }
 
 impl RenderBlock {
@@ -48,6 +68,7 @@ impl RenderBlock {
             inlines: Vec::new(),
             hidden_ranges: Vec::new(),
             delimiter_lines: Vec::new(),
+            containers: Vec::new(),
         }
     }
 

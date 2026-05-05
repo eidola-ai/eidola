@@ -98,16 +98,51 @@ The first cut covers:
 - Italic (`*`): italic trait + dim/hide of `*` delimiters.
 - Strikethrough (`~~`): strikethrough decoration + dim/hide of `~~`.
 - Body paragraphs (no-op styling).
+- Fenced code blocks (` ``` ` / `~~~`): mono font, full-width rounded
+  background, no soft-wrap (horizontal scroll for overflow), dim/hide of
+  fence chars and info string per cursor.
+- Blockquotes (`> `): per-level left border bar + cumulative left
+  indent, dim/hide of every `>` marker per blockquote level. Composes
+  via the `containers` chain on each leaf — any leaf (paragraph,
+  heading, code block, future list item) inside N nested blockquotes
+  carries N `Container::BlockQuote` entries; the element layer applies
+  `N * blockquote_indent` of left padding and paints N stacked border
+  bars. Code-block backgrounds inset *inside* the blockquote indent so
+  the border bar stays visible.
 - Soft-wrap.
 - Cursor + selection geometry, mouse hit-test, basic keyboard navigation
   (arrows / home / end / doc start / doc end), basic editing (insert text,
   backspace / delete, newline / line break), select-all.
 
 Explicitly *out* of this first phase: setext-heading normalization, ordered
-list renumbering, code blocks, blockquotes, lists (all kinds), inline code,
-links, images, thematic rules, tables, HTML, IME marked-text, word /
-line-aware delete, indent / outdent, and tab-trapped focus traversal. Each
-will land as a follow-up.
+list renumbering, lists (all kinds), inline code, links, images, thematic
+rules, tables, HTML, IME marked-text, word / line-aware delete, indent /
+outdent, and tab-trapped focus traversal. Each will land as a follow-up.
+
+### Container chain (composability invariant)
+
+Every `RenderBlock` carries a `containers: Vec<Container>` chain
+(outermost first). A leaf inside `> > para` carries `[BlockQuote,
+BlockQuote]`. When lists land they'll add `Container::ListItem { … }`
+entries to the same chain, and the element layer will read indent /
+decoration off the chain in the same loop. This keeps the renderer
+flat: `inject_empty_paragraphs` doesn't have to know about nesting,
+and the element layer doesn't special-case "blockquote inside list"
+vs. "list inside blockquote" — it just iterates `containers` in
+order. Adding a new container kind is one new variant + one new
+`match` arm in `containers_left_indent` / `paint`'s decoration loop.
+
+Known v1 limitations of the blockquote model:
+
+- A standalone `>` line in the middle of a blockquote (`> p1\n>\n> p2`)
+  has no parsed leaf — the marker is dropped and that line is invisible.
+  The user-typed form `> p1\n\n> p2` (two separate blockquotes) is
+  unaffected.
+- When the cursor is *inside* a blockquote, the dimmed `> ` prefix shapes
+  inline with the content, so content shifts right by the prefix's
+  width. This is a known visual diff vs. cursor-outside; the chat
+  renderer (no cursor) only ever shows the cursor-outside layout, so
+  pixel-fidelity with chat is preserved on the rendered side.
 
 ## Module map
 
