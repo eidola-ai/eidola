@@ -13,7 +13,7 @@
 use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
 use gpui_component::Root;
 use gpui_markdown_editor::editor::{
-    Backspace, Delete, DocumentEnd, DocumentStart, Down, End, Enter, Home, Right, SelectAll,
+    Backspace, Delete, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Right, SelectAll,
     ShiftEnter, ShiftRight, Up,
 };
 use gpui_markdown_editor::{BlockKind, EditorState, MarkdownEditor, RenderSpec, Selection};
@@ -125,15 +125,51 @@ fn arrow_keys_move_cursor(cx: &mut TestAppContext) {
     dispatch(cx, handle, &editor, Right);
     editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 2));
 
-    // Down once lands on the empty inter-paragraph line (column 0).
+    // Down preserves column 2 and jumps straight to the second
+    // paragraph: there's no visible empty row between paragraphs in
+    // `abc\n\ndef` (the structural pair is the paragraph break itself,
+    // not an empty paragraph), and `move_vertical` skips phantom lines
+    // whose start is a forbidden pair interior.
     dispatch(cx, handle, &editor, Down);
-    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 4));
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 7));
 
-    // Up once climbs back through the empty line; column was lost when we
-    // landed on it (no preferred-column tracking yet — that's a known
-    // follow-up). Cursor returns to the start of the previous line.
+    // Up symmetrically returns to column 2 of the first paragraph.
     dispatch(cx, handle, &editor, Up);
-    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 0));
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 2));
+}
+
+#[gpui::test]
+fn right_arrow_skips_paragraph_break_interior(cx: &mut TestAppContext) {
+    // The user-reported case: in `p1\n\np2`, byte 3 is between the two
+    // `\n`s of the paragraph break — visually unreachable and would
+    // split the pair if typed at. Right from byte 2 must jump straight
+    // to byte 4 (start of p2).
+    let initial = EditorState {
+        markdown: "p1\n\np2".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 4));
+    dispatch(cx, handle, &editor, Left);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 2));
+}
+
+#[gpui::test]
+fn arrow_navigation_through_empty_paragraph_lands_on_visible_row(cx: &mut TestAppContext) {
+    // `p1\n\n\n\np2` has one synthetic empty paragraph between (range
+    // 3..5). Right from end-of-p1 should land on the empty row (byte 4)
+    // — which is the boundary between the structural pair and the
+    // empty pair, allowed and visually on the empty row.
+    let initial = EditorState {
+        markdown: "p1\n\n\n\np2".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 4));
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 6));
 }
 
 #[gpui::test]

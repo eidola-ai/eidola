@@ -18,6 +18,18 @@
 //!    and `move_` both snap; promotion only inserts ASCII `\n` so it
 //!    can't break this.
 //!
+//! 3. **No cursor inside a structural `\n\n` pair.** The interior byte of
+//!    a paragraph-break / empty-paragraph pair is unreachable visually
+//!    (the pair renders as one row, not two) and typing there would split
+//!    the pair into a stray odd-length run. After every transition,
+//!    `avoid_forbidden_positions` snaps any cursor or selection endpoint
+//!    that lands on the interior of a structural pair *away* from the
+//!    pre-event position: forward if the cursor moved forward (or didn't
+//!    move), backward if it moved back. So Right at the end of `p1` in
+//!    `p1\n\np2` skips from byte 2 straight to 4 (start of p2), and Left
+//!    from byte 4 jumps back to 2. Hard-break `\n`s are exempt — they're
+//!    in-paragraph content, not part of a structural pair.
+//!
 //! # Pairs model
 //!
 //! The buffer treats `\n\n` as the atomic structural unit. Each Enter
@@ -50,6 +62,12 @@ use crate::event::EditorEvent;
 use crate::state::{EditorState, Selection};
 
 pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
+    let prev_anchor = match state.selection {
+        Selection::Cursor(p) => p,
+        Selection::Range { anchor, .. } => anchor,
+    };
+    let prev_head = state.selection.head();
+
     let next = match event {
         EditorEvent::InsertText(text) => insert_text(state, &text),
         EditorEvent::InsertNewline => insert_text(state, "\n\n"),
@@ -78,7 +96,8 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
         EditorEvent::ExtendDocumentStart => move_(state, Move::DocStart, true),
         EditorEvent::ExtendDocumentEnd => move_(state, Move::DocEnd, true),
     };
-    enforce_invariants(next)
+    let next = enforce_invariants(next);
+    avoid_forbidden_positions(next, prev_anchor, prev_head)
 }
 
 /// Promote any lone, mid-content `\n` into `\n\n` so the buffer never
@@ -125,6 +144,112 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
 /// it was logically next to.
 fn map_offset(promote_after: &[usize], off: usize) -> usize {
     off + promote_after.iter().filter(|&&p| p < off).count()
+}
+
+/// Snap any cursor or selection endpoint that landed at a forbidden
+/// position (interior of a structural `\n\n` pair) away from where it
+/// came from. Forward if the cursor moved forward (or didn't move),
+/// backward if it moved back. See module docs for the rationale.
+fn avoid_forbidden_positions(
+    state: EditorState,
+    prev_anchor: usize,
+    prev_head: usize,
+) -> EditorState {
+    let bytes = state.markdown.as_bytes();
+    let new_sel = match state.selection {
+        Selection::Cursor(p) => Selection::Cursor(snap_off_forbidden(bytes, p, prev_head)),
+        Selection::Range { anchor, head } => {
+            let a = snap_off_forbidden(bytes, anchor, prev_anchor);
+            let h = snap_off_forbidden(bytes, head, prev_head);
+            if a == h {
+                Selection::Cursor(h)
+            } else {
+                Selection::Range { anchor: a, head: h }
+            }
+        }
+    };
+    EditorState {
+        selection: new_sel,
+        ..state
+    }
+}
+
+fn snap_off_forbidden(bytes: &[u8], pos: usize, prev: usize) -> usize {
+    if !is_forbidden_position(bytes, pos) {
+        return pos;
+    }
+    if pos < prev {
+        prev_allowed_position(bytes, pos)
+    } else {
+        next_allowed_position(bytes, pos)
+    }
+}
+
+/// Is byte index `p` the interior of a structural `\n\n` pair? Pairs are
+/// the atomic unit of paragraph-break-or-empty in the source; cursors
+/// must not sit inside one.
+///
+/// Test: `bytes[p-1]` and `bytes[p]` are both `\n`, and the count of
+/// consecutive **structural** `\n`s ending at `p-1` is odd. Hard breaks
+/// (`  \n` or `\\\n`) are in-paragraph content; the back-walk stops
+/// before counting one. Hard-break `\n`s only appear at the *start* of a
+/// run of consecutive `\n`s — a `\n` mid-run is preceded by another
+/// `\n`, not by spaces or a backslash — so the check at the back-walk's
+/// terminus is enough.
+fn is_forbidden_position(bytes: &[u8], p: usize) -> bool {
+    if p == 0 || p >= bytes.len() {
+        return false;
+    }
+    if bytes[p - 1] != b'\n' || bytes[p] != b'\n' {
+        return false;
+    }
+    let mut count = 0;
+    let mut i = p;
+    while i > 0 && bytes[i - 1] == b'\n' {
+        let q = i - 1;
+        let preceded_by_two_spaces = q >= 2 && bytes[q - 1] == b' ' && bytes[q - 2] == b' ';
+        let preceded_by_backslash = q >= 1 && bytes[q - 1] == b'\\';
+        if preceded_by_two_spaces || preceded_by_backslash {
+            break;
+        }
+        count += 1;
+        i -= 1;
+    }
+    count % 2 == 1
+}
+
+fn next_allowed_position(bytes: &[u8], mut p: usize) -> usize {
+    while p < bytes.len() && is_forbidden_position(bytes, p) {
+        p += 1;
+    }
+    p
+}
+
+fn prev_allowed_position(bytes: &[u8], mut p: usize) -> usize {
+    while p > 0 && is_forbidden_position(bytes, p) {
+        p -= 1;
+    }
+    p
+}
+
+/// Snap `p` to the closest allowed position. Forward wins ties, matching
+/// the post-pass's default-forward when `prev == new`. This is the
+/// idempotent variant of the snap rule — used by `set_selection` (mouse
+/// clicks, host API), where running the same input twice must produce
+/// the same output. Movement events use the prev-comparison rule
+/// instead, because direction is what makes Right vs Left cleanly
+/// asymmetric.
+fn nearest_allowed_position(bytes: &[u8], p: usize) -> usize {
+    if !is_forbidden_position(bytes, p) {
+        return p;
+    }
+    let next = next_allowed_position(bytes, p);
+    let prev = prev_allowed_position(bytes, p);
+    if next.saturating_sub(p) <= p.saturating_sub(prev) {
+        next
+    } else {
+        prev
+    }
 }
 
 /// Is the `\n` at byte index `p` a soft break (a lone newline that would
@@ -319,8 +444,31 @@ fn set_selection(state: EditorState, sel: Selection) -> EditorState {
             }
         }
     };
+    let on_boundaries = snap_selection_to_char_boundaries(&state.markdown, normalized);
+    // Mouse clicks and host SetSelection calls feed offsets that may
+    // land on a forbidden pair interior — most often a synthetic empty
+    // paragraph between two real blocks, whose `display_to_source`
+    // anchors at the block's source-range start (which is the pair
+    // interior). Using the prev-comparison rule here would flip the
+    // cursor between two adjacent allowed positions every time a
+    // `MouseMoveEvent` re-feeds the same offset, because each call
+    // sees the previously-snapped position as `prev`. Nearest-allowed
+    // is idempotent: same input → same output.
+    let bytes = state.markdown.as_bytes();
+    let final_sel = match on_boundaries {
+        Selection::Cursor(p) => Selection::Cursor(nearest_allowed_position(bytes, p)),
+        Selection::Range { anchor, head } => {
+            let a = nearest_allowed_position(bytes, anchor);
+            let h = nearest_allowed_position(bytes, head);
+            if a == h {
+                Selection::Cursor(h)
+            } else {
+                Selection::Range { anchor: a, head: h }
+            }
+        }
+    };
     EditorState {
-        selection: snap_selection_to_char_boundaries(&state.markdown, normalized),
+        selection: final_sel,
         ..state
     }
 }
@@ -451,28 +599,52 @@ fn line_end_offset(text: &str, pos: usize) -> usize {
     end
 }
 
+/// Vertical navigation, aware of phantom `\n`-bounded segments.
+///
+/// `line_start_offset` slices the buffer at every `\n`, so a structural
+/// `\n\n` pair shows up as two adjacent zero-length "lines" with the
+/// pair interior as the start of the second. That position is forbidden
+/// (no visible row to land on), and `text.split('\n')` doesn't know it.
+/// Skipping any segment whose start is forbidden makes Up/Down move
+/// from one *visible* line to the next visible line — across paragraph
+/// breaks (which contribute zero visible rows) and synthetic empty
+/// paragraphs (one visible row each).
 fn move_vertical(text: &str, pos: usize, direction: i32) -> usize {
+    let bytes = text.as_bytes();
     let line_start = line_start_offset(text, pos);
     let column = pos - line_start;
     if direction < 0 {
-        if line_start == 0 {
-            return 0;
+        let mut probe = line_start;
+        loop {
+            if probe == 0 {
+                return 0;
+            }
+            let prev_line_end = probe - 1;
+            let prev_line_start = line_start_offset(text, prev_line_end);
+            if is_forbidden_position(bytes, prev_line_start) {
+                probe = prev_line_start;
+                continue;
+            }
+            let prev_line_len = prev_line_end - prev_line_start;
+            let target = prev_line_start + column.min(prev_line_len);
+            return snap_to_char_boundary(text, target);
         }
-        let prev_line_end = line_start - 1;
-        let prev_line_start = line_start_offset(text, prev_line_end);
-        let prev_line_len = prev_line_end - prev_line_start;
-        let target = prev_line_start + column.min(prev_line_len);
-        snap_to_char_boundary(text, target)
     } else {
-        let line_end = line_end_offset(text, pos);
-        if line_end >= text.len() {
-            return text.len();
+        let mut probe = line_end_offset(text, pos);
+        loop {
+            if probe >= text.len() {
+                return text.len();
+            }
+            let next_line_start = probe + 1;
+            if is_forbidden_position(bytes, next_line_start) {
+                probe = line_end_offset(text, next_line_start);
+                continue;
+            }
+            let next_line_end = line_end_offset(text, next_line_start);
+            let next_line_len = next_line_end - next_line_start;
+            let target = next_line_start + column.min(next_line_len);
+            return snap_to_char_boundary(text, target);
         }
-        let next_line_start = line_end + 1;
-        let next_line_end = line_end_offset(text, next_line_start);
-        let next_line_len = next_line_end - next_line_start;
-        let target = next_line_start + column.min(next_line_len);
-        snap_to_char_boundary(text, target)
     }
 }
 
@@ -1073,6 +1245,362 @@ mod invariant_tests {
         for evt in steps {
             s = update(s, evt);
             assert_no_soft_breaks(&s.markdown);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Forbidden-position invariant — the cursor must never sit inside a
+// structural `\n\n` pair. Pair interiors are visually unreachable (the
+// pair renders as one row), and typing there would split the pair into a
+// stray odd-length newline run. Every state transition in `update()` runs
+// the post-pass that snaps offending cursors away, with the snap
+// direction determined by where the cursor came from.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod forbidden_position_tests {
+    use super::*;
+
+    fn st(s: &str, cursor: usize) -> EditorState {
+        EditorState {
+            markdown: s.into(),
+            selection: Selection::Cursor(cursor),
+        }
+    }
+
+    fn assert_no_forbidden(state: &EditorState) {
+        let bytes = state.markdown.as_bytes();
+        let positions: Vec<usize> = match state.selection {
+            Selection::Cursor(p) => vec![p],
+            Selection::Range { anchor, head } => vec![anchor, head],
+        };
+        for p in positions {
+            assert!(
+                !is_forbidden_position(bytes, p),
+                "selection endpoint {p} is forbidden in {:?}",
+                state.markdown
+            );
+        }
+    }
+
+    // ---- The detector itself -----------------------------------------
+
+    #[test]
+    fn paragraph_break_interior_is_forbidden() {
+        let bytes = b"p1\n\np2";
+        assert!(is_forbidden_position(bytes, 3));
+        assert!(!is_forbidden_position(bytes, 0));
+        assert!(!is_forbidden_position(bytes, 2));
+        assert!(!is_forbidden_position(bytes, 4));
+        assert!(!is_forbidden_position(bytes, 6));
+    }
+
+    #[test]
+    fn between_two_pairs_is_allowed() {
+        // `p1\n\n\n\np2`: 4-newline run = 2 pairs. Position 4 is the
+        // boundary between the two pairs (allowed), positions 3 and 5
+        // are pair interiors (forbidden).
+        let bytes = b"p1\n\n\n\np2";
+        assert!(is_forbidden_position(bytes, 3));
+        assert!(!is_forbidden_position(bytes, 4));
+        assert!(is_forbidden_position(bytes, 5));
+    }
+
+    #[test]
+    fn six_newline_run_alternates_forbidden_and_allowed() {
+        let bytes = b"p1\n\n\n\n\n\np2";
+        assert!(is_forbidden_position(bytes, 3));
+        assert!(!is_forbidden_position(bytes, 4));
+        assert!(is_forbidden_position(bytes, 5));
+        assert!(!is_forbidden_position(bytes, 6));
+        assert!(is_forbidden_position(bytes, 7));
+        assert!(!is_forbidden_position(bytes, 8)); // start of p2
+    }
+
+    #[test]
+    fn leading_pair_interior_is_forbidden() {
+        let bytes = b"\n\nab";
+        assert!(is_forbidden_position(bytes, 1));
+        assert!(!is_forbidden_position(bytes, 0));
+        assert!(!is_forbidden_position(bytes, 2));
+    }
+
+    #[test]
+    fn hard_break_alone_has_no_forbidden_positions() {
+        // `ab  \n` — single hard break, no structural pair.
+        let bytes = b"ab  \n";
+        for p in 0..=bytes.len() {
+            assert!(
+                !is_forbidden_position(bytes, p),
+                "p={p} unexpectedly forbidden"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_break_followed_by_structural_pair_only_marks_pair_interior() {
+        // `ab  \n\n\ncd` — hard break (\n at 4) + 2 structural \n's
+        // (positions 5, 6). The structural pair is [5, 7). Position 6
+        // is the pair interior (forbidden); the hard-break \n doesn't
+        // pull position 5 into being forbidden because the back-walk
+        // stops at the hard-break terminator.
+        let bytes = b"ab  \n\n\ncd";
+        assert!(!is_forbidden_position(bytes, 5));
+        assert!(is_forbidden_position(bytes, 6));
+        assert!(!is_forbidden_position(bytes, 7));
+    }
+
+    #[test]
+    fn backslash_hard_break_treated_same() {
+        // `ab\\\n\n\ncd` — backslash + \n is a hard break; same shape.
+        let bytes = b"ab\\\n\n\ncd";
+        // bytes: a(0) b(1) \\(2) \n(3) \n(4) \n(5) c(6) d(7)
+        // Hard-break \n at 3 (preceded by \\ at 2). Structural pair
+        // [4, 6); interior is 5.
+        assert!(!is_forbidden_position(bytes, 4));
+        assert!(is_forbidden_position(bytes, 5));
+        assert!(!is_forbidden_position(bytes, 6));
+    }
+
+    #[test]
+    fn doc_edges_are_never_forbidden() {
+        let bytes = b"\n\n";
+        assert!(!is_forbidden_position(bytes, 0));
+        assert!(!is_forbidden_position(bytes, bytes.len()));
+    }
+
+    // ---- Movement directional snapping --------------------------------
+
+    #[test]
+    fn right_arrow_skips_paragraph_break_interior() {
+        let s = update(st("p1\n\np2", 2), EditorEvent::MoveRight);
+        assert_eq!(s.selection, Selection::Cursor(4));
+        assert_no_forbidden(&s);
+    }
+
+    #[test]
+    fn left_arrow_skips_paragraph_break_interior() {
+        let s = update(st("p1\n\np2", 4), EditorEvent::MoveLeft);
+        assert_eq!(s.selection, Selection::Cursor(2));
+        assert_no_forbidden(&s);
+    }
+
+    #[test]
+    fn right_arrow_through_extra_pair_lands_at_inter_pair_boundary() {
+        // `p1\n\n\n\np2` — Right from end of p1 (byte 2) skips byte 3
+        // (forbidden) and lands at byte 4 (between the two pairs,
+        // allowed; visually on the empty row).
+        let s = update(st("p1\n\n\n\np2", 2), EditorEvent::MoveRight);
+        assert_eq!(s.selection, Selection::Cursor(4));
+        assert_no_forbidden(&s);
+    }
+
+    #[test]
+    fn left_arrow_through_extra_pair_lands_at_inter_pair_boundary() {
+        let s = update(st("p1\n\n\n\np2", 6), EditorEvent::MoveLeft);
+        assert_eq!(s.selection, Selection::Cursor(4));
+        assert_no_forbidden(&s);
+    }
+
+    #[test]
+    fn right_arrow_off_inter_pair_boundary_lands_at_next_real_block() {
+        // From the inter-pair boundary (byte 4), Right would land at
+        // byte 5 (forbidden, interior of pair 2). Snap forward → 6
+        // (start of p2).
+        let s = update(st("p1\n\n\n\np2", 4), EditorEvent::MoveRight);
+        assert_eq!(s.selection, Selection::Cursor(6));
+        assert_no_forbidden(&s);
+    }
+
+    #[test]
+    fn left_arrow_off_inter_pair_boundary_lands_at_prev_real_block() {
+        let s = update(st("p1\n\n\n\np2", 4), EditorEvent::MoveLeft);
+        assert_eq!(s.selection, Selection::Cursor(2));
+        assert_no_forbidden(&s);
+    }
+
+    #[test]
+    fn down_from_first_paragraph_skips_break_to_second() {
+        // `p1\n\np2` MoveDown from byte 0: target byte 3 (forbidden).
+        // Snap forward → byte 4 (start of p2).
+        let s = update(st("p1\n\np2", 0), EditorEvent::MoveDown);
+        assert_eq!(s.selection, Selection::Cursor(4));
+        assert_no_forbidden(&s);
+    }
+
+    #[test]
+    fn up_from_second_paragraph_skips_break_to_first() {
+        // `move_vertical` skips the phantom (forbidden) line between
+        // paragraphs and preserves column 0, so Up from start of p2
+        // lands at start of p1, not at end-of-p1 like a simple
+        // post-snap would produce.
+        let s = update(st("p1\n\np2", 4), EditorEvent::MoveUp);
+        assert_eq!(s.selection, Selection::Cursor(0));
+        assert_no_forbidden(&s);
+    }
+
+    #[test]
+    fn down_from_first_paragraph_lands_on_visible_empty_row() {
+        // `p1\n\n\n\np2` MoveDown from p1@0: target → 3 (forbidden) →
+        // snap forward to 4. Byte 4 is on the empty row (synthetic
+        // empty has range 3..5).
+        let s = update(st("p1\n\n\n\np2", 0), EditorEvent::MoveDown);
+        assert_eq!(s.selection, Selection::Cursor(4));
+        assert_no_forbidden(&s);
+    }
+
+    #[test]
+    fn up_from_p2_in_long_run_lands_on_empty_row() {
+        let s = update(st("p1\n\n\n\np2", 6), EditorEvent::MoveUp);
+        assert_eq!(s.selection, Selection::Cursor(4));
+        assert_no_forbidden(&s);
+    }
+
+    // ---- ExtendLeft / ExtendRight (range selections) ------------------
+
+    #[test]
+    fn extend_right_skips_forbidden_interior() {
+        // From cursor at byte 2 in `p1\n\np2`, Shift+Right should extend
+        // the selection past the forbidden byte 3 to end at byte 4.
+        let s = update(st("p1\n\np2", 2), EditorEvent::ExtendRight);
+        assert_eq!(s.selection, Selection::range(2, 4));
+        assert_no_forbidden(&s);
+    }
+
+    #[test]
+    fn extend_left_skips_forbidden_interior() {
+        let s = update(st("p1\n\np2", 4), EditorEvent::ExtendLeft);
+        assert_eq!(s.selection, Selection::range(4, 2));
+        assert_no_forbidden(&s);
+    }
+
+    // ---- SetSelection (the host API) ----------------------------------
+    //
+    // SetSelection uses *nearest-allowed* (idempotent), not prev-comparison.
+    // That keeps mouse-drag stable: every `mouse_move` fires another
+    // `SetSelection` with the same offset, and each must produce the
+    // same result regardless of where the previously-snapped cursor
+    // ended up. See the comment at the top of `set_selection`.
+
+    #[test]
+    fn set_selection_to_forbidden_snaps_to_nearest_allowed() {
+        // pos=3 in `p1\n\np2`: equidistant between allowed 2 and 4.
+        // Forward wins ties, matching the post-pass default. Same
+        // result regardless of where the cursor was before — that's
+        // the load-bearing idempotence property.
+        for prev in [0, 1, 2, 3, 4, 5, 6] {
+            let s = update(
+                st("p1\n\np2", prev),
+                EditorEvent::SetSelection(Selection::Cursor(3)),
+            );
+            assert_eq!(
+                s.selection,
+                Selection::Cursor(4),
+                "prev={prev} gave {:?}",
+                s.selection
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_set_selection_at_forbidden_offset_is_stable() {
+        // Regression for the mouse-drag flicker: a `MouseMoveEvent`
+        // re-fires `SetSelection` at the same offset on every frame.
+        // Under prev-comparison the cursor would oscillate between the
+        // two adjacent allowed positions (2 and 4) because each call
+        // saw the previous snap as `prev`. Nearest-allowed makes it
+        // converge in one step.
+        let mut s = st("p1\n\np2", 0);
+        for _ in 0..5 {
+            s = update(s, EditorEvent::SetSelection(Selection::Cursor(3)));
+            assert_eq!(s.selection, Selection::Cursor(4));
+        }
+    }
+
+    #[test]
+    fn set_selection_inside_inter_block_pair_lands_on_visible_empty_row() {
+        // The user-reported case: clicking on a synthetic empty row
+        // between paragraphs. The renderer's `display_to_source` for
+        // the empty maps clicks to the pair interior (forbidden);
+        // nearest-allowed snaps to the inter-pair boundary, which is
+        // visually the same row.
+        let s = update(
+            st("p1\n\n\n\np2", 0),
+            EditorEvent::SetSelection(Selection::Cursor(3)),
+        );
+        // Interior of pair 1; equidistant between 2 (end of p1) and 4
+        // (visible empty row). Forward wins → 4.
+        assert_eq!(s.selection, Selection::Cursor(4));
+    }
+
+    // ---- Range endpoints snap independently ---------------------------
+
+    #[test]
+    fn range_anchor_and_head_snap_independently() {
+        // Both endpoints land on forbidden interiors of pair 1 / pair
+        // 2. nearest-allowed snaps each independently — anchor 3 is
+        // tied between 2 and 4 (forward → 4); head 5 is tied between
+        // 4 and 6 (forward → 6). Result: a real range, not a collapse.
+        let initial = EditorState {
+            markdown: "p1\n\n\n\np2".into(),
+            selection: Selection::Cursor(0),
+        };
+        let s = update(
+            initial,
+            EditorEvent::SetSelection(Selection::Range { anchor: 3, head: 5 }),
+        );
+        assert_eq!(s.selection, Selection::range(4, 6));
+    }
+
+    // ---- Hard breaks pass through unchanged --------------------------
+
+    #[test]
+    fn navigation_around_hard_break_is_unaffected() {
+        // `ab  \nX` cursor right after the hard-break \n. Right arrow
+        // moves to byte 6 (after X). No forbidden positions in this doc.
+        let s = update(st("ab  \nX", 5), EditorEvent::MoveRight);
+        assert_eq!(s.selection, Selection::Cursor(6));
+        assert_no_forbidden(&s);
+    }
+
+    // ---- Empty-row navigation round-trip ------------------------------
+
+    #[test]
+    fn arrow_round_trip_stays_clear_of_forbidden() {
+        // Walk Right from the start of `p1\n\n\n\n\n\np2` and back
+        // again; every step must produce an allowed cursor.
+        let mut s = st("p1\n\n\n\n\n\np2", 0);
+        let path = [
+            EditorEvent::MoveRight, // 0 → 1
+            EditorEvent::MoveRight, // 1 → 2
+            EditorEvent::MoveRight, // 2 → skip 3 → 4
+            EditorEvent::MoveRight, // 4 → skip 5 → 6
+            EditorEvent::MoveRight, // 6 → skip 7 → 8 (start of p2)
+            EditorEvent::MoveRight, // 8 → 9
+            EditorEvent::MoveRight, // 9 → 10
+        ];
+        let expected = [1usize, 2, 4, 6, 8, 9, 10];
+        for (evt, want) in path.into_iter().zip(expected) {
+            s = update(s, evt);
+            assert_eq!(s.selection, Selection::Cursor(want));
+            assert_no_forbidden(&s);
+        }
+        // Walk back to the start.
+        let back = [
+            EditorEvent::MoveLeft, // 10 → 9
+            EditorEvent::MoveLeft, // 9 → 8
+            EditorEvent::MoveLeft, // 8 → skip 7 → 6
+            EditorEvent::MoveLeft, // 6 → skip 5 → 4
+            EditorEvent::MoveLeft, // 4 → skip 3 → 2
+            EditorEvent::MoveLeft, // 2 → 1
+            EditorEvent::MoveLeft, // 1 → 0
+        ];
+        let expected = [9usize, 8, 6, 4, 2, 1, 0];
+        for (evt, want) in back.into_iter().zip(expected) {
+            s = update(s, evt);
+            assert_eq!(s.selection, Selection::Cursor(want));
+            assert_no_forbidden(&s);
         }
     }
 }
