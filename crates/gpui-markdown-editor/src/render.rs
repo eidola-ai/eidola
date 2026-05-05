@@ -341,7 +341,22 @@ fn inject_empty_paragraphs(source: &str, real_blocks: Vec<RenderBlock>) -> Vec<R
         out.push(block.clone());
     }
 
-    // Trailing gap. Each pair is one trailing empty paragraph.
+    // Trailing gap. Same offset-by-1 layout as the inter-block case so
+    // the cursor's natural resting position (the boundary between this
+    // empty's pair and the next pair) falls strictly inside the empty's
+    // range. With offset 0 — the layout the leading case still uses —
+    // the empty's start coincides with the previous block's end, so
+    // typing at "the cursor on row N" position would extend the
+    // previous paragraph rather than create new content for row N.
+    //
+    // The shift by 1 pushes each trailing pair forward by one byte. The
+    // *last* pair would extend one byte past the document, so we clamp
+    // it: the final empty's range becomes a 1-byte slice over its lone
+    // `\n`. Visually it still renders as one empty row (the
+    // all-newlines fast-path in `shape_block_lines` emits a single line
+    // for any block whose text is purely `\n`s); functionally, the
+    // cursor at end-of-doc is `range.end` (allowed) and the last block
+    // claims it via the end-clause in `block_claims_cursor`.
     let last_end = real_blocks
         .last()
         .expect("checked non-empty above")
@@ -352,8 +367,9 @@ fn inject_empty_paragraphs(source: &str, real_blocks: Vec<RenderBlock>) -> Vec<R
         .count();
     let trailing_empties = trailing_count / 2;
     for i in 0..trailing_empties {
-        let start = last_end + 2 * i;
-        out.push(empty_paragraph_pair(start));
+        let start = last_end + 2 * i + 1;
+        let end = (start + 2).min(bytes.len());
+        out.push(RenderBlock::new(start..end, BlockKind::Paragraph));
     }
 
     out
@@ -562,19 +578,24 @@ mod tests {
     // ---- Empty-paragraph injection ----------------------------------------
 
     /// Count "empty paragraph" blocks in a spec — synthetic blocks
-    /// produced by `inject_empty_paragraphs`. In the pairs model each
-    /// such block spans exactly two `\n` bytes (we check the bytes
-    /// themselves, not just the range size, so a real 2-char paragraph
-    /// like `"p1"` doesn't get miscounted).
+    /// produced by `inject_empty_paragraphs`. Most synthetic empties
+    /// span 2 `\n` bytes (a full pair), but the *last* trailing empty
+    /// is clamped to doc length and may span just 1 `\n`. Either way
+    /// the block's text is purely `\n`s, which is what we check (so a
+    /// real 2-char paragraph like `"p1"` doesn't get miscounted).
     fn count_empty_blocks(spec: &RenderSpec, src: &str) -> usize {
         let bytes = src.as_bytes();
         spec.blocks
             .iter()
             .filter(|b| {
-                matches!(b.kind, BlockKind::Paragraph)
-                    && b.source_range.end - b.source_range.start == 2
-                    && (b.source_range.start..b.source_range.end)
-                        .all(|i| bytes.get(i).copied() == Some(b'\n'))
+                if !matches!(b.kind, BlockKind::Paragraph) {
+                    return false;
+                }
+                if b.source_range.end <= b.source_range.start {
+                    return false;
+                }
+                (b.source_range.start..b.source_range.end)
+                    .all(|i| bytes.get(i).copied() == Some(b'\n'))
             })
             .count()
     }
@@ -698,15 +719,19 @@ mod tests {
     fn enter_at_end_of_paragraph_renders_one_trailing_empty() {
         // The user-flow regression: Enter from end of `paragraph 1`
         // produces `paragraph 1\n\n` (pairs model). Render must show a
-        // visible empty trailing row.
+        // visible empty trailing row. Trailing empties use the same
+        // offset-by-1 layout as inter-block empties; the last empty is
+        // clamped to doc length, giving a 1-byte range that still
+        // shapes to one visible row.
         let src = "paragraph 1\n\n";
         let spec = render_with_cursor(src, 13);
-        assert_eq!(count_empty_blocks(&spec, src), 1);
+        // Real "paragraph 1" + 1 trailing synthetic empty.
+        assert_eq!(spec.blocks.len(), 2);
         let trailing = spec
             .blocks
             .iter()
-            .find(|b| b.source_range == (11..13))
-            .expect("synthetic empty owning the trailing pair");
+            .find(|b| b.source_range == (12..13))
+            .expect("synthetic empty owning the clamped trailing pair");
         assert!(matches!(trailing.kind, BlockKind::Paragraph));
     }
 

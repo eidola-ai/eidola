@@ -185,6 +185,14 @@ fn snap_off_forbidden(bytes: &[u8], pos: usize, prev: usize) -> usize {
     }
 }
 
+/// Test-only: re-export of `is_forbidden_position` for cross-module tests
+/// in `element.rs` that need to verify the cursor-claim invariant only
+/// over allowed offsets.
+#[cfg(test)]
+pub(crate) fn is_forbidden_position_for_test(bytes: &[u8], p: usize) -> bool {
+    is_forbidden_position(bytes, p)
+}
+
 /// Is byte index `p` the interior of a structural `\n\n` pair? Pairs are
 /// the atomic unit of paragraph-break-or-empty in the source; cursors
 /// must not sit inside one.
@@ -1565,6 +1573,58 @@ mod forbidden_position_tests {
     }
 
     // ---- Empty-row navigation round-trip ------------------------------
+
+    // ---- Trailing-empty typing semantics ------------------------------
+    //
+    // The trailing-empty layout shifts each pair by 1 inside the gap so
+    // the cursor's resting position when on row N is the typing position
+    // that creates content for row N. With offset 0, "cursor on empty
+    // row" and "cursor at end of paragraph" share a source offset, and
+    // typing extends the paragraph instead.
+
+    #[test]
+    fn enter_at_end_of_paragraph_then_type_creates_new_paragraph_for_empty_row() {
+        // The user-flow regression. Enter from end of `paragraph` puts
+        // the cursor on the empty row below. Typing X must create a new
+        // "X" paragraph on that row, not extend "paragraph" to
+        // "paragraphX".
+        let mut s = st("paragraph", 9);
+        s = update(s, EditorEvent::InsertNewline);
+        assert_eq!(s.markdown, "paragraph\n\n");
+        assert_eq!(s.selection, Selection::Cursor(11));
+        s = update(s, EditorEvent::InsertText("X".into()));
+        assert_eq!(s.markdown, "paragraph\n\nX");
+    }
+
+    #[test]
+    fn right_arrow_from_end_of_paragraph_into_trailing_empty_then_type() {
+        // Cursor at end of paragraph, Right lands on the empty row, X
+        // creates a new paragraph for it.
+        let mut s = st("paragraph\n\n\n\n\n\n", 9);
+        s = update(s, EditorEvent::MoveRight);
+        assert_eq!(s.selection, Selection::Cursor(11));
+        s = update(s, EditorEvent::InsertText("X".into()));
+        assert_eq!(s.markdown, "paragraph\n\nX\n\n\n\n");
+        assert_no_forbidden(&s);
+    }
+
+    #[test]
+    fn click_offset_at_trailing_empty_anchor_snaps_to_typing_position() {
+        // Trailing empties have `display_to_source = [block.start]`,
+        // and `block.start` is the *forbidden* interior of the
+        // structural pair. Clicking on the empty row therefore feeds
+        // `SetSelection(block.start)` through `update`, which uses
+        // nearest-allowed and lands at the empty's strict-interior
+        // typing position.
+        let s = update(
+            st("paragraph\n\n\n\n\n\n", 0),
+            EditorEvent::SetSelection(Selection::Cursor(10)),
+        );
+        // Empty 1 is range 10..12; click anchor is 10 (forbidden).
+        // Nearest allowed: prev=9 (end of paragraph) and next=11
+        // (typing position). Forward wins → 11.
+        assert_eq!(s.selection, Selection::Cursor(11));
+    }
 
     #[test]
     fn arrow_round_trip_stays_clear_of_forbidden() {

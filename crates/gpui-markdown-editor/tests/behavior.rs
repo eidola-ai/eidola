@@ -261,15 +261,19 @@ fn enter_at_end_of_paragraph_creates_visible_trailing_empty(cx: &mut TestAppCont
         assert_eq!(e.cursor_offset(), 13);
     });
 
-    // Spec: paragraph + 1 trailing empty (range covering the pair of
-    // trailing `\n`s).
+    // Spec: paragraph + 1 trailing empty. The trailing-pair formula
+    // shifts by 1 (matching the inter-block layout) so the empty's
+    // strict-interior is the typing position that creates new content
+    // for the empty row instead of extending the paragraph. The last
+    // empty is clamped to doc length, giving a 1-byte range over the
+    // final `\n`.
     let spec = current_spec(cx, &editor);
     assert!(spec.blocks.len() >= 2);
     let trailing_empty = spec
         .blocks
         .iter()
-        .find(|b| b.source_range == (11..13))
-        .expect("synthetic empty paragraph owning the trailing `\\n\\n`");
+        .find(|b| b.source_range == (12..13))
+        .expect("synthetic empty owning the clamped trailing pair");
     assert!(matches!(trailing_empty.kind, BlockKind::Paragraph));
     assert!(trailing_empty.inlines.is_empty());
 }

@@ -504,12 +504,15 @@ impl Render for MarkdownEditor {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move));
 
+        let block_starts: Vec<usize> = spec.blocks.iter().map(|b| b.source_range.start).collect();
         for (idx, block) in spec.blocks.into_iter().enumerate() {
             let is_last = idx + 1 == block_count;
+            let next_block_start = block_starts.get(idx + 1).copied();
             container = container.child(BlockElement::new(
                 block,
                 idx,
                 is_last,
+                next_block_start,
                 view.clone(),
                 style.clone(),
             ));

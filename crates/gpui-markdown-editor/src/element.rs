@@ -28,6 +28,15 @@ pub struct BlockElement {
     block: RenderBlock,
     block_index: usize,
     is_last_block: bool,
+    /// Source-range start of the block immediately after this one in
+    /// document order, if any. Used so the cursor at this block's
+    /// `source_range.end` only renders here when the next block doesn't
+    /// strictly contain that offset — otherwise the caret would paint
+    /// twice (once at this block's end-of-line, once at the next
+    /// block's start). Adjacent blocks share boundaries in the
+    /// trailing/leading empty-paragraph cases, where `inject_empty_paragraphs`
+    /// puts the empty's start at the previous block's end.
+    next_block_start: Option<usize>,
     editor: Entity<MarkdownEditor>,
     style: MarkdownStyle,
 }
@@ -37,6 +46,7 @@ impl BlockElement {
         block: RenderBlock,
         block_index: usize,
         is_last_block: bool,
+        next_block_start: Option<usize>,
         editor: Entity<MarkdownEditor>,
         style: MarkdownStyle,
     ) -> Self {
@@ -44,6 +54,7 @@ impl BlockElement {
             block,
             block_index,
             is_last_block,
+            next_block_start,
             editor,
             style,
         }
@@ -270,8 +281,13 @@ impl Element for BlockElement {
             source_range: self.block.source_range.clone(),
         };
 
-        let (mut cursor_quad, selection_quads) =
-            build_caret_and_selection(&laid_out, selection, &style, self.is_last_block);
+        let (mut cursor_quad, selection_quads) = build_caret_and_selection(
+            &laid_out,
+            selection,
+            &style,
+            self.is_last_block,
+            self.next_block_start,
+        );
 
         if cursor_quad.is_none() && source.is_empty() && self.block_index == 0 {
             // Truly empty document — paint a cursor at the origin so the
@@ -651,6 +667,7 @@ fn build_caret_and_selection(
     selection: Selection,
     style: &MarkdownStyle,
     is_last_block: bool,
+    next_block_start: Option<usize>,
 ) -> (Option<gpui::PaintQuad>, Vec<gpui::PaintQuad>) {
     let cursor_offset = selection.head();
     let cursor_color = style.caret_color;
@@ -663,8 +680,12 @@ fn build_caret_and_selection(
     let sel_range = selection.selection_range();
     let has_selection = sel_range.start != sel_range.end;
 
-    let cursor_in_block =
-        cursor_offset >= block.source_range.start && cursor_offset <= block.source_range.end;
+    let cursor_in_block = block_claims_cursor(
+        cursor_offset,
+        block.source_range.start,
+        block.source_range.end,
+        next_block_start,
+    );
 
     for line in &block.lines {
         let lo = line.source_range.start;
@@ -763,6 +784,27 @@ fn paint_selection_for_line(
         ),
         color,
     ));
+}
+
+/// Decide whether a block claims the cursor at `cursor_offset`. A block
+/// owns the offset if it sits strictly inside the block's source range,
+/// OR if it sits at the block's end *and* no following block starts at
+/// that offset. The end-clause keeps the trailing cursor at end-of-doc
+/// rendered (no next block to claim it) while preventing double-paint
+/// when a trailing or leading synthetic empty starts at the previous
+/// block's end — `inject_empty_paragraphs` does exactly that for those
+/// cases, so without this guard a cursor at the boundary would paint
+/// on both blocks' rows.
+fn block_claims_cursor(
+    cursor_offset: usize,
+    block_start: usize,
+    block_end: usize,
+    next_block_start: Option<usize>,
+) -> bool {
+    let strict = cursor_offset >= block_start && cursor_offset < block_end;
+    let at_end = cursor_offset == block_end;
+    let next_claims = matches!(next_block_start, Some(s) if s == cursor_offset);
+    strict || (at_end && !next_claims)
 }
 
 // ---------------------------------------------------------------------------
@@ -899,5 +941,123 @@ mod tests {
         // line each.
         let counts = shape_visible_row_counts(cx, "# title\n\n\n\n\n\nbody");
         assert_eq!(counts, vec![1, 1, 1, 1]);
+    }
+
+    // ---- Cursor-claim rule: each offset is owned by at most one block ---
+
+    /// Render `src` and walk every byte position from 0 to `len`, asking
+    /// each block whether it claims that offset. Returns
+    /// `claims_by_offset[p]` = list of block indices that claim `p`. The
+    /// invariant under test: every entry has length exactly 1 — no
+    /// double-paint, no orphan offset.
+    fn cursor_claims_per_offset(src: &str) -> Vec<Vec<usize>> {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let starts: Vec<usize> = blocks.iter().map(|b| b.source_range.start).collect();
+        (0..=src.len())
+            .map(|offset| {
+                blocks
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, b)| {
+                        let next_start = starts.get(idx + 1).copied();
+                        block_claims_cursor(
+                            offset,
+                            b.source_range.start,
+                            b.source_range.end,
+                            next_start,
+                        )
+                    })
+                    .map(|(idx, _)| idx)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_offset_is_claimed_by_more_than_one_block() {
+        // The no-double-cursor invariant. Forbidden offsets may go
+        // unclaimed (zero blocks) — fine, the snap rule keeps the
+        // cursor away from them. Allowed offsets must be claimed by
+        // exactly one block. The bug we're regressing against had two
+        // blocks claiming the same boundary offset (e.g., end of
+        // "paragraph" AND start of trailing empty), painting two
+        // carets at the same offset.
+        for src in [
+            "p1\n\np2",
+            "p1\n\n\n\np2",
+            "p1\n\n\n\n\n\np2",
+            "paragraph",
+            "paragraph\n\n",
+            "paragraph\n\n\n\n",
+            "paragraph\n\n\n\n\n\n",
+            "\n\np1",
+            "\n\n\n\np1",
+            "# title\n\nbody",
+            "# title\n\n\n\n\n\nbody",
+        ] {
+            let bytes = src.as_bytes();
+            for (offset, claims) in cursor_claims_per_offset(src).into_iter().enumerate() {
+                assert!(
+                    claims.len() <= 1,
+                    "offset {offset} in {src:?} claimed by multiple blocks {claims:?}"
+                );
+                if !crate::update::is_forbidden_position_for_test(bytes, offset) {
+                    assert_eq!(
+                        claims.len(),
+                        1,
+                        "allowed offset {offset} in {src:?} claimed by no block"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_empty_layout_keeps_paragraph_end_on_paragraph_row() {
+        // In `paragraph\n\n\n\n\n\n` (paragraph + 3 trailing empties),
+        // the trailing-pair formula offsets each empty by 1 inside the
+        // gap so its strict-interior position falls between two pairs
+        // — that's where the cursor naturally rests when it's on an
+        // empty row, and typing there creates a new paragraph for the
+        // row instead of extending the previous content paragraph.
+        //
+        // Layout: paragraph (0..9), empty 1 (10..12), empty 2 (12..14),
+        // empty 3 (14..15) — last empty clamped to doc end. The
+        // resting positions are 11, 13, 15 (boundaries between pairs
+        // and end-of-doc); position 9 stays on paragraph.
+        let claims = cursor_claims_per_offset("paragraph\n\n\n\n\n\n");
+        assert_eq!(claims[9], vec![0]); // end of paragraph
+        assert_eq!(claims[11], vec![1]); // empty 1 strict interior
+        assert_eq!(claims[13], vec![2]); // empty 2 strict interior
+        assert_eq!(claims[15], vec![3]); // empty 3 (end-of-doc, last block)
+    }
+
+    #[test]
+    fn leading_empty_boundary_claimed_by_paragraph_not_empty() {
+        // Symmetric: in `\n\np1`, byte 2 is end of leading empty AND
+        // start of "p1". p1 strictly contains it; empty yields.
+        let claims = cursor_claims_per_offset("\n\np1");
+        // Block 0: empty (0..2). Block 1: p1 (2..4).
+        assert_eq!(claims[0], vec![0]);
+        assert_eq!(claims[2], vec![1]);
+    }
+
+    #[test]
+    fn end_of_doc_still_renders_on_last_block() {
+        // No next block to claim end-of-doc; the last block must keep
+        // its end-clause claim.
+        let claims = cursor_claims_per_offset("paragraph");
+        assert_eq!(claims.last().unwrap(), &vec![0]);
+    }
+
+    #[test]
+    fn empty_doc_offset_zero_claimed_by_anchor_block() {
+        let claims = cursor_claims_per_offset("");
+        assert_eq!(claims, vec![vec![0]]);
     }
 }
