@@ -252,6 +252,20 @@ impl MarkdownEditor {
         {
             return 0;
         }
+
+        // First pass: direct hit. If `position.y` falls in any line's
+        // vertical extent, hit-test inside that line.
+        //
+        // Second pass: nearest line. Lines don't tile vertically — there's
+        // a `paragraph_gap` between blocks — so a mouse drag whose y
+        // momentarily falls in the gap would otherwise hit no line at
+        // all. The previous fallback returned `markdown.len()`, making
+        // the selection head shoot to end-of-doc every time the mouse
+        // crossed a gap. Snap to the closest line by vertical distance,
+        // then clamp the local y to that line's bounds so the x
+        // coordinate still picks the right column.
+        let mut best: Option<&crate::element::LaidOutLine> = None;
+        let mut best_distance: Pixels = px(f32::INFINITY);
         for key in &keys {
             let block = &self.last_blocks[*key];
             for line in &block.lines {
@@ -261,8 +275,32 @@ impl MarkdownEditor {
                     let local = Point::new(position.x - line.origin.x, position.y - line.origin.y);
                     return line.source_offset_for_local_point(local);
                 }
+                let distance = if position.y < line_top {
+                    line_top - position.y
+                } else {
+                    position.y - line_bottom
+                };
+                if distance < best_distance {
+                    best_distance = distance;
+                    best = Some(line);
+                }
             }
         }
+
+        if let Some(line) = best {
+            let line_top = line.origin.y;
+            let line_bottom = line_top + line.wrapped_height;
+            let clamped_y = if position.y < line_top {
+                px(0.0)
+            } else if position.y >= line_bottom {
+                line.wrapped_height - px(1.0)
+            } else {
+                position.y - line_top
+            };
+            let local = Point::new(position.x - line.origin.x, clamped_y);
+            return line.source_offset_for_local_point(local);
+        }
+
         self.state.markdown.len()
     }
 
