@@ -180,6 +180,52 @@ fn select_all_spans_document(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn empty_document_still_has_a_renderable_block(cx: &mut TestAppContext) {
+    // Regression: deleting all content used to leave the spec with zero
+    // blocks, so no `BlockElement::paint` ran and the editor stopped
+    // accepting input. The spec must always have at least one block to
+    // anchor the cursor and register the input handler.
+    let (_, editor) = open_editor(cx, EditorState::with_markdown(""));
+    let spec = current_spec(cx, &editor);
+    assert!(
+        !spec.blocks.is_empty(),
+        "empty doc must still render a block"
+    );
+}
+
+#[gpui::test]
+fn select_all_then_backspace_keeps_editor_usable(cx: &mut TestAppContext) {
+    // The exact reproduction of the user-reported bug: clear all content
+    // via select-all + backspace, then verify the editor's spec still has
+    // a block and the cursor offset is sane. (We can't directly test
+    // typed-text routing in `TestAppContext` — that goes through
+    // `EntityInputHandler` which needs a real window — but a non-empty
+    // spec is the load-bearing precondition: it's what makes `paint` run
+    // and register the input handler.)
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown("Hello, world!"));
+    dispatch(cx, handle, &editor, SelectAll);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "");
+        assert_eq!(e.cursor_offset(), 0);
+    });
+    let spec = current_spec(cx, &editor);
+    assert!(!spec.blocks.is_empty());
+
+    // Pressing Enter from this empty state still goes through the action
+    // pipeline (which doesn't depend on rendering having happened) and
+    // produces a one-`\n` source. Confirm the post-pass / render leaves
+    // us with multiple visible blocks (typewriter intuition: cursor on
+    // line 2, line 1 empty above).
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "\n");
+    });
+    let spec = current_spec(cx, &editor);
+    assert!(spec.blocks.len() >= 2);
+}
+
 // ---------------------------------------------------------------------------
 // Render spec — the cursor-aware delimiter rule, observed end-to-end
 // ---------------------------------------------------------------------------

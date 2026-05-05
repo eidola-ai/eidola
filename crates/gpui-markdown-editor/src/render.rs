@@ -250,17 +250,38 @@ fn apply_delimiter_visibility(
 fn inject_empty_paragraphs(source: &str, real_blocks: Vec<RenderBlock>) -> Vec<RenderBlock> {
     let bytes = source.as_bytes();
 
-    // Special case: no real blocks at all. Treat the whole document as a
-    // free zone; the first `\n` is the implicit "first-line terminator"
-    // and the rest are empties (matches the leading formula `L - 1`).
+    // Special case: no real blocks at all. The content-bearing formulas
+    // assume there's at least one parsed block to anchor empties around;
+    // here there isn't. Two things go wrong if we just return an empty
+    // `Vec`:
+    //
+    //   1. No `BlockElement::paint` runs for this frame, so no
+    //      `window.handle_input` registers the `EntityInputHandler` and
+    //      typed text has nowhere to route.
+    //   2. There's no shaped line to paint a cursor against, so the user
+    //      can't see where they are and can't click to place the cursor.
+    //
+    // Emit one synthetic block per *line* in the source (lines bounded
+    // by `\n`, plus one trailing line after the last `\n`) so every
+    // byte position from 0 to `len` has a block to anchor against and
+    // the cursor follows typewriter intuition: pressing Enter `N` times
+    // in an empty doc shows `N + 1` visible rows.
     if real_blocks.is_empty() {
-        let positions: Vec<usize> = (0..bytes.len()).filter(|&p| bytes[p] == b'\n').collect();
-        let empties = positions.len().saturating_sub(1);
-        return positions
-            .into_iter()
-            .take(empties)
-            .map(empty_paragraph_block)
-            .collect();
+        let mut out = Vec::with_capacity(bytes.len() + 1);
+        let mut line_start = 0;
+        for (p, &b) in bytes.iter().enumerate() {
+            if b == b'\n' {
+                out.push(RenderBlock::new(line_start..p + 1, BlockKind::Paragraph));
+                line_start = p + 1;
+            }
+        }
+        // Trailing line (after the last `\n`, or the only line if there
+        // were no `\n`s at all).
+        out.push(RenderBlock::new(
+            line_start..bytes.len(),
+            BlockKind::Paragraph,
+        ));
+        return out;
     }
 
     let mut out: Vec<RenderBlock> = Vec::with_capacity(real_blocks.len() * 2);
@@ -478,9 +499,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_document_yields_empty_spec() {
+    fn empty_document_yields_one_anchor_block() {
+        // Without at least one block, no `BlockElement::paint` runs, so
+        // the input handler never registers and the cursor never paints
+        // — that's the "deleted everything, can't type anymore" bug. The
+        // injector emits a single zero-byte anchor for "" so the editor
+        // is always usable.
         let spec = render_with_cursor("", 0);
-        assert!(spec.blocks.is_empty());
+        assert_eq!(spec.blocks.len(), 1);
+        assert_eq!(spec.blocks[0].source_range, 0..0);
+        assert!(matches!(spec.blocks[0].kind, BlockKind::Paragraph));
     }
 
     #[test]
@@ -614,16 +642,35 @@ mod tests {
     }
 
     #[test]
-    fn doc_of_only_newlines() {
-        // No real blocks. `\n\n\n` (3 newlines) → 2 empties via the
-        // leading-style formula (first newline is structural).
+    fn doc_of_only_newlines_emits_one_block_per_line() {
+        // For a content-empty doc we don't have a parsed block to anchor
+        // empties around, so the formula doesn't apply — emit one block
+        // per line so every byte position has a cursor anchor and the
+        // visual count matches typewriter intuition.
+        //
+        // `\n\n\n` has 3 `\n`s = 4 lines. Three of those lines are bounded
+        // by a `\n` (ranges 0..1, 1..2, 2..3); the fourth is the trailing
+        // line after the last `\n` (range 3..3, zero bytes).
         let spec = render_with_cursor("\n\n\n", 0);
-        assert_eq!(count_empty_blocks(&spec), 2);
+        assert_eq!(spec.blocks.len(), 4);
+        let ranges: Vec<_> = spec.blocks.iter().map(|b| b.source_range.clone()).collect();
+        assert_eq!(ranges, vec![0..1, 1..2, 2..3, 3..3]);
         assert!(
             spec.blocks
                 .iter()
                 .all(|b| matches!(b.kind, BlockKind::Paragraph))
         );
+    }
+
+    #[test]
+    fn single_newline_emits_two_blocks() {
+        // Source `\n` is "Enter once in an empty doc" — typewriter
+        // intuition says the user is now on line 2 with line 1 empty
+        // above. Both byte positions (0 and 1) need cursor anchors.
+        let spec = render_with_cursor("\n", 1);
+        assert_eq!(spec.blocks.len(), 2);
+        assert_eq!(spec.blocks[0].source_range, 0..1);
+        assert_eq!(spec.blocks[1].source_range, 1..1);
     }
 
     #[test]
