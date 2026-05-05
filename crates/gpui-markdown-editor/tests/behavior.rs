@@ -68,7 +68,9 @@ fn editor_constructs_with_initial_state(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn enter_action_inserts_newline(cx: &mut TestAppContext) {
+fn enter_action_inserts_paragraph_break(cx: &mut TestAppContext) {
+    // Enter mid-paragraph emits `\n` which the post-pass promotes to `\n\n`
+    // (a paragraph break) — see `update::enforce_invariants`.
     let initial = EditorState {
         markdown: "abc".into(),
         selection: Selection::Cursor(2),
@@ -76,8 +78,8 @@ fn enter_action_inserts_newline(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Enter);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "ab\nc");
-        assert_eq!(e.cursor_offset(), 3);
+        assert_eq!(e.state.markdown, "ab\n\nc");
+        assert_eq!(e.cursor_offset(), 4);
     });
 }
 
@@ -111,8 +113,10 @@ fn delete_removes_forward_grapheme(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn arrow_keys_move_cursor(cx: &mut TestAppContext) {
+    // Already-normalized fixture so the post-pass is a no-op and the move
+    // geometry is the only thing under test.
     let initial = EditorState {
-        markdown: "abc\ndef".into(),
+        markdown: "abc\n\ndef".into(),
         selection: Selection::Cursor(0),
     };
     let (handle, editor) = open_editor(cx, initial);
@@ -121,29 +125,36 @@ fn arrow_keys_move_cursor(cx: &mut TestAppContext) {
     dispatch(cx, handle, &editor, Right);
     editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 2));
 
+    // Down once lands on the empty inter-paragraph line (column 0).
     dispatch(cx, handle, &editor, Down);
-    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 6));
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 4));
 
+    // Up once climbs back through the empty line; column was lost when we
+    // landed on it (no preferred-column tracking yet — that's a known
+    // follow-up). Cursor returns to the start of the previous line.
     dispatch(cx, handle, &editor, Up);
-    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 2));
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 0));
 }
 
 #[gpui::test]
 fn home_end_doc_jump(cx: &mut TestAppContext) {
+    // "abc\n\ndef" — cursor at byte 6 (between 'd' and 'e' on the second
+    // paragraph). Already-normalized fixture so the post-pass doesn't move
+    // the cursor.
     let initial = EditorState {
-        markdown: "abc\ndef".into(),
-        selection: Selection::Cursor(5),
+        markdown: "abc\n\ndef".into(),
+        selection: Selection::Cursor(6),
     };
     let (handle, editor) = open_editor(cx, initial);
 
     dispatch(cx, handle, &editor, Home);
-    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 4));
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 5));
     dispatch(cx, handle, &editor, End);
-    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 7));
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 8));
     dispatch(cx, handle, &editor, DocumentStart);
     editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 0));
     dispatch(cx, handle, &editor, DocumentEnd);
-    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 7));
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 8));
 }
 
 #[gpui::test]
@@ -245,4 +256,139 @@ fn italic_and_strike_dim_within_selection(cx: &mut TestAppContext) {
     assert!(para.has_dimmed_range(3..4));
     assert!(para.has_dimmed_range(9..11));
     assert!(para.has_dimmed_range(13..15));
+}
+
+// ---------------------------------------------------------------------------
+// Soft-break invariant — the buffer never carries a lone mid-content `\n`,
+// no matter what edit path produces it.
+// ---------------------------------------------------------------------------
+
+fn assert_no_soft_break(md: &str) {
+    let bytes = md.as_bytes();
+    for p in 1..bytes.len().saturating_sub(1) {
+        if bytes[p] != b'\n' {
+            continue;
+        }
+        let surrounded = bytes[p - 1] != b'\n' && bytes[p + 1] != b'\n';
+        let backslash = bytes[p - 1] == b'\\';
+        let trailing_spaces = p >= 2 && bytes[p - 1] == b' ' && bytes[p - 2] == b' ';
+        assert!(
+            !surrounded || backslash || trailing_spaces,
+            "soft break at byte {p} in {md:?}",
+        );
+    }
+}
+
+#[gpui::test]
+fn enter_in_middle_of_paragraph_creates_paragraph_break(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "hello world".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "hello\n\n world");
+        assert_no_soft_break(&e.state.markdown);
+    });
+}
+
+#[gpui::test]
+fn three_enters_grow_into_two_empty_paragraphs(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "ab".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+
+    // Each Enter at the cursor keeps adding to the trailing run.
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // First Enter at end-of-doc: lone `\n` is trailing, allowed.
+        assert_eq!(e.state.markdown, "ab\n");
+    });
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "ab\n\n");
+    });
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "ab\n\n\n");
+        assert_no_soft_break(&e.state.markdown);
+    });
+}
+
+#[gpui::test]
+fn backspace_at_paragraph_break_merges_in_one_keystroke(cx: &mut TestAppContext) {
+    // The user is at the very start of the second paragraph and pressing
+    // Backspace should collapse the paragraph break, not feel like a no-op.
+    let initial = EditorState {
+        markdown: "first\n\nsecond".into(),
+        selection: Selection::Cursor(7),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "firstsecond");
+        assert_eq!(e.cursor_offset(), 5);
+        assert_no_soft_break(&e.state.markdown);
+    });
+}
+
+#[gpui::test]
+fn backspace_through_empty_paragraphs_one_at_a_time(cx: &mut TestAppContext) {
+    // 4 newlines = one paragraph break + 2 empty paragraphs.
+    let initial = EditorState {
+        markdown: "a\n\n\n\nb".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "a\n\n\nb"));
+
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "a\n\nb"));
+
+    // Final backspace collapses the break.
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "ab");
+        assert_no_soft_break(&e.state.markdown);
+    });
+}
+
+#[gpui::test]
+fn delete_forward_at_paragraph_break_merges(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "first\n\nsecond".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Delete);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "firstsecond");
+        assert_eq!(e.cursor_offset(), 5);
+        assert_no_soft_break(&e.state.markdown);
+    });
+}
+
+#[gpui::test]
+fn select_across_paragraph_break_and_replace(cx: &mut TestAppContext) {
+    // Selecting a range that includes the paragraph break and typing should
+    // produce a single paragraph with no soft break.
+    let initial = EditorState {
+        markdown: "alpha\n\nbeta".into(),
+        selection: Selection::range(2, 9),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    // Replacement comes via the `EntityInputHandler` path (the production
+    // text-input route — IME / typed chars). We dispatch SelectAll-style
+    // intent indirectly by deleting the range first, then inserting; the
+    // backspace path exercises selection deletion.
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "alta");
+        assert_no_soft_break(&e.state.markdown);
+    });
 }

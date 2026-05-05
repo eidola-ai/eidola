@@ -1,15 +1,27 @@
-//! Standalone demo window for `gpui-markdown-editor`. Useful for blind
-//! agent iteration and for eyeballing changes during development.
+//! Standalone demo window for `gpui-markdown-editor`. Three-pane layout:
+//!
+//! - **Editor** (left, flex-grow) — the WYSIWYG editor.
+//! - **Source** (middle, fixed width) — the live raw markdown buffer,
+//!   selectable so you can copy and inspect whitespace/escape characters.
+//! - **AST** (right, fixed width) — `format!("{:#?}", parse(&md))` of the
+//!   currently-parsed syntax tree, refreshed on every edit.
+//!
+//! The two debug panes track the editor live: a `cx.observe` on the editor
+//! entity re-renders the parent on every state change.
 //!
 //! Run with `cargo run -p gpui-markdown-editor --bin demo`.
 
-use gpui::{App, AppContext, Bounds, Focusable, KeyBinding, WindowBounds, WindowOptions, px, size};
-use gpui_component::{Root, Theme};
+use gpui::{
+    App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement, KeyBinding,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, WindowBounds,
+    WindowOptions, div, prelude::FluentBuilder, px, rems, size,
+};
+use gpui_component::{Root, Theme, h_flex, text::TextView, v_flex};
 use gpui_component_assets::Assets;
 use gpui_markdown_editor::{
     Backspace, Copy, Cut, Delete, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left,
     MarkdownEditor, Paste, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown,
-    ShiftEnd, ShiftEnter, ShiftHome, ShiftLeft, ShiftRight, ShiftUp, Up,
+    ShiftEnd, ShiftEnter, ShiftHome, ShiftLeft, ShiftRight, ShiftUp, Up, parse,
 };
 
 const DEMO_DOCUMENT: &str = "\
@@ -66,17 +78,143 @@ fn bind_keys(cx: &mut App) {
     ]);
 }
 
+/// Top-level demo view. Owns the editor entity and observes it so the
+/// debug panes track edits.
+struct DemoApp {
+    editor: Entity<MarkdownEditor>,
+}
+
+impl DemoApp {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let editor = cx.new(|cx| MarkdownEditor::new(DEMO_DOCUMENT, window, cx));
+        // Re-render this view whenever the editor's state changes — that's
+        // how the source / AST panes track edits live.
+        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+        Self { editor }
+    }
+}
+
+impl Render for DemoApp {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::global(cx);
+        let editor = self.editor.read(cx);
+        let md = editor.state.markdown.clone();
+        let cursor_label = match editor.state.selection {
+            gpui_markdown_editor::Selection::Cursor(p) => format!("cursor: {p}"),
+            gpui_markdown_editor::Selection::Range { anchor, head } => {
+                format!("selection: anchor={anchor} head={head}")
+            }
+        };
+        let ast = format!("{:#?}", parse(&md));
+        let bg = theme.background;
+        let fg = theme.foreground;
+        let muted = theme.muted_foreground;
+        let border = theme.border;
+
+        h_flex()
+            .size_full()
+            .bg(bg)
+            .text_color(fg)
+            // Editor pane.
+            .child(
+                div()
+                    .id("editor-pane")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .child(self.editor.clone()),
+            )
+            .child(div().w(px(1.)).h_full().bg(border))
+            // Source pane.
+            .child(debug_pane("source", Some(cursor_label), &md, muted, border))
+            .child(div().w(px(1.)).h_full().bg(border))
+            // AST pane.
+            .child(debug_pane("ast", None, &ast, muted, border))
+    }
+}
+
+/// Side pane showing `content` as a fenced code block (so the literal
+/// text — including whitespace — is visible in monospace and selectable
+/// for copy / paste).
+fn debug_pane(
+    label: &'static str,
+    subtitle: Option<String>,
+    content: &str,
+    muted: gpui::Hsla,
+    border: gpui::Hsla,
+) -> impl IntoElement {
+    let id_label = SharedString::from(format!("pane-{label}"));
+    let body = SharedString::from(wrap_in_fenced_code_block(content));
+    let view_id = SharedString::from(format!("pane-md-{label}"));
+
+    v_flex()
+        .w(px(360.))
+        .h_full()
+        .child(
+            v_flex()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(border)
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(SharedString::from(label.to_uppercase())),
+                )
+                .when_some(subtitle, |this, sub| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(SharedString::from(sub)),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .id(id_label)
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px_3()
+                .pb_3()
+                .text_size(rems(0.85))
+                .child(TextView::markdown(view_id, body).selectable(true)),
+        )
+}
+
+/// Wrap `content` in a fenced code block. Picks a fence longer than any
+/// run of backticks the content already contains so it round-trips
+/// safely even if `content` has its own fenced blocks.
+fn wrap_in_fenced_code_block(content: &str) -> String {
+    let mut max = 0u32;
+    let mut cur = 0u32;
+    for c in content.chars() {
+        if c == '`' {
+            cur += 1;
+            max = max.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    let fence: String = "`".repeat((max + 1).max(3) as usize);
+    let trail = if content.ends_with('\n') { "" } else { "\n" };
+    format!("{fence}\n{content}{trail}{fence}")
+}
+
 fn main() {
     gpui_platform::application()
         .with_assets(Assets)
         .run(|cx: &mut App| {
             gpui_component::init(cx);
-            // Use whichever theme matches the OS appearance.
             Theme::sync_system_appearance(None, cx);
 
             bind_keys(cx);
 
-            let bounds = Bounds::centered(None, size(px(900.0), px(720.0)), cx);
+            let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
             let window = cx
                 .open_window(
                     WindowOptions {
@@ -84,16 +222,18 @@ fn main() {
                         ..Default::default()
                     },
                     |window, cx| {
-                        let editor = cx.new(|cx| MarkdownEditor::new(DEMO_DOCUMENT, window, cx));
-                        cx.new(|cx| Root::new(editor, window, cx))
+                        let demo = cx.new(|cx| DemoApp::new(window, cx));
+                        cx.new(|cx| Root::new(demo, window, cx))
                     },
                 )
                 .expect("open window");
 
             window
                 .update(cx, |root, window, cx| {
-                    if let Ok(view) = root.view().clone().downcast::<MarkdownEditor>() {
-                        window.focus(&view.focus_handle(cx), cx);
+                    if let Ok(demo) = root.view().clone().downcast::<DemoApp>() {
+                        let editor = demo.read(cx).editor.clone();
+                        let focus = editor.read(cx).focus_handle.clone();
+                        window.focus(&focus, cx);
                     }
                     cx.activate(true);
                 })

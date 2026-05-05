@@ -9,6 +9,36 @@
 //!
 //! Every construct with explicit delimiters routes through
 //! `apply_delimiter_visibility`.
+//!
+//! # Empty-paragraph injection
+//!
+//! pulldown-cmark collapses any number of blank lines between blocks into
+//! a single paragraph break, so a source like `"a\n\n\n\nb"` parses to
+//! exactly two paragraphs with no record of the extra newlines. Our
+//! editor's invariant (see `update::enforce_invariants`) keeps every
+//! user-typed `\n` in the buffer, but if the renderer just walked the
+//! parser's output the extras would be invisible — pressing Enter many
+//! times would change source but not visuals.
+//!
+//! After collecting the parser's blocks, `inject_empty_paragraphs` walks
+//! every free-zone of newlines (leading, between blocks, trailing) and
+//! emits one synthetic empty `Paragraph` block per "extra" newline so the
+//! cursor has visible empty rows to land on.
+//!
+//! Formulas — derived from "first `\n` in each kind of free zone is
+//! structural / a separator, the rest are empties":
+//!
+//! - Leading run of `L` newlines: `max(0, L - 1)` empty paragraphs.
+//! - Inter-block run of `M` newlines (counted between *content*
+//!   boundaries, not parser ranges, so the trailing `\n` pulldown-cmark
+//!   sometimes folds into a paragraph's range doesn't cause off-by-one):
+//!   `max(0, M - 2)` empties (one for the prev's terminator, one for the
+//!   next's separator).
+//! - Trailing run of `T` newlines: `max(0, T - 1)` empties.
+//!
+//! Each synthetic block's `source_range` is exactly one `\n` byte, so a
+//! cursor at that offset hit-tests into it and a click in the empty row
+//! lands the cursor at a real source position.
 
 use std::ops::Range;
 
@@ -18,10 +48,11 @@ use crate::syntax::{NodeKind, SyntaxNode};
 
 pub fn render(state: &EditorState, tree: &[SyntaxNode]) -> RenderSpec {
     let cursor = CursorRange::from(&state.selection);
-    let mut blocks = Vec::new();
+    let mut real_blocks = Vec::new();
     for node in tree {
-        render_node(node, cursor, &mut blocks);
+        render_node(node, cursor, &mut real_blocks);
     }
+    let blocks = inject_empty_paragraphs(&state.markdown, real_blocks);
     RenderSpec { blocks }
 }
 
@@ -212,6 +243,96 @@ fn apply_delimiter_visibility(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Empty-paragraph injection (see module docs for the formulas).
+// ---------------------------------------------------------------------------
+
+fn inject_empty_paragraphs(source: &str, real_blocks: Vec<RenderBlock>) -> Vec<RenderBlock> {
+    let bytes = source.as_bytes();
+
+    // Special case: no real blocks at all. Treat the whole document as a
+    // free zone; the first `\n` is the implicit "first-line terminator"
+    // and the rest are empties (matches the leading formula `L - 1`).
+    if real_blocks.is_empty() {
+        let positions: Vec<usize> = (0..bytes.len()).filter(|&p| bytes[p] == b'\n').collect();
+        let empties = positions.len().saturating_sub(1);
+        return positions
+            .into_iter()
+            .take(empties)
+            .map(empty_paragraph_block)
+            .collect();
+    }
+
+    let mut out: Vec<RenderBlock> = Vec::with_capacity(real_blocks.len() * 2);
+
+    // Leading gap.
+    let first_content = block_content_start(bytes, &real_blocks[0].source_range);
+    let leading: Vec<usize> = (0..first_content).filter(|&p| bytes[p] == b'\n').collect();
+    let leading_empties = leading.len().saturating_sub(1);
+    for &p in leading.iter().take(leading_empties) {
+        out.push(empty_paragraph_block(p));
+    }
+
+    // Real blocks, with inter-block empties before each.
+    for (i, block) in real_blocks.iter().enumerate() {
+        if i > 0 {
+            let prev_end = block_content_end_excl(bytes, &real_blocks[i - 1].source_range);
+            let next_start = block_content_start(bytes, &block.source_range);
+            let positions: Vec<usize> = (prev_end..next_start)
+                .filter(|&p| bytes[p] == b'\n')
+                .collect();
+            let empties = positions.len().saturating_sub(2);
+            // Skip 1 (prev's terminator). Take `empties`. The remaining
+            // trailing position is the next's separator.
+            for &p in positions.iter().skip(1).take(empties) {
+                out.push(empty_paragraph_block(p));
+            }
+        }
+        out.push(block.clone());
+    }
+
+    // Trailing gap.
+    let last = real_blocks.last().expect("checked non-empty above");
+    let last_end = block_content_end_excl(bytes, &last.source_range);
+    let trailing: Vec<usize> = (last_end..bytes.len())
+        .filter(|&p| bytes[p] == b'\n')
+        .collect();
+    let trailing_empties = trailing.len().saturating_sub(1);
+    // Skip 1 (last's terminator). Take `trailing_empties`.
+    for &p in trailing.iter().skip(1).take(trailing_empties) {
+        out.push(empty_paragraph_block(p));
+    }
+
+    out
+}
+
+/// Position of the first non-`\n` byte in `range`. (Falls back to the end
+/// if the range is all newlines, but in practice block ranges from
+/// pulldown-cmark always contain at least one content character.)
+fn block_content_start(bytes: &[u8], range: &Range<usize>) -> usize {
+    let mut p = range.start;
+    while p < range.end && bytes[p] == b'\n' {
+        p += 1;
+    }
+    p
+}
+
+/// One past the last non-`\n` byte in `range`. pulldown-cmark sometimes
+/// folds a single trailing `\n` into a paragraph's range; trimming here
+/// makes the inter-block-gap arithmetic count newlines uniformly between
+/// *content* boundaries.
+fn block_content_end_excl(bytes: &[u8], range: &Range<usize>) -> usize {
+    let mut p = range.end;
+    while p > range.start && bytes[p - 1] == b'\n' {
+        p -= 1;
+    }
+    p
+}
+
+fn empty_paragraph_block(newline_position: usize) -> RenderBlock {
+    RenderBlock::new(newline_position..newline_position + 1, BlockKind::Paragraph)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +489,156 @@ mod tests {
         let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
         assert!(block.inlines.is_empty());
         assert!(block.hidden_ranges.is_empty());
+    }
+
+    // ---- Empty-paragraph injection ----------------------------------------
+
+    /// Counts how many top-level blocks are "empty" — `Paragraph` kind
+    /// with neither inline runs nor hidden ranges. The synthetic blocks
+    /// emitted by `inject_empty_paragraphs` are the only blocks in our
+    /// minimal grammar that satisfy that.
+    fn count_empty_blocks(spec: &RenderSpec) -> usize {
+        spec.blocks
+            .iter()
+            .filter(|b| {
+                matches!(b.kind, BlockKind::Paragraph)
+                    && b.inlines.is_empty()
+                    && b.hidden_ranges.is_empty()
+                    && b.source_range.end - b.source_range.start == 1
+            })
+            .count()
+    }
+
+    #[test]
+    fn paragraph_break_alone_produces_no_empty_blocks() {
+        // `\n\n` between two paragraphs is just the structural separator.
+        let spec = render_with_cursor("p1\n\np2", 0);
+        assert_eq!(count_empty_blocks(&spec), 0);
+        assert_eq!(spec.blocks.len(), 2);
+    }
+
+    #[test]
+    fn extra_inter_block_newline_emits_one_empty_paragraph() {
+        // 3 newlines between content = paragraph break + 1 empty paragraph.
+        let spec = render_with_cursor("p1\n\n\np2", 0);
+        assert_eq!(count_empty_blocks(&spec), 1);
+        assert_eq!(spec.blocks.len(), 3);
+    }
+
+    #[test]
+    fn user_example_four_newlines_emits_two_empty_paragraphs() {
+        // The user's reported case: `paragraph 1\n\n\n\nparagraph 2` (4
+        // newlines between content) should render as p1 + two visible
+        // empty rows + p2.
+        let spec = render_with_cursor("paragraph 1\n\n\n\nparagraph 2", 0);
+        assert_eq!(count_empty_blocks(&spec), 2);
+        assert_eq!(spec.blocks.len(), 4);
+    }
+
+    fn synthetic_empties(spec: &RenderSpec, src: &str) -> Vec<RenderBlock> {
+        spec.blocks
+            .iter()
+            .filter(|b| {
+                matches!(b.kind, BlockKind::Paragraph)
+                    && b.source_range.end - b.source_range.start == 1
+                    && src.as_bytes()[b.source_range.start] == b'\n'
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn empty_block_source_ranges_are_each_one_newline_in_the_gap() {
+        let src = "p1\n\n\n\np2";
+        let spec = render_with_cursor(src, 0);
+        let empties = synthetic_empties(&spec, src);
+        assert_eq!(empties.len(), 2);
+        // Block ranges should be inside the inter-block newline run and
+        // each cover exactly one `\n`.
+        for b in &empties {
+            let r = &b.source_range;
+            assert_eq!(r.end - r.start, 1, "empty block range {:?}", r);
+            assert_eq!(
+                src.as_bytes()[r.start],
+                b'\n',
+                "empty block at non-newline byte"
+            );
+        }
+        // ...and the byte positions are strictly increasing.
+        let positions: Vec<_> = empties.iter().map(|b| b.source_range.start).collect();
+        let mut sorted = positions.clone();
+        sorted.sort();
+        assert_eq!(positions, sorted);
+    }
+
+    #[test]
+    fn leading_newlines_emit_empty_paragraphs() {
+        // `\n\np1` → 1 leading empty paragraph above `p1`.
+        let spec = render_with_cursor("\n\np1", 0);
+        assert_eq!(count_empty_blocks(&spec), 1);
+        assert_eq!(spec.blocks.len(), 2);
+        // First block is the empty; second is the real paragraph.
+        assert!(spec.blocks[0].inlines.is_empty());
+    }
+
+    #[test]
+    fn single_leading_newline_no_empty() {
+        // `\np1` is just CommonMark trim — no extra space.
+        let spec = render_with_cursor("\np1", 0);
+        assert_eq!(count_empty_blocks(&spec), 0);
+    }
+
+    #[test]
+    fn trailing_newlines_emit_empty_paragraphs() {
+        // `p1\n\n` → 1 trailing empty paragraph below `p1`.
+        let spec = render_with_cursor("p1\n\n", 0);
+        assert_eq!(count_empty_blocks(&spec), 1);
+        // ...and `p1\n\n\n` adds another.
+        let spec = render_with_cursor("p1\n\n\n", 0);
+        assert_eq!(count_empty_blocks(&spec), 2);
+    }
+
+    #[test]
+    fn single_trailing_newline_no_empty() {
+        let spec = render_with_cursor("p1\n", 0);
+        assert_eq!(count_empty_blocks(&spec), 0);
+    }
+
+    #[test]
+    fn empties_around_a_heading() {
+        // Headings also trigger the formula.
+        let spec = render_with_cursor("# title\n\n\n\nbody", 0);
+        // 4 inter-content newlines → 2 empties between heading and body.
+        assert_eq!(count_empty_blocks(&spec), 2);
+        assert_eq!(spec.blocks.len(), 4);
+    }
+
+    #[test]
+    fn doc_of_only_newlines() {
+        // No real blocks. `\n\n\n` (3 newlines) → 2 empties via the
+        // leading-style formula (first newline is structural).
+        let spec = render_with_cursor("\n\n\n", 0);
+        assert_eq!(count_empty_blocks(&spec), 2);
+        assert!(
+            spec.blocks
+                .iter()
+                .all(|b| matches!(b.kind, BlockKind::Paragraph))
+        );
+    }
+
+    #[test]
+    fn cursor_inside_an_empty_paragraph_block_lands_on_its_range() {
+        // For `p1\n\n\np2`, the gap has 3 newlines at bytes 2, 3, 4. The
+        // formula is `M - 2 = 1` empty paragraph, placed at the middle
+        // `\n` (the one *after* the prev's terminator and *before* the
+        // next's separator).
+        let src = "p1\n\n\np2";
+        let spec = render_with_cursor(src, 0);
+        let empties = synthetic_empties(&spec, src);
+        assert_eq!(empties.len(), 1);
+        // The empty owns byte 3 (positions in the gap are [2, 3, 4];
+        // skip 1 — the prev's terminator at 2 — take 1 — the empty at 3;
+        // the remaining 4 is the next's separator).
+        assert_eq!(empties[0].source_range, 3..4);
     }
 }

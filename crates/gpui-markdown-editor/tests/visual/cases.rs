@@ -103,6 +103,32 @@ pub fn register(s: &mut Snapshots) {
             MarkdownEditor::with_state(state, window, cx)
         })
     });
+
+    // Empty paragraph injection: 4 newlines between content should
+    // render as paragraph break + 2 visible empty rows. Mirrors the
+    // user-reported case.
+    s.add("empty_paragraphs_between_blocks", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "paragraph 1\n\n\n\nparagraph 2".into(),
+                selection: Selection::Cursor(0),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Same source, cursor on one of the empty rows — confirms the cursor
+    // has somewhere visible to land.
+    s.add("empty_paragraphs_cursor_in_empty_row", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "paragraph 1\n\n\n\nparagraph 2".into(),
+                // Byte 13 is the middle empty paragraph in this source.
+                selection: Selection::Cursor(13),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
 }
 
 /// Build an editor whose cursor is placed inside `needle` (3 chars in, by
