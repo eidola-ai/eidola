@@ -209,10 +209,10 @@ fn shift_enter_at_end_of_paragraph_keeps_cursor_in_same_paragraph(cx: &mut TestA
 
 #[gpui::test]
 fn enter_at_end_of_paragraph_creates_visible_trailing_empty(cx: &mut TestAppContext) {
-    // User-reported regression: pressing Enter at the end of the only
-    // paragraph used to produce no visible change. The source did pick
-    // up a trailing `\n` but pulldown-cmark folded it into the
-    // paragraph's range and the renderer never emitted a trailing empty.
+    // User-reported regression (now fixed by the pairs model): pressing
+    // Enter at the end of the only paragraph used to produce no visible
+    // change. With Enter inserting `\n\n`, the source has 2 trailing
+    // `\n`s and the renderer emits 1 trailing empty paragraph block.
     let initial = EditorState {
         markdown: "paragraph 1".into(),
         selection: Selection::Cursor(11),
@@ -221,23 +221,19 @@ fn enter_at_end_of_paragraph_creates_visible_trailing_empty(cx: &mut TestAppCont
     dispatch(cx, handle, &editor, Enter);
 
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "paragraph 1\n");
-        assert_eq!(e.cursor_offset(), 12);
+        assert_eq!(e.state.markdown, "paragraph 1\n\n");
+        assert_eq!(e.cursor_offset(), 13);
     });
 
-    // Spec must contain the original paragraph *and* a synthetic empty
-    // paragraph anchoring the cursor at byte 12.
+    // Spec: paragraph + 1 trailing empty (range covering the pair of
+    // trailing `\n`s).
     let spec = current_spec(cx, &editor);
-    assert!(
-        spec.blocks.len() >= 2,
-        "expected paragraph + trailing empty, got {} blocks",
-        spec.blocks.len()
-    );
+    assert!(spec.blocks.len() >= 2);
     let trailing_empty = spec
         .blocks
         .iter()
-        .find(|b| b.source_range == (11..12))
-        .expect("synthetic empty owning the trailing `\\n`");
+        .find(|b| b.source_range == (11..13))
+        .expect("synthetic empty paragraph owning the trailing `\\n\\n`");
     assert!(matches!(trailing_empty.kind, BlockKind::Paragraph));
     assert!(trailing_empty.inlines.is_empty());
 }
@@ -275,14 +271,12 @@ fn select_all_then_backspace_keeps_editor_usable(cx: &mut TestAppContext) {
     let spec = current_spec(cx, &editor);
     assert!(!spec.blocks.is_empty());
 
-    // Pressing Enter from this empty state still goes through the action
-    // pipeline (which doesn't depend on rendering having happened) and
-    // produces a one-`\n` source. Confirm the post-pass / render leaves
-    // us with multiple visible blocks (typewriter intuition: cursor on
-    // line 2, line 1 empty above).
+    // Pressing Enter from this empty state goes through the action
+    // pipeline and produces `\n\n` (pairs model). Confirm render emits
+    // multiple visible blocks.
     dispatch(cx, handle, &editor, Enter);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "\n");
+        assert_eq!(e.state.markdown, "\n\n");
     });
     let spec = current_spec(cx, &editor);
     assert!(spec.blocks.len() >= 2);
@@ -402,26 +396,23 @@ fn enter_in_middle_of_paragraph_creates_paragraph_break(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-fn three_enters_grow_into_two_empty_paragraphs(cx: &mut TestAppContext) {
+fn three_enters_grow_into_three_visible_empty_rows(cx: &mut TestAppContext) {
+    // Pairs model: each Enter inserts `\n\n`, so three Enters from the
+    // end of "ab" produces six trailing `\n`s (`T / 2 = 3` trailing
+    // empties).
     let initial = EditorState {
         markdown: "ab".into(),
         selection: Selection::Cursor(2),
     };
     let (handle, editor) = open_editor(cx, initial);
 
-    // Each Enter at the cursor keeps adding to the trailing run.
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "ab\n\n"));
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "ab\n\n\n\n"));
     dispatch(cx, handle, &editor, Enter);
     editor.read_with(cx, |e, _| {
-        // First Enter at end-of-doc: lone `\n` is trailing, allowed.
-        assert_eq!(e.state.markdown, "ab\n");
-    });
-    dispatch(cx, handle, &editor, Enter);
-    editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "ab\n\n");
-    });
-    dispatch(cx, handle, &editor, Enter);
-    editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "ab\n\n\n");
+        assert_eq!(e.state.markdown, "ab\n\n\n\n\n\n");
         assert_no_soft_break(&e.state.markdown);
     });
 }
@@ -444,8 +435,9 @@ fn backspace_at_paragraph_break_merges_in_one_keystroke(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-fn backspace_through_empty_paragraphs_one_at_a_time(cx: &mut TestAppContext) {
-    // 4 newlines = one paragraph break + 2 empty paragraphs.
+fn backspace_through_empty_paragraphs_one_pair_at_a_time(cx: &mut TestAppContext) {
+    // Pairs model: source `a\n\n\n\nb` is paragraph break + 1 empty (2
+    // pairs total). Each backspace removes one pair.
     let initial = EditorState {
         markdown: "a\n\n\n\nb".into(),
         selection: Selection::Cursor(5),
@@ -453,12 +445,8 @@ fn backspace_through_empty_paragraphs_one_at_a_time(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
 
     dispatch(cx, handle, &editor, Backspace);
-    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "a\n\n\nb"));
-
-    dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "a\n\nb"));
 
-    // Final backspace collapses the break.
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
         assert_eq!(e.state.markdown, "ab");

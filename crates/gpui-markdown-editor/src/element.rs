@@ -413,6 +413,28 @@ fn shape_block_lines(
     };
     let mut out = Vec::new();
     let mut cursor = block.source_range.start;
+
+    // Synthetic empty paragraphs from `inject_empty_paragraphs` cover a
+    // pair of `\n`s in the pairs model — the whole pair is one visible
+    // empty row, not one row per `\n`. Without this short-circuit
+    // `split_inclusive('\n')` yields one piece per `\n` and we paint two
+    // empty rows where one is intended (the `p1\n\n\n\np2` bug:
+    // 1 synthetic block, but 2 visible rows between the paragraphs).
+    //
+    // Hard breaks (`  \n`, `\\\n`) are content, not pure newlines, so
+    // they bypass this branch and fall through to the regular path
+    // where the post-loop hard-break post-pass handles them.
+    if !block_text.is_empty() && block_text.bytes().all(|b| b == b'\n') {
+        if let Some(line) = empty_shaped_line(font_size, window) {
+            out.push(ShapedLine {
+                line,
+                source_range: block.source_range.clone(),
+                display_to_source: vec![block.source_range.start],
+            });
+        }
+        return out;
+    }
+
     for raw_line in block_text.split_inclusive('\n') {
         let raw_end = cursor + raw_line.len();
         let trailing_nl = raw_line.ends_with('\n');
@@ -741,4 +763,141 @@ fn paint_selection_for_line(
         ),
         color,
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Whitespace shaping tests — companion to the block-count tests in
+// `render.rs`. Those check `inject_empty_paragraphs` produces the right
+// number of `RenderBlock`s; these check `shape_block_lines` produces the
+// right number of *visible* shaped lines per block. Both invariants must
+// hold for the rendered editor to match user intent — the bug that
+// motivated this module split was a `\n\n` synthetic block (1 block per
+// the renderer) shaping into 2 visible empty rows.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse;
+    use crate::render::render;
+    use crate::state::{EditorState, Selection};
+    use gpui::{AppContext, Context, Render, TestAppContext, WindowOptions};
+
+    struct EmptyRoot;
+    impl Render for EmptyRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::div()
+        }
+    }
+
+    /// Render `src` end-to-end, then shape each block through
+    /// `shape_block_lines` and return the visible-line count per block.
+    /// `wrap_w` is wide enough that no soft-wrap kicks in for the inputs
+    /// we test.
+    fn shape_visible_row_counts(cx: &mut TestAppContext, src: &str) -> Vec<usize> {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let src_owned = src.to_string();
+
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            blocks
+                .iter()
+                .map(|b| {
+                    let font_size = font_size_for_block(&b.kind, &style);
+                    shape_block_lines(&src_owned, b, &style, font_size, Some(px(720.0)), window)
+                        .len()
+                })
+                .collect()
+        })
+        .expect("update window")
+    }
+
+    #[gpui::test]
+    fn paragraph_break_alone_shapes_one_line_per_paragraph(cx: &mut TestAppContext) {
+        // `p1\n\np2` — two real paragraphs, no synthetic empties between.
+        // Each paragraph trims to its content (no trailing `\n`) so one
+        // visible row each.
+        let counts = shape_visible_row_counts(cx, "p1\n\np2");
+        assert_eq!(counts, vec![1, 1]);
+    }
+
+    #[gpui::test]
+    fn extra_inter_block_pair_shapes_one_visible_empty_row(cx: &mut TestAppContext) {
+        // `p1\n\n\n\np2` — 1 synthetic empty between (range 3..5,
+        // bytes "\n\n"). The pairs model says one visible empty row per
+        // synthetic, not two.
+        let counts = shape_visible_row_counts(cx, "p1\n\n\n\np2");
+        assert_eq!(counts, vec![1, 1, 1]);
+    }
+
+    #[gpui::test]
+    fn six_newlines_between_real_blocks_shape_two_visible_empty_rows(cx: &mut TestAppContext) {
+        // The user-readable form: paragraph 1, two visible empty rows,
+        // paragraph 2. In the pairs model that's 6 `\n`s = paragraph
+        // break + 2 empty pairs = 2 synthetic blocks shaping to 1 line
+        // each.
+        let counts = shape_visible_row_counts(cx, "paragraph 1\n\n\n\n\n\nparagraph 2");
+        assert_eq!(counts, vec![1, 1, 1, 1]);
+    }
+
+    #[gpui::test]
+    fn trailing_pair_shapes_one_visible_empty_row(cx: &mut TestAppContext) {
+        // Enter at end of a paragraph: one trailing pair, one visible
+        // trailing empty row.
+        let counts = shape_visible_row_counts(cx, "paragraph 1\n\n");
+        assert_eq!(counts, vec![1, 1]);
+    }
+
+    #[gpui::test]
+    fn three_trailing_pairs_shape_three_visible_empty_rows(cx: &mut TestAppContext) {
+        // Three Enters at the end → three trailing visible empty rows.
+        let counts = shape_visible_row_counts(cx, "ab\n\n\n\n\n\n");
+        assert_eq!(counts, vec![1, 1, 1, 1]);
+    }
+
+    #[gpui::test]
+    fn leading_pair_shapes_one_visible_empty_row_above(cx: &mut TestAppContext) {
+        let counts = shape_visible_row_counts(cx, "\n\np1");
+        assert_eq!(counts, vec![1, 1]);
+    }
+
+    #[gpui::test]
+    fn trailing_hard_break_shapes_two_lines_in_one_block(cx: &mut TestAppContext) {
+        // `paragraph 1  \n` is one paragraph with a trailing hard break:
+        // one block, two shaped lines (the content row + the empty
+        // trailing row inside the same paragraph). Crucially this
+        // bypasses the new all-newlines short-circuit because the block
+        // text contains spaces.
+        let counts = shape_visible_row_counts(cx, "paragraph 1  \n");
+        assert_eq!(counts, vec![2]);
+    }
+
+    #[gpui::test]
+    fn empty_doc_shapes_zero_lines_at_shape_layer(cx: &mut TestAppContext) {
+        // The single anchor block for "" has range 0..0 — block_text is
+        // "", split_inclusive yields nothing, no shaped lines. The
+        // visible empty row is fabricated by `prepaint`'s fallback, not
+        // by `shape_block_lines`. This test pins that contract: the
+        // shape layer doesn't pretend "" has a row.
+        let counts = shape_visible_row_counts(cx, "");
+        assert_eq!(counts, vec![0]);
+    }
+
+    #[gpui::test]
+    fn heading_with_inter_block_empties_shapes_one_per_synthetic(cx: &mut TestAppContext) {
+        // Headings use the same inter-block formula as paragraphs. Two
+        // synthetic empties between heading and body should shape to one
+        // line each.
+        let counts = shape_visible_row_counts(cx, "# title\n\n\n\n\n\nbody");
+        assert_eq!(counts, vec![1, 1, 1, 1]);
+    }
 }

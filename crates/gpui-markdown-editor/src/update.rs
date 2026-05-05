@@ -18,18 +18,31 @@
 //!    and `move_` both snap; promotion only inserts ASCII `\n` so it
 //!    can't break this.
 //!
+//! # Pairs model
+//!
+//! The buffer treats `\n\n` as the atomic structural unit. Each Enter
+//! inserts exactly `\n\n`; each empty paragraph is rendered from a pair
+//! of `\n`s; smart-delete removes pairs. With this discipline the source
+//! always carries an even count of `\n`s in any structural run, and the
+//! "typing on a trailing empty loses a row" asymmetry disappears for
+//! free: typing X at the end of `p1\n\n\n\n` (2 trailing empties)
+//! produces `p1\n\n\n\nX`, which the renderer reads as paragraph break +
+//! 1 empty + X — same row count as before typing.
+//!
+//! Hard breaks (`  \n`, `\\\n`) are exempt from the pairs discipline —
+//! they're a deliberate single `\n` in mid-paragraph.
+//!
 //! # Implication for editing actions
 //!
-//! Most actions don't have to know about #1 — they just produce whatever
-//! markdown they think makes sense, and the post-pass cleans up. The one
-//! exception is `delete_backward` / `delete_forward` at a paragraph
-//! break: deleting a single `\n` from a 2-newline run would leave a soft
-//! break that the post-pass would immediately re-promote, so backspace
-//! at a paragraph boundary would *appear* to do nothing. Those two
-//! handlers detect "I'm about to delete from a 2-newline mid-content run"
-//! and delete *both* newlines instead, collapsing the paragraph break in
-//! one keystroke. Longer runs (paragraph break + empty paragraphs) drop
-//! one newline at a time as the user expects.
+//! Most actions don't have to know about either invariant — they just
+//! produce whatever markdown they think makes sense, and the post-pass
+//! cleans up soft breaks. The only special case is `delete_backward` /
+//! `delete_forward`: a generic "delete one byte" at a paragraph break
+//! would leave a soft break that the post-pass would immediately
+//! re-promote, so the keypress would feel like a no-op. Both handlers
+//! detect "I'm in a `\n` run" and delete a *pair* (collapsing the break
+//! to merge paragraphs, or removing one empty paragraph from a longer
+//! run).
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -39,7 +52,7 @@ use crate::state::{EditorState, Selection};
 pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
     let next = match event {
         EditorEvent::InsertText(text) => insert_text(state, &text),
-        EditorEvent::InsertNewline => insert_text(state, "\n"),
+        EditorEvent::InsertNewline => insert_text(state, "\n\n"),
         EditorEvent::InsertLineBreak => insert_text(state, "  \n"),
 
         EditorEvent::DeleteBackward => delete_backward(state),
@@ -248,26 +261,24 @@ fn newline_run_around(bytes: &[u8], anchor: usize) -> (usize, usize) {
 }
 
 /// Given a contiguous newline run `[start, end)` that the cursor is
-/// touching, decide which slice of it to delete so the result still
-/// satisfies the no-soft-breaks invariant *and* the keystroke produces
-/// visible progress.
+/// touching, decide which slice to delete. Per the pairs model in the
+/// module-level docs, every "Enter unit" in the source is a pair of
+/// `\n`s, so each delete keystroke removes a pair from the run. For an
+/// exactly-2 run, that's the whole paragraph break, merging adjacent
+/// paragraphs. For runs of 4+, that removes one empty paragraph.
 ///
-/// The interesting case is `[\n, \n]` between two non-newline chars:
-/// deleting either newline alone leaves a single `\n` that the post-pass
-/// would promote right back to `\n\n`, so backspace would feel like a
-/// no-op. Detecting this lets us delete both newlines and merge the
-/// paragraphs in one keystroke. Longer runs (paragraph break + N empty
-/// paragraphs) drop one newline at a time the way the user expects;
-/// runs at the document edge can also drop one safely because a single
-/// leading or trailing `\n` is allowed by the invariant.
-fn paragraph_break_delete_extent(bytes: &[u8], run_start: usize, run_end: usize) -> (usize, usize) {
+/// The lone-`\n` case (run length 1) only arises from anomalous input
+/// (paste with a stray `\n`); we delete it and let `enforce_invariants`
+/// re-normalize anything that's left.
+fn paragraph_break_delete_extent(
+    _bytes: &[u8],
+    run_start: usize,
+    run_end: usize,
+) -> (usize, usize) {
     let len = run_end - run_start;
-    let mid_content = run_start > 0 && run_end < bytes.len();
-    if len == 2 && mid_content {
-        (run_start, run_end)
+    if len >= 2 {
+        (run_end - 2, run_end)
     } else {
-        // Drop one newline from the trailing edge of the run. The choice of
-        // edge is arbitrary for a homogeneous run.
         (run_end - 1, run_end)
     }
 }
@@ -718,20 +729,15 @@ mod invariant_tests {
     // ---- Insert / paste flows --------------------------------------------------
 
     #[test]
-    fn second_enter_at_paragraph_boundary_grows_to_empty_paragraph() {
-        // First Enter: "ab" cursor=2 → "ab\n\n" (still trailing).
-        // ...actually "ab" cursor=2, Enter inserts \n at end → "ab\n", which
-        // is trailing-edge so the post-pass leaves it. Push that case
-        // forward — start mid-content where the promotion is what we want
-        // to test.
+    fn second_enter_at_paragraph_boundary_adds_another_pair() {
+        // Pairs model: each Enter inserts `\n\n`. Two Enters mid-content
+        // gives 4 `\n`s between content = paragraph break + 1 empty.
         let s1 = update(st("abcd", 2), EditorEvent::InsertNewline);
         assert_eq!(s1.markdown, "ab\n\ncd");
         assert_eq!(s1.selection, Selection::Cursor(4));
 
-        // Second Enter at the same cursor (now mid-break): adds one `\n`,
-        // creating an empty paragraph between.
         let s2 = update(s1, EditorEvent::InsertNewline);
-        assert_eq!(s2.markdown, "ab\n\n\ncd");
+        assert_eq!(s2.markdown, "ab\n\n\n\ncd");
         assert_no_soft_breaks(&s2.markdown);
     }
 
@@ -773,6 +779,91 @@ mod invariant_tests {
         assert_no_soft_breaks(&s.markdown);
     }
 
+    // ---- Pairs model: Enter inserts `\n\n`, typing on trailing empty
+    //      preserves visible empty count without any prepend trick ----------
+
+    #[test]
+    fn enter_inserts_two_newlines_at_end_of_paragraph() {
+        let s = update(st("p1", 2), EditorEvent::InsertNewline);
+        assert_eq!(s.markdown, "p1\n\n");
+        assert_eq!(s.selection, Selection::Cursor(4));
+    }
+
+    #[test]
+    fn second_enter_at_end_of_paragraph_grows_to_two_pairs() {
+        let s = update(st("p1", 2), EditorEvent::InsertNewline);
+        let s = update(s, EditorEvent::InsertNewline);
+        // Two Enters from end: source is two `\n\n` units → 2 trailing
+        // empties when rendered (`T / 2 = 2`).
+        assert_eq!(s.markdown, "p1\n\n\n\n");
+        assert_eq!(s.selection, Selection::Cursor(6));
+    }
+
+    #[test]
+    fn typing_at_end_of_two_enter_run_preserves_visible_empty() {
+        // 2 Enters from "p1" → `p1\n\n\n\n` (3 rows: p1 + 2 empties).
+        // Typing X → `p1\n\n\n\nX`, which renders as p1 + 1 inter empty
+        // + X = 3 rows. Visible-row count preserved without any
+        // editor-side prepend.
+        let mut s = st("p1", 2);
+        s = update(s, EditorEvent::InsertNewline);
+        s = update(s, EditorEvent::InsertNewline);
+        s = update(s, EditorEvent::InsertText("X".into()));
+        assert_eq!(s.markdown, "p1\n\n\n\nX");
+    }
+
+    #[test]
+    fn typing_at_single_trailing_newline_promotes_via_enforce() {
+        // A *single* trailing `\n` (anomalous in the pairs model — not
+        // produced by Enter — but possible via paste of "p1\n").
+        // Typing X gives `p1\nX`; the soft `\n` is then promoted to
+        // `\n\n` by `enforce_invariants`. The user sees 0 empties → 0
+        // empties. Stable.
+        let s = update(st("p1\n", 3), EditorEvent::InsertText("X".into()));
+        assert_eq!(s.markdown, "p1\n\nX");
+    }
+
+    #[test]
+    fn typing_after_trailing_hard_break_fills_the_continuation_line() {
+        // After Shift+Enter from end of "ab", source is "ab  \n" with a
+        // hard break. The renderer shows that as a paragraph with two
+        // visible lines (content + empty trailing). Typing X just fills
+        // the continuation line — no extra paragraph injected.
+        let s = update(st("ab  \n", 5), EditorEvent::InsertText("X".into()));
+        assert_eq!(s.markdown, "ab  \nX");
+    }
+
+    #[test]
+    fn enter_at_trailing_empty_adds_one_more_pair() {
+        // Pressing Enter from a trailing-empty position extends the run
+        // by one pair (one more visible empty).
+        let s = update(st("p1\n\n", 4), EditorEvent::InsertNewline);
+        assert_eq!(s.markdown, "p1\n\n\n\n");
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_hard_break_not_a_pair() {
+        // Shift+Enter is the *line-break* keystroke (in-paragraph), not
+        // a paragraph break, so it stays at one `\n`.
+        let s = update(st("p1\n\n", 4), EditorEvent::InsertLineBreak);
+        assert_eq!(s.markdown, "p1\n\n  \n");
+    }
+
+    #[test]
+    fn typing_at_end_of_doc_without_trailing_newlines_appends_directly() {
+        let s = update(st("p1", 2), EditorEvent::InsertText("X".into()));
+        assert_eq!(s.markdown, "p1X");
+    }
+
+    #[test]
+    fn typing_in_doc_of_only_newlines_does_not_promote() {
+        // No content before the trailing run, so this is leading-only.
+        // Inserting X gives `\n\nX` — the leading pair is L=2 → 1 leading
+        // empty above X.
+        let s = update(st("\n\n", 2), EditorEvent::InsertText("X".into()));
+        assert_eq!(s.markdown, "\n\nX");
+    }
+
     // ---- Backspace at paragraph boundaries ------------------------------------
 
     #[test]
@@ -795,25 +886,35 @@ mod invariant_tests {
     }
 
     #[test]
-    fn backspace_through_empty_paragraph_drops_one_newline() {
-        // Run of 3 newlines = paragraph break + 1 empty paragraph. Backspace
-        // at the start of the second-content paragraph removes the empty
-        // paragraph but keeps the break.
+    fn backspace_through_odd_run_normalizes_via_pair_delete_plus_promotion() {
+        // Source `ab\n\n\ncd` is anomalous in the pairs model (3 `\n`s,
+        // odd). Backspace removes a pair, leaving `ab\ncd` — one stray
+        // `\n` mid-content. `enforce_invariants` promotes that to
+        // `\n\n`. Net effect: ends up as a regular paragraph break.
         let s = update(st("ab\n\n\ncd", 5), EditorEvent::DeleteBackward);
         assert_eq!(s.markdown, "ab\n\ncd");
-        assert_eq!(s.selection, Selection::Cursor(4));
         assert_no_soft_breaks(&s.markdown);
     }
 
     #[test]
-    fn backspace_through_two_empty_paragraphs_drops_one_at_a_time() {
-        // 4 newlines = paragraph break + 2 empty paragraphs.
+    fn backspace_through_empty_paragraphs_drops_one_pair_at_a_time() {
+        // Pairs model: source `ab\n\n\n\ncd` is paragraph break + 1 empty.
+        // Each backspace deletes a pair (= one paragraph "unit"). First
+        // press removes the empty; second press collapses the break.
         let s = update(st("ab\n\n\n\ncd", 6), EditorEvent::DeleteBackward);
-        assert_eq!(s.markdown, "ab\n\n\ncd");
+        assert_eq!(s.markdown, "ab\n\ncd");
+        let s = update(s, EditorEvent::DeleteBackward);
+        assert_eq!(s.markdown, "abcd");
+    }
+
+    #[test]
+    fn backspace_through_three_empty_paragraphs_drops_one_pair_at_a_time() {
+        // Source `ab\n\n\n\n\n\ncd` is paragraph break + 2 empties.
+        let s = update(st("ab\n\n\n\n\n\ncd", 8), EditorEvent::DeleteBackward);
+        assert_eq!(s.markdown, "ab\n\n\n\ncd");
         let s = update(s, EditorEvent::DeleteBackward);
         assert_eq!(s.markdown, "ab\n\ncd");
         let s = update(s, EditorEvent::DeleteBackward);
-        // One more drops the whole break (run is now exactly 2 mid-content).
         assert_eq!(s.markdown, "abcd");
     }
 
@@ -825,12 +926,12 @@ mod invariant_tests {
     }
 
     #[test]
-    fn backspace_at_leading_paragraph_break_drops_one() {
-        // "\n\nab" with cursor at 2 (right before 'a'). Backspace deletes
-        // one `\n` — leaving "\nab" with a single leading `\n` which is
-        // CommonMark whitespace, allowed by the invariant.
+    fn backspace_at_leading_paragraph_break_removes_a_pair() {
+        // Pairs model: a leading run of 2 `\n`s is one leading empty.
+        // Backspace at the start of the first content paragraph removes
+        // the entire pair (the empty above it).
         let s = update(st("\n\nab", 2), EditorEvent::DeleteBackward);
-        assert_eq!(s.markdown, "\nab");
+        assert_eq!(s.markdown, "ab");
         assert_no_soft_breaks(&s.markdown);
     }
 

@@ -104,13 +104,14 @@ pub fn register(s: &mut Snapshots) {
         })
     });
 
-    // Empty paragraph injection: 4 newlines between content should
-    // render as paragraph break + 2 visible empty rows. Mirrors the
-    // user-reported case.
+    // Empty paragraph injection: 6 newlines between content should
+    // render as paragraph break + 2 visible empty rows in the pairs
+    // model (each Enter inserts `\n\n`, so 3 Enters mid-content gives 6
+    // `\n`s).
     s.add("empty_paragraphs_between_blocks", win, |window, cx| {
         cx.new(|cx| {
             let state = EditorState {
-                markdown: "paragraph 1\n\n\n\nparagraph 2".into(),
+                markdown: "paragraph 1\n\n\n\n\n\nparagraph 2".into(),
                 selection: Selection::Cursor(0),
             };
             MarkdownEditor::with_state(state, window, cx)
@@ -122,22 +123,24 @@ pub fn register(s: &mut Snapshots) {
     s.add("empty_paragraphs_cursor_in_empty_row", win, |window, cx| {
         cx.new(|cx| {
             let state = EditorState {
-                markdown: "paragraph 1\n\n\n\nparagraph 2".into(),
-                // Byte 13 is the middle empty paragraph in this source.
-                selection: Selection::Cursor(13),
+                // 6 `\n`s = 1 paragraph break + 2 empty paragraphs.
+                // Byte 14 is in the middle empty paragraph (range 14..16).
+                markdown: "paragraph 1\n\n\n\n\n\nparagraph 2".into(),
+                selection: Selection::Cursor(14),
             };
             MarkdownEditor::with_state(state, window, cx)
         })
     });
 
     // Trailing empty paragraph: pressing Enter at the end of "paragraph 1"
-    // produces "paragraph 1\n" with the cursor at byte 12. The render
-    // must show one empty trailing row anchoring the cursor.
+    // produces `paragraph 1\n\n` (pairs model, one Enter = `\n\n`) with
+    // the cursor at byte 13. Render shows one trailing empty row
+    // anchoring the cursor.
     s.add("trailing_empty_after_one_enter", win, |window, cx| {
         cx.new(|cx| {
             let state = EditorState {
-                markdown: "paragraph 1\n".into(),
-                selection: Selection::Cursor(12),
+                markdown: "paragraph 1\n\n".into(),
+                selection: Selection::Cursor(13),
             };
             MarkdownEditor::with_state(state, window, cx)
         })
