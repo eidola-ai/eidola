@@ -279,6 +279,35 @@ fn enter_at_end_of_paragraph_creates_visible_trailing_empty(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn enter_in_empty_doc_emits_one_visible_row_per_press(cx: &mut TestAppContext) {
+    // Pressing Enter from an empty doc shows N + 1 visible rows after
+    // N presses (typewriter intuition). Previously the lines-based
+    // fallback for content-empty docs counted one block per `\n` plus
+    // a trailing anchor — twice the expected row count.
+    let (handle, editor) = open_editor(cx, EditorState::with_markdown(""));
+    let spec0 = current_spec(cx, &editor);
+    assert_eq!(spec0.blocks.len(), 1);
+
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "\n\n");
+        assert_eq!(e.cursor_offset(), 2);
+    });
+    let spec1 = current_spec(cx, &editor);
+    assert_eq!(spec1.blocks.len(), 2);
+
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "\n\n\n\n"));
+    let spec2 = current_spec(cx, &editor);
+    assert_eq!(spec2.blocks.len(), 3);
+
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "\n\n\n\n\n\n"));
+    let spec3 = current_spec(cx, &editor);
+    assert_eq!(spec3.blocks.len(), 4);
+}
+
+#[gpui::test]
 fn empty_document_still_has_a_renderable_block(cx: &mut TestAppContext) {
     // Regression: deleting all content used to leave the spec with zero
     // blocks, so no `BlockElement::paint` ran and the editor stopped

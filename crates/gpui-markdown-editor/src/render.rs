@@ -258,9 +258,8 @@ fn inject_empty_paragraphs(source: &str, real_blocks: Vec<RenderBlock>) -> Vec<R
     let bytes = source.as_bytes();
 
     // Special case: no real blocks at all. The content-bearing formulas
-    // assume there's at least one parsed block to anchor empties around;
-    // here there isn't. Two things go wrong if we just return an empty
-    // `Vec`:
+    // assume at least one parsed block to anchor empties around; here
+    // there isn't. Two things go wrong if we just return an empty `Vec`:
     //
     //   1. No `BlockElement::paint` runs for this frame, so no
     //      `window.handle_input` registers the `EntityInputHandler` and
@@ -268,24 +267,21 @@ fn inject_empty_paragraphs(source: &str, real_blocks: Vec<RenderBlock>) -> Vec<R
     //   2. There's no shaped line to paint a cursor against, so the user
     //      can't see where they are and can't click to place the cursor.
     //
-    // Emit one synthetic block per *line* in the source (lines bounded
-    // by `\n`, plus one trailing line after the last `\n`) so every
-    // byte position from 0 to `len` has a block to anchor against and
-    // the cursor follows typewriter intuition: pressing Enter `N` times
-    // in an empty doc shows `N + 1` visible rows.
+    // Pairs-model layout for content-empty docs: emit `N/2` empty
+    // paragraph blocks (each spanning a `\n\n` pair) followed by one
+    // zero-byte anchor block at the doc end. Pressing Enter `N` times
+    // from an empty doc produces `N` pairs and shows `N + 1` rows —
+    // typewriter intuition.
     if real_blocks.is_empty() {
-        let mut out = Vec::with_capacity(bytes.len() + 1);
-        let mut line_start = 0;
-        for (p, &b) in bytes.iter().enumerate() {
-            if b == b'\n' {
-                out.push(RenderBlock::new(line_start..p + 1, BlockKind::Paragraph));
-                line_start = p + 1;
-            }
+        let n_newlines = bytes.iter().filter(|&&b| b == b'\n').count();
+        let n_pairs = n_newlines / 2;
+        let mut out = Vec::with_capacity(n_pairs + 1);
+        for i in 0..n_pairs {
+            out.push(empty_paragraph_pair(2 * i));
         }
-        // Trailing line (after the last `\n`, or the only line if there
-        // were no `\n`s at all).
+        let anchor_start = 2 * n_pairs;
         out.push(RenderBlock::new(
-            line_start..bytes.len(),
+            anchor_start..bytes.len(),
             BlockKind::Paragraph,
         ));
         return out;
@@ -790,19 +786,17 @@ mod tests {
     }
 
     #[test]
-    fn doc_of_only_newlines_emits_one_block_per_line() {
-        // For a content-empty doc we don't have a parsed block to anchor
-        // empties around, so the formula doesn't apply — emit one block
-        // per line so every byte position has a cursor anchor and the
-        // visual count matches typewriter intuition.
+    fn content_empty_doc_emits_one_block_per_pair_plus_anchor() {
+        // Pairs-model layout for content-empty docs: `N/2` synthetic
+        // empty paragraph blocks (each `\n\n`) plus one zero-byte
+        // anchor block at the doc end. Pressing Enter `N` times in an
+        // empty doc gives `N` pairs and `N + 1` visible rows.
         //
-        // `\n\n\n` has 3 `\n`s = 4 lines. Three of those lines are bounded
-        // by a `\n` (ranges 0..1, 1..2, 2..3); the fourth is the trailing
-        // line after the last `\n` (range 3..3, zero bytes).
-        let spec = render_with_cursor("\n\n\n", 0);
-        assert_eq!(spec.blocks.len(), 4);
+        // `\n\n\n\n` has 4 `\n`s = 2 pairs. Two empty pair blocks
+        // [0..2) and [2..4), plus a trailing anchor [4..4).
+        let spec = render_with_cursor("\n\n\n\n", 0);
         let ranges: Vec<_> = spec.blocks.iter().map(|b| b.source_range.clone()).collect();
-        assert_eq!(ranges, vec![0..1, 1..2, 2..3, 3..3]);
+        assert_eq!(ranges, vec![0..2, 2..4, 4..4]);
         assert!(
             spec.blocks
                 .iter()
@@ -811,14 +805,25 @@ mod tests {
     }
 
     #[test]
-    fn single_newline_emits_two_blocks() {
-        // Source `\n` is "Enter once in an empty doc" — typewriter
-        // intuition says the user is now on line 2 with line 1 empty
-        // above. Both byte positions (0 and 1) need cursor anchors.
-        let spec = render_with_cursor("\n", 1);
+    fn one_enter_from_empty_doc_emits_two_blocks() {
+        // Source `\n\n` is "Enter once in an empty doc": one pair → one
+        // visible empty above + one anchor at doc end.
+        let spec = render_with_cursor("\n\n", 2);
         assert_eq!(spec.blocks.len(), 2);
+        assert_eq!(spec.blocks[0].source_range, 0..2);
+        assert_eq!(spec.blocks[1].source_range, 2..2);
+    }
+
+    #[test]
+    fn anomalous_lone_newline_emits_one_anchor_block() {
+        // Anomalous: a single `\n` doesn't form a pair. `enforce_invariants`
+        // leaves a single doc-edge `\n` alone, and the renderer treats
+        // the whole thing as one anchor block (the all-newlines
+        // fast-path in `shape_block_lines` still produces one visible
+        // row).
+        let spec = render_with_cursor("\n", 0);
+        assert_eq!(spec.blocks.len(), 1);
         assert_eq!(spec.blocks[0].source_range, 0..1);
-        assert_eq!(spec.blocks[1].source_range, 1..1);
     }
 
     #[test]
