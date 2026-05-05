@@ -147,6 +147,7 @@ pub async fn insert_pre_credential_issuance(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_pre_credential_refund(
     conn: &Connection,
     id: &str,
@@ -290,7 +291,7 @@ pub struct SpendingCredentialRow {
     pub spend_amount: i64,
     pub pre_credential_id: String,
     pub pre_refund_data: Vec<u8>,
-    pub spend_proof_data: Option<Vec<u8>>,
+    pub spend_proof_data: Vec<u8>,
     pub issuer_key_id: String,
     pub public_key_data: Vec<u8>,
 }
@@ -323,7 +324,7 @@ pub async fn list_spending_credentials(
             spend_amount: row.get::<i64>(4).map_err(AppError::db)?,
             pre_credential_id: row.get::<String>(5).map_err(AppError::db)?,
             pre_refund_data: row.get::<Vec<u8>>(6).map_err(AppError::db)?,
-            spend_proof_data: row.get::<Option<Vec<u8>>>(7).map_err(AppError::db)?,
+            spend_proof_data: row.get::<Vec<u8>>(7).map_err(AppError::db)?,
             issuer_key_id: row.get::<String>(8).map_err(AppError::db)?,
             public_key_data: row.get::<Vec<u8>>(9).map_err(AppError::db)?,
         });

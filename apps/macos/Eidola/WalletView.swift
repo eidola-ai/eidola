@@ -26,13 +26,9 @@ struct WalletView: View {
                 VStack(alignment: .leading, spacing: 2) {
                   Text(cred.nonce.prefix(16) + "...")
                     .font(.system(.body, design: .monospaced))
-                  Text(
-                    cred.canRecover
-                      ? "Stuck \u{2014} \(cred.spendAmount) credits charged"
-                      : "Unrecoverable \u{2014} spend proof not stored"
-                  )
-                  .font(.caption)
-                  .foregroundStyle(cred.canRecover ? .orange : .red)
+                  Text("Stuck \u{2014} \(cred.spendAmount) credits charged")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
                 }
 
                 Spacer()
@@ -47,20 +43,18 @@ struct WalletView: View {
             HStack {
               Text("In Flight")
               Spacer()
-              if core.spendingCredentials.contains(where: { $0.canRecover }) {
-                Button("Recover All") {
-                  Task {
-                    let recovered = await core.recoverSpendingCredentials()
-                    if recovered.isEmpty {
-                      recoveryMessage = "No credentials could be recovered."
-                    } else {
-                      recoveryMessage = "Recovered \(recovered.count) credential(s)."
-                    }
+              Button("Recover All") {
+                Task {
+                  let recovered = await core.recoverSpendingCredentials()
+                  if recovered.isEmpty {
+                    recoveryMessage = "No credentials could be recovered."
+                  } else {
+                    recoveryMessage = "Recovered \(recovered.count) credential(s)."
                   }
                 }
-                .buttonStyle(.borderless)
-                .disabled(core.isLoading)
               }
+              .buttonStyle(.borderless)
+              .disabled(core.isLoading)
             }
           }
         }

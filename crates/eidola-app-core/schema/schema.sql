@@ -28,11 +28,13 @@ CREATE TABLE pre_credential (
         (type = 'issuance'
             AND credential_nonce IS NULL
             AND spend_amount IS NULL
+            AND spend_proof_data IS NULL
             AND credits IS NOT NULL)
         OR
         (type = 'refund'
             AND credential_nonce IS NOT NULL
             AND spend_amount IS NOT NULL
+            AND spend_proof_data IS NOT NULL
             AND credits IS NULL)
     )
 );

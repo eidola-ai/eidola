@@ -95,7 +95,6 @@ pub struct InFlightCredentialInfo {
     pub credits: i64,
     pub generation: i64,
     pub spend_amount: i64,
-    pub can_recover: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -628,7 +627,6 @@ impl Inner {
                 credits: r.credits,
                 generation: r.generation,
                 spend_amount: r.spend_amount,
-                can_recover: r.spend_proof_data.is_some(),
             })
             .collect())
     }
@@ -645,10 +643,7 @@ impl Inner {
         let mut recovered = Vec::new();
 
         for row in rows {
-            let spend_proof_cbor = match row.spend_proof_data {
-                Some(data) => data,
-                None => continue, // can't recover without spend proof
-            };
+            let spend_proof_cbor = row.spend_proof_data;
 
             let spend_proof = match SpendProof::<128>::from_cbor(&spend_proof_cbor) {
                 Ok(p) => p,
@@ -678,8 +673,8 @@ impl Inner {
             let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
             let auth_value = format!("PrivateToken token=\"{token_b64}\"");
 
-            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
-                if process_refund(
+            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
+                && process_refund(
                     &refund_obj,
                     &params,
                     &spend_proof,
@@ -692,9 +687,8 @@ impl Inner {
                 )
                 .await
                 .is_ok()
-                {
-                    recovered.push(row.nonce);
-                }
+            {
+                recovered.push(row.nonce);
             }
         }
 
@@ -1318,6 +1312,7 @@ impl Inner {
             &cred.issuer_key_id,
             &pre_refund_cbor,
             charge_credits as i64,
+            &spend_proof_cbor,
             now,
         )
         .await?;

@@ -5,8 +5,8 @@
 //! first run will write the golden image; subsequent runs verify against it.
 
 use eidola_app_core::{
-    BalancePoolInfo, BalancesResult, ConfigState, CredentialInfo, MeasurementInfo, PriceInfo,
-    SpaceMessage,
+    BalancePoolInfo, BalancesResult, ConfigState, CredentialInfo, InFlightCredentialInfo,
+    MeasurementInfo, PriceInfo, SpaceMessage,
 };
 use eidola_gui::account::AccountView;
 use eidola_gui::chat::{ChatView, StreamingResponse};
@@ -422,6 +422,29 @@ fn register_wallet(s: &mut Snapshots) {
                         generation: 2,
                     },
                 ];
+                c
+            });
+            cx.new(|cx| WalletView::new(core, window, cx))
+        },
+    );
+
+    s.add(
+        "wallet_with_in_flight",
+        size(px(560.), px(480.)),
+        |window, cx| {
+            let core = cx.new(|_| {
+                let mut c = Core::stub();
+                c.spending_credentials = vec![InFlightCredentialInfo {
+                    nonce: "deadbeefcafef00d0123456789abcdef".into(),
+                    credits: 800,
+                    generation: 1,
+                    spend_amount: 700,
+                }];
+                c.credentials = vec![CredentialInfo {
+                    nonce: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into(),
+                    credits: 1_500,
+                    generation: 0,
+                }];
                 c
             });
             cx.new(|cx| WalletView::new(core, window, cx))

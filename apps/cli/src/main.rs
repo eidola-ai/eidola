@@ -358,14 +358,9 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     if !spending.is_empty() {
                         println!("in-flight credentials:");
                         for c in &spending {
-                            let status = if c.can_recover {
-                                "recoverable"
-                            } else {
-                                "unrecoverable"
-                            };
                             println!(
-                                "  {}: {} credits, {} charged ({})",
-                                c.nonce, c.credits, c.spend_amount, status
+                                "  {}: {} credits, {} charged",
+                                c.nonce, c.credits, c.spend_amount
                             );
                         }
                         println!();
@@ -388,12 +383,11 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 }
                 CredentialsCommand::Recover => {
                     let spending = core.wallet_spending_credentials().await?;
-                    let recoverable = spending.iter().filter(|c| c.can_recover).count();
-                    if recoverable == 0 {
-                        println!("no recoverable credentials");
+                    if spending.is_empty() {
+                        println!("no in-flight credentials");
                         return Ok(());
                     }
-                    println!("attempting to recover {recoverable} credential(s)...");
+                    println!("attempting to recover {} credential(s)...", spending.len());
                     let recovered = core.recover_spending_credentials().await?;
                     if recovered.is_empty() {
                         println!("no credentials could be recovered");

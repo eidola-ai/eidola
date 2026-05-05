@@ -60,6 +60,15 @@ pub fn run() {
         theme::install(cx);
 
         let core = Core::new(cx);
+
+        // Best-effort recovery of any in-flight credentials left over from a
+        // previous run that crashed mid-spend. Fires-and-forgets — the result
+        // surfaces on the wallet view next time the user opens it. Mirrors
+        // the SwiftUI app's startup .task on EidolaApp.
+        core.update(cx, |c, cx| {
+            c.recover_spending_credentials(cx, |_, _, _| {});
+        });
+
         cx.set_global(AppGlobal {
             core,
             settings_window: None,

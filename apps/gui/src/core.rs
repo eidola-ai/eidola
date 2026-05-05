@@ -3,7 +3,7 @@ use std::sync::Arc;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AccountCreateResult, AllocateResult, AppCore, BalancesResult, ChatResult, ChatStreamEvent,
-    ConfigState, CredentialInfo, ModelInfo, PriceInfo, SpaceMessage,
+    ConfigState, CredentialInfo, InFlightCredentialInfo, ModelInfo, PriceInfo, SpaceMessage,
 };
 use gpui::{App, AppContext, AsyncApp, Context, Entity, Task, WeakEntity};
 use tokio::sync::{mpsc, oneshot};
@@ -24,6 +24,7 @@ pub struct Core {
     pub balances: Option<BalancesResult>,
     pub prices: Vec<PriceInfo>,
     pub credentials: Vec<CredentialInfo>,
+    pub spending_credentials: Vec<InFlightCredentialInfo>,
     pub models: Vec<ModelInfo>,
 
     pub error_message: Option<String>,
@@ -46,6 +47,7 @@ impl Core {
             balances: None,
             prices: Vec::new(),
             credentials: Vec::new(),
+            spending_credentials: Vec::new(),
             models: Vec::new(),
             error_message: None,
             busy: false,
@@ -62,6 +64,7 @@ impl Core {
             balances: None,
             prices: Vec::new(),
             credentials: Vec::new(),
+            spending_credentials: Vec::new(),
             models: Vec::new(),
             error_message: None,
             busy: false,
@@ -200,11 +203,52 @@ impl Core {
         };
         self.spawn(
             cx,
-            move || async move { core.wallet_credentials().await },
+            move || async move {
+                let active = core.wallet_credentials().await?;
+                let spending = core.wallet_spending_credentials().await?;
+                Ok((active, spending))
+            },
             |this, result, cx| match result {
-                Ok(c) => {
-                    this.credentials = c;
+                Ok((active, spending)) => {
+                    this.credentials = active;
+                    this.spending_credentials = spending;
                     cx.notify();
+                }
+                Err(e) => this.set_error(e, cx),
+            },
+        );
+    }
+
+    /// Attempt recovery of any in-flight credentials. After the call
+    /// returns, refreshes both active and spending credentials caches and
+    /// stashes the recovered nonces into `last_recovered` so the UI can
+    /// surface a result message. The result count is delivered via the
+    /// `on_done` callback so callers can show an alert.
+    pub fn recover_spending_credentials(
+        &mut self,
+        cx: &mut Context<Self>,
+        on_done: impl FnOnce(&mut Core, Vec<String>, &mut Context<Core>) + 'static,
+    ) {
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
+        self.spawn(
+            cx,
+            move || {
+                let core1 = core.clone();
+                async move {
+                    let recovered = core1.recover_spending_credentials().await?;
+                    let active = core1.wallet_credentials().await?;
+                    let spending = core1.wallet_spending_credentials().await?;
+                    Ok((recovered, active, spending))
+                }
+            },
+            move |this, result, cx| match result {
+                Ok((recovered, active, spending)) => {
+                    this.credentials = active;
+                    this.spending_credentials = spending;
+                    cx.notify();
+                    on_done(this, recovered, cx);
                 }
                 Err(e) => this.set_error(e, cx),
             },
@@ -243,10 +287,15 @@ impl Core {
                     let core2 = core_for_then.clone();
                     this.spawn(
                         cx,
-                        move || async move { core1.wallet_credentials().await },
+                        move || async move {
+                            let active = core1.wallet_credentials().await?;
+                            let spending = core1.wallet_spending_credentials().await?;
+                            Ok((active, spending))
+                        },
                         |this, result, cx| {
-                            if let Ok(c) = result {
-                                this.credentials = c;
+                            if let Ok((active, spending)) = result {
+                                this.credentials = active;
+                                this.spending_credentials = spending;
                                 cx.notify();
                             }
                         },

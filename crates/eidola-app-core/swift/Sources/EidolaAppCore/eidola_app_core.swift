@@ -1507,18 +1507,14 @@ public struct InFlightCredentialInfo: Equatable, Hashable {
   public var credits: Int64
   public var generation: Int64
   public var spendAmount: Int64
-  public var canRecover: Bool
 
   // Default memberwise initializers are never public by default, so we
   // declare one manually.
-  public init(
-    nonce: String, credits: Int64, generation: Int64, spendAmount: Int64, canRecover: Bool
-  ) {
+  public init(nonce: String, credits: Int64, generation: Int64, spendAmount: Int64) {
     self.nonce = nonce
     self.credits = credits
     self.generation = generation
     self.spendAmount = spendAmount
-    self.canRecover = canRecover
   }
 
 }
@@ -1539,8 +1535,7 @@ public struct FfiConverterTypeInFlightCredentialInfo: FfiConverterRustBuffer {
         nonce: FfiConverterString.read(from: &buf),
         credits: FfiConverterInt64.read(from: &buf),
         generation: FfiConverterInt64.read(from: &buf),
-        spendAmount: FfiConverterInt64.read(from: &buf),
-        canRecover: FfiConverterBool.read(from: &buf)
+        spendAmount: FfiConverterInt64.read(from: &buf)
       )
   }
 
@@ -1549,7 +1544,6 @@ public struct FfiConverterTypeInFlightCredentialInfo: FfiConverterRustBuffer {
     FfiConverterInt64.write(value.credits, into: &buf)
     FfiConverterInt64.write(value.generation, into: &buf)
     FfiConverterInt64.write(value.spendAmount, into: &buf)
-    FfiConverterBool.write(value.canRecover, into: &buf)
   }
 }
 
