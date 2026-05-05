@@ -9,7 +9,7 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::syntax::{NodeKind, SyntaxNode};
 
@@ -66,6 +66,16 @@ impl<'a> Walker<'a> {
             Tag::Heading { level, .. } => {
                 let kind = self.heading_kind(level as u8, &range);
                 self.push_frame(SyntaxNode::new(kind, range));
+            }
+            Tag::CodeBlock(CodeBlockKind::Fenced(lang)) => {
+                let kind = self.fenced_code_block_kind(&range, Some(lang.into_string()));
+                self.push_frame(SyntaxNode::new(kind, range));
+            }
+            Tag::CodeBlock(CodeBlockKind::Indented) => {
+                // Indented code blocks aren't a first-class construct yet —
+                // treat them as plain paragraphs so cursor geometry still
+                // works on the source bytes.
+                self.push_frame(SyntaxNode::new(NodeKind::Paragraph, range));
             }
             Tag::Emphasis => {
                 let (delim, content) = self.symmetric_delimiters(&range, 1);
@@ -185,6 +195,118 @@ impl<'a> Walker<'a> {
         let content = opening.end..closing.start;
         (vec![opening, closing], content)
     }
+
+    /// Identify the opening / closing fence and the inner content of a
+    /// fenced code block. pulldown-cmark gives us `range` covering the
+    /// whole construct (including fences and any trailing `\n`), and the
+    /// info string (`lang`). We scan the bytes to:
+    ///
+    /// * locate the opening fence — the leading run of `` ` `` or `~`,
+    ///   together with any info string and the `\n` that ends the
+    ///   opening line (treated as a single delimiter range that the
+    ///   renderer hides outside / dims inside);
+    /// * locate the closing fence — the trailing run of the same
+    ///   character on its own line, together with any preceding `\n`;
+    /// * everything between is `content_range`.
+    ///
+    /// An *unterminated* fenced block (the file ends before the closing
+    /// fence) is supported: there is one delimiter range (the opener)
+    /// and the content runs to `range.end`. CommonMark allows this and
+    /// pulldown-cmark emits the `CodeBlock` tag even when the closing
+    /// fence is absent.
+    fn fenced_code_block_kind(&self, range: &Range<usize>, lang: Option<String>) -> NodeKind {
+        let bytes = self.source.as_bytes();
+        let start = range.start;
+        let end = range.end;
+
+        // Opening fence character: the first non-whitespace byte at the
+        // start of `range`. We tolerate up to 3 leading spaces of
+        // indentation per CommonMark, so scan past them first.
+        let mut p = start;
+        while p < end && (bytes[p] == b' ' || bytes[p] == b'\t') {
+            p += 1;
+        }
+        let fence_char = bytes.get(p).copied().unwrap_or(b'`');
+
+        // Opening fence run: one or more `fence_char`s.
+        while p < end && bytes[p] == fence_char {
+            p += 1;
+        }
+        // Info string + rest of opening line. The opener delimiter
+        // ends *before* the trailing `\n` so it stays on a single
+        // line, matching how the closer delimiter is shaped (also
+        // pre-newline). The element layer's hidden-range lookup is
+        // per-line and matches `r.end <= line_logical_end`, so an
+        // opener that included the `\n` would silently fail the
+        // match and render the fence text instead of hiding it.
+        while p < end && bytes[p] != b'\n' {
+            p += 1;
+        }
+        let opener_end = p;
+        let after_opener_newline = if p < end && bytes[p] == b'\n' {
+            p + 1
+        } else {
+            p
+        };
+
+        // Closing fence: walk back from `end` over a trailing `\n`,
+        // then over a run of `fence_char`s, then over leading spaces /
+        // tabs on that line. If we land on a `\n` before any
+        // `fence_char` was consumed, there's no closing fence.
+        let mut q = end;
+        // Strip exactly one trailing `\n` if present (CommonMark allows
+        // pulldown to either include or exclude it depending on whether
+        // the file ends mid-block).
+        if q > after_opener_newline && bytes[q - 1] == b'\n' {
+            q -= 1;
+        }
+        // Scan back over fence chars on the closing line.
+        let mut closing_fence_start = q;
+        while closing_fence_start > opener_end && bytes[closing_fence_start - 1] == fence_char {
+            closing_fence_start -= 1;
+        }
+        let has_closing_fence = closing_fence_start < q;
+        // Skip indentation on the closing fence line. The `\n` that
+        // ends the *previous* line stays in `content_range` — it's the
+        // EOL of the last code line, not part of the closing fence.
+        let mut closing_indent_start = closing_fence_start;
+        if has_closing_fence {
+            while closing_indent_start > after_opener_newline
+                && (bytes[closing_indent_start - 1] == b' '
+                    || bytes[closing_indent_start - 1] == b'\t')
+            {
+                closing_indent_start -= 1;
+            }
+        }
+
+        let lang = lang.map(|s| s.trim().to_string());
+
+        if has_closing_fence {
+            // Both opener and closer span their fence line *up to but
+            // not including* the trailing `\n` — they're per-line
+            // delimiters. `q` points at the closing line's
+            // post-fence trailing-whitespace boundary (i.e. its
+            // logical end before the trailing `\n`).
+            let opener = start..opener_end;
+            let closer = closing_indent_start..q;
+            let content_range = after_opener_newline..closing_indent_start;
+            NodeKind::CodeBlock {
+                lang,
+                content_range,
+                delimiter_ranges: vec![opener, closer],
+            }
+        } else {
+            // Unterminated — one delimiter (the opener) and content
+            // runs to the end of the parser-reported range.
+            let opener = start..opener_end;
+            let content_range = after_opener_newline..end;
+            NodeKind::CodeBlock {
+                lang,
+                content_range,
+                delimiter_ranges: vec![opener],
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +366,105 @@ mod tests {
     #[test]
     fn empty_input_produces_no_blocks() {
         assert!(parse("").is_empty());
+    }
+
+    #[test]
+    fn parses_fenced_code_block_with_language() {
+        // pulldown reports `range` from the opening fence through the
+        // closing fence — the trailing `\n` after the closing fence is
+        // outside the construct (it's the same one-trailing-newline
+        // behavior paragraphs have, handled in the renderer's empty-
+        // paragraph injection).
+        let src = "```rust\nfn x() {}\n```\n";
+        let nodes = parse(src);
+        assert_eq!(nodes.len(), 1);
+        match &first(&nodes).kind {
+            NodeKind::CodeBlock {
+                lang,
+                content_range,
+                delimiter_ranges,
+            } => {
+                assert_eq!(lang.as_deref(), Some("rust"));
+                assert_eq!(&src[content_range.clone()], "fn x() {}\n");
+                assert_eq!(delimiter_ranges.len(), 2);
+                assert_eq!(&src[delimiter_ranges[0].clone()], "```rust");
+                assert_eq!(&src[delimiter_ranges[1].clone()], "```");
+            }
+            other => panic!("expected fenced code block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_fenced_code_block_without_language() {
+        let src = "```\nplain\n```";
+        let nodes = parse(src);
+        match &first(&nodes).kind {
+            NodeKind::CodeBlock {
+                lang,
+                content_range,
+                delimiter_ranges,
+            } => {
+                assert_eq!(lang.as_deref(), Some(""));
+                assert_eq!(&src[content_range.clone()], "plain\n");
+                assert_eq!(&src[delimiter_ranges[0].clone()], "```");
+                assert_eq!(&src[delimiter_ranges[1].clone()], "```");
+            }
+            other => panic!("expected fenced code block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tilde_fenced_code_block() {
+        let src = "~~~js\nlet x = 1;\n~~~\n";
+        let nodes = parse(src);
+        match &first(&nodes).kind {
+            NodeKind::CodeBlock {
+                lang,
+                content_range,
+                delimiter_ranges,
+            } => {
+                assert_eq!(lang.as_deref(), Some("js"));
+                assert_eq!(&src[content_range.clone()], "let x = 1;\n");
+                assert_eq!(&src[delimiter_ranges[0].clone()], "~~~js");
+                assert_eq!(&src[delimiter_ranges[1].clone()], "~~~");
+            }
+            other => panic!("expected fenced code block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_unterminated_fenced_code_block() {
+        // CommonMark allows a fenced block with no closing fence — the
+        // block extends to end-of-document. Useful for live editing.
+        let src = "```rust\nfn x() {}\n";
+        let nodes = parse(src);
+        match &first(&nodes).kind {
+            NodeKind::CodeBlock {
+                lang,
+                content_range,
+                delimiter_ranges,
+            } => {
+                assert_eq!(lang.as_deref(), Some("rust"));
+                assert_eq!(&src[content_range.clone()], "fn x() {}\n");
+                assert_eq!(delimiter_ranges.len(), 1);
+                assert_eq!(&src[delimiter_ranges[0].clone()], "```rust");
+            }
+            other => panic!("expected fenced code block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fenced_code_block_with_no_inner_markdown_parsing() {
+        // `**bold**` inside a code block is literal — no Strong child
+        // node should appear in the parse tree.
+        let src = "```\n**not bold**\n```";
+        let nodes = parse(src);
+        let block = first(&nodes);
+        assert!(matches!(block.kind, NodeKind::CodeBlock { .. }));
+        let has_strong = block
+            .children
+            .iter()
+            .any(|c| matches!(c.kind, NodeKind::Strong { .. }));
+        assert!(!has_strong, "code block must not contain inline parses");
     }
 }

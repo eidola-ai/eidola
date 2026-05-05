@@ -68,6 +68,12 @@ pub struct MarkdownEditor {
     pub(crate) last_bounds: Option<Bounds<Pixels>>,
     pub(crate) frame_input_handler_set: bool,
     marked_range: Option<Range<usize>>,
+    /// Per-block horizontal scroll offset (positive = content scrolled
+    /// left under the visible band). Keyed by block index; entries
+    /// persist across re-renders so a user's scroll position survives
+    /// re-shape. Stale entries (block index no longer present in this
+    /// frame's spec) are harmless — they're simply not read.
+    code_block_scrolls: HashMap<usize, Pixels>,
 }
 
 impl MarkdownEditor {
@@ -95,7 +101,19 @@ impl MarkdownEditor {
             last_bounds: None,
             frame_input_handler_set: false,
             marked_range: None,
+            code_block_scrolls: HashMap::new(),
         }
+    }
+
+    pub(crate) fn code_block_scroll(&self, block_index: usize) -> Pixels {
+        self.code_block_scrolls
+            .get(&block_index)
+            .copied()
+            .unwrap_or(px(0.0))
+    }
+
+    pub(crate) fn set_code_block_scroll(&mut self, block_index: usize, offset: Pixels) {
+        self.code_block_scrolls.insert(block_index, offset);
     }
 
     pub fn style(mut self, style: MarkdownStyle) -> Self {
@@ -126,7 +144,18 @@ impl MarkdownEditor {
         self.dispatch(EditorEvent::DeleteForward, cx);
     }
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::InsertNewline, cx);
+        // Inside a fenced code block, Enter inserts a single `\n` —
+        // the block treats `\n` as a literal line separator, not a
+        // paragraph break. (Paragraphs use `\n\n`; promoting a single
+        // `\n` to `\n\n` here would visually duplicate every Enter
+        // inside code.)
+        let cursor = self.state.selection.head();
+        let bytes = self.state.markdown.as_bytes();
+        if update::cursor_is_in_fenced_code_content(bytes, cursor) {
+            self.dispatch(EditorEvent::InsertText("\n".into()), cx);
+        } else {
+            self.dispatch(EditorEvent::InsertNewline, cx);
+        }
     }
     fn shift_enter(&mut self, _: &ShiftEnter, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorEvent::InsertLineBreak, cx);

@@ -27,6 +27,20 @@ pub struct MarkdownStyle {
     pub heading_base_font_size: Pixels,
     pub heading_font_size: Option<HeadingFontSize>,
 
+    /// Mono font size used for code blocks. Defaults to the theme's
+    /// `mono_font_size`.
+    pub mono_font_size: Pixels,
+    /// Background color of the rounded code-block fill. Defaults to
+    /// `theme.muted` so it sits visibly distinct from the body
+    /// background without dominating the page.
+    pub code_block_background: Hsla,
+    /// Inner padding (top, right, bottom, left equal) inside the code
+    /// block fill, before content shaping.
+    pub code_block_padding: Pixels,
+    /// Corner radius of the code-block fill. Defaults to the theme's
+    /// `radius`.
+    pub code_block_radius: Pixels,
+
     pub text_color: Hsla,
     pub delimiter_color: Hsla,
     pub background: Hsla,
@@ -47,6 +61,11 @@ impl MarkdownStyle {
 
             heading_base_font_size: theme.font_size,
             heading_font_size: None,
+
+            mono_font_size: theme.mono_font_size,
+            code_block_background: theme.muted,
+            code_block_padding: px(12.0),
+            code_block_radius: theme.radius,
 
             text_color: theme.foreground,
             delimiter_color: theme.muted_foreground,
@@ -82,6 +101,26 @@ impl MarkdownStyle {
         F: Fn(u8, Pixels) -> Pixels + Send + Sync + 'static,
     {
         self.heading_font_size = Some(Arc::new(f));
+        self
+    }
+
+    pub fn mono_font_size(mut self, size: Pixels) -> Self {
+        self.mono_font_size = size;
+        self
+    }
+
+    pub fn code_block_padding(mut self, pad: Pixels) -> Self {
+        self.code_block_padding = pad;
+        self
+    }
+
+    pub fn code_block_background(mut self, bg: Hsla) -> Self {
+        self.code_block_background = bg;
+        self
+    }
+
+    pub fn code_block_radius(mut self, radius: Pixels) -> Self {
+        self.code_block_radius = radius;
         self
     }
 

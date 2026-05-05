@@ -538,6 +538,94 @@ fn delete_forward_at_paragraph_break_merges(cx: &mut TestAppContext) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Fenced code blocks
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn enter_inside_code_block_inserts_single_newline(cx: &mut TestAppContext) {
+    // Inside a fenced code block, Enter inserts `\n` — not the
+    // paragraph-break `\n\n`. The buffer remains valid markdown with
+    // its single `\n` preserved (enforce_invariants exempts code-block
+    // content from soft-break promotion).
+    let initial = EditorState {
+        markdown: "```rust\nlet x = 1;\n```".into(),
+        // Cursor at end of "let x = 1;".
+        selection: Selection::Cursor(18),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "```rust\nlet x = 1;\n\n```");
+        assert_eq!(e.cursor_offset(), 19);
+    });
+}
+
+#[gpui::test]
+fn enter_outside_code_block_inserts_paragraph_break(cx: &mut TestAppContext) {
+    // Sanity: Enter just after a code block's closing fence is
+    // outside-the-block — the existing paragraph-break behavior holds.
+    let initial = EditorState {
+        markdown: "```\nx\n```\n\npara".into(),
+        // Cursor inside "para".
+        selection: Selection::Cursor(13),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "```\nx\n```\n\npa\n\nra");
+    });
+}
+
+#[gpui::test]
+fn code_block_renders_as_code_block_kind(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "```rust\nlet x = 1;\n```".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    assert!(
+        spec.blocks
+            .iter()
+            .any(|b| matches!(b.kind, BlockKind::CodeBlock { .. })),
+    );
+}
+
+#[gpui::test]
+fn pasted_multiline_inside_code_block_keeps_single_newlines(cx: &mut TestAppContext) {
+    // The exact regression: paste of source containing single `\n`s
+    // inside a fenced block must NOT have its newlines promoted to
+    // `\n\n` (which would mangle the code).
+    let initial = EditorState {
+        markdown: "```\n\n```".into(),
+        // Cursor inside the empty content (between opening `\n` and
+        // closing fence).
+        selection: Selection::Cursor(4),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _window, cx| {
+        editor.update(cx, |e, cx| {
+            // Simulate a paste of multiline source by setting the
+            // markdown directly, then running the post-pass via
+            // `update` to verify it doesn't promote the inner `\n`s.
+            e.state.markdown = "```\nline1\nline2\nline3\n```".into();
+            e.state.selection = Selection::Cursor(20);
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(20)),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "```\nline1\nline2\nline3\n```");
+    });
+}
+
 #[gpui::test]
 fn select_across_paragraph_break_and_replace(cx: &mut TestAppContext) {
     // Selecting a range that includes the paragraph break and typing should

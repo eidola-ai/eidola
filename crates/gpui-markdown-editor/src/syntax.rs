@@ -52,6 +52,18 @@ pub enum NodeKind {
         delimiter_ranges: Vec<ByteRange>,
         content_range: ByteRange,
     },
+    /// Fenced code block. `delimiter_ranges` covers the opening fence
+    /// line *including* the optional info string and the closing fence
+    /// line (if present). `content_range` is the inner code, excluding
+    /// fence lines and the newlines that bound them — so cursor /
+    /// selection math inside the block works on raw code bytes.
+    /// `lang` is the trimmed info string (`Some("rust")`, `Some("")`
+    /// for an empty info string, etc.).
+    CodeBlock {
+        lang: Option<String>,
+        content_range: ByteRange,
+        delimiter_ranges: Vec<ByteRange>,
+    },
     SoftBreak,
     HardBreak,
     Text,

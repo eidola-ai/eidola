@@ -95,8 +95,9 @@ fn render_node(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<RenderBlock
     match &node.kind {
         NodeKind::Paragraph => render_paragraph(node, cursor, out),
         NodeKind::Heading { .. } => render_heading(node, cursor, out),
+        NodeKind::CodeBlock { .. } => render_code_block(node, cursor, out),
         // Anything else at top level — nothing to do yet. (Future phases add
-        // handling for lists, blockquotes, code blocks, etc.)
+        // handling for lists, blockquotes, etc.)
         _ => {}
     }
 }
@@ -104,6 +105,24 @@ fn render_node(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<RenderBlock
 fn render_paragraph(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<RenderBlock>) {
     let mut block = RenderBlock::new(node.range.clone(), BlockKind::Paragraph);
     collect_inlines(node, cursor, &mut block);
+    out.push(block);
+}
+
+fn render_code_block(node: &SyntaxNode, cursor: CursorRange, out: &mut Vec<RenderBlock>) {
+    let (lang, delimiter_ranges) = match &node.kind {
+        NodeKind::CodeBlock {
+            lang,
+            delimiter_ranges,
+            ..
+        } => (lang.clone(), delimiter_ranges.clone()),
+        _ => return,
+    };
+
+    let mut block = RenderBlock::new(node.range.clone(), BlockKind::CodeBlock { lang });
+    let cursor_inside = cursor.overlaps(&node.range);
+    apply_delimiter_visibility(&delimiter_ranges, cursor_inside, &mut block);
+    // No inline children — code-block content is literal source bytes,
+    // shaped in mono font by the element layer.
     out.push(block);
 }
 
@@ -824,6 +843,61 @@ mod tests {
         let spec = render_with_cursor("\n", 0);
         assert_eq!(spec.blocks.len(), 1);
         assert_eq!(spec.blocks[0].source_range, 0..1);
+    }
+
+    // ---- Fenced code blocks ----------------------------------------------
+
+    #[test]
+    fn fenced_code_block_emits_one_block_with_lang() {
+        let src = "```rust\nlet x = 1;\n```\n";
+        let spec = render_with_cursor(src, 0);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::CodeBlock { .. }));
+        match &block.kind {
+            BlockKind::CodeBlock { lang } => assert_eq!(lang.as_deref(), Some("rust")),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn fenced_code_block_hides_fences_when_cursor_outside() {
+        // Cursor placed at a paragraph below the code block.
+        let src = "```rust\nlet x = 1;\n```\n\npara";
+        let cursor = src.find("para").unwrap() + 1;
+        let spec = render_with_cursor(src, cursor);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::CodeBlock { .. }));
+        // Opener "```rust" = 0..7, closer "```" = 19..22 — both
+        // pre-newline so per-line hidden-range lookup matches them.
+        assert!(block.has_hidden_range(0..7));
+        assert!(block.has_hidden_range(19..22));
+        assert!(!block.has_dimmed_range(0..7));
+    }
+
+    #[test]
+    fn fenced_code_block_dims_fences_when_cursor_inside() {
+        let src = "```rust\nlet x = 1;\n```";
+        // Cursor inside the content.
+        let spec = render_with_cursor(src, 10);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::CodeBlock { .. }));
+        assert!(block.has_dimmed_range(0..7));
+        assert!(block.has_dimmed_range(19..22));
+        assert!(!block.has_hidden_range(0..7));
+    }
+
+    #[test]
+    fn fenced_code_block_has_no_inline_runs_for_pseudo_markdown() {
+        // `**` inside a code block is literal, not a Strong delimiter —
+        // there should be no bold inline run, no hidden range for the
+        // asterisks.
+        let src = "```\n**not bold**\n```";
+        let spec = render_with_cursor(src, 0);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::CodeBlock { .. }));
+        assert!(
+            block
+                .inlines
+                .iter()
+                .all(|r| !r.style.bold && !r.style.italic),
+            "code-block content must not be styled by inline markdown",
+        );
     }
 
     #[test]

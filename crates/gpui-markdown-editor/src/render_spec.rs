@@ -51,7 +51,18 @@ impl RenderBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockKind {
     Paragraph,
-    Heading { level: u8 },
+    Heading {
+        level: u8,
+    },
+    /// Fenced code block. `lang` is the trimmed info string (`Some("rust")`,
+    /// `Some("")` for an empty info string, or `None` for an indented
+    /// block — not yet emitted, reserved). The block is a *leaf*: no
+    /// inline markdown is parsed inside, the renderer ships content as
+    /// raw text, and the element layer paints in the mono font with a
+    /// non-wrapping shape pass.
+    CodeBlock {
+        lang: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

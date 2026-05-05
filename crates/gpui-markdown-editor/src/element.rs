@@ -13,9 +13,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Element, ElementId, ElementInputHandler, Entity, FontStyle, FontWeight,
-    GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Point, SharedString, Size,
-    StrikethroughStyle, Style, TextRun, Window, WrappedLine, fill, point, px, relative, size,
+    App, BorderStyle, Bounds, ContentMask, Edges, Element, ElementId, ElementInputHandler, Entity,
+    FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels,
+    Point, ScrollDelta, ScrollWheelEvent, SharedString, Size, StrikethroughStyle, Style, TextRun,
+    Window, WrappedLine, fill, point, px, quad, relative, size,
 };
 use smallvec::SmallVec;
 
@@ -146,6 +147,19 @@ pub struct PrepaintState {
     laid_out: LaidOutBlock,
     cursor_quad: Option<gpui::PaintQuad>,
     selection_quads: Vec<gpui::PaintQuad>,
+    /// `Some` only for code blocks. Holds the geometry needed during
+    /// paint to draw the rounded background, clip content to the
+    /// visible band, and overlay the horizontal scrollbar.
+    code_block_paint: Option<CodeBlockPaint>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodeBlockPaint {
+    bg_bounds: Bounds<Pixels>,
+    content_clip: Bounds<Pixels>,
+    content_width: Pixels,
+    visible_width: Pixels,
+    scroll_x: Pixels,
 }
 
 impl Element for BlockElement {
@@ -171,6 +185,8 @@ impl Element for BlockElement {
         let font_size = font_size_for_block(&self.block.kind, &self.style);
         let line_height = font_size * self.style.line_height.0;
         let spacing_above = spacing_above_for_block(&self.block.kind, &self.style);
+        let inner_pad = block_inner_padding(&self.block.kind, &self.style);
+        let is_code = is_code_block(&self.block.kind);
 
         let source = self.editor.read(cx).state.markdown.clone();
         style.size.width = relative(1.0).into();
@@ -187,16 +203,24 @@ impl Element for BlockElement {
                         _ => None,
                     })
                     .unwrap_or(px(f32::INFINITY));
-                let wrap_w = avail_w.max(px(1.0));
+                // Code blocks don't soft-wrap — long lines extend off
+                // the right edge of the visible region and the user
+                // scrolls horizontally to see them. Other blocks wrap
+                // at the available width.
+                let wrap_w = if is_code {
+                    None
+                } else {
+                    Some(avail_w.max(px(1.0)))
+                };
                 let lines = shape_block_lines(
                     &source,
                     &block_clone,
                     &style_clone,
                     font_size,
-                    Some(wrap_w),
+                    wrap_w,
                     window,
                 );
-                let mut h = spacing_above;
+                let mut h = spacing_above + inner_pad * 2.;
                 if lines.is_empty() {
                     h += line_height;
                 }
@@ -221,28 +245,50 @@ impl Element for BlockElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let (selection, source) = {
+        let (selection, source, scroll_offset) = {
             let editor = self.editor.read(cx);
-            (editor.state.selection, editor.state.markdown.clone())
+            let scroll = editor.code_block_scroll(self.block_index);
+            (
+                editor.state.selection,
+                editor.state.markdown.clone(),
+                scroll,
+            )
         };
 
         let style = self.style.clone();
         let font_size = font_size_for_block(&self.block.kind, &style);
         let line_height = font_size * style.line_height.0;
         let spacing_above = spacing_above_for_block(&self.block.kind, &style);
+        let inner_pad = block_inner_padding(&self.block.kind, &style);
+        let is_code = is_code_block(&self.block.kind);
 
         let block_top = bounds.origin.y + spacing_above;
-        let line_origin_x = bounds.origin.x;
+        // Code blocks inset their content from the rounded background
+        // fill by `inner_pad` on every edge. Non-code blocks have
+        // `inner_pad == 0` and behave as before.
+        let content_top = block_top + inner_pad;
+        let content_left = bounds.origin.x + inner_pad;
         let block_width = bounds.size.width;
+        let visible_content_width = (block_width - inner_pad * 2.).max(px(1.0));
 
-        let wrap_w = Some(block_width.max(px(1.0)));
+        let wrap_w = if is_code {
+            None
+        } else {
+            Some(block_width.max(px(1.0)))
+        };
         let shaped = shape_block_lines(&source, &self.block, &style, font_size, wrap_w, window);
 
         let mut lines: Vec<LaidOutLine> = Vec::new();
-        let mut cursor_y = block_top;
+        let mut content_cursor_y = content_top;
+        // Track the widest shaped line so we can size the horizontal
+        // scrollbar / cap the scroll offset for code blocks.
+        let mut max_line_width = px(0.0);
         for sl in shaped {
             let wrapped_h = line_height * ((sl.line.wrap_boundaries().len() as f32) + 1.0);
-            let origin = point(line_origin_x, cursor_y);
+            let origin = point(content_left, content_cursor_y);
+            if sl.line.width() > max_line_width {
+                max_line_width = sl.line.width();
+            }
             lines.push(LaidOutLine {
                 line: sl.line,
                 origin,
@@ -251,29 +297,55 @@ impl Element for BlockElement {
                 source_range: sl.source_range,
                 display_to_source: sl.display_to_source,
             });
-            cursor_y += wrapped_h;
+            content_cursor_y += wrapped_h;
         }
 
         if lines.is_empty() {
             // Empty block — fabricate a zero-content shaped line so cursor
-            // positioning still works on truly empty paragraphs.
+            // positioning still works on truly empty paragraphs / empty
+            // code blocks.
             if let Some(line) = empty_shaped_line(font_size, window) {
                 lines.push(LaidOutLine {
                     line,
-                    origin: point(line_origin_x, cursor_y),
+                    origin: point(content_left, content_cursor_y),
                     row_height: line_height,
                     wrapped_height: line_height,
                     source_range: self.block.source_range.clone(),
                     display_to_source: vec![self.block.source_range.start],
                 });
-                cursor_y += line_height;
+                content_cursor_y += line_height;
             }
         }
 
+        let block_bottom = content_cursor_y + inner_pad;
         let block_bounds = Bounds::new(
-            point(line_origin_x, block_top),
-            size(block_width, cursor_y - block_top),
+            point(bounds.origin.x, block_top),
+            size(block_width, block_bottom - block_top),
         );
+
+        // Cap horizontal scroll: the rightmost edge of the widest line
+        // should never go further left than `visible_content_width`.
+        let max_scroll = (max_line_width - visible_content_width).max(px(0.0));
+        let scroll_x = scroll_offset.min(max_scroll).max(px(0.0));
+        if is_code && scroll_x != scroll_offset {
+            // Out-of-range cached scroll (e.g. content shrank) — clamp
+            // it on the editor so subsequent frames see the corrected
+            // value.
+            let block_index = self.block_index;
+            self.editor.update(cx, |editor, _| {
+                editor.set_code_block_scroll(block_index, scroll_x);
+            });
+        }
+        // Translate every shaped-line origin by `-scroll_x` so the
+        // downstream code (cursor / selection geometry, hit-testing
+        // through `last_blocks`) sees positions in the *visible*
+        // coordinate space. The content_mask in `paint` clips anything
+        // that lands outside the visible band.
+        if is_code && scroll_x > px(0.0) {
+            for line in &mut lines {
+                line.origin.x -= scroll_x;
+            }
+        }
 
         let laid_out = LaidOutBlock {
             block_bounds,
@@ -298,10 +370,32 @@ impl Element for BlockElement {
             ));
         }
 
+        // Code-block-specific paint state: bg quad bounds, the inner
+        // content rect (used as content_mask for clipping), and the
+        // scrollbar geometry if content overflows.
+        let code_block_paint = if is_code {
+            Some(CodeBlockPaint {
+                bg_bounds: block_bounds,
+                content_clip: Bounds::new(
+                    point(bounds.origin.x + inner_pad, block_top + inner_pad),
+                    size(
+                        visible_content_width,
+                        block_bottom - block_top - inner_pad * 2.,
+                    ),
+                ),
+                content_width: max_line_width,
+                visible_width: visible_content_width,
+                scroll_x,
+            })
+        } else {
+            None
+        };
+
         PrepaintState {
             laid_out,
             cursor_quad,
             selection_quads,
+            code_block_paint,
         }
     }
 
@@ -329,25 +423,98 @@ impl Element for BlockElement {
             );
         }
 
-        for q in prepaint.selection_quads.drain(..) {
-            window.paint_quad(q);
+        let code_block_paint = prepaint.code_block_paint;
+
+        // Code blocks get a rounded background fill and clip their
+        // content to that fill (so long lines don't visually leak past
+        // the block's right edge into the next paragraph).
+        if let Some(cb) = &code_block_paint {
+            window.paint_quad(quad(
+                cb.bg_bounds,
+                self.style.code_block_radius,
+                self.style.code_block_background,
+                Edges::default(),
+                gpui::transparent_black(),
+                BorderStyle::default(),
+            ));
         }
 
-        for laid in &prepaint.laid_out.lines {
-            let _ = laid.line.paint(
-                laid.origin,
-                laid.row_height,
-                gpui::TextAlign::Left,
-                None,
-                window,
-                cx,
-            );
-        }
+        let mask = code_block_paint.as_ref().map(|cb| ContentMask {
+            bounds: cb.content_clip,
+        });
+        let cursor_quad = prepaint.cursor_quad.take();
+        let selection_quads = std::mem::take(&mut prepaint.selection_quads);
+        let lines: Vec<&LaidOutLine> = prepaint.laid_out.lines.iter().collect();
+        let focused = focus_handle.is_focused(window);
 
-        if focus_handle.is_focused(window)
-            && let Some(quad) = prepaint.cursor_quad.take()
+        window.with_content_mask(mask, |window| {
+            for q in selection_quads {
+                window.paint_quad(q);
+            }
+            for laid in &lines {
+                let _ = laid.line.paint(
+                    laid.origin,
+                    laid.row_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+            if focused && let Some(q) = cursor_quad {
+                window.paint_quad(q);
+            }
+        });
+
+        // Horizontal scrollbar overlay — only when the code block has
+        // overflow. A thin track at the bottom of the bg fill, with a
+        // muted thumb whose size and offset reflect the visible /
+        // total ratio. Painted *outside* the content mask so it stays
+        // visible when the user is scrolled past the right edge of
+        // their content.
+        if let Some(cb) = &code_block_paint
+            && cb.content_width > cb.visible_width
         {
-            window.paint_quad(quad);
+            paint_horizontal_scrollbar(window, cb, &self.style);
+        }
+
+        if let Some(cb) = code_block_paint {
+            // Capture for the scroll-wheel listener.
+            let editor = self.editor.clone();
+            let block_index = self.block_index;
+            let max_scroll = (cb.content_width - cb.visible_width).max(px(0.0));
+            let bg_bounds = cb.bg_bounds;
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
+                if !phase.bubble() {
+                    return;
+                }
+                if !bg_bounds.contains(&event.position) {
+                    return;
+                }
+                let dx = match event.delta {
+                    // Trackpad / pixel-precision wheel.
+                    ScrollDelta::Pixels(p) => p.x,
+                    // Discrete wheel — scale lines into ~16 px/line
+                    // for predictable feel.
+                    ScrollDelta::Lines(p) => px(p.x * 16.0),
+                };
+                if dx == px(0.0) {
+                    return;
+                }
+                editor.update(cx, |editor, cx| {
+                    let prev = editor.code_block_scroll(block_index);
+                    // Scroll wheel deltas on macOS are inverted (a
+                    // swipe-left on the trackpad gives positive dx
+                    // and means "scroll right" — i.e. show content
+                    // further to the right). Subtract `dx` so the
+                    // content tracks the swipe direction.
+                    let next = (prev - dx).clamp(px(0.0), max_scroll);
+                    if next != prev {
+                        editor.set_code_block_scroll(block_index, next);
+                        cx.notify();
+                    }
+                });
+            });
         }
 
         let laid_out = std::mem::replace(
@@ -367,6 +534,44 @@ impl Element for BlockElement {
             });
         });
     }
+}
+
+fn paint_horizontal_scrollbar(window: &mut Window, cb: &CodeBlockPaint, style: &MarkdownStyle) {
+    let track_h = px(4.0);
+    let track_pad = px(4.0);
+    let track_y = cb.bg_bounds.bottom() - track_h - track_pad;
+    let track_left = cb.bg_bounds.left() + track_pad;
+    let track_right = cb.bg_bounds.right() - track_pad;
+    let track_w = (track_right - track_left).max(px(1.0));
+
+    // Thumb: proportional to visible / content, offset by scroll
+    // position. Minimum thumb width keeps it draggable-feeling at
+    // very long content.
+    let ratio = (cb.visible_width / cb.content_width).clamp(0.05, 1.0);
+    let thumb_w = (track_w * ratio).max(px(24.0));
+    let scroll_ratio = if cb.content_width > cb.visible_width {
+        f32::from(cb.scroll_x) / f32::from(cb.content_width - cb.visible_width)
+    } else {
+        0.0
+    };
+    let thumb_x = track_left + (track_w - thumb_w) * scroll_ratio;
+
+    // Use the delimiter color (theme.muted_foreground) at low alpha so
+    // the thumb reads as chrome, not content.
+    let mut thumb_color = style.delimiter_color;
+    thumb_color.a *= 0.5;
+
+    window.paint_quad(quad(
+        Bounds::from_corners(
+            point(thumb_x, track_y),
+            point(thumb_x + thumb_w, track_y + track_h),
+        ),
+        track_h / 2.,
+        thumb_color,
+        Edges::default(),
+        gpui::transparent_black(),
+        BorderStyle::default(),
+    ));
 }
 
 fn union_bounds(a: Bounds<Pixels>, b: Bounds<Pixels>) -> Bounds<Pixels> {
@@ -390,6 +595,7 @@ fn font_size_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
     match kind {
         BlockKind::Heading { level } => style.size_for_heading(*level),
         BlockKind::Paragraph => style.font_size,
+        BlockKind::CodeBlock { .. } => style.mono_font_size,
     }
 }
 
@@ -397,9 +603,22 @@ fn spacing_above_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
     let rems_factor = match kind {
         BlockKind::Heading { level } if *level <= 2 => 1.5,
         BlockKind::Heading { .. } => 1.25,
-        BlockKind::Paragraph => style.paragraph_gap.0,
+        BlockKind::Paragraph | BlockKind::CodeBlock { .. } => style.paragraph_gap.0,
     };
     px(f32::from(style.font_size) * rems_factor)
+}
+
+/// Inner padding for a block's visible region — non-zero only for
+/// code blocks, which inset their content from the background fill.
+fn block_inner_padding(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
+    match kind {
+        BlockKind::CodeBlock { .. } => style.code_block_padding,
+        _ => px(0.0),
+    }
+}
+
+fn is_code_block(kind: &BlockKind) -> bool {
+    matches!(kind, BlockKind::CodeBlock { .. })
 }
 
 // ---------- Shaping ----------
@@ -460,6 +679,25 @@ fn shape_block_lines(
 
         let (display_text, display_to_source) =
             build_display_line(source, &logical_source_range, block);
+
+        // Hide-driven elision: if the source line had visible content
+        // (non-empty logical range) but every byte was hidden, drop
+        // the line entirely instead of emitting an empty shaped row.
+        // Without this, hiding a code block's opening fence
+        // (`build_display_line` returns "") would still consume one
+        // visible row of vertical space inside the block. Lines that
+        // were *originally* empty in source (e.g. a blank line in a
+        // paragraph or between content lines of a code block) keep
+        // emitting one row — that's the user's intent.
+        let was_empty_in_source = logical_source_range.start == logical_source_range.end;
+        if display_text.is_empty() && !was_empty_in_source {
+            cursor = raw_end;
+            if !trailing_nl {
+                break;
+            }
+            continue;
+        }
+
         let runs = build_runs_for_line(&display_text, &display_to_source, block, style);
 
         let shared = SharedString::from(display_text);
@@ -638,9 +876,13 @@ fn effective_inline_style(src_offset: usize, block: &RenderBlock) -> InlineStyle
     acc
 }
 
-fn base_font_for_block(_kind: &BlockKind, style: &MarkdownStyle) -> gpui::Font {
+fn base_font_for_block(kind: &BlockKind, style: &MarkdownStyle) -> gpui::Font {
+    let family = match kind {
+        BlockKind::CodeBlock { .. } => style.mono_font_family.clone(),
+        _ => style.font_family.clone(),
+    };
     gpui::Font {
-        family: style.font_family.clone(),
+        family,
         features: gpui::FontFeatures::default(),
         fallbacks: None,
         weight: FontWeight::NORMAL,

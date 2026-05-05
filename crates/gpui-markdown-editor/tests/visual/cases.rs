@@ -146,6 +146,44 @@ pub fn register(s: &mut Snapshots) {
         })
     });
 
+    // Fenced code block — cursor outside (fences hidden).
+    s.add("code_block_cursor_outside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "Some intro.\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\nTrailing prose.".into(),
+                // Cursor in trailing prose.
+                selection: Selection::Cursor(60),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Fenced code block — cursor inside (fences dimmed).
+    s.add("code_block_cursor_inside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "```rust\nfn main() {\n    println!(\"hi\");\n}\n```".into(),
+                // Inside content.
+                selection: Selection::Cursor(20),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Fenced code block — long line that overflows the visible width
+    // and triggers the horizontal scrollbar.
+    s.add("code_block_overflow_scrollbar", win, |window, cx| {
+        cx.new(|cx| {
+            let long = "let x = some_extremely_long_variable_name_that_will_definitely_exceed_the_block_width_at_720_px();";
+            let md = format!("```rust\n{long}\n```");
+            let state = EditorState {
+                markdown: md,
+                selection: Selection::Cursor(0),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
     // Trailing hard break: Shift+Enter at the end produces
     // `"paragraph 1  \n"`. Visually similar to the regular trailing
     // Enter but the empty trailing row sits *inside* the same paragraph

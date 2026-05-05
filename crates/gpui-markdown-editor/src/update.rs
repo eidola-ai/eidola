@@ -105,8 +105,18 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
 /// single linear scan, allocates only when there's something to fix).
 pub fn enforce_invariants(state: EditorState) -> EditorState {
     let bytes = state.markdown.as_bytes();
+    // Code-block content is exempt from the soft-break promotion rule:
+    // a single mid-content `\n` inside ```/~~~ fences is a literal line
+    // separator, not the ambiguous CommonMark soft break we promote
+    // elsewhere. Without this guard, paste of multi-line code into a
+    // fenced block would re-flow into a series of `\n\n`-separated
+    // paragraph-style rows.
+    let code_ranges = fenced_code_content_ranges(bytes);
     let mut promote_after: Vec<usize> = Vec::new();
     for p in 0..bytes.len() {
+        if is_in_ranges(p, &code_ranges) {
+            continue;
+        }
         if is_soft_break(bytes, p) {
             promote_after.push(p);
         }
@@ -178,6 +188,13 @@ fn snap_off_forbidden(bytes: &[u8], pos: usize, prev: usize) -> usize {
     if !is_forbidden_position(bytes, pos) {
         return pos;
     }
+    // Inside a fenced code block, a `\n\n` is a literal blank line in
+    // the user's code — not a structural paragraph break. Cursor
+    // positions there are perfectly valid; don't snap them away.
+    let code_ranges = fenced_code_content_ranges(bytes);
+    if is_in_ranges(pos, &code_ranges) {
+        return pos;
+    }
     if pos < prev {
         prev_allowed_position(bytes, pos)
     } else {
@@ -191,6 +208,110 @@ fn snap_off_forbidden(bytes: &[u8], pos: usize, prev: usize) -> usize {
 #[cfg(test)]
 pub(crate) fn is_forbidden_position_for_test(bytes: &[u8], p: usize) -> bool {
     is_forbidden_position(bytes, p)
+}
+
+/// Re-export for `editor::enter` so it can route Enter inside a code
+/// block to a single-`\n` insert.
+pub(crate) fn cursor_is_in_fenced_code_content(bytes: &[u8], p: usize) -> bool {
+    is_in_ranges(p, &fenced_code_content_ranges(bytes))
+}
+
+/// Find every fenced code block's full byte range in `bytes` —
+/// inclusive of the opening fence line, the inner content, and the
+/// closing fence line (or end-of-source for an unterminated block).
+///
+/// Used to exempt those bytes from the soft-break and forbidden-pair
+/// rules. Both rules are about paragraph-context structure; they don't
+/// apply inside a code block where every `\n` is content.
+///
+/// We intentionally don't go through pulldown-cmark here: this function
+/// runs inside `enforce_invariants` and `snap_off_forbidden`, both of
+/// which want a cheap byte-level answer. The scanner only knows about
+/// fences (` ``` ` and `~~~`), which is enough to gate the
+/// soft-break and forbidden-position rules. Indented code blocks
+/// require leading whitespace on every line and don't contain the
+/// `\n\n` patterns that would trigger either rule, so missing them is
+/// harmless.
+///
+/// CommonMark fence rules (loosely): opening fence is at most 3 leading
+/// spaces of indent then 3+ `` ` ``s or `~`s; closing fence matches
+/// the same character with at least the same length and only
+/// whitespace on the rest of the line.
+fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<core::ops::Range<usize>> {
+    let mut out: Vec<core::ops::Range<usize>> = Vec::new();
+    // (fence_char, fence_len, block_start) while inside an open block.
+    // `block_start` is the byte index of the opening fence line's
+    // first byte; the emitted range runs through the closing fence
+    // line's *trailing `\n`* (or end-of-source for unterminated).
+    let mut open: Option<(u8, usize, usize)> = None;
+
+    let mut p = 0;
+    while p < bytes.len() {
+        let line_start = p;
+        while p < bytes.len() && bytes[p] != b'\n' {
+            p += 1;
+        }
+        let line_end = p;
+        let line_after = if p < bytes.len() { p + 1 } else { p };
+
+        let mut q = line_start;
+        let mut indent = 0;
+        while q < line_end && indent < 4 && bytes[q] == b' ' {
+            q += 1;
+            indent += 1;
+        }
+        let fence_char = if q < line_end && (bytes[q] == b'`' || bytes[q] == b'~') {
+            Some(bytes[q])
+        } else {
+            None
+        };
+
+        if let Some(fc) = fence_char
+            && indent < 4
+        {
+            let mut r = q;
+            while r < line_end && bytes[r] == fc {
+                r += 1;
+            }
+            let fence_len = r - q;
+            if fence_len >= 3 {
+                if let Some((open_fc, open_len, block_start)) = open {
+                    if fc == open_fc && fence_len >= open_len {
+                        let mut s = r;
+                        let mut only_ws = true;
+                        while s < line_end {
+                            if bytes[s] != b' ' && bytes[s] != b'\t' {
+                                only_ws = false;
+                                break;
+                            }
+                            s += 1;
+                        }
+                        if only_ws {
+                            // Range covers the whole block, including
+                            // the closing fence line *and* its
+                            // trailing `\n`.
+                            out.push(block_start..line_after);
+                            open = None;
+                        }
+                    }
+                } else {
+                    open = Some((fc, fence_len, line_start));
+                }
+            }
+        }
+
+        p = line_after;
+    }
+
+    if let Some((_, _, block_start)) = open {
+        out.push(block_start..bytes.len());
+    }
+
+    out
+}
+
+fn is_in_ranges(p: usize, ranges: &[core::ops::Range<usize>]) -> bool {
+    ranges.iter().any(|r| p >= r.start && p < r.end)
 }
 
 /// Is byte index `p` the interior of a structural `\n\n` pair? Pairs are
