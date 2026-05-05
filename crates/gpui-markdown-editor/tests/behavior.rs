@@ -593,6 +593,72 @@ fn code_block_renders_as_code_block_kind(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn backspace_inside_code_block_deletes_one_newline(cx: &mut TestAppContext) {
+    // Outside code blocks, backspacing into a `\n\n` pair deletes the
+    // whole pair (the structural paragraph break). Inside a code
+    // block, `\n\n` is a literal blank line — Backspace should
+    // remove just one `\n`.
+    let initial = EditorState {
+        markdown: "```\nline1\n\nline2\n```".into(),
+        // Cursor right after the second `\n` (start of "line2").
+        selection: Selection::Cursor(11),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "```\nline1\nline2\n```");
+        assert_eq!(e.cursor_offset(), 10);
+    });
+}
+
+#[gpui::test]
+fn delete_forward_inside_code_block_deletes_one_newline(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "```\nline1\n\nline2\n```".into(),
+        // Cursor at the first `\n` of the `\n\n` pair (end of
+        // "line1").
+        selection: Selection::Cursor(9),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Delete);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "```\nline1\nline2\n```");
+        assert_eq!(e.cursor_offset(), 9);
+    });
+}
+
+#[gpui::test]
+fn cursor_can_land_in_blank_line_inside_code_block(cx: &mut TestAppContext) {
+    // The forbidden-position rule (cursor can't sit inside a
+    // structural `\n\n` pair) doesn't apply in code blocks — a
+    // blank code line is a real, addressable position. Setting the
+    // cursor to the interior of a `\n\n` inside a code block must
+    // *not* snap it elsewhere.
+    let initial = EditorState {
+        markdown: "```\nline1\n\nline2\n```".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _window, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            // Position 10 is the interior of the `\n\n` pair
+            // separating "line1" and "line2".
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(10)),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.cursor_offset(), 10);
+    });
+}
+
+#[gpui::test]
 fn pasted_multiline_inside_code_block_keeps_single_newlines(cx: &mut TestAppContext) {
     // The exact regression: paste of source containing single `\n`s
     // inside a fenced block must NOT have its newlines promoted to

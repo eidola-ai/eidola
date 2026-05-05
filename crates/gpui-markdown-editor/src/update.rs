@@ -188,13 +188,6 @@ fn snap_off_forbidden(bytes: &[u8], pos: usize, prev: usize) -> usize {
     if !is_forbidden_position(bytes, pos) {
         return pos;
     }
-    // Inside a fenced code block, a `\n\n` is a literal blank line in
-    // the user's code — not a structural paragraph break. Cursor
-    // positions there are perfectly valid; don't snap them away.
-    let code_ranges = fenced_code_content_ranges(bytes);
-    if is_in_ranges(pos, &code_ranges) {
-        return pos;
-    }
     if pos < prev {
         prev_allowed_position(bytes, pos)
     } else {
@@ -314,18 +307,32 @@ fn is_in_ranges(p: usize, ranges: &[core::ops::Range<usize>]) -> bool {
     ranges.iter().any(|r| p >= r.start && p < r.end)
 }
 
-/// Is byte index `p` the interior of a structural `\n\n` pair? Pairs are
-/// the atomic unit of paragraph-break-or-empty in the source; cursors
-/// must not sit inside one.
+/// Is byte index `p` a forbidden cursor position?
 ///
-/// Test: `bytes[p-1]` and `bytes[p]` are both `\n`, and the count of
-/// consecutive **structural** `\n`s ending at `p-1` is odd. Hard breaks
-/// (`  \n` or `\\\n`) are in-paragraph content; the back-walk stops
-/// before counting one. Hard-break `\n`s only appear at the *start* of a
-/// run of consecutive `\n`s — a `\n` mid-run is preceded by another
-/// `\n`, not by spaces or a backslash — so the check at the back-walk's
-/// terminus is enough.
+/// Forbidden positions are pair interiors of *structural* `\n\n` runs
+/// — paragraph breaks and synthetic empty paragraphs. Inside a fenced
+/// code block, the same byte pattern is just a blank line of code, so
+/// every offset is allowed. Hard breaks (`  \n` / `\\\n`) are
+/// in-paragraph content and exempt regardless of code-block context.
 fn is_forbidden_position(bytes: &[u8], p: usize) -> bool {
+    if !is_paragraph_break_interior(bytes, p) {
+        return false;
+    }
+    // Inside a fenced code block, `\n\n` is a literal blank line in
+    // the user's code, not a structural pair. The single
+    // structural-paragraph-break rule doesn't apply there.
+    !is_in_ranges(p, &fenced_code_content_ranges(bytes))
+}
+
+/// The pure structural test for `\n\n` pair interiors, without the
+/// code-block escape hatch. `bytes[p-1]` and `bytes[p]` are both `\n`,
+/// and the count of consecutive **structural** `\n`s ending at `p-1`
+/// is odd. Hard breaks (`  \n` or `\\\n`) are in-paragraph content;
+/// the back-walk stops before counting one. Hard-break `\n`s only
+/// appear at the *start* of a run of consecutive `\n`s — a `\n`
+/// mid-run is preceded by another `\n`, not by spaces or a backslash
+/// — so the check at the back-walk's terminus is enough.
+fn is_paragraph_break_interior(bytes: &[u8], p: usize) -> bool {
     if p == 0 || p >= bytes.len() {
         return false;
     }
@@ -452,9 +459,13 @@ fn delete_backward(state: EditorState) -> EditorState {
     // If we're backspacing into a `\n` run, treat the run atomically: a
     // 2-newline mid-content run gets deleted in one go (otherwise the
     // post-pass would re-promote and the keypress would feel like a no-op).
+    // Inside a fenced code block, `\n`s are literal line separators
+    // — pair-deleting them would silently merge two distinct code
+    // lines on a single keystroke. Fall through to the regular
+    // grapheme delete path instead.
     let extent = {
         let bytes = state.markdown.as_bytes();
-        if bytes[cursor - 1] == b'\n' {
+        if bytes[cursor - 1] == b'\n' && !cursor_is_in_fenced_code_content(bytes, cursor) {
             let (run_start, run_end) = newline_run_around(bytes, cursor - 1);
             Some(paragraph_break_delete_extent(bytes, run_start, run_end))
         } else {
@@ -484,7 +495,7 @@ fn delete_forward(state: EditorState) -> EditorState {
 
     let extent = {
         let bytes = state.markdown.as_bytes();
-        if bytes[cursor] == b'\n' {
+        if bytes[cursor] == b'\n' && !cursor_is_in_fenced_code_content(bytes, cursor) {
             let (run_start, run_end) = newline_run_around(bytes, cursor);
             Some(paragraph_break_delete_extent(bytes, run_start, run_end))
         } else {
