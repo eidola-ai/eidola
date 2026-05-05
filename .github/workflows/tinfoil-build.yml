@@ -20,19 +20,28 @@ on:
     tags:
       - "v*"
 
+# Each tag run is unique and produces a release; serialize rather than cancel.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
 jobs:
   release:
     name: Attest and release
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: write # create the GitHub release for the tag
+      id-token: write # mint the OIDC token used for Sigstore attestation
+      attestations: write # publish the Sigstore attestation via actions/attest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Build and release
         uses: tinfoilsh/measure-image-action@9733d724326dd6b476335ec513210861894d4cb2 # v0.8.2
