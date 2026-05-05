@@ -362,13 +362,19 @@ fn block_content_start(bytes: &[u8], range: &Range<usize>) -> usize {
     p
 }
 
-/// One past the last non-`\n` byte in `range`. pulldown-cmark sometimes
-/// folds a single trailing `\n` into a paragraph's range; trimming here
-/// makes the inter-block-gap arithmetic count newlines uniformly between
-/// *content* boundaries.
+/// One past the last non-`\n` byte in `range`, *except* `\n`s that are
+/// hard breaks (`  \n` or `\\\n`). Hard breaks are in-paragraph line
+/// breaks — part of the block's content — so they stay inside the
+/// block's range. Only "structural" trailing `\n`s (the kind pulldown-
+/// cmark folds in as a paragraph terminator) get trimmed.
 fn block_content_end_excl(bytes: &[u8], range: &Range<usize>) -> usize {
     let mut p = range.end;
     while p > range.start && bytes[p - 1] == b'\n' {
+        let preceded_by_two_spaces = p >= 3 && bytes[p - 2] == b' ' && bytes[p - 3] == b' ';
+        let preceded_by_backslash = p >= 2 && bytes[p - 2] == b'\\';
+        if preceded_by_two_spaces || preceded_by_backslash {
+            break;
+        }
         p -= 1;
     }
     p
@@ -674,6 +680,29 @@ mod tests {
             })
             .count();
         assert_eq!(trailing, 1);
+    }
+
+    #[test]
+    fn trailing_hard_break_keeps_block_range_intact() {
+        // Pressing Shift+Enter at the end of "paragraph 1" produces
+        // "paragraph 1  \n" — the trailing `\n` is part of an
+        // in-paragraph hard break, not a paragraph terminator. The
+        // block's range must still cover it (so the element layer can
+        // render the implicit empty trailing line within the same
+        // paragraph), and *no* trailing empty paragraph block should be
+        // emitted (that would produce an extra paragraph_gap).
+        let spec = render_with_cursor("paragraph 1  \n", 0);
+        assert_eq!(spec.blocks.len(), 1);
+        let block = &spec.blocks[0];
+        assert_eq!(block.source_range, 0..14);
+        assert!(matches!(block.kind, BlockKind::Paragraph));
+    }
+
+    #[test]
+    fn trailing_backslash_hard_break_kept_in_block_range() {
+        let spec = render_with_cursor("paragraph 1\\\n", 0);
+        assert_eq!(spec.blocks.len(), 1);
+        assert_eq!(spec.blocks[0].source_range, 0..13);
     }
 
     #[test]

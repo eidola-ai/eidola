@@ -142,6 +142,21 @@ pub fn register(s: &mut Snapshots) {
             MarkdownEditor::with_state(state, window, cx)
         })
     });
+
+    // Trailing hard break: Shift+Enter at the end produces
+    // `"paragraph 1  \n"`. Visually similar to the regular trailing
+    // Enter but the empty trailing row sits *inside* the same paragraph
+    // (no paragraph_gap between the content row and the empty row),
+    // matching CommonMark hard-break semantics.
+    s.add("trailing_hard_break", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "paragraph 1  \n".into(),
+                selection: Selection::Cursor(14),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
 }
 
 /// Build an editor whose cursor is placed inside `needle` (3 chars in, by

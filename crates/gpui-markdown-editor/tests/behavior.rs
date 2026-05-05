@@ -14,7 +14,7 @@ use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
 use gpui_component::Root;
 use gpui_markdown_editor::editor::{
     Backspace, Delete, DocumentEnd, DocumentStart, Down, End, Enter, Home, Right, SelectAll,
-    ShiftRight, Up,
+    ShiftEnter, ShiftRight, Up,
 };
 use gpui_markdown_editor::{BlockKind, EditorState, MarkdownEditor, RenderSpec, Selection};
 
@@ -178,6 +178,33 @@ fn select_all_spans_document(cx: &mut TestAppContext) {
     editor.read_with(cx, |e, _| {
         assert_eq!(e.state.selection, Selection::range(0, 5));
     });
+}
+
+#[gpui::test]
+fn shift_enter_at_end_of_paragraph_keeps_cursor_in_same_paragraph(cx: &mut TestAppContext) {
+    // The companion to `enter_at_end_of_paragraph_creates_visible_trailing_empty`.
+    // Shift+Enter inserts a hard break (`  \n`); the user expects the
+    // cursor to drop to a new visible line *inside* the same paragraph,
+    // not to a new separate paragraph.
+    let initial = EditorState {
+        markdown: "paragraph 1".into(),
+        selection: Selection::Cursor(11),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftEnter);
+
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "paragraph 1  \n");
+        assert_eq!(e.cursor_offset(), 14);
+    });
+
+    // Single block (paragraph), no trailing empty paragraph injected —
+    // the trailing `\n` is content of this paragraph (the hard-break
+    // terminator) and the implicit empty trailing line is rendered
+    // *within* the block by `element.rs::shape_block_lines`.
+    let spec = current_spec(cx, &editor);
+    assert_eq!(spec.blocks.len(), 1);
+    assert_eq!(spec.blocks[0].source_range, 0..14);
 }
 
 #[gpui::test]

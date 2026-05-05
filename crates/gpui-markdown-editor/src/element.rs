@@ -446,7 +446,45 @@ fn shape_block_lines(
             break;
         }
     }
+
+    // If the block ends with a hard break (`  \n` or `\\\n`), that
+    // trailing `\n` is in-paragraph content (an explicit line break),
+    // not a paragraph terminator. Emit a visible empty trailing line so
+    // the cursor at `block.range.end` lands below the content row.
+    // (Other blocks ending in `\n` — most importantly the synthetic
+    // single-`\n` empty paragraphs from `inject_empty_paragraphs` — are
+    // *not* hard breaks and don't need this treatment.)
+    if ends_with_hard_break(block_text)
+        && let Some(last) = out.last_mut()
+    {
+        if last.source_range.end > last.source_range.start {
+            last.source_range.end -= 1;
+        }
+        if let Some(empty_line) = empty_shaped_line(font_size, window) {
+            out.push(ShapedLine {
+                line: empty_line,
+                source_range: block.source_range.end..block.source_range.end,
+                display_to_source: vec![block.source_range.end],
+            });
+        }
+    }
+
     out
+}
+
+fn ends_with_hard_break(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    if n == 0 || bytes[n - 1] != b'\n' {
+        return false;
+    }
+    if n >= 3 && bytes[n - 2] == b' ' && bytes[n - 3] == b' ' {
+        return true;
+    }
+    if n >= 2 && bytes[n - 2] == b'\\' {
+        return true;
+    }
+    false
 }
 
 fn build_display_line(
