@@ -13,6 +13,7 @@
 //!                                              BlockElement (gpui Element, one per block)
 //! ```
 
+pub mod analysis;
 pub mod editor;
 pub mod element;
 pub mod event;

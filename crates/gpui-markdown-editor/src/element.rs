@@ -243,31 +243,16 @@ impl Element for BlockElement {
                     wrap_w,
                     window,
                 );
-                let mut h = spacing_above + inner_pad * 2.;
-                if lines.is_empty() {
-                    h += line_height;
-                }
-                for line in &lines {
-                    h += line_height * ((line.line.wrap_boundaries().len() as f32) + 1.0);
-                }
-                // Code blocks insert vertical breathing room between
-                // each fence row and the adjacent content lines —
-                // contributes once at fence→content and once at
-                // content→fence (or once trailing if there's no
-                // closing fence). Non-code blocks have no
-                // delimiters and skip this entirely.
-                if is_code {
-                    let mut last_was_delim = true;
-                    for line in &lines {
-                        if line.is_delimiter != last_was_delim {
-                            h += style_clone.code_block_content_padding_y;
-                        }
-                        last_was_delim = line.is_delimiter;
-                    }
-                    if !last_was_delim {
-                        h += style_clone.code_block_content_padding_y;
-                    }
-                }
+                // Block height is `spacing_above` + 2× `inner_pad` +
+                // (sum of shaped line heights with code-block
+                // breathing). The same content arithmetic runs in
+                // `prepaint` to position lines — extracted into
+                // `shaped_content_height` so the two phases can't
+                // drift on wrap math, breathing pads, or the empty-
+                // block fallback.
+                let h = spacing_above
+                    + inner_pad * 2.
+                    + shaped_content_height(&lines, line_height, is_code, &style_clone);
                 Size {
                     width: avail_w,
                     height: h,
@@ -857,6 +842,45 @@ struct ShapedLine {
     source_range: Range<usize>,
     display_to_source: Vec<usize>,
     is_delimiter: bool,
+}
+
+/// Total inner-content height contributed by a list of shaped lines:
+/// the sum of per-line heights (each line's `line_height` * (wrap
+/// boundaries + 1)), plus code-block breathing pads at every
+/// fence↔content transition and after a trailing content tail. An
+/// empty list reserves one `line_height` of space (the empty-block
+/// fallback row that `prepaint` fabricates a shaped line for).
+///
+/// `request_layout` and `prepaint` both call this. Keeping the
+/// arithmetic in one place is the only way to be certain the height
+/// `request_layout` returned matches the height `prepaint` actually
+/// fills with shaped lines.
+fn shaped_content_height(
+    lines: &[ShapedLine],
+    line_height: Pixels,
+    is_code: bool,
+    style: &MarkdownStyle,
+) -> Pixels {
+    if lines.is_empty() {
+        return line_height;
+    }
+    let mut h = px(0.0);
+    for line in lines {
+        h += line_height * ((line.line.wrap_boundaries().len() as f32) + 1.0);
+    }
+    if is_code {
+        let mut last_was_delim = true; // "above the block" is a fence
+        for line in lines {
+            if line.is_delimiter != last_was_delim {
+                h += style.code_block_content_padding_y;
+            }
+            last_was_delim = line.is_delimiter;
+        }
+        if !last_was_delim {
+            h += style.code_block_content_padding_y;
+        }
+    }
+    h
 }
 
 /// One block, one logical line at a time. For each line we build the display
@@ -1550,7 +1574,7 @@ mod tests {
                     claims.len() <= 1,
                     "offset {offset} in {src:?} claimed by multiple blocks {claims:?}"
                 );
-                if !crate::update::is_forbidden_position_for_test(bytes, offset) {
+                if !crate::analysis::is_forbidden_position(bytes, offset) {
                     assert_eq!(
                         claims.len(),
                         1,
