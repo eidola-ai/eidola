@@ -117,18 +117,28 @@ The first cut covers:
   `Heading`) recurses to emit its own leaves. Every leaf carries
   the same `Container::ListItem` chain entry for the item it sits
   in — nested items pick up an additional entry per level, so a
-  triple-nested item's leaf carries three. The element layer adds
-  `list_indent` of left padding per `Container::ListItem` entry,
-  so nesting compounds visually. The first leaf an item emits has
-  its source range extended back to the item's start so the marker
-  shapes into its line; subsequent leaves extend back over leading
-  indent so the indent shapes with the content. **Tab** nests the
-  cursor's item under the previous sibling at its depth (no-op if
-  there's no previous sibling); **Shift+Tab** dedents the item by
-  one level, falling through to "drop the marker" at depth 0. For
-  unordered items, the marker (`- `, `* `, `+ `) substitutes to a
-  bullet glyph (`• `) when the cursor is outside the item — the
-  raw marker reappears when the cursor enters so it can be edited.
+  triple-nested item's leaf carries three. Each entry records this
+  item's `marker_byte_len` and the parent list's
+  `list_max_marker_text` (the widest marker text by digit count —
+  for `1..11` items that's `"11. "`, for unordered lists
+  canonicalized to `"- "`). The element layer shapes
+  `list_max_marker_text` in the body font and uses
+  `list_indent + marker_pixel_width` as that level's left padding,
+  so every item in the list aligns at the same content edge
+  regardless of its own marker's width. The marker bytes
+  themselves are always hidden from the shaped line (analogous to
+  the blockquote `>` overlay treatment) and the marker glyph
+  paints as a `MarkerOverlay` right-aligned inside the item's
+  indent strip. The renderer additionally hides the cumulative
+  ancestor-indent on every continuation line of every leaf so
+  nested content and wraparound text shape from the same column
+  as the first line. **Tab** nests the cursor's item under the
+  previous sibling at its depth (no-op if there's no previous
+  sibling); **Shift+Tab** dedents the item by one level, falling
+  through to "drop the marker" at depth 0. For unordered items
+  the overlay glyph is `• ` when the cursor is outside the item
+  and the raw bullet char (`- `, `* `, `+ `) when inside, so the
+  user has visual feedback while editing the marker scope.
   Ordered items keep their digits visible always (the numbers
   carry meaning); they renumber automatically when items are
   inserted, removed, or reordered: every item in an ordered list

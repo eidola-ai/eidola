@@ -336,6 +336,102 @@ pub fn register(s: &mut Snapshots) {
             MarkdownEditor::with_state(state, window, cx)
         })
     });
+
+    // ---- Lists ----------------------------------------------------------
+
+    // Unordered list — bullet glyphs render in the indent strip,
+    // content shapes from a uniform left edge.
+    s.add("unordered_list_cursor_outside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "- foo\n- bar\n- baz\n\nbody".into(),
+                // Cursor outside the list.
+                selection: Selection::Cursor(20),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Same source, cursor on one of the items — shows the raw `-`
+    // bullet char (vs the `•` shown when outside) so the user has
+    // visual feedback they're inside the marker scope.
+    s.add("unordered_list_cursor_inside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "- foo\n- bar\n- baz".into(),
+                selection: Selection::Cursor(8),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Ordered list spanning a digit-count boundary — items 1-9
+    // shape as 2-char markers (`1.`-`9.`) and items 10-11 as
+    // 3-char markers (`10.`/`11.`). Every item's content edge
+    // aligns at the column of the *widest* marker, so `1. one`
+    // shares its content X with `11. eleven`.
+    s.add("ordered_list_mixed_width_markers", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: concat!(
+                    "1. one\n",
+                    "2. two\n",
+                    "3. three\n",
+                    "4. four\n",
+                    "5. five\n",
+                    "6. six\n",
+                    "7. seven\n",
+                    "8. eight\n",
+                    "9. nine\n",
+                    "10. ten\n",
+                    "11. eleven\n",
+                )
+                .into(),
+                // Cursor at end of doc (outside any item, so all
+                // markers paint as their digit form).
+                selection: Selection::Cursor(0),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Nested list — inner items pick up additional indent from
+    // their `Container::ListItem` chain entry. Outer markers sit
+    // in their own strip; inner markers in theirs.
+    s.add("nested_list", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "- outer\n  - inner one\n  - inner two\n- outer two".into(),
+                selection: Selection::Cursor(0),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Triple-nested list — three indent strips stack. `containers_left_indent`
+    // sums each level's marker width plus the leading `list_indent`.
+    s.add("triple_nested_list", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "- a\n  - b\n    - c".into(),
+                selection: Selection::Cursor(0),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Multi-paragraph item — the second paragraph's leading
+    // continuation indent is hidden so its content shapes from the
+    // same column as the first paragraph.
+    s.add("multi_paragraph_list_item", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "- first paragraph\n\n  second paragraph at the same column\n".into(),
+                selection: Selection::Cursor(0),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
 }
 
 /// Build an editor whose cursor is placed inside `needle` (3 chars in, by

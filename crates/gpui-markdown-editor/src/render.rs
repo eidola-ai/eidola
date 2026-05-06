@@ -50,8 +50,8 @@
 use std::ops::Range;
 
 use crate::render_spec::{
-    BlockKind, Container, InlineRun, InlineStyle, ListItemKind, RenderBlock, RenderSpec,
-    Substitution,
+    BlockKind, Container, InlineRun, InlineStyle, ListItemKind, MarkerOverlay, RenderBlock,
+    RenderSpec,
 };
 use crate::state::{EditorState, Selection};
 use crate::syntax::{ListKind, NodeKind, SyntaxNode};
@@ -288,6 +288,12 @@ fn render_list(
         ListKind::Ordered { start } => Some(start),
         ListKind::Unordered => None,
     };
+    // Compute the widest marker text in this list once. Every sibling
+    // item carries the same string on its `Container::ListItem` chain
+    // entry; the element layer measures it to size the marker column
+    // so all items align at the same content edge regardless of
+    // their own marker's width.
+    let max_marker_text = compute_list_max_marker_text(node, kind);
     for child in &node.children {
         let NodeKind::ListItem { marker_range } = &child.kind else {
             continue;
@@ -304,11 +310,39 @@ fn render_list(
             child,
             marker_range,
             item_kind,
+            &max_marker_text,
             source,
             cursor,
             containers,
             out,
         );
+    }
+}
+
+/// Widest marker *text* anywhere in this list.
+///
+/// For unordered lists every marker is two bytes (`- `, `* `, or `+ `);
+/// they shape to nearly identical pixel widths. We canonicalize to
+/// `"- "` so the indent computation is stable regardless of which
+/// bullet char a particular item uses.
+///
+/// For ordered lists the widest marker is whichever item has the most
+/// digits — `start + child_count - 1`. We format it back with the
+/// `". "` suffix the parser uses today; once `)` markers are
+/// supported the canonicalization will need to round-trip the actual
+/// punctuation.
+fn compute_list_max_marker_text(node: &SyntaxNode, kind: ListKind) -> String {
+    match kind {
+        ListKind::Unordered => "- ".to_string(),
+        ListKind::Ordered { start } => {
+            let count = node
+                .children
+                .iter()
+                .filter(|c| matches!(c.kind, NodeKind::ListItem { .. }))
+                .count() as u64;
+            let max_n = if count <= 1 { start } else { start + count - 1 };
+            format!("{}. ", max_n)
+        }
     }
 }
 
@@ -339,27 +373,47 @@ fn marker_char(source: &str, marker_range: &Range<usize>) -> u8 {
 ///   entry — the recursive `render_node` call passes the chain
 ///   through.
 ///
-/// The first leaf the item emits has its source range extended
-/// back to the item's start so the marker (`- ` / `1. `) is shaped
-/// into its line. Subsequent leaves extend back over their leading
-/// indent so the indent shapes together with the content
-/// (positioning the next paragraph or nested-list line under the
-/// first paragraph's content column).
+/// The first leaf the item emits has its source range extended back
+/// to the item's start so the marker (`- ` / `1. `) sits inside the
+/// leaf for hide-and-overlay treatment. Subsequent leaves extend
+/// back over their leading indent so the same hide-and-overlay
+/// applies to continuation indent. The marker bytes are always
+/// hidden from the shaped line (so content shapes at column 0
+/// regardless of marker width or cursor position) and the marker
+/// glyph is painted as a `MarkerOverlay` in the item's indent strip
+/// — analogous to the blockquote `>` overlay treatment.
+///
+/// After all leaves are emitted, this item's own contribution to
+/// the cumulative continuation indent is hidden on every leaf
+/// inside its source range (direct + recursed). Each enclosing list
+/// item's call hides *its* contribution on top, so cumulatively
+/// the entire `total_marker_widths` worth of leading bytes
+/// disappears from the shaped line — the visual indent is then
+/// produced entirely by the container chain's left padding.
+#[allow(clippy::too_many_arguments)]
 fn render_list_item(
     node: &SyntaxNode,
     marker_range: &Range<usize>,
     item_kind: ListItemKind,
+    list_max_marker_text: &str,
     source: &str,
     cursor: CursorRange,
     containers: &[Container],
     out: &mut Vec<RenderBlock>,
 ) {
     let cursor_inside = cursor.overlaps(&node.range);
+    let item_marker_byte_len = marker_range.end - marker_range.start;
     let mut chain = containers.to_vec();
     chain.push(Container::ListItem {
         cursor_inside,
         kind: item_kind,
+        marker_byte_len: item_marker_byte_len,
+        list_max_marker_text: list_max_marker_text.to_string(),
     });
+    // Index of *this* item's `Container::ListItem` entry in the chain
+    // — used as the marker overlay's `level` so the element layer
+    // paints into this level's indent strip.
+    let item_level = chain.len() - 1;
     let bytes = source.as_bytes();
     let leaves_start_idx = out.len();
 
@@ -425,23 +479,6 @@ fn render_list_item(
     }
     emit_inline_run(&mut inline_run, &mut emitted_first, out);
 
-    // Bullet substitution: for unordered items, when the cursor is
-    // outside the item, replace the marker bytes (`- `, `* `, `+ `)
-    // with a bullet glyph in the first leaf's shaped line. The
-    // substitution lives in `RenderBlock::substitutions`; the
-    // element layer handles the display swap and remaps cursor
-    // positions through the substitution. Ordered items keep their
-    // numbers visible — the digits convey ordering information.
-    if !cursor_inside
-        && matches!(item_kind, ListItemKind::Unordered(_))
-        && let Some(first_leaf) = out.get_mut(leaves_start_idx)
-    {
-        first_leaf.substitutions.push(Substitution {
-            source_range: marker_range.clone(),
-            display: "• ".to_string(),
-        });
-    }
-
     // Empty item (no children at all, or the recursion emitted
     // nothing) — emit a single empty leaf so the item's source
     // range is claimed by something. Otherwise the cursor /
@@ -450,6 +487,100 @@ fn render_list_item(
         let mut block = RenderBlock::new(node.range.clone(), BlockKind::Paragraph);
         block.containers = chain;
         out.push(block);
+    }
+
+    // Identify the leaf that owns the marker line — i.e., the leaf
+    // whose source_range starts at or before the item's start.
+    // After `extend_leading_range` runs for the first emitted leaf,
+    // it'll be the one with `source_range.start == node.range.start`.
+    // For an empty item the synthetic leaf above also satisfies this.
+    let first_leaf_idx = out
+        .iter()
+        .enumerate()
+        .skip(leaves_start_idx)
+        .find(|(_, leaf)| leaf.source_range.start <= node.range.start)
+        .map(|(i, _)| i);
+
+    if let Some(idx) = first_leaf_idx {
+        let first_leaf = &mut out[idx];
+        // Hide the marker bytes (and any leading ancestor indent on
+        // this line) from the shaped first line — the marker is
+        // rendered as an overlay glyph in the indent strip instead.
+        let line_end = source_line_end(bytes, first_leaf.source_range.start);
+        // `source_line_end` returns the offset *past* the trailing
+        // `\n`; trim it so we don't accidentally hide the newline.
+        let line_end = if line_end > 0 && bytes.get(line_end - 1) == Some(&b'\n') {
+            line_end - 1
+        } else {
+            line_end
+        };
+        let hide_end = marker_range.end.min(line_end);
+        if hide_end > first_leaf.source_range.start {
+            first_leaf
+                .hidden_ranges
+                .push(first_leaf.source_range.start..hide_end);
+        }
+        // Push the marker overlay so the element layer paints the
+        // marker text in this item's indent strip. The element layer
+        // resolves the marker text to display from `containers[level]`
+        // (kind + cursor_inside).
+        first_leaf.marker_overlays.push(MarkerOverlay {
+            source_range: marker_range.clone(),
+            level: item_level,
+        });
+    }
+
+    // Hide *this* item's contribution to leading indent on every
+    // line of every leaf the item produced (direct + recursed). Each
+    // enclosing list item adds its own contribution on top, so the
+    // cumulative `total_marker_widths` of leading whitespace is
+    // hidden across the chain.
+    for leaf in &mut out[leaves_start_idx..] {
+        hide_item_continuation_indent(leaf, item_marker_byte_len, bytes);
+    }
+}
+
+/// Hide up to `item_marker_byte_len` leading-space bytes on every
+/// line in `leaf.source_range`. Marker chars on the first leaf's
+/// first line are hidden separately by `render_list_item` as a bulk
+/// range that may overlap this hide — `build_display_line` collapses
+/// overlapping hidden ranges, so the redundancy is benign.
+fn hide_item_continuation_indent(
+    leaf: &mut RenderBlock,
+    item_marker_byte_len: usize,
+    bytes: &[u8],
+) {
+    if item_marker_byte_len == 0 {
+        return;
+    }
+    let leaf_range = leaf.source_range.clone();
+    let mut p = leaf_range.start;
+    while p < leaf_range.end {
+        let line_end_inclusive_nl = source_line_end(bytes, p);
+        let line_content_end =
+            if line_end_inclusive_nl > 0 && bytes.get(line_end_inclusive_nl - 1) == Some(&b'\n') {
+                line_end_inclusive_nl - 1
+            } else {
+                line_end_inclusive_nl
+            }
+            .min(leaf_range.end);
+
+        let mut q = p;
+        let limit = (p + item_marker_byte_len).min(line_content_end);
+        while q < limit && bytes[q] == b' ' {
+            q += 1;
+        }
+        if q > p {
+            leaf.hidden_ranges.push(p..q);
+        }
+        p = line_end_inclusive_nl.min(leaf_range.end);
+        if p < leaf_range.end && bytes[p] == b'\n' {
+            p += 1;
+        } else if p == line_end_inclusive_nl && p == line_content_end {
+            // No trailing newline (last line) and we've consumed the
+            // whole line — stop the loop.
+            break;
+        }
     }
 }
 

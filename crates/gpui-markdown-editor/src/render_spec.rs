@@ -101,9 +101,23 @@ pub enum Container {
     /// the cursor's position vs. the item's source range. `kind` lets
     /// the editor choose what to insert when the user presses Enter at
     /// the end of an item (next bullet vs next number).
+    ///
+    /// `marker_byte_len` is this item's specific marker length in
+    /// source bytes (e.g. `2` for `- `, `4` for `24. `). Used to
+    /// detect and hide the matching continuation indent on subsequent
+    /// lines of the item.
+    ///
+    /// `list_max_marker_text` is the widest marker text anywhere in
+    /// the parent list (e.g. `"31. "` for an ordered list ending at
+    /// item 31, `"- "` for any unordered list). The element layer
+    /// shapes this string in the body font and uses its width as
+    /// every sibling's content-edge indent, so all items in the list
+    /// align at the same column regardless of their own marker width.
     ListItem {
         cursor_inside: bool,
         kind: ListItemKind,
+        marker_byte_len: usize,
+        list_max_marker_text: String,
     },
 }
 

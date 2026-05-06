@@ -21,7 +21,7 @@ use gpui::{
 use smallvec::SmallVec;
 
 use crate::editor::MarkdownEditor;
-use crate::render_spec::{BlockKind, Container, InlineStyle, RenderBlock};
+use crate::render_spec::{BlockKind, Container, InlineStyle, ListItemKind, RenderBlock};
 use crate::state::Selection;
 use crate::style::MarkdownStyle;
 
@@ -232,7 +232,7 @@ impl Element for BlockElement {
         );
         let inner_pad = block_inner_padding(&self.block.kind, &self.style);
         let is_code = is_code_block(&self.block.kind);
-        let container_indent = containers_left_indent(&self.block.containers, &self.style);
+        let container_indent = containers_left_indent(&self.block.containers, &self.style, window);
 
         let source = self.editor.read(cx).state.markdown.clone();
         style.size.width = relative(1.0).into();
@@ -330,7 +330,7 @@ impl Element for BlockElement {
         // recomputes it for its own bounds.
         let inner_pad = block_inner_padding(&self.block.kind, &style);
         let is_code = is_code_block(&self.block.kind);
-        let container_indent = containers_left_indent(&self.block.containers, &style);
+        let container_indent = containers_left_indent(&self.block.containers, &style, window);
 
         let block_top = bounds.origin.y + extra_above + spacing_above;
         // `block_left` is the left edge of *this* leaf's visible
@@ -633,7 +633,7 @@ impl Element for BlockElement {
                         };
                     let bar_height = (bar_bottom - bar_top).max(px(0.0));
                     let left = bounds.origin.x
-                        + container_x_at_level(&self.block.containers, level, &self.style)
+                        + container_x_at_level(&self.block.containers, level, &self.style, window)
                         + self.style.blockquote_border_inset;
                     let bar = Bounds::new(
                         point(left, bar_top),
@@ -852,12 +852,19 @@ impl Element for BlockElement {
     }
 }
 
-/// Paint each container marker as a glyph centered horizontally on
-/// its level's border bar. The marker's source byte selects which
-/// shaped line provides the y origin so multi-line leaves (soft-wrap,
-/// hard-break continuations) get one glyph per visible row. Painted
-/// in the body font + delimiter color so the chrome reads cohesive
-/// with the bar itself.
+/// Paint each container marker as a glyph in its level's indent
+/// strip. Dispatches on the container kind at the marker's level:
+///
+/// * `BlockQuote` — paint a `>` glyph centered on the level's left
+///   border bar so the bar passes through the glyph's middle.
+/// * `ListItem` — paint the item's marker text (`• `, `- `, or
+///   `1. `) right-aligned within the item's indent strip so every
+///   sibling's content edge lines up regardless of marker width.
+///
+/// The marker's source byte selects which shaped line provides the y
+/// origin, so multi-line leaves (soft-wrap, hard-break continuations)
+/// pick the right row. Painted in the body font + delimiter color
+/// so the chrome reads cohesive with the rest of the indent column.
 #[allow(clippy::too_many_arguments)]
 fn paint_marker_overlays(
     overlays: &[crate::render_spec::MarkerOverlay],
@@ -872,53 +879,131 @@ fn paint_marker_overlays(
     if overlays.is_empty() {
         return;
     }
-    let font_size = font_size_for_block(kind, style);
-    let font = base_font_for_block(kind, style);
     for marker in overlays {
+        let Some(level_container) = containers.get(marker.level).cloned() else {
+            continue;
+        };
         let Some(line) = lines.iter().find(|l| {
             l.source_range.start <= marker.source_range.start
                 && marker.source_range.start < l.source_range.end
         }) else {
             continue;
         };
-        let runs = [TextRun {
-            len: 1,
-            font: font.clone(),
-            color: style.delimiter_color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        }];
-        let Some(glyph) = window
-            .text_system()
-            .shape_text(SharedString::from(">"), font_size, &runs, None, None)
-            .ok()
-            .and_then(|mut v| v.drain(..).next())
-        else {
-            continue;
-        };
-        // The marker glyph sits over its level's blockquote border
-        // bar — same X position the bar uses (gap *before* this
-        // level's indent contribution, plus the inset within that
-        // gap).
-        let bar_left = block_origin_x
-            + container_x_at_level(containers, marker.level, style)
-            + style.blockquote_border_inset;
-        // Center the glyph horizontally on the bar so the bar passes
-        // through the glyph's middle. The glyph is wider than the
-        // bar, so its left/right edges spill into the indent on both
-        // sides — that's intentional, the marker reads as
-        // *integrated* with the bar rather than floating beside it.
-        let glyph_x = bar_left + (style.blockquote_border_width - glyph.width()) / 2.0;
-        let _ = glyph.paint(
-            point(glyph_x, line.origin.y),
-            line.row_height,
-            gpui::TextAlign::Left,
-            None,
-            window,
-            cx,
-        );
+        match level_container {
+            Container::BlockQuote { .. } => {
+                paint_blockquote_marker_overlay(
+                    containers,
+                    marker.level,
+                    line,
+                    block_origin_x,
+                    kind,
+                    style,
+                    window,
+                    cx,
+                );
+            }
+            Container::ListItem {
+                kind: item_kind,
+                cursor_inside,
+                ..
+            } => {
+                paint_list_marker_overlay(
+                    containers,
+                    marker.level,
+                    line,
+                    block_origin_x,
+                    item_kind,
+                    cursor_inside,
+                    style,
+                    window,
+                    cx,
+                );
+            }
+        }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_blockquote_marker_overlay(
+    containers: &[Container],
+    level: usize,
+    line: &LaidOutLine,
+    block_origin_x: Pixels,
+    kind: &BlockKind,
+    style: &MarkdownStyle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let font_size = font_size_for_block(kind, style);
+    let font = base_font_for_block(kind, style);
+    let runs = [TextRun {
+        len: 1,
+        font,
+        color: style.delimiter_color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }];
+    let Some(glyph) = window
+        .text_system()
+        .shape_text(SharedString::from(">"), font_size, &runs, None, None)
+        .ok()
+        .and_then(|mut v| v.drain(..).next())
+    else {
+        return;
+    };
+    let bar_left = block_origin_x
+        + container_x_at_level(containers, level, style, window)
+        + style.blockquote_border_inset;
+    // Center the glyph horizontally on the bar so the bar passes
+    // through the glyph's middle. The glyph is wider than the bar,
+    // so its left/right edges spill into the indent on both sides —
+    // that's intentional, the marker reads as *integrated* with the
+    // bar rather than floating beside it.
+    let glyph_x = bar_left + (style.blockquote_border_width - glyph.width()) / 2.0;
+    let _ = glyph.paint(
+        point(glyph_x, line.origin.y),
+        line.row_height,
+        gpui::TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_list_marker_overlay(
+    containers: &[Container],
+    level: usize,
+    line: &LaidOutLine,
+    block_origin_x: Pixels,
+    kind: ListItemKind,
+    cursor_inside: bool,
+    style: &MarkdownStyle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let display = list_marker_display_text(kind, cursor_inside);
+    let Some(glyph) = shape_marker_text(&display, style, window) else {
+        return;
+    };
+    // Right-align the marker glyph against the level's *content
+    // edge* (the X where the next level — or the leaf body — starts).
+    // The marker text already includes its trailing space, so the
+    // glyph's right edge sitting at the content edge gives natural
+    // separation from the body. Items in the same list with shorter
+    // markers (e.g. `1. ` next to `28. `) right-align under a common
+    // content edge — periods and bullets line up.
+    let strip_right = block_origin_x + container_x_at_level(containers, level + 1, style, window);
+    let glyph_x = strip_right - glyph.width();
+    let _ = glyph.paint(
+        point(glyph_x, line.origin.y),
+        line.row_height,
+        gpui::TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
 }
 
 fn paint_horizontal_scrollbar(window: &mut Window, cb: &CodeBlockPaint, style: &MarkdownStyle) {
@@ -1082,8 +1167,12 @@ fn is_code_block(kind: &BlockKind) -> bool {
 /// decoration painted at level L (e.g. a blockquote border bar) sits
 /// at `bounds.origin.x + container_x_at_level(.., L, ..)`, *before*
 /// L's own indent contribution.
-fn containers_left_indent(containers: &[Container], style: &MarkdownStyle) -> Pixels {
-    container_x_at_level(containers, containers.len(), style)
+fn containers_left_indent(
+    containers: &[Container],
+    style: &MarkdownStyle,
+    window: &mut Window,
+) -> Pixels {
+    container_x_at_level(containers, containers.len(), style, window)
 }
 
 /// Cumulative left indent contributed by `containers[..up_to]` — i.e.
@@ -1093,16 +1182,166 @@ fn containers_left_indent(containers: &[Container], style: &MarkdownStyle) -> Pi
 /// decoration (a blockquote border bar at level L) needs to sit in
 /// the gap *before* its own indent contribution: pass `up_to = L` to
 /// get the X of that gap's left edge.
-fn container_x_at_level(containers: &[Container], up_to: usize, style: &MarkdownStyle) -> Pixels {
+///
+/// Each container kind contributes its own indent:
+///
+/// * `BlockQuote` — fixed `style.blockquote_indent` per level.
+/// * `ListItem` — `style.list_indent` of leading padding plus the
+///   shaped pixel width of the parent list's widest marker
+///   (`list_max_marker_text`). This is what makes every item in the
+///   list align at the same content edge regardless of its own
+///   marker's width: a `1.` and a `24.` in the same list both
+///   resolve to the same indent because they share the same
+///   `list_max_marker_text`. The marker glyph itself paints as an
+///   overlay inside this strip — see `paint_marker_overlays`.
+fn container_x_at_level(
+    containers: &[Container],
+    up_to: usize,
+    style: &MarkdownStyle,
+    window: &mut Window,
+) -> Pixels {
     let limit = up_to.min(containers.len());
     let mut acc = px(0.0);
     for c in &containers[..limit] {
         match c {
             Container::BlockQuote { .. } => acc += style.blockquote_indent,
-            Container::ListItem { .. } => acc += style.list_indent,
+            Container::ListItem {
+                list_max_marker_text,
+                ..
+            } => {
+                let marker_w = measure_marker_text_width(list_max_marker_text, style, window);
+                acc += style.list_indent + marker_w;
+            }
         }
     }
     acc
+}
+
+/// Pixel width budget for an indent-defining marker text shaped in
+/// the body font at the body font size. Two cases:
+///
+/// * **Ordered marker** (`text` starts with a digit run, e.g.
+///   `"11. "`) — reserve `max(shape("0".."9"))` pixels per digit
+///   plus the shaped suffix. The renderer hands us a string built
+///   from `start + count - 1`; that gives the *digit count*
+///   accurately but doesn't know the font's per-digit shape
+///   widths. By widening every digit slot to the worst-case glyph
+///   we cover the user's case where `24.` may shape wider than
+///   `31.` in a proportional-figure font, without needing to
+///   re-shape every actual marker in the list.
+///
+/// * **Other text** (unordered bullet, anything else) — shape and
+///   measure directly.
+fn measure_marker_text_width(text: &str, style: &MarkdownStyle, window: &mut Window) -> Pixels {
+    if text.is_empty() {
+        return px(0.0);
+    }
+    if let Some((digit_count, suffix)) = split_digit_prefix(text) {
+        let widest_digit = widest_single_digit_width(style, window);
+        let suffix_w = if suffix.is_empty() {
+            px(0.0)
+        } else {
+            shape_marker_text(suffix, style, window)
+                .map(|line| line.width())
+                .unwrap_or(px(0.0))
+        };
+        return widest_digit * (digit_count as f32) + suffix_w;
+    }
+    shape_marker_text(text, style, window)
+        .map(|line| line.width())
+        .unwrap_or(px(0.0))
+}
+
+/// Split `text` into `(digit_count, suffix)` if it begins with one
+/// or more ASCII digits. `None` for non-numeric markers (so callers
+/// can fall back to direct shaping).
+fn split_digit_prefix(text: &str) -> Option<(usize, &str)> {
+    let bytes = text.as_bytes();
+    let mut n = 0;
+    while n < bytes.len() && bytes[n].is_ascii_digit() {
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    Some((n, &text[n..]))
+}
+
+/// Pixel width of the widest single ASCII digit (0-9) shaped in the
+/// body font. Stable per font + size, but recomputed per call —
+/// `shape_text` is internally cached by gpui so the redundant calls
+/// are cheap. Centralizing here keeps `measure_marker_text_width`
+/// readable.
+fn widest_single_digit_width(style: &MarkdownStyle, window: &mut Window) -> Pixels {
+    let mut max_w = px(0.0);
+    for d in b'0'..=b'9' {
+        let s = (d as char).to_string();
+        let w = shape_marker_text(&s, style, window)
+            .map(|line| line.width())
+            .unwrap_or(px(0.0));
+        if w > max_w {
+            max_w = w;
+        }
+    }
+    max_w
+}
+
+/// Shape `text` in the body font + delimiter color so it can be
+/// painted as a marker overlay or measured for indent.
+fn shape_marker_text(
+    text: &str,
+    style: &MarkdownStyle,
+    window: &mut Window,
+) -> Option<Arc<WrappedLine>> {
+    if text.is_empty() {
+        return None;
+    }
+    let font = gpui::Font {
+        family: style.font_family.clone(),
+        features: gpui::FontFeatures::default(),
+        fallbacks: None,
+        weight: FontWeight::NORMAL,
+        style: FontStyle::Normal,
+    };
+    let runs = [TextRun {
+        len: text.len(),
+        font,
+        color: style.delimiter_color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }];
+    window
+        .text_system()
+        .shape_text(
+            SharedString::from(text.to_string()),
+            style.font_size,
+            &runs,
+            None,
+            None,
+        )
+        .ok()
+        .and_then(|mut v| v.drain(..).next())
+        .map(Arc::new)
+}
+
+/// Display text for an item's marker overlay. Unordered items
+/// substitute a bullet glyph (`• `) when the cursor is outside, and
+/// reveal the raw bullet character when the cursor is inside so the
+/// user has visual feedback when "editing" the marker. Ordered
+/// items always paint their digits — the numbers carry meaning and
+/// users expect them stable.
+fn list_marker_display_text(kind: ListItemKind, cursor_inside: bool) -> String {
+    match kind {
+        ListItemKind::Unordered(b) if cursor_inside => {
+            let mut s = String::with_capacity(2);
+            s.push(b as char);
+            s.push(' ');
+            s
+        }
+        ListItemKind::Unordered(_) => "• ".to_string(),
+        ListItemKind::Ordered { number } => format!("{}. ", number),
+    }
 }
 
 // ---------- Shaping ----------
@@ -1858,13 +2097,12 @@ mod tests {
             "# title\n\nbody",
             "# title\n\n\n\n\n\nbody",
         ] {
-            let bytes = src.as_bytes();
             for (offset, claims) in cursor_claims_per_offset(src).into_iter().enumerate() {
                 assert!(
                     claims.len() <= 1,
                     "offset {offset} in {src:?} claimed by multiple blocks {claims:?}"
                 );
-                if !crate::analysis::is_forbidden_position(bytes, offset) {
+                if !crate::analysis::is_forbidden_position(src, offset) {
                     assert_eq!(
                         claims.len(),
                         1,

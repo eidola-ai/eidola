@@ -140,19 +140,140 @@ pub(crate) fn is_in_ranges(p: usize, ranges: &[Range<usize>]) -> bool {
 
 /// Is byte index `p` a forbidden cursor position?
 ///
-/// Forbidden positions are pair interiors of *structural* `\n\n` runs
-/// — paragraph breaks and synthetic empty paragraphs. Inside a fenced
-/// code block, the same byte pattern is just a blank line of code, so
-/// every offset is allowed. Hard breaks (`  \n` / `\\\n`) are
-/// in-paragraph content and exempt regardless of code-block context.
-pub fn is_forbidden_position(bytes: &[u8], p: usize) -> bool {
-    if !is_paragraph_break_interior(bytes, p) {
+/// Two flavors of forbidden:
+///
+/// 1. **Structural-pair interior.** `p` sits strictly inside a
+///    `\n\n` run (top-level) or its depth-D blockquote analog
+///    `\n[> …]\n[> …]`. These pair-shaped runs collapse to one
+///    `paragraph_gap` visually so the bytes between the two
+///    boundary `\n`s have nowhere to land. Inside a fenced code
+///    block the same byte pattern is just a blank line of code, so
+///    those are exempt. Hard breaks (`  \n` / `\\\n`) are
+///    in-paragraph content and exempt regardless of code-block
+///    context.
+///
+/// 2. **List-indent interior.** `p` sits strictly inside the
+///    leading hidden bytes of a list-item line — either the
+///    cumulative ancestor indent + this item's marker on a marker
+///    line, or the cumulative ancestor indent on a continuation
+///    line. The renderer hides those bytes from the shaped line so
+///    a cursor strictly inside them has no visible position to
+///    land on; treating them as forbidden makes arrow-key
+///    navigation skip over the indent in one step instead of
+///    pausing at invisible byte positions.
+pub fn is_forbidden_position(markdown: &str, p: usize) -> bool {
+    let bytes = markdown.as_bytes();
+    if is_paragraph_break_interior(bytes, p) && !is_in_ranges(p, &fenced_code_content_ranges(bytes))
+    {
+        return true;
+    }
+    if is_list_indent_interior(markdown, p) {
+        return true;
+    }
+    false
+}
+
+/// Is byte index `p` inside hidden list-item indent bytes? On any
+/// line in a list item's source range, the leading
+/// `cumulative_marker_byte_len` bytes are hidden by the renderer
+/// (cumulative = sum of every enclosing item's marker length). On
+/// the marker line of an item the same span ends at the marker's
+/// end (the marker chars are part of the hidden span).
+///
+/// The hidden span `[line_start, line_start + cumulative)` collapses
+/// to a single visible content edge in the rendered line. Both the
+/// "real beginning of the line" (byte right after `\n`) and the
+/// "after-marker" content edge map to the same display position, so
+/// landing at any of those source bytes — including `line_start` —
+/// is visually indistinguishable. Forbidding the entire hidden span
+/// (excluding only the *content edge* at `hidden_end`) keeps each
+/// visible cursor column owned by exactly one source position, so
+/// arrow-key navigation across line boundaries doesn't pause at an
+/// invisible byte offset and `SetSelection` snaps to the unique
+/// content edge.
+///
+/// Doc-start byte 0 is exempt — every doc edge is allowed by
+/// convention (matching the `is_paragraph_break_interior` rule)
+/// and forbidding it would leave `nearest_allowed_position` with
+/// no allowed predecessor to fall back to.
+pub fn is_list_indent_interior(markdown: &str, p: usize) -> bool {
+    if p == 0 {
         return false;
     }
-    // Inside a fenced code block, `\n\n` is a literal blank line in
-    // the user's code, not a structural pair. The single
-    // structural-paragraph-break rule doesn't apply there.
-    !is_in_ranges(p, &fenced_code_content_ranges(bytes))
+    let bytes = markdown.as_bytes();
+    let line_start = line_start_offset(bytes, p);
+    let total = list_line_indent_at(markdown, line_start);
+    if total == 0 {
+        return false;
+    }
+    // Clamp to end of line so we don't spill past a `\n` in
+    // unusual cases (e.g. a line shorter than the cumulative
+    // indent).
+    let line_end = {
+        let mut q = p.max(line_start);
+        while q < bytes.len() && bytes[q] != b'\n' {
+            q += 1;
+        }
+        q
+    };
+    let hidden_end = (line_start + total).min(line_end);
+    p < hidden_end
+}
+
+/// Sum of marker_byte_lens for every list item whose source range
+/// *overlaps* the line at `line_start` — i.e., every item whose
+/// hide-continuation-indent pass would touch this line during
+/// rendering. This is the right summation for "what's hidden at the
+/// start of this line":
+///
+/// * On a continuation line of an item, the item's range covers the
+///   line, so the item contributes its marker_byte_len of leading
+///   spaces.
+/// * On the marker line of a nested item, the inner item's range
+///   starts at the marker (pulldown convention) — it overlaps the
+///   line via the marker bytes, so its marker_byte_len is added on
+///   top of any outer ancestor's continuation contribution.
+/// * Across a sibling-item boundary (e.g. byte right after the `\n`
+///   between two siblings), the *previous* sibling's range ends at
+///   `line_start` and so does *not* overlap the line — only the
+///   next sibling's marker contributes.
+fn list_line_indent_at(markdown: &str, line_start: usize) -> usize {
+    let bytes = markdown.as_bytes();
+    let mut line_end = line_start;
+    while line_end < bytes.len() && bytes[line_end] != b'\n' {
+        line_end += 1;
+    }
+    items_overlapping(markdown, line_start, line_end)
+        .iter()
+        .map(|i| i.marker_range.end - i.marker_range.start)
+        .sum()
+}
+
+/// All list items whose source range overlaps `[start, end)`,
+/// outer-first. Used by `list_line_indent_at`.
+fn items_overlapping(markdown: &str, start: usize, end: usize) -> Vec<ItemSpan> {
+    fn walk(
+        nodes: &[crate::syntax::SyntaxNode],
+        start: usize,
+        end: usize,
+        out: &mut Vec<ItemSpan>,
+    ) {
+        for node in nodes {
+            if node.range.start >= end || node.range.end <= start {
+                continue;
+            }
+            if let crate::syntax::NodeKind::ListItem { marker_range } = &node.kind {
+                out.push(ItemSpan {
+                    range: node.range.clone(),
+                    marker_range: marker_range.clone(),
+                });
+            }
+            walk(&node.children, start, end, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&crate::parser::parse(markdown), start, end, &mut out);
+    out
 }
 
 /// Pure structural test for "p sits strictly inside a structural pair."
@@ -309,15 +430,16 @@ pub fn is_paragraph_break_interior(bytes: &[u8], p: usize) -> bool {
 // Allowed-position snapping
 // ---------------------------------------------------------------------------
 
-pub fn next_allowed_position(bytes: &[u8], mut p: usize) -> usize {
-    while p < bytes.len() && is_forbidden_position(bytes, p) {
+pub fn next_allowed_position(markdown: &str, mut p: usize) -> usize {
+    let len = markdown.len();
+    while p < len && is_forbidden_position(markdown, p) {
         p += 1;
     }
     p
 }
 
-pub fn prev_allowed_position(bytes: &[u8], mut p: usize) -> usize {
-    while p > 0 && is_forbidden_position(bytes, p) {
+pub fn prev_allowed_position(markdown: &str, mut p: usize) -> usize {
+    while p > 0 && is_forbidden_position(markdown, p) {
         p -= 1;
     }
     p
@@ -327,16 +449,46 @@ pub fn prev_allowed_position(bytes: &[u8], mut p: usize) -> usize {
 /// the idempotent variant of the snap rule — used by `set_selection`
 /// (mouse clicks, host API), where running the same input twice must
 /// produce the same output.
-pub fn nearest_allowed_position(bytes: &[u8], p: usize) -> usize {
-    if !is_forbidden_position(bytes, p) {
+///
+/// Two special cases override the source-byte-distance metric:
+///
+/// 1. **List-indent forbidden positions** all collapse to the same
+///    visible content edge of the *current* line. The next allowed
+///    byte forward sits at that content edge; the prev allowed byte
+///    backward sits on the *previous* visual line. Snap forward so
+///    a click on the marker area lands at the current line's
+///    content rather than hopping back across the line boundary.
+///
+/// 2. **Doc-edge degeneracy** — `prev_allowed_position` bottoms out
+///    at byte 0 even if 0 is forbidden, and `next_allowed_position`
+///    similarly at `markdown.len()`. We re-check each candidate and
+///    drop it if still forbidden; if both are unavailable, return
+///    `p` (degenerate buffer where every position is forbidden).
+pub fn nearest_allowed_position(markdown: &str, p: usize) -> usize {
+    if !is_forbidden_position(markdown, p) {
         return p;
     }
-    let next = next_allowed_position(bytes, p);
-    let prev = prev_allowed_position(bytes, p);
-    if next.saturating_sub(p) <= p.saturating_sub(prev) {
-        next
-    } else {
-        prev
+    if is_list_indent_interior(markdown, p) {
+        let next = next_allowed_position(markdown, p);
+        if !is_forbidden_position(markdown, next) {
+            return next;
+        }
+    }
+    let next = next_allowed_position(markdown, p);
+    let prev = prev_allowed_position(markdown, p);
+    let prev_ok = !is_forbidden_position(markdown, prev);
+    let next_ok = !is_forbidden_position(markdown, next);
+    match (prev_ok, next_ok) {
+        (true, true) => {
+            if next.saturating_sub(p) <= p.saturating_sub(prev) {
+                next
+            } else {
+                prev
+            }
+        }
+        (true, false) => prev,
+        (false, true) => next,
+        (false, false) => p,
     }
 }
 
@@ -1927,41 +2079,122 @@ mod tests {
 
     #[test]
     fn paragraph_break_interior_is_forbidden() {
-        let bytes = b"p1\n\np2";
-        assert!(is_forbidden_position(bytes, 3));
-        assert!(!is_forbidden_position(bytes, 0));
-        assert!(!is_forbidden_position(bytes, 2));
-        assert!(!is_forbidden_position(bytes, 4));
-        assert!(!is_forbidden_position(bytes, 6));
+        let src = "p1\n\np2";
+        assert!(is_forbidden_position(src, 3));
+        assert!(!is_forbidden_position(src, 0));
+        assert!(!is_forbidden_position(src, 2));
+        assert!(!is_forbidden_position(src, 4));
+        assert!(!is_forbidden_position(src, 6));
     }
 
     #[test]
     fn between_two_pairs_is_allowed() {
-        let bytes = b"p1\n\n\n\np2";
-        assert!(is_forbidden_position(bytes, 3));
-        assert!(!is_forbidden_position(bytes, 4));
-        assert!(is_forbidden_position(bytes, 5));
+        let src = "p1\n\n\n\np2";
+        assert!(is_forbidden_position(src, 3));
+        assert!(!is_forbidden_position(src, 4));
+        assert!(is_forbidden_position(src, 5));
     }
 
     #[test]
     fn six_newline_run_alternates_forbidden_and_allowed() {
-        let bytes = b"p1\n\n\n\n\n\np2";
-        assert!(is_forbidden_position(bytes, 3));
-        assert!(!is_forbidden_position(bytes, 4));
-        assert!(is_forbidden_position(bytes, 5));
-        assert!(!is_forbidden_position(bytes, 6));
-        assert!(is_forbidden_position(bytes, 7));
-        assert!(!is_forbidden_position(bytes, 8));
+        let src = "p1\n\n\n\n\n\np2";
+        assert!(is_forbidden_position(src, 3));
+        assert!(!is_forbidden_position(src, 4));
+        assert!(is_forbidden_position(src, 5));
+        assert!(!is_forbidden_position(src, 6));
+        assert!(is_forbidden_position(src, 7));
+        assert!(!is_forbidden_position(src, 8));
     }
 
     #[test]
     fn fenced_code_blanks_are_not_forbidden() {
-        let bytes = b"```\n\n\n```\n";
-        for p in 0..bytes.len() {
+        let src = "```\n\n\n```\n";
+        for p in 0..src.len() {
             assert!(
-                !is_forbidden_position(bytes, p),
+                !is_forbidden_position(src, p),
                 "byte {p} unexpectedly forbidden inside code block",
             );
+        }
+    }
+
+    // ---- List indent forbidden positions -------------------------------
+
+    #[test]
+    fn list_marker_interior_is_forbidden() {
+        // `- foo`: bytes 0..2 are the hidden marker. Cursor at the
+        // marker chars (1) is forbidden; the doc-start edge (0) is
+        // exempt and the content edge (2) is the unique landing for
+        // the line.
+        let src = "- foo";
+        assert!(!is_forbidden_position(src, 0));
+        assert!(is_forbidden_position(src, 1));
+        assert!(!is_forbidden_position(src, 2));
+        assert!(!is_forbidden_position(src, 3));
+    }
+
+    #[test]
+    fn ordered_list_marker_interior_is_forbidden() {
+        // `1. foo`: bytes 0..3 are the hidden marker (`1. `). Doc
+        // start (0) allowed; marker chars (1, 2) forbidden; content
+        // edge (3) allowed.
+        let src = "1. foo";
+        assert!(!is_forbidden_position(src, 0));
+        assert!(is_forbidden_position(src, 1));
+        assert!(is_forbidden_position(src, 2));
+        assert!(!is_forbidden_position(src, 3));
+    }
+
+    #[test]
+    fn nested_list_outer_indent_plus_inner_marker_form_one_run() {
+        // `- outer\n  - nested`: on the inner item's marker line,
+        // bytes 8..10 are outer-continuation indent and bytes
+        // 10..12 are the inner marker. Together [8, 12) is the
+        // hidden run. The "real beginning of the line" (8), the
+        // ancestor-indent interior (9), and the inner marker chars
+        // (10, 11) all collapse to the same visible position —
+        // forbidden. Only the content edge (12) is allowed.
+        let src = "- outer\n  - nested";
+        assert!(is_forbidden_position(src, 8));
+        assert!(is_forbidden_position(src, 9));
+        assert!(is_forbidden_position(src, 10));
+        assert!(is_forbidden_position(src, 11));
+        assert!(!is_forbidden_position(src, 12));
+    }
+
+    #[test]
+    fn list_continuation_indent_interior_is_forbidden() {
+        // `- foo\n  bar`: bytes 6..8 are the hidden continuation
+        // indent. The line-start byte (6) and the indent interior
+        // (7) are both forbidden — they share the visible content
+        // edge with byte 8.
+        let src = "- foo\n  bar";
+        assert!(is_forbidden_position(src, 6));
+        assert!(is_forbidden_position(src, 7));
+        assert!(!is_forbidden_position(src, 8));
+    }
+
+    #[test]
+    fn sibling_list_item_line_start_is_forbidden() {
+        // `1. one\n2. two`: byte 7 is the *real beginning* of the
+        // second item's line (right after `\n` at byte 6). The
+        // marker `2. ` runs 7..10. All four bytes [7, 10) collapse
+        // to the same visible content edge; forbidden. Byte 10 is
+        // the unique allowed landing for the line.
+        let src = "1. one\n2. two";
+        assert!(!is_forbidden_position(src, 6)); // end of line 1
+        assert!(is_forbidden_position(src, 7));
+        assert!(is_forbidden_position(src, 8));
+        assert!(is_forbidden_position(src, 9));
+        assert!(!is_forbidden_position(src, 10));
+    }
+
+    #[test]
+    fn cursor_outside_any_list_is_unaffected() {
+        // `plain` — no list, no list-indent forbidden positions
+        // should ever fire.
+        let src = "plain text";
+        for p in 0..=src.len() {
+            assert!(!is_forbidden_position(src, p));
         }
     }
 

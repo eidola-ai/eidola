@@ -2174,10 +2174,16 @@ fn shift_tab_outside_a_list_is_a_noop(cx: &mut TestAppContext) {
     });
 }
 
-// ---- Bullet glyph substitution -------------------------------------
+// ---- Marker overlay rendering --------------------------------------
 
 #[gpui::test]
-fn unordered_marker_substitutes_bullet_when_cursor_outside(cx: &mut TestAppContext) {
+fn unordered_marker_hidden_and_overlaid_at_level_zero(cx: &mut TestAppContext) {
+    // The marker bytes (`- `) are always hidden from the shaped line
+    // — content shapes from column 0 of the leaf so all items in a
+    // list align at the same content edge regardless of marker
+    // width. The marker glyph paints as a `MarkerOverlay` in the
+    // item's indent strip; the element layer chooses `• ` when the
+    // cursor is outside vs the raw bullet char when inside.
     let initial = EditorState {
         markdown: "- foo\n\nbody".into(),
         // Cursor in the body paragraph, well outside the list.
@@ -2190,18 +2196,17 @@ fn unordered_marker_substitutes_bullet_when_cursor_outside(cx: &mut TestAppConte
         .iter()
         .find(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
         .expect("list item leaf");
-    assert_eq!(item.substitutions.len(), 1);
-    let sub = &item.substitutions[0];
-    assert_eq!(sub.source_range, 0..2);
-    assert_eq!(sub.display, "• ");
+    assert!(item.has_hidden_range(0..2));
+    assert!(item.has_marker_overlay(0..2, 0));
 }
 
 #[gpui::test]
-fn unordered_marker_no_substitution_when_cursor_inside(cx: &mut TestAppContext) {
+fn unordered_marker_overlay_present_when_cursor_inside(cx: &mut TestAppContext) {
+    // Hide-and-overlay applies regardless of cursor position. The
+    // overlay glyph the element layer paints just changes from `• `
+    // to the raw bullet char when the cursor is inside the item.
     let initial = EditorState {
         markdown: "- foo".into(),
-        // Cursor on the item itself — show the raw `- ` so the
-        // user can edit the marker.
         selection: Selection::Cursor(3),
     };
     let (_, editor) = open_editor(cx, initial);
@@ -2211,13 +2216,22 @@ fn unordered_marker_no_substitution_when_cursor_inside(cx: &mut TestAppContext) 
         .iter()
         .find(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
         .unwrap();
-    assert!(item.substitutions.is_empty());
+    assert!(item.has_hidden_range(0..2));
+    assert!(item.has_marker_overlay(0..2, 0));
+    assert!(matches!(
+        item.containers[0],
+        Container::ListItem {
+            cursor_inside: true,
+            ..
+        }
+    ));
 }
 
 #[gpui::test]
-fn ordered_marker_does_not_substitute(cx: &mut TestAppContext) {
-    // Ordered items keep their digits visible — they convey
-    // ordering. No substitution regardless of cursor position.
+fn ordered_marker_hidden_and_overlaid(cx: &mut TestAppContext) {
+    // Ordered items get the same hide-and-overlay treatment. The
+    // element layer paints the digits via `kind` rather than
+    // substituting a bullet glyph.
     let initial = EditorState {
         markdown: "1. foo\n\nbody".into(),
         selection: Selection::Cursor(10),
@@ -2229,11 +2243,13 @@ fn ordered_marker_does_not_substitute(cx: &mut TestAppContext) {
         .iter()
         .find(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
         .unwrap();
-    assert!(item.substitutions.is_empty());
+    // Marker `1. ` is 3 bytes.
+    assert!(item.has_hidden_range(0..3));
+    assert!(item.has_marker_overlay(0..3, 0));
 }
 
 #[gpui::test]
-fn star_marker_also_substitutes_bullet(cx: &mut TestAppContext) {
+fn star_marker_also_hidden_and_overlaid(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "* foo\n\nbody".into(),
         selection: Selection::Cursor(9),
@@ -2245,8 +2261,286 @@ fn star_marker_also_substitutes_bullet(cx: &mut TestAppContext) {
         .iter()
         .find(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
         .unwrap();
-    assert_eq!(item.substitutions.len(), 1);
-    assert_eq!(item.substitutions[0].display, "• ");
+    assert!(item.has_hidden_range(0..2));
+    assert!(item.has_marker_overlay(0..2, 0));
+}
+
+#[gpui::test]
+fn list_max_marker_text_reflects_widest_marker_in_list(cx: &mut TestAppContext) {
+    // Items in the same ordered list all carry the same
+    // `list_max_marker_text` so the element layer can compute one
+    // uniform indent for the whole list.
+    let initial = EditorState {
+        markdown: "1. one\n2. two\n3. three\n4. four\n5. five\n6. six\n7. seven\n8. eight\n9. nine\n10. ten\n11. eleven".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let texts: Vec<String> = spec
+        .blocks
+        .iter()
+        .filter_map(|b| match b.containers.first() {
+            Some(Container::ListItem {
+                list_max_marker_text,
+                ..
+            }) => Some(list_max_marker_text.clone()),
+            _ => None,
+        })
+        .collect();
+    // Every item in the list reports `11. ` as the widest marker.
+    assert!(!texts.is_empty());
+    for text in &texts {
+        assert_eq!(text, "11. ");
+    }
+}
+
+#[gpui::test]
+fn unordered_list_max_marker_text_canonicalizes_to_dash(cx: &mut TestAppContext) {
+    // For unordered lists, `list_max_marker_text` is canonicalized
+    // to `"- "` regardless of the actual bullet char (`-`, `*`,
+    // `+`) — they all shape to nearly identical pixel widths and
+    // the indent should be stable.
+    let initial = EditorState {
+        markdown: "* foo\n* bar".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let item = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .unwrap();
+    if let Container::ListItem {
+        list_max_marker_text,
+        ..
+    } = &item.containers[0]
+    {
+        assert_eq!(list_max_marker_text, "- ");
+    } else {
+        panic!("expected ListItem container");
+    }
+}
+
+#[gpui::test]
+fn list_item_marker_byte_len_recorded_per_item(cx: &mut TestAppContext) {
+    // The container records this item's specific marker length so
+    // the renderer's indent-hiding pass knows how many leading
+    // spaces to elide on continuation lines.
+    let initial = EditorState {
+        markdown: "1. one\n2. two".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let lens: Vec<usize> = spec
+        .blocks
+        .iter()
+        .filter_map(|b| match b.containers.first() {
+            Some(Container::ListItem {
+                marker_byte_len, ..
+            }) => Some(*marker_byte_len),
+            _ => None,
+        })
+        .collect();
+    // Both `1. ` and `2. ` are 3 bytes.
+    assert_eq!(lens, vec![3, 3]);
+}
+
+#[gpui::test]
+fn left_arrow_skips_hidden_list_marker_bytes(cx: &mut TestAppContext) {
+    // Cursor at byte 2 (right after `- `, start of `foo`). One Left
+    // arrow should land at byte 0 (start of leaf), skipping byte 1
+    // which is the strict interior of the hidden marker.
+    let initial = EditorState {
+        markdown: "- foo".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Left);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.cursor_offset(), 0);
+    });
+}
+
+#[gpui::test]
+fn right_arrow_skips_hidden_list_marker_bytes(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- foo".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| {
+        // From byte 0, Right should jump past the marker interior to
+        // byte 2 (start of content).
+        assert_eq!(e.cursor_offset(), 2);
+    });
+}
+
+#[gpui::test]
+fn cursor_at_real_start_of_list_item_line_snaps_forward(cx: &mut TestAppContext) {
+    // The user's reported case: cursor at the *real* beginning of
+    // the second item's line (byte right after the `\n` between
+    // items, before the `2`). That position visually overlaps with
+    // the content edge of the line, so it's forbidden — clicking
+    // there or moving to it via SetSelection should snap to the
+    // unique content edge (byte 11, before `Item`).
+    let src = "1. Item one\n2. Item two";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let landed = cx.update(|cx| {
+        editor.update(cx, |e, _| {
+            let next = std::mem::take(&mut e.state);
+            // Byte 12 = right after `\n`, real start of second line.
+            let updated = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(12)),
+            );
+            e.state = updated;
+            e.cursor_offset()
+        })
+    });
+    // `2. ` runs 12..15; the unique allowed landing is 15 (before `Item`).
+    assert_eq!(landed, 15);
+}
+
+#[gpui::test]
+fn down_arrow_lands_at_content_edge_not_line_start(cx: &mut TestAppContext) {
+    // Down-arrow from end of first item should land at the *content
+    // edge* of the second item, not at the (forbidden) line-start
+    // before its marker.
+    let initial = EditorState {
+        markdown: "- one\n- two".into(),
+        // Cursor at end of "one" (byte 5).
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Down);
+    editor.read_with(cx, |e, _| {
+        // `- ` of second item runs 6..8; content edge is 8.
+        // Without the line-start-forbidden rule the cursor would
+        // pause at 6 first; with it, navigation goes straight to 8.
+        let cursor = e.cursor_offset();
+        assert!(
+            cursor == 8 || cursor == 11,
+            "expected cursor at content edge (8) or end of line (11), got {cursor}",
+        );
+        // The hidden line-start (6) and hidden interior (7) must not be claimed.
+        assert_ne!(cursor, 6);
+        assert_ne!(cursor, 7);
+    });
+}
+
+#[gpui::test]
+fn click_inside_hidden_marker_snaps_to_nearest_edge(cx: &mut TestAppContext) {
+    // SetSelection from a click at byte 1 (mid-marker) snaps to the
+    // nearest allowed edge — which for `- foo` is byte 0 or byte 2,
+    // both at distance 1 (forward wins ties → byte 2).
+    let initial = EditorState {
+        markdown: "- foo".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let final_state = cx.update(|cx| {
+        editor.update(cx, |e, _| {
+            let next = std::mem::take(&mut e.state);
+            let updated = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(1)),
+            );
+            e.state = updated;
+            e.cursor_offset()
+        })
+    });
+    assert_eq!(final_state, 2);
+}
+
+#[gpui::test]
+fn nested_list_item_hides_inner_marker(cx: &mut TestAppContext) {
+    // Pulldown reports the nested item starting at the marker byte
+    // (byte 10 for `- outer\n  - nested`), so the leading 2 spaces
+    // (bytes 8..10) live between the outer leaf and the inner leaf
+    // — they aren't part of any leaf's source range and need no
+    // explicit hiding. The inner leaf's marker bytes themselves
+    // (bytes 10..12) ARE inside its range and must be hidden so
+    // the shaped line begins at the content column. The visual
+    // indent for the nested item comes from the cumulative
+    // container-chain left padding.
+    let initial = EditorState {
+        markdown: "- outer\n  - nested".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let inner = spec
+        .blocks
+        .iter()
+        .find(|b| b.containers.len() == 2)
+        .expect("nested item leaf");
+    assert_eq!(inner.source_range.start, 10);
+    assert!(item_hidden_ranges_cover(inner, 10..12));
+    // The marker overlay sits at the inner level (= 1) so the
+    // element layer paints it inside the inner item's indent
+    // strip, not the outer's.
+    assert!(inner.has_marker_overlay(10..12, 1));
+}
+
+#[gpui::test]
+fn multi_paragraph_list_item_hides_continuation_indent(cx: &mut TestAppContext) {
+    // A loose item with two paragraphs has a 2-space continuation
+    // indent on the second paragraph's line. With the new model,
+    // that indent is hidden so the second paragraph's content
+    // shapes from column 0 of the leaf, and the visual indent
+    // comes from the container's left padding.
+    let initial = EditorState {
+        markdown: "- foo\n\n  bar".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let leaves: Vec<&_> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .collect();
+    // Two paragraph leaves for the same item.
+    assert_eq!(leaves.len(), 2, "expected two leaves for loose item");
+    // Second leaf's source range starts at or before byte 7 (the
+    // start of the line `  bar`, after `- foo\n\n`). Its leading
+    // 2 spaces (bytes 7..9) should be hidden.
+    let second = leaves[1];
+    assert!(
+        item_hidden_ranges_cover(second, 7..9),
+        "continuation indent at 7..9 should be hidden, got {:?}",
+        second.hidden_ranges,
+    );
+}
+
+/// True iff the union of `block.hidden_ranges` covers every byte in
+/// `target`. Used by tests that don't care which specific hidden
+/// range covers a byte (the renderer may emit overlapping ranges
+/// when multiple list-item levels each contribute to hiding the
+/// same continuation indent).
+fn item_hidden_ranges_cover(
+    block: &gpui_markdown_editor::RenderBlock,
+    target: std::ops::Range<usize>,
+) -> bool {
+    let mut covered = vec![false; target.end.saturating_sub(target.start)];
+    for r in &block.hidden_ranges {
+        let lo = r.start.max(target.start);
+        let hi = r.end.min(target.end);
+        if hi <= lo {
+            continue;
+        }
+        for i in lo..hi {
+            covered[i - target.start] = true;
+        }
+    }
+    covered.iter().all(|c| *c)
 }
 
 #[gpui::test]

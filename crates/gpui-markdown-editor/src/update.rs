@@ -393,12 +393,12 @@ fn avoid_forbidden_positions(
     prev_anchor: usize,
     prev_head: usize,
 ) -> EditorState {
-    let bytes = state.markdown.as_bytes();
+    let markdown = state.markdown.clone();
     let new_sel = match state.selection {
-        Selection::Cursor(p) => Selection::Cursor(snap_off_forbidden(bytes, p, prev_head)),
+        Selection::Cursor(p) => Selection::Cursor(snap_off_forbidden(&markdown, p, prev_head)),
         Selection::Range { anchor, head } => {
-            let a = snap_off_forbidden(bytes, anchor, prev_anchor);
-            let h = snap_off_forbidden(bytes, head, prev_head);
+            let a = snap_off_forbidden(&markdown, anchor, prev_anchor);
+            let h = snap_off_forbidden(&markdown, head, prev_head);
             if a == h {
                 Selection::Cursor(h)
             } else {
@@ -412,14 +412,14 @@ fn avoid_forbidden_positions(
     }
 }
 
-fn snap_off_forbidden(bytes: &[u8], pos: usize, prev: usize) -> usize {
-    if !is_forbidden_position(bytes, pos) {
+fn snap_off_forbidden(markdown: &str, pos: usize, prev: usize) -> usize {
+    if !is_forbidden_position(markdown, pos) {
         return pos;
     }
     if pos < prev {
-        prev_allowed_position(bytes, pos)
+        prev_allowed_position(markdown, pos)
     } else {
-        next_allowed_position(bytes, pos)
+        next_allowed_position(markdown, pos)
     }
 }
 
@@ -541,7 +541,7 @@ fn delete_backward(state: EditorState) -> EditorState {
     // fall through to the regular grapheme-delete path instead.
     let bytes = state.markdown.as_bytes();
     if !analysis::is_in_fenced_code(bytes, cursor) {
-        let snapped = next_allowed_position(bytes, cursor);
+        let snapped = next_allowed_position(&state.markdown, cursor);
         // Blockquote outdent: at the start of a non-first paragraph
         // inside a BQ, Backspace pops one level of nesting from
         // *both halves* of the preceding `\n[prefix]\n[prefix]` pair
@@ -592,7 +592,7 @@ fn delete_forward(state: EditorState) -> EditorState {
 
     let bytes = state.markdown.as_bytes();
     if !analysis::is_in_fenced_code(bytes, cursor) {
-        let snapped = prev_allowed_position(bytes, cursor);
+        let snapped = prev_allowed_position(&state.markdown, cursor);
         if let Some(pair_end) = pair_at_start(bytes, snapped) {
             return splice(&state.markdown, cursor, snapped, pair_end);
         }
@@ -648,12 +648,11 @@ fn set_selection(state: EditorState, sel: Selection) -> EditorState {
     // `MouseMoveEvent` re-feeds the same offset, because each call
     // sees the previously-snapped position as `prev`. Nearest-allowed
     // is idempotent: same input → same output.
-    let bytes = state.markdown.as_bytes();
     let final_sel = match on_boundaries {
-        Selection::Cursor(p) => Selection::Cursor(nearest_allowed_position(bytes, p)),
+        Selection::Cursor(p) => Selection::Cursor(nearest_allowed_position(&state.markdown, p)),
         Selection::Range { anchor, head } => {
-            let a = nearest_allowed_position(bytes, anchor);
-            let h = nearest_allowed_position(bytes, head);
+            let a = nearest_allowed_position(&state.markdown, anchor);
+            let h = nearest_allowed_position(&state.markdown, head);
             if a == h {
                 Selection::Cursor(h)
             } else {
@@ -799,10 +798,11 @@ fn line_end_offset(text: &str, pos: usize) -> usize {
 /// `\n\n` pair shows up as two adjacent zero-length "lines" with the
 /// pair interior as the start of the second. That position is forbidden
 /// (no visible row to land on), and `text.split('\n')` doesn't know it.
-/// Skipping any segment whose start is forbidden makes Up/Down move
-/// from one *visible* line to the next visible line — across paragraph
-/// breaks (which contribute zero visible rows) and synthetic empty
-/// paragraphs (one visible row each).
+/// We test specifically for `is_paragraph_break_interior` rather than
+/// the general `is_forbidden_position` so we *only* skip phantom
+/// no-row segments — list-item line-start bytes are also forbidden
+/// (they collapse onto the line's content edge), but the line itself
+/// is a real visible row and Up/Down should land on it.
 fn move_vertical(text: &str, pos: usize, direction: i32) -> usize {
     let bytes = text.as_bytes();
     let line_start = line_start_offset(text, pos);
@@ -815,7 +815,7 @@ fn move_vertical(text: &str, pos: usize, direction: i32) -> usize {
             }
             let prev_line_end = probe - 1;
             let prev_line_start = line_start_offset(text, prev_line_end);
-            if is_forbidden_position(bytes, prev_line_start) {
+            if analysis::is_paragraph_break_interior(bytes, prev_line_start) {
                 probe = prev_line_start;
                 continue;
             }
@@ -830,7 +830,7 @@ fn move_vertical(text: &str, pos: usize, direction: i32) -> usize {
                 return text.len();
             }
             let next_line_start = probe + 1;
-            if is_forbidden_position(bytes, next_line_start) {
+            if analysis::is_paragraph_break_interior(bytes, next_line_start) {
                 probe = line_end_offset(text, next_line_start);
                 continue;
             }
@@ -1464,14 +1464,13 @@ mod forbidden_position_tests {
     }
 
     fn assert_no_forbidden(state: &EditorState) {
-        let bytes = state.markdown.as_bytes();
         let positions: Vec<usize> = match state.selection {
             Selection::Cursor(p) => vec![p],
             Selection::Range { anchor, head } => vec![anchor, head],
         };
         for p in positions {
             assert!(
-                !is_forbidden_position(bytes, p),
+                !is_forbidden_position(&state.markdown, p),
                 "selection endpoint {p} is forbidden in {:?}",
                 state.markdown
             );
@@ -1482,12 +1481,12 @@ mod forbidden_position_tests {
 
     #[test]
     fn paragraph_break_interior_is_forbidden() {
-        let bytes = b"p1\n\np2";
-        assert!(is_forbidden_position(bytes, 3));
-        assert!(!is_forbidden_position(bytes, 0));
-        assert!(!is_forbidden_position(bytes, 2));
-        assert!(!is_forbidden_position(bytes, 4));
-        assert!(!is_forbidden_position(bytes, 6));
+        let src = "p1\n\np2";
+        assert!(is_forbidden_position(src, 3));
+        assert!(!is_forbidden_position(src, 0));
+        assert!(!is_forbidden_position(src, 2));
+        assert!(!is_forbidden_position(src, 4));
+        assert!(!is_forbidden_position(src, 6));
     }
 
     #[test]
@@ -1495,38 +1494,38 @@ mod forbidden_position_tests {
         // `p1\n\n\n\np2`: 4-newline run = 2 pairs. Position 4 is the
         // boundary between the two pairs (allowed), positions 3 and 5
         // are pair interiors (forbidden).
-        let bytes = b"p1\n\n\n\np2";
-        assert!(is_forbidden_position(bytes, 3));
-        assert!(!is_forbidden_position(bytes, 4));
-        assert!(is_forbidden_position(bytes, 5));
+        let src = "p1\n\n\n\np2";
+        assert!(is_forbidden_position(src, 3));
+        assert!(!is_forbidden_position(src, 4));
+        assert!(is_forbidden_position(src, 5));
     }
 
     #[test]
     fn six_newline_run_alternates_forbidden_and_allowed() {
-        let bytes = b"p1\n\n\n\n\n\np2";
-        assert!(is_forbidden_position(bytes, 3));
-        assert!(!is_forbidden_position(bytes, 4));
-        assert!(is_forbidden_position(bytes, 5));
-        assert!(!is_forbidden_position(bytes, 6));
-        assert!(is_forbidden_position(bytes, 7));
-        assert!(!is_forbidden_position(bytes, 8)); // start of p2
+        let src = "p1\n\n\n\n\n\np2";
+        assert!(is_forbidden_position(src, 3));
+        assert!(!is_forbidden_position(src, 4));
+        assert!(is_forbidden_position(src, 5));
+        assert!(!is_forbidden_position(src, 6));
+        assert!(is_forbidden_position(src, 7));
+        assert!(!is_forbidden_position(src, 8)); // start of p2
     }
 
     #[test]
     fn leading_pair_interior_is_forbidden() {
-        let bytes = b"\n\nab";
-        assert!(is_forbidden_position(bytes, 1));
-        assert!(!is_forbidden_position(bytes, 0));
-        assert!(!is_forbidden_position(bytes, 2));
+        let src = "\n\nab";
+        assert!(is_forbidden_position(src, 1));
+        assert!(!is_forbidden_position(src, 0));
+        assert!(!is_forbidden_position(src, 2));
     }
 
     #[test]
     fn hard_break_alone_has_no_forbidden_positions() {
         // `ab  \n` — single hard break, no structural pair.
-        let bytes = b"ab  \n";
-        for p in 0..=bytes.len() {
+        let src = "ab  \n";
+        for p in 0..=src.len() {
             assert!(
-                !is_forbidden_position(bytes, p),
+                !is_forbidden_position(src, p),
                 "p={p} unexpectedly forbidden"
             );
         }
@@ -1539,29 +1538,29 @@ mod forbidden_position_tests {
         // is the pair interior (forbidden); the hard-break \n doesn't
         // pull position 5 into being forbidden because the back-walk
         // stops at the hard-break terminator.
-        let bytes = b"ab  \n\n\ncd";
-        assert!(!is_forbidden_position(bytes, 5));
-        assert!(is_forbidden_position(bytes, 6));
-        assert!(!is_forbidden_position(bytes, 7));
+        let src = "ab  \n\n\ncd";
+        assert!(!is_forbidden_position(src, 5));
+        assert!(is_forbidden_position(src, 6));
+        assert!(!is_forbidden_position(src, 7));
     }
 
     #[test]
     fn backslash_hard_break_treated_same() {
         // `ab\\\n\n\ncd` — backslash + \n is a hard break; same shape.
-        let bytes = b"ab\\\n\n\ncd";
+        let src = "ab\\\n\n\ncd";
         // bytes: a(0) b(1) \\(2) \n(3) \n(4) \n(5) c(6) d(7)
         // Hard-break \n at 3 (preceded by \\ at 2). Structural pair
         // [4, 6); interior is 5.
-        assert!(!is_forbidden_position(bytes, 4));
-        assert!(is_forbidden_position(bytes, 5));
-        assert!(!is_forbidden_position(bytes, 6));
+        assert!(!is_forbidden_position(src, 4));
+        assert!(is_forbidden_position(src, 5));
+        assert!(!is_forbidden_position(src, 6));
     }
 
     #[test]
     fn doc_edges_are_never_forbidden() {
-        let bytes = b"\n\n";
-        assert!(!is_forbidden_position(bytes, 0));
-        assert!(!is_forbidden_position(bytes, bytes.len()));
+        let src = "\n\n";
+        assert!(!is_forbidden_position(src, 0));
+        assert!(!is_forbidden_position(src, src.len()));
     }
 
     // ---- Movement directional snapping --------------------------------
