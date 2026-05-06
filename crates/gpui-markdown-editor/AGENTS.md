@@ -132,17 +132,56 @@ vs. "list inside blockquote" — it just iterates `containers` in
 order. Adding a new container kind is one new variant + one new
 `match` arm in `containers_left_indent` / `paint`'s decoration loop.
 
-Known v1 limitations of the blockquote model:
+Blockquote-internal whitespace and editing are the depth-D
+generalization of the top-level pairs invariant. `\n\n` at top level
+is the structural paragraph-break unit; inside a blockquote at depth
+D, the corresponding unit is `\n[prefix]\n[prefix]` where `[prefix] =
+"> " × D` (length `2 + 4D` bytes). The two halves are:
 
-- A standalone `>` line in the middle of a blockquote (`> p1\n>\n> p2`)
-  has no parsed leaf — the marker is dropped and that line is invisible.
-  The user-typed form `> p1\n\n> p2` (two separate blockquotes) is
-  unaffected.
-- When the cursor is *inside* a blockquote, the dimmed `> ` prefix shapes
-  inline with the content, so content shifts right by the prefix's
-  width. This is a known visual diff vs. cursor-outside; the chat
-  renderer (no cursor) only ever shows the cursor-outside layout, so
-  pixel-fidelity with chat is preserved on the rendered side.
+- The first `[prefix]` line is the marker-only "middle" of the pair.
+  It collapses to one paragraph_gap visually — *no rendered row*.
+  Cursor positions strictly inside the pair are forbidden and snap to
+  the nearest boundary, the same way the byte between a top-level
+  `\n\n` is forbidden today.
+- The second `[prefix]` is the start of the new paragraph. When a
+  parsed paragraph follows, the leaf claims it; when nothing follows
+  yet (the post-Enter transient), `render_blockquote` emits a
+  synthetic empty leaf so the cursor has a row to land on.
+
+The same rules drop out across the editor:
+
+- **Soft-break promotion is depth-aware.** A stray `\n` is exempt
+  from promotion only if it's part of a complete pair (the new
+  `is_paragraph_break_interior` recognizes the alternation `\n
+  [prefix] \n [prefix]…` and forbids interior bytes accordingly). Any
+  other lone mid-content `\n` — soft breaks across BQ lines, lazy
+  continuations — is promoted: `enforce_invariants` inserts
+  `[prefix(D)]\n[prefix(D - existing)]` after the offending `\n` so
+  the result is a complete depth-D pair. Lazy continuations with
+  hard breaks are normalized the same way (the missing prefix is
+  inserted on the continuation line). The chat renderer's
+  CommonMark soft-break-as-soft-break rendering does diverge from
+  the editor's promote-everything rule on paste — that's the only
+  pixel-fidelity cost of the simpler invariant.
+- **Atomic pair delete.** Backspace at the *end* of a depth-D pair
+  removes all `2 + 4D` bytes in one keystroke; Delete-forward at the
+  *start* does the symmetric delete. Both subsume the old
+  top-level `\n\n` delete and the (now removed) blockquote-pop logic
+  under one rule. Inside fenced code-block content `\n`s are
+  literal — the pair detector is bypassed there, falling through to
+  grapheme delete.
+- **Blockquote-aware Enter and Shift+Enter.** `editor::enter` parses,
+  finds the deepest blockquote at the cursor, and inserts `\n` +
+  `"> " × D` + `\n` + `"> " × D`. `editor::shift_enter` inserts
+  `  \n` + `"> " × D` so the hard-break continuation line carries
+  the marker — and `render_blockquote` extends the previous paragraph
+  leaf forward to swallow the trailing marker line so the cursor has
+  a visible continuation row even before the user types content.
+- **Prefix normalization.** `enforce_invariants` rewrites every
+  blockquote `>` to `> ` (inserting the trailing space if missing),
+  unless the cursor is sitting on the byte right after that specific
+  `>` — the user may be about to type the space themselves. Code
+  content is exempt, same gate as soft-break promotion.
 
 ## Module map
 

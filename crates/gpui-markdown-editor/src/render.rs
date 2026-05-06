@@ -57,7 +57,7 @@ pub fn render(state: &EditorState, tree: &[SyntaxNode]) -> RenderSpec {
     let cursor = CursorRange::from(&state.selection);
     let mut real_blocks = Vec::new();
     for node in tree {
-        render_node(node, cursor, &[], &mut real_blocks);
+        render_node(node, &state.markdown, cursor, &[], &mut real_blocks);
     }
     let blocks = inject_empty_paragraphs(&state.markdown, real_blocks);
     RenderSpec { blocks }
@@ -93,6 +93,7 @@ impl CursorRange {
 
 fn render_node(
     node: &SyntaxNode,
+    source: &str,
     cursor: CursorRange,
     containers: &[Container],
     out: &mut Vec<RenderBlock>,
@@ -102,7 +103,7 @@ fn render_node(
         NodeKind::Heading { .. } => render_heading(node, cursor, containers, out),
         NodeKind::CodeBlock { .. } => render_code_block(node, cursor, containers, out),
         NodeKind::BlockQuote { prefix_ranges } => {
-            render_blockquote(node, prefix_ranges, cursor, containers, out)
+            render_blockquote(node, prefix_ranges, source, cursor, containers, out)
         }
         // Anything else at top level — nothing to do yet. (Future phases add
         // handling for lists, etc.)
@@ -124,23 +125,38 @@ fn render_paragraph(
 
 /// Render a blockquote container.
 ///
-/// We don't emit a `RenderBlock` for the blockquote itself — instead, every
-/// leaf block inside the blockquote (paragraph, heading, code block, or a
-/// nested blockquote's leaves) carries a `Container::BlockQuote` entry on
-/// its `containers` chain. The element layer applies the cumulative
-/// left-indent and paints per-level borders from that chain.
+/// We don't emit a `RenderBlock` for the blockquote itself — every leaf
+/// block inside (paragraph, heading, code block, or a nested
+/// blockquote's leaves) carries a `Container::BlockQuote` entry on its
+/// `containers` chain. The element layer reads that chain to apply
+/// cumulative left-indent and paint per-level borders.
 ///
-/// Per-line `>` markers belong to the leaf they introduce. After the
-/// children are rendered, we walk this blockquote's `prefix_ranges` and
-/// distribute each one to whichever leaf owns it (extending the leaf's
-/// `source_range` upward to swallow the marker if pulldown-cmark ranged
-/// the leaf to start *after* the marker, which it always does for the
-/// marker on the first line). The marker is then added to the leaf's
-/// `hidden_ranges` (cursor outside the blockquote) or as a dimmed
-/// `InlineRun` (cursor inside) — same shape as every other delimiter.
+/// **Pair-aware marker distribution.** The `\n[prefix]\n[prefix]`
+/// structural pair (the depth-D analog of `\n\n`) collapses to one
+/// paragraph_gap visually — the marker line in the middle is *not* a
+/// separate row. So among the per-line markers this blockquote
+/// reports, we distinguish three cases:
+///
+/// 1. **Content-line markers** (claimed by a parsed leaf): attach to
+///    that leaf as hidden / dimmed.
+/// 2. **First-prefix-of-pair markers** (the marker-only line in the
+///    middle of `\n[prefix]\n[prefix]`): skip entirely — the line
+///    has no rendered row.
+/// 3. **Second-prefix-of-pair markers** that aren't claimed by any
+///    parsed leaf (the trailing-empty case post-Enter, or an extra
+///    empty between two paragraphs): emit a synthetic empty
+///    Paragraph leaf so the cursor can land on that empty row.
+///
+/// The toggle bit `expect_middle` distinguishes (2) from (3) inside
+/// the same loop: it starts true (the first unclaimed marker after
+/// content, or after the BQ's start, is the *middle* of a pair) and
+/// flips on each unclaimed marker. A claimed marker resets it back
+/// to `true` (a parsed paragraph effectively occupies the same role
+/// the second-of-pair would).
 fn render_blockquote(
     node: &SyntaxNode,
     prefix_ranges: &[Range<usize>],
+    source: &str,
     cursor: CursorRange,
     containers: &[Container],
     out: &mut Vec<RenderBlock>,
@@ -151,29 +167,116 @@ fn render_blockquote(
 
     let start = out.len();
     for child in &node.children {
-        render_node(child, cursor, &child_chain, out);
+        render_node(child, source, cursor, &child_chain, out);
     }
 
+    let bytes = source.as_bytes();
+    let mut expect_middle = true;
     for prefix in prefix_ranges {
         if let Some(leaf) = find_leaf_for_prefix(&mut out[start..], prefix) {
-            // Extend the leaf's source_range to swallow the prefix —
-            // pulldown ranges most leaves to start *after* the line's
-            // blockquote marker, so without this extension the marker
-            // falls outside the leaf entirely and the element layer
-            // can't hide / dim it.
+            // Pulldown ranges most leaves to start *after* the line's
+            // marker; extend so the marker falls inside the leaf and
+            // the element layer can hide / dim it.
             if prefix.start < leaf.source_range.start {
                 leaf.source_range.start = prefix.start;
             }
-            if cursor_inside {
-                leaf.inlines.push(InlineRun {
-                    source_range: prefix.clone(),
-                    style: InlineStyle::dimmed(),
-                });
-            } else {
-                leaf.hidden_ranges.push(prefix.clone());
-            }
+            attach_marker(leaf, prefix, cursor_inside);
+            expect_middle = true;
+        } else if is_after_hard_break(bytes, prefix.start)
+            && let Some(leaf) = find_leaf_ending_at(&mut out[start..], prefix.start)
+        {
+            // Hard-break continuation: the prefix sits at the start
+            // of a line that follows a `  \n` / `\\\n` hard break.
+            // It's a continuation of the previous paragraph (same
+            // visual paragraph, new visual line), not the middle of
+            // a structural pair. Pulldown often excludes the
+            // dangling marker line from the paragraph's range when
+            // there's no content after it yet (the post-Shift+Enter
+            // transient), so we extend the leaf forward to swallow
+            // it. The toggle isn't touched — this is content, not a
+            // pair half.
+            leaf.source_range.end = source_line_end(bytes, prefix.end);
+            attach_marker(leaf, prefix, cursor_inside);
+        } else if expect_middle {
+            // First prefix of a structural pair — the marker line is
+            // the collapsed paragraph-break separator. No row, no
+            // synthetic. The bytes still exist in source so the
+            // forbidden-position rule keeps the cursor out of the
+            // pair interior.
+            expect_middle = false;
+        } else {
+            // Second prefix of a pair with no parsed-paragraph
+            // partner — emit a synthetic empty leaf so the cursor
+            // has a visible row to land on (post-Enter trailing, or
+            // an extra empty between two paragraphs). The synthetic
+            // shares this BQ's container chain, so an outer
+            // blockquote's later distribution attaches *its* marker
+            // here too.
+            let line_end = source_line_end(bytes, prefix.end);
+            let mut synth = RenderBlock::new(prefix.start..line_end, BlockKind::Paragraph);
+            synth.containers = child_chain.clone();
+            attach_marker(&mut synth, prefix, cursor_inside);
+            out.push(synth);
+            expect_middle = true;
         }
     }
+
+    // Synthetics are appended in `prefix_ranges` order (source order)
+    // but may now sit *after* a parsed leaf that occurs later in
+    // source — sort so subsequent passes (outer-blockquote
+    // distribution, `inject_empty_paragraphs`, the editor's per-block
+    // index) see blocks in source order.
+    out[start..].sort_by_key(|b| b.source_range.start);
+}
+
+/// True if `pos` is the byte index right after a hard-break `\n`
+/// (`  \n` or `\\\n`). Used by `render_blockquote` to recognize that
+/// a marker at `pos` introduces a paragraph-continuation line, not
+/// the middle of a structural pair.
+fn is_after_hard_break(bytes: &[u8], pos: usize) -> bool {
+    if pos == 0 {
+        return false;
+    }
+    let nl = pos - 1;
+    if bytes.get(nl) != Some(&b'\n') {
+        return false;
+    }
+    let preceded_by_two_spaces = nl >= 2 && bytes[nl - 1] == b' ' && bytes[nl - 2] == b' ';
+    let preceded_by_backslash = nl >= 1 && bytes[nl - 1] == b'\\';
+    preceded_by_two_spaces || preceded_by_backslash
+}
+
+/// Find the latest leaf in `slice` whose source range ends *at* `pos`
+/// (i.e., the leaf right before a hard-break continuation marker
+/// that needs to extend it forward).
+fn find_leaf_ending_at(slice: &mut [RenderBlock], pos: usize) -> Option<&mut RenderBlock> {
+    slice
+        .iter_mut()
+        .rev()
+        .find(|leaf| leaf.source_range.end == pos)
+}
+
+fn attach_marker(leaf: &mut RenderBlock, prefix: &Range<usize>, cursor_inside: bool) {
+    if cursor_inside {
+        leaf.inlines.push(InlineRun {
+            source_range: prefix.clone(),
+            style: InlineStyle::dimmed(),
+        });
+    } else {
+        leaf.hidden_ranges.push(prefix.clone());
+    }
+}
+
+/// Byte offset just past the end of the source line containing `pos`,
+/// inclusive of any trailing `\n`. Mirrors how pulldown-cmark ranges
+/// parsed paragraphs (the trailing `\n` is part of the leaf's range,
+/// then trimmed by `inject_empty_paragraphs`).
+fn source_line_end(bytes: &[u8], pos: usize) -> usize {
+    let mut q = pos;
+    while q < bytes.len() && bytes[q] != b'\n' {
+        q += 1;
+    }
+    if q < bytes.len() { q + 1 } else { q }
 }
 
 /// Find the leaf in `slice` whose source range covers the byte at
@@ -1195,6 +1298,95 @@ mod tests {
             .expect("blockquote leaf");
         assert!(matches!(bq.kind, BlockKind::Heading { level: 1 }));
         assert!(bq.has_hidden_range(2..4)); // "# "
+    }
+
+    #[test]
+    fn trailing_pair_emits_one_synthetic_for_cursor() {
+        // The state right after pressing Enter inside `> hi`: the
+        // trailing 6-byte pair `\n> \n> ` collapses to *one*
+        // paragraph_gap visually — no row for the middle marker
+        // line — but a synthetic leaf is still needed at the
+        // second-of-pair so the cursor has somewhere to land.
+        let src = "> hi\n> \n> ";
+        let spec = render_with_cursor(src, src.len());
+        let bq_leaves: Vec<_> = spec
+            .blocks
+            .iter()
+            .filter(|b| !b.containers.is_empty())
+            .collect();
+        // Real para + 1 synthetic trailing leaf = 2 leaves.
+        assert_eq!(bq_leaves.len(), 2);
+        assert!(
+            bq_leaves.iter().all(|b| b.containers.len() == 1
+                && matches!(b.containers[0], Container::BlockQuote { .. }))
+        );
+        // The trailing synthetic ends at the buffer's end so a
+        // boundary cursor lands on it.
+        let trailing = bq_leaves.last().unwrap();
+        assert_eq!(trailing.source_range.end, src.len());
+    }
+
+    #[test]
+    fn middle_of_pair_marker_does_not_render_a_row() {
+        // The middle marker line of a structural pair (the byte run
+        // between the pair's two `\n`s) collapses to whitespace — no
+        // leaf claims those bytes, so the element layer has no row to
+        // paint there.
+        let src = "> hi\n> \n> ";
+        let spec = render_with_cursor(src, src.len());
+        // Bytes 5..7 are the *middle* marker line `> ` (between the
+        // pair's two `\n`s at bytes 4 and 7). No leaf should contain
+        // byte 5.
+        let claims = spec
+            .blocks
+            .iter()
+            .filter(|b| b.source_range.start <= 5 && 5 < b.source_range.end)
+            .count();
+        assert_eq!(
+            claims, 0,
+            "middle-of-pair marker bytes must not be inside any rendered leaf",
+        );
+    }
+
+    #[test]
+    fn trailing_synthetic_dims_its_marker_when_cursor_inside() {
+        // Cursor on the trailing synthetic — its marker dims. The
+        // middle marker line has no rendered row, so its marker has
+        // nothing to dim against.
+        let src = "> hi\n> \n> ";
+        let spec = render_with_cursor(src, src.len());
+        let trailing = spec
+            .blocks
+            .iter()
+            .rfind(|b| !b.containers.is_empty())
+            .expect("trailing synthetic");
+        assert!(
+            trailing.inlines.iter().any(|r| r.style.dimmed),
+            "trailing synthetic must carry a dimmed marker run",
+        );
+    }
+
+    #[test]
+    fn nested_blockquote_synthetic_carries_outer_marker_too() {
+        // Depth-2 trailing state. The outer blockquote's distribution
+        // pass should attach its marker to the synthetic the inner
+        // pass emitted, so each empty marker line carries *both*
+        // levels' markers.
+        let src = "> > hi\n> > \n> > ";
+        let spec = render_with_cursor(src, src.len());
+        let last = spec
+            .blocks
+            .iter()
+            .rfind(|b| !b.containers.is_empty())
+            .expect("trailing leaf");
+        assert_eq!(last.containers.len(), 2);
+        // The trailing line spans bytes 12..16 (`> > `). The inner
+        // marker is at 14..16 and the outer at 12..14 — both should be
+        // recorded as dimmed inline runs (cursor at end-of-doc is on
+        // the construct's boundary, treated as inside).
+        assert!(last.has_dimmed_range(12..14));
+        assert!(last.has_dimmed_range(14..16));
+        assert_eq!(last.source_range.start, 12);
     }
 
     #[test]

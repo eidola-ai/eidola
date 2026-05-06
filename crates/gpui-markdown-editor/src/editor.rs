@@ -153,12 +153,43 @@ impl MarkdownEditor {
         let bytes = self.state.markdown.as_bytes();
         if update::cursor_is_in_fenced_code_content(bytes, cursor) {
             self.dispatch(EditorEvent::InsertText("\n".into()), cx);
+            return;
+        }
+        // Inside a blockquote, Enter must keep the new paragraph at
+        // the same depth. The structural unit is `\n` + N `> `
+        // markers + `\n` + N `> ` markers — the first `\n` ends the
+        // current paragraph, the marker line in the middle is the
+        // paragraph-break separator visible row (synthetic leaf), and
+        // the second-line markers introduce the new paragraph the
+        // user is typing into. The soft-break exemption keeps both
+        // `\n`s from being promoted to `\n\n` (which would terminate
+        // the blockquote scope).
+        let depth = update::blockquote_depth_at(&self.state.markdown, cursor);
+        if depth > 0 {
+            let prefix = "> ".repeat(depth);
+            let insertion = format!("\n{prefix}\n{prefix}");
+            self.dispatch(EditorEvent::InsertText(insertion), cx);
         } else {
             self.dispatch(EditorEvent::InsertNewline, cx);
         }
     }
     fn shift_enter(&mut self, _: &ShiftEnter, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::InsertLineBreak, cx);
+        // Inside a blockquote, a hard break (`  \n`) must be followed
+        // by N `> ` markers so the continuation line stays in the
+        // blockquote scope. Without the markers, pulldown treats the
+        // following line as a *lazy* continuation, which works in
+        // most cases but loses the marker on that line — typing
+        // there would shift the marker target away from the cursor's
+        // visual column.
+        let cursor = self.state.selection.head();
+        let depth = update::blockquote_depth_at(&self.state.markdown, cursor);
+        if depth > 0 {
+            let prefix = "> ".repeat(depth);
+            let insertion = format!("  \n{prefix}");
+            self.dispatch(EditorEvent::InsertText(insertion), cx);
+        } else {
+            self.dispatch(EditorEvent::InsertLineBreak, cx);
+        }
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {

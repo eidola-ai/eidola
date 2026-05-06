@@ -101,9 +101,14 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
 }
 
 /// Promote any lone, mid-content `\n` into `\n\n` so the buffer never
-/// contains a soft break. Idempotent and cheap on already-clean states (a
-/// single linear scan, allocates only when there's something to fix).
+/// contains a soft break, then normalize every blockquote `>` marker to
+/// `> `. Idempotent and cheap on already-clean states.
 pub fn enforce_invariants(state: EditorState) -> EditorState {
+    let state = promote_soft_breaks(state);
+    normalize_blockquote_prefixes(state)
+}
+
+fn promote_soft_breaks(state: EditorState) -> EditorState {
     let bytes = state.markdown.as_bytes();
     // Code-block content is exempt from the soft-break promotion rule:
     // a single mid-content `\n` inside ```/~~~ fences is a literal line
@@ -112,33 +117,86 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
     // fenced block would re-flow into a series of `\n\n`-separated
     // paragraph-style rows.
     let code_ranges = fenced_code_content_ranges(bytes);
-    let mut promote_after: Vec<usize> = Vec::new();
+
+    // Each entry: (insertion_position, inserted_string). Computed in a
+    // single forward scan over the *original* buffer so offsets line
+    // up with the input — the apply step later remaps cursor offsets
+    // exactly once.
+    let mut inserts: Vec<(usize, String)> = Vec::new();
     for p in 0..bytes.len() {
         if is_in_ranges(p, &code_ranges) {
             continue;
         }
-        if is_soft_break(bytes, p) {
-            promote_after.push(p);
+        if !is_soft_break(bytes, p) {
+            continue;
         }
+
+        // Promotion shape: turn the stray `\n` at p into a complete
+        // depth-D pair `\n[prefix]\n[prefix]`. D is the depth of the
+        // line ending at `p`; whatever markers already exist on the
+        // *next* line are kept in place so we never duplicate them.
+        let depth = line_depth_ending_at(bytes, p);
+        let (existing_markers, _) = count_line_markers(bytes, p + 1);
+        let prefix = "> ".repeat(depth);
+
+        let (insert_at, inserted) = if existing_markers >= depth {
+            // The next line already opens with at least the line-
+            // before's depth. Splice in `[prefix]\n` right *after*
+            // the existing `\n`; the existing markers naturally
+            // become the second `[prefix]` of the pair.
+            (p + 1, format!("{prefix}\n"))
+        } else {
+            // Lazy continuation (next line lacks at least one of the
+            // markers we'd expect). Insert the full `[prefix]\n
+            // [prefix]` so the continuation line gains the missing
+            // markers and the pair structure is complete.
+            (p + 1, format!("{prefix}\n{prefix}"))
+        };
+
+        if inserted.is_empty() {
+            continue; // depth 0 + existing_markers >= 0 → nothing to do
+        }
+        inserts.push((insert_at, inserted));
     }
-    if promote_after.is_empty() {
+
+    if inserts.is_empty() {
         return state;
     }
 
-    let mut new_md = String::with_capacity(state.markdown.len() + promote_after.len());
+    // Apply inserts in order. Each `inserts[i].0` is in *original*
+    // coordinates, so we rebuild the buffer by interleaving original
+    // slices with inserted strings.
+    let total_added: usize = inserts.iter().map(|(_, s)| s.len()).sum();
+    let mut new_md = String::with_capacity(state.markdown.len() + total_added);
     let mut last = 0;
-    for &p in &promote_after {
-        new_md.push_str(&state.markdown[last..=p]);
-        new_md.push('\n');
-        last = p + 1;
+    for (pos, ins) in &inserts {
+        new_md.push_str(&state.markdown[last..*pos]);
+        new_md.push_str(ins);
+        last = *pos;
     }
     new_md.push_str(&state.markdown[last..]);
 
+    let map = |off: usize| -> usize {
+        let mut shift = 0;
+        for (pos, ins) in &inserts {
+            if *pos < off {
+                shift += ins.len();
+            } else if *pos == off {
+                // Convention: an offset exactly at an insertion point
+                // shifts forward, so the cursor stays "with" the
+                // content it sat against. (For Enter-from-soft-break
+                // the cursor is typically left-of the broken `\n`,
+                // so this branch rarely fires; it's the safe default.)
+                shift += ins.len();
+            }
+        }
+        off + shift
+    };
     let new_sel = match state.selection {
-        Selection::Cursor(p) => Selection::Cursor(map_offset(&promote_after, p)),
+        Selection::Cursor(p) => Selection::Cursor(map(p)),
         Selection::Range { anchor, head } => Selection::Range {
-            anchor: map_offset(&promote_after, anchor),
-            head: map_offset(&promote_after, head),
+            anchor: map(anchor),
+            head: map(head),
         },
     };
 
@@ -148,12 +206,83 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
     }
 }
 
-/// Map an offset in the pre-promotion string to the corresponding offset
-/// after promotion. Convention: an offset that falls *exactly at* an
-/// insertion site shifts forward, so the cursor stays "with" the content
-/// it was logically next to.
-fn map_offset(promote_after: &[usize], off: usize) -> usize {
-    off + promote_after.iter().filter(|&&p| p < off).count()
+/// Insert a space after every blockquote `>` marker that isn't already
+/// followed by one — *unless* the cursor (or selection anchor / head)
+/// is exactly the byte right after the `>`. Mid-typing the user might
+/// have just pressed `>` and intends to type a space themselves; we
+/// don't second-guess them. Once the cursor moves away, the next
+/// `update` call's post-pass normalizes the marker so the parsed
+/// shape stays predictable for the renderer.
+///
+/// Skips `>` bytes that fall inside fenced code-block content — those
+/// are literal `>` characters, not blockquote markers.
+fn normalize_blockquote_prefixes(state: EditorState) -> EditorState {
+    let bytes = state.markdown.as_bytes();
+    let code_ranges = fenced_code_content_ranges(bytes);
+    let (cursor_head, cursor_anchor) = match state.selection {
+        Selection::Cursor(p) => (p, p),
+        Selection::Range { anchor, head } => (head, anchor),
+    };
+
+    let mut insert_at: Vec<usize> = Vec::new();
+    let mut p = 0;
+    while p < bytes.len() {
+        let line_start = p;
+        let mut line_end = p;
+        while line_end < bytes.len() && bytes[line_end] != b'\n' {
+            line_end += 1;
+        }
+        let mut q = line_start;
+        loop {
+            let mut indent = 0;
+            while q < line_end && bytes[q] == b' ' && indent < 3 {
+                q += 1;
+                indent += 1;
+            }
+            if q < line_end && bytes[q] == b'>' && !is_in_ranges(q, &code_ranges) {
+                let after_gt = q + 1;
+                let needs_space =
+                    after_gt < line_end && bytes[after_gt] != b' ' && bytes[after_gt] != b'\n';
+                if needs_space && after_gt != cursor_head && after_gt != cursor_anchor {
+                    insert_at.push(after_gt);
+                }
+                q = after_gt;
+                if q < line_end && bytes[q] == b' ' {
+                    q += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        p = line_end + 1;
+    }
+
+    if insert_at.is_empty() {
+        return state;
+    }
+
+    let mut new_md = String::with_capacity(state.markdown.len() + insert_at.len());
+    let mut last = 0;
+    for &pos in &insert_at {
+        new_md.push_str(&state.markdown[last..pos]);
+        new_md.push(' ');
+        last = pos;
+    }
+    new_md.push_str(&state.markdown[last..]);
+
+    let map = |off: usize| -> usize { off + insert_at.iter().filter(|&&p| p < off).count() };
+    let new_sel = match state.selection {
+        Selection::Cursor(p) => Selection::Cursor(map(p)),
+        Selection::Range { anchor, head } => Selection::Range {
+            anchor: map(anchor),
+            head: map(head),
+        },
+    };
+
+    EditorState {
+        markdown: new_md,
+        selection: new_sel,
+    }
 }
 
 /// Snap any cursor or selection endpoint that landed at a forbidden
@@ -207,6 +336,38 @@ pub(crate) fn is_forbidden_position_for_test(bytes: &[u8], p: usize) -> bool {
 /// block to a single-`\n` insert.
 pub(crate) fn cursor_is_in_fenced_code_content(bytes: &[u8], p: usize) -> bool {
     is_in_ranges(p, &fenced_code_content_ranges(bytes))
+}
+
+/// Deepest blockquote nesting that contains `cursor`. Used by the
+/// editor's Enter / Shift+Enter handlers to emit a paragraph break /
+/// hard break that *stays inside* the blockquote — the structural
+/// shape is `\n` + `"> "` × depth + `\n` + `"> "` × depth (Enter) or
+/// `"  \n"` + `"> "` × depth (Shift+Enter), which the
+/// soft-break-exemption rule + synthetic marker leaves render as one
+/// extra empty row at the same depth. Falls back on the parser
+/// because byte-level scanning can't disambiguate lazy continuations
+/// (a paragraph line without a `>` marker that pulldown still treats
+/// as inside the blockquote).
+pub fn blockquote_depth_at(markdown: &str, cursor: usize) -> usize {
+    fn walk(nodes: &[crate::syntax::SyntaxNode], cursor: usize, depth: usize) -> usize {
+        let mut deepest = depth;
+        for node in nodes {
+            // Boundary equality (`cursor == range.end`) treats the
+            // post-construct caret as still inside, matching the
+            // delimiter-visibility rule the renderer uses.
+            if cursor < node.range.start || cursor > node.range.end {
+                continue;
+            }
+            let new_depth = if matches!(node.kind, crate::syntax::NodeKind::BlockQuote { .. }) {
+                depth + 1
+            } else {
+                depth
+            };
+            deepest = deepest.max(walk(&node.children, cursor, new_depth));
+        }
+        deepest
+    }
+    walk(&crate::parser::parse(markdown), cursor, 0)
 }
 
 /// Find every fenced code block's full byte range in `bytes` —
@@ -324,34 +485,172 @@ fn is_forbidden_position(bytes: &[u8], p: usize) -> bool {
     !is_in_ranges(p, &fenced_code_content_ranges(bytes))
 }
 
-/// The pure structural test for `\n\n` pair interiors, without the
-/// code-block escape hatch. `bytes[p-1]` and `bytes[p]` are both `\n`,
-/// and the count of consecutive **structural** `\n`s ending at `p-1`
-/// is odd. Hard breaks (`  \n` or `\\\n`) are in-paragraph content;
-/// the back-walk stops before counting one. Hard-break `\n`s only
-/// appear at the *start* of a run of consecutive `\n`s — a `\n`
-/// mid-run is preceded by another `\n`, not by spaces or a backslash
-/// — so the check at the back-walk's terminus is enough.
+/// Pure structural test for "p sits strictly inside a structural pair."
+///
+/// The structural pair is the depth-D generalization of `\n\n`: it is
+/// `\n[prefix]\n[prefix]` where `[prefix]` is `> ` repeated D times
+/// (D >= 0; D == 0 collapses to plain `\n\n`). Top-level paragraph
+/// breaks are pairs at depth 0; blockquote-internal paragraph breaks
+/// are pairs at depth >= 1. Within a contiguous run of consecutive
+/// pairs the byte sequence alternates `\n` / `[prefix]` / `\n` /
+/// `[prefix]` …; allowed cursor positions are at multiples of one
+/// pair length (the run boundaries and the seams between adjacent
+/// pairs). Every other interior position is forbidden.
+///
+/// We detect by walking outward from `p` over the contiguous run of
+/// only `\n`, `>`, and ` ` bytes — that's the maximal region a pair
+/// can occupy. If both walks bracket the run with content (or
+/// buffer edges) and the run holds an even count of `\n`s laid out as
+/// equally-sized pair-shaped slices, `p` is forbidden iff its offset
+/// from the run start isn't a clean multiple of the pair length.
+///
+/// Hard breaks (`  \n` / `\\\n`) bound the run early — `bytes[q-1]`
+/// of `  ` or `\\` doesn't satisfy the `' '/'>'/'\n'` predicate, so
+/// the walk stops before counting them.
 fn is_paragraph_break_interior(bytes: &[u8], p: usize) -> bool {
-    if p == 0 || p >= bytes.len() {
+    if p == 0 || p > bytes.len() {
         return false;
     }
-    if bytes[p - 1] != b'\n' || bytes[p] != b'\n' {
+
+    // The run reads `[partial-prefix]? \n [prefix] \n [prefix] \n …`
+    // around `p`. All `[prefix]`s in a single pair must have the
+    // *same* marker count — once one prefix sets the depth, the
+    // walks (back and forward) cap consumption to that count so a
+    // greedy reach into adjacent content (a stray `>` end-of-buffer,
+    // a deeper nested BQ start, a content trailing space) doesn't
+    // corrupt pair-length math.
+    //
+    // Algorithm:
+    //   1. Back-walk: consume a `[partial-prefix]` left of `p` (the
+    //      markers `p` sits inside), then *require* a structural
+    //      `\n`. If none, `p` is in content — return false.
+    //   2. Repeat back-walk: consume another `[prefix] \n`. The
+    //      first such full prefix sets the depth; later prefixes
+    //      must match. If a marker count differs, stop (mixed-depth
+    //      run isn't a single pair structure).
+    //   3. Forward-walk: consume the rest of the partial-prefix
+    //      forward, then alternating `\n [prefix]` segments. Cap
+    //      each prefix to the established depth.
+    //   4. Check the run is `\n[prefix]\n[prefix]…` with even `\n`
+    //      count and pair_len consistent with a depth-D pair.
+
+    let mut q = p;
+    let initial_partial_back = walk_back_markers(bytes, &mut q, usize::MAX);
+    if !walk_back_required_newline(bytes, &mut q) {
         return false;
     }
-    let mut count = 0;
-    let mut i = p;
-    while i > 0 && bytes[i - 1] == b'\n' {
-        let q = i - 1;
+    let mut run_start = q;
+    let mut depth: Option<usize> = None;
+    loop {
+        let probe = q;
+        let cap = depth.unwrap_or(usize::MAX);
+        let count = walk_back_markers(bytes, &mut q, cap);
+        if count == 0 {
+            break;
+        }
+        if !walk_back_required_newline(bytes, &mut q) {
+            // Markers consumed without a preceding `\n` — content.
+            // `q` may be partially walked but `run_start` wasn't
+            // updated, so the run already excludes these bytes.
+            let _ = probe;
+            break;
+        }
+        match depth {
+            Some(d) if d != count => break, // mixed-depth — stop
+            None => depth = Some(count),
+            _ => {}
+        }
+        run_start = q;
+    }
+
+    let mut q = p;
+    // Complete the partial-prefix forward.
+    let initial_partial_fwd = if let Some(d) = depth {
+        let needed = d.saturating_sub(initial_partial_back);
+        walk_forward_markers(bytes, &mut q, needed)
+    } else {
+        // No depth from backward yet — first thing we see (forward
+        // partial-prefix or first full prefix below) sets it.
+        walk_forward_markers(bytes, &mut q, usize::MAX)
+    };
+    let total_partial = initial_partial_back + initial_partial_fwd;
+    if let Some(d) = depth {
+        if total_partial != d {
+            // The partial-prefix at `p` doesn't fit the established
+            // depth — `p` is in content adjacent to the run, not
+            // inside it.
+            return false;
+        }
+    } else if total_partial > 0 {
+        depth = Some(total_partial);
+    }
+
+    let mut run_end = q;
+    while q < bytes.len() && bytes[q] == b'\n' {
         let preceded_by_two_spaces = q >= 2 && bytes[q - 1] == b' ' && bytes[q - 2] == b' ';
         let preceded_by_backslash = q >= 1 && bytes[q - 1] == b'\\';
         if preceded_by_two_spaces || preceded_by_backslash {
             break;
         }
-        count += 1;
-        i -= 1;
+        q += 1;
+        let cap = depth.unwrap_or(usize::MAX);
+        let consumed = walk_forward_markers(bytes, &mut q, cap);
+        match depth {
+            Some(d) if consumed != d => {
+                // Next prefix doesn't match depth — the run ends
+                // before this `\n`. (q has already been advanced
+                // past the `\n` and a partial prefix, but run_end
+                // wasn't yet committed for this iteration.)
+                break;
+            }
+            None => depth = Some(consumed),
+            _ => {}
+        }
+        run_end = q;
     }
-    count % 2 == 1
+
+    let run_len = run_end - run_start;
+    if run_len < 2 {
+        return false;
+    }
+    let nl_count = bytes[run_start..run_end]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count();
+    if nl_count < 2 || !nl_count.is_multiple_of(2) {
+        return false;
+    }
+    let pair_count = nl_count / 2;
+    if !run_len.is_multiple_of(pair_count) {
+        return false;
+    }
+    let pair_len = run_len / pair_count;
+    // Each pair is `\n[prefix]\n[prefix]` of length `2 + 4D`, so
+    // `(pair_len - 2)` must be a multiple of 4 (two prefixes × two
+    // bytes per `> ` marker).
+    if pair_len < 2 || !(pair_len - 2).is_multiple_of(4) {
+        return false;
+    }
+    let offset = p - run_start;
+    offset > 0 && offset < run_len && !offset.is_multiple_of(pair_len)
+}
+
+/// Walk `q` back over a single structural `\n`. Returns true on
+/// success (and updates `q`); returns false (and leaves `q`
+/// unchanged) if `q` isn't preceded by a `\n` or the `\n` is part of
+/// a hard break.
+fn walk_back_required_newline(bytes: &[u8], q: &mut usize) -> bool {
+    if *q == 0 || bytes[*q - 1] != b'\n' {
+        return false;
+    }
+    let nl = *q - 1;
+    let preceded_by_two_spaces = nl >= 2 && bytes[nl - 1] == b' ' && bytes[nl - 2] == b' ';
+    let preceded_by_backslash = nl >= 1 && bytes[nl - 1] == b'\\';
+    if preceded_by_two_spaces || preceded_by_backslash {
+        return false;
+    }
+    *q -= 1;
+    true
 }
 
 fn next_allowed_position(bytes: &[u8], mut p: usize) -> usize {
@@ -390,13 +689,20 @@ fn nearest_allowed_position(bytes: &[u8], p: usize) -> usize {
 
 /// Is the `\n` at byte index `p` a soft break (a lone newline that would
 /// be ambiguous in CommonMark)?
+///
+/// Soft breaks are mid-content `\n`s that aren't part of a complete
+/// structural pair. The depth-D pair `\n[prefix]\n[prefix]` is the
+/// generalization of `\n\n`: a `\n` is exempt if it's one of the two
+/// `\n`s in such a pair (so the `\n` between two adjacent BQ-content
+/// paragraphs survives, but a stray `\n` across two BQ lines —
+/// CommonMark's "lazy continuation" — is still promoted).
 fn is_soft_break(bytes: &[u8], p: usize) -> bool {
     if bytes[p] != b'\n' {
         return false;
     }
     // Edge of document — single leading or trailing `\n` is harmless
-    // whitespace in CommonMark, and changing it would surprise users who
-    // pasted content that ends in `\n`.
+    // whitespace in CommonMark, and changing it would surprise users
+    // who pasted content that ends in `\n`.
     if p == 0 || p + 1 >= bytes.len() {
         return false;
     }
@@ -404,15 +710,61 @@ fn is_soft_break(bytes: &[u8], p: usize) -> bool {
     if bytes[p - 1] == b'\n' || bytes[p + 1] == b'\n' {
         return false;
     }
-    // Backslash hard break (`\<NL>`).
+    // Hard breaks (`\\\n` / `  \n`).
     if bytes[p - 1] == b'\\' {
         return false;
     }
-    // Trailing-whitespace hard break (`  <NL>` or longer).
     if p >= 2 && bytes[p - 1] == b' ' && bytes[p - 2] == b' ' {
         return false;
     }
+    // Already part of a structural depth-D pair. The pair-interior
+    // detector also classifies the byte right after either `\n` of
+    // the pair as interior; piggyback on it to recognize "this `\n`
+    // belongs to a pair" by probing both adjacent positions.
+    if is_paragraph_break_interior(bytes, p) || is_paragraph_break_interior(bytes, p + 1) {
+        return false;
+    }
     true
+}
+
+/// Count the leading blockquote markers on the line that contains
+/// `line_start`. Each marker is `>` optionally followed by a single
+/// space, optionally preceded by up to 3 CommonMark-permitted spaces
+/// of indent. Returns the marker count and the byte offset right
+/// after the last marker.
+fn count_line_markers(bytes: &[u8], line_start: usize) -> (usize, usize) {
+    let mut q = line_start;
+    let mut markers = 0;
+    loop {
+        let mut indent = 0;
+        while q < bytes.len() && bytes[q] == b' ' && indent < 3 {
+            q += 1;
+            indent += 1;
+        }
+        if q < bytes.len() && bytes[q] == b'>' {
+            q += 1;
+            if q < bytes.len() && bytes[q] == b' ' {
+                q += 1;
+            }
+            markers += 1;
+            continue;
+        }
+        return (markers, q);
+    }
+}
+
+/// Depth (count of leading `> ` markers) of the source line ending at
+/// `line_end_excl` — i.e. the line whose final byte is at
+/// `line_end_excl - 1` (and whose `\n` terminator, if present, sits at
+/// `line_end_excl`). Walks back to the previous `\n` (or buffer start)
+/// to find the line's start, then counts markers forward.
+fn line_depth_ending_at(bytes: &[u8], line_end_excl: usize) -> usize {
+    let mut s = line_end_excl;
+    while s > 0 && bytes[s - 1] != b'\n' {
+        s -= 1;
+    }
+    let (markers, _) = count_line_markers(bytes, s);
+    markers
 }
 
 fn clamp(pos: usize, len: usize) -> usize {
@@ -456,28 +808,73 @@ fn delete_backward(state: EditorState) -> EditorState {
         return state;
     }
 
-    // If we're backspacing into a `\n` run, treat the run atomically: a
-    // 2-newline mid-content run gets deleted in one go (otherwise the
-    // post-pass would re-promote and the keypress would feel like a no-op).
-    // Inside a fenced code block, `\n`s are literal line separators
-    // — pair-deleting them would silently merge two distinct code
-    // lines on a single keystroke. Fall through to the regular
-    // grapheme delete path instead.
-    let extent = {
-        let bytes = state.markdown.as_bytes();
-        if bytes[cursor - 1] == b'\n' && !cursor_is_in_fenced_code_content(bytes, cursor) {
-            let (run_start, run_end) = newline_run_around(bytes, cursor - 1);
-            Some(paragraph_break_delete_extent(bytes, run_start, run_end))
-        } else {
-            None
+    // Atomic pair delete: when the cursor sits at (or somewhere
+    // inside) a depth-D structural pair `\n[prefix]\n[prefix]`,
+    // Backspace removes the whole `2 + 4D` bytes in one step. We
+    // first snap forward over any pair interior — that's where a
+    // direct cursor placement (e.g. a click on the visually-
+    // collapsed paragraph_gap, or a programmatic SetSelection) might
+    // land — then look for a pair *ending* at the snapped position.
+    // This subsumes both the top-level `\n\n`-pair delete (D=0) and
+    // the old blockquote-pop logic (D >= 1) under one rule. Inside
+    // fenced code-block content, `\n`s are literal line separators —
+    // fall through to the regular grapheme delete path instead.
+    let bytes = state.markdown.as_bytes();
+    if !cursor_is_in_fenced_code_content(bytes, cursor) {
+        let snapped = next_allowed_position(bytes, cursor);
+        if let Some(pair_start) = pair_at_end(bytes, snapped) {
+            return splice(&state.markdown, cursor, pair_start, snapped);
         }
-    };
-    if let Some((del_start, del_end)) = extent {
-        return splice(&state.markdown, cursor, del_start, del_end);
     }
 
     let prev = prev_grapheme_offset(&state.markdown, cursor);
     splice(&state.markdown, cursor, prev, cursor)
+}
+
+/// If `cursor` sits at the end of a depth-D structural pair (`\n` +
+/// `> ` × D + `\n` + `> ` × D), return the pair's start byte.
+///
+/// The detector walks backward symmetrically: prefix → `\n` → prefix
+/// → `\n`, requiring the two prefixes to be the same length so an
+/// uneven structure doesn't trigger an atomic delete. Hard-break
+/// `\n`s (`  \n` / `\\\n`) are not pair `\n`s — the back-walk rejects
+/// them.
+fn pair_at_end(bytes: &[u8], cursor: usize) -> Option<usize> {
+    let mut q = cursor;
+    // 2nd prefix.
+    let markers1 = walk_back_markers(bytes, &mut q, usize::MAX);
+    // 2nd `\n`.
+    if !walk_back_required_newline(bytes, &mut q) {
+        return None;
+    }
+    // 1st prefix (must match the 2nd's count).
+    let markers2 = walk_back_markers(bytes, &mut q, markers1);
+    if markers2 != markers1 {
+        return None;
+    }
+    // 1st `\n`.
+    if !walk_back_required_newline(bytes, &mut q) {
+        return None;
+    }
+    Some(q)
+}
+
+/// Walk `q` back over up to `cap` blockquote markers (`> ` or bare
+/// `>`), returning the count consumed.
+fn walk_back_markers(bytes: &[u8], q: &mut usize, cap: usize) -> usize {
+    let mut count = 0;
+    while count < cap {
+        if *q >= 2 && bytes[*q - 1] == b' ' && bytes[*q - 2] == b'>' {
+            *q -= 2;
+            count += 1;
+        } else if *q >= 1 && bytes[*q - 1] == b'>' {
+            *q -= 1;
+            count += 1;
+        } else {
+            return count;
+        }
+    }
+    count
 }
 
 fn delete_forward(state: EditorState) -> EditorState {
@@ -493,59 +890,74 @@ fn delete_forward(state: EditorState) -> EditorState {
         return state;
     }
 
-    let extent = {
-        let bytes = state.markdown.as_bytes();
-        if bytes[cursor] == b'\n' && !cursor_is_in_fenced_code_content(bytes, cursor) {
-            let (run_start, run_end) = newline_run_around(bytes, cursor);
-            Some(paragraph_break_delete_extent(bytes, run_start, run_end))
-        } else {
-            None
+    let bytes = state.markdown.as_bytes();
+    if !cursor_is_in_fenced_code_content(bytes, cursor) {
+        let snapped = prev_allowed_position(bytes, cursor);
+        if let Some(pair_end) = pair_at_start(bytes, snapped) {
+            return splice(&state.markdown, cursor, snapped, pair_end);
         }
-    };
-    if let Some((del_start, del_end)) = extent {
-        return splice(&state.markdown, cursor, del_start, del_end);
     }
 
     let next = next_grapheme_offset(&state.markdown, cursor);
     splice(&state.markdown, cursor, cursor, next)
 }
 
-/// Walk outward from a `\n` byte to find the contiguous run of newlines
-/// containing it. Returns `[start, end)` byte indices.
-fn newline_run_around(bytes: &[u8], anchor: usize) -> (usize, usize) {
-    debug_assert_eq!(bytes[anchor], b'\n');
-    let mut start = anchor;
-    while start > 0 && bytes[start - 1] == b'\n' {
-        start -= 1;
+/// Forward analog of [`pair_at_end`]: if `cursor` sits at the start of
+/// a depth-D structural pair, return the pair's end byte. Used by
+/// `delete_forward` so a forward-delete merges paragraphs by removing
+/// the whole `2 + 4D` bytes in one keystroke.
+fn pair_at_start(bytes: &[u8], cursor: usize) -> Option<usize> {
+    let mut q = cursor;
+    if !walk_forward_required_newline(bytes, &mut q) {
+        return None;
     }
-    let mut end = anchor + 1;
-    while end < bytes.len() && bytes[end] == b'\n' {
-        end += 1;
+    let markers1 = walk_forward_markers(bytes, &mut q, usize::MAX);
+    if !walk_forward_required_newline(bytes, &mut q) {
+        return None;
     }
-    (start, end)
+    let markers2 = walk_forward_markers(bytes, &mut q, markers1);
+    if markers2 != markers1 {
+        return None;
+    }
+    Some(q)
 }
 
-/// Given a contiguous newline run `[start, end)` that the cursor is
-/// touching, decide which slice to delete. Per the pairs model in the
-/// module-level docs, every "Enter unit" in the source is a pair of
-/// `\n`s, so each delete keystroke removes a pair from the run. For an
-/// exactly-2 run, that's the whole paragraph break, merging adjacent
-/// paragraphs. For runs of 4+, that removes one empty paragraph.
-///
-/// The lone-`\n` case (run length 1) only arises from anomalous input
-/// (paste with a stray `\n`); we delete it and let `enforce_invariants`
-/// re-normalize anything that's left.
-fn paragraph_break_delete_extent(
-    _bytes: &[u8],
-    run_start: usize,
-    run_end: usize,
-) -> (usize, usize) {
-    let len = run_end - run_start;
-    if len >= 2 {
-        (run_end - 2, run_end)
-    } else {
-        (run_end - 1, run_end)
+/// Walk `q` forward over up to `cap` blockquote markers (`> ` or
+/// bare `>`), returning the count consumed. Handles the in-marker
+/// case where `q` sits between a `>` and its trailing `' '`: the
+/// trailing space is consumed *without counting*, since whoever's
+/// walking from the other side has already accounted for that
+/// marker. (Callers like `pair_at_start` always start `q` at a `\n`,
+/// so the in-marker case never fires there.)
+fn walk_forward_markers(bytes: &[u8], q: &mut usize, cap: usize) -> usize {
+    if *q < bytes.len() && bytes[*q] == b' ' && *q >= 1 && bytes[*q - 1] == b'>' {
+        *q += 1;
     }
+    let mut count = 0;
+    while count < cap && *q < bytes.len() && bytes[*q] == b'>' {
+        *q += 1;
+        if *q < bytes.len() && bytes[*q] == b' ' {
+            *q += 1;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Walk `q` forward over a single structural `\n` (not the `\n` of a
+/// hard break `  \n` / `\\\n`). Returns true on success; leaves `q`
+/// unmodified on failure.
+fn walk_forward_required_newline(bytes: &[u8], q: &mut usize) -> bool {
+    if *q >= bytes.len() || bytes[*q] != b'\n' {
+        return false;
+    }
+    let preceded_by_two_spaces = *q >= 2 && bytes[*q - 1] == b' ' && bytes[*q - 2] == b' ';
+    let preceded_by_backslash = *q >= 1 && bytes[*q - 1] == b'\\';
+    if preceded_by_two_spaces || preceded_by_backslash {
+        return false;
+    }
+    *q += 1;
+    true
 }
 
 /// Splice out `[del_start, del_end)` from `markdown` and re-anchor the

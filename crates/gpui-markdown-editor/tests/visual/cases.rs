@@ -233,6 +233,41 @@ pub fn register(s: &mut Snapshots) {
         })
     });
 
+    // After Enter inside `> hello` — empty marker line plus a new
+    // blockquote line where the cursor sits. Borders span both lines.
+    s.add("blockquote_after_enter", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "> hello\n> \n> ".into(),
+                selection: Selection::Cursor(13),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Same shape at depth 2 — two stacked borders span all three rows.
+    s.add("nested_blockquote_after_enter", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "> > deep\n> > \n> > ".into(),
+                selection: Selection::Cursor(18),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Hard break inside a blockquote: `  \n> ` keeps the second visual
+    // line in the same paragraph and inside the blockquote.
+    s.add("blockquote_hard_break", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "> hello  \n> ".into(),
+                selection: Selection::Cursor(12),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
     // Code block inside a blockquote — the code-block bg paints
     // *inside* the blockquote indent, not over the border bar.
     s.add("code_block_inside_blockquote", win, |window, cx| {

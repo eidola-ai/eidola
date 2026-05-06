@@ -802,6 +802,420 @@ fn cursor_inside_blockquote_marks_only_overlapping_levels(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn enter_inside_blockquote_keeps_new_paragraph_at_same_depth(cx: &mut TestAppContext) {
+    // The user's load-bearing example: cursor at the end of a single
+    // blockquote paragraph; pressing Enter must produce *two* lines —
+    // the empty marker separator and the new paragraph's marker — both
+    // still inside the blockquote.
+    let initial = EditorState {
+        markdown: "> hello".into(),
+        selection: Selection::Cursor(7),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> hello\n> \n> ");
+        assert_eq!(e.cursor_offset(), 13);
+        // The paragraph the cursor sits in still belongs to a
+        // blockquote (depth 1).
+        assert_eq!(
+            gpui_markdown_editor::update::blockquote_depth_at(
+                &e.state.markdown,
+                e.cursor_offset(),
+            ),
+            1,
+        );
+    });
+}
+
+#[gpui::test]
+fn enter_inside_nested_blockquote_keeps_depth(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "> > deep".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> > deep\n> > \n> > ");
+        assert_eq!(
+            gpui_markdown_editor::update::blockquote_depth_at(
+                &e.state.markdown,
+                e.cursor_offset(),
+            ),
+            2,
+        );
+    });
+}
+
+#[gpui::test]
+fn shift_enter_inside_blockquote_keeps_marker_on_continuation(cx: &mut TestAppContext) {
+    // Hard break inside a blockquote: `  \n` followed by `> ` so the
+    // continuation line stays in the blockquote scope.
+    let initial = EditorState {
+        markdown: "> hello".into(),
+        selection: Selection::Cursor(7),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftEnter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> hello  \n> ");
+        assert_eq!(e.cursor_offset(), 12);
+    });
+}
+
+#[gpui::test]
+fn backspace_at_end_of_pair_atomically_undoes_paragraph_break(cx: &mut TestAppContext) {
+    // After `> hello` + Enter, cursor sits at the end of the depth-1
+    // pair `\n> \n> `. Backspace removes the whole 6-byte pair in one
+    // keystroke — the analog of how Backspace at the start of `p2`
+    // in `p1\n\np2` deletes both `\n`s and merges into `p1p2`. Result:
+    // back to the pre-Enter state.
+    let initial = EditorState {
+        markdown: "> hello\n> \n> ".into(),
+        selection: Selection::Cursor(13),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> hello");
+        assert_eq!(e.cursor_offset(), 7);
+    });
+}
+
+#[gpui::test]
+fn backspace_at_end_of_depth_2_pair_undoes_atomically(cx: &mut TestAppContext) {
+    // Same shape, depth 2: pair length is `2 + 4*2 = 10` bytes; one
+    // Backspace removes them all and lands back on the original
+    // `> > deep` content.
+    let initial = EditorState {
+        markdown: "> > deep\n> > \n> > ".into(),
+        selection: Selection::Cursor(18),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> > deep");
+        assert_eq!(e.cursor_offset(), 8);
+    });
+}
+
+#[gpui::test]
+fn enter_then_backspace_round_trips(cx: &mut TestAppContext) {
+    // The interactive sequence: press Enter inside a blockquote, then
+    // Backspace once. The atomic pair delete returns the buffer
+    // *exactly* to the pre-Enter state.
+    let initial = EditorState {
+        markdown: "> hello".into(),
+        selection: Selection::Cursor(7),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> hello");
+        assert_eq!(e.cursor_offset(), 7);
+    });
+}
+
+#[gpui::test]
+fn typing_inside_blockquote_after_enter_preserves_scope(cx: &mut TestAppContext) {
+    // The user types Enter then content. The new paragraph is a real
+    // second paragraph inside the same blockquote — pulldown sees
+    // both `p1` and the typed content as paragraphs of one bq.
+    let initial = EditorState {
+        markdown: "> p1".into(),
+        selection: Selection::Cursor(4),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("p2".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> p1\n> \n> p2");
+    });
+}
+
+/// `MarkdownEditor::with_state` skips the post-pass — it accepts the
+/// initial state verbatim. Production state always arrives via
+/// `update::update`, which is where the soft-break + prefix
+/// normalization passes live. To exercise those passes in a behavior
+/// test we run the (no-op) selection update through `update`.
+fn run_enforce_invariants(cx: &mut TestAppContext, initial: EditorState) -> EditorState {
+    let sel = initial.selection;
+    cx.update(|_| {
+        gpui_markdown_editor::update::update(
+            initial,
+            gpui_markdown_editor::EditorEvent::SetSelection(sel),
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Pair-model invariants — the depth-D pair `\n[prefix]\n[prefix]` is the
+// blockquote-internal analog of `\n\n`. Cursor can't sit inside it, arrow
+// keys jump over it, Backspace deletes the whole pair atomically, soft
+// breaks across BQ lines get promoted to a complete pair shape (incl.
+// lazy-continuation insertion), and hard-break lazy continuations get
+// the missing marker inserted.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn space_inside_blockquote_does_not_inject_extra_lines(cx: &mut TestAppContext) {
+    // Regression: typing a space at the end of a blockquote content
+    // line whose buffer also has trailing pair-shaped marker rows
+    // used to cause `enforce_invariants` to misclassify the inserted
+    // space as content extending the run, fail the pair structural
+    // check, and re-promote the surrounding `\n` *every* update —
+    // each invocation injecting another `> \n` line. The fix is the
+    // tighter backward walk in `is_paragraph_break_interior`: a
+    // walk-back over `' '` / `'>'` only counts toward the run if it
+    // terminates at a structural `\n`.
+    let initial = EditorState {
+        markdown: "> blockquote\n> \n> ".into(),
+        // Cursor right after "blockquote".
+        selection: Selection::Cursor(12),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText(" ".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        // Exactly one space inserted — the trailing pair structure
+        // is unchanged.
+        assert_eq!(e.state.markdown, "> blockquote \n> \n> ");
+        assert_eq!(e.cursor_offset(), 13);
+    });
+
+    // Idempotent: a no-op SetSelection (mouse move, click handler
+    // re-feeding the same offset) re-runs `enforce_invariants`. The
+    // buffer must stay identical — no fresh promotion fires.
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let sel = e.state.selection;
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::SetSelection(sel),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> blockquote \n> \n> ");
+    });
+}
+
+#[gpui::test]
+fn typing_gt_to_enter_nested_blockquote_does_not_inject_extra_lines(cx: &mut TestAppContext) {
+    // Same class of bug as `space_inside_blockquote_does_not_inject_extra_lines`,
+    // this time on the *forward* walk. State right after Enter inside
+    // `> level 1`: the trailing pair has cursor on its second-of-pair
+    // marker line. Typing `>` to start a depth-2 BQ used to make the
+    // forward walk greedily consume the typed `>` as a continuation
+    // marker, breaking pair-length math, and promote the existing
+    // structural `\n`s — injecting a fresh `> \n` line per keystroke.
+    let initial = EditorState {
+        markdown: "> level 1\n> \n> ".into(),
+        // Cursor at end of buffer.
+        selection: Selection::Cursor(15),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText(">".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        // Exactly one `>` appended. Trailing pair structure is
+        // unchanged (still 4 lines: content + middle marker + new
+        // marker line with the typed `>`).
+        assert_eq!(e.state.markdown, "> level 1\n> \n> >");
+        assert_eq!(e.cursor_offset(), 16);
+    });
+
+    // Idempotent on re-update.
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let sel = e.state.selection;
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::SetSelection(sel),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> level 1\n> \n> >");
+    });
+
+    // The reported follow-on: right-arrow navigation must not
+    // trigger fresh promotion either.
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> level 1\n> \n> >");
+    });
+}
+
+#[gpui::test]
+fn cursor_cannot_set_inside_blockquote_pair(cx: &mut TestAppContext) {
+    // Position 8 is bytes 5..7 = `> ` plus bytes 7 = `\n` of the
+    // pair `\n> \n> ` at bytes 4..10. Setting the cursor strictly
+    // inside (bytes 5-9) snaps to the nearest allowed boundary.
+    let initial = EditorState {
+        markdown: "> p1\n> \n> p2".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(7)),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        // Cursor at 7 (interior of pair 4..10 — strictly inside) is
+        // forbidden. Snap should land on the nearest boundary
+        // (either 4 = end of p1, or 10 = start of p2). Both are
+        // valid landing points.
+        let off = e.cursor_offset();
+        assert!(off == 4 || off == 10, "cursor snapped to unexpected {off}");
+    });
+}
+
+#[gpui::test]
+fn right_arrow_jumps_over_blockquote_pair(cx: &mut TestAppContext) {
+    // Right from byte 4 (end of p1) skips the 6-byte pair interior
+    // and lands on byte 10 (start of p2).
+    let initial = EditorState {
+        markdown: "> p1\n> \n> p2".into(),
+        selection: Selection::Cursor(4),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 10));
+}
+
+#[gpui::test]
+fn delete_forward_at_pair_start_atomically_undoes_break(cx: &mut TestAppContext) {
+    // Delete forward at the first `\n` of a depth-1 pair removes the
+    // whole 6-byte pair, merging the two BQ paragraphs into one.
+    // Same shape as top-level `p1\n\np2` → Delete → `p1p2`.
+    let initial = EditorState {
+        markdown: "> hello\n> \n> world".into(),
+        selection: Selection::Cursor(7),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Delete);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> helloworld");
+        assert_eq!(e.cursor_offset(), 7);
+    });
+}
+
+#[gpui::test]
+fn soft_break_across_bq_lines_promotes_to_pair(cx: &mut TestAppContext) {
+    // Pasted state with a stray `\n` between two BQ lines.
+    // enforce_invariants promotes it to the full pair shape so the
+    // result is one BQ with two paragraphs (a paragraph break inside
+    // the BQ), not two BQs separated by `\n\n`.
+    let initial = EditorState {
+        markdown: "> p1\n> p2".into(),
+        selection: Selection::Cursor(9),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "> p1\n> \n> p2");
+}
+
+#[gpui::test]
+fn lazy_continuation_under_soft_break_gets_marker_inserted(cx: &mut TestAppContext) {
+    // CommonMark lazy continuation: line 2 has no `>` marker.
+    // Promotion inserts both the missing prefix on line 2 and the
+    // pair structure so the BQ scope continues cleanly.
+    let initial = EditorState {
+        markdown: "> hello\nworld".into(),
+        selection: Selection::Cursor(13),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "> hello\n> \n> world");
+}
+
+#[gpui::test]
+fn hard_break_to_soft_break_promotes_to_pair(cx: &mut TestAppContext) {
+    // The user's load-bearing example: hard break inside a BQ
+    // followed by a backspace of one trailing space turns into a
+    // depth-D pair, not a top-level `\n\n` break.
+    let initial = EditorState {
+        markdown: "> hello \n> world".into(),
+        selection: Selection::Cursor(9),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "> hello \n> \n> world");
+}
+
+#[gpui::test]
+fn missing_space_after_marker_normalizes_when_cursor_moves_off(cx: &mut TestAppContext) {
+    // Cursor *not* at the byte right after `>` — the post-pass
+    // inserts a space so `>foo` becomes `> foo`.
+    let initial = EditorState {
+        markdown: ">foo".into(),
+        selection: Selection::Cursor(4),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "> foo");
+}
+
+#[gpui::test]
+fn missing_space_after_marker_left_alone_when_cursor_just_after_gt(cx: &mut TestAppContext) {
+    // Cursor immediately after `>` — the user might be about to type
+    // the space themselves. Don't second-guess them.
+    let initial = EditorState {
+        markdown: ">foo".into(),
+        selection: Selection::Cursor(1),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, ">foo");
+    assert_eq!(final_state.selection, Selection::Cursor(1));
+}
+
+#[gpui::test]
 fn code_block_inside_blockquote_carries_blockquote_container(cx: &mut TestAppContext) {
     let initial = EditorState {
         markdown: "> ```\n> code\n> ```\n\nbody".into(),
