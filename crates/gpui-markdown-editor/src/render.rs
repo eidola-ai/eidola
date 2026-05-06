@@ -51,6 +51,7 @@ use std::ops::Range;
 
 use crate::render_spec::{
     BlockKind, Container, InlineRun, InlineStyle, ListItemKind, RenderBlock, RenderSpec,
+    Substitution,
 };
 use crate::state::{EditorState, Selection};
 use crate::syntax::{ListKind, NodeKind, SyntaxNode};
@@ -322,27 +323,31 @@ fn marker_char(source: &str, marker_range: &Range<usize>) -> u8 {
     bytes.get(p).copied().unwrap_or(b'-')
 }
 
-/// Render one list item.
+/// Render one list item, walking its children in source order and
+/// partitioning them into:
 ///
-/// Two shapes:
+/// * **Inline runs** — contiguous spans of inline children (`Text`,
+///   `SoftBreak`, `Strong`, …). Each run becomes one paragraph leaf.
+///   For tight items pulldown emits these directly under the item;
+///   for loose items they're wrapped in a `Paragraph` (handled
+///   below).
+/// * **Block-level children** — `Paragraph` (loose-item content),
+///   `List` (nested list), `BlockQuote` (nested BQ), `CodeBlock`
+///   (fenced code inside an item), `Heading`. Each emits its own
+///   leaves via the standard recursion. Nested lists pick up
+///   another `Container::ListItem` on top of this item's chain
+///   entry — the recursive `render_node` call passes the chain
+///   through.
 ///
-/// * **Tight item** (no `Paragraph` wrapper — pulldown emits `Text`
-///   children directly inside `Item`): emit one paragraph leaf
-///   spanning the whole item's source range.
-/// * **Multi-paragraph item** (one or more `Paragraph` children):
-///   emit one leaf per child. The first paragraph's source range
-///   extends back to the item's start so the marker (`- ` / `1. `)
-///   is shaped into its line. Subsequent paragraphs extend back
-///   over their leading indent so the indent shapes together with
-///   the content (positioning the second paragraph roughly under
-///   the first paragraph's content column).
-///
-/// Every leaf carries the same `Container::ListItem` chain entry,
-/// so the element layer applies `list_indent` once per item
-/// regardless of how many paragraphs it contains.
+/// The first leaf the item emits has its source range extended
+/// back to the item's start so the marker (`- ` / `1. `) is shaped
+/// into its line. Subsequent leaves extend back over their leading
+/// indent so the indent shapes together with the content
+/// (positioning the next paragraph or nested-list line under the
+/// first paragraph's content column).
 fn render_list_item(
     node: &SyntaxNode,
-    _marker_range: &Range<usize>,
+    marker_range: &Range<usize>,
     item_kind: ListItemKind,
     source: &str,
     cursor: CursorRange,
@@ -355,43 +360,126 @@ fn render_list_item(
         cursor_inside,
         kind: item_kind,
     });
+    let bytes = source.as_bytes();
+    let leaves_start_idx = out.len();
 
-    let paragraph_children: Vec<&SyntaxNode> = node
-        .children
-        .iter()
-        .filter(|c| matches!(c.kind, NodeKind::Paragraph))
-        .collect();
+    // Walk children in source order, accumulating inline children
+    // until we hit a block-level child. At each block boundary
+    // (and at the end of the children list) flush the accumulated
+    // inline run as one paragraph leaf, then either render the
+    // block child as its own leaf (Paragraph) or recurse
+    // (List / BlockQuote / CodeBlock / Heading).
+    let mut emitted_first = false;
+    let mut inline_run: Vec<&SyntaxNode> = Vec::new();
+    let emit_inline_run =
+        |group: &mut Vec<&SyntaxNode>, emitted_first: &mut bool, out: &mut Vec<RenderBlock>| {
+            if group.is_empty() {
+                return;
+            }
+            let start = group.first().unwrap().range.start;
+            let end = group.last().unwrap().range.end;
+            let mut range = start..end;
+            extend_leading_range(&mut range, *emitted_first, node.range.start, bytes);
+            let mut block = RenderBlock::new(range, BlockKind::Paragraph);
+            block.containers = chain.clone();
+            for child in group.iter() {
+                walk_inline(child, cursor, InlineStyle::default(), &mut block);
+            }
+            out.push(block);
+            *emitted_first = true;
+            group.clear();
+        };
+    let emit_paragraph_child =
+        |para: &SyntaxNode, emitted_first: &mut bool, out: &mut Vec<RenderBlock>| {
+            let mut range = para.range.clone();
+            extend_leading_range(&mut range, *emitted_first, node.range.start, bytes);
+            let mut block = RenderBlock::new(range, BlockKind::Paragraph);
+            block.containers = chain.clone();
+            collect_inlines(para, cursor, &mut block);
+            out.push(block);
+            *emitted_first = true;
+        };
 
-    if paragraph_children.is_empty() {
-        // Tight item — pulldown emitted `Text` children directly
-        // inside the Item, no `Paragraph` wrapper. One leaf spans
-        // the whole item.
-        let mut block = RenderBlock::new(node.range.clone(), BlockKind::Paragraph);
-        block.containers = chain;
-        collect_inlines(node, cursor, &mut block);
-        out.push(block);
-        return;
+    for child in &node.children {
+        if is_block_level(&child.kind) {
+            emit_inline_run(&mut inline_run, &mut emitted_first, out);
+            match &child.kind {
+                NodeKind::Paragraph => {
+                    emit_paragraph_child(child, &mut emitted_first, out);
+                }
+                _ => {
+                    // Nested list / blockquote / code block /
+                    // heading — recurse with this item's container
+                    // chain so any leaves the recursion emits
+                    // carry it.
+                    let before = out.len();
+                    render_node(child, source, cursor, &chain, out);
+                    if out.len() > before {
+                        emitted_first = true;
+                    }
+                }
+            }
+        } else {
+            inline_run.push(child);
+        }
+    }
+    emit_inline_run(&mut inline_run, &mut emitted_first, out);
+
+    // Bullet substitution: for unordered items, when the cursor is
+    // outside the item, replace the marker bytes (`- `, `* `, `+ `)
+    // with a bullet glyph in the first leaf's shaped line. The
+    // substitution lives in `RenderBlock::substitutions`; the
+    // element layer handles the display swap and remaps cursor
+    // positions through the substitution. Ordered items keep their
+    // numbers visible — the digits convey ordering information.
+    if !cursor_inside
+        && matches!(item_kind, ListItemKind::Unordered(_))
+        && let Some(first_leaf) = out.get_mut(leaves_start_idx)
+    {
+        first_leaf.substitutions.push(Substitution {
+            source_range: marker_range.clone(),
+            display: "• ".to_string(),
+        });
     }
 
-    let bytes = source.as_bytes();
-    for (i, para) in paragraph_children.iter().enumerate() {
-        let mut range = para.range.clone();
-        if i == 0 {
-            // First paragraph: extend back to the item's start so
-            // the marker is part of the leaf's source.
-            range.start = node.range.start;
-        } else {
-            // Subsequent paragraphs: extend back over leading
-            // indent on the same line so the indent shapes with
-            // the content rather than vanishing into the gap.
-            while range.start > 0 && bytes[range.start - 1] == b' ' {
-                range.start -= 1;
-            }
-        }
-        let mut block = RenderBlock::new(range, BlockKind::Paragraph);
-        block.containers = chain.clone();
-        collect_inlines(para, cursor, &mut block);
+    // Empty item (no children at all, or the recursion emitted
+    // nothing) — emit a single empty leaf so the item's source
+    // range is claimed by something. Otherwise the cursor /
+    // hit-test math has no block to anchor on.
+    if !emitted_first {
+        let mut block = RenderBlock::new(node.range.clone(), BlockKind::Paragraph);
+        block.containers = chain;
         out.push(block);
+    }
+}
+
+fn is_block_level(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Paragraph
+            | NodeKind::Heading { .. }
+            | NodeKind::CodeBlock { .. }
+            | NodeKind::BlockQuote { .. }
+            | NodeKind::List { .. }
+    )
+}
+
+/// For the *first* leaf of a list item, extend its source range
+/// back to the item's start so the marker shapes into the leaf.
+/// For *subsequent* leaves, extend back over leading spaces on the
+/// line so the indent shapes with the content rather than vanishing.
+fn extend_leading_range(
+    range: &mut Range<usize>,
+    already_emitted_first: bool,
+    item_start: usize,
+    bytes: &[u8],
+) {
+    if !already_emitted_first {
+        range.start = item_start;
+    } else {
+        while range.start > 0 && bytes[range.start - 1] == b' ' {
+            range.start -= 1;
+        }
     }
 }
 

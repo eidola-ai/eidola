@@ -83,6 +83,9 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
 
         EditorEvent::SetSelection(sel) => set_selection(state, sel),
 
+        EditorEvent::IncreaseListDepth => increase_list_depth(state),
+        EditorEvent::DecreaseListDepth => decrease_list_depth(state),
+
         EditorEvent::MoveLeft => move_(state, Move::Left, false),
         EditorEvent::MoveRight => move_(state, Move::Right, false),
         EditorEvent::MoveUp => move_(state, Move::Up, false),
@@ -135,7 +138,11 @@ fn normalize_lists(state: EditorState) -> EditorState {
 }
 
 fn collapse_consecutive_hard_breaks(state: EditorState) -> EditorState {
-    let edits = analysis::consecutive_hard_break_edits(&state.markdown);
+    let cursors: Vec<usize> = match state.selection {
+        Selection::Cursor(p) => vec![p],
+        Selection::Range { anchor, head } => vec![anchor, head],
+    };
+    let edits = analysis::consecutive_hard_break_edits(&state.markdown, &cursors);
     if edits.is_empty() {
         return state;
     }
@@ -443,6 +450,22 @@ fn insert_line_break(state: EditorState) -> EditorState {
     insert_text(state, &insertion)
 }
 
+fn increase_list_depth(state: EditorState) -> EditorState {
+    let cursor = state.selection.head();
+    let Some(edits) = analysis::list_item_indent_edits(&state.markdown, cursor) else {
+        return state;
+    };
+    apply_edits(state, &edits)
+}
+
+fn decrease_list_depth(state: EditorState) -> EditorState {
+    let cursor = state.selection.head();
+    let Some(edits) = analysis::list_item_dedent_edits(&state.markdown, cursor) else {
+        return state;
+    };
+    apply_edits(state, &edits)
+}
+
 fn apply_replace(markdown: &str, edit: analysis::DepthDecreaseEdit) -> EditorState {
     let mut buf = String::with_capacity(
         markdown.len() - (edit.range.end - edit.range.start) + edit.replacement.len(),
@@ -497,12 +520,16 @@ fn delete_backward(state: EditorState) -> EditorState {
         return state;
     }
 
-    // List-item depth decrease: Backspace right after a marker drops
-    // that marker, turning a top-level item into a paragraph or a
-    // nested item into content of the parent. Mirrors the blockquote
-    // outdent rule and shares its single-keystroke pop semantics.
-    if let Some(edit) = analysis::backspace_at_item_start_edit(&state.markdown, cursor) {
-        return apply_replace(&state.markdown, edit);
+    // List-item depth decrease: Backspace right after a marker
+    // takes the same path as Shift+Tab — for a top-level item
+    // it becomes a paragraph (with the surrounding scope's
+    // canonical break ahead of it), and for a nested item it
+    // becomes a sibling of its parent. The two gestures share
+    // semantics; see `analysis::list_item_dedent_edits`.
+    if analysis::cursor_at_item_marker_end(&state.markdown, cursor)
+        && let Some(edits) = analysis::list_item_dedent_edits(&state.markdown, cursor)
+    {
+        return apply_edits(state, &edits);
     }
 
     // At a structural boundary, Backspace has two specialized rules.

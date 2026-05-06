@@ -14,10 +14,10 @@ use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
 use gpui_component::Root;
 use gpui_markdown_editor::editor::{
     Backspace, Delete, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Right, SelectAll,
-    ShiftEnter, ShiftRight, Up,
+    ShiftEnter, ShiftRight, ShiftTab, Tab, Up,
 };
 use gpui_markdown_editor::{
-    BlockKind, Container, EditorState, MarkdownEditor, RenderSpec, Selection,
+    BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, RenderSpec, Selection,
 };
 
 fn open_editor(
@@ -1751,7 +1751,8 @@ fn enter_on_empty_item_inside_blockquote_exits_to_bq_paragraph(cx: &mut TestAppC
 #[gpui::test]
 fn backspace_at_start_of_top_level_item_strips_marker(cx: &mut TestAppContext) {
     // Cursor at byte 2 (right after `- `) — Backspace removes the
-    // marker and the item becomes a top-level paragraph.
+    // marker and the item becomes a top-level paragraph. With no
+    // preceding content, no `\n\n` separator is needed.
     let initial = EditorState {
         markdown: "- foo".into(),
         selection: Selection::Cursor(2),
@@ -1761,6 +1762,42 @@ fn backspace_at_start_of_top_level_item_strips_marker(cx: &mut TestAppContext) {
     editor.read_with(cx, |e, _| {
         assert_eq!(e.state.markdown, "foo");
         assert_eq!(e.cursor_offset(), 0);
+    });
+}
+
+#[gpui::test]
+fn backspace_at_start_of_non_first_item_creates_paragraph_break(cx: &mut TestAppContext) {
+    // The user-reported flow: `1. Item one\n2. |Item two` with the
+    // cursor right after `2. `. Backspace should *decrease the
+    // depth* — for a top-level item that means becoming a
+    // paragraph separated from the previous item by `\n\n`. Just
+    // dropping the marker would leave `1. Item one\nItem two`
+    // (lazy continuation), which the canonicalizer would then
+    // re-promote to `1. Item one  \n   Item two` — wrong.
+    let initial = EditorState {
+        markdown: "1. Item one\n2. Item two".into(),
+        selection: Selection::Cursor(15),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. Item one\n\nItem two");
+    });
+}
+
+#[gpui::test]
+fn backspace_at_start_of_nested_item_dedents_to_sibling(cx: &mut TestAppContext) {
+    // Symmetric to Shift+Tab: Backspace at the start of a nested
+    // item content makes it a sibling of the parent item rather
+    // than merging the content into the parent.
+    let initial = EditorState {
+        markdown: "- a\n  - b".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- a\n- b");
     });
 }
 
@@ -1876,4 +1913,600 @@ fn multi_paragraph_item_renders_as_two_paragraph_leaves(cx: &mut TestAppContext)
         2,
         "multi-paragraph item must render one leaf per paragraph",
     );
+}
+
+// ---- Nested lists --------------------------------------------------
+
+#[gpui::test]
+fn nested_list_renders_with_two_container_levels(cx: &mut TestAppContext) {
+    // `- outer\n  - nested` — pulldown gives outer item containing
+    // text "outer" + a nested List child whose item is "nested".
+    // Render must emit two leaves: outer with one ListItem in its
+    // chain, inner with two.
+    let initial = EditorState {
+        markdown: "- outer\n  - nested".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let depths: Vec<usize> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .map(|b| {
+            b.containers
+                .iter()
+                .filter(|c| matches!(c, Container::ListItem { .. }))
+                .count()
+        })
+        .collect();
+    assert_eq!(depths, vec![1, 2]);
+}
+
+#[gpui::test]
+fn nested_list_with_outer_sibling_renders_three_leaves(cx: &mut TestAppContext) {
+    // Outer item with a nested item, then an outer sibling. Three
+    // leaves: outer-1 (depth 1), nested (depth 2), outer-2 (depth 1).
+    let initial = EditorState {
+        markdown: "- outer\n  - nested\n- sibling".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let depths: Vec<usize> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .map(|b| {
+            b.containers
+                .iter()
+                .filter(|c| matches!(c, Container::ListItem { .. }))
+                .count()
+        })
+        .collect();
+    assert_eq!(depths, vec![1, 2, 1]);
+}
+
+#[gpui::test]
+fn triple_nested_list_renders_three_levels(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- a\n  - b\n    - c".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let depths: Vec<usize> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .map(|b| {
+            b.containers
+                .iter()
+                .filter(|c| matches!(c, Container::ListItem { .. }))
+                .count()
+        })
+        .collect();
+    assert_eq!(depths, vec![1, 2, 3]);
+}
+
+#[gpui::test]
+fn nested_ordered_inside_unordered(cx: &mut TestAppContext) {
+    // The marker character should track per-list — outer is bullet,
+    // inner is ordered. Both items get ListItem container entries
+    // with the right `kind`.
+    let initial = EditorState {
+        markdown: "- foo\n  1. one\n  2. two".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let kinds: Vec<&Container> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .map(|b| b.containers.last().unwrap())
+        .collect();
+    // Outer "foo" → Unordered. Inner "one" → Ordered { 1 }. Inner
+    // "two" → Ordered { 2 }.
+    assert!(matches!(
+        kinds[0],
+        Container::ListItem {
+            kind: ListItemKind::Unordered(b'-'),
+            ..
+        }
+    ));
+    assert!(matches!(
+        kinds[1],
+        Container::ListItem {
+            kind: ListItemKind::Ordered { number: 1 },
+            ..
+        }
+    ));
+    assert!(matches!(
+        kinds[2],
+        Container::ListItem {
+            kind: ListItemKind::Ordered { number: 2 },
+            ..
+        }
+    ));
+}
+
+#[gpui::test]
+fn enter_inside_nested_list_creates_next_nested_item(cx: &mut TestAppContext) {
+    // Cursor inside the nested item — Enter creates the next
+    // nested item (not an outer one). The continuation prefix
+    // includes the outer-list indent so the new line stays at the
+    // nested depth.
+    let initial = EditorState {
+        markdown: "- outer\n  - nested".into(),
+        selection: Selection::Cursor(18),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- outer\n  - nested\n  - ");
+    });
+}
+
+// ---- Tab / Shift+Tab nesting changes -------------------------------
+
+#[gpui::test]
+fn tab_nests_top_level_item_under_previous_sibling(cx: &mut TestAppContext) {
+    // Cursor on second item; Tab nests it under the first.
+    let initial = EditorState {
+        markdown: "- one\n- two".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- one\n  - two");
+    });
+}
+
+#[gpui::test]
+fn tab_on_first_item_is_a_noop(cx: &mut TestAppContext) {
+    // No previous sibling at the same depth — Tab does nothing.
+    let initial = EditorState {
+        markdown: "- only".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- only");
+    });
+}
+
+#[gpui::test]
+fn tab_nests_into_existing_nested_list(cx: &mut TestAppContext) {
+    // The previous sibling has a nested list. Tab on the next
+    // top-level item should join that nested list rather than
+    // creating a new one.
+    let initial = EditorState {
+        markdown: "- one\n  - nested\n- two".into(),
+        selection: Selection::Cursor(19),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- one\n  - nested\n  - two");
+        // And it parses as one outer item with two nested items.
+        let spec = e.render_spec();
+        let depths: Vec<usize> = spec
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+            .map(|b| b.containers.len())
+            .collect();
+        assert_eq!(depths, vec![1, 2, 2]);
+    });
+}
+
+#[gpui::test]
+fn tab_nests_already_nested_item_one_level_deeper(cx: &mut TestAppContext) {
+    // `- a\n  - b\n  - c` cursor on c. Tab nests c under b.
+    let initial = EditorState {
+        markdown: "- a\n  - b\n  - c".into(),
+        selection: Selection::Cursor(15),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- a\n  - b\n    - c");
+    });
+}
+
+#[gpui::test]
+fn shift_tab_dedents_nested_item_to_sibling(cx: &mut TestAppContext) {
+    // `- a\n  - b` cursor on b; Shift+Tab makes b a top-level
+    // sibling of a.
+    let initial = EditorState {
+        markdown: "- a\n  - b".into(),
+        selection: Selection::Cursor(9),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftTab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- a\n- b");
+    });
+}
+
+#[gpui::test]
+fn shift_tab_dedents_triple_nested_to_double(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- a\n  - b\n    - c".into(),
+        selection: Selection::Cursor(17),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftTab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- a\n  - b\n  - c");
+    });
+}
+
+#[gpui::test]
+fn shift_tab_on_top_level_item_drops_marker(cx: &mut TestAppContext) {
+    // At depth 0 there's no enclosing list to dedent into; the
+    // operation falls through to "drop the marker bytes," which
+    // turns the item into a top-level paragraph.
+    let initial = EditorState {
+        markdown: "- foo".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftTab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "foo");
+    });
+}
+
+#[gpui::test]
+fn shift_tab_outside_a_list_is_a_noop(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "just a paragraph".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftTab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "just a paragraph");
+    });
+}
+
+// ---- Bullet glyph substitution -------------------------------------
+
+#[gpui::test]
+fn unordered_marker_substitutes_bullet_when_cursor_outside(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- foo\n\nbody".into(),
+        // Cursor in the body paragraph, well outside the list.
+        selection: Selection::Cursor(9),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let item = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .expect("list item leaf");
+    assert_eq!(item.substitutions.len(), 1);
+    let sub = &item.substitutions[0];
+    assert_eq!(sub.source_range, 0..2);
+    assert_eq!(sub.display, "• ");
+}
+
+#[gpui::test]
+fn unordered_marker_no_substitution_when_cursor_inside(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- foo".into(),
+        // Cursor on the item itself — show the raw `- ` so the
+        // user can edit the marker.
+        selection: Selection::Cursor(3),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let item = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .unwrap();
+    assert!(item.substitutions.is_empty());
+}
+
+#[gpui::test]
+fn ordered_marker_does_not_substitute(cx: &mut TestAppContext) {
+    // Ordered items keep their digits visible — they convey
+    // ordering. No substitution regardless of cursor position.
+    let initial = EditorState {
+        markdown: "1. foo\n\nbody".into(),
+        selection: Selection::Cursor(10),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let item = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .unwrap();
+    assert!(item.substitutions.is_empty());
+}
+
+#[gpui::test]
+fn star_marker_also_substitutes_bullet(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "* foo\n\nbody".into(),
+        selection: Selection::Cursor(9),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let item = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .unwrap();
+    assert_eq!(item.substitutions.len(), 1);
+    assert_eq!(item.substitutions[0].display, "• ");
+}
+
+#[gpui::test]
+fn shift_enter_at_end_of_list_item_with_following_item(cx: &mut TestAppContext) {
+    // The user-reported flow: in a two-item ordered list, cursor
+    // at the end of item 1's content, press Shift+Enter twice,
+    // type "A". Expected end state: item 1 has two paragraphs
+    // (the second containing "A"), each at the canonical indent.
+    let initial = EditorState {
+        markdown: "1. Item one\n2. Item two".into(),
+        selection: Selection::Cursor(11),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftEnter);
+    // After one Shift+Enter alone the existing item-2 line break
+    // must NOT be misread as a second hard break — that's the
+    // false-positive the user hit. The buffer should still have
+    // a real hard-break continuation in item 1, with item 2
+    // intact below.
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. Item one  \n   \n2. Item two");
+    });
+    dispatch(cx, handle, &editor, ShiftEnter);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("A".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        // Two Shift+Enters → paragraph break inside the item.
+        // "A" is the start of item 1's second paragraph at the
+        // canonical 3-space indent. The source isn't strictly
+        // canonical (`\n   \n` blank-with-whitespace between
+        // paragraphs and a tight separator before item 2) —
+        // pulldown parses this identically to the
+        // strictly-canonical `1. Item one\n\n   A\n\n2. Item two`,
+        // so item 1 still renders with two paragraphs and item 2
+        // is a proper sibling. Tightening the residual whitespace
+        // in source is a follow-up canonicalization; the bug
+        // report's load-bearing complaint — "A" with the wrong
+        // indent — is resolved by the cursor-aware
+        // `consecutive_hard_break_edits` skip.
+        assert_eq!(e.state.markdown, "1. Item one\n   \n   A\n2. Item two");
+        // Verify the parse: item 1 has two paragraph leaves
+        // (depth 1), item 2 has one (depth 1).
+        let spec = e.render_spec();
+        let item_leaves: Vec<usize> = spec
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+            .map(|b| b.containers.len())
+            .collect();
+        assert_eq!(item_leaves, vec![1, 1, 1]);
+    });
+}
+
+// ---- Marker-to-content spacing -------------------------------------
+
+#[gpui::test]
+fn extra_space_after_unordered_marker_is_stripped(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "-  foo".into(),
+        selection: Selection::Cursor(6),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "- foo");
+}
+
+#[gpui::test]
+fn multiple_extra_spaces_after_marker_are_stripped(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "-    foo".into(),
+        selection: Selection::Cursor(8),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "- foo");
+}
+
+#[gpui::test]
+fn extra_space_after_ordered_marker_is_stripped(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "1.  foo".into(),
+        selection: Selection::Cursor(7),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "1. foo");
+}
+
+#[gpui::test]
+fn empty_item_with_only_extra_trailing_spaces_is_left_alone(cx: &mut TestAppContext) {
+    // A marker followed by only spaces (no content) is a transient
+    // mid-edit state — the user just pressed Enter or Tab and the
+    // cursor is parked there. We don't strip the trailing spaces;
+    // doing so would yank the cursor backward.
+    let initial = EditorState {
+        markdown: "- foo\n-  ".into(),
+        selection: Selection::Cursor(9),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "- foo\n-  ");
+}
+
+// ---- Ordered-list renumbering --------------------------------------
+
+#[gpui::test]
+fn ordered_list_renumbers_after_inserted_item(cx: &mut TestAppContext) {
+    // Pretend the user inserted a new "two" between original
+    // items 1 and 3 — now the list reads 1, 2, 3 in source but
+    // numbered 1, 1, 3 (the inserted item kept the old number).
+    // enforce_invariants renumbers to 1, 2, 3.
+    let initial = EditorState {
+        markdown: "1. one\n1. two\n3. three".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "1. one\n2. two\n3. three");
+}
+
+#[gpui::test]
+fn ordered_list_renumbers_after_removed_item(cx: &mut TestAppContext) {
+    // Source numbered 1, 5, 3 → canonical 1, 2, 3.
+    let initial = EditorState {
+        markdown: "1. one\n5. middle\n3. three".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "1. one\n2. middle\n3. three");
+}
+
+#[gpui::test]
+fn ordered_list_renumbering_preserves_non_one_start(cx: &mut TestAppContext) {
+    // The first item's number IS the list's start; we don't
+    // rewrite the start to 1. Subsequent items count up from
+    // wherever the user began.
+    let initial = EditorState {
+        markdown: "10. ten\n12. twelve".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "10. ten\n11. twelve");
+}
+
+#[gpui::test]
+fn ordered_list_renumber_widens_indent_for_continuation(cx: &mut TestAppContext) {
+    // Item 9 followed by what would *become* item 10. The
+    // continuation indent grows from 3 spaces to 4 along with
+    // the renumber.
+    let initial = EditorState {
+        markdown: "9. nine\n9. ten  \n   cont".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "9. nine\n10. ten  \n    cont");
+}
+
+#[gpui::test]
+fn tab_on_ordered_item_starts_nested_list_at_one(cx: &mut TestAppContext) {
+    // The user's reported flow: type `1. Item one`, press Enter
+    // (gives `1. Item one\n2. ` cursor at end), then press Tab.
+    //
+    // Without rewriting the marker, the post-Tab source
+    // `1. Item one\n   2. ` doesn't parse as a nested list —
+    // CommonMark says an ordered list with start > 1 can't open
+    // mid-item, so pulldown sees `   2. ` as continuation text.
+    // Tab must rewrite the marker to `1. ` so the nested list
+    // actually opens; renumbering then handles any subsequent
+    // joining of existing nested items.
+    //
+    // (Pulldown doesn't open a list for the *empty* `1. ` either
+    // — it needs content. So the AST shape only flips to nested
+    // once the user starts typing. The test types one character
+    // to trigger the parse and verifies the depth.)
+    let initial = EditorState {
+        markdown: "1. Item one\n2. ".into(),
+        selection: Selection::Cursor(15),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. Item one\n   1. ");
+    });
+    // Type one character to give pulldown content to parse.
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("x".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. Item one\n   1. x");
+        let spec = e.render_spec();
+        let depths: Vec<usize> = spec
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+            .map(|b| b.containers.len())
+            .collect();
+        assert_eq!(depths, vec![1, 2]);
+    });
+}
+
+#[gpui::test]
+fn tab_on_ordered_item_joining_existing_nested_list_renumbers(cx: &mut TestAppContext) {
+    // Existing nested list with one item; the next outer item
+    // gets Tab'd. The renumbering pass should make it item 2 of
+    // the nested list.
+    let initial = EditorState {
+        markdown: "1. one\n   1. nested-1\n2. two".into(),
+        selection: Selection::Cursor(25),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. one\n   1. nested-1\n   2. two");
+    });
+}
+
+#[gpui::test]
+fn shift_tab_on_nested_ordered_item_dedents_correct_one(cx: &mut TestAppContext) {
+    // Regression for the user's report that Shift+Tab "unnests
+    // 'Item one' rather than 'Item one, one'." With the buffer
+    // canonicalized as `1. Item one\n   1. Item one, one`,
+    // cursor on "Item one, one" (depth 2), Shift+Tab dedents the
+    // *inner* item, not the outer.
+    let initial = EditorState {
+        markdown: "1. Item one\n   1. Item one, one".into(),
+        selection: Selection::Cursor(20),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftTab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. Item one\n2. Item one, one");
+    });
+}
+
+#[gpui::test]
+fn tab_preserves_continuation_lines_under_new_indent(cx: &mut TestAppContext) {
+    // Item with a hard-break continuation. Tab indents *both*
+    // the marker line and the continuation by the previous
+    // sibling's marker width, keeping the item's structure intact.
+    let initial = EditorState {
+        markdown: "- one\n- two  \n  cont".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- one\n  - two  \n    cont");
+    });
 }

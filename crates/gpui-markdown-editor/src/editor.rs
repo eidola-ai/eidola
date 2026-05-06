@@ -36,6 +36,8 @@ actions!(
         Delete,
         Enter,
         ShiftEnter,
+        Tab,
+        ShiftTab,
         Left,
         Right,
         Up,
@@ -153,6 +155,17 @@ impl MarkdownEditor {
     }
     fn shift_enter(&mut self, _: &ShiftEnter, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorEvent::InsertLineBreak, cx);
+    }
+    fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
+        // Tab in a list item nests it under the previous sibling.
+        // Outside of a list this is a no-op (the action just falls
+        // through; hosting apps that want a literal Tab character
+        // can add their own keybinding).
+        self.dispatch(EditorEvent::IncreaseListDepth, cx);
+    }
+    fn shift_tab(&mut self, _: &ShiftTab, _: &mut Window, cx: &mut Context<Self>) {
+        // Symmetric: dedent the cursor's list item by one level.
+        self.dispatch(EditorEvent::DecreaseListDepth, cx);
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -540,6 +553,8 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::shift_enter))
+            .on_action(cx.listener(Self::tab))
+            .on_action(cx.listener(Self::shift_tab))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::up))

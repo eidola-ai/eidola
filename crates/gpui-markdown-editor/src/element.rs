@@ -1325,6 +1325,26 @@ fn build_display_line(
 
     let mut pos = line.start;
     while pos < line.end {
+        // Substitutions take precedence over hidden ranges and
+        // raw-source copy: when `pos` matches a substitution's
+        // source_range.start, append the substitution's display
+        // bytes and skip past `source_range.end`. Each display byte
+        // maps to `source_range.start` so a click on the substituted
+        // glyph (e.g. a bullet) lands at the start of the original
+        // marker bytes.
+        if let Some(sub) = block
+            .substitutions
+            .iter()
+            .find(|s| s.source_range.start == pos && s.source_range.end <= line.end)
+        {
+            for _ in 0..sub.display.len() {
+                map.push(sub.source_range.start);
+            }
+            display.push_str(&sub.display);
+            pos = sub.source_range.end;
+            continue;
+        }
+
         // Find the *furthest* hidden-range end that covers `pos`.
         // Multiple hidden ranges can overlap on the same byte — the
         // common case is a blockquote `> ` whose trailing space is

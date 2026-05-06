@@ -58,6 +58,21 @@ pub struct RenderBlock {
     /// so the content's horizontal position is identical regardless of
     /// cursor focus — the overlay simply appears or disappears.
     pub marker_overlays: Vec<MarkerOverlay>,
+    /// Display-text substitutions: each entry replaces a byte range
+    /// of source with a literal display string in the shaped line.
+    /// Used today to render unordered list markers (`- `, `* `, `+ `)
+    /// as a bullet glyph (`• `) when the cursor is outside the item.
+    /// All display bytes of a substitution map back to
+    /// `source_range.start` for cursor-position purposes, so a
+    /// click on the bullet lands at the start of the original
+    /// marker bytes.
+    pub substitutions: Vec<Substitution>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Substitution {
+    pub source_range: Range<usize>,
+    pub display: String,
 }
 
 /// A container-level glyph drawn on top of the container's
@@ -114,6 +129,7 @@ impl RenderBlock {
             delimiter_lines: Vec::new(),
             containers: Vec::new(),
             marker_overlays: Vec::new(),
+            substitutions: Vec::new(),
         }
     }
 

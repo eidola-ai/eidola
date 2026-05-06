@@ -109,16 +109,46 @@ The first cut covers:
   `N * blockquote_indent` of left padding and paints N stacked border
   bars. Code-block backgrounds inset *inside* the blockquote indent so
   the border bar stays visible.
-- Lists (top-level + nested-inside-blockquote, MVP): unordered
-  (`-` / `*` / `+`) and ordered (`1.`, `2.`, …). Each *paragraph* of
-  each item parses to one leaf carrying a `Container::ListItem`
-  entry — multi-paragraph items render as multiple leaves, all
-  inside the same item container. The first paragraph's source
-  range includes the item's marker; subsequent paragraphs include
-  their leading indent. The element layer adds `list_indent` of
-  left padding once per item regardless of paragraph count. Bullet
-  glyph substitution and ordered-list renumbering on edit are
-  follow-ups. Lists nested inside lists are not yet wired.
+- Lists (top-level, nested inside blockquotes, **and nested inside
+  list items**): unordered (`-` / `*` / `+`) and ordered (`1.`,
+  `2.`, …). Each item's children are walked in source order; each
+  inline run (or `Paragraph` child) becomes one leaf, and each
+  block-level child (nested `List`, `BlockQuote`, `CodeBlock`,
+  `Heading`) recurses to emit its own leaves. Every leaf carries
+  the same `Container::ListItem` chain entry for the item it sits
+  in — nested items pick up an additional entry per level, so a
+  triple-nested item's leaf carries three. The element layer adds
+  `list_indent` of left padding per `Container::ListItem` entry,
+  so nesting compounds visually. The first leaf an item emits has
+  its source range extended back to the item's start so the marker
+  shapes into its line; subsequent leaves extend back over leading
+  indent so the indent shapes with the content. **Tab** nests the
+  cursor's item under the previous sibling at its depth (no-op if
+  there's no previous sibling); **Shift+Tab** dedents the item by
+  one level, falling through to "drop the marker" at depth 0. For
+  unordered items, the marker (`- `, `* `, `+ `) substitutes to a
+  bullet glyph (`• `) when the cursor is outside the item — the
+  raw marker reappears when the cursor enters so it can be edited.
+  Ordered items keep their digits visible always (the numbers
+  carry meaning); they renumber automatically when items are
+  inserted, removed, or reordered: every item in an ordered list
+  gets `start + index` regardless of what the user typed.
+
+  **CommonMark interaction note: ordered lists can't open mid-item
+  unless they start at 1.** Pulldown follows the spec rule that
+  "an ordered list with start > 1 cannot interrupt a paragraph"
+  — and the same restriction applies inside another list item's
+  content. So when Tab nests an ordered item, the marker is
+  rewritten to `1. ` regardless of what number it had at the
+  outer level (otherwise the post-Tab source parses as
+  continuation text, not a nested list). The renumbering pass
+  then handles any subsequent siblings — joining an existing
+  nested list with prior items at numbers 1, 2, 3 simply
+  rewrites the new arrival from `1. ` back to `n+1. `. The
+  general principle: editing operations that change list
+  structure must produce a source that pulldown actually parses
+  as the intended structure; the renumbering / canonicalization
+  passes only operate on what pulldown sees.
 
   **Whitespace rules `enforce_invariants` enforces inside lists**
   (the analog of the blockquote pairs / soft-break discipline):
@@ -138,11 +168,14 @@ The first cut covers:
     break in source. This is what enables Shift+Enter twice as
     the "create a paragraph break inside this item" gesture
     without a dedicated event.
-  - No lazy continuations: continuation lines carry exactly
-    `marker_width` spaces of indent (3 for `1. ` or `- `, 4 for
-    `10. ` etc.) and the preceding line ends with a hard break
-    (`  \n`). Editing `9.` → `10.` re-aligns every continuation by
-    +1 space; the inverse for narrowing.
+  - No lazy continuations: continuation lines carry exactly the
+    item's *cumulative* indent (sum of every enclosing list-item's
+    marker width — 2 for top-level `- `, 4 for an item nested
+    once inside another `- ` item, etc.) and the preceding line
+    ends with a hard break (`  \n`). Editing `9.` → `10.`
+    re-aligns every continuation by +1 space; the inverse for
+    narrowing. Nested items inherit ancestor indent so a deep
+    triple-nest reads at the right column.
   - Soft breaks within an item promote to hard break + indent so
     the chat renderer's soft-break-as-space rule doesn't collapse
     multi-line item content onto one line.
@@ -162,11 +195,9 @@ The first cut covers:
   (arrows / home / end / doc start / doc end), basic editing (insert text,
   backspace / delete, newline / line break), select-all.
 
-Explicitly *out* of this first phase: setext-heading normalization, ordered
-list renumbering on edit, nested-inside-list lists (lists inside list
-items), inline code, links, images, thematic rules, tables, HTML,
-IME marked-text, word / line-aware delete, and tab-trapped focus
-traversal. Each will land as a follow-up.
+Explicitly *out* of this first phase: setext-heading normalization, inline
+code, links, images, thematic rules, tables, HTML, IME marked-text,
+word / line-aware delete. Each will land as a follow-up.
 
 ### Container chain (composability invariant)
 

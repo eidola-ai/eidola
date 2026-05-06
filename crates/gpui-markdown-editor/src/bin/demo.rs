@@ -21,7 +21,7 @@ use gpui_component_assets::Assets;
 use gpui_markdown_editor::{
     Backspace, Copy, Cut, Delete, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left,
     MarkdownEditor, Paste, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown,
-    ShiftEnd, ShiftEnter, ShiftHome, ShiftLeft, ShiftRight, ShiftUp, Up, parse,
+    ShiftEnd, ShiftEnter, ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, Tab, Up, parse,
 };
 
 const DEMO_DOCUMENT: &str = "\
@@ -44,11 +44,15 @@ You can combine ***bold and italic*** as a triple-asterisk run, or use
 ### Lists
 
 - First bullet item.
-- Second bullet item.
+- A nested case:
+  - Inside another bullet.
+  - Two-level nesting.
 - A third one.
 
 1. Numbered, starting at one.
-2. The next item.
+2. With a nested ordered list:
+   1. First sub-item.
+   2. Second sub-item.
 3. And so on.
 ";
 
@@ -59,6 +63,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", Delete, None),
         KeyBinding::new("enter", Enter, None),
         KeyBinding::new("shift-enter", ShiftEnter, None),
+        KeyBinding::new("tab", Tab, None),
+        KeyBinding::new("shift-tab", ShiftTab, None),
         // Caret motion
         KeyBinding::new("left", Left, None),
         KeyBinding::new("right", Right, None),
