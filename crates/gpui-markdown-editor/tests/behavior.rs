@@ -1473,3 +1473,117 @@ fn select_across_paragraph_break_and_replace(cx: &mut TestAppContext) {
         assert_no_soft_break(&e.state.markdown);
     });
 }
+
+// ---------------------------------------------------------------------------
+// Lists
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn unordered_list_renders_one_container_per_item(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- foo\n- bar\n".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let items: Vec<_> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .collect();
+    assert_eq!(items.len(), 2);
+}
+
+#[gpui::test]
+fn enter_at_end_of_unordered_item_creates_next_bullet(cx: &mut TestAppContext) {
+    // Cursor at end of "- foo" → Enter inserts `\n- ` so the user
+    // can type the next item. The list as a whole now parses as
+    // two items.
+    let initial = EditorState {
+        markdown: "- foo".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- foo\n- ");
+        assert_eq!(e.cursor_offset(), 8);
+    });
+}
+
+#[gpui::test]
+fn enter_at_end_of_ordered_item_increments_number(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "1. foo".into(),
+        selection: Selection::Cursor(6),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. foo\n2. ");
+    });
+}
+
+#[gpui::test]
+fn typing_inside_list_does_not_split_on_newline(cx: &mut TestAppContext) {
+    // The load-bearing soft-break-exemption test: a buffer containing
+    // a list with single `\n` separators between items. The rule
+    // change exempts list ranges from soft-break promotion so the
+    // structure survives `enforce_invariants`. Without the exemption
+    // the `\n` between items would promote to `\n\n` and split the
+    // list into two single-item lists.
+    let initial = EditorState {
+        markdown: "- foo\n- bar".into(),
+        selection: Selection::Cursor(11),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "- foo\n- bar");
+}
+
+#[gpui::test]
+fn typing_in_a_list_item_does_not_break_the_list(cx: &mut TestAppContext) {
+    // Type a character inside an item's content. Source stays intact
+    // (no spurious promotions) and the editor still parses as a list.
+    let initial = EditorState {
+        markdown: "- foo\n- bar".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("X".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- fooX\n- bar");
+        let spec = e.render_spec();
+        let item_count = spec
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+            .count();
+        assert_eq!(item_count, 2, "list must still parse as two items");
+    });
+}
+
+#[gpui::test]
+fn enter_inside_list_inside_blockquote_keeps_both_scopes(cx: &mut TestAppContext) {
+    // `> - foo` cursor at end → Enter must produce `\n> - ` so the
+    // new item stays inside both the BQ and the list.
+    let initial = EditorState {
+        markdown: "> - foo".into(),
+        selection: Selection::Cursor(7),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> - foo\n> - ");
+    });
+}

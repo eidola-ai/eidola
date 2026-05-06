@@ -68,6 +68,15 @@ pub struct MarkdownStyle {
     /// Nested blockquotes apply this indent cumulatively, one per
     /// level. Mirrors `blockquoteIndent` in the Swift implementation.
     pub blockquote_indent: Pixels,
+    /// Horizontal indent contributed by one list-item container —
+    /// applied to the leaf content's left edge so each item's content
+    /// (marker plus body) sits inset from the surrounding prose. The
+    /// marker glyph itself sits at the start of this indent and is
+    /// part of the shaped line, so a longer marker (`12.`) and a
+    /// shorter one (`-`) currently occupy different fractions of the
+    /// indent — visual alignment of the marker column across items is
+    /// a future polish item.
+    pub list_indent: Pixels,
     /// Width of the per-level left border bar painted at the start of
     /// the indent block. The bar sits at the level's left edge; the
     /// content sits `blockquote_indent` further right.
@@ -115,6 +124,8 @@ impl MarkdownStyle {
             blockquote_border_width: px(3.0),
             blockquote_border_inset: px(6.0),
             blockquote_border_color: theme.border,
+
+            list_indent: px(8.0),
 
             text_color: theme.foreground,
             delimiter_color: theme.muted_foreground,
@@ -205,6 +216,11 @@ impl MarkdownStyle {
 
     pub fn blockquote_border_color(mut self, color: Hsla) -> Self {
         self.blockquote_border_color = color;
+        self
+    }
+
+    pub fn list_indent(mut self, indent: Pixels) -> Self {
+        self.list_indent = indent;
         self
     }
 

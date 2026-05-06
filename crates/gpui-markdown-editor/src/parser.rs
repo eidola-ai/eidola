@@ -11,7 +11,7 @@ use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
-use crate::syntax::{NodeKind, SyntaxNode};
+use crate::syntax::{ListKind, NodeKind, SyntaxNode};
 
 pub fn parse(markdown: &str) -> Vec<SyntaxNode> {
     let mut opts = Options::empty();
@@ -83,6 +83,17 @@ impl<'a> Walker<'a> {
                 // collapse to a plain blockquote.
                 let kind = self.blockquote_kind(&range);
                 self.push_frame(SyntaxNode::new(kind, range));
+            }
+            Tag::List(start) => {
+                let kind = match start {
+                    Some(n) => ListKind::Ordered { start: n },
+                    None => ListKind::Unordered,
+                };
+                self.push_frame(SyntaxNode::new(NodeKind::List { kind }, range));
+            }
+            Tag::Item => {
+                let marker_range = self.list_item_marker_range(&range);
+                self.push_frame(SyntaxNode::new(NodeKind::ListItem { marker_range }, range));
             }
             Tag::Emphasis => {
                 let (delim, content) = self.symmetric_delimiters(&range, 1);
@@ -357,6 +368,46 @@ impl<'a> Walker<'a> {
         NodeKind::BlockQuote {
             prefix_ranges: self.blockquote_prefix_ranges(range, outer_depth),
         }
+    }
+
+    /// Locate the marker bytes (e.g. `- `, `* `, `1. `) that introduce
+    /// the list item spanning `range`. Pulldown's Item range starts
+    /// at the *very* first byte of the item line (any leading
+    /// whitespace + the marker character(s) + the optional trailing
+    /// space), so we scan forward over leading spaces, the marker
+    /// run, and a single trailing space.
+    ///
+    /// CommonMark marker shapes:
+    ///   - Bullet: one of `-`, `*`, `+`
+    ///   - Ordered: one or more digits followed by `.` or `)`
+    ///
+    /// In both forms the marker character(s) are followed by at least
+    /// one space (or tab) before the content. We consume exactly one
+    /// trailing space — the rest, if any, are content indentation.
+    fn list_item_marker_range(&self, range: &Range<usize>) -> Range<usize> {
+        let bytes = self.source.as_bytes();
+        let mut q = range.start;
+        // Up to 3 leading spaces of indent precede the marker.
+        let mut indent = 0;
+        while q < range.end && bytes[q] == b' ' && indent < 3 {
+            q += 1;
+            indent += 1;
+        }
+        let marker_start = q;
+        if q < range.end && (bytes[q] == b'-' || bytes[q] == b'*' || bytes[q] == b'+') {
+            q += 1;
+        } else {
+            while q < range.end && bytes[q].is_ascii_digit() {
+                q += 1;
+            }
+            if q < range.end && (bytes[q] == b'.' || bytes[q] == b')') {
+                q += 1;
+            }
+        }
+        if q < range.end && bytes[q] == b' ' {
+            q += 1;
+        }
+        marker_start..q
     }
 
     fn blockquote_prefix_ranges(

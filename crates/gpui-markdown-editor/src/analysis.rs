@@ -722,19 +722,228 @@ pub fn blockquote_depth_at(markdown: &str, cursor: usize) -> usize {
     walk(&crate::parser::parse(markdown), cursor, 0)
 }
 
-/// The active container prefix that introduces the line at `cursor` —
-/// the literal string a continuation line would need to repeat to stay
-/// inside every container that wraps `cursor`. For top-level content
-/// this is `""`; for a depth-D blockquote it's `"> "` repeated D
-/// times. Future list-item containers will extend the produced string
-/// with their indent prefix.
+/// The blockquote-marker prefix that introduces the line at `cursor`
+/// — `"> "` repeated D times where D is the blockquote depth, or
+/// `""` at top level. Lists don't add to this prefix: a list-item
+/// continuation line uses indentation matching the marker's width,
+/// not a literal repeated marker, so the prefix string concept
+/// genuinely applies only to per-line-prefix containers (today, just
+/// blockquotes).
 ///
-/// Used by Enter / Shift+Enter to emit a newline that keeps the new
-/// paragraph or hard-break continuation in the same container scope,
-/// and by `enforce_invariants` to detect / repair lazy continuations.
-pub fn active_container_prefix(markdown: &str, cursor: usize) -> String {
+/// Used by `enforce_invariants` when promoting a soft break across
+/// blockquote lines: the depth-D pair we insert needs this prefix
+/// repeated on both halves.
+pub fn blockquote_continuation_prefix(markdown: &str, cursor: usize) -> String {
     let depth = blockquote_depth_at(markdown, cursor);
     "> ".repeat(depth)
+}
+
+// ---------------------------------------------------------------------------
+// List ranges and item context
+// ---------------------------------------------------------------------------
+
+/// Byte ranges of every list (top-level or nested) in the buffer.
+/// Used to exempt list-internal `\n` bytes from soft-break promotion
+/// — inside a list pulldown handles line structure (item separators,
+/// continuation indent, lazy continuations) and the buffer's own
+/// `\n` discipline doesn't apply.
+///
+/// Implementation: walks the parsed tree. Pulldown is fast enough at
+/// our buffer sizes that calling it inside `enforce_invariants`
+/// per-update isn't visible. If that ever changes, replace with a
+/// byte scanner — but list edges are far harder to identify
+/// byte-locally than fence edges, so the parser pass is the right
+/// default.
+pub fn list_content_ranges(markdown: &str) -> Vec<Range<usize>> {
+    fn collect(nodes: &[crate::syntax::SyntaxNode], out: &mut Vec<Range<usize>>) {
+        for n in nodes {
+            if matches!(n.kind, crate::syntax::NodeKind::List { .. }) {
+                out.push(n.range.clone());
+            }
+            collect(&n.children, out);
+        }
+    }
+    let tree = crate::parser::parse(markdown);
+    let mut out = Vec::new();
+    collect(&tree, &mut out);
+    out
+}
+
+/// `Some(item)` when `cursor` falls inside a list item. The returned
+/// kind is the *innermost* item's — used by Enter handling to choose
+/// the next item's marker. Boundary equality treats end-of-item as
+/// still inside (so Enter at the end of `- foo` produces a new item
+/// rather than escaping the list).
+fn innermost_list_item_at(markdown: &str, cursor: usize) -> Option<ItemContext> {
+    fn walk(
+        nodes: &[crate::syntax::SyntaxNode],
+        cursor: usize,
+        in_list: Option<crate::syntax::ListKind>,
+        item_index_in_list: usize,
+        deepest: &mut Option<ItemContext>,
+    ) {
+        for node in nodes {
+            if cursor < node.range.start || cursor > node.range.end {
+                continue;
+            }
+            match &node.kind {
+                crate::syntax::NodeKind::List { kind } => {
+                    let mut idx = 0;
+                    for child in &node.children {
+                        if matches!(child.kind, crate::syntax::NodeKind::ListItem { .. })
+                            && cursor >= child.range.start
+                            && cursor <= child.range.end
+                        {
+                            walk(
+                                std::slice::from_ref(child),
+                                cursor,
+                                Some(*kind),
+                                idx,
+                                deepest,
+                            );
+                            idx += 1;
+                        } else if matches!(child.kind, crate::syntax::NodeKind::ListItem { .. }) {
+                            idx += 1;
+                        }
+                    }
+                }
+                crate::syntax::NodeKind::ListItem { .. } => {
+                    if let Some(list_kind) = in_list {
+                        *deepest = Some(ItemContext {
+                            list_kind,
+                            item_index: item_index_in_list,
+                        });
+                    }
+                    walk(&node.children, cursor, None, 0, deepest);
+                }
+                _ => {
+                    walk(&node.children, cursor, in_list, item_index_in_list, deepest);
+                }
+            }
+        }
+    }
+
+    let tree = crate::parser::parse(markdown);
+    let mut deepest = None;
+    walk(&tree, cursor, None, 0, &mut deepest);
+    deepest
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ItemContext {
+    list_kind: crate::syntax::ListKind,
+    /// Zero-based position of this item within its list — used to
+    /// compute the next ordered item's number (`start + index + 1`).
+    item_index: usize,
+}
+
+impl ItemContext {
+    /// Marker text for the *next* item the user creates by pressing
+    /// Enter at the end of this one. For unordered, repeat the
+    /// bullet char from this item; for ordered, increment.
+    fn next_marker_text(&self, markdown: &str) -> String {
+        match self.list_kind {
+            crate::syntax::ListKind::Unordered => {
+                // Find this list's first item to read the bullet
+                // char actually used in source; default to `-` if
+                // we can't find it.
+                let bullet = bullet_for_item_index(markdown, self.item_index).unwrap_or(b'-');
+                format!("{} ", bullet as char)
+            }
+            crate::syntax::ListKind::Ordered { start } => {
+                // `start` is the parsed list-start; `item_index`
+                // counts items from zero, so the *next* item's
+                // number is `start + item_index + 1`.
+                format!("{}. ", start + self.item_index as u64 + 1)
+            }
+        }
+    }
+}
+
+/// Walk the parse tree to find the unordered-list bullet character
+/// for the item at `item_index` of any list. Used as a fallback when
+/// we want the same bullet style the rest of the list uses; we
+/// don't currently thread the marker char through `ItemContext`.
+fn bullet_for_item_index(markdown: &str, item_index: usize) -> Option<u8> {
+    fn walk(nodes: &[crate::syntax::SyntaxNode], target: usize, source: &str) -> Option<u8> {
+        for n in nodes {
+            if let crate::syntax::NodeKind::List {
+                kind: crate::syntax::ListKind::Unordered,
+            } = n.kind
+            {
+                let mut idx = 0;
+                for child in &n.children {
+                    if let crate::syntax::NodeKind::ListItem { marker_range } = &child.kind {
+                        if idx == target {
+                            let bytes = source.as_bytes();
+                            for &b in &bytes[marker_range.clone()] {
+                                if b == b'-' || b == b'*' || b == b'+' {
+                                    return Some(b);
+                                }
+                            }
+                            return None;
+                        }
+                        idx += 1;
+                    }
+                }
+            }
+            if let Some(b) = walk(&n.children, target, source) {
+                return Some(b);
+            }
+        }
+        None
+    }
+    walk(&crate::parser::parse(markdown), item_index, markdown)
+}
+
+// ---------------------------------------------------------------------------
+// Public Enter / Shift+Enter insertions
+// ---------------------------------------------------------------------------
+
+/// Source string to insert when the user presses Enter at `cursor`.
+/// Encapsulates the routing across all container kinds we support so
+/// keyboard, IME, paste-derived, and programmatic dispatch all share
+/// one rule.
+///
+/// Routing (innermost wins):
+///   * Inside a fenced code block: a literal `\n` (code uses `\n`
+///     as a line separator; promoting to `\n\n` would visually
+///     duplicate every keystroke).
+///   * Inside a list item: `\n` + the active blockquote continuation
+///     prefix (if any) + the next item's marker. This puts the
+///     cursor at the start of a new sibling item at the same
+///     blockquote depth.
+///   * Inside a blockquote (without an enclosed list): the depth-D
+///     paragraph-break pair `\n[prefix]\n[prefix]` — its two halves
+///     render as a single paragraph_gap visually.
+///   * Top level: `\n\n`, the top-level paragraph break.
+pub fn enter_insertion(markdown: &str, cursor: usize) -> String {
+    let bytes = markdown.as_bytes();
+    if is_in_fenced_code(bytes, cursor) {
+        return "\n".to_string();
+    }
+    let bq_prefix = blockquote_continuation_prefix(markdown, cursor);
+    if let Some(item) = innermost_list_item_at(markdown, cursor) {
+        return format!("\n{bq_prefix}{}", item.next_marker_text(markdown));
+    }
+    if !bq_prefix.is_empty() {
+        return format!("\n{bq_prefix}\n{bq_prefix}");
+    }
+    "\n\n".to_string()
+}
+
+/// Source string to insert when the user presses Shift+Enter at
+/// `cursor`. Inside a blockquote, the continuation line carries the
+/// blockquote prefix so it stays in scope. Inside a list, the
+/// continuation falls through to a plain hard break — pulldown's
+/// lazy-continuation rule keeps the line attached to the same item
+/// without a special prefix.
+pub fn line_break_insertion(markdown: &str, cursor: usize) -> String {
+    let bq_prefix = blockquote_continuation_prefix(markdown, cursor);
+    if !bq_prefix.is_empty() && innermost_list_item_at(markdown, cursor).is_none() {
+        return format!("  \n{bq_prefix}");
+    }
+    "  \n".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -804,18 +1013,100 @@ mod tests {
     }
 
     #[test]
-    fn active_container_prefix_top_level() {
-        assert_eq!(active_container_prefix("hello", 2), "");
+    fn blockquote_continuation_prefix_top_level() {
+        assert_eq!(blockquote_continuation_prefix("hello", 2), "");
     }
 
     #[test]
-    fn active_container_prefix_blockquote_depth_1() {
-        assert_eq!(active_container_prefix("> hi", 4), "> ");
+    fn blockquote_continuation_prefix_depth_1() {
+        assert_eq!(blockquote_continuation_prefix("> hi", 4), "> ");
     }
 
     #[test]
-    fn active_container_prefix_blockquote_depth_2() {
-        assert_eq!(active_container_prefix("> > deep", 8), "> > ");
+    fn blockquote_continuation_prefix_depth_2() {
+        assert_eq!(blockquote_continuation_prefix("> > deep", 8), "> > ");
+    }
+
+    // ---- Enter / Shift+Enter routing -----------------------------------
+
+    #[test]
+    fn enter_at_top_level_inserts_paragraph_break() {
+        assert_eq!(enter_insertion("hello", 5), "\n\n");
+    }
+
+    #[test]
+    fn enter_inside_blockquote_inserts_pair() {
+        assert_eq!(enter_insertion("> hi", 4), "\n> \n> ");
+    }
+
+    #[test]
+    fn enter_inside_unordered_list_inserts_next_marker() {
+        // After "- foo" (end-of-buffer cursor), Enter should produce
+        // a new bullet item below.
+        assert_eq!(enter_insertion("- foo", 5), "\n- ");
+    }
+
+    #[test]
+    fn enter_inside_ordered_list_increments_number() {
+        assert_eq!(enter_insertion("1. foo", 6), "\n2. ");
+    }
+
+    #[test]
+    fn enter_inside_ordered_list_starting_at_ten_yields_eleven() {
+        // The list starts at 10; the second item should be 11. Enter
+        // at the end of the second item produces 12.
+        assert_eq!(enter_insertion("10. ten\n11. eleven", 18), "\n12. ");
+    }
+
+    #[test]
+    fn enter_in_fenced_code_inserts_single_newline() {
+        let src = "```\nx\n```";
+        assert_eq!(enter_insertion(src, 5), "\n");
+    }
+
+    #[test]
+    fn enter_inside_list_with_star_marker_repeats_star() {
+        assert_eq!(enter_insertion("* foo", 5), "\n* ");
+    }
+
+    #[test]
+    fn enter_inside_list_inside_blockquote_emits_combined_prefix() {
+        // `> - foo`: cursor in foo. Enter should emit `\n> - ` so the
+        // new item stays inside the blockquote *and* starts a new
+        // bullet.
+        assert_eq!(enter_insertion("> - foo", 7), "\n> - ");
+    }
+
+    #[test]
+    fn line_break_top_level_is_plain_hard_break() {
+        assert_eq!(line_break_insertion("ab", 2), "  \n");
+    }
+
+    #[test]
+    fn line_break_inside_blockquote_carries_marker() {
+        assert_eq!(line_break_insertion("> hi", 4), "  \n> ");
+    }
+
+    #[test]
+    fn line_break_inside_list_is_plain_hard_break() {
+        // For lists we don't synthesize a continuation prefix —
+        // pulldown's lazy-continuation rule keeps the line attached
+        // to the same item.
+        assert_eq!(line_break_insertion("- foo", 5), "  \n");
+    }
+
+    // ---- List ranges ---------------------------------------------------
+
+    #[test]
+    fn list_content_ranges_covers_top_level_list() {
+        let ranges = list_content_ranges("- foo\n- bar\n");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..12);
+    }
+
+    #[test]
+    fn list_content_ranges_empty_outside_list() {
+        assert!(list_content_ranges("just paragraphs").is_empty());
     }
 
     /// Regression for Point 4 in the architecture review: the byte

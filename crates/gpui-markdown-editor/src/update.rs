@@ -115,13 +115,18 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
 
 fn promote_soft_breaks(state: EditorState) -> EditorState {
     let bytes = state.markdown.as_bytes();
-    // Code-block content is exempt from the soft-break promotion rule:
-    // a single mid-content `\n` inside ```/~~~ fences is a literal line
-    // separator, not the ambiguous CommonMark soft break we promote
-    // elsewhere. Without this guard, paste of multi-line code into a
-    // fenced block would re-flow into a series of `\n\n`-separated
-    // paragraph-style rows.
+    // Two classes of bytes are exempt from the soft-break promotion
+    // rule:
+    //
+    //   * Fenced code-block content. A single mid-content `\n` inside
+    //     ```/~~~ fences is a literal line separator, not the
+    //     ambiguous CommonMark soft break.
+    //   * List ranges. Inside a list pulldown handles line structure
+    //     (item separators, marker continuation, indented paragraphs,
+    //     lazy continuations). Promoting `\n` to `\n\n` between two
+    //     items would split the list.
     let code_ranges = fenced_code_content_ranges(bytes);
+    let list_ranges = analysis::list_content_ranges(&state.markdown);
 
     // Each entry: (insertion_position, inserted_string). Computed in a
     // single forward scan over the *original* buffer so offsets line
@@ -129,7 +134,7 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
     // exactly once.
     let mut inserts: Vec<(usize, String)> = Vec::new();
     for p in 0..bytes.len() {
-        if is_in_ranges(p, &code_ranges) {
+        if is_in_ranges(p, &code_ranges) || is_in_ranges(p, &list_ranges) {
             continue;
         }
         if !is_soft_break(bytes, p) {
@@ -333,49 +338,20 @@ fn snap_off_forbidden(bytes: &[u8], pos: usize, prev: usize) -> usize {
 /// New callers should import directly from [`crate::analysis`].
 pub use crate::analysis::blockquote_depth_at;
 
-// ---------------------------------------------------------------------------
-// Context-aware insertions
-// ---------------------------------------------------------------------------
-//
-// `EditorEvent::InsertNewline` and `InsertLineBreak` decide what to insert
-// based on the cursor's surrounding context: inside a fenced code block, in
-// a blockquote, or top-level. The branching used to live in `editor.rs`'s
-// action handlers; centralizing it here keeps the rule consistent across
-// keyboard, IME, paste-derived, and programmatic dispatch.
+// `EditorEvent::InsertNewline` / `InsertLineBreak` route through
+// `analysis::enter_insertion` / `line_break_insertion`, which know about
+// every container kind and emit the right source string for the cursor's
+// position. The shell stays a router so keyboard, IME, paste-derived, and
+// programmatic dispatch all share one rule.
 
 fn insert_newline(state: EditorState) -> EditorState {
-    let cursor = state.selection.head();
-    let bytes = state.markdown.as_bytes();
-    // Inside a fenced code block, Enter inserts a literal `\n`. Code
-    // content uses `\n` as a line separator; promoting it to `\n\n`
-    // would visually duplicate every keystroke.
-    if analysis::is_in_fenced_code(bytes, cursor) {
-        return insert_text(state, "\n");
-    }
-    // Inside a container (blockquote — and future lists), the new
-    // paragraph must stay at the same depth. Insert the depth-D pair
-    // `\n[prefix]\n[prefix]` so the soft-break exemption keeps both
-    // `\n`s intact and the second prefix introduces the new
-    // paragraph the user types into.
-    let prefix = analysis::active_container_prefix(&state.markdown, cursor);
-    if !prefix.is_empty() {
-        return insert_text(state, &format!("\n{prefix}\n{prefix}"));
-    }
-    insert_text(state, "\n\n")
+    let insertion = analysis::enter_insertion(&state.markdown, state.selection.head());
+    insert_text(state, &insertion)
 }
 
 fn insert_line_break(state: EditorState) -> EditorState {
-    let cursor = state.selection.head();
-    // Inside a container, a hard break must be followed by the active
-    // prefix so the continuation line stays in scope. Without the
-    // prefix, pulldown would treat the next line as a *lazy*
-    // continuation; the marker would silently land on a different
-    // visual column from the cursor.
-    let prefix = analysis::active_container_prefix(&state.markdown, cursor);
-    if !prefix.is_empty() {
-        return insert_text(state, &format!("  \n{prefix}"));
-    }
-    insert_text(state, "  \n")
+    let insertion = analysis::line_break_insertion(&state.markdown, state.selection.head());
+    insert_text(state, &insertion)
 }
 
 fn clamp(pos: usize, len: usize) -> usize {

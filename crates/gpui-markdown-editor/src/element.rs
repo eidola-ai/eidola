@@ -51,6 +51,7 @@ pub struct BlockElement {
 }
 
 impl BlockElement {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         block: RenderBlock,
         block_index: usize,
@@ -632,13 +633,20 @@ impl Element for BlockElement {
                         };
                     let bar_height = (bar_bottom - bar_top).max(px(0.0));
                     let left = bounds.origin.x
-                        + self.style.blockquote_border_inset
-                        + self.style.blockquote_indent * (level as f32);
+                        + container_x_at_level(&self.block.containers, level, &self.style)
+                        + self.style.blockquote_border_inset;
                     let bar = Bounds::new(
                         point(left, bar_top),
                         size(self.style.blockquote_border_width, bar_height),
                     );
                     window.paint_quad(fill(bar, self.style.blockquote_border_color));
+                }
+                Container::ListItem { .. } => {
+                    // List items have no left-edge chrome of their
+                    // own — their visual cue is the marker glyph
+                    // shaped into the line, plus the cumulative
+                    // `list_indent` already applied by the
+                    // container chain.
                 }
             }
         }
@@ -653,6 +661,7 @@ impl Element for BlockElement {
         // without any horizontal shift in the content's position.
         paint_marker_overlays(
             &self.block.marker_overlays,
+            &self.block.containers,
             &self.block.kind,
             &prepaint.laid_out.lines,
             bounds.origin.x,
@@ -849,8 +858,10 @@ impl Element for BlockElement {
 /// hard-break continuations) get one glyph per visible row. Painted
 /// in the body font + delimiter color so the chrome reads cohesive
 /// with the bar itself.
+#[allow(clippy::too_many_arguments)]
 fn paint_marker_overlays(
     overlays: &[crate::render_spec::MarkerOverlay],
+    containers: &[Container],
     kind: &BlockKind,
     lines: &[LaidOutLine],
     block_origin_x: Pixels,
@@ -886,9 +897,13 @@ fn paint_marker_overlays(
         else {
             continue;
         };
+        // The marker glyph sits over its level's blockquote border
+        // bar — same X position the bar uses (gap *before* this
+        // level's indent contribution, plus the inset within that
+        // gap).
         let bar_left = block_origin_x
-            + style.blockquote_border_inset
-            + style.blockquote_indent * (marker.level as f32);
+            + container_x_at_level(containers, marker.level, style)
+            + style.blockquote_border_inset;
         // Center the glyph horizontally on the bar so the bar passes
         // through the glyph's middle. The glyph is wider than the
         // bar, so its left/right edges spill into the indent on both
@@ -1062,15 +1077,29 @@ fn is_code_block(kind: &BlockKind) -> bool {
 }
 
 /// Cumulative left indent contributed by every container (blockquote,
-/// future list-items) that wraps this leaf. The leaf's content starts
-/// `containers_left_indent` inset from `bounds.origin.x`; per-level
-/// border bars sit at `bounds.origin.x + i * blockquote_indent` where
-/// `i` is the level's index in the containers chain (outermost = 0).
+/// list-item) that wraps this leaf. The leaf's content starts
+/// `containers_left_indent` inset from `bounds.origin.x`; a per-level
+/// decoration painted at level L (e.g. a blockquote border bar) sits
+/// at `bounds.origin.x + container_x_at_level(.., L, ..)`, *before*
+/// L's own indent contribution.
 fn containers_left_indent(containers: &[Container], style: &MarkdownStyle) -> Pixels {
+    container_x_at_level(containers, containers.len(), style)
+}
+
+/// Cumulative left indent contributed by `containers[..up_to]` — i.e.
+/// the X offset (relative to the layout box) of the *content edge* of
+/// the container at index `up_to`. With `up_to == containers.len()`
+/// this matches `containers_left_indent`. Used when a per-level
+/// decoration (a blockquote border bar at level L) needs to sit in
+/// the gap *before* its own indent contribution: pass `up_to = L` to
+/// get the X of that gap's left edge.
+fn container_x_at_level(containers: &[Container], up_to: usize, style: &MarkdownStyle) -> Pixels {
+    let limit = up_to.min(containers.len());
     let mut acc = px(0.0);
-    for c in containers {
+    for c in &containers[..limit] {
         match c {
             Container::BlockQuote { .. } => acc += style.blockquote_indent,
+            Container::ListItem { .. } => acc += style.list_indent,
         }
     }
     acc

@@ -79,7 +79,34 @@ pub enum NodeKind {
     BlockQuote {
         prefix_ranges: Vec<ByteRange>,
     },
+    /// List container. `kind` distinguishes ordered vs unordered.
+    /// Children are one `ListItem` per item, in source order. The
+    /// list itself contributes no rendered chrome — its presence is
+    /// implied by the items it wraps.
+    List {
+        kind: ListKind,
+    },
+    /// One list item. `marker_range` covers the marker plus the
+    /// trailing space (e.g. `- ` or `1. `). Children are the item's
+    /// content blocks. For tight single-paragraph items pulldown
+    /// emits a `Text` leaf directly; for loose items it wraps the
+    /// content in `Paragraph`. The renderer treats both shapes the
+    /// same — one leaf per item, with the marker hidden / dimmed
+    /// according to the cursor-visibility rule.
+    ListItem {
+        marker_range: ByteRange,
+    },
     SoftBreak,
     HardBreak,
     Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKind {
+    /// Bullet list (`-`, `*`, `+`).
+    Unordered,
+    /// Numbered list. `start` is the parsed start number — preserved
+    /// from source so that pasted numbered lists retain their
+    /// numbering. Re-numbering on edit is not yet implemented.
+    Ordered { start: u64 },
 }

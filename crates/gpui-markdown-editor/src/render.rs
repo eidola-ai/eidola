@@ -49,9 +49,11 @@
 
 use std::ops::Range;
 
-use crate::render_spec::{BlockKind, Container, InlineRun, InlineStyle, RenderBlock, RenderSpec};
+use crate::render_spec::{
+    BlockKind, Container, InlineRun, InlineStyle, ListItemKind, RenderBlock, RenderSpec,
+};
 use crate::state::{EditorState, Selection};
-use crate::syntax::{NodeKind, SyntaxNode};
+use crate::syntax::{ListKind, NodeKind, SyntaxNode};
 
 pub fn render(state: &EditorState, tree: &[SyntaxNode]) -> RenderSpec {
     let cursor = CursorRange::from(&state.selection);
@@ -105,8 +107,8 @@ fn render_node(
         NodeKind::BlockQuote { prefix_ranges } => {
             render_blockquote(node, prefix_ranges, source, cursor, containers, out)
         }
-        // Anything else at top level — nothing to do yet. (Future phases add
-        // handling for lists, etc.)
+        NodeKind::List { kind } => render_list(node, *kind, source, cursor, containers, out),
+        // Anything else at top level — nothing to do yet.
         _ => {}
     }
 }
@@ -252,6 +254,112 @@ fn render_blockquote(
     // distribution, `inject_empty_paragraphs`, the editor's per-block
     // index) see blocks in source order.
     out[start..].sort_by_key(|b| b.source_range.start);
+}
+
+/// Render a list container.
+///
+/// Lists themselves contribute no chrome — only their items do — but
+/// they're the place we can see all sibling items and assign each its
+/// number / bullet info. We walk every direct `ListItem` child and
+/// emit one paragraph leaf per item, carrying a `Container::ListItem`
+/// in its chain.
+///
+/// Scope (MVP):
+///   - Tight single-paragraph items.
+///   - Loose / multi-paragraph items render their content but don't
+///     yet preserve the inter-paragraph empty rows specifically for
+///     lists — `inject_empty_paragraphs` handles those generically
+///     downstream.
+///   - Nested lists (a `List` child inside an `Item`) are not yet
+///     wired; they parse but don't render specially. The outer
+///     item's leaf still appears with its marker.
+fn render_list(
+    node: &SyntaxNode,
+    kind: ListKind,
+    source: &str,
+    cursor: CursorRange,
+    containers: &[Container],
+    out: &mut Vec<RenderBlock>,
+) {
+    // For ordered lists pulldown gives us only the *list's* start
+    // number; we increment per item to derive each item's own number.
+    let mut next_number = match kind {
+        ListKind::Ordered { start } => Some(start),
+        ListKind::Unordered => None,
+    };
+    for child in &node.children {
+        let NodeKind::ListItem { marker_range } = &child.kind else {
+            continue;
+        };
+        let item_kind = match &kind {
+            ListKind::Unordered => ListItemKind::Unordered(marker_char(source, marker_range)),
+            ListKind::Ordered { .. } => {
+                let n = next_number.unwrap_or(1);
+                next_number = Some(n + 1);
+                ListItemKind::Ordered { number: n }
+            }
+        };
+        render_list_item(
+            child,
+            marker_range,
+            item_kind,
+            source,
+            cursor,
+            containers,
+            out,
+        );
+    }
+}
+
+fn marker_char(source: &str, marker_range: &Range<usize>) -> u8 {
+    let bytes = source.as_bytes();
+    // Skip leading indent spaces; the first non-space byte is the
+    // bullet.
+    let mut p = marker_range.start;
+    while p < marker_range.end && bytes[p] == b' ' {
+        p += 1;
+    }
+    bytes.get(p).copied().unwrap_or(b'-')
+}
+
+/// Render one list item as a single paragraph leaf carrying a
+/// `Container::ListItem` entry.
+///
+/// The leaf's source range is the item's range *trimmed* to its
+/// content extent — pulldown includes the trailing `\n` (or `\n\n`
+/// for loose items) in the Item range, but `inject_empty_paragraphs`
+/// expects every leaf already trimmed to its content. We let it
+/// handle trimming in the same pass it uses for paragraphs.
+///
+/// The marker bytes (`- `, `1. `, …) sit *inside* the leaf's source
+/// range. They render as plain shaped text — no hide / dim treatment
+/// for now. A future polish pass can substitute `- ` with a bullet
+/// glyph (`•`) when the cursor is outside the line.
+fn render_list_item(
+    node: &SyntaxNode,
+    _marker_range: &Range<usize>,
+    item_kind: ListItemKind,
+    _source: &str,
+    cursor: CursorRange,
+    containers: &[Container],
+    out: &mut Vec<RenderBlock>,
+) {
+    let cursor_inside = cursor.overlaps(&node.range);
+    let mut chain = containers.to_vec();
+    chain.push(Container::ListItem {
+        cursor_inside,
+        kind: item_kind,
+    });
+
+    // Tight items have no Paragraph wrapper — pulldown emits Text
+    // children directly. Loose items wrap their content in a
+    // Paragraph. Either way we want one leaf whose `inlines` come
+    // from the item's inline subtree. Constructing a single leaf for
+    // the whole item handles both shapes uniformly.
+    let mut block = RenderBlock::new(node.range.clone(), BlockKind::Paragraph);
+    block.containers = chain;
+    collect_inlines(node, cursor, &mut block);
+    out.push(block);
 }
 
 /// True if `pos` is the byte index right after a hard-break `\n`
@@ -1486,5 +1594,114 @@ mod tests {
         let empties = synthetic_empties(&spec, src);
         assert_eq!(empties.len(), 1);
         assert_eq!(empties[0].source_range, 3..5);
+    }
+
+    // ---- Lists -----------------------------------------------------------
+
+    #[test]
+    fn unordered_list_emits_one_paragraph_leaf_per_item() {
+        let src = "- foo\n- bar\n";
+        let spec = render_with_cursor(src, 0);
+        let items: Vec<_> = spec
+            .blocks
+            .iter()
+            .filter(|b| !b.containers.is_empty())
+            .collect();
+        assert_eq!(items.len(), 2);
+        for b in &items {
+            assert_eq!(b.containers.len(), 1);
+            assert!(matches!(
+                b.containers[0],
+                Container::ListItem {
+                    kind: ListItemKind::Unordered(b'-'),
+                    ..
+                }
+            ));
+            assert!(matches!(b.kind, BlockKind::Paragraph));
+        }
+    }
+
+    #[test]
+    fn ordered_list_assigns_per_item_numbers() {
+        let src = "1. one\n2. two\n3. three\n";
+        let spec = render_with_cursor(src, 0);
+        let nums: Vec<u64> = spec
+            .blocks
+            .iter()
+            .filter_map(|b| match b.containers.first() {
+                Some(Container::ListItem {
+                    kind: ListItemKind::Ordered { number },
+                    ..
+                }) => Some(*number),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nums, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn ordered_list_starting_at_ten_preserves_offset() {
+        // The list's start number is whatever pulldown reports;
+        // per-item numbers count up from there.
+        let src = "10. ten\n11. eleven\n";
+        let spec = render_with_cursor(src, 0);
+        let nums: Vec<u64> = spec
+            .blocks
+            .iter()
+            .filter_map(|b| match b.containers.first() {
+                Some(Container::ListItem {
+                    kind: ListItemKind::Ordered { number },
+                    ..
+                }) => Some(*number),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nums, vec![10, 11]);
+    }
+
+    #[test]
+    fn list_item_marker_is_inside_leaf_source_range() {
+        // The leaf's source_range starts at the item's range start —
+        // the marker bytes are inside the leaf so future hide / dim
+        // / substitute treatments can address them.
+        let src = "- foo\n";
+        let spec = render_with_cursor(src, 0);
+        let item = spec
+            .blocks
+            .iter()
+            .find(|b| !b.containers.is_empty())
+            .expect("list item leaf");
+        assert_eq!(item.source_range.start, 0);
+    }
+
+    #[test]
+    fn cursor_inside_list_item_flips_container_flag() {
+        let src = "- foo\n- bar\n";
+        // Cursor on first item.
+        let spec = render_with_cursor(src, 3);
+        let first = spec
+            .blocks
+            .iter()
+            .find(|b| !b.containers.is_empty())
+            .unwrap();
+        assert!(matches!(
+            first.containers[0],
+            Container::ListItem {
+                cursor_inside: true,
+                ..
+            }
+        ));
+        // Cursor on second item.
+        let spec = render_with_cursor(src, 9);
+        let second_inside_count = spec
+            .blocks
+            .iter()
+            .filter_map(|b| match b.containers.first() {
+                Some(Container::ListItem { cursor_inside, .. }) => Some(*cursor_inside),
+                _ => None,
+            })
+            .filter(|c| *c)
+            .count();
+        assert_eq!(second_inside_count, 1);
     }
 }

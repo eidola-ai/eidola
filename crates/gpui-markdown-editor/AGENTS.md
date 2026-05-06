@@ -109,15 +109,27 @@ The first cut covers:
   `N * blockquote_indent` of left padding and paints N stacked border
   bars. Code-block backgrounds inset *inside* the blockquote indent so
   the border bar stays visible.
+- Lists (top-level only, MVP): unordered (`-` / `*` / `+`) and
+  ordered (`1.`, `2.`, …). Each item parses to one `Paragraph` leaf
+  carrying a `Container::ListItem` entry; the element layer adds
+  `list_indent` of left padding. The marker bytes are part of the
+  shaped line for now — bullet-glyph substitution is a follow-up.
+  Pressing Enter at the end of an item produces a new item with the
+  next marker (same bullet char for unordered, n+1 for ordered);
+  numbered renumbering of existing items on edit is not yet
+  implemented. Lists nested inside lists, multi-paragraph (loose)
+  items, and lists inside / containing blockquotes (other than the
+  combined-prefix Enter handling) are not yet wired.
 - Soft-wrap.
 - Cursor + selection geometry, mouse hit-test, basic keyboard navigation
   (arrows / home / end / doc start / doc end), basic editing (insert text,
   backspace / delete, newline / line break), select-all.
 
 Explicitly *out* of this first phase: setext-heading normalization, ordered
-list renumbering, lists (all kinds), inline code, links, images, thematic
-rules, tables, HTML, IME marked-text, word / line-aware delete, indent /
-outdent, and tab-trapped focus traversal. Each will land as a follow-up.
+list renumbering on edit, loose / nested / blockquote-mixed lists,
+inline code, links, images, thematic rules, tables, HTML, IME
+marked-text, word / line-aware delete, indent / outdent, and
+tab-trapped focus traversal. Each will land as a follow-up.
 
 ### Container chain (composability invariant)
 

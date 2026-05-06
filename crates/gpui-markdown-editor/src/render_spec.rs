@@ -81,6 +81,27 @@ pub enum Container {
     /// the cursor's position vs. the *blockquote's* source range (not
     /// the leaf's), so all leaves of the same blockquote agree.
     BlockQuote { cursor_inside: bool },
+    /// One list-item wrapping this leaf. Lists themselves contribute no
+    /// chrome — the item is the visible unit. `cursor_inside` reflects
+    /// the cursor's position vs. the item's source range. `kind` lets
+    /// the editor choose what to insert when the user presses Enter at
+    /// the end of an item (next bullet vs next number).
+    ListItem {
+        cursor_inside: bool,
+        kind: ListItemKind,
+    },
+}
+
+/// What kind of list item this is — the marker shape that produced it.
+/// Used to choose the next item's marker text on Enter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListItemKind {
+    /// Bullet item; the byte is the bullet character (`-`, `*`, or `+`).
+    Unordered(u8),
+    /// Numbered item. `number` is *this* item's parsed number; the next
+    /// item produced by Enter is `number + 1`. Renumbering of later
+    /// items in the list is not yet implemented.
+    Ordered { number: u64 },
 }
 
 impl RenderBlock {

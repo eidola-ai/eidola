@@ -40,6 +40,16 @@ inside they reveal in a dimmed color. Try clicking around in the
 
 You can combine ***bold and italic*** as a triple-asterisk run, or use
 ~~strikethrough~~ inside a paragraph alongside other styling.
+
+### Lists
+
+- First bullet item.
+- Second bullet item.
+- A third one.
+
+1. Numbered, starting at one.
+2. The next item.
+3. And so on.
 ";
 
 fn bind_keys(cx: &mut App) {
