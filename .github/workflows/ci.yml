@@ -10,6 +10,11 @@ on:
     branches:
       - main
 
+# Cancel superseded PR runs; let pushes to main and tag releases finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions: {}
 
 jobs:
@@ -24,12 +29,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        # save-if scopes writes to main; this job only runs tests, no
+        # artifact from here is published.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 # zizmor: ignore[cache-poisoning]
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -66,15 +75,19 @@ jobs:
       artifact_manifest: ${{ steps.partial.outputs.actual }}
     permissions:
       contents: read
-      packages: write
-      pull-requests: write
+      packages: write # push OCI images to ghcr.io on push events
+      pull-requests: write # surfaced through artifact-manifest job; declared here for parity
 
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        # type=gha cache is branch-scoped: PR branches cannot write the main
+        # scope; the release path is StageX-reproducible from source pins.
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0 # zizmor: ignore[cache-poisoning]
         with:
           version: v0.31.1
           platforms: linux/amd64
@@ -117,9 +130,10 @@ jobs:
         env:
           REGISTRY: ${{ steps.tags.outputs.registry || '' }}
           TAGS: ${{ steps.tags.outputs.tags || 'dev' }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           PUSH_FLAG=""
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${EVENT_NAME}" = "push" ]; then
             PUSH_FLAG="--push"
           fi
           ./scripts/artifact-manifest.sh build \
@@ -129,9 +143,11 @@ jobs:
             --set "*.cache-to=type=gha,mode=max"
 
       - name: Record OCI artifact manifest
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           PUSH_FLAG=""
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${EVENT_NAME}" = "push" ]; then
             PUSH_FLAG="--push"
           fi
           echo "actual<<EOF" >> "$GITHUB_OUTPUT"
@@ -141,9 +157,11 @@ jobs:
 
       - name: Verify OCI artifact subset
         id: verify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           PUSH_FLAG=""
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${EVENT_NAME}" = "push" ]; then
             PUSH_FLAG="--push"
           fi
           if ./scripts/artifact-manifest.sh verify ${PUSH_FLAG} --metadata-file "${BAKE_METADATA_FILE}" --manifest artifact-manifest.json; then
@@ -172,17 +190,23 @@ jobs:
   # ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:a914e5b3fc1197d61832009778a77ca30717314fd32702cfdf90a42f2c279ea3
   apple:
     name: Apple builds
-    runs-on: self-hosted
+    runs-on: self-hosted # zizmor: ignore[self-hosted-runner] -- macOS XCFramework + Nix builds require an Apple-silicon runner
     timeout-minutes: 30
+    # Only main and v* tag pushes acquire the Cachix write token, gated by
+    # the branch-restricted `cachix-write` environment in repo settings.
+    # Other runs (PRs, schedule, dispatch) get no environment and pull
+    # anonymously from the public Cachix cache.
+    environment: ${{ (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) && 'cachix-write' || '' }}
     outputs:
       artifact_manifest: ${{ steps.partial.outputs.actual }}
     permissions:
       contents: read
-      id-token: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install Nix
         uses: cachix/install-nix-action@ab739621df7a23f52766f9ccc97f38da6b7af14f # v31.10.5
@@ -236,35 +260,40 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      pull-requests: write
+      pull-requests: write # post REQUEST_CHANGES review when manifest is stale
 
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        # save-if scopes writes to main; this job only verifies the manifest,
+        # it does not produce any published artifact.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 # zizmor: ignore[cache-poisoning]
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache CVM artifacts
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        # CVM kernel/initrd downloads are Sigstore-verified by the
+        # --verify-attestations flag below, so a poisoned cache is rejected
+        # at verification time.
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5 # zizmor: ignore[cache-poisoning]
         with:
           path: ~/.cache/eidola/cvm
           key: cvm-${{ hashFiles('tinfoil-config.yml') }}
 
       - name: Materialize partial manifests
+        env:
+          OCI_MANIFEST: ${{ needs.oci.outputs.artifact_manifest }}
+          APPLE_MANIFEST: ${{ needs.apple.outputs.artifact_manifest }}
         run: |
-          cat > /tmp/oci-artifact-manifest.json <<'EOF'
-          ${{ needs.oci.outputs.artifact_manifest }}
-          EOF
-
-          cat > /tmp/apple-artifact-manifest.json <<'EOF'
-          ${{ needs.apple.outputs.artifact_manifest }}
-          EOF
+          printf '%s' "$OCI_MANIFEST" > /tmp/oci-artifact-manifest.json
+          printf '%s' "$APPLE_MANIFEST" > /tmp/apple-artifact-manifest.json
 
       - name: Verify full artifact manifest
         id: verify
@@ -290,6 +319,7 @@ jobs:
         if: steps.verify.outputs.match == 'false' && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           ACTUAL: ${{ steps.verify.outputs.actual }}
         run: |
@@ -307,7 +337,7 @@ jobs:
               event: "REQUEST_CHANGES",
               body: $body
             }' | gh api --silent -X POST \
-              "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+              "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
               --input -
 
       - name: Fail on manifest mismatch

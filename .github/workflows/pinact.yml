@@ -6,15 +6,26 @@ on:
       - ".github/workflows/*.yml"
       - ".github/workflows/*.yaml"
 
-permissions:
-  contents: write
-  pull-requests: write
+# Cancel superseded runs when a PR branch is updated; only the latest commit's
+# pin suggestions are useful.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Workflow-level: no permissions by default; each job opts in to what it needs.
+permissions: {}
 
 jobs:
   suggest-pins:
+    name: Suggest pinning GitHub Actions
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write # post review comments on the PR suggesting SHA pins
+      contents: write # pinact-action requires this for parity with skip_push: false; not exercised here
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Suggest action pins
         uses: mike-marcacci/pinact-action@a56127fea631bf6b44c7182ff09aedfd74ce476d # v1.0.0
