@@ -109,27 +109,64 @@ The first cut covers:
   `N * blockquote_indent` of left padding and paints N stacked border
   bars. Code-block backgrounds inset *inside* the blockquote indent so
   the border bar stays visible.
-- Lists (top-level only, MVP): unordered (`-` / `*` / `+`) and
-  ordered (`1.`, `2.`, …). Each item parses to one `Paragraph` leaf
-  carrying a `Container::ListItem` entry; the element layer adds
-  `list_indent` of left padding. The marker bytes are part of the
-  shaped line for now — bullet-glyph substitution is a follow-up.
-  Pressing Enter at the end of an item produces a new item with the
-  next marker (same bullet char for unordered, n+1 for ordered);
-  numbered renumbering of existing items on edit is not yet
-  implemented. Lists nested inside lists, multi-paragraph (loose)
-  items, and lists inside / containing blockquotes (other than the
-  combined-prefix Enter handling) are not yet wired.
+- Lists (top-level + nested-inside-blockquote, MVP): unordered
+  (`-` / `*` / `+`) and ordered (`1.`, `2.`, …). Each *paragraph* of
+  each item parses to one leaf carrying a `Container::ListItem`
+  entry — multi-paragraph items render as multiple leaves, all
+  inside the same item container. The first paragraph's source
+  range includes the item's marker; subsequent paragraphs include
+  their leading indent. The element layer adds `list_indent` of
+  left padding once per item regardless of paragraph count. Bullet
+  glyph substitution and ordered-list renumbering on edit are
+  follow-ups. Lists nested inside lists are not yet wired.
+
+  **Whitespace rules `enforce_invariants` enforces inside lists**
+  (the analog of the blockquote pairs / soft-break discipline):
+
+  - Lists are always rendered tight *between* items: a `\n\n+` run
+    between two items collapses to one `\n`. *Inside* an item,
+    `\n\n` is preserved as a paragraph break — multi-paragraph
+    items are first-class. The pixel-fidelity divergence with the
+    chat renderer's loose-list spacing is the documented cost.
+  - Two consecutive hard breaks (`  \n` + scope-continuation +
+    `  \n`, in any scope) collapse to a paragraph break in the
+    same scope. The trailing-marker `  ` of each hard break is
+    dropped; the scope-continuation between them (BQ `> `, list
+    indent, …) is preserved. So at top level `foo  \n  \nbar` →
+    `foo\n\nbar`; inside a blockquote the depth-D pair shape
+    regenerates; inside a list item it produces a paragraph
+    break in source. This is what enables Shift+Enter twice as
+    the "create a paragraph break inside this item" gesture
+    without a dedicated event.
+  - No lazy continuations: continuation lines carry exactly
+    `marker_width` spaces of indent (3 for `1. ` or `- `, 4 for
+    `10. ` etc.) and the preceding line ends with a hard break
+    (`  \n`). Editing `9.` → `10.` re-aligns every continuation by
+    +1 space; the inverse for narrowing.
+  - Soft breaks within an item promote to hard break + indent so
+    the chat renderer's soft-break-as-space rule doesn't collapse
+    multi-line item content onto one line.
+  - The trailing `\n` of a list is the boundary with the next
+    block: the soft-break rule promotes `- item\n# heading` (and
+    similar pairings) to `- item\n\n# heading`.
+  - Empty-item Enter and Backspace at the start of an item content
+    both *decrease the item's nesting depth by one* (analog of
+    blockquote outdent). For a top-level list item this drops the
+    marker (item becomes a paragraph); for a list inside a
+    blockquote it leaves the BQ scope intact while ending the
+    list. This subsumes the typical "double-Enter exits a list" UX
+    and the "Backspace at start of list item joins it" UX without
+    a dedicated state flag.
 - Soft-wrap.
 - Cursor + selection geometry, mouse hit-test, basic keyboard navigation
   (arrows / home / end / doc start / doc end), basic editing (insert text,
   backspace / delete, newline / line break), select-all.
 
 Explicitly *out* of this first phase: setext-heading normalization, ordered
-list renumbering on edit, loose / nested / blockquote-mixed lists,
-inline code, links, images, thematic rules, tables, HTML, IME
-marked-text, word / line-aware delete, indent / outdent, and
-tab-trapped focus traversal. Each will land as a follow-up.
+list renumbering on edit, nested-inside-list lists (lists inside list
+items), inline code, links, images, thematic rules, tables, HTML,
+IME marked-text, word / line-aware delete, and tab-trapped focus
+traversal. Each will land as a follow-up.
 
 ### Container chain (composability invariant)
 

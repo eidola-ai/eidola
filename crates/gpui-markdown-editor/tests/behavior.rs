@@ -1587,3 +1587,293 @@ fn enter_inside_list_inside_blockquote_keeps_both_scopes(cx: &mut TestAppContext
         assert_eq!(e.state.markdown, "> - foo\n> - ");
     });
 }
+
+// ---- List boundary with surrounding blocks --------------------------
+
+#[gpui::test]
+fn list_followed_by_heading_uses_double_newline_boundary(cx: &mut TestAppContext) {
+    // Pulldown sees a heading as a separate top-level construct (a
+    // setext / ATX heading interrupts list parsing), so the bytes
+    // between list and heading fall outside the list's exempt range
+    // and `promote_soft_breaks` enforces the canonical `\n\n`
+    // boundary.
+    let initial = EditorState {
+        markdown: "- item\n# heading".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "- item\n\n# heading");
+}
+
+#[gpui::test]
+fn list_followed_by_lazy_paragraph_canonicalizes_to_continuation(cx: &mut TestAppContext) {
+    // Pulldown's lazy-continuation rule treats `- item\nparagraph`
+    // as one list item with text "item paragraph". Our canonical
+    // form preserves that parse but makes it explicit: the
+    // continuation gets indented to marker width and the line
+    // break becomes a hard break. The result is one item with
+    // an indented multi-line body — *not* a list-then-paragraph
+    // split (which would require an explicit `\n\n` from the user).
+    let initial = EditorState {
+        markdown: "- item\nparagraph".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "- item  \n  paragraph");
+}
+
+// ---- List canonicalization passes ----------------------------------
+
+#[gpui::test]
+fn loose_list_gets_tightened_to_single_newline_separator(cx: &mut TestAppContext) {
+    // A pasted loose list (`\n\n` between items) collapses to a
+    // tight one (`\n`). The pixel-fidelity cost is documented:
+    // the chat renderer would still render the original loosely,
+    // but the editor's "always tight" rule wins inside the
+    // composer.
+    let initial = EditorState {
+        markdown: "- foo\n\n- bar".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "- foo\n- bar");
+}
+
+#[gpui::test]
+fn lazy_continuation_in_item_promotes_to_hard_break_with_indent(cx: &mut TestAppContext) {
+    // Pulldown calls `- foo\nbar` a lazy continuation: "bar" stays
+    // in item 1. We canonicalize to `- foo  \n  bar` — explicit
+    // hard break + explicit indent — so the chat renderer doesn't
+    // collapse "foo bar" onto one line via soft-break-as-space.
+    let initial = EditorState {
+        markdown: "- foo\nbar".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "- foo  \n  bar");
+}
+
+#[gpui::test]
+fn soft_break_inside_item_promotes_to_hard_break(cx: &mut TestAppContext) {
+    // Already-indented soft break (the user pasted text with proper
+    // indent but a soft break, not a hard one). Canonical form
+    // promotes the `\n` to `  \n` so editor and chat renderers agree.
+    let initial = EditorState {
+        markdown: "- foo\n  bar".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "- foo  \n  bar");
+}
+
+#[gpui::test]
+fn ordered_marker_widening_reindents_continuations(cx: &mut TestAppContext) {
+    // Marker `9.` (2 chars + space = 3 bytes) becomes `10.`
+    // (3 chars + space = 4 bytes). The continuation indent must
+    // grow from 3 to 4 spaces. Tested via direct buffer state to
+    // avoid having to drive the actual marker edit through the
+    // editor.
+    let initial = EditorState {
+        markdown: "10. foo  \n   bar".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "10. foo  \n    bar");
+}
+
+#[gpui::test]
+fn ordered_marker_narrowing_reindents_continuations(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "1. foo  \n    bar".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "1. foo  \n   bar");
+}
+
+// ---- Empty-item Enter (depth decrease) -------------------------------
+
+#[gpui::test]
+fn enter_on_empty_top_level_item_exits_to_paragraph(cx: &mut TestAppContext) {
+    // The "Enter twice to exit a list" UX, framed as decreasing the
+    // item's nesting depth by one. After:
+    //   1. type `- foo` (cursor at 5)
+    //   2. Enter → `- foo\n- ` (cursor at 8)
+    //   3. Enter on the empty item → exit to top-level paragraph.
+    let initial = EditorState {
+        markdown: "- foo\n- ".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- foo\n\n");
+        assert_eq!(e.cursor_offset(), 7);
+    });
+}
+
+#[gpui::test]
+fn enter_on_sole_empty_item_clears_buffer(cx: &mut TestAppContext) {
+    // First-keystroke flow: `- ` with cursor at 2, Enter exits the
+    // list. With no preceding content, the buffer is left empty.
+    let initial = EditorState {
+        markdown: "- ".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "");
+        assert_eq!(e.cursor_offset(), 0);
+    });
+}
+
+#[gpui::test]
+fn enter_on_empty_item_inside_blockquote_exits_to_bq_paragraph(cx: &mut TestAppContext) {
+    // `> - foo\n> - ` with cursor at end → Enter on the empty list
+    // item drops the list level but leaves the BQ scope intact.
+    let initial = EditorState {
+        markdown: "> - foo\n> - ".into(),
+        selection: Selection::Cursor(12),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // Result: BQ paragraph + BQ paragraph break + new empty BQ
+        // line. The depth-D pair shape `\n> \n> ` carries the BQ
+        // forward without re-introducing a list marker.
+        assert_eq!(e.state.markdown, "> - foo\n> \n> ");
+    });
+}
+
+// ---- Backspace at start of item content ----------------------------
+
+#[gpui::test]
+fn backspace_at_start_of_top_level_item_strips_marker(cx: &mut TestAppContext) {
+    // Cursor at byte 2 (right after `- `) — Backspace removes the
+    // marker and the item becomes a top-level paragraph.
+    let initial = EditorState {
+        markdown: "- foo".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "foo");
+        assert_eq!(e.cursor_offset(), 0);
+    });
+}
+
+#[gpui::test]
+fn backspace_at_start_of_ordered_item_strips_marker(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "1. foo".into(),
+        selection: Selection::Cursor(3),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "foo");
+        assert_eq!(e.cursor_offset(), 0);
+    });
+}
+
+// ---- Two consecutive hard breaks → paragraph break ----------------
+
+#[gpui::test]
+fn two_hard_breaks_at_top_level_become_paragraph_break(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "foo  \n  \nbar".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "foo\n\nbar");
+}
+
+#[gpui::test]
+fn two_hard_breaks_in_blockquote_become_bq_paragraph_pair(cx: &mut TestAppContext) {
+    // Inside a depth-1 blockquote the canonical paragraph break is
+    // `\n> \n> ` — the depth-1 pair shape. Dropping the trailing
+    // `  ` of both hard breaks yields exactly that.
+    let initial = EditorState {
+        markdown: "> foo  \n>   \n> bar".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "> foo\n> \n> bar");
+}
+
+#[gpui::test]
+fn two_hard_breaks_in_list_item_create_paragraph_break(cx: &mut TestAppContext) {
+    // Pulldown then sees one item with two paragraphs ("foo" and
+    // "bar"). The indent between the `\n`s stays — pulldown is
+    // happy either with `\n\n  ` or `\n  \n  `, both parse the
+    // same.
+    let initial = EditorState {
+        markdown: "- foo  \n    \n  bar".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "- foo\n  \n  bar");
+}
+
+#[gpui::test]
+fn shift_enter_twice_inside_list_item_creates_paragraph_break(cx: &mut TestAppContext) {
+    // The end-to-end UX flow. Type `- foo`, press Shift+Enter twice:
+    // we want a paragraph break inside the same list item, with the
+    // cursor on the empty new paragraph.
+    let initial = EditorState {
+        markdown: "- foo".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftEnter);
+    dispatch(cx, handle, &editor, ShiftEnter);
+    editor.read_with(cx, |e, _| {
+        // After the second Shift+Enter the buffer is
+        // `- foo  \n    \n  ` — two consecutive hard breaks. The
+        // collapse pass drops both trailing-`  `s, producing
+        // `- foo\n  \n  `.
+        assert_eq!(e.state.markdown, "- foo\n  \n  ");
+    });
+}
+
+// ---- Multi-paragraph items survive enforce_invariants ---------------
+
+#[gpui::test]
+fn multi_paragraph_list_item_is_preserved(cx: &mut TestAppContext) {
+    // `1. This is a list\n\n   With a second paragraph.` — pulldown's
+    // canonical multi-paragraph item shape. Indent matches the
+    // `1. ` marker width (3 spaces). enforce_invariants must
+    // preserve this exactly: no `\n\n` collapse, no hard-break
+    // promotion across the paragraph break.
+    let initial = EditorState {
+        markdown: "1. This is a list\n\n   With a second paragraph.".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(
+        final_state.markdown,
+        "1. This is a list\n\n   With a second paragraph.",
+    );
+}
+
+#[gpui::test]
+fn multi_paragraph_item_renders_as_two_paragraph_leaves(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "1. first paragraph\n\n   second paragraph".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let item_leaves: Vec<_> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .collect();
+    assert_eq!(
+        item_leaves.len(),
+        2,
+        "multi-paragraph item must render one leaf per paragraph",
+    );
+}

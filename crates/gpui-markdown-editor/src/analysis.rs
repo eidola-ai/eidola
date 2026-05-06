@@ -742,30 +742,44 @@ pub fn blockquote_continuation_prefix(markdown: &str, cursor: usize) -> String {
 // List ranges and item context
 // ---------------------------------------------------------------------------
 
-/// Byte ranges of every list (top-level or nested) in the buffer.
-/// Used to exempt list-internal `\n` bytes from soft-break promotion
-/// — inside a list pulldown handles line structure (item separators,
-/// continuation indent, lazy continuations) and the buffer's own
-/// `\n` discipline doesn't apply.
+/// Byte ranges of every list's *interior* — used to exempt
+/// list-internal `\n` bytes from soft-break promotion. Inside a list
+/// pulldown handles line structure (item separators, continuation
+/// indent, hard-break-with-indent inside items) and the buffer's own
+/// `\n` discipline doesn't apply for those bytes.
 ///
-/// Implementation: walks the parsed tree. Pulldown is fast enough at
-/// our buffer sizes that calling it inside `enforce_invariants`
-/// per-update isn't visible. If that ever changes, replace with a
-/// byte scanner — but list edges are far harder to identify
-/// byte-locally than fence edges, so the parser pass is the right
-/// default.
+/// We deliberately *exclude* the trailing `\n` of every list range:
+/// that newline is the boundary with the next top-level block, and
+/// the editor-wide rule says any structural-block boundary uses
+/// `\n\n`. Without this trim, `- item\nparagraph` would have its
+/// boundary `\n` exempt, leaving the soft-break rule unable to
+/// enforce the `\n\n` separator between list and paragraph.
+///
+/// Implementation: walks the parsed tree. Pulldown is fast enough
+/// at our buffer sizes that calling it inside `enforce_invariants`
+/// per-update isn't visible.
 pub fn list_content_ranges(markdown: &str) -> Vec<Range<usize>> {
-    fn collect(nodes: &[crate::syntax::SyntaxNode], out: &mut Vec<Range<usize>>) {
+    fn collect(nodes: &[crate::syntax::SyntaxNode], bytes: &[u8], out: &mut Vec<Range<usize>>) {
         for n in nodes {
             if matches!(n.kind, crate::syntax::NodeKind::List { .. }) {
-                out.push(n.range.clone());
+                let mut end = n.range.end;
+                // Trim every trailing `\n` so the boundary with the
+                // next block is not exempt. Pulldown ranges
+                // typically include either one trailing `\n`
+                // (tight) or two (loose with paragraph break before
+                // the next block); both should be promotable to a
+                // canonical `\n\n` boundary by the soft-break rule.
+                while end > n.range.start && bytes[end - 1] == b'\n' {
+                    end -= 1;
+                }
+                out.push(n.range.start..end);
             }
-            collect(&n.children, out);
+            collect(&n.children, bytes, out);
         }
     }
     let tree = crate::parser::parse(markdown);
     let mut out = Vec::new();
-    collect(&tree, &mut out);
+    collect(&tree, markdown.as_bytes(), &mut out);
     out
 }
 
@@ -807,11 +821,14 @@ fn innermost_list_item_at(markdown: &str, cursor: usize) -> Option<ItemContext> 
                         }
                     }
                 }
-                crate::syntax::NodeKind::ListItem { .. } => {
+                crate::syntax::NodeKind::ListItem { marker_range } => {
                     if let Some(list_kind) = in_list {
                         *deepest = Some(ItemContext {
                             list_kind,
                             item_index: item_index_in_list,
+                            marker_width: marker_range.end - marker_range.start,
+                            item_range: node.range.clone(),
+                            marker_range: marker_range.clone(),
                         });
                     }
                     walk(&node.children, cursor, None, 0, deepest);
@@ -829,12 +846,20 @@ fn innermost_list_item_at(markdown: &str, cursor: usize) -> Option<ItemContext> 
     deepest
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ItemContext {
     list_kind: crate::syntax::ListKind,
     /// Zero-based position of this item within its list — used to
     /// compute the next ordered item's number (`start + index + 1`).
     item_index: usize,
+    /// Byte width of the marker (e.g. 2 for `- `, 3 for `1. `, 4 for
+    /// `10. `). Continuation lines for this item should carry this
+    /// many leading spaces of indent.
+    marker_width: usize,
+    /// Source range of the whole item.
+    item_range: Range<usize>,
+    /// Source range of the marker bytes (e.g. `- ` or `1. `).
+    marker_range: Range<usize>,
 }
 
 impl ItemContext {
@@ -934,16 +959,563 @@ pub fn enter_insertion(markdown: &str, cursor: usize) -> String {
 
 /// Source string to insert when the user presses Shift+Enter at
 /// `cursor`. Inside a blockquote, the continuation line carries the
-/// blockquote prefix so it stays in scope. Inside a list, the
-/// continuation falls through to a plain hard break — pulldown's
-/// lazy-continuation rule keeps the line attached to the same item
-/// without a special prefix.
+/// blockquote prefix. Inside a list item, the continuation carries
+/// `marker_width` spaces of indent so the next line stays inside the
+/// item per CommonMark's continuation rule (and so the
+/// no-lazy-continuation invariant holds without a separate
+/// promotion pass).
 pub fn line_break_insertion(markdown: &str, cursor: usize) -> String {
     let bq_prefix = blockquote_continuation_prefix(markdown, cursor);
-    if !bq_prefix.is_empty() && innermost_list_item_at(markdown, cursor).is_none() {
+    if let Some(item) = innermost_list_item_at(markdown, cursor) {
+        let indent = " ".repeat(item.marker_width);
+        return format!("  \n{bq_prefix}{indent}");
+    }
+    if !bq_prefix.is_empty() {
         return format!("  \n{bq_prefix}");
     }
     "  \n".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Empty-item / depth-decrease detection
+// ---------------------------------------------------------------------------
+
+/// Edit prescribed by an "exit list" (empty-item Enter or
+/// backspace-at-start-of-item) intent.
+///
+/// `range_to_replace` is the source slice the editor should splice
+/// out; `replacement` is what to put in its place; `cursor_offset`
+/// (relative to `replacement.start()`) is where to land the cursor
+/// after the splice.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DepthDecreaseEdit {
+    pub range: Range<usize>,
+    pub replacement: String,
+    /// Where the cursor lands, in the *post-splice* buffer, given as
+    /// an absolute byte offset.
+    pub cursor: usize,
+}
+
+/// `Some(edit)` when the user pressed Enter on an *empty* list item
+/// at `cursor` (cursor at end of an item line whose content beyond
+/// the marker is empty).
+///
+/// The edit decreases the item's nesting depth by one — analogous to
+/// blockquote outdent. For a depth-1 (top-level) empty item the
+/// result is a paragraph break with the item line removed; for a
+/// nested item the marker bytes are dropped and the line becomes a
+/// continuation of the parent item.
+pub fn empty_item_exit_edit(markdown: &str, cursor: usize) -> Option<DepthDecreaseEdit> {
+    let item = innermost_list_item_at(markdown, cursor)?;
+    if !item_is_empty_at_cursor(markdown, &item, cursor) {
+        return None;
+    }
+    Some(build_depth_decrease_edit(
+        markdown,
+        &item,
+        ExitTrigger::EmptyEnter,
+    ))
+}
+
+/// `Some(edit)` when the user pressed Backspace at the *start* of a
+/// list item's content (the byte right after the marker). The
+/// rule mirrors the empty-Enter case: decrease the item's nesting
+/// depth by one. For a depth-1 item the result is a top-level
+/// paragraph; for nested, the line becomes a continuation of the
+/// parent.
+pub fn backspace_at_item_start_edit(markdown: &str, cursor: usize) -> Option<DepthDecreaseEdit> {
+    let item = innermost_list_item_at(markdown, cursor)?;
+    if cursor != item.marker_range.end {
+        return None;
+    }
+    Some(build_depth_decrease_edit(
+        markdown,
+        &item,
+        ExitTrigger::BackspaceAtStart,
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExitTrigger {
+    /// Enter on an empty item: replace the item line + leading
+    /// separator with a paragraph break and drop the cursor at the
+    /// start of the new top-level paragraph.
+    EmptyEnter,
+    /// Backspace at start of item content: drop just the marker
+    /// bytes and leave any item content in place.
+    BackspaceAtStart,
+}
+
+fn item_is_empty_at_cursor(markdown: &str, item: &ItemContext, cursor: usize) -> bool {
+    if cursor != item.item_range.end && !cursor_at_end_of_first_line(markdown, item, cursor) {
+        return false;
+    }
+    let bytes = markdown.as_bytes();
+    let content = &bytes[item.marker_range.end..item.item_range.end];
+    content
+        .iter()
+        .all(|&b| b == b' ' || b == b'\t' || b == b'\n')
+}
+
+fn cursor_at_end_of_first_line(markdown: &str, item: &ItemContext, cursor: usize) -> bool {
+    let bytes = markdown.as_bytes();
+    let mut p = item.marker_range.end;
+    while p < item.item_range.end && bytes[p] != b'\n' {
+        p += 1;
+    }
+    cursor == p
+}
+
+fn build_depth_decrease_edit(
+    markdown: &str,
+    item: &ItemContext,
+    trigger: ExitTrigger,
+) -> DepthDecreaseEdit {
+    let bytes = markdown.as_bytes();
+    let bq_prefix = blockquote_continuation_prefix(markdown, item.marker_range.start);
+    // The "outer scope" is the prefix that introduces lines outside
+    // this list-item — empty (top level) or `> ` × D (inside a
+    // blockquote). The decrease drops the item's marker; the line
+    // is then inside the outer scope.
+    match trigger {
+        ExitTrigger::EmptyEnter => {
+            // Replace the item line *plus* the preceding separator
+            // (`\n` between this and the previous item) with a
+            // paragraph break that respects the outer scope. For the
+            // first item of a top-level list with no preceding
+            // content, the result drops the marker outright.
+            let line_start = line_start_offset(bytes, item.marker_range.start);
+            let prev_sep_start = if line_start > 0 && bytes[line_start - 1] == b'\n' {
+                line_start - 1
+            } else {
+                line_start
+            };
+            let replacement = if prev_sep_start == 0 {
+                // No preceding content — leave the buffer empty in
+                // the spliced region. Cursor lands at the beginning.
+                String::new()
+            } else if bq_prefix.is_empty() {
+                // Top-level: the standard `\n\n` paragraph break.
+                "\n\n".to_string()
+            } else {
+                // Inside a blockquote: the depth-D pair shape.
+                format!("\n{bq_prefix}\n{bq_prefix}")
+            };
+            let cursor = prev_sep_start + replacement.len();
+            DepthDecreaseEdit {
+                range: prev_sep_start..item.item_range.end,
+                replacement,
+                cursor,
+            }
+        }
+        ExitTrigger::BackspaceAtStart => {
+            // Drop just the marker bytes; the rest of the item
+            // becomes a continuation of the outer scope. Other
+            // normalization passes (continuation reindent, tighten,
+            // soft-break promotion) clean up downstream.
+            DepthDecreaseEdit {
+                range: item.marker_range.clone(),
+                replacement: String::new(),
+                cursor: item.marker_range.start,
+            }
+        }
+    }
+}
+
+fn line_start_offset(bytes: &[u8], pos: usize) -> usize {
+    let mut p = pos;
+    while p > 0 && bytes[p - 1] != b'\n' {
+        p -= 1;
+    }
+    p
+}
+
+// ---------------------------------------------------------------------------
+// List canonicalization
+// ---------------------------------------------------------------------------
+
+/// One byte-range edit produced by `list_normalization_edits`. Edits
+/// are emitted in *original* (pre-edit) coordinates and applied
+/// sweep-style: the apply step at the call site walks them in order
+/// and produces the new buffer plus a cursor remap.
+#[derive(Debug, Clone)]
+pub struct SourceEdit {
+    pub range: Range<usize>,
+    pub replacement: String,
+}
+
+/// Detect every pair of *consecutive* hard breaks in the buffer and
+/// emit edits that drop both pairs of trailing `  ` (the hard-break
+/// markers) — leaving two adjacent `\n`s where the user typed a
+/// double Shift+Enter.
+///
+/// Runs *before* the list / soft-break passes so the resulting
+/// `\n\n` is treated as a paragraph break by everything downstream:
+/// at top level it's a paragraph separator; inside a blockquote
+/// the depth-D pair shape regenerates around it; inside a list
+/// item it splits the item into multiple paragraphs.
+///
+/// "Consecutive" means: a hard break (`  \n`) followed by another
+/// hard break (`  \n`) with only whitespace, `>` markers, or tabs
+/// between them. Any actual content between disqualifies the pair.
+/// (Backslash hard breaks `\\\n` are recognized symmetrically.)
+pub fn consecutive_hard_break_edits(markdown: &str) -> Vec<SourceEdit> {
+    let bytes = markdown.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\n' {
+            i += 1;
+            continue;
+        }
+        let Some(first_trailing) = hard_break_trailing_at(bytes, i) else {
+            i += 1;
+            continue;
+        };
+        // Walk forward over container-continuation bytes and find
+        // the next `\n`. If it's also a hard break with only
+        // continuation between, the pair is consecutive.
+        let mut j = i + 1;
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'>') {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'\n' {
+            i += 1;
+            continue;
+        }
+        let Some(second_trailing) = hard_break_trailing_at(bytes, j) else {
+            i += 1;
+            continue;
+        };
+        // Found two consecutive hard breaks — emit deletes for both
+        // trailing-marker runs. The `\n`s themselves stay (they
+        // become the paragraph break) and any container-continuation
+        // bytes between them stay too (BQ markers / list indent
+        // belong to the surrounding scope, not the hard breaks).
+        out.push(SourceEdit {
+            range: first_trailing,
+            replacement: String::new(),
+        });
+        out.push(SourceEdit {
+            range: second_trailing,
+            replacement: String::new(),
+        });
+        i = j + 1;
+    }
+    out
+}
+
+/// If the `\n` at `nl` is the terminator of a hard break, return the
+/// byte range of the *canonical* trailing-marker characters (`  ` or
+/// `\\`) that precede it. Otherwise `None`.
+///
+/// Non-greedy on purpose: we drop only the two `  ` (or one `\\`)
+/// that *are* the hard-break marker, never spaces beyond that.
+/// Greedy walking would swallow BQ-marker trailing space (`> ` →
+/// `>`) and over-collapse list-item indent into the wrong canonical
+/// shape.
+fn hard_break_trailing_at(bytes: &[u8], nl: usize) -> Option<Range<usize>> {
+    if nl >= 2 && bytes[nl - 1] == b' ' && bytes[nl - 2] == b' ' {
+        return Some((nl - 2)..nl);
+    }
+    if nl >= 1 && bytes[nl - 1] == b'\\' {
+        return Some((nl - 1)..nl);
+    }
+    None
+}
+
+/// Canonicalize list source — runs as part of `enforce_invariants`,
+/// before the soft-break / blockquote-prefix passes.
+///
+/// What this enforces, per item:
+///
+/// 1. **Tight separation between items.** A `\n\n` between two
+///    items at the same depth collapses to `\n` (loose lists are
+///    rendered tight in our editor; the chat renderer's
+///    loose-list spacing is the documented divergence cost).
+/// 2. **No lazy continuations.** A continuation line missing its
+///    indent gets its indent prepended. The previous line's `\n`
+///    is rewritten to `  \n` (hard break) so the line break is
+///    explicit in source — this closes the soft-break-as-space
+///    fidelity gap inside list items.
+/// 3. **Indent matches marker width.** Continuation lines (and
+///    nested lists) carry exactly `marker_width` leading spaces.
+///    Editing `9.` → `10.` re-aligns every continuation by
+///    +1 space; editing back re-aligns by −1.
+///
+/// Returns the edits in source order. The caller applies them and
+/// remaps the cursor.
+pub fn list_normalization_edits(markdown: &str) -> Vec<SourceEdit> {
+    let tree = crate::parser::parse(markdown);
+    let bytes = markdown.as_bytes();
+    let mut edits = Vec::new();
+    walk_normalize_lists(&tree, bytes, &mut edits);
+    edits.sort_by_key(|e| e.range.start);
+    edits
+}
+
+fn walk_normalize_lists(
+    nodes: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+    out: &mut Vec<SourceEdit>,
+) {
+    for n in nodes {
+        match &n.kind {
+            crate::syntax::NodeKind::List { .. } => {
+                normalize_list_node(n, bytes, out);
+                // Recurse into items so nested lists inside items get
+                // normalized too.
+                for child in &n.children {
+                    walk_normalize_lists(&child.children, bytes, out);
+                }
+            }
+            _ => walk_normalize_lists(&n.children, bytes, out),
+        }
+    }
+}
+
+fn normalize_list_node(list: &crate::syntax::SyntaxNode, bytes: &[u8], out: &mut Vec<SourceEdit>) {
+    let items: Vec<&crate::syntax::SyntaxNode> = list
+        .children
+        .iter()
+        .filter(|c| matches!(c.kind, crate::syntax::NodeKind::ListItem { .. }))
+        .collect();
+
+    // Per-item canonicalization. Inter-item tightening (a `\n\n+`
+    // run between two items collapsing to `\n`) is handled inside
+    // `normalize_item` for non-last items: pulldown folds the
+    // trailing run into each item's range, so the tighten edit
+    // belongs to the *preceding* item.
+    let last_idx = items.len().saturating_sub(1);
+    for (idx, item) in items.iter().enumerate() {
+        let crate::syntax::NodeKind::ListItem { marker_range } = &item.kind else {
+            continue;
+        };
+        normalize_item(item, marker_range, bytes, idx == last_idx, out);
+    }
+}
+
+fn normalize_item(
+    item: &crate::syntax::SyntaxNode,
+    marker_range: &Range<usize>,
+    bytes: &[u8],
+    is_last_item: bool,
+    out: &mut Vec<SourceEdit>,
+) {
+    let marker_width = marker_range.end - marker_range.start;
+    let indent_string = " ".repeat(marker_width);
+    let item_start = item.range.start;
+    // Trim the trailing `\n` run from the canonicalization region.
+    // Pulldown folds 1 or more trailing newlines into each Item's
+    // range — the count distinguishes tight vs loose. For
+    // non-last items, all but one of those newlines is "loose
+    // padding" that we collapse to keep lists tight. For the last
+    // item, the trailing run is *boundary* with the surrounding
+    // structure (next top-level block, EOF, the `\n\n` we just
+    // inserted via empty-item-Enter exit, …) — leave it alone so
+    // those upstream rules can do their job.
+    let raw_end = item.range.end;
+    let mut item_end = raw_end;
+    while item_end > item_start && bytes[item_end - 1] == b'\n' {
+        item_end -= 1;
+    }
+    let trailing_nls = raw_end - item_end;
+    if !is_last_item && trailing_nls > 1 {
+        // Tighten: keep one `\n`, drop the rest.
+        out.push(SourceEdit {
+            range: (item_end + 1)..raw_end,
+            replacement: String::new(),
+        });
+    }
+
+    // The item's first line — from `item_start` (where the marker
+    // sits) to the first `\n` — is left as-is. Pulldown sometimes
+    // includes leading indent ahead of the marker for nested items;
+    // we trust that.
+    let mut p = item_start;
+    while p < item_end && bytes[p] != b'\n' {
+        p += 1;
+    }
+
+    // Content lines beyond the first. For each non-empty content
+    // line we want: previous `\n` → `  \n` (hard break) AND leading
+    // spaces == marker_width. A blank line within the item collapses
+    // — pulldown ranges already strip the trailing folded newlines
+    // for tight lists, but loose-list items can hold internal
+    // `\n\n+` runs. Collapse those to a single `\n`.
+
+    // We deliberately do *not* collapse `\n\n+` runs inside an item.
+    // Multi-paragraph items are now first-class: a `\n\n` run is a
+    // paragraph break inside the item (or, in longer runs, a
+    // paragraph break plus empty paragraphs — same pairs model as
+    // top level). Inter-item tightening for non-last items is
+    // handled above by the trailing-trim block.
+    let _ = p;
+
+    // Walk content lines. For each line beyond the first that has
+    // *actual content* (something past leading spaces), enforce two
+    // things: the preceding line ends with `  \n` (hard break — for
+    // plain-text continuations only; nested constructs use a soft
+    // boundary) and the leading whitespace equals `indent_string`.
+    //
+    // Empty / blank continuation lines are skipped — their existence
+    // is either transient (the cursor parked on a fresh hard-break
+    // continuation, no content yet) or one half of a `\n\n`
+    // paragraph break we leave alone.
+    let mut line_starts: Vec<usize> = Vec::new();
+    {
+        let mut r = item_start;
+        line_starts.push(r);
+        while r < item_end {
+            if bytes[r] == b'\n' && r + 1 < item_end {
+                line_starts.push(r + 1);
+            }
+            r += 1;
+        }
+    }
+
+    for line_start in line_starts.iter().copied().skip(1) {
+        let line_end = next_line_end(bytes, line_start, item_end);
+
+        // Skip blank lines — they're handled by the collapse pass
+        // (or, if trailing, intentionally preserved as transient
+        // post-Shift+Enter cursor real estate).
+        let mut indent_end = line_start;
+        while indent_end < line_end && bytes[indent_end] == b' ' {
+            indent_end += 1;
+        }
+        if indent_end >= line_end {
+            continue;
+        }
+
+        // Skip blockquote-scope continuation lines. Pulldown's Item
+        // ranges sometimes swallow `> ` continuation lines from an
+        // enclosing blockquote (notably the post-Enter transient
+        // `> - foo\n> \n> ` shape). Those bytes are outer-container
+        // markers, not item content — adding `marker_width` of indent
+        // in front of them would corrupt the BQ scope.
+        //
+        // CommonMark allows up to 3 spaces of indent before a `>`
+        // marker, so we accept the shape even when our heuristic
+        // sees a small leading-space run.
+        if indent_end < line_end && bytes[indent_end] == b'>' && (indent_end - line_start) <= 3 {
+            continue;
+        }
+
+        // Count `\n`s in the run immediately preceding this line.
+        // - run = 1 (one `\n`): a soft break or lazy continuation
+        //   that we promote to a hard break.
+        // - run ≥ 2: a paragraph break (or paragraph break + empty
+        //   paragraphs), which leaves this line introducing a fresh
+        //   paragraph inside the item. No hard-break treatment —
+        //   the `\n\n` IS the structural break.
+        let mut nl_count = 0;
+        let mut effective_prev_nl = line_start;
+        while effective_prev_nl > item_start && bytes[effective_prev_nl - 1] == b'\n' {
+            effective_prev_nl -= 1;
+            nl_count += 1;
+        }
+        let is_paragraph_break = nl_count >= 2;
+
+        let is_nested_construct =
+            line_starts_nested_construct(bytes, line_start, line_end, marker_width);
+
+        if !is_nested_construct
+            && !is_paragraph_break
+            && !is_already_hard_break(bytes, effective_prev_nl)
+        {
+            out.push(SourceEdit {
+                range: effective_prev_nl..effective_prev_nl,
+                replacement: "  ".to_string(),
+            });
+        }
+
+        let current_indent = indent_end - line_start;
+        if current_indent != marker_width {
+            out.push(SourceEdit {
+                range: line_start..indent_end,
+                replacement: indent_string.clone(),
+            });
+        }
+    }
+}
+
+fn next_line_end(bytes: &[u8], line_start: usize, item_end: usize) -> usize {
+    let mut e = line_start;
+    while e < item_end && bytes[e] != b'\n' {
+        e += 1;
+    }
+    e
+}
+
+fn is_already_hard_break(bytes: &[u8], nl: usize) -> bool {
+    if nl >= 2 && bytes[nl - 1] == b' ' && bytes[nl - 2] == b' ' {
+        return true;
+    }
+    if nl >= 1 && bytes[nl - 1] == b'\\' {
+        return true;
+    }
+    false
+}
+
+/// Heuristic: does the line at `line_start` open a nested
+/// construct (another list, a blockquote, a fenced code block) at
+/// the right indent for our parent item? Used to skip hard-break
+/// promotion before such lines (CommonMark would parse the hard
+/// break as ending the paragraph, which would split the construct
+/// off the parent).
+fn line_starts_nested_construct(
+    bytes: &[u8],
+    line_start: usize,
+    line_end: usize,
+    parent_marker_width: usize,
+) -> bool {
+    // Look past leading indent.
+    let mut p = line_start;
+    let mut indent = 0;
+    while p < line_end && bytes[p] == b' ' && indent <= parent_marker_width + 3 {
+        p += 1;
+        indent += 1;
+    }
+    if p >= line_end {
+        return false;
+    }
+    let c = bytes[p];
+    // List markers.
+    if c == b'-' || c == b'*' || c == b'+' {
+        // Followed by space?
+        if p + 1 < line_end && bytes[p + 1] == b' ' {
+            return true;
+        }
+    }
+    if c.is_ascii_digit() {
+        let mut q = p;
+        while q < line_end && bytes[q].is_ascii_digit() {
+            q += 1;
+        }
+        if q < line_end
+            && (bytes[q] == b'.' || bytes[q] == b')')
+            && q + 1 < line_end
+            && bytes[q + 1] == b' '
+        {
+            return true;
+        }
+    }
+    // Blockquote.
+    if c == b'>' {
+        return true;
+    }
+    // Fenced code block opener.
+    if c == b'`' || c == b'~' {
+        let mut q = p;
+        while q < line_end && bytes[q] == c {
+            q += 1;
+        }
+        if q - p >= 3 {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,20 +1660,28 @@ mod tests {
     }
 
     #[test]
-    fn line_break_inside_list_is_plain_hard_break() {
-        // For lists we don't synthesize a continuation prefix —
-        // pulldown's lazy-continuation rule keeps the line attached
-        // to the same item.
-        assert_eq!(line_break_insertion("- foo", 5), "  \n");
+    fn line_break_inside_list_carries_indent() {
+        // Continuation lines inside a list item must carry indent
+        // matching the marker width — `- foo` has a 2-byte marker, so
+        // a hard break inside the item inserts `  \n` followed by 2
+        // spaces of indent. Ordered items inherit a wider marker
+        // (`1. ` is 3 bytes) and therefore a wider indent.
+        assert_eq!(line_break_insertion("- foo", 5), "  \n  ");
+        assert_eq!(line_break_insertion("1. foo", 6), "  \n   ");
+        assert_eq!(line_break_insertion("10. tens", 8), "  \n    ");
     }
 
     // ---- List ranges ---------------------------------------------------
 
     #[test]
-    fn list_content_ranges_covers_top_level_list() {
+    fn list_content_ranges_excludes_trailing_newline() {
+        // The trailing `\n` of a list is the boundary with the next
+        // top-level block; excluding it from the exempt range lets
+        // `promote_soft_breaks` enforce the canonical `\n\n`
+        // separator there.
         let ranges = list_content_ranges("- foo\n- bar\n");
         assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0], 0..12);
+        assert_eq!(ranges[0], 0..11);
     }
 
     #[test]

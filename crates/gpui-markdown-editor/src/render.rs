@@ -322,24 +322,29 @@ fn marker_char(source: &str, marker_range: &Range<usize>) -> u8 {
     bytes.get(p).copied().unwrap_or(b'-')
 }
 
-/// Render one list item as a single paragraph leaf carrying a
-/// `Container::ListItem` entry.
+/// Render one list item.
 ///
-/// The leaf's source range is the item's range *trimmed* to its
-/// content extent — pulldown includes the trailing `\n` (or `\n\n`
-/// for loose items) in the Item range, but `inject_empty_paragraphs`
-/// expects every leaf already trimmed to its content. We let it
-/// handle trimming in the same pass it uses for paragraphs.
+/// Two shapes:
 ///
-/// The marker bytes (`- `, `1. `, …) sit *inside* the leaf's source
-/// range. They render as plain shaped text — no hide / dim treatment
-/// for now. A future polish pass can substitute `- ` with a bullet
-/// glyph (`•`) when the cursor is outside the line.
+/// * **Tight item** (no `Paragraph` wrapper — pulldown emits `Text`
+///   children directly inside `Item`): emit one paragraph leaf
+///   spanning the whole item's source range.
+/// * **Multi-paragraph item** (one or more `Paragraph` children):
+///   emit one leaf per child. The first paragraph's source range
+///   extends back to the item's start so the marker (`- ` / `1. `)
+///   is shaped into its line. Subsequent paragraphs extend back
+///   over their leading indent so the indent shapes together with
+///   the content (positioning the second paragraph roughly under
+///   the first paragraph's content column).
+///
+/// Every leaf carries the same `Container::ListItem` chain entry,
+/// so the element layer applies `list_indent` once per item
+/// regardless of how many paragraphs it contains.
 fn render_list_item(
     node: &SyntaxNode,
     _marker_range: &Range<usize>,
     item_kind: ListItemKind,
-    _source: &str,
+    source: &str,
     cursor: CursorRange,
     containers: &[Container],
     out: &mut Vec<RenderBlock>,
@@ -351,15 +356,43 @@ fn render_list_item(
         kind: item_kind,
     });
 
-    // Tight items have no Paragraph wrapper — pulldown emits Text
-    // children directly. Loose items wrap their content in a
-    // Paragraph. Either way we want one leaf whose `inlines` come
-    // from the item's inline subtree. Constructing a single leaf for
-    // the whole item handles both shapes uniformly.
-    let mut block = RenderBlock::new(node.range.clone(), BlockKind::Paragraph);
-    block.containers = chain;
-    collect_inlines(node, cursor, &mut block);
-    out.push(block);
+    let paragraph_children: Vec<&SyntaxNode> = node
+        .children
+        .iter()
+        .filter(|c| matches!(c.kind, NodeKind::Paragraph))
+        .collect();
+
+    if paragraph_children.is_empty() {
+        // Tight item — pulldown emitted `Text` children directly
+        // inside the Item, no `Paragraph` wrapper. One leaf spans
+        // the whole item.
+        let mut block = RenderBlock::new(node.range.clone(), BlockKind::Paragraph);
+        block.containers = chain;
+        collect_inlines(node, cursor, &mut block);
+        out.push(block);
+        return;
+    }
+
+    let bytes = source.as_bytes();
+    for (i, para) in paragraph_children.iter().enumerate() {
+        let mut range = para.range.clone();
+        if i == 0 {
+            // First paragraph: extend back to the item's start so
+            // the marker is part of the leaf's source.
+            range.start = node.range.start;
+        } else {
+            // Subsequent paragraphs: extend back over leading
+            // indent on the same line so the indent shapes with
+            // the content rather than vanishing into the gap.
+            while range.start > 0 && bytes[range.start - 1] == b' ' {
+                range.start -= 1;
+            }
+        }
+        let mut block = RenderBlock::new(range, BlockKind::Paragraph);
+        block.containers = chain.clone();
+        collect_inlines(para, cursor, &mut block);
+        out.push(block);
+    }
 }
 
 /// True if `pos` is the byte index right after a hard-break `\n`

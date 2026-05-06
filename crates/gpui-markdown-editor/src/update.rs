@@ -106,11 +106,93 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
 }
 
 /// Promote any lone, mid-content `\n` into `\n\n` so the buffer never
-/// contains a soft break, then normalize every blockquote `>` marker to
-/// `> `. Idempotent and cheap on already-clean states.
+/// contains a soft break, normalize every blockquote `>` marker to
+/// `> `, canonicalize list source (tight separators, hard-break
+/// continuations, marker-width indent on continuation lines), and
+/// collapse two consecutive hard breaks into a paragraph break.
+/// Idempotent and cheap on already-clean states.
 pub fn enforce_invariants(state: EditorState) -> EditorState {
+    // Order matters: collapse two-hard-break-pairs *first*, because
+    // that's how a user-produced "Shift+Enter Shift+Enter" reaches
+    // its canonical paragraph-break form before any other pass
+    // looks at it. The list normalizer then sees a clean `\n\n`
+    // (not a paragraph break to be re-promoted as a hard break).
+    let state = collapse_consecutive_hard_breaks(state);
+    let state = normalize_lists(state);
     let state = promote_soft_breaks(state);
     normalize_blockquote_prefixes(state)
+}
+
+/// Apply the list-canonicalization edits computed by
+/// [`analysis::list_normalization_edits`] in a single sweep, remapping
+/// the cursor through every splice.
+fn normalize_lists(state: EditorState) -> EditorState {
+    let edits = analysis::list_normalization_edits(&state.markdown);
+    if edits.is_empty() {
+        return state;
+    }
+    apply_edits(state, &edits)
+}
+
+fn collapse_consecutive_hard_breaks(state: EditorState) -> EditorState {
+    let edits = analysis::consecutive_hard_break_edits(&state.markdown);
+    if edits.is_empty() {
+        return state;
+    }
+    apply_edits(state, &edits)
+}
+
+fn apply_edits(state: EditorState, edits: &[analysis::SourceEdit]) -> EditorState {
+    // Edits are sorted by range.start. Rebuild the buffer
+    // interleaving original slices with replacements; the cursor
+    // remap walks the same edit sequence and accumulates the byte
+    // delta past every prior splice.
+    let total_delta: isize = edits
+        .iter()
+        .map(|e| e.replacement.len() as isize - (e.range.end - e.range.start) as isize)
+        .sum();
+    let new_len = (state.markdown.len() as isize + total_delta).max(0) as usize;
+    let mut new_md = String::with_capacity(new_len);
+    let mut last = 0;
+    for e in edits {
+        new_md.push_str(&state.markdown[last..e.range.start]);
+        new_md.push_str(&e.replacement);
+        last = e.range.end;
+    }
+    new_md.push_str(&state.markdown[last..]);
+
+    let map = |off: usize| -> usize {
+        let mut shift: isize = 0;
+        for e in edits {
+            if e.range.end <= off {
+                shift += e.replacement.len() as isize - (e.range.end - e.range.start) as isize;
+            } else if e.range.start < off && off < e.range.end {
+                // Cursor was inside the spliced range — pin to the
+                // end of the replacement.
+                let new_pos = (e.range.start as isize + shift) + e.replacement.len() as isize;
+                return new_pos.max(0) as usize;
+            } else {
+                break;
+            }
+        }
+        ((off as isize) + shift).max(0) as usize
+    };
+    let new_sel = match state.selection {
+        Selection::Cursor(p) => Selection::Cursor(map(p)),
+        Selection::Range { anchor, head } => {
+            let a = map(anchor);
+            let h = map(head);
+            if a == h {
+                Selection::Cursor(h)
+            } else {
+                Selection::Range { anchor: a, head: h }
+            }
+        }
+    };
+    EditorState {
+        markdown: new_md,
+        selection: new_sel,
+    }
 }
 
 fn promote_soft_breaks(state: EditorState) -> EditorState {
@@ -345,13 +427,33 @@ pub use crate::analysis::blockquote_depth_at;
 // programmatic dispatch all share one rule.
 
 fn insert_newline(state: EditorState) -> EditorState {
-    let insertion = analysis::enter_insertion(&state.markdown, state.selection.head());
+    let cursor = state.selection.head();
+    // Empty-item Enter decreases the item's nesting depth by one
+    // (analogous to blockquote outdent). This subsumes the
+    // "double-Enter exits a list" UX without a dedicated state flag.
+    if let Some(edit) = analysis::empty_item_exit_edit(&state.markdown, cursor) {
+        return apply_replace(&state.markdown, edit);
+    }
+    let insertion = analysis::enter_insertion(&state.markdown, cursor);
     insert_text(state, &insertion)
 }
 
 fn insert_line_break(state: EditorState) -> EditorState {
     let insertion = analysis::line_break_insertion(&state.markdown, state.selection.head());
     insert_text(state, &insertion)
+}
+
+fn apply_replace(markdown: &str, edit: analysis::DepthDecreaseEdit) -> EditorState {
+    let mut buf = String::with_capacity(
+        markdown.len() - (edit.range.end - edit.range.start) + edit.replacement.len(),
+    );
+    buf.push_str(&markdown[..edit.range.start]);
+    buf.push_str(&edit.replacement);
+    buf.push_str(&markdown[edit.range.end..]);
+    EditorState {
+        markdown: buf,
+        selection: Selection::Cursor(edit.cursor),
+    }
 }
 
 fn clamp(pos: usize, len: usize) -> usize {
@@ -393,6 +495,14 @@ fn delete_backward(state: EditorState) -> EditorState {
     let cursor = state.selection.head();
     if cursor == 0 {
         return state;
+    }
+
+    // List-item depth decrease: Backspace right after a marker drops
+    // that marker, turning a top-level item into a paragraph or a
+    // nested item into content of the parent. Mirrors the blockquote
+    // outdent rule and shares its single-keystroke pop semantics.
+    if let Some(edit) = analysis::backspace_at_item_start_edit(&state.markdown, cursor) {
+        return apply_replace(&state.markdown, edit);
     }
 
     // At a structural boundary, Backspace has two specialized rules.
