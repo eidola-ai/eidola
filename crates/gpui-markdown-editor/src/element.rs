@@ -1045,9 +1045,7 @@ fn level_shared_with_neighbor(
     let Some(neighbor) = neighbor else {
         return false;
     };
-    neighbor.len() > level
-        && containers.len() > level
-        && containers[..=level] == neighbor[..=level]
+    neighbor.len() > level && containers.len() > level && containers[..=level] == neighbor[..=level]
 }
 
 /// Inner padding for a block's visible region — non-zero only for

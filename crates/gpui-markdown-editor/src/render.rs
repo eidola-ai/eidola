@@ -176,7 +176,16 @@ fn render_blockquote(
     }
 
     let bytes = source.as_bytes();
-    let mut expect_middle = true;
+    // `deferred` holds the most recent unclaimed prefix that we
+    // tentatively assumed is the *middle* of a `[prefix]\n[prefix]`
+    // structural pair (no row of its own). It either gets dropped
+    // when its partner comes in — the partner takes the synthetic —
+    // or, if no partner ever shows up, we promote the deferred
+    // prefix itself to a synthetic at end-of-loop. The promotion
+    // keeps a freshly-typed lone `> ` parsing-as-blockquote
+    // *rendering* as a blockquote immediately, instead of waiting
+    // for the user to type a paired marker.
+    let mut deferred: Option<Range<usize>> = None;
     for prefix in prefix_ranges {
         if let Some(leaf) = find_leaf_for_prefix(&mut out[start..], prefix) {
             // Pulldown ranges most leaves to start *after* the line's
@@ -186,7 +195,7 @@ fn render_blockquote(
                 leaf.source_range.start = prefix.start;
             }
             attach_marker(leaf, prefix, cursor_inside, level);
-            expect_middle = true;
+            deferred = None;
         } else if is_after_hard_break(bytes, prefix.start)
             && let Some(leaf) = find_leaf_ending_at(&mut out[start..], prefix.start)
         {
@@ -198,32 +207,43 @@ fn render_blockquote(
             // dangling marker line from the paragraph's range when
             // there's no content after it yet (the post-Shift+Enter
             // transient), so we extend the leaf forward to swallow
-            // it. The toggle isn't touched — this is content, not a
+            // it. `deferred` isn't touched — this is content, not a
             // pair half.
             leaf.source_range.end = source_line_end(bytes, prefix.end);
             attach_marker(leaf, prefix, cursor_inside, level);
-        } else if expect_middle {
-            // First prefix of a structural pair — the marker line is
-            // the collapsed paragraph-break separator. No row, no
-            // synthetic. The bytes still exist in source so the
-            // forbidden-position rule keeps the cursor out of the
-            // pair interior.
-            expect_middle = false;
+        } else if deferred.is_none() {
+            // First unclaimed prefix — defer. Treated as middle of a
+            // pair *if* a partner shows up below; otherwise promoted
+            // to a synthetic by the post-loop fixup.
+            deferred = Some(prefix.clone());
         } else {
-            // Second prefix of a pair with no parsed-paragraph
-            // partner — emit a synthetic empty leaf so the cursor
-            // has a visible row to land on (post-Enter trailing, or
-            // an extra empty between two paragraphs). The synthetic
-            // shares this BQ's container chain, so an outer
-            // blockquote's later distribution attaches *its* marker
-            // here too.
+            // Partner for a deferred middle — the *current* prefix
+            // is the second-of-pair and gets a synthetic empty leaf
+            // so the cursor has a visible row to land on (post-
+            // Enter trailing, or an extra empty between two
+            // paragraphs). The synthetic shares this BQ's container
+            // chain, so an outer blockquote's later distribution
+            // attaches *its* marker here too.
             let line_end = source_line_end(bytes, prefix.end);
             let mut synth = RenderBlock::new(prefix.start..line_end, BlockKind::Paragraph);
             synth.containers = child_chain.clone();
             attach_marker(&mut synth, prefix, cursor_inside, level);
             out.push(synth);
-            expect_middle = true;
+            deferred = None;
         }
+    }
+    // Unpaired trailing prefix: a parsed-as-blockquote line with no
+    // partner above (no real content claimed it) and no partner
+    // below (no following marker). Without this fixup, a lone `> `
+    // at end-of-doc would render as a plain paragraph until the
+    // user typed a second marker — visually contradicting the
+    // already-blockquote parse.
+    if let Some(prefix) = deferred {
+        let line_end = source_line_end(bytes, prefix.end);
+        let mut synth = RenderBlock::new(prefix.start..line_end, BlockKind::Paragraph);
+        synth.containers = child_chain.clone();
+        attach_marker(&mut synth, &prefix, cursor_inside, level);
+        out.push(synth);
     }
 
     // Synthetics are appended in `prefix_ranges` order (source order)
@@ -272,10 +292,11 @@ fn find_leaf_ending_at(slice: &mut [RenderBlock], pos: usize) -> Option<&mut Ren
 fn attach_marker(leaf: &mut RenderBlock, prefix: &Range<usize>, cursor_inside: bool, level: usize) {
     leaf.hidden_ranges.push(prefix.clone());
     if cursor_inside {
-        leaf.marker_overlays.push(crate::render_spec::MarkerOverlay {
-            source_range: prefix.clone(),
-            level,
-        });
+        leaf.marker_overlays
+            .push(crate::render_spec::MarkerOverlay {
+                source_range: prefix.clone(),
+                level,
+            });
     }
 }
 
@@ -1322,6 +1343,31 @@ mod tests {
             .expect("blockquote leaf");
         assert!(matches!(bq.kind, BlockKind::Heading { level: 1 }));
         assert!(bq.has_hidden_range(2..4)); // "# "
+    }
+
+    #[test]
+    fn unpaired_trailing_marker_renders_as_blockquote() {
+        // `paragraph\n\n> ` parses as a paragraph followed by a
+        // blockquote whose only marker is the lone trailing `> ` —
+        // no second-of-pair partner. The synthetic must still be
+        // emitted with `containers = [BlockQuote { … }]` so the
+        // element layer paints the bar immediately, instead of
+        // waiting for the user to type a character. Regression
+        // against a bug where the deferred prefix was dropped on
+        // loop exit and the trailing line rendered as a plain
+        // paragraph.
+        let src = "paragraph\n\n> ";
+        let spec = render_with_cursor(src, src.len());
+        let bq_leaves: Vec<_> = spec
+            .blocks
+            .iter()
+            .filter(|b| !b.containers.is_empty())
+            .collect();
+        assert_eq!(bq_leaves.len(), 1, "expected one BQ leaf for the lone `> `");
+        let synth = bq_leaves[0];
+        assert!(matches!(synth.kind, BlockKind::Paragraph));
+        assert!(matches!(synth.containers[0], Container::BlockQuote { .. }));
+        assert!(synth.source_range.contains(&11));
     }
 
     #[test]

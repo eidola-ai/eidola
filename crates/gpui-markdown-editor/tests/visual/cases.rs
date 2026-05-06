@@ -261,6 +261,20 @@ pub fn register(s: &mut Snapshots) {
         })
     });
 
+    // Lone trailing `> ` after a regular paragraph — the user just
+    // typed `> ` after pressing Enter twice. The block parses as a
+    // blockquote and must render as one immediately, with the bar
+    // and overlay marker visible at the cursor row.
+    s.add("blockquote_lone_trailing_marker", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "paragraph\n\n> ".into(),
+                selection: Selection::Cursor(13),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
     // After Enter inside `> hello` — empty marker line plus a new
     // blockquote line where the cursor sits. Borders span both lines.
     s.add("blockquote_after_enter", win, |window, cx| {
