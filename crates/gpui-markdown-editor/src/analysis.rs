@@ -563,6 +563,92 @@ pub fn line_depth_ending_at(bytes: &[u8], line_end_excl: usize) -> usize {
 // Pair detectors at boundaries (used by atomic Backspace/Delete)
 // ---------------------------------------------------------------------------
 
+/// If `cursor` sits at the start of a paragraph that is *embedded
+/// within* a blockquote (preceded by another BQ-prefixed line), return
+/// the two byte ranges that Backspace should remove to decrease the
+/// paragraph's nesting by one — one leading `> ` from the line at
+/// the cursor *and* one leading `> ` from the prefix line directly
+/// above it (the `[prefix]\n[prefix]` pair-half pattern).
+///
+/// Returned as `(above, current)` in source order, so callers can
+/// process them right-to-left to keep offsets stable across a
+/// two-stage splice.
+///
+/// **Why both halves outdent together.** The pair invariant the rest
+/// of the editor relies on is that any structural paragraph break is
+/// a clean `\n[prefix]\n[prefix]` of *equal-depth* prefixes. Popping a
+/// marker only from the cursor's line would leave an asymmetric pair
+/// — the line above one level deeper than the line at the cursor —
+/// which the soft-break detector and pair-interior detector both have
+/// to special-case to avoid corrupting on the next event. By
+/// outdenting both halves of the pair in one keystroke, the result is
+/// either a clean depth-(D-1) pair (when both started at depth D) or
+/// a clean depth-0 paragraph break (when the second half had only one
+/// marker to pop). The buffer never enters an asymmetric state, no
+/// soft break is introduced, and `enforce_invariants` is a no-op on
+/// the result.
+///
+/// The trigger condition is the source pattern
+/// `\n[markers ≥ 1]\n[markers ≥ 1]` ending right at `cursor` — both
+/// the line at the cursor and the line above it carry at least one
+/// BQ marker. The two prefix lengths do *not* have to match: an
+/// asymmetric state that snuck in via paste or a future programmatic
+/// edit still outdents cleanly, with each side losing one marker.
+///
+/// Cases the detector deliberately *doesn't* fire on:
+///
+/// - The first paragraph of a top-level BQ that follows non-BQ
+///   content (`para\n\n> bq`). The line above is content at depth 0
+///   — outdenting would erase the user's BQ structure for what should
+///   feel like a normal Backspace at the boundary. Falls through to
+///   grapheme delete instead, matching the pre-change behavior.
+/// - Top-level paragraph break `\n\n`. No marker to pop; the depth-0
+///   atomic pair delete path takes over and merges the paragraphs.
+///
+/// Generalizes to lists: when list containers land, replace
+/// `walk_back_markers` with a "walk back over the active continuation
+/// prefix of the line ending at `cursor`" and the same outdent rule
+/// applies — pop the deepest container marker from each half of the
+/// pair.
+pub fn bq_paragraph_outdent(bytes: &[u8], cursor: usize) -> Option<(Range<usize>, Range<usize>)> {
+    let mut q = cursor;
+    let markers1 = walk_back_markers(bytes, &mut q, usize::MAX);
+    if markers1 == 0 {
+        return None;
+    }
+    let prefix_below_start = q;
+    if !walk_back_required_newline(bytes, &mut q) {
+        return None;
+    }
+    let markers2 = walk_back_markers(bytes, &mut q, usize::MAX);
+    if markers2 == 0 {
+        return None;
+    }
+    let prefix_above_start = q;
+    if !walk_back_required_newline(bytes, &mut q) {
+        return None;
+    }
+    Some((
+        first_marker_range(bytes, prefix_above_start),
+        first_marker_range(bytes, prefix_below_start),
+    ))
+}
+
+/// Byte range of the *first* blockquote marker on the line beginning
+/// at `start`. Handles both the canonical `> ` form (2 bytes) and a
+/// bare `>` (1 byte; appears when a marker sits right before `\n` and
+/// `normalize_blockquote_prefixes` has nothing to pad).
+fn first_marker_range(bytes: &[u8], start: usize) -> Range<usize> {
+    let mut p = start;
+    if p < bytes.len() && bytes[p] == b'>' {
+        p += 1;
+        if p < bytes.len() && bytes[p] == b' ' {
+            p += 1;
+        }
+    }
+    start..p
+}
+
 /// If `cursor` sits at the end of a depth-D structural pair (`\n` +
 /// `> ` × D + `\n` + `> ` × D), return the pair's start byte.
 ///

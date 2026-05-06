@@ -865,12 +865,14 @@ fn shift_enter_inside_blockquote_keeps_marker_on_continuation(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-fn backspace_at_end_of_pair_atomically_undoes_paragraph_break(cx: &mut TestAppContext) {
+fn backspace_at_end_of_depth_1_pair_outdents_to_depth_0(cx: &mut TestAppContext) {
     // After `> hello` + Enter, cursor sits at the end of the depth-1
-    // pair `\n> \n> `. Backspace removes the whole 6-byte pair in one
-    // keystroke — the analog of how Backspace at the start of `p2`
-    // in `p1\n\np2` deletes both `\n`s and merges into `p1p2`. Result:
-    // back to the pre-Enter state.
+    // pair `\n> \n> ` — the start of an empty trailing paragraph at
+    // depth 1. Backspace pops one level of blockquote nesting from
+    // *both* halves of the pair so the structural break stays
+    // balanced: the depth-1 pair `\n> \n> ` (6 bytes) becomes a
+    // depth-0 pair `\n\n` (2 bytes). The empty trailing paragraph
+    // is now top-level.
     let initial = EditorState {
         markdown: "> hello\n> \n> ".into(),
         selection: Selection::Cursor(13),
@@ -878,16 +880,17 @@ fn backspace_at_end_of_pair_atomically_undoes_paragraph_break(cx: &mut TestAppCo
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> hello");
-        assert_eq!(e.cursor_offset(), 7);
+        assert_eq!(e.state.markdown, "> hello\n\n");
+        assert_eq!(e.cursor_offset(), 9);
     });
 }
 
 #[gpui::test]
-fn backspace_at_end_of_depth_2_pair_undoes_atomically(cx: &mut TestAppContext) {
-    // Same shape, depth 2: pair length is `2 + 4*2 = 10` bytes; one
-    // Backspace removes them all and lands back on the original
-    // `> > deep` content.
+fn backspace_at_end_of_depth_2_pair_outdents_to_depth_1(cx: &mut TestAppContext) {
+    // Depth-2 case: both halves of the pair lose one `> ` so a
+    // depth-2 pair `\n> > \n> > ` (10 bytes) becomes a depth-1 pair
+    // `\n> \n> ` (6 bytes) — the trailing paragraph is now at
+    // depth 1 and the structural break is still balanced.
     let initial = EditorState {
         markdown: "> > deep\n> > \n> > ".into(),
         selection: Selection::Cursor(18),
@@ -895,26 +898,135 @@ fn backspace_at_end_of_depth_2_pair_undoes_atomically(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> > deep\n> \n> ");
+        assert_eq!(e.cursor_offset(), 14);
+    });
+}
+
+#[gpui::test]
+fn successive_backspaces_walk_paragraph_through_nesting_levels(cx: &mut TestAppContext) {
+    // The outdent walk: each Backspace pops one level off *both*
+    // halves of the preceding pair, so the pair structure stays
+    // balanced at each step (depth 2 → 1 → 0). After the depth-0
+    // paragraph break is reached, the next Backspace has no marker
+    // left to pop and falls through to the existing atomic
+    // top-level-pair delete, merging into the previous paragraph.
+    let initial = EditorState {
+        markdown: "> > deep\n> > \n> > ".into(),
+        selection: Selection::Cursor(18),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // depth 2 → 1
+        assert_eq!(e.state.markdown, "> > deep\n> \n> ");
+        assert_eq!(e.cursor_offset(), 14);
+    });
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // depth 1 → 0
+        assert_eq!(e.state.markdown, "> > deep\n\n");
+        assert_eq!(e.cursor_offset(), 10);
+    });
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // depth 0 break gets the original atomic pair delete; the
+        // trailing empty paragraph merges into "deep".
         assert_eq!(e.state.markdown, "> > deep");
         assert_eq!(e.cursor_offset(), 8);
     });
 }
 
 #[gpui::test]
-fn enter_then_backspace_round_trips(cx: &mut TestAppContext) {
-    // The interactive sequence: press Enter inside a blockquote, then
-    // Backspace once. The atomic pair delete returns the buffer
-    // *exactly* to the pre-Enter state.
+fn backspace_outdents_interior_paragraph_not_just_trailing(cx: &mut TestAppContext) {
+    // The outdent rule applies to *any* non-first paragraph in the
+    // blockquote, not just an empty trailing one. Cursor at the start
+    // of "two" — Backspace pops a `> ` from each half of the pair
+    // so the depth-1 pair becomes `\n\n` and "two" is top-level.
+    // The previous paragraph "one" is untouched.
     let initial = EditorState {
-        markdown: "> hello".into(),
-        selection: Selection::Cursor(7),
+        markdown: "> one\n> \n> two".into(),
+        selection: Selection::Cursor(11),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> hello");
+        assert_eq!(e.state.markdown, "> one\n\ntwo");
         assert_eq!(e.cursor_offset(), 7);
+    });
+}
+
+#[gpui::test]
+fn backspace_at_top_level_paragraph_break_still_merges(cx: &mut TestAppContext) {
+    // The outdent rule only fires inside a blockquote — at depth 0
+    // there are no markers to pop, so Backspace at the start of a
+    // top-level second paragraph still does the original atomic pair
+    // delete and merges into the previous paragraph.
+    let initial = EditorState {
+        markdown: "p1\n\np2".into(),
+        selection: Selection::Cursor(4),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "p1p2");
+        assert_eq!(e.cursor_offset(), 2);
+    });
+}
+
+#[gpui::test]
+fn backspace_at_first_paragraph_in_blockquote_falls_through(cx: &mut TestAppContext) {
+    // The outdent rule requires a *non-first* paragraph in the BQ —
+    // i.e. a preceding pair half *also* in a BQ. Without one (cursor
+    // at the start of the blockquote's first paragraph content,
+    // preceded by non-BQ content), Backspace falls through to the
+    // regular grapheme delete. This protects the case where the BQ
+    // begins right after a top-level paragraph.
+    let initial = EditorState {
+        markdown: "para\n\n> hi".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "para\n\n>hi");
+    });
+}
+
+#[gpui::test]
+fn backspace_outdent_preserves_no_soft_break_invariant(cx: &mut TestAppContext) {
+    // The user-visible invariant: the buffer never carries a soft
+    // break, and outdenting a BQ paragraph should not violate that.
+    // Run the outdent through the same `update::update` path used in
+    // production — including the `enforce_invariants` post-pass that
+    // runs after every event — and check the result has no soft
+    // breaks.
+    use gpui_markdown_editor::analysis::is_soft_break;
+    let initial = EditorState {
+        markdown: "> > > p1\n> > > \n> > > p2".into(),
+        selection: Selection::Cursor(22),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    // Walk the paragraph from depth 3 → 2 → 1 → 0. At each step the
+    // pair is still balanced (the post-outdent buffer is depth-D pair
+    // structure for some D), so `enforce_invariants` doesn't insert
+    // any synthetic prefixes.
+    for _ in 0..3 {
+        dispatch(cx, handle, &editor, Backspace);
+        editor.read_with(cx, |e, _| {
+            let bytes = e.state.markdown.as_bytes();
+            for p in 0..bytes.len() {
+                assert!(
+                    !is_soft_break(bytes, p),
+                    "soft break at byte {p} in {:?}",
+                    e.state.markdown,
+                );
+            }
+        });
+    }
+    editor.read_with(cx, |e, _| {
+        // Final state: depth-0 pair separating the two paragraphs.
+        assert_eq!(e.state.markdown, "> > > p1\n\np2");
     });
 }
 

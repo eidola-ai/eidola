@@ -419,20 +419,42 @@ fn delete_backward(state: EditorState) -> EditorState {
         return state;
     }
 
-    // Atomic pair delete: when the cursor sits at (or somewhere
-    // inside) a depth-D structural pair `\n[prefix]\n[prefix]`,
-    // Backspace removes the whole `2 + 4D` bytes in one step. We
-    // first snap forward over any pair interior — that's where a
-    // direct cursor placement (e.g. a click on the visually-
-    // collapsed paragraph_gap, or a programmatic SetSelection) might
-    // land — then look for a pair *ending* at the snapped position.
-    // This subsumes both the top-level `\n\n`-pair delete (D=0) and
-    // the old blockquote-pop logic (D >= 1) under one rule. Inside
+    // At a structural boundary, Backspace has two specialized rules.
+    // Both first snap forward over any pair interior — that's where a
+    // direct cursor placement (e.g. a click on the visually-collapsed
+    // paragraph_gap, or a programmatic SetSelection) might land — then
+    // inspect the structure ending at the snapped position. Inside
     // fenced code-block content, `\n`s are literal line separators —
-    // fall through to the regular grapheme delete path instead.
+    // fall through to the regular grapheme-delete path instead.
     let bytes = state.markdown.as_bytes();
     if !analysis::is_in_fenced_code(bytes, cursor) {
         let snapped = next_allowed_position(bytes, cursor);
+        // Blockquote outdent: at the start of a non-first paragraph
+        // inside a BQ, Backspace pops one level of nesting from
+        // *both halves* of the preceding `\n[prefix]\n[prefix]` pair
+        // instead of merging the paragraph with the previous one.
+        // Outdenting both halves keeps the pair invariant (depth-D
+        // → depth-(D-1) is still a clean balanced pair, and a
+        // depth-1 pair becomes a depth-0 `\n\n` break) so the result
+        // is never an asymmetric pair the rest of the rules would
+        // have to special-case. When the paragraph reaches depth 0
+        // the outdent detector returns `None` and the next Backspace
+        // falls through to the depth-0 atomic pair delete below,
+        // which merges into the previous paragraph as before.
+        if let Some((above, below)) = analysis::bq_paragraph_outdent(bytes, snapped) {
+            // Apply right-to-left so the earlier range's offsets
+            // don't need to be remapped.
+            let after_below = splice(&state.markdown, cursor, below.start, below.end);
+            return splice(
+                &after_below.markdown,
+                after_below.selection.head(),
+                above.start,
+                above.end,
+            );
+        }
+        // Atomic pair delete at depth 0: when the cursor sits at a
+        // top-level `\n\n` paragraph break, Backspace removes the
+        // whole pair in one step, merging the two paragraphs.
         if let Some(pair_start) = pair_at_end(bytes, snapped) {
             return splice(&state.markdown, cursor, pair_start, snapped);
         }
