@@ -1089,6 +1089,110 @@ fn typing_gt_to_enter_nested_blockquote_does_not_inject_extra_lines(cx: &mut Tes
 }
 
 #[gpui::test]
+fn typing_gt_on_interior_blank_bq_line_does_not_inject_lines(cx: &mut TestAppContext) {
+    // Generalization of the trailing-pair bug to *interior* blank lines
+    // surrounded by content on both sides. Initial buffer:
+    //
+    //   > Level 1
+    //   >
+    //   >        <- cursor at end of marker (depth 1, blank)
+    //   >
+    //   > Level 1
+    //
+    // Typing `>` should turn line 3 into a depth-2 marker line (`> >`)
+    // without changing any other line. The underlying byte scanner used
+    // to misclassify the `\n`s between the new depth-2 line and the
+    // adjacent depth-1 blank lines as soft breaks, splice in
+    // `[depth-2-prefix]\n[depth-2-prefix]`, and concatenate the inserted
+    // prefix with the existing depth-1 prefix to grow the line to
+    // depth 3 — and each subsequent event (including the right-arrow
+    // navigation tested below) cascaded another round of the same
+    // misclassification, producing many spurious lines.
+    //
+    // The fix that makes both shapes stable is the marker-only-line
+    // adjacency exemption in `is_soft_break`: marker-only blank lines
+    // are paragraph terminators, not paragraph content, so the `\n`s
+    // adjacent to them are structural stitching rather than soft breaks.
+    let initial = EditorState {
+        markdown: "> Level 1\n> \n> \n> \n> Level 1".into(),
+        // Cursor at the `\n` ending line 3 (the middle blank).
+        selection: Selection::Cursor(15),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText(">".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> Level 1\n> \n> >\n> \n> Level 1");
+        assert_eq!(e.cursor_offset(), 16);
+    });
+
+    // Right-arrow shouldn't change the buffer at all (only selection
+    // moves). The original bug expanded the buffer by ~3 lines on each
+    // arrow press.
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> Level 1\n> \n> >\n> \n> Level 1");
+    });
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> Level 1\n> \n> >\n> \n> Level 1");
+    });
+}
+
+#[gpui::test]
+fn typing_gt_on_first_blank_bq_line_does_not_cascade(cx: &mut TestAppContext) {
+    // Companion to the interior-blank case. Cursor on the *first* blank
+    // line (line 2) — typing `>` here makes the depth-2 line sit
+    // adjacent to two equal-depth blank `> ` lines (3 and 4) before the
+    // closing content. Without the marker-only exemption, the `\n`s
+    // between those blank lines (which are interrupted by the new
+    // depth-2 line earlier in the run, breaking the pair detector's
+    // run analysis) get classified as soft breaks and each
+    // `enforce_invariants` call splices in another structural line.
+    let initial = EditorState {
+        markdown: "> Level 1\n> \n> \n> \n> Level 1".into(),
+        selection: Selection::Cursor(11),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText(">".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // Result: line 2 deepens to `> > ` (normalize adds the trailing
+    // space because the cursor moves off it after insertion). All other
+    // lines untouched.
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> Level 1\n> > \n> \n> \n> Level 1");
+    });
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> Level 1\n> > \n> \n> \n> Level 1");
+    });
+}
+
+#[gpui::test]
 fn cursor_cannot_set_inside_blockquote_pair(cx: &mut TestAppContext) {
     // Position 8 is bytes 5..7 = `> ` plus bytes 7 = `\n` of the
     // pair `\n> \n> ` at bytes 4..10. Setting the cursor strictly

@@ -347,41 +347,101 @@ pub fn nearest_allowed_position(bytes: &[u8], p: usize) -> usize {
 /// Is the `\n` at byte index `p` a soft break (a lone newline that would
 /// be ambiguous in CommonMark)?
 ///
-/// Soft breaks are mid-content `\n`s that aren't part of a complete
-/// structural pair. The depth-D pair `\n[prefix]\n[prefix]` is the
-/// generalization of `\n\n`: a `\n` is exempt if it's one of the two
-/// `\n`s in such a pair (so the `\n` between two adjacent BQ-content
-/// paragraphs survives, but a stray `\n` across two BQ lines —
-/// CommonMark's "lazy continuation" — is still promoted).
+/// A soft break is the `\n` *between two lines of paragraph content in
+/// the same container scope* — exactly the kind CommonMark would render
+/// as a space inside a paragraph. The editor's invariant promotes such
+/// `\n`s into the depth-D pair `\n[prefix]\n[prefix]` so the resulting
+/// rendering matches the chat transcript pixel-for-pixel.
+///
+/// The byte detector implements that semantic with five exemption rules.
+/// Anything `\n` falling into one of these is *not* a soft break — it's
+/// already a structural separator and the buffer carries it verbatim:
+///
+/// 1. **Document edge.** Leading or trailing single `\n` is harmless
+///    whitespace; rewriting it would corrupt pasted content.
+/// 2. **Adjacent `\n`.** Already inside a paragraph-break run.
+/// 3. **Hard break** (`  \n` / `\\\n`) — deliberate in-paragraph break.
+/// 4. **Pair-interior.** The `\n` is one of the two `\n`s of a complete
+///    depth-D pair `\n[prefix]\n[prefix]`; the pair detector flags both
+///    halves, and we probe `p` and `p + 1` to recognize either.
+/// 5. **Marker-only-line adjacency.** Either the line above or the
+///    line below is "marker-only" — every byte after its container
+///    markers is whitespace. Marker-only lines are *paragraph
+///    terminators*, not paragraph content, so the `\n`s on either side
+///    of one are structural stitching, never soft breaks. This subsumes
+///    most of the depth-change cases (the deeper/shallower marker
+///    line is itself marker-only) and is what actually makes
+///    `enforce_invariants` idempotent across runs of mixed-depth blank
+///    lines: without it, a `\n` between two same-depth blank lines that
+///    are interrupted by a different-depth blank elsewhere in the run
+///    breaks the pair detector, gets misclassified as a soft break, and
+///    each `enforce_invariants` call splices in another `[prefix]\n`
+///    that further fragments the run — the cascading-line bug.
+///
+/// Genuine *lazy paragraph continuations* (line_a has BQ markers,
+/// line_b has none but has content) still promote: line_b isn't
+/// marker-only, so the rule above doesn't fire, and the editor restores
+/// the dropped BQ scope by inserting the missing prefix.
+///
+/// This rule generalizes to lists by extending `is_marker_only_line` to
+/// recognize list-marker continuation prefixes; the same five exemption
+/// classes apply unchanged.
 pub fn is_soft_break(bytes: &[u8], p: usize) -> bool {
     if bytes[p] != b'\n' {
         return false;
     }
-    // Edge of document — single leading or trailing `\n` is harmless
-    // whitespace in CommonMark, and changing it would surprise users
-    // who pasted content that ends in `\n`.
     if p == 0 || p + 1 >= bytes.len() {
         return false;
     }
-    // Already part of a paragraph break run.
     if bytes[p - 1] == b'\n' || bytes[p + 1] == b'\n' {
         return false;
     }
-    // Hard breaks (`\\\n` / `  \n`).
     if bytes[p - 1] == b'\\' {
         return false;
     }
     if p >= 2 && bytes[p - 1] == b' ' && bytes[p - 2] == b' ' {
         return false;
     }
-    // Already part of a structural depth-D pair. The pair-interior
-    // detector also classifies the byte right after either `\n` of
-    // the pair as interior; piggyback on it to recognize "this `\n`
-    // belongs to a pair" by probing both adjacent positions.
     if is_paragraph_break_interior(bytes, p) || is_paragraph_break_interior(bytes, p + 1) {
         return false;
     }
+    if is_marker_only_line_ending_at(bytes, p) || is_marker_only_line_starting_at(bytes, p + 1) {
+        return false;
+    }
     true
+}
+
+/// Whether the line ending at `line_end_excl` (i.e. whose `\n` is at
+/// `line_end_excl` or whose end-of-buffer is at `line_end_excl`) is
+/// "marker-only" — has at least one BQ marker and only whitespace after
+/// the markers. Used by the soft-break detector to recognize structural
+/// separator lines (which are paragraph terminators, not paragraph
+/// content).
+pub fn is_marker_only_line_ending_at(bytes: &[u8], line_end_excl: usize) -> bool {
+    let mut start = line_end_excl;
+    while start > 0 && bytes[start - 1] != b'\n' {
+        start -= 1;
+    }
+    is_marker_only_range(bytes, start, line_end_excl)
+}
+
+/// Forward analog of [`is_marker_only_line_ending_at`].
+pub fn is_marker_only_line_starting_at(bytes: &[u8], line_start: usize) -> bool {
+    let mut end = line_start;
+    while end < bytes.len() && bytes[end] != b'\n' {
+        end += 1;
+    }
+    is_marker_only_range(bytes, line_start, end)
+}
+
+fn is_marker_only_range(bytes: &[u8], line_start: usize, line_end_excl: usize) -> bool {
+    let (markers, after) = count_line_markers(bytes, line_start);
+    if markers == 0 {
+        return false;
+    }
+    bytes[after..line_end_excl]
+        .iter()
+        .all(|&b| b == b' ' || b == b'\t')
 }
 
 // ---------------------------------------------------------------------------
