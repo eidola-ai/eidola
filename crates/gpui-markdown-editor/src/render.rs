@@ -162,6 +162,11 @@ fn render_blockquote(
     out: &mut Vec<RenderBlock>,
 ) {
     let cursor_inside = cursor.overlaps(&node.range);
+    // The level of *this* blockquote's prefix markers is the number
+    // of containers wrapping it (outer blockquotes / list items, etc.)
+    // — the element layer uses it to look up the matching border bar
+    // when painting overlay markers.
+    let level = containers.len();
     let mut child_chain = containers.to_vec();
     child_chain.push(Container::BlockQuote { cursor_inside });
 
@@ -176,11 +181,11 @@ fn render_blockquote(
         if let Some(leaf) = find_leaf_for_prefix(&mut out[start..], prefix) {
             // Pulldown ranges most leaves to start *after* the line's
             // marker; extend so the marker falls inside the leaf and
-            // the element layer can hide / dim it.
+            // the element layer can hide / overlay it.
             if prefix.start < leaf.source_range.start {
                 leaf.source_range.start = prefix.start;
             }
-            attach_marker(leaf, prefix, cursor_inside);
+            attach_marker(leaf, prefix, cursor_inside, level);
             expect_middle = true;
         } else if is_after_hard_break(bytes, prefix.start)
             && let Some(leaf) = find_leaf_ending_at(&mut out[start..], prefix.start)
@@ -196,7 +201,7 @@ fn render_blockquote(
             // it. The toggle isn't touched — this is content, not a
             // pair half.
             leaf.source_range.end = source_line_end(bytes, prefix.end);
-            attach_marker(leaf, prefix, cursor_inside);
+            attach_marker(leaf, prefix, cursor_inside, level);
         } else if expect_middle {
             // First prefix of a structural pair — the marker line is
             // the collapsed paragraph-break separator. No row, no
@@ -215,7 +220,7 @@ fn render_blockquote(
             let line_end = source_line_end(bytes, prefix.end);
             let mut synth = RenderBlock::new(prefix.start..line_end, BlockKind::Paragraph);
             synth.containers = child_chain.clone();
-            attach_marker(&mut synth, prefix, cursor_inside);
+            attach_marker(&mut synth, prefix, cursor_inside, level);
             out.push(synth);
             expect_middle = true;
         }
@@ -256,14 +261,21 @@ fn find_leaf_ending_at(slice: &mut [RenderBlock], pos: usize) -> Option<&mut Ren
         .find(|leaf| leaf.source_range.end == pos)
 }
 
-fn attach_marker(leaf: &mut RenderBlock, prefix: &Range<usize>, cursor_inside: bool) {
+/// Attach one blockquote prefix marker to `leaf`. The marker is
+/// *always* hidden from the shaped line (so content position never
+/// shifts as the cursor moves in or out of the construct). When the
+/// cursor is inside, an entry is also recorded in `marker_overlays`
+/// at this blockquote's `level` — the element layer paints those
+/// glyphs on top of the corresponding border bar so the user still
+/// sees the raw `>` markers when focused, just shifted onto the
+/// container decoration instead of inlined into the text.
+fn attach_marker(leaf: &mut RenderBlock, prefix: &Range<usize>, cursor_inside: bool, level: usize) {
+    leaf.hidden_ranges.push(prefix.clone());
     if cursor_inside {
-        leaf.inlines.push(InlineRun {
+        leaf.marker_overlays.push(crate::render_spec::MarkerOverlay {
             source_range: prefix.clone(),
-            style: InlineStyle::dimmed(),
+            level,
         });
-    } else {
-        leaf.hidden_ranges.push(prefix.clone());
     }
 }
 
@@ -1206,7 +1218,13 @@ mod tests {
     }
 
     #[test]
-    fn blockquote_dims_marker_when_cursor_inside() {
+    fn blockquote_marker_overlays_when_cursor_inside() {
+        // Markers are *always* hidden from the shaped line so content
+        // doesn't shift horizontally between focus / blur. When the
+        // cursor is inside the construct, the marker is also recorded
+        // as a `MarkerOverlay` at this blockquote's level so the
+        // element layer can paint the `>` glyph on top of the border
+        // bar.
         let src = "> hi\nbody";
         // Cursor inside "hi" at byte 3.
         let spec = render_with_cursor(src, 3);
@@ -1215,8 +1233,8 @@ mod tests {
             .iter()
             .find(|b| !b.containers.is_empty())
             .expect("blockquote leaf");
-        assert!(bq.has_dimmed_range(0..2));
-        assert!(!bq.has_hidden_range(0..2));
+        assert!(bq.has_hidden_range(0..2));
+        assert!(bq.has_marker_overlay(0..2, 0));
         assert!(matches!(
             bq.containers[0],
             Container::BlockQuote {
@@ -1237,9 +1255,12 @@ mod tests {
             .find(|b| !b.containers.is_empty())
             .expect("blockquote leaf");
         // Cursor at 0 — boundary equality treats this as "inside",
-        // so markers dim rather than hide.
-        assert!(bq.has_dimmed_range(0..2));
-        assert!(bq.has_dimmed_range(8..10));
+        // so markers always hide from the line and overlay onto the
+        // bar.
+        assert!(bq.has_hidden_range(0..2));
+        assert!(bq.has_hidden_range(8..10));
+        assert!(bq.has_marker_overlay(0..2, 0));
+        assert!(bq.has_marker_overlay(8..10, 0));
         assert_eq!(bq.source_range.start, 0);
     }
 
@@ -1268,11 +1289,12 @@ mod tests {
     }
 
     #[test]
-    fn nested_blockquote_dims_only_levels_the_cursor_is_inside() {
-        // Two-deep nest with cursor inside both levels: both markers
-        // dim. There is no positional ambiguity in `> > deep` — any
-        // cursor inside the source range is inside both nested
-        // blockquotes.
+    fn nested_blockquote_overlays_each_level_when_cursor_inside() {
+        // Two-deep nest with cursor inside both levels: outer marker
+        // (level 0) and inner marker (level 1) each become an overlay
+        // at their own bar's column. There is no positional ambiguity
+        // in `> > deep` — any cursor inside the source range is
+        // inside both nested blockquotes.
         let src = "> > deep\n";
         let spec = render_with_cursor(src, 6);
         let bq = spec
@@ -1280,8 +1302,10 @@ mod tests {
             .iter()
             .find(|b| !b.containers.is_empty())
             .expect("blockquote leaf");
-        assert!(bq.has_dimmed_range(0..2));
-        assert!(bq.has_dimmed_range(2..4));
+        assert!(bq.has_hidden_range(0..2));
+        assert!(bq.has_hidden_range(2..4));
+        assert!(bq.has_marker_overlay(0..2, 0));
+        assert!(bq.has_marker_overlay(2..4, 1));
     }
 
     #[test]
@@ -1349,10 +1373,10 @@ mod tests {
     }
 
     #[test]
-    fn trailing_synthetic_dims_its_marker_when_cursor_inside() {
-        // Cursor on the trailing synthetic — its marker dims. The
-        // middle marker line has no rendered row, so its marker has
-        // nothing to dim against.
+    fn trailing_synthetic_overlays_its_marker_when_cursor_inside() {
+        // Cursor on the trailing synthetic — its marker overlays
+        // onto the bar. The middle marker line has no rendered row,
+        // so its marker has nothing to overlay against.
         let src = "> hi\n> \n> ";
         let spec = render_with_cursor(src, src.len());
         let trailing = spec
@@ -1361,8 +1385,8 @@ mod tests {
             .rfind(|b| !b.containers.is_empty())
             .expect("trailing synthetic");
         assert!(
-            trailing.inlines.iter().any(|r| r.style.dimmed),
-            "trailing synthetic must carry a dimmed marker run",
+            !trailing.marker_overlays.is_empty(),
+            "trailing synthetic must carry an overlay marker",
         );
     }
 
@@ -1380,12 +1404,15 @@ mod tests {
             .rfind(|b| !b.containers.is_empty())
             .expect("trailing leaf");
         assert_eq!(last.containers.len(), 2);
-        // The trailing line spans bytes 12..16 (`> > `). The inner
-        // marker is at 14..16 and the outer at 12..14 — both should be
-        // recorded as dimmed inline runs (cursor at end-of-doc is on
-        // the construct's boundary, treated as inside).
-        assert!(last.has_dimmed_range(12..14));
-        assert!(last.has_dimmed_range(14..16));
+        // The trailing line spans bytes 12..16 (`> > `). The outer
+        // marker is at 12..14 (level 0), the inner at 14..16 (level
+        // 1) — both hidden from the line and recorded as overlays
+        // since the cursor at end-of-doc sits on both constructs'
+        // boundaries (treated as inside).
+        assert!(last.has_hidden_range(12..14));
+        assert!(last.has_hidden_range(14..16));
+        assert!(last.has_marker_overlay(12..14, 0));
+        assert!(last.has_marker_overlay(14..16, 1));
         assert_eq!(last.source_range.start, 12);
     }
 

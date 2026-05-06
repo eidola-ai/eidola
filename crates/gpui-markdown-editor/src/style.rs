@@ -21,6 +21,16 @@ pub struct MarkdownStyle {
     pub font_size: Pixels,
     pub line_height: Rems,
     pub paragraph_gap: Rems,
+    /// Extra vertical breathing room added at the boundary between
+    /// two blocks whose container chains don't match (e.g. paragraph
+    /// → blockquote, or moving in / out of a nested level). Split
+    /// half-and-half between the two adjacent blocks. Painted
+    /// *outside* the blockquote border bar so the bar doesn't extend
+    /// into the breathing room — the extra reads as visual
+    /// separation from surrounding prose, not as part of the
+    /// quoted region. Set to `rems(0.0)` for the original flush
+    /// behavior.
+    pub container_boundary_gap: Rems,
 
     /// Base size for headings. The `heading_font_size` callback (if any)
     /// scales this per level. Default is `font_size`.
@@ -62,6 +72,11 @@ pub struct MarkdownStyle {
     /// the indent block. The bar sits at the level's left edge; the
     /// content sits `blockquote_indent` further right.
     pub blockquote_border_width: Pixels,
+    /// Horizontal inset for the *outermost* (level 0) border bar so it
+    /// doesn't sit flush against the editor's leading edge. Inner
+    /// nested bars inherit the same inset by virtue of being painted
+    /// at `blockquote_border_inset + level * blockquote_indent`.
+    pub blockquote_border_inset: Pixels,
     /// Color of the per-level left border bar. Defaults to the
     /// theme's `border` so the bar reads as chrome rather than
     /// content.
@@ -84,6 +99,7 @@ impl MarkdownStyle {
             font_size: theme.font_size,
             line_height: rems(1.5),
             paragraph_gap: rems(1.0),
+            container_boundary_gap: rems(0.5),
 
             heading_base_font_size: theme.font_size,
             heading_font_size: None,
@@ -97,6 +113,7 @@ impl MarkdownStyle {
 
             blockquote_indent: px(20.0),
             blockquote_border_width: px(3.0),
+            blockquote_border_inset: px(6.0),
             blockquote_border_color: theme.border,
 
             text_color: theme.foreground,
@@ -115,6 +132,11 @@ impl MarkdownStyle {
 
     pub fn paragraph_gap(mut self, gap: Rems) -> Self {
         self.paragraph_gap = gap;
+        self
+    }
+
+    pub fn container_boundary_gap(mut self, gap: Rems) -> Self {
+        self.container_boundary_gap = gap;
         self
     }
 
@@ -173,6 +195,11 @@ impl MarkdownStyle {
 
     pub fn blockquote_border_width(mut self, width: Pixels) -> Self {
         self.blockquote_border_width = width;
+        self
+    }
+
+    pub fn blockquote_border_inset(mut self, inset: Pixels) -> Self {
+        self.blockquote_border_inset = inset;
         self
     }
 

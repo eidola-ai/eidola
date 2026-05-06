@@ -50,6 +50,29 @@ pub struct RenderBlock {
     /// — that's intentional, so `inject_empty_paragraphs` (which
     /// works on a flat list) doesn't have to know about nesting.
     pub containers: Vec<Container>,
+    /// Per-line container-marker glyphs to paint as overlays on top
+    /// of their corresponding container decoration (e.g. the `>` of a
+    /// blockquote, painted over the level's left border bar) when the
+    /// cursor is "inside" that container. Always-hidden in the shaped
+    /// line itself (the marker bytes also appear in `hidden_ranges`)
+    /// so the content's horizontal position is identical regardless of
+    /// cursor focus — the overlay simply appears or disappears.
+    pub marker_overlays: Vec<MarkerOverlay>,
+}
+
+/// A container-level glyph drawn on top of the container's
+/// decoration. Today only blockquote `>` markers populate this, one
+/// per blockquote-prefixed source line per cursor-inside level.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkerOverlay {
+    /// Source range of the marker bytes in the buffer (e.g. `> ` or
+    /// just `>`). The element layer locates the shaped line that
+    /// contains `source_range.start` to choose the y position.
+    pub source_range: Range<usize>,
+    /// Index into `containers` of the container this marker belongs
+    /// to (outermost = 0). Drives the x position so each level's
+    /// overlay sits over its own border bar.
+    pub level: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +92,7 @@ impl RenderBlock {
             hidden_ranges: Vec::new(),
             delimiter_lines: Vec::new(),
             containers: Vec::new(),
+            marker_overlays: Vec::new(),
         }
     }
 
@@ -80,6 +104,12 @@ impl RenderBlock {
         self.inlines
             .iter()
             .any(|r| r.source_range == range && r.style.dimmed)
+    }
+
+    pub fn has_marker_overlay(&self, range: Range<usize>, level: usize) -> bool {
+        self.marker_overlays
+            .iter()
+            .any(|o| o.source_range == range && o.level == level)
     }
 }
 

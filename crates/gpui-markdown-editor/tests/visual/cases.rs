@@ -221,6 +221,34 @@ pub fn register(s: &mut Snapshots) {
         })
     });
 
+    // Nested-bq sandwich: an outer-only paragraph, a nested
+    // paragraph, then another outer-only paragraph. The outer bar
+    // (level 0) should remain continuous through *both* boundaries
+    // because the outer level is shared on each side; only the
+    // inner bar pulls back into the breathing room. Sibling
+    // paragraphs above and below the whole construct exercise the
+    // paragraph ↔ blockquote boundary too.
+    s.add("nested_blockquote_sandwich", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: concat!(
+                    "Lead-in paragraph.\n",
+                    "\n",
+                    "> Outer only.\n",
+                    "\n",
+                    "> > Nested.\n",
+                    "\n",
+                    "> Outer only again.\n",
+                    "\n",
+                    "Trailing prose.",
+                )
+                .into(),
+                selection: Selection::Cursor(0),
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
     // Blockquote wrapping a heading — the heading's `# ` *and* the
     // blockquote's `> ` both hide together.
     s.add("blockquote_around_heading", win, |window, cx| {

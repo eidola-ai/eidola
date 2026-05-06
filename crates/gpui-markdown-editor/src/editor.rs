@@ -566,14 +566,26 @@ impl Render for MarkdownEditor {
             .on_mouse_move(cx.listener(Self::on_mouse_move));
 
         let block_starts: Vec<usize> = spec.blocks.iter().map(|b| b.source_range.start).collect();
+        // Snapshot each block's container chain *before* moving the
+        // blocks into elements so we can hand each `BlockElement` the
+        // chains of its immediate neighbors (used to add extra
+        // breathing room at container-boundary transitions).
+        let containers_per_block: Vec<Vec<crate::render_spec::Container>> =
+            spec.blocks.iter().map(|b| b.containers.clone()).collect();
         for (idx, block) in spec.blocks.into_iter().enumerate() {
             let is_last = idx + 1 == block_count;
             let next_block_start = block_starts.get(idx + 1).copied();
+            let prev_containers = idx
+                .checked_sub(1)
+                .and_then(|i| containers_per_block.get(i).cloned());
+            let next_containers = containers_per_block.get(idx + 1).cloned();
             container = container.child(BlockElement::new(
                 block,
                 idx,
                 is_last,
                 next_block_start,
+                prev_containers,
+                next_containers,
                 view.clone(),
                 style.clone(),
             ));

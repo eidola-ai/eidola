@@ -38,6 +38,14 @@ pub struct BlockElement {
     /// trailing/leading empty-paragraph cases, where `inject_empty_paragraphs`
     /// puts the empty's start at the previous block's end.
     next_block_start: Option<usize>,
+    /// Container chain of the previous block in document order, if
+    /// any. `None` at doc start. Used to detect "container boundary"
+    /// transitions — blockquote-to-paragraph and friends — and add
+    /// extra breathing room above this block when the chains differ.
+    prev_containers: Option<Vec<Container>>,
+    /// Symmetric to `prev_containers` for the block immediately
+    /// after this one. `None` at doc end.
+    next_containers: Option<Vec<Container>>,
     editor: Entity<MarkdownEditor>,
     style: MarkdownStyle,
 }
@@ -48,6 +56,8 @@ impl BlockElement {
         block_index: usize,
         is_last_block: bool,
         next_block_start: Option<usize>,
+        prev_containers: Option<Vec<Container>>,
+        next_containers: Option<Vec<Container>>,
         editor: Entity<MarkdownEditor>,
         style: MarkdownStyle,
     ) -> Self {
@@ -56,6 +66,8 @@ impl BlockElement {
             block_index,
             is_last_block,
             next_block_start,
+            prev_containers,
+            next_containers,
             editor,
             style,
         }
@@ -206,6 +218,17 @@ impl Element for BlockElement {
         let font_size = font_size_for_block(&self.block.kind, &self.style);
         let line_height = font_size * self.style.line_height.0;
         let spacing_above = spacing_above_for_block(&self.block.kind, &self.style);
+        let spacing_below = spacing_below_for_block(&self.block.kind, &self.style);
+        let extra_above = container_boundary_extra(
+            &self.block.containers,
+            self.prev_containers.as_deref(),
+            &self.style,
+        );
+        let extra_below = container_boundary_extra(
+            &self.block.containers,
+            self.next_containers.as_deref(),
+            &self.style,
+        );
         let inner_pad = block_inner_padding(&self.block.kind, &self.style);
         let is_code = is_code_block(&self.block.kind);
         let container_indent = containers_left_indent(&self.block.containers, &self.style);
@@ -243,16 +266,26 @@ impl Element for BlockElement {
                     wrap_w,
                     window,
                 );
-                // Block height is `spacing_above` + 2× `inner_pad` +
-                // (sum of shaped line heights with code-block
-                // breathing). The same content arithmetic runs in
+                // Block height is `extra_above` + `spacing_above` +
+                // 2× `inner_pad` + (sum of shaped line heights with
+                // code-block breathing) + `spacing_below` +
+                // `extra_below`. The same content arithmetic runs in
                 // `prepaint` to position lines — extracted into
                 // `shaped_content_height` so the two phases can't
                 // drift on wrap math, breathing pads, or the empty-
-                // block fallback.
-                let h = spacing_above
+                // block fallback. `spacing_below` is part of the
+                // layout box so per-block decorations spanning
+                // `bounds` minus the extras (e.g. the blockquote
+                // border bar) extend symmetric around the content
+                // rows; the extras themselves sit *outside* the
+                // decoration so they read as inter-block breathing
+                // room rather than part of the construct.
+                let h = extra_above
+                    + spacing_above
                     + inner_pad * 2.
-                    + shaped_content_height(&lines, line_height, is_code, &style_clone);
+                    + shaped_content_height(&lines, line_height, is_code, &style_clone)
+                    + spacing_below
+                    + extra_below;
                 Size {
                     width: avail_w,
                     height: h,
@@ -285,11 +318,20 @@ impl Element for BlockElement {
         let font_size = font_size_for_block(&self.block.kind, &style);
         let line_height = font_size * style.line_height.0;
         let spacing_above = spacing_above_for_block(&self.block.kind, &style);
+        let extra_above = container_boundary_extra(
+            &self.block.containers,
+            self.prev_containers.as_deref(),
+            &style,
+        );
+        // `extra_below` doesn't affect content positioning during
+        // prepaint — it sits past `block_bottom` and is already part
+        // of `bounds.size.height` from `request_layout`. The bar paint
+        // recomputes it for its own bounds.
         let inner_pad = block_inner_padding(&self.block.kind, &style);
         let is_code = is_code_block(&self.block.kind);
         let container_indent = containers_left_indent(&self.block.containers, &style);
 
-        let block_top = bounds.origin.y + spacing_above;
+        let block_top = bounds.origin.y + extra_above + spacing_above;
         // `block_left` is the left edge of *this* leaf's visible
         // region — `bounds.origin.x` shifted right by every
         // container's indent. Per-level blockquote borders paint at
@@ -525,24 +567,99 @@ impl Element for BlockElement {
         // already-indented content area (the bg is `block_left` to
         // `block_left + block_width`, which starts to the right of
         // every border bar). Each container that's a blockquote
-        // contributes one bar at `bounds.origin.x + i *
-        // blockquote_indent`. The bar spans this leaf's full vertical
-        // bounds — when two consecutive leaves share the same
-        // blockquote, their bars meet flush at the leaf boundary
-        // (paragraph_gap above leaf 2 is part of leaf 2's bounds, so
-        // the gap is covered by leaf 2's bar).
+        // contributes one bar at `bounds.origin.x +
+        // blockquote_border_inset + i * blockquote_indent`. The bar
+        // spans this leaf's full vertical bounds, which now include
+        // both `spacing_above` and `spacing_below` (each half a
+        // paragraph_gap) — so the bar reads as symmetric around the
+        // content rows. When two consecutive leaves share the same
+        // blockquote their bars still meet flush at the leaf boundary
+        // (`spacing_below` of leaf 1 ends exactly where `spacing_above`
+        // of leaf 2 begins).
+        // The bar's vertical extent is the layout box minus any
+        // container-boundary extras: extras are pure inter-block
+        // breathing room and shouldn't be covered by the bar (the bar
+        // marks the quoted region, the extras sit outside it). For
+        // consecutive blockquoted leaves with the same chain both
+        // extras are zero, so bars meet flush at the leaf boundary.
+        // Per-level bar extents.
+        //
+        // The block as a whole reserves `extra_above` / `extra_below`
+        // breathing room at any container-boundary transition. But
+        // when nesting changes — e.g. block A `[outer]` → block B
+        // `[outer, inner]` — the *outer* level is shared between A
+        // and B, so the outer bar should stay continuous through the
+        // extras while the *inner* bar stops at them. Each level's
+        // bar therefore computes its own top / bottom against
+        // whether the matching ancestry is present in the immediate
+        // neighbor: shared at level L → bar paints flush to the
+        // layout box on that side; not shared → bar pulls back by
+        // the extra so the boundary breathes.
+        let extra_above = container_boundary_extra(
+            &self.block.containers,
+            self.prev_containers.as_deref(),
+            &self.style,
+        );
+        let extra_below = container_boundary_extra(
+            &self.block.containers,
+            self.next_containers.as_deref(),
+            &self.style,
+        );
         for (level, container) in self.block.containers.iter().enumerate() {
             match container {
                 Container::BlockQuote { .. } => {
-                    let left = bounds.origin.x + self.style.blockquote_indent * (level as f32);
+                    let above_continues = level_shared_with_neighbor(
+                        level,
+                        &self.block.containers,
+                        self.prev_containers.as_deref(),
+                    );
+                    let below_continues = level_shared_with_neighbor(
+                        level,
+                        &self.block.containers,
+                        self.next_containers.as_deref(),
+                    );
+                    let bar_top = bounds.origin.y
+                        + if above_continues {
+                            px(0.0)
+                        } else {
+                            extra_above
+                        };
+                    let bar_bottom = bounds.origin.y + bounds.size.height
+                        - if below_continues {
+                            px(0.0)
+                        } else {
+                            extra_below
+                        };
+                    let bar_height = (bar_bottom - bar_top).max(px(0.0));
+                    let left = bounds.origin.x
+                        + self.style.blockquote_border_inset
+                        + self.style.blockquote_indent * (level as f32);
                     let bar = Bounds::new(
-                        point(left, bounds.origin.y),
-                        size(self.style.blockquote_border_width, bounds.size.height),
+                        point(left, bar_top),
+                        size(self.style.blockquote_border_width, bar_height),
                     );
                     window.paint_quad(fill(bar, self.style.blockquote_border_color));
                 }
             }
         }
+
+        // Overlay container markers (cursor-inside `>` glyphs) on top
+        // of their level's border bar. Painted *after* the bars and
+        // *before* content text so the glyph reads on top of the bar
+        // but doesn't compete with body shaping. Because the marker
+        // bytes were also pushed into `hidden_ranges`, the shaped
+        // line itself starts at `block_left` regardless of whether
+        // overlays are present — the user gets the raw `>` they typed
+        // without any horizontal shift in the content's position.
+        paint_marker_overlays(
+            &self.block.marker_overlays,
+            &self.block.kind,
+            &prepaint.laid_out.lines,
+            bounds.origin.x,
+            &self.style,
+            window,
+            cx,
+        );
 
         // Layered backgrounds for code blocks:
         //
@@ -726,6 +843,69 @@ impl Element for BlockElement {
     }
 }
 
+/// Paint each container marker as a glyph centered horizontally on
+/// its level's border bar. The marker's source byte selects which
+/// shaped line provides the y origin so multi-line leaves (soft-wrap,
+/// hard-break continuations) get one glyph per visible row. Painted
+/// in the body font + delimiter color so the chrome reads cohesive
+/// with the bar itself.
+fn paint_marker_overlays(
+    overlays: &[crate::render_spec::MarkerOverlay],
+    kind: &BlockKind,
+    lines: &[LaidOutLine],
+    block_origin_x: Pixels,
+    style: &MarkdownStyle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if overlays.is_empty() {
+        return;
+    }
+    let font_size = font_size_for_block(kind, style);
+    let font = base_font_for_block(kind, style);
+    for marker in overlays {
+        let Some(line) = lines.iter().find(|l| {
+            l.source_range.start <= marker.source_range.start
+                && marker.source_range.start < l.source_range.end
+        }) else {
+            continue;
+        };
+        let runs = [TextRun {
+            len: 1,
+            font: font.clone(),
+            color: style.delimiter_color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        let Some(glyph) = window
+            .text_system()
+            .shape_text(SharedString::from(">"), font_size, &runs, None, None)
+            .ok()
+            .and_then(|mut v| v.drain(..).next())
+        else {
+            continue;
+        };
+        let bar_left = block_origin_x
+            + style.blockquote_border_inset
+            + style.blockquote_indent * (marker.level as f32);
+        // Center the glyph horizontally on the bar so the bar passes
+        // through the glyph's middle. The glyph is wider than the
+        // bar, so its left/right edges spill into the indent on both
+        // sides — that's intentional, the marker reads as
+        // *integrated* with the bar rather than floating beside it.
+        let glyph_x = bar_left + (style.blockquote_border_width - glyph.width()) / 2.0;
+        let _ = glyph.paint(
+            point(glyph_x, line.origin.y),
+            line.row_height,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
+}
+
 fn paint_horizontal_scrollbar(window: &mut Window, cb: &CodeBlockPaint, style: &MarkdownStyle) {
     let track_h = px(3.0);
     // Sit on the seam between the content strip and the closing fence
@@ -798,13 +978,76 @@ fn font_size_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
     }
 }
 
+/// Half of the block's vertical breathing room. Each block reserves
+/// the *same* amount above and below its content (see
+/// `spacing_below_for_block`) so the inter-block gap between two
+/// blocks of the same kind is preserved (`above + below`), and so any
+/// per-block decoration spanning the full layout bounds — most
+/// importantly the blockquote border bar — sits symmetric around the
+/// content rows. With the previous "all above" model the bar extended
+/// roughly a `paragraph_gap` above the text top and stopped at the
+/// text bottom, which read as visually unbalanced.
 fn spacing_above_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
     let rems_factor = match kind {
         BlockKind::Heading { level } if *level <= 2 => 1.5,
         BlockKind::Heading { .. } => 1.25,
         BlockKind::Paragraph | BlockKind::CodeBlock { .. } => style.paragraph_gap.0,
     };
-    px(f32::from(style.font_size) * rems_factor)
+    px(f32::from(style.font_size) * rems_factor / 2.0)
+}
+
+/// Symmetric companion to `spacing_above_for_block`. Stacking two
+/// blocks of the same kind reproduces the old single-`paragraph_gap`
+/// inter-block gap (`above_2 + below_1 = 2 * (factor / 2) = factor`).
+/// Mixed-kind transitions (e.g. paragraph → heading) average the two
+/// factors instead of using just the next block's, which slightly
+/// smooths the visual rhythm without disturbing same-kind sequences.
+fn spacing_below_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
+    spacing_above_for_block(kind, style)
+}
+
+/// Extra breathing room added on the side of `containers` that faces
+/// `neighbor` when the two chains differ (paragraph → blockquote, or
+/// the move into / out of a nested level). Splits
+/// `style.container_boundary_gap` half-and-half between the two
+/// adjacent blocks so the total extra at the boundary is one full
+/// `container_boundary_gap`. Zero when chains match (consecutive
+/// leaves of the same blockquote get no extra) and zero at doc
+/// start / end (`neighbor == None`) so the editor's leading and
+/// trailing edges stay flush against the editor frame as before.
+fn container_boundary_extra(
+    containers: &[Container],
+    neighbor: Option<&[Container]>,
+    style: &MarkdownStyle,
+) -> Pixels {
+    let Some(neighbor) = neighbor else {
+        return px(0.0);
+    };
+    if neighbor == containers {
+        return px(0.0);
+    }
+    px(f32::from(style.font_size) * style.container_boundary_gap.0 / 2.0)
+}
+
+/// Does `neighbor`'s chain match `containers` up to *and including*
+/// `level`? Used by per-level bar painting to decide whether the bar
+/// for level L should extend through the block's boundary extras: if
+/// the same ancestry (outermost → level L) is present on the other
+/// side, the bar at level L paints flush to the layout box and joins
+/// the neighbor's bar at the same level; otherwise it pulls back by
+/// the extra so the new (or removed) level reads as starting / ending
+/// inside the breathing room.
+fn level_shared_with_neighbor(
+    level: usize,
+    containers: &[Container],
+    neighbor: Option<&[Container]>,
+) -> bool {
+    let Some(neighbor) = neighbor else {
+        return false;
+    };
+    neighbor.len() > level
+        && containers.len() > level
+        && containers[..=level] == neighbor[..=level]
 }
 
 /// Inner padding for a block's visible region — non-zero only for
