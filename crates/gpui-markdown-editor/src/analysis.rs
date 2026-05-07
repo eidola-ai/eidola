@@ -1214,18 +1214,43 @@ pub fn chain_blockquote_depth(chain: &[EnclosingContainer]) -> usize {
         .count()
 }
 
-/// `"> "` repeated `chain_blockquote_depth(chain)` times.
-///
-/// **Note.** This is the BQ-only flattening — it does *not* preserve
-/// the alternation when list-item entries interleave with the BQ
-/// entries. Callers that need the per-line continuation prefix on a
-/// chain that may contain list-items should use
-/// [`chain_continuation_prefix`] instead. This wrapper survives only
-/// for callers that genuinely want "BQ markers, ignoring lists" —
-/// today, the back-compat shim used by [`blockquote_continuation_prefix`].
-pub fn chain_blockquote_prefix(chain: &[EnclosingContainer]) -> String {
-    "> ".repeat(chain_blockquote_depth(chain))
-}
+// ---------------------------------------------------------------------------
+// Chain prefix builders — the canonical entry points
+// ---------------------------------------------------------------------------
+//
+// These helpers turn an `EnclosingChain` into the bytes that introduce a
+// continuation line for that chain. **Use these — don't compute prefixes
+// locally.** Reaching for raw `\n` boundaries or hand-built `"> "` strings
+// in a chain-aware context is a bug; we've fixed several of those by
+// migrating to these helpers.
+//
+// Canonical entry points and when to use each:
+//
+// - [`chain_continuation_prefix`] — full per-line continuation prefix,
+//   interleaving LI indents and BQ markers in chain order. Use whenever
+//   you need the bytes that appear at the start of a continuation line
+//   for the cursor's chain (Enter inserts, Shift+Enter inserts, soft-break
+//   promotion, paragraph-break-pair shapes, render's chain-aware hide pass).
+//
+// - [`chain_continuation_prefix_bytes`] — byte-length of the same string
+//   without allocating. Use for "how many bytes of hidden continuation
+//   prefix introduce this line".
+//
+// - [`chain_outer_prefix_bytes`] — byte-length of the prefix contributed
+//   by every container *above* the innermost. Use to compute "where does
+//   the active container's content begin on this line, relative to
+//   line_start" — i.e. the offset to insert / strip indent at without
+//   disturbing outer markers (Tab indent insertion, Shift+Tab dedent
+//   strip).
+//
+// - [`chain_pair_shape`] — the `(blank_prefix, content_prefix)`
+//   representation of the canonical paragraph-break pair for the chain.
+//   Use whenever you emit or recognize a structural pair: BQ-outdent
+//   transform, atomic pair-delete, forbidden-position predicate.
+//
+// All four helpers agree by construction. If a future call site needs a
+// *new* shape variant, add it here with the same naming pattern; don't
+// duplicate the chain-walking logic in callers.
 
 /// The full per-line continuation prefix for `chain`, walking
 /// outermost-first and emitting one segment per container in chain
@@ -1245,9 +1270,8 @@ pub fn chain_blockquote_prefix(chain: &[EnclosingContainer]) -> String {
 /// same alternation pixel-for-pixel; this helper produces the source
 /// counterpart.
 ///
-/// Subsumes the BQ-only [`chain_blockquote_prefix`] (which dropped LI
-/// alternation) and pairs with [`chain_continuation_prefix_bytes`] for
-/// callers that just want the byte count without the string.
+/// Pairs with [`chain_continuation_prefix_bytes`] for callers that want
+/// the byte count without the string.
 pub fn chain_continuation_prefix(chain: &[EnclosingContainer]) -> String {
     let mut out = String::new();
     for c in chain {
@@ -1492,21 +1516,6 @@ fn walk_forward_exact(bytes: &[u8], q: &mut usize, expected: &[u8]) -> bool {
 /// inside, matching the delimiter-visibility rule the renderer uses.
 pub fn blockquote_depth_at(markdown: &str, cursor: usize) -> usize {
     chain_blockquote_depth(&enclosing_containers_at(markdown, cursor))
-}
-
-/// The blockquote-marker prefix that introduces the line at `cursor`
-/// — `"> "` repeated D times where D is the blockquote depth, or
-/// `""` at top level. Lists don't add to this prefix: a list-item
-/// continuation line uses indentation matching the marker's width,
-/// not a literal repeated marker, so the prefix string concept
-/// genuinely applies only to per-line-prefix containers (today, just
-/// blockquotes).
-///
-/// Used by `enforce_invariants` when promoting a soft break across
-/// blockquote lines: the depth-D pair we insert needs this prefix
-/// repeated on both halves.
-pub fn blockquote_continuation_prefix(markdown: &str, cursor: usize) -> String {
-    chain_blockquote_prefix(&enclosing_containers_at(markdown, cursor))
 }
 
 // ---------------------------------------------------------------------------
@@ -2080,10 +2089,9 @@ fn build_depth_decrease_edit(markdown: &str, item: &ListItemContext) -> DepthDec
     // ancestors contribute their indent (mirrors the
     // [`enter_insertion`] LI branch's `outer = chain - innermost LI`
     // pattern, and the same fix applied in
-    // [`list_item_dedent_edits`]). The legacy
-    // [`blockquote_continuation_prefix`] is BQ-only and drops outer LI
-    // indent, which lets the BQ visually escape an enclosing list
-    // when this item is dropped.
+    // [`list_item_dedent_edits`]). A BQ-only prefix would drop the
+    // outer LI indent and let the BQ visually escape an enclosing
+    // list when this item is dropped.
     let marker_chain = enclosing_containers_at(markdown, item.marker_range.start);
     let outer_chain: &[EnclosingContainer] = match marker_chain.last() {
         Some(EnclosingContainer::ListItem(_)) => &marker_chain[..marker_chain.len() - 1],
@@ -2953,21 +2961,6 @@ mod tests {
         // cursor at end of buffer; the depth-1 pair `\n> \n> ` ends
         // there and starts at byte 4.
         assert_eq!(pair_at_end(bytes, bytes.len()), Some(4));
-    }
-
-    #[test]
-    fn blockquote_continuation_prefix_top_level() {
-        assert_eq!(blockquote_continuation_prefix("hello", 2), "");
-    }
-
-    #[test]
-    fn blockquote_continuation_prefix_depth_1() {
-        assert_eq!(blockquote_continuation_prefix("> hi", 4), "> ");
-    }
-
-    #[test]
-    fn blockquote_continuation_prefix_depth_2() {
-        assert_eq!(blockquote_continuation_prefix("> > deep", 8), "> > ");
     }
 
     // ---- Enter / Shift+Enter routing -----------------------------------

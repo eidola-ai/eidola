@@ -56,33 +56,68 @@ use crate::render_spec::{
 use crate::state::{EditorState, Selection};
 use crate::syntax::{ListKind, NodeKind, SyntaxNode};
 
+/// Build a [`RenderSpec`] for the editor's current state.
+///
+/// The render walker is structured as a **pipeline**, not a tree walk —
+/// the recursive walk produces a flat `Vec<RenderBlock>`, and several
+/// post-passes run in a specific order to refine the spec. The order
+/// is load-bearing; reorder only with care. New passes that fix
+/// follow-on bugs should slot into this list with a clear rationale.
+///
+/// ```text
+/// 1. recursive walk (`render_node` → render_paragraph / render_blockquote /
+///    render_list / render_list_item / render_code_block / render_heading).
+///    Emits one leaf per parsed paragraph / heading / code block, with
+///    per-leaf hidden ranges for own-container chrome (LI marker, BQ
+///    prefix) but NOT for chain-aware alternation hiding.
+///
+/// 2. inject_empty_paragraphs — emit synthetic empty Paragraph leaves
+///    for trailing positions and inter-block paragraph breaks that
+///    pulldown didn't claim (post-Enter transient, end-of-buffer
+///    cursor row, etc.). Each synth's chain comes from
+///    `chain_for_position` — the same chain query the cursor walker
+///    uses, so render and analysis agree.
+///
+/// 3. merge_hard_break_continuations — when pulldown's parse splits at
+///    a `  \n` hard break followed by a trailing line of pure
+///    chain-continuation prefix (no further content), the recursive
+///    walk + inject_empty_paragraphs produce two adjacent Paragraph
+///    blocks separated by paragraph_gap. The same source with one
+///    extra byte of content parses as ONE paragraph (hard-break
+///    continuation). Merge the split case so the visual matches.
+///
+/// 4. hide_chain_continuation_prefix (per-block) — the per-item and
+///    per-BQ hides done by the recursive walk catch their own
+///    contributions, but miss bytes that sit *between* container
+///    kinds in alternating chains like `[LI, BQ, LI]` (e.g. the
+///    trailing LI continuation indent after the last BQ marker). One
+///    chain-driven pass at the end catches all alternations
+///    uniformly. Uses `chain_continuation_prefix(chain)` to compare
+///    bytes line-by-line against the canonical prefix; matching
+///    spans are added to `hidden_ranges`.
+///
+/// 5. merge_hidden_ranges (per-block) — multiple hide passes (own
+///    container, alternating chain, code-block fence, …) can produce
+///    overlapping or duplicate entries. Normalize each block's
+///    `hidden_ranges` into a sorted, non-overlapping list so the
+///    element layer's shaping doesn't pay for duplicate work.
+/// ```
+///
+/// **Invariant.** Every chain-aware decision in the pipeline goes
+/// through `analysis::enclosing_containers_at` /
+/// `analysis::chain_continuation_prefix` / `analysis::chain_pair_shape`.
+/// Reaching for raw `\n` boundaries or hand-built `"> "` strings is a
+/// bug; we've fixed several of those by migrating to the canonical
+/// helpers.
 pub fn render(state: &EditorState, tree: &[SyntaxNode]) -> RenderSpec {
     let cursor = CursorRange::from(&state.selection);
     let mut real_blocks = Vec::new();
     for node in tree {
-        render_node(node, &state.markdown, cursor, &[], &mut real_blocks);
+        render_node(node, tree, &state.markdown, cursor, &[], &mut real_blocks);
     }
     let mut blocks = inject_empty_paragraphs(&state.markdown, tree, cursor, real_blocks);
     let bytes = state.markdown.as_bytes();
-    // Hard-break continuation merge. When pulldown's parse splits at a
-    // `  \n` hard break that's followed by a trailing line of pure
-    // chain-continuation prefix bytes (no further content), the
-    // resulting two blocks shape as two visual paragraphs separated
-    // by `paragraph_gap`. The same source plus one byte of content
-    // would parse as ONE paragraph (hard-break continuation through
-    // the trailing line). Merge those split-but-conceptually-one
-    // pairs back into a single block so the cursor sits directly
-    // under the previous row, matching the with-content case. See
-    // `bugs.md::hard_break_trailing_synth_introduces_paragraph_gap`.
     merge_hard_break_continuations(&mut blocks, bytes);
-    // Final pass: hide the full chain-continuation prefix on every
-    // line of every leaf. The per-item / per-BQ hide passes only
-    // catch their own contribution, which works for monotone chains
-    // but misses bytes that sit *between* container kinds in
-    // alternating chains like `[LI, BQ, LI]` — the trailing LI
-    // continuation indent on a continuation line shows as visible
-    // text under the per-item passes alone. Doing one chain-driven
-    // pass at the end catches all alternations uniformly.
     for block in &mut blocks {
         hide_chain_continuation_prefix(block, bytes);
         merge_hidden_ranges(&mut block.hidden_ranges);
@@ -252,6 +287,7 @@ impl CursorRange {
 
 fn render_node(
     node: &SyntaxNode,
+    tree: &[SyntaxNode],
     source: &str,
     cursor: CursorRange,
     containers: &[Container],
@@ -262,9 +298,9 @@ fn render_node(
         NodeKind::Heading { .. } => render_heading(node, cursor, containers, out),
         NodeKind::CodeBlock { .. } => render_code_block(node, cursor, containers, out),
         NodeKind::BlockQuote { prefix_ranges } => {
-            render_blockquote(node, prefix_ranges, source, cursor, containers, out)
+            render_blockquote(node, prefix_ranges, tree, source, cursor, containers, out)
         }
-        NodeKind::List { kind } => render_list(node, *kind, source, cursor, containers, out),
+        NodeKind::List { kind } => render_list(node, *kind, tree, source, cursor, containers, out),
         // Anything else at top level — nothing to do yet.
         _ => {}
     }
@@ -315,6 +351,7 @@ fn render_paragraph(
 fn render_blockquote(
     node: &SyntaxNode,
     prefix_ranges: &[Range<usize>],
+    tree: &[SyntaxNode],
     source: &str,
     cursor: CursorRange,
     containers: &[Container],
@@ -331,7 +368,7 @@ fn render_blockquote(
 
     let start = out.len();
     for child in &node.children {
-        render_node(child, source, cursor, &child_chain, out);
+        render_node(child, tree, source, cursor, &child_chain, out);
     }
 
     let bytes = source.as_bytes();
@@ -417,18 +454,14 @@ fn render_blockquote(
             // is the second-of-pair and gets a synthetic empty leaf
             // so the cursor has a visible row to land on (post-
             // Enter trailing, or an extra empty between two
-            // paragraphs). Query the chain at the synth's byte via
-            // `analysis::enclosing_containers_at` so we pick up
-            // *any* container that encloses the byte (including a
-            // deeper inner list-item that `child_chain` — built up
-            // walking-down from this BQ — doesn't see). Falls back
-            // to `child_chain` if the analysis chain is shorter
-            // (which would happen if the synth sits past every
-            // open container and analysis correctly reports
-            // "outside everything").
+            // paragraphs). Chain comes from `chain_for_position`
+            // (the canonical analysis-side query) so we pick up
+            // *any* container that encloses the byte — including a
+            // deeper inner list-item that `child_chain`, built up
+            // walking-down from this BQ, doesn't see.
             let line_end = source_line_end(bytes, prefix.end);
             let mut synth = RenderBlock::new(prefix.start..line_end, BlockKind::Paragraph);
-            synth.containers = synth_chain_for_bq(source, cursor, prefix.start, &child_chain);
+            synth.containers = chain_for_position(tree, source, cursor, prefix.start);
             attach_marker(&mut synth, prefix, cursor_inside, level);
             synth_indices.push(out.len());
             out.push(synth);
@@ -444,7 +477,7 @@ fn render_blockquote(
     if let Some(prefix) = deferred {
         let line_end = source_line_end(bytes, prefix.end);
         let mut synth = RenderBlock::new(prefix.start..line_end, BlockKind::Paragraph);
-        synth.containers = synth_chain_for_bq(source, cursor, prefix.start, &child_chain);
+        synth.containers = chain_for_position(tree, source, cursor, prefix.start);
         attach_marker(&mut synth, &prefix, cursor_inside, level);
         synth_indices.push(out.len());
         out.push(synth);
@@ -486,32 +519,6 @@ fn extend_synth_to_line_start(leaf: &mut RenderBlock, bytes: &[u8]) {
     leaf.source_range.start = p;
 }
 
-/// Resolve a BQ-emitted synth's container chain at `position`. Calls
-/// [`crate::analysis::enclosing_containers_at`] (the same byte-level
-/// query the cursor walker uses) so the synth carries every
-/// container that structurally encloses its byte — including a
-/// deeper inner list-item whose range was extended through a
-/// trailing pair shape by `effective_node_end`.
-///
-/// Falls back to `fallback` (the BQ's outer-built `child_chain`)
-/// when the analysis chain is shorter, so we never *drop* a
-/// container the BQ already knows about. In practice the analysis
-/// chain is always a (non-strict) extension of `child_chain` for
-/// these synths, so the fallback is paranoia.
-fn synth_chain_for_bq(
-    source: &str,
-    cursor: CursorRange,
-    position: usize,
-    fallback: &[Container],
-) -> Vec<Container> {
-    let analysis_chain = crate::analysis::enclosing_containers_at(source, position);
-    if analysis_chain.len() < fallback.len() {
-        return fallback.to_vec();
-    }
-    let tree = crate::parser::parse(source);
-    translate_enclosing_chain(&tree, source, cursor, analysis_chain)
-}
-
 /// Render a list container.
 ///
 /// Lists themselves contribute no chrome — only their items do — but
@@ -532,6 +539,7 @@ fn synth_chain_for_bq(
 fn render_list(
     node: &SyntaxNode,
     kind: ListKind,
+    tree: &[SyntaxNode],
     source: &str,
     cursor: CursorRange,
     containers: &[Container],
@@ -566,6 +574,7 @@ fn render_list(
             marker_range,
             item_kind,
             &max_marker_text,
+            tree,
             source,
             cursor,
             containers,
@@ -651,6 +660,7 @@ fn render_list_item(
     marker_range: &Range<usize>,
     item_kind: ListItemKind,
     list_max_marker_text: &str,
+    tree: &[SyntaxNode],
     source: &str,
     cursor: CursorRange,
     containers: &[Container],
@@ -723,7 +733,7 @@ fn render_list_item(
                     // carry it.
                     let before = out.len();
                     let was_first = !emitted_first;
-                    render_node(child, source, cursor, &chain, out);
+                    render_node(child, tree, source, cursor, &chain, out);
                     if out.len() > before {
                         // When this is the *first* leaf the item
                         // emits, extend the leftmost recursed leaf's
@@ -1482,14 +1492,22 @@ fn hide_chain_continuation_prefix(leaf: &mut RenderBlock, bytes: &[u8]) {
     }
 }
 
-/// Build a render-spec container chain at `position`, delegating the
-/// "what containers enclose this byte?" question to
+/// **The canonical "container chain at byte X" query for the render
+/// walker.** Both synth-leaf emission sites (`inject_empty_paragraphs`
+/// for trailing / inter-block synths, and `render_blockquote` for
+/// deferred-pair synths) go through this helper, which delegates to
 /// [`crate::analysis::enclosing_containers_at`] so render-side and
 /// cursor-side queries can never disagree.
 ///
-/// The analysis chain reports `EnclosingContainer`s — `BlockQuote`
-/// (with its parsed range) and `ListItem` (with the item's
-/// `ListItemContext`). Translation to render-spec `Container`:
+/// New synth-leaf emission paths (e.g. for code blocks in deeper
+/// nesting cases) should go through this function — never construct
+/// a synth's `containers` chain by hand or reuse a "built-up-while-
+/// walking" chain. The walking chain misses containers whose ranges
+/// were extended through trailing pair shapes by `effective_node_end`,
+/// which is the exact case synths land in.
+///
+/// Translation from analysis-side `EnclosingContainer` to render-spec
+/// `Container`:
 ///   - `BlockQuote { range }` → `Container::BlockQuote { cursor_inside }`
 ///     where `cursor_inside = cursor.overlaps(&range)`.
 ///   - `ListItem(ctx)` → `Container::ListItem { cursor_inside, kind,
@@ -1498,14 +1516,6 @@ fn hide_chain_continuation_prefix(leaf: &mut RenderBlock, bytes: &[u8]) {
 ///     ordered, marker char for unordered) — we look up the smallest
 ///     `List` node in `tree` that owns this item via its
 ///     `marker_range`.
-///
-/// Synthetic empty leaves emitted by `inject_empty_paragraphs` use
-/// this so they carry the same chain a parsed leaf at the same byte
-/// would; the render-walker's BQ-emitted synth (in
-/// `render_blockquote`) uses it for the same reason — its
-/// "built-up-while-walking" `child_chain` doesn't see deeper
-/// containers like an inner list-item that `analysis` recognizes via
-/// `effective_node_end` extension.
 fn chain_for_position(
     tree: &[SyntaxNode],
     source: &str,

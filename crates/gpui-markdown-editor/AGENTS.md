@@ -240,26 +240,27 @@ D, the corresponding unit is `\n[prefix]\n[prefix]` where `[prefix] =
 
 The same rules drop out across the editor:
 
-- **Soft-break promotion is depth-aware.** A stray `\n` is exempt
-  from promotion only if it's part of a complete pair (the new
-  `is_paragraph_break_interior` recognizes the alternation `\n
-  [prefix] \n [prefix]…` and forbids interior bytes accordingly). Any
-  other lone mid-content `\n` — soft breaks across BQ lines, lazy
-  continuations — is promoted: `enforce_invariants` inserts
-  `[prefix(D)]\n[prefix(D - existing)]` after the offending `\n` so
-  the result is a complete depth-D pair. Lazy continuations with
-  hard breaks are normalized the same way (the missing prefix is
-  inserted on the continuation line). The chat renderer's
-  CommonMark soft-break-as-soft-break rendering does diverge from
-  the editor's promote-everything rule on paste — that's the only
-  pixel-fidelity cost of the simpler invariant.
-- **Atomic pair delete.** Backspace at the *end* of a depth-D pair
-  removes all `2 + 4D` bytes in one keystroke; Delete-forward at the
-  *start* does the symmetric delete. Both subsume the old
-  top-level `\n\n` delete and the (now removed) blockquote-pop logic
-  under one rule. Inside fenced code-block content `\n`s are
-  literal — the pair detector is bypassed there, falling through to
-  grapheme delete.
+- **Soft-break promotion is chain-aware.** A stray `\n` is exempt
+  from promotion only if it's part of a complete pair (the
+  forbidden-position detector recognizes the chain-aware pair shape
+  `\n{blank_prefix}\n{content_prefix}` from `chain_pair_shape` and
+  forbids interior bytes accordingly). Any other lone mid-content
+  `\n` — soft breaks across BQ lines, lazy continuations — is
+  promoted: `enforce_invariants` inserts the missing prefix bytes
+  per `chain_continuation_prefix` so the result is a complete pair
+  for the cursor's chain. The chat renderer's CommonMark
+  soft-break-as-soft-break rendering does diverge from the editor's
+  promote-everything rule on paste — that's the only pixel-fidelity
+  cost of the simpler invariant.
+- **Atomic pair delete.** Backspace at the *end* of a chain-aware
+  pair removes the whole pair in one keystroke; Delete-forward at
+  the *start* does the symmetric delete. The pair shape is whatever
+  `chain_pair_shape(chain)` produces for the cursor's chain — symmetric
+  `\n{prefix}\n{prefix}` for chains ending in BQ, asymmetric
+  `\n{blank}\n{content}` for chains with BQ trailed by LIs, or
+  `\n\n{indent}` for chains with no BQ. Inside fenced code-block
+  content `\n`s are literal — the pair detector is bypassed there,
+  falling through to grapheme delete.
 - **Blockquote-aware Enter and Shift+Enter.** `editor::enter` parses,
   finds the deepest blockquote at the cursor, and inserts `\n` +
   `"> " × D` + `\n` + `"> " × D`. `editor::shift_enter` inserts
@@ -272,6 +273,77 @@ The same rules drop out across the editor:
   unless the cursor is sitting on the byte right after that specific
   `>` — the user may be about to type the space themselves. Code
   content is exempt, same gate as soft-break promotion.
+
+### Chain-aware invariants (the helper family)
+
+The depth-D-pair invariants above are special cases of a more general
+rule: every byte sequence that "introduces" a continuation line in a
+nested chain is built by walking the chain outermost-first, emitting
+the per-container prefix (LI indent, BQ marker) in chain order. So a
+chain `[LI(2), BQ, LI(2), BQ]` produces `"  >   > "` — outer-LI indent,
+outer BQ marker, inner-LI indent, inner BQ marker.
+
+`analysis.rs` exposes a small canonical helper family. **Use these —
+don't compute prefixes locally.** Reaching for raw `\n` boundaries or
+hand-built `"> "` strings in a chain-aware context is a bug; we've
+fixed several of those by migrating to these helpers.
+
+| Helper | Use when… |
+|--------|----------|
+| `chain_continuation_prefix(chain)` | You need the bytes that introduce a continuation line for the cursor's chain (Enter inserts, Shift+Enter inserts, soft-break promotion, render's chain-aware hide pass). |
+| `chain_continuation_prefix_bytes(chain)` | Same byte-length without allocating. |
+| `chain_outer_prefix_bytes(chain)` | The byte count contributed by every container *above* the innermost — the offset to insert / strip indent at without disturbing outer markers (Tab indent insertion, Shift+Tab dedent strip). |
+| `chain_pair_shape(chain) -> (blank, content)` | You're emitting or recognizing a structural pair. The pair shape is always `\n{blank}\n{content}`; three branches collapse into one tuple: chain ends in BQ → symmetric, BQ trailed by LIs → asymmetric, no BQ → `("", full)`. |
+
+These helpers power: `enter_insertion`, `line_break_insertion`, soft-break
+promotion in `update.rs`, `list_item_indent_edits`, `list_item_dedent_edits`,
+`build_depth_decrease_edit`, atomic pair-delete (`pair_at_end_for_chain`),
+forbidden-position detection (`is_chain_pair_interior`), and on the render
+side `chain_for_position`, `hide_chain_continuation_prefix`, and
+`merge_hard_break_continuations`. New chain-aware code should funnel
+through them; if a future call site needs a *new* shape variant, add it
+here with the same naming pattern.
+
+The cursor walker `analysis::enclosing_containers_at` is similarly the
+single source of truth for "what containers enclose byte X". The render
+walker's `chain_for_position` delegates to it so the two analyses can
+never disagree.
+
+### Render walker pipeline
+
+`render::render` is structured as a pipeline, not a tree walk. After the
+recursive `render_node` walk produces a flat `Vec<RenderBlock>`, several
+post-passes run in a specific order to refine the spec. The order is
+load-bearing; reorder only with care.
+
+```text
+1. recursive walk (render_node → render_paragraph / render_blockquote /
+   render_list / render_list_item / render_code_block / render_heading)
+2. inject_empty_paragraphs   — synth empty Paragraph leaves for trailing
+                                positions and inter-block paragraph
+                                breaks pulldown didn't claim. Each
+                                synth's chain comes from
+                                `chain_for_position`.
+3. merge_hard_break_continuations  — when pulldown splits a `  \n`
+                                      hard break followed by a trailing
+                                      line of pure chain-continuation
+                                      prefix into two blocks, merge
+                                      them so the visual matches the
+                                      with-content case.
+4. hide_chain_continuation_prefix (per block) — final chain-driven
+                                                 hide pass that catches
+                                                 alternating-chain
+                                                 prefix bytes the
+                                                 per-container hides
+                                                 miss.
+5. merge_hidden_ranges (per block) — normalize the per-block
+                                      `hidden_ranges` into a sorted,
+                                      non-overlapping list.
+```
+
+New passes that fix follow-on bugs slot into this list with a clear
+rationale. The doc comment on `render::render` carries this same list
+in code; keep both in sync.
 
 ## Module map
 
