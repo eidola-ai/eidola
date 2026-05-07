@@ -1669,16 +1669,17 @@ fn soft_break_inside_item_promotes_to_hard_break(cx: &mut TestAppContext) {
 #[gpui::test]
 fn ordered_marker_widening_reindents_continuations(cx: &mut TestAppContext) {
     // Marker `9.` (2 chars + space = 3 bytes) becomes `10.`
-    // (3 chars + space = 4 bytes). The continuation indent must
-    // grow from 3 to 4 spaces. Tested via direct buffer state to
-    // avoid having to drive the actual marker edit through the
-    // editor.
+    // (3 chars + space = 4 bytes). The continuation indent on
+    // item 10 must grow from 3 to 4 spaces. Tested via a 2-item
+    // list (start=9) so the split-orphan renumbering heuristic
+    // (which renumbers single-item start>1 lists to start at 1)
+    // doesn't intrude on this fixture.
     let initial = EditorState {
-        markdown: "10. foo  \n   bar".into(),
+        markdown: "9. nine\n10. foo  \n   bar".into(),
         selection: Selection::Cursor(0),
     };
     let final_state = run_enforce_invariants(cx, initial);
-    assert_eq!(final_state.markdown, "10. foo  \n    bar");
+    assert_eq!(final_state.markdown, "9. nine\n10. foo  \n    bar");
 }
 
 #[gpui::test]
@@ -1842,16 +1843,19 @@ fn two_hard_breaks_in_blockquote_become_bq_paragraph_pair(cx: &mut TestAppContex
 
 #[gpui::test]
 fn two_hard_breaks_in_list_item_create_paragraph_break(cx: &mut TestAppContext) {
-    // Pulldown then sees one item with two paragraphs ("foo" and
-    // "bar"). The indent between the `\n`s stays — pulldown is
-    // happy either with `\n\n  ` or `\n  \n  `, both parse the
-    // same.
+    // Pulldown sees one item with two paragraphs ("foo" and
+    // "bar"). After collapse_consecutive_hard_breaks drops both
+    // hard-break markers, the residual blank-line whitespace is
+    // also stripped (cursor at byte 0 — far from the blank line —
+    // so the cursor-in-gap guard doesn't fire), producing the
+    // strictly-canonical paragraph-break shape `\n\n   ` rather
+    // than `\n  \n  `.
     let initial = EditorState {
         markdown: "- foo  \n    \n  bar".into(),
         selection: Selection::Cursor(0),
     };
     let final_state = run_enforce_invariants(cx, initial);
-    assert_eq!(final_state.markdown, "- foo\n  \n  bar");
+    assert_eq!(final_state.markdown, "- foo\n\n  bar");
 }
 
 #[gpui::test]
@@ -1869,9 +1873,11 @@ fn shift_enter_twice_inside_list_item_creates_paragraph_break(cx: &mut TestAppCo
     editor.read_with(cx, |e, _| {
         // After the second Shift+Enter the buffer is
         // `- foo  \n    \n  ` — two consecutive hard breaks. The
-        // collapse pass drops both trailing-`  `s, producing
-        // `- foo\n  \n  `.
-        assert_eq!(e.state.markdown, "- foo\n  \n  ");
+        // collapse pass drops both trailing-`  `s. The blank line
+        // *between* the breaks (not the trailing one — cursor sits
+        // there) gets its residual whitespace stripped, producing
+        // the strictly-canonical `- foo\n\n  ` paragraph break.
+        assert_eq!(e.state.markdown, "- foo\n\n  ");
     });
 }
 
@@ -2579,18 +2585,18 @@ fn shift_enter_at_end_of_list_item_with_following_item(cx: &mut TestAppContext) 
     editor.read_with(cx, |e, _| {
         // Two Shift+Enters → paragraph break inside the item.
         // "A" is the start of item 1's second paragraph at the
-        // canonical 3-space indent. The source isn't strictly
-        // canonical (`\n   \n` blank-with-whitespace between
-        // paragraphs and a tight separator before item 2) —
-        // pulldown parses this identically to the
-        // strictly-canonical `1. Item one\n\n   A\n\n2. Item two`,
-        // so item 1 still renders with two paragraphs and item 2
-        // is a proper sibling. Tightening the residual whitespace
-        // in source is a follow-up canonicalization; the bug
-        // report's load-bearing complaint — "A" with the wrong
-        // indent — is resolved by the cursor-aware
-        // `consecutive_hard_break_edits` skip.
-        assert_eq!(e.state.markdown, "1. Item one\n   \n   A\n2. Item two");
+        // canonical 3-space indent. The cursor-aware blank-line
+        // tightening pass strips the residual whitespace from the
+        // blank line between the two paragraphs once the cursor
+        // moves off it (here, "A" is typed at the cursor's parked
+        // position, leaving the *previous* blank line free for
+        // canonicalization). The result is the strictly-canonical
+        // `1. Item one\n\n   A\n2. Item two` paragraph-break shape
+        // pulldown would parse identically. The separator with
+        // item 2 is still tight (`\n2.` rather than `\n\n2.`) —
+        // that's the documented inter-item tightening rule kept
+        // unchanged.
+        assert_eq!(e.state.markdown, "1. Item one\n\n   A\n2. Item two");
         // Verify the parse: item 1 has two paragraph leaves
         // (depth 1), item 2 has one (depth 1).
         let spec = e.render_spec();
@@ -2648,6 +2654,57 @@ fn empty_item_with_only_extra_trailing_spaces_is_left_alone(cx: &mut TestAppCont
     };
     let final_state = run_enforce_invariants(cx, initial);
     assert_eq!(final_state.markdown, "- foo\n-  ");
+}
+
+#[gpui::test]
+fn extra_marker_spacing_preserved_when_cursor_in_gap(cx: &mut TestAppContext) {
+    // The user typed `- ` then a *second* space and the cursor sits
+    // between the two spaces. Stripping the extra space would jerk
+    // the cursor backward mid-typing — unwanted. The cursor-in-gap
+    // guard preserves the source until the cursor moves away.
+    let initial = EditorState {
+        markdown: "-  foo".into(),
+        selection: Selection::Cursor(2),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "-  foo");
+    // Cursor at the content edge (past the gap): legitimate "fix
+    // it" cursor position. Strip fires.
+    let initial = EditorState {
+        markdown: "-  foo".into(),
+        selection: Selection::Cursor(6),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "- foo");
+}
+
+// ---- Residual whitespace tightening (cursor-aware) -----------------
+
+#[gpui::test]
+fn residual_blank_line_whitespace_is_stripped(cx: &mut TestAppContext) {
+    // A multi-paragraph item whose paragraph break carries indent
+    // residue (`\n   \n`) gets canonicalized to a strict `\n\n`
+    // when no cursor sits on the blank line. Pulldown parses both
+    // forms identically; the strip is purely source-cleanliness.
+    let initial = EditorState {
+        markdown: "1. one\n   \n   two".into(),
+        selection: Selection::Cursor(0),
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "1. one\n\n   two");
+}
+
+#[gpui::test]
+fn residual_blank_line_preserved_when_cursor_parked_there(cx: &mut TestAppContext) {
+    // The blank-line residue is also the transient post-Shift+Enter
+    // shape. With the cursor parked on the blank line, stripping
+    // the indent would yank the cursor to column zero — wrong.
+    let initial = EditorState {
+        markdown: "1. one\n   \n   two".into(),
+        selection: Selection::Cursor(10), // end of "   " on the blank line
+    };
+    let final_state = run_enforce_invariants(cx, initial);
+    assert_eq!(final_state.markdown, "1. one\n   \n   two");
 }
 
 // ---- Ordered-list renumbering --------------------------------------
@@ -2802,5 +2859,657 @@ fn tab_preserves_continuation_lines_under_new_indent(cx: &mut TestAppContext) {
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
         assert_eq!(e.state.markdown, "- one\n  - two  \n    cont");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Nesting stress corpus
+//
+// Scenarios called out in the architectural review's response document
+// (`gpui-markdown-editor-review-response.md`, refinement E). Each test
+// exercises one nesting interaction the per-construct tests above don't
+// cover: alternating-container nesting (BQ-in-list-in-BQ-in-list and
+// reversed), code blocks inside containers, multi-paragraph items
+// holding nested lists, and the depth-change gestures (Tab / Shift+Tab /
+// empty-Enter / Backspace-at-start) at every level.
+//
+// These read like ordinary behavior tests rather than a parameterized
+// corpus on purpose — when one fails, the diagnostic is "this exact
+// nesting interaction broke" with full source, action sequence, and
+// expected shape inline. A future case added to this section is one
+// `#[gpui::test]` away.
+// ---------------------------------------------------------------------------
+//
+// ---- Container nesting --------------------------------------------------
+
+/// Helper: count `Container::ListItem` entries in a block's chain.
+fn list_item_depth(b: &gpui_markdown_editor::RenderBlock) -> usize {
+    b.containers
+        .iter()
+        .filter(|c| matches!(c, Container::ListItem { .. }))
+        .count()
+}
+
+/// Helper: count `Container::BlockQuote` entries in a block's chain.
+fn blockquote_depth(b: &gpui_markdown_editor::RenderBlock) -> usize {
+    b.containers
+        .iter()
+        .filter(|c| matches!(c, Container::BlockQuote { .. }))
+        .count()
+}
+
+#[gpui::test]
+fn bq_inside_list_inside_bq_inside_list_renders_with_full_chain(cx: &mut TestAppContext) {
+    // The 4-level alternating nesting. Each leaf carries the
+    // outermost-first chain `[ListItem, BlockQuote, ListItem,
+    // BlockQuote]` at the deepest leaf. Editor must keep the
+    // rendered chain consistent with the source structure rather
+    // than mis-attributing to a flatter container model.
+    let initial = EditorState {
+        markdown: "- > - > deepest".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let leaves: Vec<&gpui_markdown_editor::RenderBlock> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.kind, BlockKind::Paragraph))
+        .collect();
+    assert!(
+        !leaves.is_empty(),
+        "expected at least one paragraph leaf in deeply nested BQ/list",
+    );
+    // The deepest leaf carries 2 ListItem entries + 2 BlockQuote
+    // entries.
+    let deepest = leaves
+        .iter()
+        .max_by_key(|b| b.containers.len())
+        .copied()
+        .unwrap();
+    assert_eq!(list_item_depth(deepest), 2);
+    assert_eq!(blockquote_depth(deepest), 2);
+}
+
+#[gpui::test]
+fn list_inside_bq_inside_list_inside_bq_renders_with_full_chain(cx: &mut TestAppContext) {
+    // The reverse alternating nesting — outer BQ, then a list
+    // item, then a nested BQ, then a list inside it.
+    let initial = EditorState {
+        markdown: "> - > - deepest".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let deepest = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.kind, BlockKind::Paragraph))
+        .max_by_key(|b| b.containers.len())
+        .unwrap();
+    assert_eq!(list_item_depth(deepest), 2);
+    assert_eq!(blockquote_depth(deepest), 2);
+}
+
+#[gpui::test]
+fn triple_nested_list_carries_three_list_item_entries(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- one\n  - two\n    - three".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let depths: Vec<usize> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .map(list_item_depth)
+        .collect();
+    assert_eq!(depths, vec![1, 2, 3]);
+}
+
+// ---- Code blocks inside containers --------------------------------------
+
+#[gpui::test]
+fn code_block_inside_list_carries_list_item_chain(cx: &mut TestAppContext) {
+    // A fenced code block as a list item's child. The CodeBlock
+    // leaf must carry the enclosing `Container::ListItem` so the
+    // element layer applies list indent / chrome.
+    let initial = EditorState {
+        markdown: "- ```\n  code\n  ```".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let code_leaf = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
+        .expect("expected one CodeBlock leaf inside the list item");
+    assert_eq!(list_item_depth(code_leaf), 1);
+}
+
+#[gpui::test]
+fn code_block_inside_bq_carries_blockquote_chain(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "> ```\n> code\n> ```".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let code_leaf = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
+        .expect("expected one CodeBlock leaf inside the blockquote");
+    assert_eq!(blockquote_depth(code_leaf), 1);
+}
+
+#[gpui::test]
+fn code_block_inside_bq_inside_list_carries_both_chains(cx: &mut TestAppContext) {
+    // Code in BQ in list. Leaf chain should carry one ListItem
+    // and one BlockQuote.
+    let initial = EditorState {
+        markdown: "- > ```\n  > code\n  > ```".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let code_leaf = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
+        .expect("expected one CodeBlock leaf inside BQ inside list");
+    assert_eq!(list_item_depth(code_leaf), 1);
+    assert_eq!(blockquote_depth(code_leaf), 1);
+}
+
+#[gpui::test]
+fn code_block_inside_list_inside_bq_carries_both_chains(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "> - ```\n>   code\n>   ```".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let code_leaf = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
+        .expect("expected one CodeBlock leaf inside list inside BQ");
+    assert_eq!(list_item_depth(code_leaf), 1);
+    assert_eq!(blockquote_depth(code_leaf), 1);
+}
+
+#[gpui::test]
+fn enter_inside_code_inside_list_inserts_single_newline(cx: &mut TestAppContext) {
+    // The fenced-code rule (Enter inserts `\n` rather than the
+    // surrounding scope's paragraph break) must still take
+    // precedence over the list-item routing when code lives inside
+    // a list item.
+    let initial = EditorState {
+        markdown: "- ```\n  code\n  ```".into(),
+        selection: Selection::Cursor(11), // mid-content on `code` line
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // Single `\n` inserted; the list-item next-marker rule
+        // doesn't fire inside code content.
+        assert!(e.state.markdown.contains("```\n  cod\n"));
+    });
+}
+
+// ---- Multi-paragraph items containing a nested list ----------------------
+
+#[gpui::test]
+fn multi_paragraph_item_with_nested_list_renders_three_leaves(cx: &mut TestAppContext) {
+    // `1. p1\n\n   p2\n\n   - nested` — item 1 has two paragraph
+    // children plus a nested unordered list. The render walker
+    // must emit one leaf per paragraph child *and* one leaf for
+    // the nested list's item, all carrying the outer item's
+    // ListItem chain entry.
+    let initial = EditorState {
+        markdown: "1. p1\n\n   p2\n\n   - nested".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let item_leaves: Vec<&gpui_markdown_editor::RenderBlock> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .collect();
+    // Two outer-paragraph leaves + one nested-item leaf.
+    assert_eq!(item_leaves.len(), 3);
+    let depths: Vec<usize> = item_leaves.iter().map(|b| list_item_depth(b)).collect();
+    assert_eq!(depths, vec![1, 1, 2]);
+}
+
+// ---- Tab at every nesting level ------------------------------------------
+
+#[gpui::test]
+fn tab_at_depth_2_nests_to_depth_3(cx: &mut TestAppContext) {
+    // Existing depth-2 nest with a sibling at depth 2 → Tab pushes
+    // sibling to depth 3.
+    let initial = EditorState {
+        markdown: "- one\n  - two\n  - three".into(),
+        selection: Selection::Cursor(20), // inside "three"
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- one\n  - two\n    - three");
+    });
+}
+
+#[gpui::test]
+#[ignore = "known bug: Tab inside a BQ-list inserts indent before the `> ` marker, splitting the BQ scope"]
+fn tab_inside_blockquote_list_nests_within_blockquote(cx: &mut TestAppContext) {
+    // List inside a BQ. Tab on the second item should nest it
+    // inside the first — the BQ scope must be preserved on every
+    // continuation line. **Currently the indent insertion uses
+    // raw byte line-starts and inserts ahead of the `> ` BQ
+    // marker, producing `  > - two` instead of `>   - two`**, so
+    // the BQ scope is broken.
+    //
+    // The corpus exposes this; the fix lives in
+    // `analysis::list_item_indent_edits`'s line-start computation,
+    // which needs to walk past the active container-prefix bytes
+    // before inserting indent.
+    let initial = EditorState {
+        markdown: "> - one\n> - two".into(),
+        selection: Selection::Cursor(13), // inside "two"
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> - one\n>   - two");
+    });
+}
+
+// ---- Shift+Tab at every nesting level ------------------------------------
+
+#[gpui::test]
+fn shift_tab_at_depth_3_dedents_to_depth_2(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- one\n  - two\n    - three".into(),
+        selection: Selection::Cursor(22),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftTab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- one\n  - two\n  - three");
+    });
+}
+
+#[gpui::test]
+fn shift_tab_at_top_level_inside_blockquote_becomes_paragraph_in_bq(cx: &mut TestAppContext) {
+    // Top-level item inside a blockquote: Shift+Tab makes it a
+    // paragraph in the BQ scope, with the depth-1 pair shape
+    // (`\n> \n> `) ahead of it rather than a top-level `\n\n`.
+    let initial = EditorState {
+        markdown: "> - one\n> - two".into(),
+        selection: Selection::Cursor(13), // inside "two"
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftTab);
+    editor.read_with(cx, |e, _| {
+        // The marker is dropped and the leading separator
+        // becomes a depth-1 pair so the result stays inside the
+        // BQ.
+        assert_eq!(e.state.markdown, "> - one\n> \n> two");
+    });
+}
+
+// ---- Empty-Enter at every nesting level ----------------------------------
+
+#[gpui::test]
+fn empty_enter_on_top_level_item_becomes_paragraph(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- one\n- ".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // The empty item drops; cursor lands at a fresh empty
+        // paragraph after the surviving item.
+        assert_eq!(e.state.markdown, "- one\n\n");
+    });
+}
+
+#[gpui::test]
+fn empty_enter_on_apparent_nested_empty_item_creates_outer_sibling(cx: &mut TestAppContext) {
+    // Edge case the corpus surfaces: pulldown doesn't open a
+    // nested list for an *empty* `  - ` marker line — it needs
+    // content to register as a nested list. So the source
+    // `- one\n  - ` with the cursor at the apparent inner-marker
+    // position is parsed by pulldown as the *outer* item with
+    // continuation content, not as an empty nested item.
+    //
+    // Empty-Enter therefore can't see "inner empty item to exit"
+    // and falls through to `enter_insertion`, which inserts the
+    // outer-level next-sibling marker. The result is a new outer
+    // sibling, leaving the apparent-nested-marker line in place
+    // as continuation text — different from the visual intent
+    // ("exit the nested level"), but consistent with what
+    // pulldown sees.
+    //
+    // Documenting the boundary here so future implementations
+    // that open a list-for-empty-marker (or that apply a
+    // pre-parse heuristic to recognize the inner marker) have a
+    // landing pad for the regression test.
+    let initial = EditorState {
+        markdown: "- one\n  - ".into(),
+        selection: Selection::Cursor(10),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- one\n  - \n- ");
+    });
+}
+
+#[gpui::test]
+fn empty_enter_on_top_level_item_inside_blockquote_stays_in_bq(cx: &mut TestAppContext) {
+    // Empty Enter on a depth-1 item inside a BQ should leave the
+    // BQ scope intact while ending the list — depth-1 pair shape
+    // ahead of the new paragraph.
+    let initial = EditorState {
+        markdown: "> - one\n> - ".into(),
+        selection: Selection::Cursor(12),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // The empty item drops and a depth-1 paragraph break
+        // takes its place — the rest of the BQ stays intact.
+        assert!(e.state.markdown.starts_with("> - one"));
+        assert!(e.state.markdown.contains("\n> \n> "));
+    });
+}
+
+// ---- Backspace-at-start at every nesting level ---------------------------
+
+#[gpui::test]
+fn backspace_at_start_of_top_level_item_makes_paragraph(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- one".into(),
+        selection: Selection::Cursor(2), // right after the marker
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // Marker is dropped; the line becomes a paragraph at top
+        // level.
+        assert_eq!(e.state.markdown, "one");
+    });
+}
+
+#[gpui::test]
+fn backspace_at_start_of_nested_item_dedents_to_outer(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- one\n  - two".into(),
+        selection: Selection::Cursor(10), // right after the inner marker
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // The inner marker stays — Backspace at the marker end of
+        // a nested item strips parent-marker-width leading
+        // spaces, dedenting the item by one level.
+        assert_eq!(e.state.markdown, "- one\n- two");
+    });
+}
+
+#[gpui::test]
+fn enter_past_post_list_separator_does_not_reanimate_list(cx: &mut TestAppContext) {
+    // User-reported scenario:
+    //
+    //   1. asdf
+    //   <blank>
+    //   |               <-- cursor on the third visual row
+    //
+    // Built by typing `1. asdf` then Enter twice (the second Enter
+    // is the empty-item exit). Cursor lands at the end of buffer
+    // `1. asdf\n\n`. A third Enter used to *re-enter the list*
+    // and restore `1. asdf\n2. ` — pulldown's list range includes
+    // the trailing `\n\n` separator, so the chain walker (with a
+    // raw range.end == cursor boundary check) saw the list as
+    // still containing the cursor.
+    //
+    // The architectural fix trims trailing `\n\n` (or longer
+    // separator runs) from List / ListItem / BlockQuote ranges
+    // before testing containment. Cursor 9 in `1. asdf\n\n` is
+    // past the trimmed list end (7), so the chain is empty and
+    // Enter routes through the default top-level paragraph break.
+    //
+    // The expected post-Enter shape is `1. asdf\n\n\n\n` — the
+    // original list, an empty paragraph, and a fresh row for the
+    // cursor. The list survives unchanged.
+    let initial = EditorState {
+        markdown: "1. asdf".into(),
+        selection: Selection::Cursor(7),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "1. asdf\n2. "));
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "1. asdf\n\n"));
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. asdf\n\n\n\n");
+        // Cursor at the end so the user can keep typing on the
+        // fresh row.
+        assert_eq!(e.state.selection, Selection::Cursor(11));
+    });
+}
+
+#[gpui::test]
+fn split_list_renumbers_trailing_orphan_to_one(cx: &mut TestAppContext) {
+    // User-reported scenario:
+    //   1. one
+    //   2. |two              <-- cursor after the "2. " marker
+    //   3. three
+    //
+    // Backspace dedents item 2 to a paragraph, splitting the
+    // ordered list. The trailing portion ("3. three") used to
+    // keep its original number — pulldown reports the new
+    // standalone list with `start=3` and the source preserves the
+    // `3. ` marker, leaving the user with a leftover-numbered
+    // orphan list.
+    //
+    // The split-orphan heuristic in `effective_list_start`
+    // recognizes that any single-item ordered list with `start>1`
+    // is almost always such a leftover from a list split (no user
+    // intentionally types or pastes a one-item list at start>1
+    // with the expectation that it stay there once the editor
+    // canonicalizes), and renumbers it to start at 1.
+    //
+    // The reordering of `enforce_invariants` (promote soft breaks
+    // *before* normalize_lists) is what makes the heuristic fire
+    // on the post-dedent buffer: before the soft break is
+    // promoted, pulldown sees `paragraph + lazy continuation`
+    // rather than `paragraph + standalone list`, so normalize
+    // wouldn't see the trailing list to renumber.
+    let initial = EditorState {
+        markdown: "1. one\n2. two\n3. three".into(),
+        selection: Selection::Cursor(10),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. one\n\ntwo\n\n1. three");
+    });
+}
+
+#[gpui::test]
+fn enter_at_start_of_paragraph_after_list_inserts_paragraph_break(cx: &mut TestAppContext) {
+    // Continuation of the split scenario. After the Backspace
+    // dedent the buffer is:
+    //
+    //   1. one
+    //
+    //   |two              <-- cursor at the start of "two"
+    //
+    //   1. three
+    //
+    // The cursor sits at byte 8, which is *also* the byte that
+    // closes the leading list (its range ends at the structural
+    // `\n\n`). Without the strict-over-boundary preference in
+    // `walk_chain`, the chain at cursor 8 included the leading
+    // list's `ListItem` entry, so Enter routed through the list
+    // and produced the next-sibling marker `\n2. ` — restoring
+    // the original list shape and undoing the Backspace.
+    //
+    // Strict containment (cursor < range.end) wins over boundary
+    // equality (cursor == range.end), so the cursor at the start
+    // of the paragraph is recognized as inside the paragraph, not
+    // the prior list. Enter inserts the top-level paragraph break.
+    let initial = EditorState {
+        markdown: "1. one\n\ntwo\n\n1. three".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. one\n\n\n\ntwo\n\n1. three");
+    });
+}
+
+#[gpui::test]
+fn backspace_at_marker_end_of_top_level_item_with_nested_child_strips_orphan_indent(
+    cx: &mut TestAppContext,
+) {
+    // User-reported flow. The original buffer:
+    //   1. level one
+    //   2. |level one          <-- cursor right after the marker
+    //      1. level three      <-- nested child of item 2
+    //
+    // Backspace at the cursor's marker-end is a top-level item
+    // dedent: drop the marker, leaving a paragraph in its place.
+    // The nested child line ("   1. level three") used to survive
+    // unchanged, leaving 3 spaces of leading whitespace that no
+    // longer corresponded to any container — pulldown then
+    // re-parsed it as a fresh top-level list with leftover
+    // indent. Subsequent operations on that orphaned source could
+    // crash apply_edits (overlapping edits in the same byte
+    // range).
+    //
+    // The fix strips the dedented item's marker_width worth of
+    // leading spaces from every continuation line, so the child
+    // line's indent dies along with the marker. Result: paragraph
+    // "level one" followed by a fresh, cleanly-aligned top-level
+    // list "1. level three".
+    let initial = EditorState {
+        markdown: "1. level one\n2. level one\n   1. level three".into(),
+        selection: Selection::Cursor(16),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown,
+            "1. level one\n\nlevel one\n\n1. level three",
+        );
+    });
+}
+
+#[gpui::test]
+fn backspace_then_enter_then_tab_sequence_does_not_crash(cx: &mut TestAppContext) {
+    // Regression for the crash in the user-reported sequence:
+    //
+    //   1. level one
+    //   2. |level one
+    //      1. level three
+    //
+    // followed by Backspace → Enter → Tab → Tab. Used to panic
+    // `apply_edits` because two passes emitted identical
+    // strip-the-blank-line edits at the same byte range, violating
+    // the non-overlap invariant.
+    //
+    // Three fixes in combination cover the flow:
+    //
+    // - The blank-line strip in `walk_item_content_lines` skips
+    //   blank lines that fall inside one of the item's nested
+    //   block children (the same guard the hard-break promoter
+    //   uses).
+    // - `list_item_dedent_edits`'s top-level branch strips the
+    //   dedented item's marker_width from continuation lines, so
+    //   nested-child indent doesn't survive as orphaned whitespace.
+    // - `walk_chain` prefers strict containment over boundary
+    //   equality, so the cursor at the start of the next-block
+    //   paragraph routes through the paragraph rather than the
+    //   list's range that ends at the same byte.
+    //
+    // The final state is a clean paragraph-and-list document:
+    // - Backspace dedents item 2; the orphaned nested child
+    //   becomes a fresh top-level list at start=1.
+    // - Enter at the start of "level one" paragraph emits the
+    //   top-level paragraph break (no longer treated as inside
+    //   item 1).
+    // - Tab on a paragraph cursor is a no-op (no list to nest in).
+    let initial = EditorState {
+        markdown: "1. level one\n2. level one\n   1. level three".into(),
+        selection: Selection::Cursor(16),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    dispatch(cx, handle, &editor, Enter);
+    dispatch(cx, handle, &editor, Tab);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown,
+            "1. level one\n\n\n\nlevel one\n\n1. level three",
+        );
+    });
+}
+
+#[gpui::test]
+fn tab_on_ordered_item_with_existing_nested_child_does_not_panic(cx: &mut TestAppContext) {
+    // Regression for the crash that surfaced as
+    //
+    //   panicked at update.rs: begin <= end (26 <= 13)
+    //
+    // Setup:
+    //   1. level one
+    //   2. level one|     <-- cursor here
+    //      1. level three
+    //
+    // Tab on item 2 should nest it under item 1, dragging the
+    // existing nested-child line ("   1. level three") with it
+    // to the new deeper indent so the child stays a child.
+    //
+    // The bug: `list_item_indent_edits` returned its edits in
+    // (line_starts in source order) followed by (the marker
+    // rewrite for the ordered item). For a multi-line ordered
+    // item, that left an unsorted edit list — pad-insert at the
+    // second line followed by a marker-rewrite at the first
+    // line. `apply_edits` walks edits expecting ascending
+    // range.start, so its `last` cursor advanced past the
+    // marker-rewrite's position, then hit the rewrite and tried
+    // to slice `markdown[last..earlier_start]` — panic.
+    //
+    // Fix: sort the edits by (range.start, range.end) before
+    // returning, so insertions at a position precede replacements
+    // at the same position. (`apply_edits` now also asserts the
+    // ordering in debug builds.)
+    let initial = EditorState {
+        markdown: "1. level one\n2. level one\n   1. level three".into(),
+        selection: Selection::Cursor(25),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        // Item 2 nested under item 1; nested-child line carried
+        // along to the new depth. Pulldown sees this as a
+        // 3-level deep ordered list — exactly the user's mental
+        // model after one Tab on the parent.
+        assert_eq!(
+            e.state.markdown,
+            "1. level one\n   1. level one\n      1. level three",
+        );
     });
 }

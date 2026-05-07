@@ -115,22 +115,48 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
 /// collapse two consecutive hard breaks into a paragraph break.
 /// Idempotent and cheap on already-clean states.
 pub fn enforce_invariants(state: EditorState) -> EditorState {
-    // Order matters: collapse two-hard-break-pairs *first*, because
-    // that's how a user-produced "Shift+Enter Shift+Enter" reaches
-    // its canonical paragraph-break form before any other pass
-    // looks at it. The list normalizer then sees a clean `\n\n`
-    // (not a paragraph break to be re-promoted as a hard break).
+    // Pass order:
+    //
+    // 1. `collapse_consecutive_hard_breaks` first, because a
+    //    user-produced "Shift+Enter Shift+Enter" reaches its
+    //    canonical paragraph-break form (`\n\n`) here. The list
+    //    normalizer then sees the clean shape, not a paragraph
+    //    break to be re-promoted as a hard break.
+    //
+    // 2. `promote_soft_breaks` *before* `normalize_lists`. A lone
+    //    mid-content `\n` at a paragraph→list (or list→paragraph,
+    //    or paragraph→paragraph) boundary needs to become `\n\n`
+    //    before pulldown's parse will reflect the structural
+    //    separation correctly. Running normalize_lists first on
+    //    the un-promoted buffer produces a parse where the
+    //    boundary block is misclassified (e.g. a list that should
+    //    be standalone is folded into the prior paragraph as
+    //    lazy continuation), so the list normalizer's per-list
+    //    rules — including the split-orphan renumber heuristic —
+    //    don't fire on the right structure.
+    //
+    // 3. `normalize_lists` last among list-affecting passes, on
+    //    the canonicalized buffer.
+    //
+    // 4. `normalize_blockquote_prefixes` is independent and runs
+    //    after the others.
     let state = collapse_consecutive_hard_breaks(state);
-    let state = normalize_lists(state);
     let state = promote_soft_breaks(state);
+    let state = normalize_lists(state);
     normalize_blockquote_prefixes(state)
 }
 
 /// Apply the list-canonicalization edits computed by
 /// [`analysis::list_normalization_edits`] in a single sweep, remapping
-/// the cursor through every splice.
+/// the cursor through every splice. Threads the live cursor positions
+/// in so per-rule guards (don't strip extra-marker-spacing while
+/// the user is mid-typing in the gap, …) can fire correctly.
 fn normalize_lists(state: EditorState) -> EditorState {
-    let edits = analysis::list_normalization_edits(&state.markdown);
+    let cursors: Vec<usize> = match state.selection {
+        Selection::Cursor(p) => vec![p],
+        Selection::Range { anchor, head } => vec![anchor, head],
+    };
+    let edits = analysis::list_normalization_edits(&state.markdown, &cursors);
     if edits.is_empty() {
         return state;
     }
@@ -150,6 +176,25 @@ fn collapse_consecutive_hard_breaks(state: EditorState) -> EditorState {
 }
 
 fn apply_edits(state: EditorState, edits: &[analysis::SourceEdit]) -> EditorState {
+    // Caller-supplied invariant: edits are ordered by `range.start`
+    // ascending, with insertions (zero-length ranges) preceding
+    // replacements at the same start. The walker below relies on
+    // this — `last` only ever moves forward — and a producer that
+    // skips the sort would panic the slice operation below with
+    // an unhelpful "begin <= end" message. Catch it here instead.
+    // Invariant: edits are non-overlapping and ordered such that
+    // each edit's range.end <= the next's range.start. Equality is
+    // allowed (an insertion at position N can immediately precede a
+    // replacement starting at N).
+    debug_assert!(
+        edits
+            .windows(2)
+            .all(|w| { w[0].range.end <= w[1].range.start }),
+        "edits passed to apply_edits must be non-overlapping and \
+         sorted such that each edit's range.end <= the next's range.start; got {:?}",
+        edits,
+    );
+
     // Edits are sorted by range.start. Rebuild the buffer
     // interleaving original slices with replacements; the cursor
     // remap walks the same edit sequence and accumulates the byte
