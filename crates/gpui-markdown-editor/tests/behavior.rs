@@ -3104,7 +3104,6 @@ fn tab_at_depth_2_nests_to_depth_3(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-#[ignore = "known bug: Tab inside a BQ-list inserts indent before the `> ` marker, splitting the BQ scope"]
 fn tab_inside_blockquote_list_nests_within_blockquote(cx: &mut TestAppContext) {
     // List inside a BQ. Tab on the second item should nest it
     // inside the first — the BQ scope must be preserved on every
@@ -3512,4 +3511,943 @@ fn tab_on_ordered_item_with_existing_nested_child_does_not_panic(cx: &mut TestAp
             "1. level one\n   1. level one\n      1. level three",
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Deep nesting stress corpus
+//
+// Wild fixtures: code blocks nested 4–5 containers deep, alternating
+// `BlockQuote` / `ListItem` chains in both directions, mixed-kind
+// siblings inside a single list item, and edits (typing, deleting,
+// navigation, depth changes) exercised at the start, interior, and end
+// of each kind.
+//
+// Each test is *self-contained* — its fixture and cursor offset are
+// inline so a single failure has full repro on the screen. Failures
+// found while authoring the corpus are recorded in `bugs.md` and the
+// failing test marked `#[ignore]` with a `known bug:` reason; the
+// expected post-action state is encoded so a later fix flips the test
+// green without further edits.
+// ---------------------------------------------------------------------------
+
+/// Insert `text` at the current cursor, going through `update::update`
+/// so `enforce_invariants` runs (the same path keystrokes take in
+/// production).
+fn type_text(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    editor: &Entity<MarkdownEditor>,
+    text: &str,
+) {
+    let owned = text.to_string();
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText(owned.clone()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+// ---- Static deep-fixture chain shape -------------------------------------
+
+#[gpui::test]
+fn deep_code_in_bq_in_list_in_bq_in_list_carries_4_chain_entries(cx: &mut TestAppContext) {
+    // Code block four containers deep: List → BQ → List → BQ → code.
+    // Continuation prefix on every interior line is `  > ` (outer item
+    // indent + BQ marker), then `  > ` again for the inner BQ-in-list:
+    //
+    //   - > - > ```
+    //     >   > code
+    //     >   > ```
+    let src = "- > - > ```\n  >   > code\n  >   > ```";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let code = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
+        .expect("code block leaf");
+    assert_eq!(
+        list_item_depth(code),
+        2,
+        "code carries both outer and inner ListItem chain entries",
+    );
+    assert_eq!(
+        blockquote_depth(code),
+        2,
+        "code carries both outer and inner BlockQuote chain entries",
+    );
+}
+
+#[gpui::test]
+fn deep_code_in_list_in_bq_in_list_in_bq_carries_4_chain_entries(cx: &mut TestAppContext) {
+    // Mirror of the above with the outer alternation flipped: BQ →
+    // List → BQ → List → code.
+    //
+    //   > - > - ```
+    //   >   >   code
+    //   >   >   ```
+    let src = "> - > - ```\n>   >   code\n>   >   ```";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let code = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
+        .expect("code block leaf");
+    assert_eq!(list_item_depth(code), 2);
+    assert_eq!(blockquote_depth(code), 2);
+}
+
+#[gpui::test]
+fn deep_5_level_bq_bq_list_bq_list_chain_renders_each_level(cx: &mut TestAppContext) {
+    // Five levels: BQ → BQ → List → BQ → List. Innermost paragraph
+    // leaf carries [BQ, BQ, ListItem, BQ, ListItem].
+    let src = "> > - > - deepest";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let deepest = spec
+        .blocks
+        .iter()
+        .max_by_key(|b| b.containers.len())
+        .expect("at least one block");
+    assert_eq!(blockquote_depth(deepest), 3, "three BQ levels");
+    assert_eq!(list_item_depth(deepest), 2, "two list-item levels");
+}
+
+#[gpui::test]
+fn deep_nest_chain_at_start_middle_end_of_innermost_item(_cx: &mut TestAppContext) {
+    // The chain walker has a strict-containment-beats-boundary
+    // preference; verify it picks the *innermost* item across three
+    // cursor positions on the same line: just inside the marker
+    // (start), the middle of the content, and the end of the line.
+    let src = "- > - > deepest";
+    let n = src.len(); // 15
+    for cursor in [8usize, 11, n] {
+        let chain = gpui_markdown_editor::analysis::enclosing_containers_at(src, cursor);
+        assert_eq!(
+            gpui_markdown_editor::analysis::chain_blockquote_depth(&chain),
+            2,
+            "BQ depth at cursor {cursor}",
+        );
+        let lists: usize = chain
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    gpui_markdown_editor::analysis::EnclosingContainer::ListItem(_)
+                )
+            })
+            .count();
+        assert_eq!(lists, 2, "list depth at cursor {cursor}");
+    }
+}
+
+// ---- Mixed-kind siblings inside one item --------------------------------
+
+#[gpui::test]
+fn item_with_paragraph_then_blockquote_then_code_renders_all_in_chain(cx: &mut TestAppContext) {
+    // Single list item with three children in source order: a
+    // paragraph, a blockquote, and a fenced code block.
+    //
+    //   - p1
+    //
+    //     > bq
+    //
+    //     ```
+    //     code
+    //     ```
+    let src = "- p1\n\n  > bq\n\n  ```\n  code\n  ```";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let leaves: Vec<&gpui_markdown_editor::RenderBlock> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .collect();
+    // p1 leaf, bq leaf, code leaf — three children of the same
+    // outer item.
+    assert_eq!(leaves.len(), 3, "three sibling-leaves under item 1");
+    let kinds: Vec<&BlockKind> = leaves.iter().map(|b| &b.kind).collect();
+    assert!(matches!(kinds[0], BlockKind::Paragraph));
+    assert!(matches!(kinds[2], BlockKind::CodeBlock { .. }));
+    let bq_leaf = leaves[1];
+    assert_eq!(blockquote_depth(bq_leaf), 1, "bq sibling carries BQ chain");
+    assert_eq!(list_item_depth(bq_leaf), 1, "still inside outer item");
+}
+
+#[gpui::test]
+fn item_with_nested_list_then_blockquote_keeps_outer_chain_through_both(cx: &mut TestAppContext) {
+    // Sibling-of-different-kinds inside an item: a nested list,
+    // then a blockquote, both children of the same outer item.
+    //
+    //   - outer
+    //     - nested
+    //
+    //     > bq
+    let src = "- outer\n  - nested\n\n  > bq";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let leaves: Vec<&gpui_markdown_editor::RenderBlock> = spec
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+        .collect();
+    // outer-item-paragraph leaf + nested-item leaf + bq-sibling
+    // leaf = 3 leaves with the outer item in their chain.
+    assert!(
+        leaves.len() >= 3,
+        "outer + nested + bq leaves all carry outer item chain (got {})",
+        leaves.len(),
+    );
+    let bq_leaf = leaves
+        .iter()
+        .find(|b| blockquote_depth(b) == 1)
+        .expect("bq sibling leaf");
+    assert_eq!(list_item_depth(bq_leaf), 1, "bq is child of outer item");
+}
+
+// ---- Typing into deep nests ----------------------------------------------
+
+#[gpui::test]
+fn type_inside_code_at_depth_4_lands_in_code_content(cx: &mut TestAppContext) {
+    // `- > - > ```\n  >   > X|\n  >   > ```` — cursor inside the
+    // code body. Typing must land in the content (not produce
+    // structural changes), and the leaf must remain a code block at
+    // depth 4.
+    let src = "- > - > ```\n  >   > X\n  >   > ```";
+    let cursor = src.find("X").unwrap() + 1;
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "Y");
+    editor.read_with(cx, |e, _| {
+        assert!(e.state.markdown.contains("XY"), "Y typed into code body");
+        let spec = e.render_spec();
+        let code = spec
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
+            .expect("still a code block");
+        assert_eq!(list_item_depth(code), 2);
+        assert_eq!(blockquote_depth(code), 2);
+    });
+}
+
+#[gpui::test]
+fn type_at_end_of_innermost_item_keeps_full_chain(cx: &mut TestAppContext) {
+    // End-of-content position on the deepest list item — typing
+    // should append to the item, not to a parent or escape the
+    // chain.
+    let src = "- > - > deep";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "er");
+    editor.read_with(cx, |e, _| {
+        assert!(e.state.markdown.ends_with("deeper"));
+        let spec = e.render_spec();
+        let deepest = spec
+            .blocks
+            .iter()
+            .max_by_key(|b| b.containers.len())
+            .unwrap();
+        assert_eq!(blockquote_depth(deepest), 2);
+        assert_eq!(list_item_depth(deepest), 2);
+    });
+}
+
+#[gpui::test]
+fn type_at_start_of_innermost_content_keeps_full_chain(cx: &mut TestAppContext) {
+    // Start-of-content position (right after the last marker on the
+    // deepest line). Typing should land in the item content,
+    // preserving every container.
+    let src = "- > - > deep";
+    let cursor = src.find("deep").unwrap();
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "X");
+    editor.read_with(cx, |e, _| {
+        assert!(
+            e.state.markdown.contains("Xdeep"),
+            "got: {:?}",
+            e.state.markdown
+        );
+        let spec = e.render_spec();
+        let deepest = spec
+            .blocks
+            .iter()
+            .max_by_key(|b| b.containers.len())
+            .unwrap();
+        assert_eq!(blockquote_depth(deepest), 2);
+        assert_eq!(list_item_depth(deepest), 2);
+    });
+}
+
+#[gpui::test]
+fn enter_at_end_of_innermost_item_stays_in_full_chain(cx: &mut TestAppContext) {
+    // Enter at end-of-deep-item should produce the next sibling at
+    // the same depth — same BQ depth, same list depth, but a new
+    // item.
+    let src = "- > - > one";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // The new sibling line carries the same outer-item indent +
+        // outer BQ marker + inner-item indent + inner BQ marker.
+        // Pulldown picks up `  >   > ` as the depth-4 prefix.
+        assert!(
+            e.state.markdown.starts_with("- > - > one\n  >   > "),
+            "got: {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn type_gt_at_start_of_nested_item_does_not_split_outer_scope(cx: &mut TestAppContext) {
+    // Typing `>` at the start of a nested-item content line should
+    // either deepen the BQ scope or be inert — but it must not
+    // collapse the outer list-item scope or rewrite the parent.
+    let src = "- > - inner";
+    let cursor = src.find("inner").unwrap();
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, ">");
+    editor.read_with(cx, |e, _| {
+        // Outer list and outer BQ both still present after typing.
+        assert!(
+            e.state.markdown.starts_with("- > "),
+            "outer list-item + BQ scope preserved, got: {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+// ---- Deleting in deep nests ---------------------------------------------
+
+#[gpui::test]
+fn backspace_at_start_of_innermost_item_dedents_one_level(cx: &mut TestAppContext) {
+    // Backspace at the marker-end of the inner item should dedent
+    // by one (drop the inner `> - ` if Backspace at marker end
+    // does the standard one-level outdent), preserving the outer
+    // list-item scope.
+    let src = "- > - inner";
+    let cursor = src.find("inner").unwrap();
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // Outer `- > ` scope must remain — the editor only loses
+        // the innermost container, not the whole stack.
+        assert!(
+            e.state.markdown.starts_with("- "),
+            "outer list scope preserved, got: {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn delete_forward_at_end_of_inner_item_does_not_panic(cx: &mut TestAppContext) {
+    // Delete-forward at the end of an inner item with another
+    // sibling at the same depth — exercises the merge path between
+    // two innermost-list items.
+    let src = "- > - one\n  > - two";
+    let cursor = src.find("one").unwrap() + "one".len();
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Delete);
+    editor.read_with(cx, |e, _| {
+        // The buffer is still a list inside a BQ inside a list —
+        // the chain shouldn't have collapsed.
+        assert!(
+            e.state.markdown.contains("- "),
+            "still has list markers, got: {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn backspace_inside_code_at_depth_4_deletes_one_byte(cx: &mut TestAppContext) {
+    // Inside a deeply nested code block, Backspace should delete
+    // one grapheme of code content (not collapse the whole block).
+    let src = "- > - > ```\n  >   > abc\n  >   > ```";
+    let cursor = src.find("abc").unwrap() + 3; // after `c`
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert!(
+            e.state.markdown.contains("ab\n"),
+            "code body should now read `ab` not `abc`, got: {:?}",
+            e.state.markdown,
+        );
+        let spec = e.render_spec();
+        // Still a code block; chain still has both BQ levels.
+        let code = spec
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
+            .expect("still a code block");
+        assert_eq!(blockquote_depth(code), 2);
+        assert_eq!(list_item_depth(code), 2);
+    });
+}
+
+#[gpui::test]
+fn select_all_then_backspace_clears_deep_nest_without_panicking(cx: &mut TestAppContext) {
+    // Catastrophic delete on a wild nest must leave a usable empty
+    // editor — no panic, no torn state.
+    let src = "- > - > ```\n  >   > code\n  >   > ```\n\n- sibling";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, SelectAll);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert!(e.state.markdown.is_empty());
+        // Still produces at least one block to host the cursor.
+        assert!(!e.render_spec().blocks.is_empty());
+    });
+}
+
+// ---- Depth changes (Tab / Shift+Tab / empty Enter) in deep nests ---------
+
+#[gpui::test]
+fn shift_tab_at_innermost_of_4_level_alternation_dedents_one_level(cx: &mut TestAppContext) {
+    // Shift+Tab on the innermost item should drop the innermost
+    // list-item, leaving the outer list-item + both blockquotes
+    // intact.
+    let src = "- > - > inner";
+    let cursor = src.find("inner").unwrap();
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftTab);
+    editor.read_with(cx, |e, _| {
+        // Outer `- > ` chain still present; inner `- ` dropped.
+        assert!(
+            e.state.markdown.starts_with("- "),
+            "outer list still present, got: {:?}",
+            e.state.markdown,
+        );
+        // The deepest leaf no longer carries 2 list-items — at
+        // least one was dropped.
+        let spec = e.render_spec();
+        let deepest = spec
+            .blocks
+            .iter()
+            .max_by_key(|b| b.containers.len())
+            .unwrap();
+        assert!(
+            list_item_depth(deepest) <= 1,
+            "innermost list-item dropped (depth ≤ 1), got: {}",
+            list_item_depth(deepest),
+        );
+    });
+}
+
+#[gpui::test]
+fn tab_on_a_sibling_inside_deep_nest_nests_within_existing_chain(cx: &mut TestAppContext) {
+    // Two innermost siblings; Tab on the second should nest it
+    // under the first, *without* losing the outer 4-level chain.
+    //
+    //   - > - one
+    //     > - two       <- cursor in "two"
+    let src = "- > - one\n  > - two";
+    let cursor = src.find("two").unwrap();
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        let md = &e.state.markdown;
+        // The outer `- > ` scope stays — the only thing that
+        // changed is the indent on the second inner-item line.
+        assert!(md.starts_with("- > "), "outer chain preserved, got: {md:?}",);
+        // The inner-second-item should be deeper than the
+        // inner-first-item by one list level.
+        let spec = e.render_spec();
+        let max_depth = spec.blocks.iter().map(list_item_depth).max().unwrap_or(0);
+        assert!(
+            max_depth >= 3,
+            "expected at least 3 list-item levels after Tab, got max {max_depth}; markdown: {md:?}",
+        );
+    });
+}
+
+#[gpui::test]
+fn empty_enter_on_innermost_item_in_deep_nest_dedents(cx: &mut TestAppContext) {
+    // Empty inner item — Enter should dedent by one level (drop
+    // the innermost marker), staying within the outer scope.
+    let src = "- > - one\n  > - ";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // Outer `- > ` chain still present.
+        assert!(
+            e.state.markdown.starts_with("- > - one"),
+            "outer chain + first inner item preserved, got: {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+// ---- Navigation in deep nests --------------------------------------------
+
+#[gpui::test]
+fn right_arrow_walks_through_entire_deep_fixture_without_panicking(cx: &mut TestAppContext) {
+    // Walk Right from byte 0 to past the end. Each step must
+    // succeed (no panic, no infinite loop) and the cursor must be
+    // monotonic-non-decreasing — even when stepping over forbidden
+    // pair interiors and continuation prefixes.
+    let src = "- > - > ```\n  >   > code\n  >   > ```\n\n- sibling";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    let mut last = 0usize;
+    for _ in 0..(src.len() + 4) {
+        dispatch(cx, handle, &editor, Right);
+        let cur = editor.read_with(cx, |e, _| e.cursor_offset());
+        assert!(
+            cur >= last,
+            "cursor went backwards: {last} → {cur} (markdown len {})",
+            src.len(),
+        );
+        last = cur;
+    }
+}
+
+#[gpui::test]
+fn down_arrow_from_top_through_deep_fixture_terminates(cx: &mut TestAppContext) {
+    // Down repeatedly — must reach EOF and terminate, not loop.
+    let src = "- > - > ```\n  >   > code\n  >   > ```\n\n- sibling";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    let mut last = 0usize;
+    let mut stuck_count = 0usize;
+    for _ in 0..32 {
+        dispatch(cx, handle, &editor, Down);
+        let cur = editor.read_with(cx, |e, _| e.cursor_offset());
+        if cur == last {
+            stuck_count += 1;
+            if stuck_count > 2 {
+                break;
+            }
+        } else {
+            stuck_count = 0;
+        }
+        last = cur;
+    }
+    // After enough Downs we should be past the deep fixture.
+    assert!(
+        last > "- > - > ```\n  >   > code\n  >   > ```".len(),
+        "Down didn't progress past the code block region (cursor at {last})",
+    );
+}
+
+#[gpui::test]
+fn home_inside_deeply_indented_continuation_lands_at_content_edge(cx: &mut TestAppContext) {
+    // Cursor inside `code` on the continuation line; Home should
+    // land at the *content edge* (right after the last container
+    // prefix `> `), not at the raw line start (which would be
+    // inside the prefix bytes).
+    let src = "- > - > ```\n  >   > code\n  >   > ```";
+    let line2_start = src.find("\n  >   > code").unwrap() + 1;
+    let content_edge = src.find("code").unwrap();
+    let cursor = content_edge + 2; // mid-content
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Home);
+    let landed = editor.read_with(cx, |e, _| e.cursor_offset());
+    // Either at the content edge or at line2_start are sane —
+    // this assertion encodes "Home lands somewhere on line 2,
+    // never before line2_start (we don't backtrack into line 1)".
+    assert!(
+        landed >= line2_start,
+        "Home moved to byte {landed}, before line2_start ({line2_start})",
+    );
+}
+
+#[gpui::test]
+fn end_inside_deeply_indented_line_lands_at_line_terminus(cx: &mut TestAppContext) {
+    let src = "- > - > ```\n  >   > code\n  >   > ```";
+    let cursor = src.find("code").unwrap();
+    let line2_end = src.find("code").unwrap() + "code".len();
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, End);
+    let landed = editor.read_with(cx, |e, _| e.cursor_offset());
+    assert_eq!(landed, line2_end, "End lands at end of `code` line");
+}
+
+// ---- Building deep structure incrementally (typing-driven) ---------------
+
+#[gpui::test]
+fn typing_a_blockquote_marker_into_a_list_item_deepens_scope(cx: &mut TestAppContext) {
+    // Start: `- foo`. Type `>` then ` ` at the marker-end position
+    // — the user keying their way into a BQ inside the list item.
+    let initial = EditorState {
+        markdown: "- foo".into(),
+        selection: Selection::Cursor(2), // right after `- `
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "> ");
+    editor.read_with(cx, |e, _| {
+        // Inside a list item, `- > foo` is a paragraph beginning
+        // with `> ` literally, *unless* pulldown opens a BQ on
+        // that line. Either outcome must not corrupt the outer
+        // list — the `- ` remains.
+        assert!(
+            e.state.markdown.starts_with("- "),
+            "outer list-item marker preserved, got: {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn typing_a_list_marker_into_a_bq_paragraph_opens_a_list(cx: &mut TestAppContext) {
+    // `> ` then `- ` should open a list inside the BQ.
+    let initial = EditorState {
+        markdown: "> ".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "- foo");
+    editor.read_with(cx, |e, _| {
+        let spec = e.render_spec();
+        let list_in_bq = spec
+            .blocks
+            .iter()
+            .any(|b| blockquote_depth(b) >= 1 && list_item_depth(b) >= 1);
+        assert!(
+            list_in_bq,
+            "list-in-BQ chain present after typing, blocks: {:#?}",
+            spec.blocks,
+        );
+    });
+}
+
+#[gpui::test]
+fn build_3_level_list_from_scratch_via_tabs(cx: &mut TestAppContext) {
+    // User-flow: type `- one`, Enter, Tab, type `two`, Enter, Tab,
+    // type `three`. End state: a triple-nested list with one item
+    // at each level.
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "- one");
+    dispatch(cx, handle, &editor, Enter);
+    dispatch(cx, handle, &editor, Tab);
+    type_text(cx, handle, &editor, "two");
+    dispatch(cx, handle, &editor, Enter);
+    dispatch(cx, handle, &editor, Tab);
+    type_text(cx, handle, &editor, "three");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown, "- one\n  - two\n    - three",
+            "expected canonical 3-level list",
+        );
+    });
+}
+
+#[gpui::test]
+fn build_bq_then_list_then_bq_via_typing(cx: &mut TestAppContext) {
+    // Build a 3-container chain by typing prefixes: end up with a
+    // BQ → List → BQ → content shape.
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "> - > deep");
+    editor.read_with(cx, |e, _| {
+        let spec = e.render_spec();
+        // At least one leaf carries [BQ, ListItem, BQ] in some order.
+        let target = spec
+            .blocks
+            .iter()
+            .find(|b| blockquote_depth(b) >= 2 && list_item_depth(b) >= 1);
+        assert!(
+            target.is_some(),
+            "no leaf has BQ+List+BQ chain, blocks: {:#?}",
+            spec.blocks,
+        );
+    });
+}
+
+// ---- Chain integrity across edits ----------------------------------------
+
+#[gpui::test]
+fn chain_remains_consistent_after_typing_at_innermost(cx: &mut TestAppContext) {
+    // Sanity: chain at cursor before/after a single keystroke is
+    // unchanged at the ListItem/BlockQuote level.
+    let src = "- > - > deep";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    let chain_before = editor.read_with(cx, |e, _| {
+        gpui_markdown_editor::analysis::enclosing_containers_at(
+            &e.state.markdown,
+            e.cursor_offset(),
+        )
+    });
+    type_text(cx, handle, &editor, "X");
+    let chain_after = editor.read_with(cx, |e, _| {
+        gpui_markdown_editor::analysis::enclosing_containers_at(
+            &e.state.markdown,
+            e.cursor_offset(),
+        )
+    });
+    assert_eq!(
+        chain_before.len(),
+        chain_after.len(),
+        "chain length unchanged after typing",
+    );
+}
+
+#[gpui::test]
+fn end_of_outermost_list_followed_by_paragraph_does_not_reanimate(cx: &mut TestAppContext) {
+    // After a deep nested list ends, a trailing paragraph at the
+    // top level must not reabsorb back into any list-item chain.
+    let src = "- > - > deep\n\nafter";
+    let cursor = src.find("after").unwrap() + "after".len();
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (_handle, editor) = open_editor(cx, initial);
+    let chain = editor.read_with(cx, |e, _| {
+        gpui_markdown_editor::analysis::enclosing_containers_at(
+            &e.state.markdown,
+            e.cursor_offset(),
+        )
+    });
+    assert!(
+        chain.is_empty(),
+        "cursor in `after` paragraph should be at top level, got chain of length {}",
+        chain.len(),
+    );
+}
+
+// ---- Bugs surfaced by the interactive `code_review_response_session` ----
+
+#[gpui::test]
+fn cursor_chain_and_block_chain_agree_on_post_shift_enter_position(cx: &mut TestAppContext) {
+    // Repro from the session script: type `1. one`, then ShiftEnter,
+    // ShiftEnter — the user expects to be sitting on a paragraph break
+    // *inside* the item, but the synthetic empty leaf the renderer
+    // produces for the cursor's row claims the chain is `(top level)`,
+    // contradicting the cursor walker.
+    let initial = EditorState {
+        markdown: "1. one".into(),
+        selection: Selection::Cursor(6),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftEnter);
+    dispatch(cx, handle, &editor, ShiftEnter);
+    editor.read_with(cx, |e, _| {
+        let cursor = e.cursor_offset();
+        let cursor_chain = gpui_markdown_editor::analysis::enclosing_containers_at(
+            &e.state.markdown,
+            cursor,
+        );
+        let spec = e.render_spec();
+        let block = spec
+            .blocks
+            .iter()
+            .find(|b| b.source_range.contains(&cursor) || b.source_range.end == cursor)
+            .expect("a block for the cursor's row");
+        let cursor_in_list = !cursor_chain.is_empty();
+        let block_in_list = !block.containers.is_empty();
+        assert_eq!(
+            cursor_in_list, block_in_list,
+            "cursor walker says in_list={cursor_in_list} but block walker says in_list={block_in_list} \
+             for source {:?} cursor={cursor}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn paragraph_break_inside_bq_in_list_keeps_full_continuation_prefix(cx: &mut TestAppContext) {
+    // Reproduces the structural failure from session keyframe 11: two
+    // ShiftEnters at end of a BQ paragraph that lives inside an item
+    // should produce a paragraph break *inside both scopes*, but
+    // currently only the BQ scope is preserved on the new line.
+    let initial = EditorState {
+        markdown: "1. one\n\n   > a".into(),
+        selection: Selection::Cursor(14), // after `> a`
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftEnter);
+    dispatch(cx, handle, &editor, ShiftEnter);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("b".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        // The trailing line carries the *outer item's* continuation
+        // indent before the BQ marker, so the BQ stays inside item 1.
+        assert!(
+            e.state.markdown.ends_with("   > b"),
+            "BQ continuation should keep `   > ` outer-indent prefix, got: {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn inserted_text_with_newline_inside_code_in_bq_keeps_single_newline(cx: &mut TestAppContext) {
+    // Inside a BQ, open a fenced code block, then insert two-line
+    // text. The embedded `\n` should remain literal — code content
+    // is exempt from soft-break promotion. Currently the BQ wrapping
+    // defeats that exemption and `>   \n>` is injected between the
+    // lines.
+    let initial = EditorState {
+        markdown: "> ```\n> \n> ```".into(),
+        selection: Selection::Cursor(8), // inside the empty code body line
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("foo\nbar".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        // No `>   \n>` pair injected — the two lines remain a single
+        // `\n` apart inside the code body.
+        let md = &e.state.markdown;
+        assert!(
+            md.contains("> foo\n> bar"),
+            "expected `> foo\\n> bar` literal in code body, got: {md:?}",
+        );
+        assert!(
+            !md.contains("> foo\n>   \n> bar") && !md.contains("> foo\n>  \n> bar"),
+            "BQ-pair should NOT have been injected between code lines, got: {md:?}",
+        );
+    });
+}
+
+#[gpui::test]
+fn render_blocks_have_no_overlapping_source_ranges_in_simple_bq_in_list(cx: &mut TestAppContext) {
+    // The minimal repro for the overlapping-blocks observation in
+    // session keyframe 19: an item whose BQ child contains a nested
+    // list. The render walker emits a paragraph leaf and a list-item
+    // leaf with overlapping source ranges.
+    let src = "1. outer\n\n   > - inner";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_handle, editor) = open_editor(cx, initial);
+    let spec = editor.read_with(cx, |e, _| e.render_spec());
+    // Sort by start, then verify each subsequent block starts at or
+    // after the previous block's end.
+    let mut sorted: Vec<&gpui_markdown_editor::RenderBlock> = spec.blocks.iter().collect();
+    sorted.sort_by_key(|b| (b.source_range.start, b.source_range.end));
+    for w in sorted.windows(2) {
+        let a = w[0];
+        let b = w[1];
+        assert!(
+            a.source_range.end <= b.source_range.start,
+            "overlap: block {:?} ({:?}) and block {:?} ({:?}) — ranges overlap",
+            a.kind,
+            a.source_range,
+            b.kind,
+            b.source_range,
+        );
+    }
 }

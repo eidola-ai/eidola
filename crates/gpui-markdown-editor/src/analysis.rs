@@ -50,13 +50,27 @@ use std::ops::Range;
 /// spaces of indent then 3+ `` ` ``s or `~`s; closing fence matches
 /// the same character with at least the same length and only
 /// whitespace on the rest of the line.
+///
+/// Fences may sit inside a blockquote at any depth: the opener and
+/// closer lines start with `> ` markers (`count_line_markers` worth of
+/// them). Once a fence opens at depth D, the block stays open until a
+/// matching closer at depth ≥ D *or* end-of-source. Lines inside the
+/// block that don't carry the `> ` prefix (e.g. transient post-paste
+/// state where a freshly-inserted continuation line is missing its BQ
+/// marker) are still treated as content — this is exactly the case
+/// `enforce_invariants` runs against, and the soft-break-promotion
+/// exemption needs to fire for those bytes too. The
+/// `normalize_blockquote_prefixes` pass and any subsequent re-parse
+/// will reconcile the prefix; until then, those bytes are code.
 pub fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
     let mut out: Vec<Range<usize>> = Vec::new();
-    // (fence_char, fence_len, block_start) while inside an open block.
-    // `block_start` is the byte index of the opening fence line's
-    // first byte; the emitted range runs through the closing fence
-    // line's *trailing `\n`* (or end-of-source for unterminated).
-    let mut open: Option<(u8, usize, usize)> = None;
+    // (fence_char, fence_len, open_depth, block_start) while inside
+    // an open block. `block_start` is the byte index of the opening
+    // fence line's first byte; the emitted range runs through the
+    // closing fence line's *trailing `\n`* (or end-of-source for
+    // unterminated). `open_depth` is the BQ-marker count on the
+    // opener line — a closer must sit at the same or greater depth.
+    let mut open: Option<(u8, usize, usize, usize)> = None;
 
     let mut p = 0;
     while p < bytes.len() {
@@ -67,7 +81,11 @@ pub fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
         let line_end = p;
         let line_after = if p < bytes.len() { p + 1 } else { p };
 
-        let mut q = line_start;
+        // Walk past any BQ markers (`> `, optionally with up to 3
+        // leading indent spaces per marker). The fence may sit inside
+        // a blockquote at any depth.
+        let (line_depth, after_markers) = count_line_markers(bytes, line_start);
+        let mut q = after_markers;
         let mut indent = 0;
         while q < line_end && indent < 4 && bytes[q] == b' ' {
             q += 1;
@@ -88,8 +106,8 @@ pub fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
             }
             let fence_len = r - q;
             if fence_len >= 3 {
-                if let Some((open_fc, open_len, block_start)) = open {
-                    if fc == open_fc && fence_len >= open_len {
+                if let Some((open_fc, open_len, open_depth, block_start)) = open {
+                    if fc == open_fc && fence_len >= open_len && line_depth >= open_depth {
                         let mut s = r;
                         let mut only_ws = true;
                         while s < line_end {
@@ -108,7 +126,7 @@ pub fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
                         }
                     }
                 } else {
-                    open = Some((fc, fence_len, line_start));
+                    open = Some((fc, fence_len, line_depth, line_start));
                 }
             }
         }
@@ -116,7 +134,7 @@ pub fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
         p = line_after;
     }
 
-    if let Some((_, _, block_start)) = open {
+    if let Some((_, _, _, block_start)) = open {
         out.push(block_start..bytes.len());
     }
 
@@ -248,9 +266,10 @@ fn list_line_indent_at(markdown: &str, line_start: usize) -> usize {
 
 /// Sum of marker widths for every list item whose source range
 /// overlaps `[start, end)`. Walks the parse tree once. This is the
-/// non-cursor analog of [`chain_total_list_indent`] — it answers
-/// "how much hidden indent overlaps this byte range?" rather than
-/// "how much indent encloses this cursor?".
+/// non-cursor analog of the LI-only piece of
+/// [`chain_continuation_prefix_bytes`] — it answers "how much hidden
+/// indent overlaps this byte range?" rather than "how much indent
+/// encloses this cursor?".
 fn sum_overlapping_item_marker_widths(markdown: &str, start: usize, end: usize) -> usize {
     fn walk(nodes: &[crate::syntax::SyntaxNode], start: usize, end: usize, total: &mut usize) {
         for node in nodes {
@@ -1116,8 +1135,65 @@ pub fn chain_blockquote_depth(chain: &[EnclosingContainer]) -> usize {
 }
 
 /// `"> "` repeated `chain_blockquote_depth(chain)` times.
+///
+/// **Note.** This is the BQ-only flattening — it does *not* preserve
+/// the alternation when list-item entries interleave with the BQ
+/// entries. Callers that need the per-line continuation prefix on a
+/// chain that may contain list-items should use
+/// [`chain_continuation_prefix`] instead. This wrapper survives only
+/// for callers that genuinely want "BQ markers, ignoring lists" —
+/// today, the back-compat shim used by [`blockquote_continuation_prefix`].
 pub fn chain_blockquote_prefix(chain: &[EnclosingContainer]) -> String {
     "> ".repeat(chain_blockquote_depth(chain))
+}
+
+/// The full per-line continuation prefix for `chain`, walking
+/// outermost-first and emitting one segment per container in chain
+/// order:
+///
+/// - `ListItem`: `marker_width` spaces (the continuation indent that
+///   keeps a continuation line aligned with this item's content edge).
+/// - `BlockQuote`: `"> "` (the marker that introduces a line inside
+///   this blockquote).
+///
+/// So a chain `[LI(2), BQ, LI(2), BQ]` produces `"  >   > "` —
+/// outer-LI indent, outer BQ marker, inner-LI indent, inner BQ
+/// marker. This is the canonical "scope continuation prefix" shape the
+/// editor needs everywhere it inserts a new line inside an arbitrary
+/// container chain (Enter, Shift+Enter, soft-break promotion,
+/// pair-promotion). The renderer's per-leaf decoration loop emits the
+/// same alternation pixel-for-pixel; this helper produces the source
+/// counterpart.
+///
+/// Subsumes the BQ-only [`chain_blockquote_prefix`] (which dropped LI
+/// alternation) and pairs with [`chain_continuation_prefix_bytes`] for
+/// callers that just want the byte count without the string.
+pub fn chain_continuation_prefix(chain: &[EnclosingContainer]) -> String {
+    let mut out = String::new();
+    for c in chain {
+        match c {
+            EnclosingContainer::ListItem(ctx) => {
+                for _ in 0..ctx.marker_width() {
+                    out.push(' ');
+                }
+            }
+            EnclosingContainer::BlockQuote { .. } => out.push_str("> "),
+        }
+    }
+    out
+}
+
+/// Byte length of [`chain_continuation_prefix`] without building the
+/// string. The two functions agree by construction: one space per LI
+/// `marker_width` byte, two bytes per BQ marker.
+pub fn chain_continuation_prefix_bytes(chain: &[EnclosingContainer]) -> usize {
+    chain
+        .iter()
+        .map(|c| match c {
+            EnclosingContainer::ListItem(ctx) => ctx.marker_width(),
+            EnclosingContainer::BlockQuote { .. } => 2,
+        })
+        .sum()
 }
 
 /// Innermost list item in `chain`, if any.
@@ -1128,31 +1204,49 @@ pub fn chain_innermost_list_item(chain: &[EnclosingContainer]) -> Option<&ListIt
     })
 }
 
-/// Sum of every `ListItem`'s marker width in `chain`. Used by the
-/// hard-break continuation rule to indent inside the innermost item.
-pub fn chain_total_list_indent(chain: &[EnclosingContainer]) -> usize {
-    chain
-        .iter()
-        .filter_map(|c| match c {
-            EnclosingContainer::ListItem(ctx) => Some(ctx.marker_width()),
-            _ => None,
-        })
-        .sum()
-}
-
-/// Sum of every `ListItem`'s marker width *except* the innermost.
-/// Used by Enter routing to indent the *new sibling* — the new item's
-/// own marker fills the innermost slot.
-pub fn chain_outer_list_indent(chain: &[EnclosingContainer]) -> usize {
-    let mut total = 0;
-    let mut last_item_width = 0;
-    for c in chain {
-        if let EnclosingContainer::ListItem(ctx) = c {
-            total += ctx.marker_width();
-            last_item_width = ctx.marker_width();
+/// `true` when the innermost list-item in `chain` has another
+/// list-item as its *immediate* (one step out) enclosing container —
+/// i.e. it's a normal nested list-item like `- a\n  - b`. `false`
+/// when the innermost LI has no enclosing LI, *or* when its immediate
+/// enclosing container is a blockquote (e.g. `- > - inner` where the
+/// inner LI's parent in the chain is the BQ, not the outer LI).
+///
+/// Used by Shift+Tab dedent to decide between "strip parent
+/// marker_width spaces" and "drop the marker entirely". Items
+/// directly wrapped by a BQ have no parent-LI marker width to
+/// subtract, so they fall through to the drop-marker branch.
+pub fn innermost_li_immediate_parent_is_list_item(chain: &[EnclosingContainer]) -> bool {
+    let mut innermost_pos: Option<usize> = None;
+    for (i, c) in chain.iter().enumerate() {
+        if matches!(c, EnclosingContainer::ListItem(_)) {
+            innermost_pos = Some(i);
         }
     }
-    total - last_item_width
+    let Some(pos) = innermost_pos else {
+        return false;
+    };
+    if pos == 0 {
+        return false;
+    }
+    matches!(chain[pos - 1], EnclosingContainer::ListItem(_))
+}
+
+/// Byte-length of the *active container prefix* that introduces a line
+/// inside the innermost entry of `chain` — i.e. the byte count
+/// contributed by every container above the innermost. Thin wrapper
+/// over [`chain_continuation_prefix_bytes`] applied to the
+/// outer-only slice.
+///
+/// Callers that want to insert / remove content "inside" the innermost
+/// container without disturbing the outer scope's prefix use
+/// `line_start + chain_outer_prefix_bytes(...)` as their insertion
+/// point.
+pub fn chain_outer_prefix_bytes(chain: &[EnclosingContainer]) -> usize {
+    if chain.is_empty() {
+        return 0;
+    }
+    let last = chain.len() - 1;
+    chain_continuation_prefix_bytes(&chain[..last])
 }
 
 /// Deepest blockquote nesting that contains `cursor`. Boundary equality
@@ -1296,18 +1390,29 @@ pub fn enter_insertion(markdown: &str, cursor: usize) -> String {
         return "\n".to_string();
     }
     let chain = enclosing_containers_at(markdown, cursor);
-    let bq_prefix = chain_blockquote_prefix(&chain);
-    if let Some(item) = chain_innermost_list_item(&chain) {
-        let outer_indent = " ".repeat(chain_outer_list_indent(&chain));
-        return format!(
-            "\n{bq_prefix}{outer_indent}{}",
-            item.next_marker_text(markdown)
-        );
+    // Route on the *innermost* (last) container, not "any LI in the
+    // chain". For a chain like `[LI, BQ, LI, BQ]` the cursor's true
+    // innermost is the BQ — Enter should produce a depth-D
+    // chain-pair, not a sibling list-item, because the cursor isn't
+    // at the LI's content edge.
+    match chain.last() {
+        Some(EnclosingContainer::ListItem(item)) => {
+            // New sibling at the innermost LI's depth: continuation
+            // prefix of the *outer* chain (everything above the
+            // innermost LI) followed by the new item's marker.
+            let outer = &chain[..chain.len() - 1];
+            let outer_prefix = chain_continuation_prefix(outer);
+            format!("\n{outer_prefix}{}", item.next_marker_text(markdown))
+        }
+        Some(EnclosingContainer::BlockQuote { .. }) => {
+            // Depth-D paragraph-break pair, with both halves carrying
+            // the full chain-aware continuation prefix so list-item
+            // ancestors keep contributing their indent.
+            let prefix = chain_continuation_prefix(&chain);
+            format!("\n{prefix}\n{prefix}")
+        }
+        None => "\n\n".to_string(),
     }
-    if !bq_prefix.is_empty() {
-        return format!("\n{bq_prefix}\n{bq_prefix}");
-    }
-    "\n\n".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,11 +1451,22 @@ pub fn list_item_indent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
     let bytes = markdown.as_bytes();
     let line_starts = item_line_starts(bytes, &innermost.item_range);
     let pad = " ".repeat(prev_marker_width);
+    // Step past the active container-prefix bytes (BQ markers,
+    // outer-LI continuation indents) before inserting indent. For an
+    // item inside a blockquote, the raw line-start sits *before* the
+    // `> ` marker — inserting there would push the marker right and
+    // detach the BQ scope from the line above. The active prefix on
+    // every line of the innermost LI is composed by the chain entries
+    // above it; we just need its byte count.
+    let outer_prefix = chain_outer_prefix_bytes(&chain);
     let mut edits: Vec<SourceEdit> = line_starts
         .into_iter()
-        .map(|ls| SourceEdit {
-            range: ls..ls,
-            replacement: pad.clone(),
+        .map(|ls| {
+            let insert_at = ls + outer_prefix;
+            SourceEdit {
+                range: insert_at..insert_at,
+                replacement: pad.clone(),
+            }
         })
         .collect();
 
@@ -1423,7 +1539,18 @@ pub fn list_item_dedent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
     let innermost = *items.last()?;
     let bytes = markdown.as_bytes();
 
-    if items.len() == 1 {
+    // Treat as "drop the marker" whenever the innermost LI's
+    // *immediate* enclosing container in the chain isn't another
+    // list-item. That covers two distinct shapes:
+    //   - A truly top-level item (chain ends in just `[..., LI]`
+    //     with nothing or only BQs above) — the existing top-level
+    //     dedent semantics.
+    //   - A list-item directly wrapped by a blockquote inside a
+    //     deeper container chain (`[..., outer-LI, BQ, inner-LI]`).
+    //     Here the inner-LI has no list-item parent to "fall back
+    //     to" via indent-stripping, but its surrounding BQ scope
+    //     already carries the line prefix; we just drop the marker.
+    if !innermost_li_immediate_parent_is_list_item(&chain) {
         // Top-level dedent: replace the leading separator + marker
         // with the surrounding scope's canonical paragraph break.
         // The BQ prefix is taken at the marker_range.start byte, not
@@ -1432,23 +1559,29 @@ pub fn list_item_dedent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
         // line of a nested construct.
         let bq_prefix = blockquote_continuation_prefix(markdown, innermost.marker_range.start);
         let line_start = line_start_offset(bytes, innermost.marker_range.start);
-        let prev_sep_start = if line_start > 0 && bytes[line_start - 1] == b'\n' {
-            line_start - 1
+        let preceded_by_newline = line_start > 0 && bytes[line_start - 1] == b'\n';
+
+        let (range, replacement) = if !preceded_by_newline {
+            // Marker sits at the buffer start *or* mid-line within
+            // an outer container's prefix bytes (e.g. `- > - > inner`
+            // — the inner LI's marker is on the same line as the
+            // outer LI's marker, after its `- > ` preamble). No
+            // leading separator to absorb; just drop the marker
+            // bytes themselves and leave the outer scope intact.
+            (innermost.marker_range.clone(), String::new())
         } else {
-            line_start
-        };
-        let replacement = if prev_sep_start == 0 {
-            String::new()
-        } else if bq_prefix.is_empty() {
-            "\n\n".to_string()
-        } else {
-            format!("\n{bq_prefix}\n{bq_prefix}")
+            // Fresh line preceded by `\n`. Replace the separator +
+            // marker with the surrounding scope's paragraph break.
+            let prev_sep_start = line_start - 1;
+            let rep = if bq_prefix.is_empty() {
+                "\n\n".to_string()
+            } else {
+                format!("\n{bq_prefix}\n{bq_prefix}")
+            };
+            (prev_sep_start..innermost.marker_range.end, rep)
         };
 
-        let mut edits = vec![SourceEdit {
-            range: prev_sep_start..innermost.marker_range.end,
-            replacement,
-        }];
+        let mut edits = vec![SourceEdit { range, replacement }];
         // Strip this-item's marker_width from each continuation
         // line, so any nested-child / continuation indent that
         // belonged to the now-defunct item doesn't survive as
@@ -1591,18 +1724,17 @@ fn item_line_starts(bytes: &[u8], item_range: &Range<usize>) -> Vec<usize> {
 /// promotion pass).
 pub fn line_break_insertion(markdown: &str, cursor: usize) -> String {
     let chain = enclosing_containers_at(markdown, cursor);
-    let bq_prefix = chain_blockquote_prefix(&chain);
-    if chain_innermost_list_item(&chain).is_some() {
-        // Hard-break continuation inside a list item lines up with
-        // *this item's* content column — that's the sum of every
-        // enclosing list-item's marker width.
-        let indent = " ".repeat(chain_total_list_indent(&chain));
-        return format!("  \n{bq_prefix}{indent}");
+    if chain.is_empty() {
+        return "  \n".to_string();
     }
-    if !bq_prefix.is_empty() {
-        return format!("  \n{bq_prefix}");
-    }
-    "  \n".to_string()
+    // The continuation line carries the full chain-aware prefix —
+    // each LI ancestor contributes its `marker_width` of continuation
+    // indent and each BQ contributes its `> ` marker, in chain order.
+    // The result is identical to the renderer's per-leaf prefix for
+    // the cursor's row, so the hard break stays inside every scope
+    // the cursor was in.
+    let prefix = chain_continuation_prefix(&chain);
+    format!("  \n{prefix}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2656,13 +2788,28 @@ mod tests {
     }
 
     #[test]
-    fn chain_outer_indent_excludes_innermost() {
-        // `- outer\n  - inner`: cursor inside inner. The new sibling's
-        // indent target is 2 (for the outer `- ` marker), not 4.
+    fn chain_continuation_prefix_for_nested_list() {
+        // `- outer\n  - inner`: cursor inside inner. The full chain
+        // continuation prefix is 4 spaces (outer 2 + inner 2); the
+        // outer-only slice (used to position a new sibling at the
+        // inner item's depth) is 2 spaces.
         let src = "- outer\n  - inner";
         let chain = enclosing_containers_at(src, src.len());
-        assert_eq!(chain_total_list_indent(&chain), 4);
-        assert_eq!(chain_outer_list_indent(&chain), 2);
+        assert_eq!(chain_continuation_prefix(&chain), "    ");
+        assert_eq!(chain_continuation_prefix_bytes(&chain), 4);
+        assert_eq!(chain_outer_prefix_bytes(&chain), 2);
+        assert_eq!(chain_continuation_prefix(&chain[..chain.len() - 1]), "  ");
+    }
+
+    #[test]
+    fn chain_continuation_prefix_alternates_li_and_bq() {
+        // `- > - > one`: chain is `[LI(2), BQ, LI(2), BQ]`. Full
+        // continuation prefix interleaves LI indents and BQ markers
+        // outermost-first.
+        let src = "- > - > one";
+        let chain = enclosing_containers_at(src, src.len());
+        assert_eq!(chain_continuation_prefix(&chain), "  >   > ");
+        assert_eq!(chain_continuation_prefix_bytes(&chain), 8);
     }
 
     #[test]

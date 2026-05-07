@@ -249,12 +249,16 @@ fn apply_edits(state: EditorState, edits: &[analysis::SourceEdit]) -> EditorStat
 
 fn promote_soft_breaks(state: EditorState) -> EditorState {
     let bytes = state.markdown.as_bytes();
-    // Two classes of bytes are exempt from the soft-break promotion
-    // rule:
+    // Two scopes special-case the soft-break promotion rule:
     //
     //   * Fenced code-block content. A single mid-content `\n` inside
     //     ```/~~~ fences is a literal line separator, not the
-    //     ambiguous CommonMark soft break.
+    //     ambiguous CommonMark soft break — so we never inflate it
+    //     to a paragraph-break pair. But the BQ scope wrapping the
+    //     fence (if any) still demands `> ` prefix continuation on
+    //     each new line; if the line after the `\n` is missing some
+    //     of those markers (a freshly-typed continuation), we splice
+    //     in just the missing prefix bytes — no pair, no extra `\n`.
     //   * List ranges. Inside a list pulldown handles line structure
     //     (item separators, marker continuation, indented paragraphs,
     //     lazy continuations). Promoting `\n` to `\n\n` between two
@@ -268,9 +272,58 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
     // exactly once.
     let mut inserts: Vec<(usize, String)> = Vec::new();
     for p in 0..bytes.len() {
-        if is_in_ranges(p, &code_ranges) || is_in_ranges(p, &list_ranges) {
+        let in_code = is_in_ranges(p, &code_ranges);
+        let in_list = is_in_ranges(p, &list_ranges);
+        // Code-content is exempt from soft-break-to-pair promotion
+        // (the `\n` is a literal line separator, not a soft break),
+        // *but* a fenced code block sitting inside a BQ still demands
+        // each new line carry the surrounding `> ` markers — and a
+        // fence inside an LI demands the LI's continuation indent.
+        // We compute the missing-prefix repair in both list and
+        // non-list cases here so the LI-wrapping case isn't silently
+        // skipped by the list_ranges short-circuit.
+        if in_code {
+            if bytes[p] != b'\n' || p + 1 >= bytes.len() {
+                continue;
+            }
+            // Build the *full* chain-aware continuation prefix the
+            // line ending at `p` carries, so a missing prefix on the
+            // next line is repaired in shape (LI indent + BQ marker,
+            // alternating). The chain query takes the cursor at `p`
+            // (end of the line) so the parser sees this line's
+            // surrounding scope.
+            let chain_at = analysis::enclosing_containers_at(&state.markdown, p);
+            let expected_prefix = analysis::chain_continuation_prefix(&chain_at);
+            if expected_prefix.is_empty() {
+                continue;
+            }
+            // What the next line already has (literal leading bytes
+            // that form a valid prefix). Compare prefix-wise so we
+            // only splice in the missing tail.
+            let next_line = &bytes[p + 1..];
+            let mut have = 0usize;
+            let exp_bytes = expected_prefix.as_bytes();
+            while have < exp_bytes.len()
+                && have < next_line.len()
+                && next_line[have] == exp_bytes[have]
+            {
+                have += 1;
+            }
+            if have >= expected_prefix.len() {
+                continue;
+            }
+            let missing = &expected_prefix[have..];
+            if !missing.is_empty() {
+                inserts.push((p + 1, missing.to_string()));
+            }
             continue;
         }
+
+        if in_list {
+            // List structure normalization is `normalize_lists`'s job.
+            continue;
+        }
+
         if !is_soft_break(bytes, p) {
             continue;
         }
@@ -730,7 +783,19 @@ fn move_(state: EditorState, direction: Move, extending: bool) -> EditorState {
         Move::Right => next_grapheme_offset(&state.markdown, head),
         Move::Up => move_vertical(&state.markdown, head, -1),
         Move::Down => move_vertical(&state.markdown, head, 1),
-        Move::LineStart => line_start_offset(&state.markdown, head),
+        // Home is content-edge biased: when the raw line-start is a
+        // forbidden position (cursor sits inside the line's hidden
+        // continuation prefix — the leading `> > ` / list indent), we
+        // search *forward* to the visible content edge of the same
+        // line rather than letting the post-move forbidden-snap walk
+        // backward across the previous `\n`. The forward scan stops at
+        // the first allowed byte, which by construction is at most
+        // `line_end` (line-end is always allowed); so a line composed
+        // entirely of hidden prefix bytes lands at the line terminus
+        // and Home never crosses a `\n`.
+        Move::LineStart => {
+            next_allowed_position(&state.markdown, line_start_offset(&state.markdown, head))
+        }
         Move::LineEnd => line_end_offset(&state.markdown, head),
         Move::DocStart => 0,
         Move::DocEnd => state.markdown.len(),
