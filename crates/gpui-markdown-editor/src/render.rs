@@ -62,8 +62,164 @@ pub fn render(state: &EditorState, tree: &[SyntaxNode]) -> RenderSpec {
     for node in tree {
         render_node(node, &state.markdown, cursor, &[], &mut real_blocks);
     }
-    let blocks = inject_empty_paragraphs(&state.markdown, tree, cursor, real_blocks);
+    let mut blocks = inject_empty_paragraphs(&state.markdown, tree, cursor, real_blocks);
+    let bytes = state.markdown.as_bytes();
+    // Hard-break continuation merge. When pulldown's parse splits at a
+    // `  \n` hard break that's followed by a trailing line of pure
+    // chain-continuation prefix bytes (no further content), the
+    // resulting two blocks shape as two visual paragraphs separated
+    // by `paragraph_gap`. The same source plus one byte of content
+    // would parse as ONE paragraph (hard-break continuation through
+    // the trailing line). Merge those split-but-conceptually-one
+    // pairs back into a single block so the cursor sits directly
+    // under the previous row, matching the with-content case. See
+    // `bugs.md::hard_break_trailing_synth_introduces_paragraph_gap`.
+    merge_hard_break_continuations(&mut blocks, bytes);
+    // Final pass: hide the full chain-continuation prefix on every
+    // line of every leaf. The per-item / per-BQ hide passes only
+    // catch their own contribution, which works for monotone chains
+    // but misses bytes that sit *between* container kinds in
+    // alternating chains like `[LI, BQ, LI]` — the trailing LI
+    // continuation indent on a continuation line shows as visible
+    // text under the per-item passes alone. Doing one chain-driven
+    // pass at the end catches all alternations uniformly.
+    for block in &mut blocks {
+        hide_chain_continuation_prefix(block, bytes);
+        merge_hidden_ranges(&mut block.hidden_ranges);
+    }
     RenderSpec { blocks }
+}
+
+/// Merge adjacent paragraph blocks where the boundary is a hard break
+/// continuation: the previous block ends with `  \n` and the next block
+/// is one or more lines of pure chain-continuation prefix (no actual
+/// content). Pulldown's parse will fold a continuation-line that has
+/// any content into the previous paragraph as a hard-break
+/// continuation, but a line of pure prefix bytes ends up as a separate
+/// (synthetic empty) block — visually a `paragraph_gap` separates them.
+/// Merging restores parity with the with-content case so the user
+/// sees the cursor row as the next line of the same paragraph.
+///
+/// Conditions (all must hold):
+/// - Both blocks are `Paragraph`.
+/// - Their source ranges are contiguous (`prev.end == next.start`).
+/// - Their container chains are identical (same containers, same
+///   ordering, same `cursor_inside`).
+/// - The chain is non-empty — top-level paragraphs follow the regular
+///   pairs model and are kept separate.
+/// - The previous block's source ends with `  \n` (a hard break).
+/// - Every line of the next block's source equals the canonical chain
+///   continuation prefix exactly (no other content on the trailing line).
+fn merge_hard_break_continuations(blocks: &mut Vec<RenderBlock>, bytes: &[u8]) {
+    let mut i = 0;
+    while i + 1 < blocks.len() {
+        if should_merge_hard_break_continuation(&blocks[i], &blocks[i + 1], bytes) {
+            let next = blocks.remove(i + 1);
+            let prev = &mut blocks[i];
+            prev.source_range.end = next.source_range.end;
+            prev.hidden_ranges.extend(next.hidden_ranges);
+            prev.inlines.extend(next.inlines);
+            prev.marker_overlays.extend(next.marker_overlays);
+            prev.delimiter_lines.extend(next.delimiter_lines);
+            prev.substitutions.extend(next.substitutions);
+            // Don't advance: try to merge again with the new neighbor
+            // in case multiple trailing prefix-only lines were emitted
+            // as separate blocks.
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn should_merge_hard_break_continuation(
+    prev: &RenderBlock,
+    next: &RenderBlock,
+    bytes: &[u8],
+) -> bool {
+    if !matches!(prev.kind, BlockKind::Paragraph) || !matches!(next.kind, BlockKind::Paragraph) {
+        return false;
+    }
+    if prev.source_range.end != next.source_range.start {
+        return false;
+    }
+    if prev.containers.is_empty() {
+        return false;
+    }
+    if prev.containers != next.containers {
+        return false;
+    }
+    let end = prev.source_range.end;
+    if end < 3 || &bytes[end - 3..end] != b"  \n" {
+        return false;
+    }
+    // Build the canonical chain prefix once; each line of `next` must
+    // equal it exactly, with no content beyond.
+    let analysis_chain: Vec<crate::analysis::EnclosingContainer> = next
+        .containers
+        .iter()
+        .map(|c| match c {
+            Container::BlockQuote { .. } => {
+                crate::analysis::EnclosingContainer::BlockQuote { range: 0..0 }
+            }
+            Container::ListItem {
+                marker_byte_len, ..
+            } => crate::analysis::EnclosingContainer::ListItem(crate::analysis::ListItemContext {
+                list_kind: crate::syntax::ListKind::Unordered,
+                item_index: 0,
+                item_range: 0..0,
+                marker_range: 0..*marker_byte_len,
+            }),
+        })
+        .collect();
+    let prefix = crate::analysis::chain_continuation_prefix(&analysis_chain);
+    let prefix_bytes = prefix.as_bytes();
+    if prefix_bytes.is_empty() {
+        return false;
+    }
+    let next_bytes = &bytes[next.source_range.start..next.source_range.end];
+    let mut p = 0;
+    while p < next_bytes.len() {
+        let line_end = next_bytes[p..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| p + i)
+            .unwrap_or(next_bytes.len());
+        let line = &next_bytes[p..line_end];
+        if line != prefix_bytes {
+            return false;
+        }
+        p = if line_end < next_bytes.len() {
+            line_end + 1
+        } else {
+            line_end
+        };
+    }
+    true
+}
+
+/// Sort `ranges` by start and merge any overlapping or touching
+/// entries. Multiple passes — per-item hide, BQ marker attach,
+/// chain-driven prefix hide — can each contribute overlapping
+/// ranges that shape down to the same display bytes; the element
+/// layer handles overlap correctly, but a normalized list is easier
+/// to inspect (and lets summing-style assertions in tests reflect
+/// actual hidden byte count without double-counting).
+fn merge_hidden_ranges(ranges: &mut Vec<Range<usize>>) {
+    if ranges.len() <= 1 {
+        return;
+    }
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for r in ranges.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && r.start <= last.end
+        {
+            last.end = last.end.max(r.end);
+        } else {
+            merged.push(r);
+        }
+    }
+    *ranges = merged;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,6 +335,39 @@ fn render_blockquote(
     }
 
     let bytes = source.as_bytes();
+    // **Same-line opening marker.** The parser's
+    // `blockquote_prefix_ranges` walks each line from `line_start`
+    // looking for `>` past `outer_depth` indent / `>` segments — but
+    // when this BQ opens *mid-line* inside an LI (e.g. `1. > foo`),
+    // the line begins with the LI marker (`1. `) which the prefix
+    // walker doesn't recognize, so the opening `> ` is silently
+    // dropped from `prefix_ranges`. Without it the marker bytes
+    // never reach `attach_marker` / `hidden_ranges` and the `>`
+    // shows as plain text in the shaped line. Detect the case
+    // (BQ.range.start has `>` and no existing prefix already covers
+    // it) and prepend a synthetic opening prefix so the regular
+    // attach loop hides it like any other line's marker.
+    let mut synth_prefix: Option<Range<usize>> = None;
+    if node.range.start < bytes.len()
+        && bytes[node.range.start] == b'>'
+        && !prefix_ranges.iter().any(|r| r.start == node.range.start)
+    {
+        let mut q = node.range.start + 1;
+        if q < bytes.len() && bytes[q] == b' ' {
+            q += 1;
+        }
+        synth_prefix = Some(node.range.start..q);
+    }
+    let owned: Vec<Range<usize>>;
+    let prefix_ranges: &[Range<usize>] = if let Some(synth) = synth_prefix {
+        owned = std::iter::once(synth)
+            .chain(prefix_ranges.iter().cloned())
+            .collect();
+        &owned
+    } else {
+        prefix_ranges
+    };
+
     // `deferred` holds the most recent unclaimed prefix that we
     // tentatively assumed is the *middle* of a `[prefix]\n[prefix]`
     // structural pair (no row of its own). It either gets dropped
@@ -188,6 +377,10 @@ fn render_blockquote(
     // keeps a freshly-typed lone `> ` parsing-as-blockquote
     // *rendering* as a blockquote immediately, instead of waiting
     // for the user to type a paired marker.
+    //
+    // Track indices of synthetics emitted by this BQ so we can run a
+    // chain-aware hide pass on them after all markers are attached.
+    let mut synth_indices: Vec<usize> = Vec::new();
     let mut deferred: Option<Range<usize>> = None;
     for prefix in prefix_ranges {
         if let Some(leaf) = find_leaf_for_prefix(&mut out[start..], prefix, bytes) {
@@ -224,13 +417,20 @@ fn render_blockquote(
             // is the second-of-pair and gets a synthetic empty leaf
             // so the cursor has a visible row to land on (post-
             // Enter trailing, or an extra empty between two
-            // paragraphs). The synthetic shares this BQ's container
-            // chain, so an outer blockquote's later distribution
-            // attaches *its* marker here too.
+            // paragraphs). Query the chain at the synth's byte via
+            // `analysis::enclosing_containers_at` so we pick up
+            // *any* container that encloses the byte (including a
+            // deeper inner list-item that `child_chain` — built up
+            // walking-down from this BQ — doesn't see). Falls back
+            // to `child_chain` if the analysis chain is shorter
+            // (which would happen if the synth sits past every
+            // open container and analysis correctly reports
+            // "outside everything").
             let line_end = source_line_end(bytes, prefix.end);
             let mut synth = RenderBlock::new(prefix.start..line_end, BlockKind::Paragraph);
-            synth.containers = child_chain.clone();
+            synth.containers = synth_chain_for_bq(source, cursor, prefix.start, &child_chain);
             attach_marker(&mut synth, prefix, cursor_inside, level);
+            synth_indices.push(out.len());
             out.push(synth);
             deferred = None;
         }
@@ -244,9 +444,20 @@ fn render_blockquote(
     if let Some(prefix) = deferred {
         let line_end = source_line_end(bytes, prefix.end);
         let mut synth = RenderBlock::new(prefix.start..line_end, BlockKind::Paragraph);
-        synth.containers = child_chain.clone();
+        synth.containers = synth_chain_for_bq(source, cursor, prefix.start, &child_chain);
         attach_marker(&mut synth, &prefix, cursor_inside, level);
+        synth_indices.push(out.len());
         out.push(synth);
+    }
+
+    // Extend each synth's range back to the start of its line so the
+    // canonical-prefix hide pass at the top level (`render`'s final
+    // loop, `hide_chain_continuation_prefix`) can claim every byte
+    // of the chain prefix on this line — outer LI indents and outer
+    // BQ markers that precede this BQ's emitting prefix on the same
+    // source line.
+    for &idx in &synth_indices {
+        extend_synth_to_line_start(&mut out[idx], bytes);
     }
 
     // Synthetics are appended in `prefix_ranges` order (source order)
@@ -255,6 +466,50 @@ fn render_blockquote(
     // distribution, `inject_empty_paragraphs`, the editor's per-block
     // index) see blocks in source order.
     out[start..].sort_by_key(|b| b.source_range.start);
+}
+
+/// Walk back the synth's `source_range.start` to the start of its
+/// first line (the byte right after the previous `\n`, or buffer
+/// start). This pulls in *all* of the canonical continuation-prefix
+/// bytes that lead into the synth — leading LI indent, outer BQ
+/// markers, intermediate LI indent — so the chain-aware hide pass
+/// can mask the full prefix on this line. Without this the synth's
+/// range starts at the BQ marker that emitted it and never claims
+/// the bytes that precede that marker on the line, so any portion
+/// of the canonical prefix sitting before the synth's emitting BQ
+/// renders as visible text.
+fn extend_synth_to_line_start(leaf: &mut RenderBlock, bytes: &[u8]) {
+    let mut p = leaf.source_range.start;
+    while p > 0 && bytes[p - 1] != b'\n' {
+        p -= 1;
+    }
+    leaf.source_range.start = p;
+}
+
+/// Resolve a BQ-emitted synth's container chain at `position`. Calls
+/// [`crate::analysis::enclosing_containers_at`] (the same byte-level
+/// query the cursor walker uses) so the synth carries every
+/// container that structurally encloses its byte — including a
+/// deeper inner list-item whose range was extended through a
+/// trailing pair shape by `effective_node_end`.
+///
+/// Falls back to `fallback` (the BQ's outer-built `child_chain`)
+/// when the analysis chain is shorter, so we never *drop* a
+/// container the BQ already knows about. In practice the analysis
+/// chain is always a (non-strict) extension of `child_chain` for
+/// these synths, so the fallback is paranoia.
+fn synth_chain_for_bq(
+    source: &str,
+    cursor: CursorRange,
+    position: usize,
+    fallback: &[Container],
+) -> Vec<Container> {
+    let analysis_chain = crate::analysis::enclosing_containers_at(source, position);
+    if analysis_chain.len() < fallback.len() {
+        return fallback.to_vec();
+    }
+    let tree = crate::parser::parse(source);
+    translate_enclosing_chain(&tree, source, cursor, analysis_chain)
 }
 
 /// Render a list container.
@@ -467,8 +722,31 @@ fn render_list_item(
                     // chain so any leaves the recursion emits
                     // carry it.
                     let before = out.len();
+                    let was_first = !emitted_first;
                     render_node(child, source, cursor, &chain, out);
                     if out.len() > before {
+                        // When this is the *first* leaf the item
+                        // emits, extend the leftmost recursed leaf's
+                        // source range back to the item's start so
+                        // the LI marker bytes (`- ` / `1. `) sit
+                        // inside it. Without this the marker-chrome
+                        // lookup below (which finds the leaf whose
+                        // `source_range.start <= node.range.start`)
+                        // misses — the recursion's leaf starts past
+                        // the marker, e.g. `1. > foo` parses as
+                        // LI→BQ→Paragraph and the BQ-paragraph leaf
+                        // starts at the BQ marker (byte 3), so the
+                        // outer LI's marker overlay never lands on
+                        // any leaf. Mirrors what
+                        // `extend_leading_range(_, false, …)` does
+                        // for the Paragraph-child path above.
+                        if was_first
+                            && let Some(idx) =
+                                (before..out.len()).min_by_key(|&i| out[i].source_range.start)
+                            && out[idx].source_range.start > node.range.start
+                        {
+                            out[idx].source_range.start = node.range.start;
+                        }
                         emitted_first = true;
                     }
                 }
@@ -1003,7 +1281,16 @@ fn inject_empty_paragraphs(
     for i in 0..leading_empties {
         let start = 2 * i;
         let mut synth = empty_paragraph_pair(start);
-        synth.containers = chain_for_position(tree, source, cursor, start);
+        // Query the chain at the second byte of the synth's pair (the
+        // cursor's natural resting position — the first `\n` of a
+        // `\n\n` pair is forbidden and snaps forward). This is past
+        // any container's `range.end` boundary that coincides with
+        // `start`, so a synth sitting in a top-level paragraph break
+        // *outside* a just-closed container reports an empty chain
+        // instead of inheriting the closed container's chain via a
+        // boundary-equality match in `pick_chain_target_for_position`.
+        let probe = (start + 1).min(bytes.len());
+        synth.containers = chain_for_position(tree, source, cursor, probe);
         out.push(synth);
     }
 
@@ -1026,7 +1313,15 @@ fn inject_empty_paragraphs(
             for k in 0..inter_empties {
                 let start = prev_end + 2 * k + 1;
                 let mut synth = empty_paragraph_pair(start);
-                synth.containers = chain_for_position(tree, source, cursor, start);
+                // See note on `probe` in the leading-gap loop. The
+                // synth's first byte is the second-of-pair `\n` in the
+                // structural break — at the boundary of a just-closed
+                // container its chain query risks a `position ==
+                // node.range.end` match. Query one byte deeper so the
+                // chain reports "outside the closed container" when
+                // the synth is structurally past it.
+                let probe = (start + 1).min(bytes.len());
+                synth.containers = chain_for_position(tree, source, cursor, probe);
                 out.push(synth);
             }
         }
@@ -1073,152 +1368,232 @@ fn inject_empty_paragraphs(
             (start + 2).min(bytes.len())
         };
         let mut synth = RenderBlock::new(start..end, BlockKind::Paragraph);
-        synth.containers = chain_for_position(tree, source, cursor, start);
+        // See note on `probe` in the leading / inter-block loops above.
+        // Query past the leading boundary `\n` so a trailing synth that
+        // sits past a just-closed container reports an empty chain.
+        let probe = (start + 1).min(bytes.len());
+        synth.containers = chain_for_position(tree, source, cursor, probe);
+        hide_synth_continuation_indent(&mut synth, bytes);
         out.push(synth);
     }
 
     out
 }
 
-/// Walk the syntax tree once at `position` and return the matching
-/// container chain as `Vec<Container>` — the render-spec's chain type.
+/// Hide every byte of the canonical chain continuation prefix on every
+/// line of a synthetic empty-paragraph leaf. The chain prefix
+/// interleaves LI continuation indents with BQ markers (outermost
+/// first); a flat "leading-LI-sum" hide misses the LI indent bytes that
+/// sit *between* BQ markers in alternating chains like
+/// `[LI, BQ, LI, BQ]` — those bytes render as visible text and push
+/// the cursor past the chain's content edge.
 ///
-/// Mirrors `analysis::walk_chain` but produces `Container` directly so
-/// synthetic empty leaves emitted by `inject_empty_paragraphs` carry
-/// the same chain a parsed leaf at the same byte would.
+/// Mirrors the parsed-leaf rendering: the real render walker hides BQ
+/// markers via `attach_marker` and per-LI continuation indents via
+/// `hide_item_continuation_indent`. Synth leaves don't have any of
+/// that scaffolding — they're emitted whole-cloth by
+/// `inject_empty_paragraphs` — so we hide the full
+/// `chain_continuation_prefix` byte sequence directly. See
+/// `bugs.md::trailing_li_continuation_indent_visible_and_eatable` and
+/// `bugs.md::alternating_chain_synth_leaf_visible_indent`.
+fn hide_synth_continuation_indent(leaf: &mut RenderBlock, bytes: &[u8]) {
+    hide_chain_continuation_prefix(leaf, bytes);
+}
+
+/// Hide the canonical [`crate::analysis::chain_continuation_prefix`]
+/// byte sequence on every line of `leaf`'s source range.
 ///
-/// The boundary rules match `analysis::pick_chain_target`:
-///   - container ranges are trimmed of any trailing `\n\n+` separator
-///     so a cursor parked on a post-construct empty row reads as
-///     "outside the construct";
-///   - strict containment beats range-end equality so the cursor at
-///     a sibling boundary picks the later sibling.
+/// This is the unified continuation-indent hide that subsumes the
+/// per-item `hide_item_continuation_indent` for cases where the chain
+/// alternates LI / BQ entries. The per-item pass only finds *leading*
+/// space runs, so on a line shaped `   > ` + `   ` + content (LI / BQ
+/// / LI prefix) it covers only the first `   ` and misses the trailing
+/// LI indent after the BQ marker. By comparing each line's bytes
+/// against the *full* chain-prefix string built from
+/// `chain_continuation_prefix`, we hide every byte of the prefix —
+/// leading LI indent, BQ markers, and the LI indent that sits
+/// *between* / *after* BQ markers — in one pass.
 ///
-/// `cursor` is the current selection (used to compute `cursor_inside`
-/// on each container — same value the renderer would have set if a
-/// real leaf had been emitted in this position).
+/// Lines whose bytes don't match the canonical prefix are left alone
+/// (they're not continuation lines — could be the line carrying the
+/// item's marker or a code-block content line that happens to live
+/// inside the leaf range).
+fn hide_chain_continuation_prefix(leaf: &mut RenderBlock, bytes: &[u8]) {
+    if leaf.containers.is_empty() {
+        return;
+    }
+    // Build the canonical chain prefix once. We use the analysis-side
+    // helper so render-side and source-side prefix shape can never
+    // disagree.
+    let analysis_chain: Vec<crate::analysis::EnclosingContainer> = leaf
+        .containers
+        .iter()
+        .map(|c| match c {
+            Container::BlockQuote { .. } => crate::analysis::EnclosingContainer::BlockQuote {
+                range: 0..0, // range isn't read by chain_continuation_prefix
+            },
+            Container::ListItem {
+                marker_byte_len, ..
+            } => crate::analysis::EnclosingContainer::ListItem(crate::analysis::ListItemContext {
+                list_kind: crate::syntax::ListKind::Unordered,
+                item_index: 0,
+                item_range: 0..0,
+                // Synthesize a marker_range whose width equals
+                // marker_byte_len; only the width matters here.
+                marker_range: 0..*marker_byte_len,
+            }),
+        })
+        .collect();
+    let prefix = crate::analysis::chain_continuation_prefix(&analysis_chain);
+    let prefix_bytes = prefix.as_bytes();
+    if prefix_bytes.is_empty() {
+        return;
+    }
+
+    let leaf_range = leaf.source_range.clone();
+    let mut p = leaf_range.start;
+    while p < leaf_range.end {
+        let line_end_inclusive_nl = source_line_end(bytes, p);
+        let line_content_end =
+            if line_end_inclusive_nl > 0 && bytes.get(line_end_inclusive_nl - 1) == Some(&b'\n') {
+                line_end_inclusive_nl - 1
+            } else {
+                line_end_inclusive_nl
+            }
+            .min(leaf_range.end);
+
+        // Match the canonical prefix byte-for-byte against the line.
+        // For LI segments (runs of spaces) and BQ segments (`> `) the
+        // prefix bytes are deterministic, so a literal byte-equal
+        // check is sufficient and avoids the per-segment loop's
+        // off-by-one footguns.
+        if line_content_end - p >= prefix_bytes.len()
+            && bytes[p..p + prefix_bytes.len()] == *prefix_bytes
+        {
+            leaf.hidden_ranges.push(p..p + prefix_bytes.len());
+        }
+
+        p = line_end_inclusive_nl.min(leaf_range.end);
+        if p < leaf_range.end && bytes[p] == b'\n' {
+            p += 1;
+        } else if p == line_end_inclusive_nl && p == line_content_end {
+            break;
+        }
+    }
+}
+
+/// Build a render-spec container chain at `position`, delegating the
+/// "what containers enclose this byte?" question to
+/// [`crate::analysis::enclosing_containers_at`] so render-side and
+/// cursor-side queries can never disagree.
+///
+/// The analysis chain reports `EnclosingContainer`s — `BlockQuote`
+/// (with its parsed range) and `ListItem` (with the item's
+/// `ListItemContext`). Translation to render-spec `Container`:
+///   - `BlockQuote { range }` → `Container::BlockQuote { cursor_inside }`
+///     where `cursor_inside = cursor.overlaps(&range)`.
+///   - `ListItem(ctx)` → `Container::ListItem { cursor_inside, kind,
+///     marker_byte_len, list_max_marker_text }`. `kind` and
+///     `list_max_marker_text` need the parent list (sibling count for
+///     ordered, marker char for unordered) — we look up the smallest
+///     `List` node in `tree` that owns this item via its
+///     `marker_range`.
+///
+/// Synthetic empty leaves emitted by `inject_empty_paragraphs` use
+/// this so they carry the same chain a parsed leaf at the same byte
+/// would; the render-walker's BQ-emitted synth (in
+/// `render_blockquote`) uses it for the same reason — its
+/// "built-up-while-walking" `child_chain` doesn't see deeper
+/// containers like an inner list-item that `analysis` recognizes via
+/// `effective_node_end` extension.
 fn chain_for_position(
     tree: &[SyntaxNode],
     source: &str,
     cursor: CursorRange,
     position: usize,
 ) -> Vec<Container> {
-    let mut out = Vec::new();
-    walk_chain_for_position(tree, source, cursor, position, &mut out);
-    out
+    let chain = crate::analysis::enclosing_containers_at(source, position);
+    translate_enclosing_chain(tree, source, cursor, chain)
 }
 
-fn walk_chain_for_position(
-    nodes: &[SyntaxNode],
+fn translate_enclosing_chain(
+    tree: &[SyntaxNode],
     source: &str,
     cursor: CursorRange,
-    position: usize,
-    out: &mut Vec<Container>,
-) {
-    let bytes = source.as_bytes();
-    let Some(node) = pick_chain_target_for_position(nodes, position, bytes) else {
-        return;
-    };
-    match &node.kind {
-        NodeKind::BlockQuote { .. } => {
-            out.push(Container::BlockQuote {
-                cursor_inside: cursor.overlaps(&node.range),
-            });
-            walk_chain_for_position(&node.children, source, cursor, position, out);
-        }
-        NodeKind::List { kind } => {
-            // Pick the right item using the same trim + strict-over-
-            // boundary preference as `pick_chain_target_for_position`,
-            // then descend into its children. Open-coded (rather than
-            // reusing the helper) so we can compute the per-item
-            // bullet / number from this list's `kind` and the item's
-            // positional index.
-            let max_marker_text = compute_list_max_marker_text(node, *kind);
-            let mut item_target: Option<(usize, &SyntaxNode, Range<usize>)> = None;
-            let mut item_is_strict = false;
-            let mut idx = 0usize;
-            for child in &node.children {
-                if let NodeKind::ListItem { marker_range } = &child.kind {
-                    let effective_end = effective_node_end_for_chain(child, bytes);
-                    if position >= child.range.start && position <= effective_end {
-                        let is_strict = position < effective_end;
-                        if is_strict || !item_is_strict {
-                            item_target = Some((idx, child, marker_range.clone()));
-                            item_is_strict = is_strict || item_is_strict;
-                        }
-                    }
-                    idx += 1;
+    chain: crate::analysis::EnclosingChain,
+) -> Vec<Container> {
+    chain
+        .into_iter()
+        .map(|c| match c {
+            crate::analysis::EnclosingContainer::BlockQuote { range } => Container::BlockQuote {
+                cursor_inside: cursor.overlaps(&range),
+            },
+            crate::analysis::EnclosingContainer::ListItem(ctx) => {
+                let (max_marker_text, item_kind) = list_context_for_item(tree, source, &ctx);
+                Container::ListItem {
+                    cursor_inside: cursor.overlaps(&ctx.item_range),
+                    kind: item_kind,
+                    marker_byte_len: ctx.marker_width(),
+                    list_max_marker_text: max_marker_text,
                 }
             }
-            if let Some((item_idx, item, marker_range)) = item_target {
-                let item_kind = match kind {
-                    ListKind::Unordered => {
-                        ListItemKind::Unordered(marker_char(source, &marker_range))
-                    }
-                    ListKind::Ordered { start } => ListItemKind::Ordered {
-                        number: start + item_idx as u64,
-                    },
-                };
-                out.push(Container::ListItem {
-                    cursor_inside: cursor.overlaps(&item.range),
-                    kind: item_kind,
-                    marker_byte_len: marker_range.end - marker_range.start,
-                    list_max_marker_text: max_marker_text,
-                });
-                walk_chain_for_position(&item.children, source, cursor, position, out);
+        })
+        .collect()
+}
+
+/// Find the smallest `List` in `tree` that contains a `ListItem` whose
+/// `marker_range` matches `ctx.marker_range`, and return its
+/// `list_max_marker_text` plus this item's `ListItemKind`. Falls back
+/// to a single-item synthesis if no match is found (the analysis chain
+/// guarantees the item exists, so this fallback is paranoia).
+fn list_context_for_item(
+    tree: &[SyntaxNode],
+    source: &str,
+    ctx: &crate::analysis::ListItemContext,
+) -> (String, ListItemKind) {
+    if let Some((list, kind)) = find_owning_list(tree, &ctx.marker_range) {
+        let max_marker_text = compute_list_max_marker_text(list, kind);
+        let item_kind = match kind {
+            ListKind::Unordered => ListItemKind::Unordered(marker_char(source, &ctx.marker_range)),
+            ListKind::Ordered { start } => ListItemKind::Ordered {
+                number: start + ctx.item_index as u64,
+            },
+        };
+        (max_marker_text, item_kind)
+    } else {
+        let max_marker_text = match ctx.list_kind {
+            ListKind::Unordered => "- ".to_string(),
+            ListKind::Ordered { start } => format!("{}. ", start),
+        };
+        let item_kind = match ctx.list_kind {
+            ListKind::Unordered => ListItemKind::Unordered(marker_char(source, &ctx.marker_range)),
+            ListKind::Ordered { start } => ListItemKind::Ordered {
+                number: start + ctx.item_index as u64,
+            },
+        };
+        (max_marker_text, item_kind)
+    }
+}
+
+fn find_owning_list<'a>(
+    nodes: &'a [SyntaxNode],
+    item_marker_range: &Range<usize>,
+) -> Option<(&'a SyntaxNode, ListKind)> {
+    for node in nodes {
+        if let NodeKind::List { kind } = &node.kind {
+            for child in &node.children {
+                if let NodeKind::ListItem { marker_range } = &child.kind
+                    && marker_range == item_marker_range
+                {
+                    return Some((node, *kind));
+                }
             }
         }
-        _ => {
-            walk_chain_for_position(&node.children, source, cursor, position, out);
+        if let Some(found) = find_owning_list(&node.children, item_marker_range) {
+            return Some(found);
         }
     }
-}
-
-/// Pick the sibling at this level that owns `position`, applying the
-/// "strict containment beats boundary equality" preference. Mirrors
-/// `analysis::pick_chain_target` but operates on `SyntaxNode` slices.
-fn pick_chain_target_for_position<'a>(
-    nodes: &'a [SyntaxNode],
-    position: usize,
-    bytes: &[u8],
-) -> Option<&'a SyntaxNode> {
-    let mut target: Option<&SyntaxNode> = None;
-    let mut target_is_strict = false;
-    for node in nodes {
-        let effective_end = effective_node_end_for_chain(node, bytes);
-        if position < node.range.start || position > effective_end {
-            continue;
-        }
-        let is_strict = position < effective_end;
-        if is_strict || !target_is_strict {
-            target = Some(node);
-            target_is_strict = is_strict || target_is_strict;
-        }
-    }
-    target
-}
-
-/// Trimmed effective end of a container node — drops a trailing
-/// `\n\n+` structural separator from List / ListItem / BlockQuote so a
-/// cursor on the post-construct empty row reads as "outside". Mirrors
-/// `analysis::effective_node_end`.
-fn effective_node_end_for_chain(node: &SyntaxNode, bytes: &[u8]) -> usize {
-    let raw_end = node.range.end;
-    let trims = matches!(
-        node.kind,
-        NodeKind::List { .. } | NodeKind::ListItem { .. } | NodeKind::BlockQuote { .. }
-    );
-    if !trims {
-        return raw_end;
-    }
-    let start = node.range.start;
-    let mut p = raw_end;
-    let mut trailing = 0;
-    while p > start && bytes[p - 1] == b'\n' {
-        p -= 1;
-        trailing += 1;
-    }
-    if trailing >= 2 { p } else { raw_end }
+    None
 }
 
 /// Position of the first non-`\n` byte in `range`. (Falls back to the end

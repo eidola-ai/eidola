@@ -4451,3 +4451,888 @@ fn render_blocks_have_no_overlapping_source_ranges_in_simple_bq_in_list(cx: &mut
         );
     }
 }
+
+#[gpui::test]
+fn enter_on_empty_inner_item_in_bq_in_outer_list_keeps_outer_indent(cx: &mut TestAppContext) {
+    // Repro from the user's report: an outer list item containing a
+    // BQ that itself contains a nested list. Cursor on the empty
+    // inner item; pressing Enter should drop the inner `- ` marker
+    // and produce a depth-1-pair separator that *carries the outer
+    // item's continuation indent* on every BQ line, so the BQ stays
+    // inside the outer list scope.
+    let src =
+        "- This is a list.\n\n  > With a blockquote.\n  > \n  > - With a nested list.\n  > - ";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // Trailing two BQ-prefix lines must carry the outer item's
+        // `  ` continuation indent, not be at column 0.
+        assert!(
+            !e.state.markdown.contains("\n> "),
+            "found a column-0 `> ` line — outer LI continuation indent was dropped: {:?}",
+            e.state.markdown,
+        );
+        assert!(
+            e.state.markdown.ends_with("  > "),
+            "buffer should end with a BQ continuation line at the outer item's indent column, got: {:?}",
+            e.state.markdown,
+        );
+        // Outer list-item is still intact at the start.
+        assert!(
+            e.state.markdown.starts_with("- This is a list."),
+            "outer item's first paragraph preserved",
+        );
+    });
+}
+
+#[gpui::test]
+fn shift_tab_on_inner_li_in_bq_wrapped_list_dedents(cx: &mut TestAppContext) {
+    // Repro from the user's report. Chain at cursor is
+    // [BQ, outer-LI(ord), inner-LI(ord)]. Shift+Tab on the empty
+    // inner item should make it a sibling of the outer LI.
+    //
+    // The line containing the inner marker starts with `>` (the BQ
+    // marker), not a space, so the existing nested-branch
+    // strip-leading-spaces loop matches zero bytes and the dedent
+    // is a no-op. Fix: skip past the active container-prefix bytes
+    // (BQ here) before stripping the parent LI's marker_width
+    // worth of leading spaces — same architectural pattern as the
+    // Tab indent fix that introduced `chain_outer_prefix_bytes`.
+    let src =
+        "> This is a blockquote.\n> \n> 1. This is a list\n>    1. With a nested list\n>    2. ";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftTab);
+    editor.read_with(cx, |e, _| {
+        // Inner marker is now at the outer level (sibling of `1. This is a list`).
+        // Result line should be `> 2. ` (BQ + sibling marker), not `>    2. `.
+        assert!(
+            e.state.markdown.ends_with("\n> 2. "),
+            "Shift+Tab should have dedented the inner item to sibling of outer LI; got: {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn backspace_on_empty_bq_paragraph_inside_li_drops_bq_scope(cx: &mut TestAppContext) {
+    // Repro from the user's report. The BQ has two trailing empty
+    // lines (the canonical depth-1 pair shape inside an LI:
+    // `\n   > \n   > `). Cursor is at the end. The user expects
+    // Backspace to convert the empty BQ paragraph into a raw
+    // (non-BQ) paragraph still nested inside the outer LI — the
+    // analog of "empty LI Enter drops the marker" but for the BQ
+    // scope.
+    let src = "1. This is a list.\n\n   > This is a blockquote\n   > \n   > ";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // Path B: the BQ scope is dropped on the trailing row but
+        // the cursor lands on an empty (non-BQ) continuation row
+        // still nested in the outer LI. The earlier BQ paragraph
+        // ("This is a blockquote") survives.
+        let md = &e.state.markdown;
+        let cursor = e.cursor_offset();
+        let chain = gpui_markdown_editor::analysis::enclosing_containers_at(md, cursor);
+
+        // Outer LI's first paragraph preserved.
+        assert!(
+            md.starts_with("1. This is a list."),
+            "outer LI's first paragraph preserved, got: {md:?}",
+        );
+        // The earlier BQ paragraph survived as content.
+        assert!(
+            md.contains("> This is a blockquote"),
+            "first BQ paragraph preserved, got: {md:?}",
+        );
+
+        // Cursor is on a non-BQ row inside the LI: chain has
+        // exactly one LI and ZERO BQs. (Path A would have left the
+        // chain at [outer-LI, BQ] with cursor at the end of the
+        // surviving BQ paragraph, which is *not* what the user
+        // wants.)
+        let li_count = chain
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    gpui_markdown_editor::analysis::EnclosingContainer::ListItem(_)
+                )
+            })
+            .count();
+        let bq_count = chain
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    gpui_markdown_editor::analysis::EnclosingContainer::BlockQuote { .. }
+                )
+            })
+            .count();
+        assert_eq!(li_count, 1, "still in outer LI; chain: {chain:?}");
+        assert_eq!(
+            bq_count, 0,
+            "cursor must be on a non-BQ row (BQ scope dropped); chain: {chain:?}",
+        );
+
+        // The trailing position must accept the cursor — no
+        // trailing `> ` (would be a BQ continuation).
+        assert!(
+            !md.ends_with("> "),
+            "trailing line is not a BQ continuation, got: {md:?}",
+        );
+    });
+}
+
+#[gpui::test]
+fn left_arrow_skips_hidden_bq_continuation_prefix_in_li(cx: &mut TestAppContext) {
+    // From the same fixture as the empty-BQ-in-LI Backspace bug.
+    // Left from byte 57 (end of buffer) should skip over every
+    // hidden continuation-prefix byte and land at the previous
+    // *visible content edge* — not at byte 56 (between the BQ's
+    // `>` and ` `), 55 (between LI indent and BQ `>`), 50, or 49.
+    //
+    // The `\n   > ` prefix has 5 hidden bytes; one Left over the
+    // entire `\n   > \n   > ` pair should land on the previous
+    // content row's terminus (end of "blockquote", byte 45) since
+    // every byte between 45 and 57 is structural prefix interior.
+    let src = "1. This is a list.\n\n   > This is a blockquote\n   > \n   > ";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    // After one Left, cursor must be at a non-forbidden position.
+    // The strict version: cursor lands at byte 45 (end of
+    // `blockquote`). The looser version we'll assert: cursor is
+    // not at any of the known-forbidden bytes (49, 50, 55, 56).
+    dispatch(cx, handle, &editor, Left);
+    let cursor = editor.read_with(cx, |e, _| e.cursor_offset());
+    assert!(
+        !matches!(cursor, 49 | 50 | 55 | 56),
+        "Left-arrow landed at forbidden BQ-prefix-interior byte {cursor}",
+    );
+}
+
+#[gpui::test]
+fn same_line_bq_inside_li_renders_with_li_marker_overlay(cx: &mut TestAppContext) {
+    // Repro from the user's report. Per CommonMark, this parses as
+    // a list with one item containing a blockquote containing a
+    // paragraph. The render walker should emit one paragraph leaf
+    // with chain [LI, BQ], the LI marker visible/hidden per cursor
+    // position, and the BQ chrome painted.
+    //
+    // Currently the LI's marker overlay isn't emitted — the
+    // rendered output has no list-item marker.
+    let src = "1. > This list contains a blockquote.";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_handle, editor) = open_editor(cx, initial);
+    let spec = editor.read_with(cx, |e, _| e.render_spec());
+    let paragraph = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::Paragraph))
+        .expect("paragraph leaf for the BQ content");
+    // Chain has both LI and BQ.
+    let li_count = paragraph
+        .containers
+        .iter()
+        .filter(|c| matches!(c, Container::ListItem { .. }))
+        .count();
+    let bq_count = paragraph
+        .containers
+        .iter()
+        .filter(|c| matches!(c, Container::BlockQuote { .. }))
+        .count();
+    assert_eq!(li_count, 1, "leaf carries one ListItem container");
+    assert_eq!(bq_count, 1, "leaf carries one BlockQuote container");
+    // The leaf must include some indication that the LI marker
+    // exists — either a marker_overlay for the `1. ` bytes or a
+    // hidden_range covering them. Without one, the rendered output
+    // can't show "1." anywhere, which is the user-visible bug.
+    let has_li_marker_chrome = !paragraph.marker_overlays.is_empty()
+        || paragraph
+            .hidden_ranges
+            .iter()
+            .any(|r| r.start == 0 && r.end >= 3);
+    assert!(
+        has_li_marker_chrome,
+        "expected LI marker chrome (overlay or hidden range covering `1. `); \
+         got marker_overlays={:?}, hidden_ranges={:?}",
+        paragraph.marker_overlays, paragraph.hidden_ranges,
+    );
+}
+
+#[gpui::test]
+fn empty_paragraph_after_bq_outdent_renders_at_top_level(cx: &mut TestAppContext) {
+    // Repro from the user's report. After Backspace at the end of
+    // an empty BQ paragraph, the trailing pair becomes a top-level
+    // paragraph break + a few blank lines. Each blank-line leaf
+    // must have an empty container chain — *not* the BQ chain
+    // inherited from the original BQ above it.
+    let src = "> This is a blockquote.\n> \n> \n\nParagraph";
+    let cursor = "> This is a blockquote.\n> \n> ".len();
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        let md = &e.state.markdown;
+        // The first BQ block ends after "blockquote."; everything
+        // past that newline is structurally outside the BQ.
+        let bq_end = md.find("blockquote.").unwrap() + "blockquote.".len();
+        let spec = e.render_spec();
+        for b in &spec.blocks {
+            // Any leaf whose source_range starts at or after the
+            // BQ's structural end must have NO BQ in its chain.
+            if b.source_range.start >= bq_end {
+                let bq_count = b
+                    .containers
+                    .iter()
+                    .filter(|c| matches!(c, Container::BlockQuote { .. }))
+                    .count();
+                assert_eq!(
+                    bq_count, 0,
+                    "leaf at range {:?} (kind {:?}) is past BQ end ({bq_end}) but \
+                     still has BQ in its chain — would render BQ chrome on a row \
+                     that isn't structurally inside the BQ. Buffer: {md:?}",
+                    b.source_range, b.kind,
+                );
+            }
+        }
+    });
+}
+
+#[gpui::test]
+fn same_line_bq_marker_inside_li_is_hidden(cx: &mut TestAppContext) {
+    // Repro from the user's report. Source `1. > content`. The
+    // first leaf must hide BOTH the LI marker (`1. ` bytes 0..3)
+    // AND the BQ marker (`> ` bytes 3..5). Currently only the LI
+    // marker is hidden — the BQ marker shows as visible plain
+    // text.
+    let src = "1. > This one is long enough to wrap around.";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (_handle, editor) = open_editor(cx, initial);
+    let spec = editor.read_with(cx, |e, _| e.render_spec());
+    let first = &spec.blocks[0];
+    // The LI marker chrome should already be hidden from prior
+    // fixes.
+    assert!(
+        first
+            .hidden_ranges
+            .iter()
+            .any(|r| r.start == 0 && r.end >= 3),
+        "LI marker `1. ` must be in hidden_ranges; got: {:?}",
+        first.hidden_ranges,
+    );
+    // The BQ marker on the same line must ALSO be hidden.
+    assert!(
+        first
+            .hidden_ranges
+            .iter()
+            .any(|r| r.start <= 3 && r.end >= 5),
+        "BQ marker `> ` (bytes 3..5) must be in hidden_ranges; got: {:?}",
+        first.hidden_ranges,
+    );
+}
+
+#[gpui::test]
+fn trailing_li_continuation_indent_is_hidden_in_synth_leaf(cx: &mut TestAppContext) {
+    // Repro from the user's report. Source `1. List item one\n\n   `
+    // with cursor at end. The synthetic empty paragraph leaf for the
+    // trailing continuation should hide the LI's continuation indent
+    // (the 3 leading spaces) so the cursor lands at the visible
+    // content edge — same column as `List item one`.
+    let src = "1. List item one\n\n   ";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (_handle, editor) = open_editor(cx, initial);
+    let spec = editor.read_with(cx, |e, _| e.render_spec());
+    // Find the leaf covering the trailing position.
+    let trailing = spec
+        .blocks
+        .iter()
+        .find(|b| b.source_range.contains(&20) || b.source_range.end == 21)
+        .expect("a leaf for the trailing position");
+    // Chain has the LI.
+    let li_count = trailing
+        .containers
+        .iter()
+        .filter(|c| matches!(c, Container::ListItem { .. }))
+        .count();
+    assert_eq!(li_count, 1, "trailing leaf carries the LI in its chain");
+    // The 3-byte indent (bytes 18..21 — `   ` after the `\n\n`) is
+    // in hidden_ranges. Without this, the rendered line shows the
+    // 3 spaces as visible text and the cursor sits past them.
+    let indent_hidden = trailing.hidden_ranges.iter().any(|r| {
+        // Some range that ends at or past 21 (the cursor position)
+        // and starts at or before 18 (right after the `\n\n`).
+        r.start <= 18 && r.end >= 21
+    });
+    assert!(
+        indent_hidden,
+        "expected hidden_range covering 18..21 (LI continuation indent) on trailing leaf; \
+         got hidden_ranges={:?}",
+        trailing.hidden_ranges,
+    );
+}
+
+#[gpui::test]
+fn backspace_at_trailing_li_continuation_atomic_deletes(cx: &mut TestAppContext) {
+    // Repro from the user's report. Source `1. List item one\n\n   `
+    // with cursor at end. Backspace should remove the entire
+    // paragraph-break-with-LI-indent (`\n\n   `, 5 bytes) and land
+    // the cursor back at the end of "List item one" (byte 16).
+    let src = "1. List item one\n\n   ";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // Source has shrunk by exactly the `\n\n   ` paragraph-break-
+        // with-indent (5 bytes).
+        assert_eq!(
+            e.state.markdown, "1. List item one",
+            "Backspace must atomic-delete the full paragraph break + LI indent",
+        );
+        assert_eq!(
+            e.cursor_offset(),
+            16,
+            "cursor at end of `one` after the atomic delete",
+        );
+    });
+}
+
+#[gpui::test]
+fn alternating_chain_trailing_synth_hides_full_continuation_prefix(cx: &mut TestAppContext) {
+    // Chain at cursor: [outer-LI, outer-BQ, inner-LI, inner-BQ].
+    // Trailing line is `   >    > ` (full continuation prefix:
+    // 3sp + `> ` + 3sp + `> `, 10 bytes). Every non-cursor byte
+    // of that prefix should be hidden — the LI continuation
+    // indents (bytes 31..34 and 36..39) AND the BQ markers
+    // (34..36 and 39..41).
+    let src = "1. > 1. > Something\n   >    > \n   >    > ";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (_handle, editor) = open_editor(cx, initial);
+    let spec = editor.read_with(cx, |e, _| e.render_spec());
+    let trailing = spec
+        .blocks
+        .iter()
+        .find(|b| b.source_range.contains(&40) || b.source_range.end == 41)
+        .expect("trailing leaf");
+    // Sum hidden bytes in the trailing-line range (31..41).
+    let hidden_in_trailing: usize = trailing
+        .hidden_ranges
+        .iter()
+        .filter(|r| r.start >= 31 && r.end <= 41)
+        .map(|r| r.end - r.start)
+        .sum();
+    assert_eq!(
+        hidden_in_trailing, 10,
+        "expected all 10 bytes of trailing continuation prefix \
+         (31..41) hidden — got {hidden_in_trailing}, \
+         hidden_ranges={:?}",
+        trailing.hidden_ranges,
+    );
+}
+
+#[gpui::test]
+fn backspace_on_alternating_chain_keeps_inner_li_scope(cx: &mut TestAppContext) {
+    // Source: `1. > 1. > Something\n   >    > \n   >    > `,
+    // cursor at end. Chain is [outer-LI, outer-BQ, inner-LI,
+    // inner-BQ]. Press Backspace.
+    //
+    // Expected: BQ-outdent drops the inner-BQ; cursor lands
+    // inside chain [outer-LI, outer-BQ, inner-LI] — a paragraph
+    // sibling to the inner-BQ within the inner-LI.
+    let src = "1. > 1. > Something\n   >    > \n   >    > ";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        let cursor = e.cursor_offset();
+        let chain =
+            gpui_markdown_editor::analysis::enclosing_containers_at(&e.state.markdown, cursor);
+        // Chain has both LIs and the outer BQ: 3 entries total.
+        let li_count = chain
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    gpui_markdown_editor::analysis::EnclosingContainer::ListItem(_)
+                )
+            })
+            .count();
+        let bq_count = chain
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    gpui_markdown_editor::analysis::EnclosingContainer::BlockQuote { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            li_count, 2,
+            "both LIs preserved in chain after BQ-outdent; chain: {chain:?}, buffer: {:?}",
+            e.state.markdown,
+        );
+        assert_eq!(
+            bq_count, 1,
+            "outer-BQ preserved, inner-BQ dropped; chain: {chain:?}, buffer: {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn alternating_chain_continuation_hides_trailing_li_indent(cx: &mut TestAppContext) {
+    // Chain at the trailing position is [outer-LI, outer-BQ,
+    // inner-LI]. The continuation prefix is `   >    ` (8 bytes:
+    // 3sp outer-LI indent + `> ` outer-BQ marker + 3sp inner-LI
+    // indent). When the user types content there, the leaf
+    // covering it must hide ALL 8 prefix bytes — the existing fix
+    // covers the BQ marker and the leading LI indent but misses
+    // the *trailing* LI indent after the last BQ marker.
+    let src = "1. > 1. > Blockquote\n   > \n   >    Paragraph  \n   >    More";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (_handle, editor) = open_editor(cx, initial);
+    let spec = editor.read_with(cx, |e, _| e.render_spec());
+    // Find the leaf covering the "More" content.
+    let more_pos = src.find("More").unwrap();
+    let leaf = spec
+        .blocks
+        .iter()
+        .find(|b| b.source_range.contains(&more_pos))
+        .expect("a leaf covering 'More'");
+    // The continuation prefix bytes are 47..55. Every byte must
+    // be hidden somewhere in this leaf's hidden_ranges.
+    for byte in 47..55 {
+        let covered = leaf
+            .hidden_ranges
+            .iter()
+            .any(|r| r.start <= byte && byte < r.end);
+        assert!(
+            covered,
+            "byte {byte} (inside continuation prefix 47..55) is not in hidden_ranges; \
+             got hidden_ranges={:?}",
+            leaf.hidden_ranges,
+        );
+    }
+}
+
+#[gpui::test]
+fn synth_trailing_leaf_in_alternating_chain_keeps_inner_li(cx: &mut TestAppContext) {
+    // Chain at the trailing empty position should be [outer-LI,
+    // outer-BQ, inner-LI]. The cursor walker sees this correctly
+    // (length 3); the render walker emits the leaf with chain
+    // length 2 ([outer-LI, outer-BQ]) — so the inner-LI's chrome
+    // (indent strip / marker overlay) won't paint, even though
+    // the cursor analytically sits inside the inner-LI.
+    let src = "1. > 1. > Blockquote\n   > \n   >    Paragraph  \n   >    ";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (_handle, editor) = open_editor(cx, initial);
+    let (cursor_chain_len, block_chain_len) = editor.read_with(cx, |e, _| {
+        let cursor_chain = gpui_markdown_editor::analysis::enclosing_containers_at(
+            &e.state.markdown,
+            e.cursor_offset(),
+        );
+        let spec = e.render_spec();
+        let trailing = spec
+            .blocks
+            .iter()
+            .find(|b| b.source_range.end == e.state.markdown.len())
+            .expect("trailing leaf");
+        (cursor_chain.len(), trailing.containers.len())
+    });
+    assert_eq!(
+        cursor_chain_len, 3,
+        "cursor walker should report 3 containers"
+    );
+    assert_eq!(
+        block_chain_len, 3,
+        "trailing leaf chain must agree with cursor walker (3 containers)",
+    );
+}
+
+#[gpui::test]
+fn hard_break_trailing_synth_extends_previous_paragraph(cx: &mut TestAppContext) {
+    // Source has a hard break (`Paragraph  `) followed by a
+    // continuation row `   >    ` (with no further content). The
+    // user expects the cursor's row to be part of the previous
+    // paragraph (a continuation of the hard break), not a
+    // separate paragraph with a paragraph_gap before it.
+    //
+    // Ground truth: the same source with one extra char of
+    // content (`Paragraph  \n   >    X`) parses as ONE paragraph
+    // with hard-break continuation — one RenderBlock. The empty
+    // case must produce the same number of blocks.
+    let empty_src = "1. > 1. > Blockquote\n   > \n   >    Paragraph  \n   >    ";
+    let with_content_src = "1. > 1. > Blockquote\n   > \n   >    Paragraph  \n   >    X";
+
+    let with_content_block_count = {
+        let initial = EditorState {
+            markdown: with_content_src.into(),
+            selection: Selection::Cursor(with_content_src.len()),
+        };
+        let (_handle, editor) = open_editor(cx, initial);
+        editor.read_with(cx, |e, _| e.render_spec().blocks.len())
+    };
+
+    let empty_block_count = {
+        let initial = EditorState {
+            markdown: empty_src.into(),
+            selection: Selection::Cursor(empty_src.len()),
+        };
+        let (_handle, editor) = open_editor(cx, initial);
+        editor.read_with(cx, |e, _| e.render_spec().blocks.len())
+    };
+
+    assert_eq!(
+        empty_block_count, with_content_block_count,
+        "empty trailing case must produce the same number of \
+         RenderBlocks as the with-content case so the cursor \
+         visual position is identical (no extra paragraph_gap). \
+         empty={empty_block_count}, with_content={with_content_block_count}",
+    );
+}
+
+#[gpui::test]
+#[ignore = "manual probe — render shape with hard break + trailing empty in alternating chain"]
+fn probe_hard_break_trailing_in_alternating_chain(cx: &mut TestAppContext) {
+    let src = "1. > 1. > Blockquote\n   > \n   >    Paragraph  \n   >    ";
+    eprintln!("\n# Source ({} bytes):", src.len());
+    eprintln!("{src:?}");
+
+    fn dump(label: &str, e: &MarkdownEditor) {
+        eprintln!("\n## {label}");
+        eprintln!(
+            "buffer ({} bytes): {:?}",
+            e.state.markdown.len(),
+            e.state.markdown
+        );
+        eprintln!("cursor: {}", e.cursor_offset());
+        let chain = gpui_markdown_editor::analysis::enclosing_containers_at(
+            &e.state.markdown,
+            e.cursor_offset(),
+        );
+        eprintln!("cursor chain length: {}", chain.len());
+        let spec = e.render_spec();
+        for (i, b) in spec.blocks.iter().enumerate() {
+            let chain_str: Vec<String> = b
+                .containers
+                .iter()
+                .map(|c| match c {
+                    Container::BlockQuote { .. } => "BQ".into(),
+                    Container::ListItem { .. } => "LI".into(),
+                })
+                .collect();
+            eprintln!(
+                "  block[{i}] {:?} range={}..{} chain=[{}]\n    hidden_ranges={:?}\n    delimiter_lines={:?}",
+                b.kind,
+                b.source_range.start,
+                b.source_range.end,
+                chain_str.join(", "),
+                b.hidden_ranges,
+                b.delimiter_lines,
+            );
+        }
+    }
+
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    editor.read_with(cx, |e, _| {
+        dump("BEFORE typing (cursor on empty trailing)", e)
+    });
+
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("More".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| dump("AFTER typing 'More'", e));
+}
+
+#[gpui::test]
+#[ignore = "manual probe — alternating chain backspace stair-step"]
+fn probe_alternating_chain_backspace_steps(cx: &mut TestAppContext) {
+    let src = "1. > 1. > Something\n   >    > \n   >    > ";
+    eprintln!("\n# Initial state");
+    eprintln!("source: {src:?}, len: {}", src.len());
+    let mut state = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    for step in 0..6 {
+        let initial = state.clone();
+        let (handle, editor) = open_editor(cx, initial);
+        editor.read_with(cx, |e, _| {
+            eprintln!("\n## After {step} BS");
+            eprintln!(
+                "buffer: {:?}, len: {}",
+                e.state.markdown,
+                e.state.markdown.len()
+            );
+            eprintln!("cursor: {}", e.cursor_offset());
+            let chain = gpui_markdown_editor::analysis::enclosing_containers_at(
+                &e.state.markdown,
+                e.cursor_offset(),
+            );
+            eprintln!("cursor chain length: {}", chain.len());
+            let spec = e.render_spec();
+            for (i, b) in spec.blocks.iter().enumerate() {
+                let chain_str: Vec<String> = b
+                    .containers
+                    .iter()
+                    .map(|c| match c {
+                        Container::BlockQuote { .. } => "BQ".into(),
+                        Container::ListItem { .. } => "LI".into(),
+                    })
+                    .collect();
+                eprintln!(
+                    "  block[{i}] {:?} range={}..{} chain=[{}] hidden={:?}",
+                    b.kind,
+                    b.source_range.start,
+                    b.source_range.end,
+                    chain_str.join(", "),
+                    b.hidden_ranges,
+                );
+            }
+        });
+        dispatch(cx, handle, &editor, Backspace);
+        state = editor.read_with(cx, |e, _| e.state.clone());
+    }
+}
+
+#[gpui::test]
+#[ignore = "manual probe — captures render + Backspace state for trailing LI continuation indent"]
+fn probe_trailing_li_continuation_indent(cx: &mut TestAppContext) {
+    let src = "1. List item one\n\n   ";
+    eprintln!("\n# Initial state\nsource: {src:?}, len: {}", src.len());
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    editor.read_with(cx, |e, _| {
+        let cursor = e.cursor_offset();
+        eprintln!("cursor: {cursor}");
+        let chain =
+            gpui_markdown_editor::analysis::enclosing_containers_at(&e.state.markdown, cursor);
+        eprintln!("cursor chain length: {}", chain.len());
+        let spec = e.render_spec();
+        for (i, b) in spec.blocks.iter().enumerate() {
+            let chain_str: Vec<String> = b
+                .containers
+                .iter()
+                .map(|c| match c {
+                    Container::BlockQuote { .. } => "BQ".into(),
+                    Container::ListItem { .. } => "LI".into(),
+                })
+                .collect();
+            eprintln!(
+                "  block[{i}] {:?} range={}..{} chain=[{}]\n    hidden_ranges={:?}",
+                b.kind,
+                b.source_range.start,
+                b.source_range.end,
+                chain_str.join(", "),
+                b.hidden_ranges,
+            );
+        }
+    });
+    eprintln!("\n# After Backspace");
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        eprintln!("buffer: {:?}", e.state.markdown);
+        eprintln!("cursor: {}", e.cursor_offset());
+    });
+    eprintln!("\n# Left arrows from initial cursor");
+    for n_lefts in 1..=4 {
+        let initial2 = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(src.len()),
+        };
+        let (handle2, editor2) = open_editor(cx, initial2);
+        for _ in 0..n_lefts {
+            dispatch(cx, handle2, &editor2, Left);
+        }
+        let cursor = editor2.read_with(cx, |e, _| e.cursor_offset());
+        eprintln!("  Left*{n_lefts}: cursor={cursor}");
+    }
+}
+
+/// Manual probe for the empty-paragraph-after-BQ-outdent bug.
+#[gpui::test]
+#[ignore = "manual probe — captures the chain on each leaf after BQ-outdent leaves multiple blank lines"]
+fn probe_empty_paragraph_after_bq_outdent(cx: &mut TestAppContext) {
+    let src = "> This is a blockquote.\n> \n> \n\nParagraph";
+    let cursor = "> This is a blockquote.\n> \n> ".len();
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(cursor),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        eprintln!("\nbuffer after Backspace: {:?}", e.state.markdown);
+        eprintln!("cursor: {}", e.cursor_offset());
+        let spec = e.render_spec();
+        for (i, b) in spec.blocks.iter().enumerate() {
+            let chain: Vec<String> = b
+                .containers
+                .iter()
+                .map(|c| match c {
+                    Container::BlockQuote { cursor_inside } => {
+                        if *cursor_inside {
+                            "BQ*".into()
+                        } else {
+                            "BQ".into()
+                        }
+                    }
+                    Container::ListItem { cursor_inside, .. } => {
+                        if *cursor_inside {
+                            "LI*".into()
+                        } else {
+                            "LI".into()
+                        }
+                    }
+                })
+                .collect();
+            eprintln!(
+                "  block[{i}] {:?} range={}..{} chain=[{}] hidden={} overlays={}",
+                b.kind,
+                b.source_range.start,
+                b.source_range.end,
+                chain.join(", "),
+                b.hidden_ranges.len(),
+                b.marker_overlays.len(),
+            );
+        }
+    });
+}
+
+/// Manual probe for the visible-`>`-marker on same-line BQ-in-LI bug.
+#[gpui::test]
+#[ignore = "manual probe — checks hidden_ranges + marker_overlays for `1. > content`"]
+fn probe_same_line_bq_in_li_render(cx: &mut TestAppContext) {
+    let src = "1. > This one is long enough to wrap.\n   > \n   > Second paragraph.\n\n";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (_handle, editor) = open_editor(cx, initial);
+    let spec = editor.read_with(cx, |e, _| e.render_spec());
+    eprintln!("\n# Source:\n{src}\n");
+    for (i, b) in spec.blocks.iter().enumerate() {
+        let chain: Vec<String> = b
+            .containers
+            .iter()
+            .map(|c| match c {
+                Container::BlockQuote { .. } => "BQ".into(),
+                Container::ListItem { .. } => "LI".into(),
+            })
+            .collect();
+        eprintln!(
+            "  block[{i}] {:?} range={}..{} chain=[{}]\n    hidden_ranges={:?}\n    marker_overlays={:?}\n    substitutions={:?}",
+            b.kind,
+            b.source_range.start,
+            b.source_range.end,
+            chain.join(", "),
+            b.hidden_ranges,
+            b.marker_overlays,
+            b.substitutions,
+        );
+    }
+}
+
+/// Manual probe — not a regression test. Run with
+/// `cargo test -p gpui-markdown-editor --test behavior probe_left_backspace -- --ignored --nocapture`
+/// to dump the buffer + cursor at each step of the user-reported sequence.
+#[gpui::test]
+#[ignore = "manual probe — captures Backspace behavior at Left*N positions for the empty-BQ-in-LI fixture"]
+fn probe_left_backspace_on_empty_bq_in_li(cx: &mut TestAppContext) {
+    let src = "1. This is a list.\n\n   > This is a blockquote\n   > \n   > ";
+    for n_lefts in 0..=5 {
+        let initial = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(src.len()),
+        };
+        let (handle, editor) = open_editor(cx, initial);
+        for _ in 0..n_lefts {
+            dispatch(cx, handle, &editor, Left);
+        }
+        let cursor_after_lefts = editor.read_with(cx, |e, _| e.cursor_offset());
+        dispatch(cx, handle, &editor, Backspace);
+        editor.read_with(cx, |e, _| {
+            let md = &e.state.markdown;
+            let cursor = e.cursor_offset();
+            // Render the buffer with `|` at cursor for visual scan.
+            let mut visual = String::with_capacity(md.len() + 1);
+            for (i, ch) in md.char_indices() {
+                if i == cursor {
+                    visual.push('|');
+                }
+                if ch == ' ' {
+                    visual.push('·');
+                } else if ch == '\n' {
+                    visual.push('⏎');
+                    visual.push('\n');
+                } else {
+                    visual.push(ch);
+                }
+            }
+            if cursor == md.len() {
+                visual.push('|');
+            }
+            eprintln!(
+                "\n=== n_lefts={n_lefts} (cursor before BS: {cursor_after_lefts}) ===\n\
+                 cursor after BS: {cursor}\nmarkdown:\n{visual}\n",
+            );
+        });
+    }
+}

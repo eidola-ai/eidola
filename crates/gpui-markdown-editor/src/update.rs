@@ -669,6 +669,68 @@ fn delete_backward(state: EditorState) -> EditorState {
         if let Some(pair_start) = pair_at_end(bytes, snapped) {
             return splice(&state.markdown, cursor, pair_start, snapped);
         }
+        // Chain-aware BQ outdent: the BQ-only walker above
+        // (`bq_paragraph_outdent`) doesn't see pairs whose prefix
+        // includes a list-item continuation indent (e.g.
+        // `\n   > \n   > ` for a depth-1 BQ pair inside a `1. `
+        // item, or the alternating-chain shape
+        // `\n   > \n   >    > ` for `[LI, BQ, LI, BQ]`). Compute the
+        // cursor's container chain, build the canonical pair shape
+        // for it via [`chain_pair_shape`], and try matching it
+        // exactly. When the cursor sits at the end of a chain-aware
+        // pair whose chain ends in a `BlockQuote`, drop the innermost
+        // BQ scope on the trailing row only — replace the pair with
+        // the canonical paragraph-break shape for the *new* chain
+        // (chain minus the trailing BQ), which derives from the
+        // three-branch [`chain_pair_shape`] rule:
+        //
+        // - New chain ends in BQ → symmetric `\n[full]\n[full]`
+        //   (depth-(D-1) pair; the existing pure-BQ depth-N tests).
+        // - New chain has BQ but trails LIs (alternating chain) →
+        //   asymmetric `\n[blank]\n[content]` where `blank` is the
+        //   prefix through the last BQ and `content` is the full
+        //   prefix. This keeps the still-open BQs' markers on the
+        //   blank line so pulldown doesn't close intermediate
+        //   list-item scopes.
+        // - New chain has no BQ (pure LI or empty) → `\n\n[content]`
+        //   (top-level paragraph break, LI continuation indent on
+        //   the new row only — Path B from
+        //   `bugs.md::backspace_on_empty_bq_paragraph_in_li_eats_hidden_chars`).
+        let chain = analysis::enclosing_containers_at(&state.markdown, snapped);
+        if matches!(
+            chain.last(),
+            Some(analysis::EnclosingContainer::BlockQuote { .. })
+        ) && let Some(pair_start) = analysis::pair_at_end_for_chain(bytes, snapped, &chain)
+        {
+            let new_chain = &chain[..chain.len() - 1];
+            let (blank_prefix, content_prefix) = analysis::chain_pair_shape(new_chain);
+            let replacement = format!("\n{blank_prefix}\n{content_prefix}");
+            let mut buf = String::with_capacity(
+                state.markdown.len() - (snapped - pair_start) + replacement.len(),
+            );
+            buf.push_str(&state.markdown[..pair_start]);
+            buf.push_str(&replacement);
+            buf.push_str(&state.markdown[snapped..]);
+            let new_cursor = pair_start + replacement.len();
+            return EditorState {
+                markdown: buf,
+                selection: Selection::Cursor(new_cursor),
+            };
+        }
+        // LI-trailing pair (no BQ at the chain's end but possibly BQs
+        // earlier): atomic-delete the whole shape so the user doesn't
+        // eat hidden prefix bytes one at a time. The forbidden-position
+        // predicate (`is_forbidden_position` → `is_list_indent_interior`
+        // / `is_chain_pair_interior`) already treats these bytes as
+        // pair-interior for navigation; this matches that behavior on
+        // the delete path.
+        if matches!(
+            chain.last(),
+            Some(analysis::EnclosingContainer::ListItem(_))
+        ) && let Some(pair_start) = analysis::pair_at_end_for_chain(bytes, snapped, &chain)
+        {
+            return splice(&state.markdown, cursor, pair_start, snapped);
+        }
     }
 
     let prev = prev_grapheme_offset(&state.markdown, cursor);
@@ -692,6 +754,16 @@ fn delete_forward(state: EditorState) -> EditorState {
     if !analysis::is_in_fenced_code(bytes, cursor) {
         let snapped = prev_allowed_position(&state.markdown, cursor);
         if let Some(pair_end) = pair_at_start(bytes, snapped) {
+            return splice(&state.markdown, cursor, snapped, pair_end);
+        }
+        // Chain-aware atomic pair delete (forward analog of the
+        // backward path in `delete_backward`). See the comment there
+        // for why the BQ-only walker above misses LI-wrapped pair
+        // shapes.
+        let chain = analysis::enclosing_containers_at(&state.markdown, snapped);
+        if !chain.is_empty()
+            && let Some(pair_end) = analysis::pair_at_start_for_chain(bytes, snapped, &chain)
+        {
             return splice(&state.markdown, cursor, snapped, pair_end);
         }
     }

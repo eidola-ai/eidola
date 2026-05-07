@@ -147,8 +147,19 @@ impl RenderBlock {
         }
     }
 
+    /// True if `range` is hidden — either as an exact entry in
+    /// `hidden_ranges` or as a sub-range of one. The post-render
+    /// `merge_hidden_ranges` pass collapses overlapping / touching
+    /// entries (so a multi-pass hide writing `[0..2]` and `[2..4]`
+    /// canonicalizes to `[0..4]`); callers that asserted on the
+    /// original sub-ranges still want a positive answer.
     pub fn has_hidden_range(&self, range: Range<usize>) -> bool {
-        self.hidden_ranges.contains(&range)
+        if range.is_empty() {
+            return self.hidden_ranges.contains(&range);
+        }
+        self.hidden_ranges
+            .iter()
+            .any(|r| r.start <= range.start && range.end <= r.end)
     }
 
     pub fn has_dimmed_range(&self, range: Range<usize>) -> bool {

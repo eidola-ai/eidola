@@ -188,6 +188,86 @@ pub fn is_forbidden_position(markdown: &str, p: usize) -> bool {
     if is_list_indent_interior(markdown, p) {
         return true;
     }
+    if is_chain_pair_interior(markdown, p) && !is_in_ranges(p, &fenced_code_content_ranges(bytes)) {
+        return true;
+    }
+    false
+}
+
+/// Chain-aware analog of [`is_paragraph_break_interior`]: is byte `p`
+/// strictly inside the canonical pair shape for the chain at `p`?
+///
+/// The canonical pair shape is
+/// `\n{blank_prefix}\n{content_prefix}` — see [`chain_pair_shape`] for
+/// the three-branch derivation. `is_paragraph_break_interior` only
+/// walks BQ markers (`>` and ` `), so it misses pairs whose prefix
+/// interleaves a list-item continuation indent with BQ markers (e.g.
+/// `\n   > \n   > ` for a depth-1 BQ pair inside a `1. `-prefixed
+/// item, or `\n   > \n   >    ` for an alternating chain ending in
+/// LI). This helper closes that gap by computing the chain at `p`,
+/// building the canonical chain-aware pair shape, and matching it
+/// exactly.
+///
+/// Pure-LI chains (no BQ anywhere) collapse to the depth-0 shape
+/// `\n\n[prefix]` and are already handled by the BQ-only walker plus
+/// [`is_list_indent_interior`]; this helper only fires for chains
+/// that contain at least one BQ.
+pub fn is_chain_pair_interior(markdown: &str, p: usize) -> bool {
+    if p == 0 || p > markdown.len() {
+        return false;
+    }
+    let chain = enclosing_containers_at(markdown, p);
+    if !chain
+        .iter()
+        .any(|c| matches!(c, EnclosingContainer::BlockQuote { .. }))
+    {
+        return false;
+    }
+    let (blank_prefix, content_prefix) = chain_pair_shape(&chain);
+    let blank_bytes = blank_prefix.as_bytes();
+    let content_bytes = content_prefix.as_bytes();
+    let pair_len = 2 + blank_bytes.len() + content_bytes.len();
+    if pair_len < 2 {
+        return false;
+    }
+    let bytes = markdown.as_bytes();
+    // Try every candidate pair start `s` such that `s < p < s +
+    // pair_len`. Each candidate position is the index of the *first*
+    // `\n` of the pair. The pair shape: bytes[s] == '\n', then
+    // `blank_prefix`, then '\n', then `content_prefix`.
+    let lo = p.saturating_sub(pair_len.saturating_sub(1));
+    for s in lo..p {
+        if s + pair_len > bytes.len() {
+            break;
+        }
+        if bytes[s] != b'\n' {
+            continue;
+        }
+        // Reject hard-break `\n` (`  \n` / `\\\n`) — those aren't
+        // structural pair `\n`s.
+        if s >= 2 && bytes[s - 1] == b' ' && bytes[s - 2] == b' ' {
+            continue;
+        }
+        if s >= 1 && bytes[s - 1] == b'\\' {
+            continue;
+        }
+        if &bytes[s + 1..s + 1 + blank_bytes.len()] != blank_bytes {
+            continue;
+        }
+        if bytes[s + 1 + blank_bytes.len()] != b'\n' {
+            continue;
+        }
+        if &bytes[s + 2 + blank_bytes.len()..s + pair_len] != content_bytes {
+            continue;
+        }
+        // Found a valid pair from s to s + pair_len. Allowed
+        // positions: the pair's start (s) and end (s + pair_len).
+        // Every other interior byte is forbidden.
+        let offset = p - s;
+        if offset > 0 && offset < pair_len {
+            return true;
+        }
+    }
     false
 }
 
@@ -1196,6 +1276,41 @@ pub fn chain_continuation_prefix_bytes(chain: &[EnclosingContainer]) -> usize {
         .sum()
 }
 
+/// Canonical paragraph-break-pair shape for `chain` as `(blank_prefix,
+/// content_prefix)`. The pair is always
+/// `\n{blank_prefix}\n{content_prefix}` — three branches collapse into
+/// one representation:
+///
+/// 1. **Chain ends in BQ** → `blank_prefix == content_prefix == full
+///    chain prefix`. Symmetric depth-D pair `\n[full]\n[full]`.
+/// 2. **Chain has BQ but trails with LIs** (e.g. `[LI, BQ, LI]`) →
+///    `blank_prefix` is the chain prefix *through the last BQ entry*
+///    (BQs require their `> ` marker on blank lines; LIs after the
+///    last BQ contribute no blank-line prefix because LIs accept
+///    blank lines without their continuation indent).
+///    `content_prefix` is the full chain prefix. Asymmetric pair
+///    `\n[blank]\n[content]`.
+/// 3. **Chain has no BQ** (pure LI chain or empty) → `blank_prefix`
+///    is empty (LIs accept a blank line at column 0); `content_prefix`
+///    is the full chain prefix. Pair `\n\n[content]`.
+///
+/// The single `(blank, content)` representation lets every call site
+/// (BQ-outdent transform, chain-aware pair detector, forbidden-position
+/// predicate) emit / recognize the canonical shape without branching on
+/// chain shape.
+pub fn chain_pair_shape(chain: &[EnclosingContainer]) -> (String, String) {
+    let content_prefix = chain_continuation_prefix(chain);
+    // Index of the last BQ entry in chain, if any.
+    let last_bq = chain
+        .iter()
+        .rposition(|c| matches!(c, EnclosingContainer::BlockQuote { .. }));
+    let blank_prefix = match last_bq {
+        Some(i) => chain_continuation_prefix(&chain[..=i]),
+        None => String::new(),
+    };
+    (blank_prefix, content_prefix)
+}
+
 /// Innermost list item in `chain`, if any.
 pub fn chain_innermost_list_item(chain: &[EnclosingContainer]) -> Option<&ListItemContext> {
     chain.iter().rev().find_map(|c| match c {
@@ -1247,6 +1362,129 @@ pub fn chain_outer_prefix_bytes(chain: &[EnclosingContainer]) -> usize {
     }
     let last = chain.len() - 1;
     chain_continuation_prefix_bytes(&chain[..last])
+}
+
+/// Chain-aware variant of [`pair_at_end`]: if `cursor` sits at the end
+/// of a structural pair for `chain`, return the pair's start byte.
+///
+/// Two pair shapes, picked by the chain's innermost container:
+///
+/// 1. **Symmetric `\n[prefix]\n[prefix]`** (chain ends in `BlockQuote`):
+///    the depth-D pair shape used inside any chain that ends in a BQ
+///    scope. `[prefix]` is [`chain_continuation_prefix`] of the full
+///    chain — alternating LI indents and `> ` BQ markers. A depth-1 BQ
+///    pair inside a `1. ` item appears as `\n   > \n   > ` (12 bytes)
+///    and is recognized as one atomic structural pair.
+/// 2. **Asymmetric `\n\n[prefix]`** (chain ends in `ListItem`, or is
+///    empty with a non-empty prefix): the canonical paragraph-break
+///    shape inside an LI without a deeper BQ scope. The break itself
+///    is a top-level `\n\n`; the LI's continuation indent re-enters
+///    the item on the new row. For a chain `[LI]` of `1. ` width
+///    (3 bytes) the shape is `\n\n   ` (5 bytes). The forbidden-
+///    position predicate already recognizes these bytes as
+///    pair-interior; this branch ensures the delete path agrees so
+///    Backspace removes the whole shape in one keystroke instead of
+///    eating one indent space per press.
+///
+/// Path A in `bugs.md::backspace_on_empty_bq_paragraph_in_li_eats_hidden_chars`
+/// — extending the atomic-pair-delete predicate to be chain-aware
+/// rather than introducing a new BQ-outdent gesture, so a single
+/// Backspace at the end of the trailing pair shape removes all
+/// `2 + chain_prefix * 2` bytes (or `2 + chain_prefix` bytes in the
+/// asymmetric LI-trailing form) and leaves the previous paragraph as
+/// the trailing block of the surrounding scope.
+pub fn pair_at_end_for_chain(
+    bytes: &[u8],
+    cursor: usize,
+    chain: &[EnclosingContainer],
+) -> Option<usize> {
+    let (blank_prefix, content_prefix) = chain_pair_shape(chain);
+    let blank_bytes = blank_prefix.as_bytes();
+    let content_bytes = content_prefix.as_bytes();
+    // Reject the trivial pair shape `\n\n` with both prefixes empty —
+    // that's the depth-0 top-level break already handled by
+    // [`pair_at_end`].
+    if blank_bytes.is_empty() && content_bytes.is_empty() {
+        return None;
+    }
+    let mut q = cursor;
+    // Walk back over `[content_prefix] \n [blank_prefix] \n` (in
+    // reverse: content_prefix → \n → blank_prefix → \n).
+    if !walk_back_exact(bytes, &mut q, content_bytes) {
+        return None;
+    }
+    if !walk_back_required_newline(bytes, &mut q) {
+        return None;
+    }
+    if !walk_back_exact(bytes, &mut q, blank_bytes) {
+        return None;
+    }
+    if !walk_back_required_newline(bytes, &mut q) {
+        return None;
+    }
+    Some(q)
+}
+
+/// Forward analog of [`pair_at_end_for_chain`].
+pub fn pair_at_start_for_chain(
+    bytes: &[u8],
+    cursor: usize,
+    chain: &[EnclosingContainer],
+) -> Option<usize> {
+    let (blank_prefix, content_prefix) = chain_pair_shape(chain);
+    let blank_bytes = blank_prefix.as_bytes();
+    let content_bytes = content_prefix.as_bytes();
+    if blank_bytes.is_empty() && content_bytes.is_empty() {
+        return None;
+    }
+    let mut q = cursor;
+    if !walk_forward_required_newline(bytes, &mut q) {
+        return None;
+    }
+    if !walk_forward_exact(bytes, &mut q, blank_bytes) {
+        return None;
+    }
+    if !walk_forward_required_newline(bytes, &mut q) {
+        return None;
+    }
+    if !walk_forward_exact(bytes, &mut q, content_bytes) {
+        return None;
+    }
+    Some(q)
+}
+
+/// Match `expected` exactly at the bytes ending at `*q`, advancing `q`
+/// backward past those bytes on success. Empty `expected` succeeds
+/// vacuously without moving `q`.
+fn walk_back_exact(bytes: &[u8], q: &mut usize, expected: &[u8]) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
+    if *q < expected.len() {
+        return false;
+    }
+    let start = *q - expected.len();
+    if &bytes[start..*q] != expected {
+        return false;
+    }
+    *q = start;
+    true
+}
+
+/// Forward analog of [`walk_back_exact`].
+fn walk_forward_exact(bytes: &[u8], q: &mut usize, expected: &[u8]) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
+    if *q + expected.len() > bytes.len() {
+        return false;
+    }
+    let end = *q + expected.len();
+    if &bytes[*q..end] != expected {
+        return false;
+    }
+    *q = end;
+    true
 }
 
 /// Deepest blockquote nesting that contains `cursor`. Boundary equality
@@ -1553,11 +1791,21 @@ pub fn list_item_dedent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
     if !innermost_li_immediate_parent_is_list_item(&chain) {
         // Top-level dedent: replace the leading separator + marker
         // with the surrounding scope's canonical paragraph break.
-        // The BQ prefix is taken at the marker_range.start byte, not
-        // the original cursor — the marker line's enclosing chain may
-        // differ from the cursor's if the cursor is in a continuation
-        // line of a nested construct.
-        let bq_prefix = blockquote_continuation_prefix(markdown, innermost.marker_range.start);
+        // The continuation prefix is taken at the marker_range.start
+        // byte, not the original cursor — the marker line's enclosing
+        // chain may differ from the cursor's if the cursor is in a
+        // continuation line of a nested construct. We use the
+        // chain-aware [`chain_continuation_prefix`] so list-item
+        // ancestors contribute their indent (mirrors the
+        // [`enter_insertion`] LI branch's `outer = chain - innermost
+        // LI` pattern). The innermost LI itself is dropped from the
+        // chain since it's the one being removed by this dedent.
+        let marker_chain = enclosing_containers_at(markdown, innermost.marker_range.start);
+        let outer_chain: &[EnclosingContainer] = match marker_chain.last() {
+            Some(EnclosingContainer::ListItem(_)) => &marker_chain[..marker_chain.len() - 1],
+            _ => &marker_chain[..],
+        };
+        let scope_prefix = chain_continuation_prefix(outer_chain);
         let line_start = line_start_offset(bytes, innermost.marker_range.start);
         let preceded_by_newline = line_start > 0 && bytes[line_start - 1] == b'\n';
 
@@ -1573,10 +1821,10 @@ pub fn list_item_dedent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
             // Fresh line preceded by `\n`. Replace the separator +
             // marker with the surrounding scope's paragraph break.
             let prev_sep_start = line_start - 1;
-            let rep = if bq_prefix.is_empty() {
+            let rep = if scope_prefix.is_empty() {
                 "\n\n".to_string()
             } else {
-                format!("\n{bq_prefix}\n{bq_prefix}")
+                format!("\n{scope_prefix}\n{scope_prefix}")
             };
             (prev_sep_start..innermost.marker_range.end, rep)
         };
@@ -1602,21 +1850,34 @@ pub fn list_item_dedent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
     if strip == 0 {
         return None;
     }
+    // Skip past the active container-prefix bytes contributed by
+    // chain entries *above* the parent LI before stripping. The
+    // predicate guarantees the trailing two chain entries are
+    // parent-LI and innermost-LI, so `&chain[..chain.len() - 2]`
+    // gives the chain above the parent. For `[BQ, outer-LI, inner-LI]`
+    // that's `[BQ]`, contributing 2 bytes (`> `) — the inner item's
+    // lines start with the BQ marker, not raw spaces, so we have to
+    // step past that before counting parent-marker-width spaces.
+    // Same architectural pattern as `chain_outer_prefix_bytes` for
+    // the Tab indent path.
+    let above_parent_chain = &chain[..chain.len() - 2];
+    let above_skip = chain_continuation_prefix_bytes(above_parent_chain);
     let line_starts = item_line_starts(bytes, &innermost.item_range);
     let mut edits = Vec::new();
     for ls in line_starts {
+        let strip_start = ls + above_skip;
         // Only remove bytes that are actually leading spaces — if
         // an upstream edit (or paste anomaly) left a line with less
         // indent than expected, we don't drop content.
-        let mut end = ls;
+        let mut end = strip_start;
         let mut removed = 0;
         while end < bytes.len() && bytes[end] == b' ' && removed < strip {
             end += 1;
             removed += 1;
         }
-        if end > ls {
+        if end > strip_start {
             edits.push(SourceEdit {
-                range: ls..end,
+                range: strip_start..end,
                 replacement: String::new(),
             });
         }
@@ -1815,7 +2076,20 @@ fn cursor_at_end_of_first_line(markdown: &str, item: &ListItemContext, cursor: u
 /// survives.
 fn build_depth_decrease_edit(markdown: &str, item: &ListItemContext) -> DepthDecreaseEdit {
     let bytes = markdown.as_bytes();
-    let bq_prefix = blockquote_continuation_prefix(markdown, item.marker_range.start);
+    // Use the chain-aware [`chain_continuation_prefix`] so list-item
+    // ancestors contribute their indent (mirrors the
+    // [`enter_insertion`] LI branch's `outer = chain - innermost LI`
+    // pattern, and the same fix applied in
+    // [`list_item_dedent_edits`]). The legacy
+    // [`blockquote_continuation_prefix`] is BQ-only and drops outer LI
+    // indent, which lets the BQ visually escape an enclosing list
+    // when this item is dropped.
+    let marker_chain = enclosing_containers_at(markdown, item.marker_range.start);
+    let outer_chain: &[EnclosingContainer] = match marker_chain.last() {
+        Some(EnclosingContainer::ListItem(_)) => &marker_chain[..marker_chain.len() - 1],
+        _ => &marker_chain[..],
+    };
+    let scope_prefix = chain_continuation_prefix(outer_chain);
     let line_start = line_start_offset(bytes, item.marker_range.start);
     let prev_sep_start = if line_start > 0 && bytes[line_start - 1] == b'\n' {
         line_start - 1
@@ -1824,10 +2098,10 @@ fn build_depth_decrease_edit(markdown: &str, item: &ListItemContext) -> DepthDec
     };
     let replacement = if prev_sep_start == 0 {
         String::new()
-    } else if bq_prefix.is_empty() {
+    } else if scope_prefix.is_empty() {
         "\n\n".to_string()
     } else {
-        format!("\n{bq_prefix}\n{bq_prefix}")
+        format!("\n{scope_prefix}\n{scope_prefix}")
     };
     let cursor = prev_sep_start + replacement.len();
     DepthDecreaseEdit {
