@@ -82,8 +82,18 @@ pub struct FencedCodeBlock {
 /// delimiter count (1 for unterminated, 2 for terminated) directly.
 pub fn fenced_code_blocks(markdown: &str) -> Vec<FencedCodeBlock> {
     let tree = crate::parser::parse(markdown);
+    fenced_code_blocks_in_tree(&tree, markdown.as_bytes())
+}
+
+/// Variant of [`fenced_code_blocks`] for callers that already hold a
+/// parse tree (typically a multi-pass `enforce_invariants` step
+/// sharing one parse across passes — see `update::enforce_invariants`).
+pub fn fenced_code_blocks_in_tree(
+    tree: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+) -> Vec<FencedCodeBlock> {
     let mut out = Vec::new();
-    collect_fenced_code_blocks(&tree, markdown.as_bytes(), &mut out);
+    collect_fenced_code_blocks(tree, bytes, &mut out);
     out
 }
 
@@ -128,6 +138,18 @@ fn collect_fenced_code_blocks(
 /// state-aware version directly).
 pub fn fenced_code_ranges(markdown: &str) -> Vec<Range<usize>> {
     fenced_code_blocks(markdown)
+        .into_iter()
+        .map(|b| b.range)
+        .collect()
+}
+
+/// Variant of [`fenced_code_ranges`] for callers that already hold a
+/// parse tree.
+pub fn fenced_code_ranges_in_tree(
+    tree: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+) -> Vec<Range<usize>> {
+    fenced_code_blocks_in_tree(tree, bytes)
         .into_iter()
         .map(|b| b.range)
         .collect()
@@ -1096,8 +1118,21 @@ pub type EnclosingChain = Vec<EnclosingContainer>;
 /// routes through the surrounding container.
 pub fn enclosing_containers_at(markdown: &str, cursor: usize) -> EnclosingChain {
     let tree = crate::parser::parse(markdown);
+    enclosing_containers_at_in_tree(&tree, markdown.as_bytes(), cursor)
+}
+
+/// Variant of [`enclosing_containers_at`] for callers that already
+/// hold a parse tree. Hot in `update::promote_soft_breaks`, which
+/// otherwise re-parses the buffer once per byte inside fenced code
+/// content (the chain query is the per-byte source-of-truth for
+/// "what continuation prefix should this line carry").
+pub fn enclosing_containers_at_in_tree(
+    tree: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+    cursor: usize,
+) -> EnclosingChain {
     let mut chain = Vec::new();
-    walk_chain(&tree, cursor, markdown.as_bytes(), &mut chain);
+    walk_chain(tree, cursor, bytes, &mut chain);
     chain
 }
 
@@ -1550,6 +1585,16 @@ pub fn blockquote_depth_at(markdown: &str, cursor: usize) -> usize {
 /// at our buffer sizes that calling it inside `enforce_invariants`
 /// per-update isn't visible.
 pub fn list_content_ranges(markdown: &str) -> Vec<Range<usize>> {
+    let tree = crate::parser::parse(markdown);
+    list_content_ranges_in_tree(&tree, markdown.as_bytes())
+}
+
+/// Variant of [`list_content_ranges`] for callers that already hold
+/// a parse tree.
+pub fn list_content_ranges_in_tree(
+    tree: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+) -> Vec<Range<usize>> {
     fn collect(nodes: &[crate::syntax::SyntaxNode], bytes: &[u8], out: &mut Vec<Range<usize>>) {
         for n in nodes {
             if matches!(n.kind, crate::syntax::NodeKind::List { .. }) {
@@ -1568,9 +1613,8 @@ pub fn list_content_ranges(markdown: &str) -> Vec<Range<usize>> {
             collect(&n.children, bytes, out);
         }
     }
-    let tree = crate::parser::parse(markdown);
     let mut out = Vec::new();
-    collect(&tree, markdown.as_bytes(), &mut out);
+    collect(tree, bytes, &mut out);
     out
 }
 
@@ -2524,9 +2568,18 @@ fn hard_break_trailing_at(bytes: &[u8], nl: usize) -> Option<Range<usize>> {
 /// remaps the cursor.
 pub fn list_normalization_edits(markdown: &str, cursors: &[usize]) -> Vec<SourceEdit> {
     let tree = crate::parser::parse(markdown);
-    let bytes = markdown.as_bytes();
+    list_normalization_edits_in_tree(&tree, markdown.as_bytes(), cursors)
+}
+
+/// Variant of [`list_normalization_edits`] for callers that already
+/// hold a parse tree.
+pub fn list_normalization_edits_in_tree(
+    tree: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+    cursors: &[usize],
+) -> Vec<SourceEdit> {
     let mut edits = Vec::new();
-    walk_normalize_lists(&tree, bytes, 0, cursors, &mut edits);
+    walk_normalize_lists(tree, bytes, 0, cursors, &mut edits);
     edits.sort_by_key(|e| e.range.start);
     edits
 }

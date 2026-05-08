@@ -59,9 +59,9 @@
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::analysis::{
-    self, count_line_markers, fenced_code_ranges, is_forbidden_position, is_in_ranges,
-    is_soft_break, line_depth_ending_at, nearest_allowed_position, next_allowed_position,
-    pair_at_end, pair_at_start, prev_allowed_position,
+    self, count_line_markers, is_forbidden_position, is_in_ranges, is_soft_break,
+    line_depth_ending_at, nearest_allowed_position, next_allowed_position, pair_at_end,
+    pair_at_start, prev_allowed_position,
 };
 use crate::event::EditorEvent;
 use crate::state::{EditorState, Selection};
@@ -140,11 +140,47 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
     //
     // 4. `normalize_blockquote_prefixes` is independent and runs
     //    after the others.
-    let state = collapse_consecutive_hard_breaks(state);
-    let state = dedupe_orphan_fence_closer(state);
-    let state = promote_soft_breaks(state);
-    let state = normalize_lists(state);
-    normalize_blockquote_prefixes(state)
+    //
+    // **Parse-tree cache.** Each pass that needs the parse tree
+    // calls `cache.tree(&state.markdown)`; passes that mutate the
+    // buffer call `cache.invalidate()` so the next pass parses
+    // fresh. Without this cache, the canonical (no-mutation) path
+    // re-parses the buffer four times per keystroke, and
+    // `promote_soft_breaks`'s per-byte `enclosing_containers_at`
+    // call inside fence content can re-parse hundreds of times per
+    // keystroke. The cache collapses both to a single parse on the
+    // common path.
+    let mut cache = ParseCache::new();
+    let state = collapse_consecutive_hard_breaks(state); // doesn't parse
+    let state = dedupe_orphan_fence_closer(state, &mut cache);
+    let state = promote_soft_breaks(state, &mut cache);
+    let state = normalize_lists(state, &mut cache);
+    normalize_blockquote_prefixes(state, &mut cache)
+}
+
+/// Lazy parse-tree cache shared across `enforce_invariants` passes.
+/// Each pass calls [`tree`](Self::tree) on the cache, parses the
+/// current buffer if the cache is empty, and returns the cached
+/// tree on every subsequent call. A pass that mutates the buffer
+/// calls [`invalidate`](Self::invalidate) so the next pass parses
+/// the new buffer.
+struct ParseCache {
+    tree: Option<Vec<crate::syntax::SyntaxNode>>,
+}
+
+impl ParseCache {
+    fn new() -> Self {
+        Self { tree: None }
+    }
+
+    fn tree(&mut self, markdown: &str) -> &[crate::syntax::SyntaxNode] {
+        self.tree
+            .get_or_insert_with(|| crate::parser::parse(markdown))
+    }
+
+    fn invalidate(&mut self) {
+        self.tree = None;
+    }
 }
 
 /// Collapse a `[terminated fence] + [identical-line unterminated fence]`
@@ -183,16 +219,16 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
 ///   chain depth than the user's manually-typed closer, so a
 ///   byte-for-byte match misses the deeper-chain case (see
 ///   `bugs.md::auto_close_fence_orphan_after_user_typed_closer`).
-fn dedupe_orphan_fence_closer(state: EditorState) -> EditorState {
+fn dedupe_orphan_fence_closer(state: EditorState, cache: &mut ParseCache) -> EditorState {
     let bytes = state.markdown.as_bytes();
     // Walk pulldown's parse tree (not the byte scanner) so we see fences
     // that sit inside LI continuation indent — `count_line_markers` only
     // tolerates 3 spaces between consecutive `>` markers, so a fence at
     // chain `[BQ, LI, LI, BQ]` (with 5+ spaces of LI indent before the
     // inner `> `) is invisible to the scanner but visible to pulldown.
-    let tree = crate::parser::parse(&state.markdown);
+    let tree = cache.tree(&state.markdown);
     let mut code_blocks: Vec<&crate::syntax::SyntaxNode> = Vec::new();
-    collect_code_blocks(&tree, &mut code_blocks);
+    collect_code_blocks(tree, &mut code_blocks);
 
     let mut delete_range: Option<std::ops::Range<usize>> = None;
     for pair in code_blocks.windows(2) {
@@ -285,6 +321,7 @@ fn dedupe_orphan_fence_closer(state: EditorState) -> EditorState {
     let Some(range) = delete_range else {
         return state;
     };
+    cache.invalidate();
     let mut new_md = String::with_capacity(state.markdown.len() - (range.end - range.start));
     new_md.push_str(&state.markdown[..range.start]);
     new_md.push_str(&state.markdown[range.end..]);
@@ -315,15 +352,19 @@ fn dedupe_orphan_fence_closer(state: EditorState) -> EditorState {
 /// the cursor through every splice. Threads the live cursor positions
 /// in so per-rule guards (don't strip extra-marker-spacing while
 /// the user is mid-typing in the gap, …) can fire correctly.
-fn normalize_lists(state: EditorState) -> EditorState {
+fn normalize_lists(state: EditorState, cache: &mut ParseCache) -> EditorState {
     let cursors: Vec<usize> = match state.selection {
         Selection::Cursor(p) => vec![p],
         Selection::Range { anchor, head } => vec![anchor, head],
     };
-    let edits = analysis::list_normalization_edits(&state.markdown, &cursors);
+    let edits = {
+        let tree = cache.tree(&state.markdown);
+        analysis::list_normalization_edits_in_tree(tree, state.markdown.as_bytes(), &cursors)
+    };
     if edits.is_empty() {
         return state;
     }
+    cache.invalidate();
     apply_edits(state, &edits)
 }
 
@@ -436,7 +477,7 @@ fn collect_code_blocks<'a>(
     }
 }
 
-fn promote_soft_breaks(state: EditorState) -> EditorState {
+fn promote_soft_breaks(state: EditorState, cache: &mut ParseCache) -> EditorState {
     let bytes = state.markdown.as_bytes();
     // Two scopes special-case the soft-break promotion rule:
     //
@@ -452,8 +493,9 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
     //     (item separators, marker continuation, indented paragraphs,
     //     lazy continuations). Promoting `\n` to `\n\n` between two
     //     items would split the list.
-    let code_ranges = fenced_code_ranges(&state.markdown);
-    let list_ranges = analysis::list_content_ranges(&state.markdown);
+    let tree = cache.tree(&state.markdown);
+    let code_ranges = analysis::fenced_code_ranges_in_tree(tree, bytes);
+    let list_ranges = analysis::list_content_ranges_in_tree(tree, bytes);
 
     // Each entry: (insertion_position, inserted_string). Computed in a
     // single forward scan over the *original* buffer so offsets line
@@ -496,7 +538,7 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
             // alternating). The chain query takes the cursor at `p`
             // (end of the line) so the parser sees this line's
             // surrounding scope.
-            let chain_at = analysis::enclosing_containers_at(&state.markdown, p);
+            let chain_at = analysis::enclosing_containers_at_in_tree(tree, bytes, p);
             let expected_prefix = analysis::chain_continuation_prefix(&chain_at);
             if expected_prefix.is_empty() {
                 continue;
@@ -626,6 +668,7 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
     if inserts.is_empty() {
         return state;
     }
+    cache.invalidate();
 
     // Apply inserts in order. Each `inserts[i].0` is in *original*
     // coordinates, so we rebuild the buffer by interleaving original
@@ -680,9 +723,9 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
 ///
 /// Skips `>` bytes that fall inside fenced code-block content — those
 /// are literal `>` characters, not blockquote markers.
-fn normalize_blockquote_prefixes(state: EditorState) -> EditorState {
+fn normalize_blockquote_prefixes(state: EditorState, cache: &mut ParseCache) -> EditorState {
     let bytes = state.markdown.as_bytes();
-    let code_ranges = fenced_code_ranges(&state.markdown);
+    let code_ranges = analysis::fenced_code_ranges_in_tree(cache.tree(&state.markdown), bytes);
     let (cursor_head, cursor_anchor) = match state.selection {
         Selection::Cursor(p) => (p, p),
         Selection::Range { anchor, head } => (head, anchor),
@@ -724,6 +767,7 @@ fn normalize_blockquote_prefixes(state: EditorState) -> EditorState {
     if insert_at.is_empty() {
         return state;
     }
+    cache.invalidate();
 
     let mut new_md = String::with_capacity(state.markdown.len() + insert_at.len());
     let mut last = 0;
