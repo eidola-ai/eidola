@@ -296,7 +296,7 @@ fn render_node(
     match &node.kind {
         NodeKind::Paragraph => render_paragraph(node, cursor, containers, out),
         NodeKind::Heading { .. } => render_heading(node, cursor, containers, out),
-        NodeKind::CodeBlock { .. } => render_code_block(node, cursor, containers, out),
+        NodeKind::CodeBlock { .. } => render_code_block(node, source, cursor, containers, out),
         NodeKind::BlockQuote { prefix_ranges } => {
             render_blockquote(node, prefix_ranges, tree, source, cursor, containers, out)
         }
@@ -1043,6 +1043,7 @@ fn find_leaf_for_prefix<'a>(
 
 fn render_code_block(
     node: &SyntaxNode,
+    source: &str,
     cursor: CursorRange,
     containers: &[Container],
     out: &mut Vec<RenderBlock>,
@@ -1081,25 +1082,46 @@ fn render_code_block(
         });
     }
 
-    // Mark fence rows for layout. The opener line covers the fence
-    // chars *plus* any info string; the closer line is just its
-    // fence chars. The element layer uses these to keep fence rows
-    // pinned (no horizontal scroll), reserve vertical space for
-    // them, and paint them outside the content mask.
+    // Mark fence rows for layout. The element layer's
+    // `line_is_fully_in_a_delimiter` check requires the
+    // `delimiter_lines` entry to *cover* the shaped line's logical
+    // range — which starts at the byte right after the previous
+    // `\n`, not at the fence chars themselves. Inside a blockquote
+    // or a list item the line begins with the chain prefix (`> `,
+    // `   `, …) so the entry has to extend back past those bytes
+    // for the fence row to register as a delimiter.
+    //
+    // The opener row covers from line-start through the info
+    // string's end (or the opener fence chars' end if there's no
+    // info string). The closer row covers from line-start through
+    // the closer fence chars' end.
+    let bytes = source.as_bytes();
     let opener_line_end = info_string_range
         .as_ref()
         .map(|r| r.end)
         .unwrap_or_else(|| delimiter_ranges[0].end);
     block
         .delimiter_lines
-        .push(delimiter_ranges[0].start..opener_line_end);
+        .push(line_start_offset(bytes, delimiter_ranges[0].start)..opener_line_end);
     if let Some(closer) = delimiter_ranges.get(1) {
-        block.delimiter_lines.push(closer.clone());
+        block
+            .delimiter_lines
+            .push(line_start_offset(bytes, closer.start)..closer.end);
     }
 
     // No inline children — code-block content is literal source bytes,
     // shaped in mono font by the element layer.
     out.push(block);
+}
+
+/// Byte position of the start of the line containing `pos` — the byte
+/// right after the previous `\n`, or 0 if `pos` is on the first line.
+fn line_start_offset(bytes: &[u8], pos: usize) -> usize {
+    let mut s = pos.min(bytes.len());
+    while s > 0 && bytes[s - 1] != b'\n' {
+        s -= 1;
+    }
+    s
 }
 
 fn render_heading(

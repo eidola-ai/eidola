@@ -1173,6 +1173,70 @@ fn effective_node_end(node: &crate::syntax::SyntaxNode, bytes: &[u8]) -> usize {
     }
 }
 
+/// `true` if any descendant of `node` has a content range that overlaps
+/// the line containing `cursor` (the byte interval `[line_start, line_end)`
+/// where `line_start` is the byte right after the previous `\n` and
+/// `line_end` is the next `\n`). Used to reject `pick_chain_target`'s
+/// boundary-equality matches when the cursor sits on a line past all of
+/// the node's actual content — e.g. an inner LI that pulldown ranges
+/// through its outer LI's trailing continuation indent under
+/// `ENABLE_EMPTY_NESTED_LISTS`. The inner LI claims byte 22 of
+/// `- parent\n  - child\n\n  ` by boundary equality, but its only
+/// content (the "child" Text leaf) is on a different line; treating
+/// it as "outside the inner LI" stops the chain query from descending
+/// into the inner LI and creating a sibling marker on subsequent
+/// Enter presses.
+///
+/// Lists' direct children are themselves containers (ListItems), not
+/// leaves — for a List node we recurse into its items' content instead
+/// of looking at the List's `children` directly.
+fn node_has_content_on_line(
+    node: &crate::syntax::SyntaxNode,
+    line_start: usize,
+    line_end: usize,
+) -> bool {
+    fn is_content_leaf(kind: &crate::syntax::NodeKind) -> bool {
+        !matches!(
+            kind,
+            crate::syntax::NodeKind::List { .. }
+                | crate::syntax::NodeKind::ListItem { .. }
+                | crate::syntax::NodeKind::BlockQuote { .. }
+        )
+    }
+    fn overlaps(r: &Range<usize>, line_start: usize, line_end: usize) -> bool {
+        r.start < line_end && r.end > line_start
+    }
+    fn walk(node: &crate::syntax::SyntaxNode, line_start: usize, line_end: usize) -> bool {
+        // Container "marker" bytes count as content for this query
+        // — an empty trailing list item like `- one\n- ` has no
+        // leaf children, but its marker line is genuine cursor
+        // territory and a chain query at the marker end must still
+        // descend into the list. Same for blockquote prefix
+        // markers.
+        match &node.kind {
+            crate::syntax::NodeKind::ListItem { marker_range } => {
+                if overlaps(marker_range, line_start, line_end) {
+                    return true;
+                }
+            }
+            crate::syntax::NodeKind::BlockQuote { prefix_ranges } => {
+                if prefix_ranges
+                    .iter()
+                    .any(|r| overlaps(r, line_start, line_end))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        if is_content_leaf(&node.kind) {
+            return overlaps(&node.range, line_start, line_end);
+        }
+        node.children.iter().any(|c| walk(c, line_start, line_end))
+    }
+    walk(node, line_start, line_end)
+}
+
 /// Pick the sibling at this level that owns `cursor`, applying the
 /// "strict containment beats boundary equality" preference. Returns
 /// `None` when no sibling matches.
@@ -1180,7 +1244,40 @@ fn pick_chain_target<'a>(
     nodes: &'a [crate::syntax::SyntaxNode],
     cursor: usize,
     bytes: &[u8],
+    parent_is_list_item: bool,
 ) -> Option<&'a crate::syntax::SyntaxNode> {
+    // Cursor's line bounds — used below to reject a *nested* List
+    // candidate (one we're considering among an LI's children)
+    // whose content doesn't reach the cursor's line. Pulldown
+    // sometimes ranges a nested List through its parent LI's
+    // trailing continuation indent, so a boundary-equality match
+    // on the List would otherwise let the chain descend into a
+    // list whose content stopped lines earlier — and Enter would
+    // route through "next sibling marker" insertion in a place
+    // the user thinks is past the inner list. The filter only
+    // fires for List candidates whose parent in the walk is an
+    // LI; top-level lists at trailing positions (e.g. cursor at
+    // the trailing pair of `1. one\n\n  `) keep the LI in their
+    // chain so atomic-delete-pair fires.
+    let line_start = if parent_is_list_item {
+        let mut s = cursor.min(bytes.len());
+        while s > 0 && bytes[s - 1] != b'\n' {
+            s -= 1;
+        }
+        s
+    } else {
+        0
+    };
+    let line_end = if parent_is_list_item {
+        let mut e = cursor.min(bytes.len());
+        while e < bytes.len() && bytes[e] != b'\n' {
+            e += 1;
+        }
+        e
+    } else {
+        0
+    };
+
     let mut target: Option<&crate::syntax::SyntaxNode> = None;
     let mut target_is_strict = false;
     for node in nodes {
@@ -1189,6 +1286,13 @@ fn pick_chain_target<'a>(
             continue;
         }
         let is_strict = cursor < effective_end;
+        if !is_strict
+            && parent_is_list_item
+            && matches!(node.kind, crate::syntax::NodeKind::List { .. })
+            && !node_has_content_on_line(node, line_start, line_end)
+        {
+            continue;
+        }
         if is_strict || !target_is_strict {
             target = Some(node);
             target_is_strict = is_strict || target_is_strict;
@@ -1203,7 +1307,17 @@ fn walk_chain(
     bytes: &[u8],
     out: &mut EnclosingChain,
 ) {
-    let Some(node) = pick_chain_target(nodes, cursor, bytes) else {
+    walk_chain_inner(nodes, cursor, bytes, out, false)
+}
+
+fn walk_chain_inner(
+    nodes: &[crate::syntax::SyntaxNode],
+    cursor: usize,
+    bytes: &[u8],
+    out: &mut EnclosingChain,
+    parent_is_list_item: bool,
+) {
+    let Some(node) = pick_chain_target(nodes, cursor, bytes, parent_is_list_item) else {
         return;
     };
     match &node.kind {
@@ -1211,7 +1325,7 @@ fn walk_chain(
             out.push(EnclosingContainer::BlockQuote {
                 range: node.range.clone(),
             });
-            walk_chain(&node.children, cursor, bytes, out);
+            walk_chain_inner(&node.children, cursor, bytes, out, false);
         }
         crate::syntax::NodeKind::List { kind } => {
             // Pick the right item using the same trim + strict-over-
@@ -1242,11 +1356,15 @@ fn walk_chain(
                     item_range: item.range.clone(),
                     marker_range,
                 }));
-                walk_chain(&item.children, cursor, bytes, out);
+                // Descending into a ListItem's content — set the
+                // `parent_is_list_item` flag so a nested List
+                // candidate's boundary-only match is filtered by
+                // content-on-line (see `pick_chain_target`).
+                walk_chain_inner(&item.children, cursor, bytes, out, true);
             }
         }
         _ => {
-            walk_chain(&node.children, cursor, bytes, out);
+            walk_chain_inner(&node.children, cursor, bytes, out, parent_is_list_item);
         }
     }
 }

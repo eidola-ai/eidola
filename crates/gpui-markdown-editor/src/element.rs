@@ -1463,8 +1463,18 @@ fn shape_block_lines(
         // reserving its space (so the block's height stays stable as
         // the cursor moves in/out and the fence rows can host a
         // distinct background).
+        //
+        // **Code-block bodies are also exempt.** An empty body line
+        // inside a code block sits as a literal source line whose
+        // bytes are typically just the chain prefix (BQ markers, LI
+        // continuation indent). Those bytes are hidden by the chain
+        // hide pass, so `display_text` ends up empty even though the
+        // source line is meaningful (one empty row of code). Without
+        // the exemption, the line gets dropped and the user sees
+        // their empty rows collapse to nothing inside any
+        // BQ/LI-wrapped code block.
         let was_empty_in_source = logical_source_range.start == logical_source_range.end;
-        if display_text.is_empty() && !was_empty_in_source && !is_delimiter {
+        if display_text.is_empty() && !was_empty_in_source && !is_delimiter && !block_is_code {
             cursor = raw_end;
             if !trailing_nl {
                 break;
@@ -2018,6 +2028,38 @@ mod tests {
         // text contains spaces.
         let counts = shape_visible_row_counts(cx, "paragraph 1  \n");
         assert_eq!(counts, vec![2]);
+    }
+
+    #[gpui::test]
+    fn empty_body_line_in_top_level_code_block_shapes_one_row(cx: &mut TestAppContext) {
+        // ```js\n\n``` — opener, one empty body line, closer. Shape
+        // count: 3 lines (opener + body + closer).
+        let counts = shape_visible_row_counts(cx, "```js\n\n```");
+        assert_eq!(counts, vec![3]);
+    }
+
+    #[gpui::test]
+    fn empty_body_line_in_bq_wrapped_code_block_shapes_one_row(cx: &mut TestAppContext) {
+        // BQ-wrapped fence with one empty body line. Each line in the
+        // body carries a `> ` prefix that the chain hide pass marks
+        // hidden — without the code-block exemption in
+        // `shape_block_lines`, the all-hidden body line gets dropped
+        // and the empty row visually disappears (the user-reported
+        // bug). With the exemption, the body line shapes as one
+        // visible empty row.
+        let counts = shape_visible_row_counts(cx, "> ```js\n> \n> ```\n");
+        // One block (the code block); 3 visible rows (opener, body, closer).
+        assert_eq!(counts, vec![3]);
+    }
+
+    #[gpui::test]
+    fn empty_body_line_in_li_wrapped_code_block_shapes_one_row(cx: &mut TestAppContext) {
+        // Same shape with an LI wrapper. The body line is `   ` (3
+        // spaces of LI continuation indent, all hidden by the chain
+        // hide pass). Without the exemption, dropped → empty row
+        // disappears. With it, shapes as one visible empty row.
+        let counts = shape_visible_row_counts(cx, "1. ```js\n   \n   ```\n");
+        assert_eq!(counts, vec![3]);
     }
 
     #[gpui::test]

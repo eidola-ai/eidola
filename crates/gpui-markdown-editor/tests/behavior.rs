@@ -3179,6 +3179,157 @@ fn empty_enter_on_top_level_item_becomes_paragraph(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn code_block_fences_are_delimiter_rows_at_every_chain(cx: &mut TestAppContext) {
+    // Fence rows (opener + closer) must be reported as
+    // `delimiter_lines` covering the *whole source line*, not just
+    // the fence chars. The element layer's
+    // `line_is_fully_in_a_delimiter` test requires the entry to
+    // cover the shaped line's full logical range — and that range
+    // begins at the byte right after the previous `\n`. For
+    // fences sitting inside a BQ or LI the line starts with the
+    // chain prefix (`> `, `   `), so a delimiter entry that
+    // started at the fence chars (the original behavior) would
+    // miss the fence row entirely and the user would see the
+    // fences rendered inside the content background instead of
+    // outside it.
+    use gpui_markdown_editor::render_spec::BlockKind;
+    let cases = [
+        ("top-level", "```js\nconsole.log('Hello world');\n```\n"),
+        (
+            "blockquote",
+            "> ```js\n> console.log('Hello world');\n> ```\n",
+        ),
+        ("list", "1. ```js\n   console.log('Hello world');\n   ```\n"),
+    ];
+    for (label, src) in cases {
+        let initial = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+        };
+        let (_handle, editor) = open_editor(cx, initial);
+        editor.read_with(cx, |e, _| {
+            let spec = e.render_spec();
+            let cb = spec
+                .blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
+                .unwrap_or_else(|| panic!("[{label}] expected a CodeBlock leaf"));
+            assert_eq!(
+                cb.delimiter_lines.len(),
+                2,
+                "[{label}] expected opener + closer delimiter rows; got {:?}",
+                cb.delimiter_lines,
+            );
+            // Every fence-row entry must start at a line boundary
+            // (the byte right after the previous `\n`, or 0).
+            let bytes = src.as_bytes();
+            for d in &cb.delimiter_lines {
+                let starts_at_line_boundary = d.start == 0 || bytes[d.start - 1] == b'\n';
+                assert!(
+                    starts_at_line_boundary,
+                    "[{label}] delimiter entry {d:?} doesn't start at a line boundary",
+                );
+            }
+        });
+    }
+}
+
+#[gpui::test]
+fn multi_enter_from_nested_item_progresses_one_level_per_press(cx: &mut TestAppContext) {
+    // User-reported repro:
+    //
+    //   - parent
+    //     - child|
+    //
+    // Each Enter should escape one nesting level cleanly without
+    // producing weird intermediate shapes. The bug before
+    // `pick_chain_target`'s nested-list content-on-line filter
+    // was that Enter 3 routed through the inner-LI's
+    // `next_marker_text` insertion (because pulldown ranges the
+    // inner LI through the outer LI's trailing continuation
+    // indent), spawning a stray `\n  - ` marker on a row visually
+    // past the nested list.
+    let initial = EditorState {
+        markdown: "- parent\n  - child".into(),
+        selection: Selection::Cursor(18),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown, "- parent\n  - child\n  - ",
+            "Enter 1: new empty inner sibling",
+        );
+    });
+
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown, "- parent\n  - child\n\n  ",
+            "Enter 2: empty-inner outdent → outer-LI continuation row",
+        );
+    });
+
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // Outer-LI sibling marker; *not* a stray inner marker.
+        assert_eq!(
+            e.state.markdown, "- parent\n  - child\n\n\n- ",
+            "Enter 3: new top-level sibling after the outer LI",
+        );
+    });
+
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // Empty outer LI → paragraph at top level.
+        assert_eq!(
+            e.state.markdown, "- parent\n  - child\n\n\n\n",
+            "Enter 4: empty outer LI drops marker, top-level paragraph",
+        );
+    });
+}
+
+#[gpui::test]
+fn double_enter_at_end_of_nested_item_outdents_on_second_press(cx: &mut TestAppContext) {
+    // User-reported repro:
+    //
+    //   - parent
+    //     - child|
+    //
+    // First Enter creates a new empty inner sibling. Second Enter
+    // (now on an empty inner item) should behave like Backspace
+    // at the same position — outdent the inner LI, leaving a
+    // paragraph row at the outer item's content depth.
+    let initial = EditorState {
+        markdown: "- parent\n  - child".into(),
+        selection: Selection::Cursor(18),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+
+    // First Enter: new empty inner sibling.
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown, "- parent\n  - child\n  - ",
+            "first Enter should create a new empty nested item",
+        );
+    });
+
+    // Second Enter: cursor on empty inner item, should outdent.
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // Same shape as `empty_enter_on_nested_empty_item_outdents_to_outer_paragraph`
+        // applied to the trailing empty inner: drop the inner marker,
+        // leave the outer item's continuation indent for the new row.
+        assert_eq!(
+            e.state.markdown, "- parent\n  - child\n\n  ",
+            "second Enter on empty inner item should outdent (Backspace-equivalent)",
+        );
+    });
+}
+
+#[gpui::test]
 fn empty_enter_on_nested_empty_item_outdents_to_outer_paragraph(cx: &mut TestAppContext) {
     // With pulldown's `ENABLE_EMPTY_NESTED_LISTS` option enabled in
     // `parser::parse`, `- one\n  - ` parses as the outer item plus
