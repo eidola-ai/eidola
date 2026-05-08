@@ -175,43 +175,112 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
 ///   removing it is safe; if the user has typed body content under
 ///   the orphan, the construct is no longer "just an artifact" and
 ///   we leave it alone.
-/// - The opener line of the second range matches the closer line of
-///   the first byte-for-byte.
+/// - The two delimiter lines have the *same fence character and same
+///   fence length* and the orphan opener carries no info string. The
+///   leading prefix on each line (BQ markers, LI continuation indent)
+///   is allowed to differ — `enforce_invariants`'s normalize passes
+///   sometimes rewrite an auto-close orphan's prefix to a shallower
+///   chain depth than the user's manually-typed closer, so a
+///   byte-for-byte match misses the deeper-chain case (see
+///   `bugs.md::auto_close_fence_orphan_after_user_typed_closer`).
 fn dedupe_orphan_fence_closer(state: EditorState) -> EditorState {
     let bytes = state.markdown.as_bytes();
-    let blocks = analysis::fenced_code_content_ranges_with_state(bytes);
+    // Walk pulldown's parse tree (not the byte scanner) so we see fences
+    // that sit inside LI continuation indent — `count_line_markers` only
+    // tolerates 3 spaces between consecutive `>` markers, so a fence at
+    // chain `[BQ, LI, LI, BQ]` (with 5+ spaces of LI indent before the
+    // inner `> `) is invisible to the scanner but visible to pulldown.
+    let tree = crate::parser::parse(&state.markdown);
+    let mut code_blocks: Vec<&crate::syntax::SyntaxNode> = Vec::new();
+    collect_code_blocks(&tree, &mut code_blocks);
+
     let mut delete_range: Option<std::ops::Range<usize>> = None;
-    for pair in blocks.windows(2) {
-        let (first, second) = (&pair[0], &pair[1]);
-        if !first.terminated || second.terminated {
+    for pair in code_blocks.windows(2) {
+        let (first, second) = (pair[0], pair[1]);
+        let (first_delims, _) = match &first.kind {
+            crate::syntax::NodeKind::CodeBlock {
+                delimiter_ranges,
+                info_string_range,
+                ..
+            } => (delimiter_ranges, info_string_range.as_ref()),
+            _ => continue,
+        };
+        let (second_delims, second_info, second_content) = match &second.kind {
+            crate::syntax::NodeKind::CodeBlock {
+                delimiter_ranges,
+                info_string_range,
+                content_range,
+                ..
+            } => (delimiter_ranges, info_string_range.as_ref(), content_range),
+            _ => continue,
+        };
+        // First must be terminated (opener + closer = two delimiters);
+        // second must be unterminated (opener only).
+        if first_delims.len() != 2 || second_delims.len() != 1 {
             continue;
         }
-        if second.range.start != first.range.end {
+        // Second must have no info string (otherwise the user intended
+        // a *new* code block with that language tag — not a duplicate
+        // of the previous closer).
+        if second_info.is_some() {
             continue;
         }
-        if second.range.end > bytes.len() {
+        // No body under the orphan: pulldown's `content_range` covers
+        // any inner code lines between the opener and closer (or, for
+        // an unterminated fence, between the opener and EOF). An
+        // empty content_range means the orphan is just a delimiter
+        // line — safe to delete. Anything inside it would be user
+        // content we shouldn't silently lose.
+        if second_content.start != second_content.end {
             continue;
         }
-        // Single-line orphan: the range must contain no embedded `\n`.
-        if bytes[second.range.start..second.range.end].contains(&b'\n') {
+        // Line-based adjacency: the orphan's line must be the line
+        // immediately after the first's closer line. We compare by
+        // byte position of the `\n` that ends the closer and the
+        // `\n` (or buffer start) right before the orphan.
+        let first_closer = &first_delims[1];
+        let closer_line_end = first_closer.end; // expected `\n` (or EOF)
+        let mut orphan_line_start = second.range.start;
+        while orphan_line_start > 0 && bytes[orphan_line_start - 1] != b'\n' {
+            orphan_line_start -= 1;
+        }
+        // Adjacency: closer_line_end is the `\n` ending the closer
+        // line; orphan_line_start is the byte right after that `\n`.
+        if closer_line_end >= bytes.len() || bytes[closer_line_end] != b'\n' {
             continue;
         }
-        // Closer line of the first range: walk back from the trailing
-        // `\n` to its line start.
-        if first.range.end == 0 || bytes[first.range.end - 1] != b'\n' {
+        if orphan_line_start != closer_line_end + 1 {
             continue;
         }
-        let closer_line_end = first.range.end - 1;
-        let mut closer_line_start = closer_line_end;
-        while closer_line_start > 0 && bytes[closer_line_start - 1] != b'\n' {
-            closer_line_start -= 1;
+        // Same fence char + length on both delimiter ranges.
+        let first_fence_char = bytes.get(first_closer.end - 1).copied();
+        let second_fence_char = bytes.get(second_delims[0].start).copied();
+        if first_fence_char != second_fence_char || !matches!(first_fence_char, Some(b'`' | b'~')) {
+            continue;
         }
-        let closer_bytes = &bytes[closer_line_start..closer_line_end];
-        let opener_bytes = &bytes[second.range.start..second.range.end];
-        if closer_bytes == opener_bytes {
-            delete_range = Some(second.range.clone());
-            break;
+        // Count fence chars in the closer (`first_delims[1]` covers
+        // leading indent + fence chars).
+        let mut first_fence_len = 0usize;
+        let mut p = first_closer.end;
+        while p > first_closer.start && bytes[p - 1] == first_fence_char.unwrap() {
+            first_fence_len += 1;
+            p -= 1;
         }
+        let second_fence_len = second_delims[0].end - second_delims[0].start;
+        if first_fence_len != second_fence_len {
+            continue;
+        }
+        // Delete from the leading `\n` of the orphan line through to
+        // the orphan line's end (inclusive of any trailing `\n`).
+        let mut orphan_line_end = second.range.end;
+        while orphan_line_end < bytes.len() && bytes[orphan_line_end] != b'\n' {
+            orphan_line_end += 1;
+        }
+        if orphan_line_end < bytes.len() && bytes[orphan_line_end] == b'\n' {
+            orphan_line_end += 1;
+        }
+        delete_range = Some((closer_line_end + 1)..orphan_line_end);
+        break;
     }
     let Some(range) = delete_range else {
         return state;
@@ -348,6 +417,32 @@ fn apply_edits(state: EditorState, edits: &[analysis::SourceEdit]) -> EditorStat
 /// well below where the divergence pattern surfaces in stress tests.
 const MAX_REPAIR_DEPTH: usize = 16;
 
+/// Hard cap on the number of bytes the missing-prefix-repair will
+/// inject in a single splice. A "modest" gap (one or two missing
+/// `> ` markers, or an LI continuation indent) is a real repair
+/// case — paste that drops a marker on the second line, an editor
+/// state that needs the BQ prefix carried through. A "huge" gap
+/// (40+ bytes of missing prefix) is the divergence shape: the
+/// previous repair created a deep prefix on one line and now we'd
+/// re-create it on the next, which compounds across keystrokes.
+/// At that point we let pulldown's re-parse pick up whatever
+/// shallower scope the bytes actually open instead of forcing the
+/// next line back to the previous depth.
+const MAX_REPAIR_BYTES: usize = 4;
+
+/// Recursively gather every `CodeBlock` node in document order.
+fn collect_code_blocks<'a>(
+    nodes: &'a [crate::syntax::SyntaxNode],
+    out: &mut Vec<&'a crate::syntax::SyntaxNode>,
+) {
+    for node in nodes {
+        if matches!(node.kind, crate::syntax::NodeKind::CodeBlock { .. }) {
+            out.push(node);
+        }
+        collect_code_blocks(&node.children, out);
+    }
+}
+
 fn promote_soft_breaks(state: EditorState) -> EditorState {
     let bytes = state.markdown.as_bytes();
     // Two scopes special-case the soft-break promotion rule:
@@ -375,6 +470,21 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
     for p in 0..bytes.len() {
         let in_code = is_in_ranges(p, &code_ranges);
         let in_list = is_in_ranges(p, &list_ranges);
+        // **Fence-opener-boundary exemption.** If `p` is a `\n` whose
+        // next byte starts a fenced code block, skip the soft-break
+        // promotion. The pair-shape `\n[prefix]\n[prefix]` is
+        // appropriate between two regular content lines, but right
+        // before a fence opener it would inject a stray prefix-only
+        // line that the user can never delete via Backspace —
+        // `delete_backward`'s "eat the line above" path removes it,
+        // this pass re-adds it, and the cycle traps the buffer at a
+        // fixed point well above zero.
+        let next_starts_fence = bytes[p] == b'\n'
+            && p + 1 < bytes.len()
+            && code_ranges.iter().any(|r| r.start == p + 1);
+        if next_starts_fence && !in_code {
+            continue;
+        }
         // Code-content is exempt from soft-break-to-pair promotion
         // (the `\n` is a literal line separator, not a soft break),
         // *but* a fenced code block sitting inside a BQ still demands
@@ -433,8 +543,55 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
                 continue;
             }
             let missing = &expected_prefix[have..];
+            if missing.len() > MAX_REPAIR_BYTES {
+                continue;
+            }
+            // Skip the repair when the missing tail consists only of
+            // *prefix bytes* (BQ markers, spaces, tabs) AND the rest
+            // of the next line is empty / whitespace. Two cases roll
+            // up here:
+            //
+            // 1. Trailing whitespace tail (`" "` or `"   "`): the
+            //    space at the end of `chain_continuation_prefix` is
+            //    cosmetic on a content-empty row — pulldown parses
+            //    both `>` and `> ` as valid BQ continuation when
+            //    nothing follows.
+            // 2. Missing `> ` markers (`"> "`, `" >"`, `"> > "`, …):
+            //    on a prefix-only continuation line the user is
+            //    *deleting* the prefix when they Backspace.
+            //    Re-injecting the markers undoes their keystroke and
+            //    traps the buffer in the trailing-prefix oscillation
+            //    documented in
+            //    `bugs.md::backspace_oscillates_inside_corrupted_chain_in_fenced_code`.
+            //
+            // The guard is conservative: we only skip when the next
+            // line carries *no* content past the partial prefix. A
+            // line with actual content after a partial prefix needs
+            // the repair so the BQ scope holds and the content stays
+            // inside the code body.
+            let next_line_end = next_line
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(next_line.len());
+            let trailing_only_whitespace_line = next_line[have..next_line_end]
+                .iter()
+                .all(|&b| b == b' ' || b == b'\t');
+            let missing_only_prefix_bytes = missing
+                .bytes()
+                .all(|b| b == b' ' || b == b'\t' || b == b'>');
+            if missing_only_prefix_bytes && trailing_only_whitespace_line {
+                continue;
+            }
             if !missing.is_empty() {
-                inserts.push((p + 1, missing.to_string()));
+                // Insert the missing tail *after* whatever prefix the
+                // next line already has. Inserting at `p + 1` (before
+                // the matched bytes) corrupts the prefix: e.g.
+                // expected `"> "`, next line starts with `">"`, missing
+                // is `" "` — inserting at `p + 1` produces `" >"` (the
+                // bytes swap), which is *not* a valid BQ marker. Insert
+                // at `p + 1 + have` instead so the line reads
+                // `[matched][missing][rest]`.
+                inserts.push((p + 1 + have, missing.to_string()));
             }
             continue;
         }
@@ -869,8 +1026,53 @@ fn delete_backward(state: EditorState) -> EditorState {
         }
     }
 
+    // **Anti-oscillation: in-fence "eat the line above" when
+    // grapheme-delete would just strip a `\n` between two prefix-only
+    // lines.**
+    //
+    // Inside a deeply-nested fenced code body, the cursor often lands
+    // right after a `\n` on a line whose content is just BQ markers
+    // (the previous repair filled them in). A bare grapheme-delete
+    // there removes the `\n`, the line below merges into the line
+    // above, `enforce_invariants` re-parses the merged line as a
+    // deeper-BQ opener, `normalize_blockquote_prefixes` re-spaces it,
+    // and the buffer ends up the same length. The user's keystroke
+    // appears to do nothing.
+    //
+    // When that pattern is detected (cursor inside fenced code, sitting
+    // at byte `\n+1`, and the *previous* line consists only of BQ
+    // markers + whitespace — no content), delete the whole previous
+    // line including its `\n`. Forward progress is guaranteed: the
+    // line above can't reappear from any normalize pass because its
+    // content was empty to begin with.
+    if analysis::is_in_fenced_code(bytes, cursor) && cursor > 0 && bytes[cursor - 1] == b'\n' {
+        let cursor_line_end = cursor - 1;
+        let mut prev_line_start = cursor_line_end;
+        while prev_line_start > 0 && bytes[prev_line_start - 1] != b'\n' {
+            prev_line_start -= 1;
+        }
+        if is_prefix_only_line(bytes, prev_line_start, cursor_line_end) {
+            return splice(&state.markdown, cursor, prev_line_start, cursor);
+        }
+    }
+
     let prev = prev_grapheme_offset(&state.markdown, cursor);
     splice(&state.markdown, cursor, prev, cursor)
+}
+
+/// `true` when the byte range `[start, end)` consists only of BQ
+/// markers (`>`), spaces, and tabs — i.e. the line carries chain
+/// continuation prefix and nothing else. A line that ends in any other
+/// byte (including fence chars or code body content) is *not*
+/// prefix-only; this is conservative on purpose so the in-code
+/// "eat the line above" path never deletes user-typed content.
+fn is_prefix_only_line(bytes: &[u8], start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    bytes[start..end]
+        .iter()
+        .all(|&b| b == b'>' || b == b' ' || b == b'\t')
 }
 
 fn delete_forward(state: EditorState) -> EditorState {

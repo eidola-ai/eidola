@@ -962,6 +962,72 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
         "38-document-complete",
         "Document fully composed. Ready to delete it from the end.",
     );
+
+    // ───────────────────────────────────────────────────────────────────
+    // PREPEND a deeply-nested construct: code block in BQ in BQ in OL in UL.
+    //
+    // The chain at code body is `[UL_LI, OL_LI, BQ, BQ]` (5 levels of
+    // structural nesting once the CodeBlock is included). We navigate
+    // back to byte 0 of the existing document and type the construct
+    // keystroke-by-keystroke. The existing document follows; the union
+    // of the two will exercise re-parse paths under deep nesting.
+    // ───────────────────────────────────────────────────────────────────
+    s.set_cursor(0, "navigate to doc start for prepend")
+        .keyframe(
+            "39-cursor-at-doc-start",
+            "Cursor at byte 0; about to prepend a deeply-nested construct \
+         (code block in BQ in BQ in OL in UL) before the existing document.",
+        );
+
+    s.type_chars_keyframed("- ", "40-prep-ul-marker", "Opening the outer UL.");
+    s.type_chars_keyframed("out", "41-prep-ul-body", "UL item content.");
+    s.key(ShiftEnter, "ShiftEnter")
+        .key(ShiftEnter, "ShiftEnter")
+        .keyframe(
+            "42-prep-ul-paragraph-break",
+            "Paragraph break inside the UL item.",
+        );
+
+    s.type_chars_keyframed(
+        "1. ",
+        "43-prep-ol-marker",
+        "Opening the nested OL inside the UL.",
+    );
+    s.type_chars_keyframed("in", "44-prep-ol-body", "OL item content.");
+    s.key(ShiftEnter, "ShiftEnter")
+        .key(ShiftEnter, "ShiftEnter")
+        .keyframe(
+            "45-prep-ol-paragraph-break",
+            "Paragraph break inside the OL item.",
+        );
+
+    s.type_chars_keyframed("> ", "46-prep-bq1-marker", "Opening the outer BQ.");
+    s.type_chars_keyframed(
+        "> ",
+        "47-prep-bq2-marker",
+        "Opening the nested BQ inside the outer BQ.",
+    );
+    s.type_chars_keyframed(
+        "```",
+        "48-prep-fence-open",
+        "Opening fence inside [UL, OL, BQ, BQ].",
+    );
+    s.type_chars_keyframed("rust", "49-prep-fence-info", "Language tag.");
+    s.key(Enter, "Enter").keyframe(
+        "50-prep-after-fence-enter",
+        "Enter at end of opener — auto-close should fire at chain [UL, OL, BQ, BQ].",
+    );
+    s.type_chars_keyframed("let n = 5;", "51-prep-body", "Code body.");
+    s.key(Enter, "Enter").keyframe(
+        "52-prep-after-body-enter",
+        "Enter inside body — literal `\\n` plus chain prefix.",
+    );
+    s.type_chars_keyframed("```", "53-prep-fence-close", "Closing fence (manual).");
+    s.keyframe(
+        "54-prep-block-complete",
+        "Deeply-nested construct prepended; orphan dedupe should keep it clean.",
+    );
+
     let mut step = 0usize;
     let max_steps = 1000usize;
     let initial_len = {
@@ -969,6 +1035,9 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
         let cx = s.cx();
         editor.read_with(cx, |e, _| e.state.markdown.len())
     };
+    let mut min_len_seen = initial_len;
+    let mut steps_without_progress = 0usize;
+    const NO_PROGRESS_BAIL: usize = 60;
     // Treat a buffer that has grown to 1.5x its starting size as a
     // runaway. Backspace should monotonically shrink the buffer; a
     // sustained net growth means the corrupted-state oscillation
@@ -1010,6 +1079,69 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
                 markdown.len()
             ),
         );
+        // Stuck detection: if Backspace produced no net change to the
+        // buffer or cursor, the press was a no-op. The most common
+        // reason at this point is the cursor reaching byte 0 while
+        // content still remains — Backspace at byte 0 has nothing to
+        // delete. Try jumping back to end-of-doc once and continuing;
+        // if even that doesn't make progress, we're truly stuck.
+        let (next_md, next_cursor) = {
+            let editor = s.editor.clone();
+            let cx = s.cx();
+            editor.read_with(cx, |e, _| (e.state.markdown.clone(), e.cursor_offset()))
+        };
+        if next_md == markdown && next_cursor == cursor {
+            if cursor == 0 && !markdown.is_empty() {
+                s.key(
+                    gpui_markdown_editor::editor::DocumentEnd,
+                    "DocumentEnd (recover from byte-0 stuck)",
+                );
+                continue;
+            }
+            s.keyframe(
+                "96-bs-stuck",
+                &format!(
+                    "Bailed: Backspace #{step} left state unchanged \
+                     (cursor {cursor}, len {}).",
+                    markdown.len()
+                ),
+            );
+            break;
+        }
+        // Oscillation / no-progress detection: track the smallest
+        // buffer size observed; if Backspace hasn't shrunk past that
+        // low-water mark in `NO_PROGRESS_BAIL` consecutive presses,
+        // we're cycling between two structurally equivalent states
+        // (the canonical case is `\n[prefix]\n` ↔ `\n[prefix]\n[prefix]`
+        // where promote_soft_breaks re-injects the half Backspace
+        // just removed). Bail with a useful keyframe instead of
+        // burning through the 1000-step cap.
+        if next_md.len() < min_len_seen {
+            min_len_seen = next_md.len();
+            steps_without_progress = 0;
+        } else {
+            steps_without_progress += 1;
+            if steps_without_progress >= NO_PROGRESS_BAIL {
+                if next_cursor == 0 && !next_md.is_empty() {
+                    s.key(
+                        gpui_markdown_editor::editor::DocumentEnd,
+                        "DocumentEnd (recover from byte-0 oscillation)",
+                    );
+                    steps_without_progress = 0;
+                    continue;
+                }
+                s.keyframe(
+                    "96-bs-stuck",
+                    &format!(
+                        "Bailed: {NO_PROGRESS_BAIL} consecutive presses \
+                         without buffer shrinking past {min_len_seen} \
+                         (current len {}, cursor {next_cursor}).",
+                        next_md.len()
+                    ),
+                );
+                break;
+            }
+        }
     }
     s.finish();
 }
