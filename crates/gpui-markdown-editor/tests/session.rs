@@ -778,3 +778,238 @@ fn _used_actions() {
     let _ = (Backspace, Delete, Down, End, Enter, Home, Left, Right);
     let _ = (ShiftEnter, ShiftLeft, ShiftRight, ShiftTab, Tab);
 }
+
+// ---------------------------------------------------------------------------
+// Nested code blocks — type a small document with code inside a BQ, inside a
+// list, inside a BQ-inside-a-list, plus a top-level paragraph; then Backspace
+// the whole thing away one keystroke at a time. This is a *discovery* harness:
+// the artifacts are what we read to spot misbehavior; assertions are
+// intentionally absent so the test doesn't hide failures behind panics.
+// ---------------------------------------------------------------------------
+
+impl Session {
+    /// Type each character of `text` as its own `InsertText` event. Mirrors a
+    /// real keyboard: each char goes through `enforce_invariants` separately,
+    /// so order-of-events bugs surface here that would not under a bulk
+    /// `type_("...")` paste.
+    #[allow(dead_code)]
+    fn type_chars(&mut self, text: &str) -> &mut Self {
+        for ch in text.chars() {
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            self.type_(s);
+        }
+        self
+    }
+
+    /// Type each char one at a time AND keyframe between every char. Use
+    /// sparingly — the artifact directory grows quickly.
+    fn type_chars_keyframed(&mut self, text: &str, prefix: &str, intent: &str) -> &mut Self {
+        let mut acc = String::new();
+        for ch in text.chars() {
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            self.type_(s);
+            acc.push(ch);
+            let display: String = acc
+                .chars()
+                .map(|c| if c == '`' { 'B' } else { c })
+                .collect();
+            self.keyframe(&format!("{prefix}-{}", slugify(&display)), intent);
+        }
+        self
+    }
+
+    /// Press Backspace once and emit a keyframe. Used by the deletion phase
+    /// to surface every interim state.
+    fn backspace_keyframed(&mut self, n: usize, intent: &str) -> &mut Self {
+        self.key(Backspace, "Backspace");
+        self.keyframe(&format!("bs-{n:03}"), intent);
+        self
+    }
+}
+
+#[gpui::test]
+fn nested_code_blocks_session(cx: &mut TestAppContext) {
+    let mut s = Session::new("nested-code-blocks", cx);
+
+    s.keyframe("00-blank", "Editor opens; nothing typed yet.");
+
+    // ───────────────────────────────────────────────────────────────────
+    // SUB-BLOCK 1: code block inside a top-level blockquote.
+    //
+    //   > ```rust
+    //   > let x = 1;
+    //   > ```
+    //
+    // Typing each char of the opening fence as its own event so we can see
+    // whether the editor behaves like a fence the moment the third backtick
+    // lands, or only after the info string + Enter follow.
+    // ───────────────────────────────────────────────────────────────────
+
+    s.type_chars_keyframed("> ", "01-bq-marker", "Opening a blockquote, char by char.");
+    s.type_chars_keyframed("```", "02-bq-fence-open", "Typing the opening fence; expect the editor to recognize a code block once the third backtick lands.");
+    s.type_chars_keyframed("rust", "03-bq-info", "Typing the language tag.");
+    s.key(Enter, "Enter").keyframe(
+        "04-bq-after-fence-enter",
+        "Enter after the opener+info — without a closing fence, what does the editor do? \
+         A naive Enter inserts `\\n\\n` (paragraph break) which would split the BQ; the \
+         desired UX may be to inject a closing fence and place the cursor on a body line.",
+    );
+    s.type_chars_keyframed(
+        "let x = 1;",
+        "05-bq-body",
+        "Typing the body of the code block.",
+    );
+    s.key(Enter, "Enter").keyframe(
+        "06-bq-after-body-enter",
+        "Enter inside code body — literal `\\n` + chain prefix; closer below already exists from auto-close.",
+    );
+    s.type_chars_keyframed("```", "07-bq-fence-close", "Typing the closing fence.");
+    s.keyframe(
+        "08-bq-block-complete",
+        "Code block inside BQ should now be a closed fenced block.",
+    );
+    s.key(Enter, "Enter").keyframe(
+        "09-bq-leave-enter",
+        "Enter after the closing fence — does this leave the BQ scope or stay inside it?",
+    );
+
+    // Whatever state we're in, get out to top-level cleanly. If still in BQ,
+    // pressing Enter again on an empty BQ row should outdent.
+    s.key(Enter, "Enter").keyframe(
+        "10-back-to-top-level",
+        "Second Enter — expect to be at top level by now (any BQ scope dropped).",
+    );
+
+    s.type_chars_keyframed("- ", "11-li-marker", "Opening an unordered list item.");
+    s.type_chars_keyframed("item", "12-li-content", "Item content.");
+    s.key(ShiftEnter, "ShiftEnter").keyframe(
+        "13-li-shift-enter-1",
+        "First ShiftEnter — hard break inside the item, indent on next line.",
+    );
+    s.key(ShiftEnter, "ShiftEnter").keyframe(
+        "14-li-shift-enter-2",
+        "Second ShiftEnter — paragraph break inside the item.",
+    );
+    s.type_chars_keyframed(
+        "```",
+        "15-li-fence-open",
+        "Typing the opening fence inside the item.",
+    );
+    s.type_chars_keyframed("rust", "16-li-info", "Language tag.");
+    s.key(Enter, "Enter").keyframe(
+        "17-li-after-fence-enter",
+        "Enter after opener inside an LI — auto-close should fire.",
+    );
+    s.type_chars_keyframed("let y = 2;", "18-li-body", "Code body inside the LI.");
+    s.key(Enter, "Enter").keyframe(
+        "19-li-after-body-enter",
+        "Enter inside code body — literal `\\n`.",
+    );
+    s.type_chars_keyframed("```", "20-li-fence-close", "Closing fence.");
+    s.keyframe("21-li-block-complete", "Code block inside LI complete.");
+    s.key(Enter, "Enter")
+        .keyframe("22-li-leave-enter", "Enter after the closing fence.");
+    s.key(Enter, "Enter").keyframe(
+        "23-back-to-top-level-after-li",
+        "Second Enter — expect to be at top level.",
+    );
+
+    s.type_chars_keyframed("- ", "24-li2-marker", "Second list — top-level.");
+    s.type_chars_keyframed("item", "25-li2-content", "Item content.");
+    s.key(ShiftEnter, "ShiftEnter")
+        .key(ShiftEnter, "ShiftEnter")
+        .keyframe(
+            "26-li2-paragraph-break",
+            "Paragraph break inside item 1 — about to open a BQ child.",
+        );
+    s.type_chars_keyframed("> ", "27-li2-bq-marker", "BQ marker inside the LI.");
+    s.type_chars_keyframed(
+        "```",
+        "28-li2-bq-fence-open",
+        "Opening fence inside [LI, BQ].",
+    );
+    s.type_chars_keyframed("rust", "29-li2-bq-info", "Language tag.");
+    s.key(Enter, "Enter").keyframe(
+        "30-li2-bq-after-fence-enter",
+        "Enter after opener inside [LI, BQ] — auto-close should fire.",
+    );
+    s.type_chars_keyframed("let z = 3;", "31-li2-bq-body", "Body inside [LI, BQ] code.");
+    s.key(Enter, "Enter").keyframe(
+        "32-li2-bq-after-body-enter",
+        "Enter inside [LI, BQ] code body.",
+    );
+    s.type_chars_keyframed("```", "33-li2-bq-fence-close", "Closing fence in [LI, BQ].");
+    s.keyframe(
+        "34-li2-bq-block-complete",
+        "Code block inside [LI, BQ] complete.",
+    );
+    s.key(Enter, "Enter").keyframe(
+        "35-li2-bq-leave-enter",
+        "Enter after closing fence in [LI, BQ].",
+    );
+    s.key(Enter, "Enter").keyframe(
+        "36-back-to-top-level-after-li2",
+        "Second Enter — expect to be at top level.",
+    );
+    s.type_chars_keyframed(
+        "Done.",
+        "37-trailing-paragraph",
+        "Top-level closing paragraph.",
+    );
+    s.keyframe(
+        "38-document-complete",
+        "Document fully composed. Ready to delete it from the end.",
+    );
+    let mut step = 0usize;
+    let max_steps = 1000usize;
+    let initial_len = {
+        let editor = s.editor.clone();
+        let cx = s.cx();
+        editor.read_with(cx, |e, _| e.state.markdown.len())
+    };
+    // Treat a buffer that has grown to 1.5x its starting size as a
+    // runaway. Backspace should monotonically shrink the buffer; a
+    // sustained net growth means the corrupted-state oscillation
+    // (`bugs.md::backspace_oscillates_inside_corrupted_chain`) is
+    // doing its work and we'll eventually overflow pulldown's
+    // recursion if we keep going. Stop here, write the keyframe, and
+    // let the regression review pick up from this state.
+    let runaway_threshold = (initial_len * 3) / 2;
+    loop {
+        if step >= max_steps {
+            s.keyframe("99-bs-cap", &format!("Hit {max_steps}-step cap; aborting."));
+            break;
+        }
+        let (markdown, cursor) = {
+            let editor = s.editor.clone();
+            let cx = s.cx();
+            editor.read_with(cx, |e, _| (e.state.markdown.clone(), e.cursor_offset()))
+        };
+        if markdown.is_empty() {
+            s.keyframe("98-bs-empty", "Buffer empty.");
+            break;
+        }
+        if markdown.len() > runaway_threshold {
+            s.keyframe(
+                "97-bs-runaway",
+                &format!(
+                    "Bailed: buffer at {} bytes exceeds 1.5x initial ({}).",
+                    markdown.len(),
+                    initial_len
+                ),
+            );
+            break;
+        }
+        step += 1;
+        s.backspace_keyframed(
+            step,
+            &format!(
+                "Backspace #{step}. cursor was {cursor}, len {}",
+                markdown.len()
+            ),
+        );
+    }
+    s.finish();
+}

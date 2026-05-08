@@ -5336,3 +5336,180 @@ fn probe_left_backspace_on_empty_bq_in_li(cx: &mut TestAppContext) {
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// Code-block nesting cohort: regression tests for the rules in
+// `bugs.md::code-block nesting cohort`. The session test
+// (`tests/session.rs::nested_code_blocks_session`) is the discovery
+// harness — these are the targeted gates.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn enter_after_unterminated_fence_in_bq_auto_closes_with_chain_prefix(cx: &mut TestAppContext) {
+    // Rule A + Rule B + Rule C combined: typing `> ```rust` and pressing
+    // Enter should leave the buffer in a *terminated* fenced state with
+    // the cursor on a body row in between, and both body and closer
+    // rows must carry the BQ continuation prefix.
+    let initial = EditorState {
+        markdown: "> ```rust".into(),
+        selection: Selection::Cursor(9),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown, "> ```rust\n> \n> ```",
+            "auto-close should inject `\\n> \\n> ```` so the fence is terminated",
+        );
+        // Cursor lands on the body row (between fences), past the prefix.
+        assert_eq!(e.cursor_offset(), 12);
+    });
+}
+
+#[gpui::test]
+fn enter_inside_terminated_fence_in_bq_inserts_newline_with_chain_prefix(cx: &mut TestAppContext) {
+    // Rule C: once the fence is closed, Enter on a body line inserts
+    // `\n` + chain continuation prefix — *not* a paragraph break pair
+    // (which would split the BQ scope) and *not* a bare `\n` (which
+    // would lose the BQ marker on the new row).
+    let initial = EditorState {
+        markdown: "> ```rust\n> body\n> ```".into(),
+        selection: Selection::Cursor(16), // end of `> body`
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown, "> ```rust\n> body\n> \n> ```",
+            "Enter inside fenced code in a BQ should add `\\n> ` (not `\\n\\n` or bare `\\n`)",
+        );
+        // Cursor on the new empty body row, past the BQ prefix.
+        assert_eq!(e.cursor_offset(), 19);
+    });
+}
+
+#[gpui::test]
+fn enter_on_empty_bq_paragraph_outdents_bq_scope(cx: &mut TestAppContext) {
+    // Rule D: the analog of empty-LI Enter outdent for blockquotes.
+    // Cursor on an empty `> ` row (chain ends in BQ); Enter drops
+    // the innermost BQ, replacing the trailing chain pair with
+    // the reduced-chain pair shape.
+    let initial = EditorState {
+        markdown: "> a\n> \n> ".into(),
+        selection: Selection::Cursor(9), // end of trailing empty `> `
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // Trailing depth-1 BQ pair → top-level pair shape.
+        assert_eq!(
+            e.state.markdown, "> a\n\n",
+            "empty-BQ Enter should outdent the BQ scope; got: {:?}",
+            e.state.markdown,
+        );
+        // Cursor lands at the end of the new top-level shape.
+        assert_eq!(e.cursor_offset(), 5);
+        // Chain at cursor: empty (top level).
+        let chain = gpui_markdown_editor::analysis::enclosing_containers_at(
+            &e.state.markdown,
+            e.cursor_offset(),
+        );
+        assert!(
+            chain.is_empty(),
+            "cursor should be at top level after BQ outdent, got chain {chain:?}",
+        );
+    });
+}
+
+#[gpui::test]
+fn render_walker_omits_synth_paragraph_inside_unterminated_fence(cx: &mut TestAppContext) {
+    // Rule E: a trailing position inside an unterminated fence is
+    // already covered by the CodeBlock leaf — the synth-paragraph
+    // injection in `render_blockquote` / `inject_empty_paragraphs`
+    // must not emit a phantom Paragraph leaf with overlapping range.
+    //
+    // Use the unterminated `> ```rust\n> \n> ` shape (the post-Enter
+    // state if auto-close were *not* in play) so we exercise the
+    // render path without depending on whether Enter auto-closed.
+    let initial = EditorState {
+        markdown: "> ```rust\n> \n> ".into(),
+        selection: Selection::Cursor(15),
+    };
+    let (_handle, editor) = open_editor(cx, initial);
+    let spec = editor.read_with(cx, |e, _| e.render_spec());
+    // Exactly one block — no phantom Paragraph leaf overlapping the
+    // CodeBlock.
+    assert_eq!(
+        spec.blocks.len(),
+        1,
+        "expected one CodeBlock leaf, got {} blocks",
+        spec.blocks.len(),
+    );
+    assert!(
+        matches!(spec.blocks[0].kind, BlockKind::CodeBlock { .. }),
+        "expected CodeBlock leaf, got {:?}",
+        spec.blocks[0].kind,
+    );
+}
+
+#[gpui::test]
+fn auto_close_orphan_dedupes_when_user_types_matching_closer(cx: &mut TestAppContext) {
+    // After auto-close fires (cursor on a body row between fences), the
+    // user types their own closing fence on the body row. The buffer
+    // momentarily holds two adjacent identical fence delimiter lines —
+    // the user's typed closer + the auto-close's now-orphaned opener.
+    // `dedupe_orphan_fence_closer` removes the orphan so the construct
+    // ends cleanly.
+    //
+    // Repro the post-state directly: a buffer where exactly that shape
+    // sits at the end. After enforce_invariants (which the editor runs
+    // on every update), the orphan is gone.
+    let initial = EditorState {
+        markdown: "> ```rust\n> body\n> ```\n> ```".into(),
+        selection: Selection::Cursor(22), // end of user's typed `> ```` closer
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    // Trigger an update so enforce_invariants runs (any no-op insert
+    // will do; here we type and immediately backspace).
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText(String::new()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        // Orphan removed: only the user's typed closer survives.
+        assert_eq!(
+            e.state.markdown, "> ```rust\n> body\n> ```\n",
+            "expected orphan opener to be deduped, got: {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn cursor_at_eof_of_unterminated_fence_classifies_as_inside(_cx: &mut TestAppContext) {
+    // Rule B: `is_in_fenced_code` treats the EOF byte of an
+    // unterminated fence range as inside the construct. Without this,
+    // the cursor sitting right after the user's `> ```rust` opener
+    // routes through chain-based Enter (BQ pair, LI marker) instead
+    // of the in-fence path — the original cascade root cause.
+    let buf = "> ```rust";
+    assert!(
+        gpui_markdown_editor::analysis::is_in_fenced_code(buf.as_bytes(), buf.len()),
+        "EOF position of unterminated fence should classify as inside the construct",
+    );
+    // For terminated fences the boundary remains exclusive so the
+    // byte right after the closer's trailing `\n` is *outside*.
+    let closed = "> ```\n> a\n> ```\n";
+    assert!(
+        !gpui_markdown_editor::analysis::is_in_fenced_code(closed.as_bytes(), closed.len()),
+        "EOF position past a terminated fence should classify as outside",
+    );
+}

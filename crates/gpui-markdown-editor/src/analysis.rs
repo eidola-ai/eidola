@@ -38,9 +38,26 @@ use std::ops::Range;
 // Fenced code block scanning
 // ---------------------------------------------------------------------------
 
+/// One fenced code block's structural extent, paired with whether the
+/// block has a clean closer.
+///
+/// Returned by [`fenced_code_content_ranges_with_state`]. The `range`
+/// always covers the opening fence line, the inner content, and the
+/// closing fence line (with its trailing `\n`) or end-of-source for an
+/// unterminated block; `terminated` distinguishes the two so the cursor
+/// query in [`is_in_fenced_code`] knows whether the byte sitting at
+/// `range.end` is "after the closer" (terminated → outside) or "at
+/// EOF inside the still-open construct" (unterminated → inside).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FencedCodeBlock {
+    pub range: Range<usize>,
+    pub terminated: bool,
+}
+
 /// Find every fenced code block's full byte range — inclusive of the
 /// opening fence line, the inner content, and the closing fence line
-/// (or end-of-source for an unterminated block).
+/// (or end-of-source for an unterminated block) — paired with whether
+/// the block was actually closed.
 ///
 /// Used to exempt those bytes from the soft-break and forbidden-pair
 /// rules. Both rules are about paragraph-context structure; they don't
@@ -62,8 +79,8 @@ use std::ops::Range;
 /// exemption needs to fire for those bytes too. The
 /// `normalize_blockquote_prefixes` pass and any subsequent re-parse
 /// will reconcile the prefix; until then, those bytes are code.
-pub fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
-    let mut out: Vec<Range<usize>> = Vec::new();
+pub fn fenced_code_content_ranges_with_state(bytes: &[u8]) -> Vec<FencedCodeBlock> {
+    let mut out: Vec<FencedCodeBlock> = Vec::new();
     // (fence_char, fence_len, open_depth, block_start) while inside
     // an open block. `block_start` is the byte index of the opening
     // fence line's first byte; the emitted range runs through the
@@ -121,7 +138,10 @@ pub fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
                             // Range covers the whole block, including
                             // the closing fence line *and* its
                             // trailing `\n`.
-                            out.push(block_start..line_after);
+                            out.push(FencedCodeBlock {
+                                range: block_start..line_after,
+                                terminated: true,
+                            });
                             open = None;
                         }
                     }
@@ -135,17 +155,40 @@ pub fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
     }
 
     if let Some((_, _, _, block_start)) = open {
-        out.push(block_start..bytes.len());
+        out.push(FencedCodeBlock {
+            range: block_start..bytes.len(),
+            terminated: false,
+        });
     }
 
     out
 }
 
+/// Range-only projection of [`fenced_code_content_ranges_with_state`].
+/// Most callers only need the spans (e.g. to skip over code content
+/// while scanning for soft-break candidates); cursor-position queries
+/// that need to distinguish "at the end of an unterminated block" from
+/// "after a clean closer" should use [`is_in_fenced_code`] (or call
+/// the state-aware version directly).
+pub fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
+    fenced_code_content_ranges_with_state(bytes)
+        .into_iter()
+        .map(|b| b.range)
+        .collect()
+}
+
 /// `true` if byte index `p` falls inside any fenced code block (opener,
-/// content, or closer). Convenience wrapper that recomputes ranges; the
-/// hot paths in `update.rs` cache the range list themselves.
+/// content, or closer). The cursor at the EOF position of an
+/// **unterminated** fence is treated as inside the construct — there's
+/// no closer to sit "after", and the user typing more content there is
+/// still composing inside the code block. For terminated blocks the
+/// byte right after the closer's trailing `\n` (i.e. exactly at
+/// `range.end`) is *outside*, so a paragraph immediately following a
+/// closed fence doesn't get classified as code.
 pub fn is_in_fenced_code(bytes: &[u8], p: usize) -> bool {
-    is_in_ranges(p, &fenced_code_content_ranges(bytes))
+    fenced_code_content_ranges_with_state(bytes)
+        .iter()
+        .any(|b| p >= b.range.start && (p < b.range.end || (!b.terminated && p == b.range.end)))
 }
 
 pub(crate) fn is_in_ranges(p: usize, ranges: &[Range<usize>]) -> bool {
@@ -181,14 +224,13 @@ pub(crate) fn is_in_ranges(p: usize, ranges: &[Range<usize>]) -> bool {
 ///    pausing at invisible byte positions.
 pub fn is_forbidden_position(markdown: &str, p: usize) -> bool {
     let bytes = markdown.as_bytes();
-    if is_paragraph_break_interior(bytes, p) && !is_in_ranges(p, &fenced_code_content_ranges(bytes))
-    {
+    if is_paragraph_break_interior(bytes, p) && !is_in_fenced_code(bytes, p) {
         return true;
     }
     if is_list_indent_interior(markdown, p) {
         return true;
     }
-    if is_chain_pair_interior(markdown, p) && !is_in_ranges(p, &fenced_code_content_ranges(bytes)) {
+    if is_chain_pair_interior(markdown, p) && !is_in_fenced_code(bytes, p) {
         return true;
     }
     false
@@ -1620,9 +1662,15 @@ fn bullet_for_item_index(markdown: &str, item_index: usize) -> Option<u8> {
 ///
 /// Routing (innermost wins):
 ///
-/// - Inside a fenced code block: a literal `\n` (code uses `\n` as
-///   a line separator; promoting to `\n\n` would visually duplicate
-///   every keystroke).
+/// - Inside a fenced code block: `\n` + the chain's continuation
+///   prefix. Code uses `\n` as a line separator (promoting to
+///   `\n\n` would visually duplicate every keystroke), but the new
+///   row still has to carry the outer BQ / LI continuation bytes
+///   so the code body stays inside its enclosing scope.
+///   Auto-close-fence (see [`auto_close_fence_edit`]) intercepts
+///   the *unterminated* case before this function fires, so by the
+///   time we reach the in-fence branch the fence has a clean
+///   closer below.
 /// - Inside a list item: `\n` + the active blockquote continuation
 ///   prefix (if any) + the *outer* list-items' accumulated indent +
 ///   the innermost item's next marker. The new line lands as a
@@ -1634,7 +1682,9 @@ fn bullet_for_item_index(markdown: &str, item_index: usize) -> Option<u8> {
 pub fn enter_insertion(markdown: &str, cursor: usize) -> String {
     let bytes = markdown.as_bytes();
     if is_in_fenced_code(bytes, cursor) {
-        return "\n".to_string();
+        let chain = enclosing_containers_at(markdown, cursor);
+        let prefix = chain_continuation_prefix(&chain);
+        return format!("\n{prefix}");
     }
     let chain = enclosing_containers_at(markdown, cursor);
     // Route on the *innermost* (last) container, not "any LI in the
@@ -1660,6 +1710,130 @@ pub fn enter_insertion(markdown: &str, cursor: usize) -> String {
         }
         None => "\n\n".to_string(),
     }
+}
+
+/// `Some(edit)` when the user pressed Enter at the end of an empty
+/// blockquote paragraph row, asking to leave the innermost BQ scope.
+///
+/// The shape: cursor sits at the end of a chain-aware pair
+/// (`\n{blank}\n{content}`, see [`pair_at_end_for_chain`]) whose chain
+/// ends in `BlockQuote`. The edit replaces the pair with the
+/// reduced-chain pair shape so the trailing row drops one BQ marker;
+/// when the chain has no remaining BQs the new shape is the top-level
+/// `\n\n`.
+///
+/// This is the Enter analog of the chain-aware BQ-outdent gesture on
+/// Backspace (the matching code lives in `update::delete_backward` and
+/// uses the same detector + replacement). Without this gesture every
+/// Enter on an empty `> ` row just appends another `\n> \n> ` pair, so
+/// the user has no Enter-only path out of a blockquote — Backspace
+/// would be the only way. Mirrors [`empty_item_exit_edit`] for list
+/// items: empty-LI Enter and empty-BQ Enter both decrease nesting
+/// depth by one.
+pub fn empty_bq_paragraph_exit_edit(markdown: &str, cursor: usize) -> Option<DepthDecreaseEdit> {
+    let bytes = markdown.as_bytes();
+    let chain = enclosing_containers_at(markdown, cursor);
+    if !matches!(chain.last(), Some(EnclosingContainer::BlockQuote { .. })) {
+        return None;
+    }
+    let pair_start = pair_at_end_for_chain(bytes, cursor, &chain)?;
+    let new_chain = &chain[..chain.len() - 1];
+    let (blank_prefix, content_prefix) = chain_pair_shape(new_chain);
+    let replacement = format!("\n{blank_prefix}\n{content_prefix}");
+    let new_cursor = pair_start + replacement.len();
+    Some(DepthDecreaseEdit {
+        range: pair_start..cursor,
+        replacement,
+        cursor: new_cursor,
+    })
+}
+
+/// `Some(edit)` when the user pressed Enter inside an *unterminated*
+/// fenced code block. The edit injects a matching closer below the
+/// cursor so the buffer never carries an unterminated fence after a
+/// keystroke, and places the cursor on a body row between the existing
+/// opener and the new closer.
+///
+/// Why intercept Enter rather than wait for the user to type the
+/// closer? Without a closer, pulldown sees the construct as extending
+/// to EOF; every subsequent keystroke is "still inside an open code
+/// block", which forces every other rule (BQ-prefix normalize,
+/// soft-break promote, render-walker synth-paragraph injection) to
+/// special-case the unterminated state. Auto-closing the fence at the
+/// first natural Enter eliminates that whole class of edge cases.
+///
+/// The closer matches the opener's fence char (`` ` `` or `~`) and at
+/// least its length; both the body row and the closer row carry the
+/// cursor's chain continuation prefix so the new bytes stay inside
+/// every enclosing BQ / LI scope.
+pub fn auto_close_fence_edit(markdown: &str, cursor: usize) -> Option<DepthDecreaseEdit> {
+    let bytes = markdown.as_bytes();
+    let states = fenced_code_content_ranges_with_state(bytes);
+    let block = states.iter().find(|b| {
+        cursor >= b.range.start
+            && (cursor < b.range.end || (!b.terminated && cursor == b.range.end))
+    })?;
+    if block.terminated {
+        return None;
+    }
+
+    let opener = parse_opener_fence(bytes, block.range.start)?;
+    let closer: String = std::iter::repeat_n(opener.fence_char as char, opener.fence_len).collect();
+
+    // The new body / closer rows take the cursor's chain so
+    // alternating chains pick up every interleaved indent + marker
+    // segment, not just the BQ markers.
+    let chain = enclosing_containers_at(markdown, cursor);
+    let prefix = chain_continuation_prefix(&chain);
+
+    let body_row = format!("\n{prefix}");
+    let closer_row = format!("\n{prefix}{closer}");
+    let replacement = format!("{body_row}{closer_row}");
+    let new_cursor = cursor + body_row.len();
+
+    Some(DepthDecreaseEdit {
+        range: cursor..cursor,
+        replacement,
+        cursor: new_cursor,
+    })
+}
+
+struct OpenerFence {
+    fence_char: u8,
+    fence_len: usize,
+}
+
+fn parse_opener_fence(bytes: &[u8], block_start: usize) -> Option<OpenerFence> {
+    let mut line_end = block_start;
+    while line_end < bytes.len() && bytes[line_end] != b'\n' {
+        line_end += 1;
+    }
+    let (_depth, after_markers) = count_line_markers(bytes, block_start);
+    let mut q = after_markers;
+    let mut indent = 0;
+    while q < line_end && indent < 4 && bytes[q] == b' ' {
+        q += 1;
+        indent += 1;
+    }
+    if indent >= 4 || q >= line_end {
+        return None;
+    }
+    let fc = bytes[q];
+    if fc != b'`' && fc != b'~' {
+        return None;
+    }
+    let mut r = q;
+    while r < line_end && bytes[r] == fc {
+        r += 1;
+    }
+    let fence_len = r - q;
+    if fence_len < 3 {
+        return None;
+    }
+    Some(OpenerFence {
+        fence_char: fc,
+        fence_len,
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -141,9 +141,104 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
     // 4. `normalize_blockquote_prefixes` is independent and runs
     //    after the others.
     let state = collapse_consecutive_hard_breaks(state);
+    let state = dedupe_orphan_fence_closer(state);
     let state = promote_soft_breaks(state);
     let state = normalize_lists(state);
     normalize_blockquote_prefixes(state)
+}
+
+/// Collapse a `[terminated fence] + [identical-line unterminated fence]`
+/// pair into a single terminated fence.
+///
+/// The shape we detect is the artifact of `auto_close_fence_edit`
+/// followed by the user typing their own closing fence themselves: the
+/// auto-close left a closer one line below the user's body row, the
+/// user's typed `\`\`\`` closed the *original* opener, and the
+/// auto-close's row became an unterminated *opener* on the line
+/// immediately after. Both lines have identical content (same prefix,
+/// same fence char, same length).
+///
+/// This pass deletes the orphan opener line so the construct ends
+/// cleanly. Without it, every Backspace through the orphan triggers
+/// missing-prefix-repair against an ever-deepening BQ chain (see
+/// `bugs.md::backspace_oscillates_inside_corrupted_chain_in_fenced_code`),
+/// because pulldown counts each `>` on the orphan-rich tail as opening
+/// another BQ scope.
+///
+/// Restricted to the *exact* shape:
+///
+/// - First range terminated, second range unterminated.
+/// - Second range starts immediately after the first's trailing `\n`
+///   (no bytes between).
+/// - Second range covers exactly one line (no embedded `\n`) — i.e.
+///   the orphan opener has no body. This is the only case where
+///   removing it is safe; if the user has typed body content under
+///   the orphan, the construct is no longer "just an artifact" and
+///   we leave it alone.
+/// - The opener line of the second range matches the closer line of
+///   the first byte-for-byte.
+fn dedupe_orphan_fence_closer(state: EditorState) -> EditorState {
+    let bytes = state.markdown.as_bytes();
+    let blocks = analysis::fenced_code_content_ranges_with_state(bytes);
+    let mut delete_range: Option<std::ops::Range<usize>> = None;
+    for pair in blocks.windows(2) {
+        let (first, second) = (&pair[0], &pair[1]);
+        if !first.terminated || second.terminated {
+            continue;
+        }
+        if second.range.start != first.range.end {
+            continue;
+        }
+        if second.range.end > bytes.len() {
+            continue;
+        }
+        // Single-line orphan: the range must contain no embedded `\n`.
+        if bytes[second.range.start..second.range.end].contains(&b'\n') {
+            continue;
+        }
+        // Closer line of the first range: walk back from the trailing
+        // `\n` to its line start.
+        if first.range.end == 0 || bytes[first.range.end - 1] != b'\n' {
+            continue;
+        }
+        let closer_line_end = first.range.end - 1;
+        let mut closer_line_start = closer_line_end;
+        while closer_line_start > 0 && bytes[closer_line_start - 1] != b'\n' {
+            closer_line_start -= 1;
+        }
+        let closer_bytes = &bytes[closer_line_start..closer_line_end];
+        let opener_bytes = &bytes[second.range.start..second.range.end];
+        if closer_bytes == opener_bytes {
+            delete_range = Some(second.range.clone());
+            break;
+        }
+    }
+    let Some(range) = delete_range else {
+        return state;
+    };
+    let mut new_md = String::with_capacity(state.markdown.len() - (range.end - range.start));
+    new_md.push_str(&state.markdown[..range.start]);
+    new_md.push_str(&state.markdown[range.end..]);
+    let map = |off: usize| -> usize {
+        if off <= range.start {
+            off
+        } else if off < range.end {
+            range.start
+        } else {
+            off - (range.end - range.start)
+        }
+    };
+    let new_sel = match state.selection {
+        Selection::Cursor(p) => Selection::Cursor(map(p)),
+        Selection::Range { anchor, head } => Selection::Range {
+            anchor: map(anchor),
+            head: map(head),
+        },
+    };
+    EditorState {
+        markdown: new_md,
+        selection: new_sel,
+    }
 }
 
 /// Apply the list-canonicalization edits computed by
@@ -247,6 +342,12 @@ fn apply_edits(state: EditorState, edits: &[analysis::SourceEdit]) -> EditorStat
     }
 }
 
+/// Hard cap on the chain depth at which `promote_soft_breaks`'s
+/// missing-prefix-repair fires. Set well above any human nesting
+/// (sixteen `> ` markers around a paragraph would be unreadable),
+/// well below where the divergence pattern surfaces in stress tests.
+const MAX_REPAIR_DEPTH: usize = 16;
+
 fn promote_soft_breaks(state: EditorState) -> EditorState {
     let bytes = state.markdown.as_bytes();
     // Two scopes special-case the soft-break promotion rule:
@@ -310,6 +411,25 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
                 have += 1;
             }
             if have >= expected_prefix.len() {
+                continue;
+            }
+            // **Anti-runaway guard.** Real documents nest at most a
+            // handful of BQ / LI containers; a chain of 16+ entries is
+            // a sign the buffer has accumulated phantom markers
+            // (typically through repeated re-parsing of an
+            // ill-formed-but-tolerated state — e.g. orphan auto-close
+            // fences chaining `> > > > >` runs together). At that
+            // depth the missing-prefix tail would be huge, which
+            // *grows* the buffer on every keystroke, which produces
+            // even deeper chains on the next re-parse, which grows
+            // the buffer further. Cap the repair: if pulldown reports
+            // a chain deeper than [`MAX_REPAIR_DEPTH`], let pulldown's
+            // own re-parse pick up whatever scope the bytes actually
+            // open instead of forcing an ever-deeper prefix back in.
+            //
+            // The cap protects against the divergence; legitimate
+            // docs with a few levels of nesting are well below it.
+            if chain_at.len() > MAX_REPAIR_DEPTH {
                 continue;
             }
             let missing = &expected_prefix[have..];
@@ -537,6 +657,22 @@ fn insert_newline(state: EditorState) -> EditorState {
     // (analogous to blockquote outdent). This subsumes the
     // "double-Enter exits a list" UX without a dedicated state flag.
     if let Some(edit) = analysis::empty_item_exit_edit(&state.markdown, cursor) {
+        return apply_replace(&state.markdown, edit);
+    }
+    // Empty-BQ-paragraph Enter is the analog for blockquotes — drops
+    // the innermost BQ scope on the trailing row. Without this, every
+    // Enter on an empty `> ` row just adds another empty `> ` pair,
+    // and the user has no Enter-only gesture to leave a BQ.
+    if let Some(edit) = analysis::empty_bq_paragraph_exit_edit(&state.markdown, cursor) {
+        return apply_replace(&state.markdown, edit);
+    }
+    // Auto-close-fence: any Enter inside an unterminated fenced code
+    // block injects a matching closer below the cursor, with the
+    // cursor on a fresh body row in between. After this fires the
+    // construct is terminated, so subsequent rules (in-fence
+    // continuation, BQ-prefix normalize, soft-break exemption) have a
+    // single unambiguous truth to read off `is_in_fenced_code`.
+    if let Some(edit) = analysis::auto_close_fence_edit(&state.markdown, cursor) {
         return apply_replace(&state.markdown, edit);
     }
     let insertion = analysis::enter_insertion(&state.markdown, cursor);

@@ -273,6 +273,34 @@ The same rules drop out across the editor:
   unless the cursor is sitting on the byte right after that specific
   `>` — the user may be about to type the space themselves. Code
   content is exempt, same gate as soft-break promotion.
+- **Unterminated-fence-aware code classification.** `is_in_fenced_code`
+  treats the EOF position of an unterminated fence as inside the
+  construct (an unterminated fence's range ends at `bytes.len()`, so
+  there's no closer to sit "after"). Every cursor-driven query —
+  Enter routing, atomic pair-delete bypass, soft-break exemption,
+  forbidden-position predicate — funnels through this predicate.
+  See `analysis::FencedCodeBlock` and
+  `fenced_code_content_ranges_with_state`.
+- **Auto-close-fence on Enter.** `analysis::auto_close_fence_edit`
+  fires before regular Enter routing when the cursor sits inside an
+  unterminated fence. The edit injects a matching closer below the
+  cursor (matching fence char and length, with the chain continuation
+  prefix on each new line) and lands the cursor on a body row in
+  between. Once this fires the construct is terminated; subsequent
+  rules read off `is_in_fenced_code` without the unterminated-state
+  ambiguity that produced the original cascade
+  (`bugs.md::enter_at_end_of_unterminated_fenced_code_inserts_paragraph_break_pair`).
+- **In-fence Enter emits chain prefix.** Inside a (now-terminated)
+  fence, `enter_insertion` returns `\n` + `chain_continuation_prefix(chain)`,
+  *not* a bare `\n`. The new code-body row keeps the BQ / LI
+  continuation bytes so the construct stays inside its enclosing
+  scope.
+- **Empty-BQ Enter outdents** (mirror of empty-LI Enter outdent).
+  `analysis::empty_bq_paragraph_exit_edit` returns the chain-aware
+  pair-replacement edit when the user presses Enter at the end of a
+  trailing BQ-pair shape; the innermost BQ scope drops, the trailing
+  shape becomes the reduced-chain pair. Wired before `enter_insertion`
+  in `update::insert_newline`.
 
 ### Chain-aware invariants (the helper family)
 

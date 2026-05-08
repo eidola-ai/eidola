@@ -1012,7 +1012,32 @@ fn find_leaf_for_prefix<'a>(
             }
         }
     }
-    found_idx.map(move |i| &mut slice[i])
+    if let Some(i) = found_idx {
+        return Some(&mut slice[i]);
+    }
+    // **Unterminated-fence boundary.** When the BQ contains an
+    // unterminated fenced code block, the CodeBlock leaf's
+    // `source_range.end` sits at `bytes.len()`. The strict
+    // `target < end` test above misses any prefix on the *last* body
+    // line (where `prefix.end == bytes.len() == leaf.source_range.end`),
+    // and without this match the deferred-pair logic emits a phantom
+    // empty paragraph at the prefix's range — overlapping the
+    // CodeBlock leaf at the same bytes (see
+    // `bugs.md::render_walker_emits_phantom_paragraph_inside_unterminated_fenced_code`).
+    // Detect "prefix lies inside an unterminated fence" via the
+    // unterminated-aware `is_in_fenced_code` predicate and attach the
+    // marker to the existing CodeBlock leaf instead.
+    if crate::analysis::is_in_fenced_code(bytes, prefix.start) {
+        for (i, b) in slice.iter().enumerate() {
+            if matches!(b.kind, BlockKind::CodeBlock { .. })
+                && b.source_range.start <= prefix.start
+                && prefix.start <= b.source_range.end
+            {
+                return Some(&mut slice[i]);
+            }
+        }
+    }
+    None
 }
 
 fn render_code_block(
@@ -1377,6 +1402,14 @@ fn inject_empty_paragraphs(
         } else {
             (start + 2).min(bytes.len())
         };
+        // Suppress synth-paragraph injection when the trailing position
+        // falls inside a fenced code range (terminated or unterminated).
+        // The CodeBlock leaf already covers those bytes — a synth here
+        // would emit a phantom Paragraph leaf overlapping the
+        // CodeBlock. See `bugs.md::render_walker_emits_phantom_…`.
+        if crate::analysis::is_in_fenced_code(bytes, start) {
+            continue;
+        }
         let mut synth = RenderBlock::new(start..end, BlockKind::Paragraph);
         // See note on `probe` in the leading / inter-block loops above.
         // Query past the leading boundary `\n` so a trailing synth that
