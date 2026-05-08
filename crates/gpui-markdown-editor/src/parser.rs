@@ -16,6 +16,13 @@ use crate::syntax::{ListKind, NodeKind, SyntaxNode};
 pub fn parse(markdown: &str) -> Vec<SyntaxNode> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
+    // Treat empty nested item lines (`  - \n`, `  1. \n`, etc.) as
+    // genuine list items rather than lazy-continuation text. Needed so
+    // the chain query inside the editor's invariant passes still
+    // reports the cursor's container correctly mid-typing — without
+    // this, an empty-marker continuation line drops out of pulldown's
+    // tree and the cursor's chain collapses to the surrounding scope.
+    opts.insert(Options::ENABLE_EMPTY_NESTED_LISTS);
 
     let mut walker = Walker::new(markdown);
     for (event, range) in Parser::new_ext(markdown, opts).into_offset_iter() {

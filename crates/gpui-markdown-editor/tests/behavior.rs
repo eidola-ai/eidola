@@ -3179,26 +3179,20 @@ fn empty_enter_on_top_level_item_becomes_paragraph(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn empty_enter_on_apparent_nested_empty_item_creates_outer_sibling(cx: &mut TestAppContext) {
-    // Edge case the corpus surfaces: pulldown doesn't open a
-    // nested list for an *empty* `  - ` marker line — it needs
-    // content to register as a nested list. So the source
-    // `- one\n  - ` with the cursor at the apparent inner-marker
-    // position is parsed by pulldown as the *outer* item with
-    // continuation content, not as an empty nested item.
+fn empty_enter_on_nested_empty_item_outdents_to_outer_paragraph(cx: &mut TestAppContext) {
+    // With pulldown's `ENABLE_EMPTY_NESTED_LISTS` option enabled in
+    // `parser::parse`, `- one\n  - ` parses as the outer item plus
+    // a nested list whose only item is empty. Empty-Enter on that
+    // inner item then takes the standard empty-LI outdent path:
+    // drop the inner marker, leaving a paragraph row at the outer
+    // item's content depth. The result is `- one\n\n  ` — the
+    // depth-1 LI-trailing pair shape, with the cursor on the new
+    // continuation row inside the outer item.
     //
-    // Empty-Enter therefore can't see "inner empty item to exit"
-    // and falls through to `enter_insertion`, which inserts the
-    // outer-level next-sibling marker. The result is a new outer
-    // sibling, leaving the apparent-nested-marker line in place
-    // as continuation text — different from the visual intent
-    // ("exit the nested level"), but consistent with what
-    // pulldown sees.
-    //
-    // Documenting the boundary here so future implementations
-    // that open a list-for-empty-marker (or that apply a
-    // pre-parse heuristic to recognize the inner marker) have a
-    // landing pad for the regression test.
+    // Before the option landed, pulldown couldn't see the inner
+    // empty marker as a list item (it needed content), so the
+    // chain query returned only the outer LI and Enter fell through
+    // to a sibling-marker insertion. The option closes that gap.
     let initial = EditorState {
         markdown: "- one\n  - ".into(),
         selection: Selection::Cursor(10),
@@ -3206,7 +3200,7 @@ fn empty_enter_on_apparent_nested_empty_item_creates_outer_sibling(cx: &mut Test
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Enter);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- one\n  - \n- ");
+        assert_eq!(e.state.markdown, "- one\n\n  ");
     });
 }
 
