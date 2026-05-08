@@ -420,7 +420,7 @@ fn render_blockquote(
     let mut synth_indices: Vec<usize> = Vec::new();
     let mut deferred: Option<Range<usize>> = None;
     for prefix in prefix_ranges {
-        if let Some(leaf) = find_leaf_for_prefix(&mut out[start..], prefix, bytes) {
+        if let Some(leaf) = find_leaf_for_prefix(&mut out[start..], prefix, source) {
             // Pulldown ranges most leaves to start *after* the line's
             // marker; extend so the marker falls inside the leaf and
             // the element layer can hide / overlay it.
@@ -982,8 +982,9 @@ fn source_line_end(bytes: &[u8], pos: usize) -> usize {
 fn find_leaf_for_prefix<'a>(
     slice: &'a mut [RenderBlock],
     prefix: &Range<usize>,
-    bytes: &[u8],
+    source: &str,
 ) -> Option<&'a mut RenderBlock> {
+    let bytes = source.as_bytes();
     let target = prefix.end;
     // Compute the line bound: the smallest byte position at-or-after
     // `target` that is a `\n` (or `bytes.len()` if none). Any leaf
@@ -1027,7 +1028,7 @@ fn find_leaf_for_prefix<'a>(
     // Detect "prefix lies inside an unterminated fence" via the
     // unterminated-aware `is_in_fenced_code` predicate and attach the
     // marker to the existing CodeBlock leaf instead.
-    if crate::analysis::is_in_fenced_code(bytes, prefix.start) {
+    if crate::analysis::is_in_fenced_code(source, prefix.start) {
         for (i, b) in slice.iter().enumerate() {
             if matches!(b.kind, BlockKind::CodeBlock { .. })
                 && b.source_range.start <= prefix.start
@@ -1407,7 +1408,7 @@ fn inject_empty_paragraphs(
         // The CodeBlock leaf already covers those bytes — a synth here
         // would emit a phantom Paragraph leaf overlapping the
         // CodeBlock. See `bugs.md::render_walker_emits_phantom_…`.
-        if crate::analysis::is_in_fenced_code(bytes, start) {
+        if crate::analysis::is_in_fenced_code(source, start) {
             continue;
         }
         let mut synth = RenderBlock::new(start..end, BlockKind::Paragraph);

@@ -1,4 +1,4 @@
-//! Byte-level structural analysis of the markdown buffer.
+//! Structural analysis of the markdown buffer.
 //!
 //! This module is the single source of truth for the byte-level facts
 //! the rest of the editor consults: where fenced code blocks live,
@@ -14,15 +14,20 @@
 //! break rule, the forbidden-position rule, and the active-prefix rule
 //! all read the same scan.
 //!
-//! # Why a byte scanner instead of pulldown
+//! # Fence-containment via pulldown
 //!
-//! Pulldown produces the same fence ranges via the parser, but the
-//! cheapest place to ask "is this byte inside a fence?" is mid-update,
-//! where we may run multiple times per keystroke and don't want to
-//! re-tokenize the whole document. The byte scanner here is intentionally
-//! cheap and only knows about the construct edges that gate the
-//! invariant rules. A regression test pins it agreeing with pulldown on
-//! fence ranges (`fenced_ranges_agree_with_pulldown`).
+//! "Is byte X inside a fenced code block?" is the dominant containment
+//! question in this module — it gates the soft-break rule, the
+//! forbidden-position predicate, every cursor-driven Enter / Backspace
+//! / Delete branch, the auto-close edit, and the render walker's
+//! synth-paragraph suppression. We answer it by walking pulldown's
+//! parse tree (`crate::parser::parse`), not by scanning the raw bytes:
+//! the byte scanner's `count_line_markers` only tolerates 3 spaces
+//! between consecutive `>` markers, so a fence sitting inside an
+//! `[LI, LI, BQ]` chain (with 4+ spaces of LI indent before the inner
+//! `> `) is invisible to a byte scan but visible to pulldown. Routing
+//! every fence query through pulldown gives a single source of truth
+//! across all chain depths.
 //!
 //! # Pairs model recap
 //!
@@ -41,17 +46,23 @@ use std::ops::Range;
 /// One fenced code block's structural extent, paired with whether the
 /// block has a clean closer.
 ///
-/// Returned by [`fenced_code_content_ranges_with_state`]. The `range`
-/// always covers the opening fence line, the inner content, and the
-/// closing fence line (with its trailing `\n`) or end-of-source for an
-/// unterminated block; `terminated` distinguishes the two so the cursor
-/// query in [`is_in_fenced_code`] knows whether the byte sitting at
-/// `range.end` is "after the closer" (terminated → outside) or "at
-/// EOF inside the still-open construct" (unterminated → inside).
+/// Returned by [`fenced_code_blocks`]. The `range` always covers the
+/// opening fence line, the inner content, and the closing fence line
+/// (with its trailing `\n`) or end-of-source for an unterminated block;
+/// `terminated` distinguishes the two so the cursor query in
+/// [`is_in_fenced_code`] knows whether the byte sitting at `range.end`
+/// is "after the closer" (terminated → outside) or "at EOF inside the
+/// still-open construct" (unterminated → inside).
+///
+/// `opener_fence_char` and `opener_fence_len` describe the opening
+/// fence run — used by [`auto_close_fence_edit`] to synthesize a
+/// matching closer on Enter inside an unterminated block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FencedCodeBlock {
     pub range: Range<usize>,
     pub terminated: bool,
+    pub opener_fence_char: u8,
+    pub opener_fence_len: usize,
 }
 
 /// Find every fenced code block's full byte range — inclusive of the
@@ -59,119 +70,64 @@ pub struct FencedCodeBlock {
 /// (or end-of-source for an unterminated block) — paired with whether
 /// the block was actually closed.
 ///
-/// Used to exempt those bytes from the soft-break and forbidden-pair
-/// rules. Both rules are about paragraph-context structure; they don't
-/// apply inside a code block where every `\n` is content.
+/// **Implementation:** walks pulldown's parse tree
+/// (`crate::parser::parse`). Routing through the parser instead of a
+/// byte scanner is the single source of truth for "is byte X inside a
+/// fence" across all chain depths — see the module docs for why a
+/// raw byte scan diverges in `[LI, LI, BQ]` chains.
 ///
-/// CommonMark fence rules (loosely): opening fence is at most 3 leading
-/// spaces of indent then 3+ `` ` ``s or `~`s; closing fence matches
-/// the same character with at least the same length and only
-/// whitespace on the rest of the line.
-///
-/// Fences may sit inside a blockquote at any depth: the opener and
-/// closer lines start with `> ` markers (`count_line_markers` worth of
-/// them). Once a fence opens at depth D, the block stays open until a
-/// matching closer at depth ≥ D *or* end-of-source. Lines inside the
-/// block that don't carry the `> ` prefix (e.g. transient post-paste
-/// state where a freshly-inserted continuation line is missing its BQ
-/// marker) are still treated as content — this is exactly the case
-/// `enforce_invariants` runs against, and the soft-break-promotion
-/// exemption needs to fire for those bytes too. The
-/// `normalize_blockquote_prefixes` pass and any subsequent re-parse
-/// will reconcile the prefix; until then, those bytes are code.
-pub fn fenced_code_content_ranges_with_state(bytes: &[u8]) -> Vec<FencedCodeBlock> {
-    let mut out: Vec<FencedCodeBlock> = Vec::new();
-    // (fence_char, fence_len, open_depth, block_start) while inside
-    // an open block. `block_start` is the byte index of the opening
-    // fence line's first byte; the emitted range runs through the
-    // closing fence line's *trailing `\n`* (or end-of-source for
-    // unterminated). `open_depth` is the BQ-marker count on the
-    // opener line — a closer must sit at the same or greater depth.
-    let mut open: Option<(u8, usize, usize, usize)> = None;
-
-    let mut p = 0;
-    while p < bytes.len() {
-        let line_start = p;
-        while p < bytes.len() && bytes[p] != b'\n' {
-            p += 1;
-        }
-        let line_end = p;
-        let line_after = if p < bytes.len() { p + 1 } else { p };
-
-        // Walk past any BQ markers (`> `, optionally with up to 3
-        // leading indent spaces per marker). The fence may sit inside
-        // a blockquote at any depth.
-        let (line_depth, after_markers) = count_line_markers(bytes, line_start);
-        let mut q = after_markers;
-        let mut indent = 0;
-        while q < line_end && indent < 4 && bytes[q] == b' ' {
-            q += 1;
-            indent += 1;
-        }
-        let fence_char = if q < line_end && (bytes[q] == b'`' || bytes[q] == b'~') {
-            Some(bytes[q])
-        } else {
-            None
-        };
-
-        if let Some(fc) = fence_char
-            && indent < 4
-        {
-            let mut r = q;
-            while r < line_end && bytes[r] == fc {
-                r += 1;
-            }
-            let fence_len = r - q;
-            if fence_len >= 3 {
-                if let Some((open_fc, open_len, open_depth, block_start)) = open {
-                    if fc == open_fc && fence_len >= open_len && line_depth >= open_depth {
-                        let mut s = r;
-                        let mut only_ws = true;
-                        while s < line_end {
-                            if bytes[s] != b' ' && bytes[s] != b'\t' {
-                                only_ws = false;
-                                break;
-                            }
-                            s += 1;
-                        }
-                        if only_ws {
-                            // Range covers the whole block, including
-                            // the closing fence line *and* its
-                            // trailing `\n`.
-                            out.push(FencedCodeBlock {
-                                range: block_start..line_after,
-                                terminated: true,
-                            });
-                            open = None;
-                        }
-                    }
-                } else {
-                    open = Some((fc, fence_len, line_depth, line_start));
-                }
-            }
-        }
-
-        p = line_after;
-    }
-
-    if let Some((_, _, _, block_start)) = open {
-        out.push(FencedCodeBlock {
-            range: block_start..bytes.len(),
-            terminated: false,
-        });
-    }
-
+/// Pulldown ranges a `CodeBlock` from the opener fence's first byte
+/// through the closing fence line's terminating `\n` (or end-of-source
+/// for an unterminated block); we project that range and the
+/// delimiter count (1 for unterminated, 2 for terminated) directly.
+pub fn fenced_code_blocks(markdown: &str) -> Vec<FencedCodeBlock> {
+    let tree = crate::parser::parse(markdown);
+    let mut out = Vec::new();
+    collect_fenced_code_blocks(&tree, markdown.as_bytes(), &mut out);
     out
 }
 
-/// Range-only projection of [`fenced_code_content_ranges_with_state`].
-/// Most callers only need the spans (e.g. to skip over code content
-/// while scanning for soft-break candidates); cursor-position queries
-/// that need to distinguish "at the end of an unterminated block" from
-/// "after a clean closer" should use [`is_in_fenced_code`] (or call
-/// the state-aware version directly).
-pub fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
-    fenced_code_content_ranges_with_state(bytes)
+fn collect_fenced_code_blocks(
+    nodes: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+    out: &mut Vec<FencedCodeBlock>,
+) {
+    for node in nodes {
+        if let crate::syntax::NodeKind::CodeBlock {
+            delimiter_ranges, ..
+        } = &node.kind
+        {
+            // Pulldown also emits `CodeBlock` for indented code blocks.
+            // We only model fenced blocks here — `parser.rs` collapses
+            // indented blocks to `Paragraph`, so any `CodeBlock` node
+            // we see is fenced. Read the opener char from
+            // `delimiter_ranges[0]`'s first byte (`` ` `` or `~`).
+            let (fence_char, fence_len) = delimiter_ranges
+                .first()
+                .and_then(|r| {
+                    let len = r.end.saturating_sub(r.start);
+                    bytes.get(r.start).copied().map(|c| (c, len))
+                })
+                .unwrap_or((b'`', 0));
+            out.push(FencedCodeBlock {
+                range: node.range.clone(),
+                terminated: delimiter_ranges.len() == 2,
+                opener_fence_char: fence_char,
+                opener_fence_len: fence_len,
+            });
+        }
+        collect_fenced_code_blocks(&node.children, bytes, out);
+    }
+}
+
+/// Range-only projection of [`fenced_code_blocks`]. Most callers only
+/// need the spans (e.g. to skip over code content while scanning for
+/// soft-break candidates); cursor-position queries that need to
+/// distinguish "at the end of an unterminated block" from "after a
+/// clean closer" should use [`is_in_fenced_code`] (or call the
+/// state-aware version directly).
+pub fn fenced_code_ranges(markdown: &str) -> Vec<Range<usize>> {
+    fenced_code_blocks(markdown)
         .into_iter()
         .map(|b| b.range)
         .collect()
@@ -185,8 +141,17 @@ pub fn fenced_code_content_ranges(bytes: &[u8]) -> Vec<Range<usize>> {
 /// byte right after the closer's trailing `\n` (i.e. exactly at
 /// `range.end`) is *outside*, so a paragraph immediately following a
 /// closed fence doesn't get classified as code.
-pub fn is_in_fenced_code(bytes: &[u8], p: usize) -> bool {
-    fenced_code_content_ranges_with_state(bytes)
+pub fn is_in_fenced_code(markdown: &str, p: usize) -> bool {
+    fenced_code_blocks(markdown)
+        .iter()
+        .any(|b| p >= b.range.start && (p < b.range.end || (!b.terminated && p == b.range.end)))
+}
+
+/// Variant of [`is_in_fenced_code`] for callers that already have a
+/// `Vec<FencedCodeBlock>` (or `Vec<Range<usize>>` via [`fenced_code_ranges`])
+/// in hand — avoids re-parsing per query.
+pub fn is_in_fenced_code_blocks(blocks: &[FencedCodeBlock], p: usize) -> bool {
+    blocks
         .iter()
         .any(|b| p >= b.range.start && (p < b.range.end || (!b.terminated && p == b.range.end)))
 }
@@ -224,13 +189,17 @@ pub(crate) fn is_in_ranges(p: usize, ranges: &[Range<usize>]) -> bool {
 ///    pausing at invisible byte positions.
 pub fn is_forbidden_position(markdown: &str, p: usize) -> bool {
     let bytes = markdown.as_bytes();
-    if is_paragraph_break_interior(bytes, p) && !is_in_fenced_code(bytes, p) {
+    // Compute fence membership once and reuse it across the two
+    // exemption checks below — each `is_in_fenced_code` call re-parses
+    // the buffer.
+    let in_fence = is_in_fenced_code(markdown, p);
+    if is_paragraph_break_interior(bytes, p) && !in_fence {
         return true;
     }
     if is_list_indent_interior(markdown, p) {
         return true;
     }
-    if is_chain_pair_interior(markdown, p) && !is_in_fenced_code(bytes, p) {
+    if is_chain_pair_interior(markdown, p) && !in_fence {
         return true;
     }
     false
@@ -1680,8 +1649,7 @@ fn bullet_for_item_index(markdown: &str, item_index: usize) -> Option<u8> {
 ///   render as a single paragraph_gap visually.
 /// - Top level: `\n\n`, the top-level paragraph break.
 pub fn enter_insertion(markdown: &str, cursor: usize) -> String {
-    let bytes = markdown.as_bytes();
-    if is_in_fenced_code(bytes, cursor) {
+    if is_in_fenced_code(markdown, cursor) {
         let chain = enclosing_containers_at(markdown, cursor);
         let prefix = chain_continuation_prefix(&chain);
         return format!("\n{prefix}");
@@ -1767,18 +1735,17 @@ pub fn empty_bq_paragraph_exit_edit(markdown: &str, cursor: usize) -> Option<Dep
 /// cursor's chain continuation prefix so the new bytes stay inside
 /// every enclosing BQ / LI scope.
 pub fn auto_close_fence_edit(markdown: &str, cursor: usize) -> Option<DepthDecreaseEdit> {
-    let bytes = markdown.as_bytes();
-    let states = fenced_code_content_ranges_with_state(bytes);
-    let block = states.iter().find(|b| {
+    let blocks = fenced_code_blocks(markdown);
+    let block = blocks.iter().find(|b| {
         cursor >= b.range.start
             && (cursor < b.range.end || (!b.terminated && cursor == b.range.end))
     })?;
-    if block.terminated {
+    if block.terminated || block.opener_fence_len == 0 {
         return None;
     }
 
-    let opener = parse_opener_fence(bytes, block.range.start)?;
-    let closer: String = std::iter::repeat_n(opener.fence_char as char, opener.fence_len).collect();
+    let closer: String =
+        std::iter::repeat_n(block.opener_fence_char as char, block.opener_fence_len).collect();
 
     // The new body / closer rows take the cursor's chain so
     // alternating chains pick up every interleaved indent + marker
@@ -1795,44 +1762,6 @@ pub fn auto_close_fence_edit(markdown: &str, cursor: usize) -> Option<DepthDecre
         range: cursor..cursor,
         replacement,
         cursor: new_cursor,
-    })
-}
-
-struct OpenerFence {
-    fence_char: u8,
-    fence_len: usize,
-}
-
-fn parse_opener_fence(bytes: &[u8], block_start: usize) -> Option<OpenerFence> {
-    let mut line_end = block_start;
-    while line_end < bytes.len() && bytes[line_end] != b'\n' {
-        line_end += 1;
-    }
-    let (_depth, after_markers) = count_line_markers(bytes, block_start);
-    let mut q = after_markers;
-    let mut indent = 0;
-    while q < line_end && indent < 4 && bytes[q] == b' ' {
-        q += 1;
-        indent += 1;
-    }
-    if indent >= 4 || q >= line_end {
-        return None;
-    }
-    let fc = bytes[q];
-    if fc != b'`' && fc != b'~' {
-        return None;
-    }
-    let mut r = q;
-    while r < line_end && bytes[r] == fc {
-        r += 1;
-    }
-    let fence_len = r - q;
-    if fence_len < 3 {
-        return None;
-    }
-    Some(OpenerFence {
-        fence_char: fc,
-        fence_len,
     })
 }
 
@@ -1872,24 +1801,34 @@ pub fn list_item_indent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
     let bytes = markdown.as_bytes();
     let line_starts = item_line_starts(bytes, &innermost.item_range);
     let pad = " ".repeat(prev_marker_width);
-    // Step past the active container-prefix bytes (BQ markers,
-    // outer-LI continuation indents) before inserting indent. For an
-    // item inside a blockquote, the raw line-start sits *before* the
-    // `> ` marker — inserting there would push the marker right and
-    // detach the BQ scope from the line above. The active prefix on
-    // every line of the innermost LI is composed by the chain entries
-    // above it; we just need its byte count.
-    let outer_prefix = chain_outer_prefix_bytes(&chain);
-    let mut edits: Vec<SourceEdit> = line_starts
-        .into_iter()
-        .map(|ls| {
-            let insert_at = ls + outer_prefix;
-            SourceEdit {
-                range: insert_at..insert_at,
-                replacement: pad.clone(),
-            }
-        })
-        .collect();
+    // Step past the active container-prefix bytes contributed by the
+    // chain entries *above the innermost LI* before inserting indent.
+    // For an item inside a blockquote-inside-LI chain like
+    // `[LI(outer), LI(inner)]` (cursor in inner LI), that's the outer
+    // LI's marker_width — so the insertion lands at the inner LI's
+    // own marker position, not before the outer LI's indent. Locating
+    // the LI's position in the chain (rather than slicing by
+    // `chain.len() - 1`) handles cursors whose innermost is something
+    // other than an LI (e.g. a BQ inside the inner LI), so we always
+    // insert at the right column for the LI being nested.
+    let innermost_li_pos = chain
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| matches!(c, EnclosingContainer::ListItem(_)).then_some(i))
+        .next_back()?;
+    let outer_skip = chain_continuation_prefix_bytes(&chain[..innermost_li_pos]);
+    let mut edits = SourceEditList::new();
+    for ls in line_starts {
+        // Insertion point = line_start + outer_skip. We use
+        // `list_item_strip_range`'s `start` to share the offset
+        // calculation with the Shift+Tab dedent path; the strip
+        // range itself is unused for insertions.
+        let insert_at = list_item_strip_range(bytes, ls, outer_skip, 0).start;
+        edits.push(SourceEdit {
+            range: insert_at..insert_at,
+            replacement: pad.clone(),
+        });
+    }
 
     if innermost.is_ordered() {
         edits.push(SourceEdit {
@@ -1898,17 +1837,11 @@ pub fn list_item_indent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
         });
     }
 
-    // Order edits the way `apply_edits` expects: ascending by
-    // range.start, with insertions (zero-length ranges) preceding
-    // replacements at the same start. The pad-insert at line_starts[0]
-    // (the marker line) and the marker-rewrite both sit at the item's
-    // first byte; without the (start, end) ordering the rewrite would
-    // come second in input order but its range would overlap the pad
-    // insert's position, panicking the apply walker on a multi-line
-    // ordered item with an existing nested-child line.
-    edits.sort_by_key(|e| (e.range.start, e.range.end));
-
-    Some(edits)
+    // The builder sorts and resolves overlap; the pad-insert at
+    // line_starts[0] and the marker-rewrite both sit at the item's
+    // first byte, and the builder's stable sort places insertions
+    // (zero-length ranges) before replacements at the same start.
+    Some(edits.finish())
 }
 
 /// Edits that decrease the nesting level of the list item
@@ -2033,42 +1966,95 @@ pub fn list_item_dedent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
     if strip == 0 {
         return None;
     }
-    // Skip past the active container-prefix bytes contributed by
-    // chain entries *above* the parent LI before stripping. The
-    // predicate guarantees the trailing two chain entries are
-    // parent-LI and innermost-LI, so `&chain[..chain.len() - 2]`
-    // gives the chain above the parent. For `[BQ, outer-LI, inner-LI]`
-    // that's `[BQ]`, contributing 2 bytes (`> `) — the inner item's
-    // lines start with the BQ marker, not raw spaces, so we have to
-    // step past that before counting parent-marker-width spaces.
-    // Same architectural pattern as `chain_outer_prefix_bytes` for
-    // the Tab indent path.
-    let above_parent_chain = &chain[..chain.len() - 2];
+    // Locate the parent LI's actual position in the chain (not
+    // `chain.len() - 2`). When the chain trails with a non-LI entry
+    // (e.g. `[outer-LI, inner-LI, BQ]` for Shift+Tab on a row inside
+    // a BQ nested in two LIs), the trailing two entries are
+    // *inner-LI, BQ* — not parent-LI, innermost-LI. Slicing by
+    // `chain.len() - 2` would include the parent LI itself in
+    // `above_parent_chain`, double-counting its marker_width and
+    // pushing the strip walker past the line terminator into adjacent
+    // lines (producing overlapping byte ranges that panic
+    // `apply_edits`).
+    let parent_pos = chain
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| matches!(c, EnclosingContainer::ListItem(_)).then_some(i))
+        .nth(items.len() - 2)?;
+    let above_parent_chain = &chain[..parent_pos];
     let above_skip = chain_continuation_prefix_bytes(above_parent_chain);
     let line_starts = item_line_starts(bytes, &innermost.item_range);
-    let mut edits = Vec::new();
+    let mut edits = SourceEditList::new();
     for ls in line_starts {
-        let strip_start = ls + above_skip;
-        // Only remove bytes that are actually leading spaces — if
-        // an upstream edit (or paste anomaly) left a line with less
-        // indent than expected, we don't drop content.
-        let mut end = strip_start;
-        let mut removed = 0;
-        while end < bytes.len() && bytes[end] == b' ' && removed < strip {
-            end += 1;
-            removed += 1;
-        }
-        if end > strip_start {
+        let r = list_item_strip_range(bytes, ls, above_skip, strip);
+        if !r.is_empty() {
             edits.push(SourceEdit {
-                range: strip_start..end,
+                range: r,
                 replacement: String::new(),
             });
         }
     }
+    let edits = edits.finish();
     if edits.is_empty() {
         return None;
     }
     Some(edits)
+}
+
+/// Range of bytes to strip (Shift+Tab) or to insert at (Tab — use the
+/// returned range's `start` as the insertion point) on a single line
+/// of a list item.
+///
+/// Tab and Shift+Tab share this primitive so they can never disagree:
+/// the indent insertion point and the dedent strip start are the same
+/// byte (`line_start + outer_skip`). The strip walker is bounded to
+/// the line's terminator (`\n` or end of buffer) so a strip on an
+/// empty / shorter-than-expected line cannot leak into the next
+/// line's bytes — which is what produced the overlapping-edit panic
+/// in `[LI, LI, BQ]` chains before refactor C.
+///
+/// Inputs:
+/// - `line_start` is the byte right after the previous `\n` (or 0).
+/// - `outer_skip` is the byte count contributed by every container
+///   *above* the parent LI for Shift+Tab (chain entries at depth
+///   shallower than the parent), or the chain's outer prefix for
+///   Tab. Both equal "the offset where the parent's prefix begins on
+///   this line".
+/// - `max_strip` is the maximum number of leading spaces to consume
+///   past `outer_skip` (= `parent.marker_width()` for Shift+Tab,
+///   = `previous_sibling.marker_width()` for Tab).
+///
+/// The returned range may be empty when:
+/// - The line is shorter than `outer_skip` (the line carries less
+///   prefix than expected — typically a blank line in the item's
+///   range).
+/// - The bytes past `outer_skip` aren't spaces (the line carries
+///   different content — typically the marker line, where the bytes
+///   past outer_skip are the marker itself).
+pub fn list_item_strip_range(
+    bytes: &[u8],
+    line_start: usize,
+    outer_skip: usize,
+    max_strip: usize,
+) -> Range<usize> {
+    let line_end = {
+        let mut e = line_start;
+        while e < bytes.len() && bytes[e] != b'\n' {
+            e += 1;
+        }
+        e
+    };
+    let strip_start = line_start + outer_skip;
+    if strip_start > line_end {
+        return strip_start..strip_start;
+    }
+    let mut end = strip_start;
+    let mut removed = 0;
+    while end < line_end && bytes[end] == b' ' && removed < max_strip {
+        end += 1;
+        removed += 1;
+    }
+    strip_start..end
 }
 
 /// Append edits that strip up to `strip` leading-space bytes from
@@ -2313,6 +2299,97 @@ fn line_start_offset(bytes: &[u8], pos: usize) -> usize {
 pub struct SourceEdit {
     pub range: Range<usize>,
     pub replacement: String,
+}
+
+/// Accumulates [`SourceEdit`]s during construction, then emits a
+/// sorted, non-overlapping list ready for `apply_edits`. Producers
+/// push edits in arbitrary order; [`finish`](Self::finish) sorts
+/// them by `(range.start, range.end)` and resolves any overlap
+/// between adjacent edits deterministically — adjacent strips with
+/// empty replacements merge into one larger strip, and strictly
+/// overlapping non-strip edits drop the later edit (matching the
+/// "longer / earlier wins" rule).
+///
+/// `apply_edits`'s panic on overlap is a defensive invariant; this
+/// builder is the friendlier failure mode that resolves the overlap
+/// rather than crashing the editor when a producer emits a malformed
+/// edit list (the headline case from refactor C, where two strip
+/// edits overlapped by one byte in `[LI, LI, BQ]` chains).
+#[derive(Debug, Default)]
+pub struct SourceEditList {
+    edits: Vec<SourceEdit>,
+}
+
+impl SourceEditList {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, edit: SourceEdit) {
+        // Drop true no-ops (zero-length range with empty replacement).
+        if edit.range.start == edit.range.end && edit.replacement.is_empty() {
+            return;
+        }
+        self.edits.push(edit);
+    }
+
+    pub fn extend(&mut self, iter: impl IntoIterator<Item = SourceEdit>) {
+        for e in iter {
+            self.push(e);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.edits.is_empty()
+    }
+
+    /// Sort edits by `(range.start, range.end)` and merge overlapping
+    /// strips. Insertions (zero-length ranges) precede replacements
+    /// at the same start; consecutive strip edits (empty replacement,
+    /// overlapping or adjacent ranges) collapse into one combined
+    /// strip. The result satisfies the
+    /// `prev.range.end <= next.range.start` invariant `apply_edits`
+    /// asserts.
+    pub fn finish(mut self) -> Vec<SourceEdit> {
+        if self.edits.is_empty() {
+            return self.edits;
+        }
+        self.edits
+            .sort_by_key(|e| (e.range.start, e.range.end, !e.replacement.is_empty()));
+        let mut out: Vec<SourceEdit> = Vec::with_capacity(self.edits.len());
+        for e in self.edits {
+            match out.last_mut() {
+                Some(prev) if prev.range.end > e.range.start => {
+                    // Overlap. Two cases collapse here:
+                    //
+                    // 1. Both edits are pure strips (empty
+                    //    replacement). Merging extends `prev.range`
+                    //    forward to `max(prev.end, e.end)`. This is
+                    //    the symmetric Tab/Shift+Tab path: when two
+                    //    strip producers race on the same line in a
+                    //    deeply-nested chain, one combined strip is
+                    //    the right semantics.
+                    // 2. Otherwise, prefer the longer edit (the one
+                    //    whose range covers more bytes). On a tie,
+                    //    keep the existing `prev` (earlier in input
+                    //    order — typically the one closer to the
+                    //    cursor's intended action).
+                    if prev.replacement.is_empty() && e.replacement.is_empty() {
+                        prev.range.end = prev.range.end.max(e.range.end);
+                    } else {
+                        let prev_len = prev.range.end - prev.range.start;
+                        let e_len = e.range.end - e.range.start;
+                        if e_len > prev_len {
+                            *prev = e;
+                        }
+                        // else: drop `e`.
+                    }
+                }
+                _ => out.push(e),
+            }
+        }
+        out
+    }
 }
 
 /// Detect every pair of *consecutive* hard breaks in the buffer and
@@ -3302,20 +3379,16 @@ mod tests {
         assert!(list_content_ranges("just paragraphs").is_empty());
     }
 
-    /// Regression for Point 4 in the architecture review: the byte
-    /// scanner here and pulldown-cmark must agree on which bytes are
-    /// inside a fenced code block.
-    ///
-    /// Direction tested: every byte pulldown attributes to a code
-    /// block, the scanner also covers. The reverse can diverge by one
-    /// trailing `\n` — the scanner's range extends through the
-    /// closing fence line's terminating `\n` so the soft-break /
-    /// forbidden-pair rules treat the byte right after the closer as
-    /// not-content (no spurious paragraph break gets injected after a
-    /// code block); pulldown's range stops one byte earlier. That gap
-    /// is intentional and documented in `fenced_code_content_ranges`.
+    /// `fenced_code_blocks` reads ranges off pulldown's parse tree.
+    /// Walk a battery of fence shapes — terminated, unterminated,
+    /// language tags, nested in BQ — and check the projected ranges
+    /// agree with what we read from a fresh `parse()` call. The two
+    /// must agree by construction (we compute one from the other), but
+    /// the test pins the projection so a future change to pulldown's
+    /// `CodeBlock` range semantics doesn't silently shift fence
+    /// containment.
     #[test]
-    fn fenced_ranges_agree_with_pulldown() {
+    fn fenced_code_blocks_match_parse_tree() {
         use crate::parser::parse;
         use crate::syntax::NodeKind;
 
@@ -3326,21 +3399,19 @@ mod tests {
             "```\nunterminated\n",
             "para\n\n```\ncode\n```\n\nafter\n",
             "```\n```\n",
+            "> ```\n> x\n> ```\n",
+            "- > ```rust\n  > let x = 1;\n  > ```\n",
         ];
         for src in cases {
-            let bytes = src.as_bytes();
-            let scanner = fenced_code_content_ranges(bytes);
+            let blocks = fenced_code_blocks(src);
             let tree = parse(src);
             let mut pulldown_ranges: Vec<Range<usize>> = Vec::new();
             collect_code_ranges(&tree, &mut pulldown_ranges);
-            for p in 0..bytes.len() {
-                if is_in_ranges(p, &pulldown_ranges) {
-                    assert!(
-                        is_in_ranges(p, &scanner),
-                        "byte {p} in {src:?}: pulldown says code, scanner disagrees",
-                    );
-                }
-            }
+            assert_eq!(
+                blocks.iter().map(|b| b.range.clone()).collect::<Vec<_>>(),
+                pulldown_ranges,
+                "ranges mismatch for {src:?}",
+            );
         }
 
         fn collect_code_ranges(nodes: &[crate::syntax::SyntaxNode], out: &mut Vec<Range<usize>>) {

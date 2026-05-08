@@ -5502,14 +5502,83 @@ fn cursor_at_eof_of_unterminated_fence_classifies_as_inside(_cx: &mut TestAppCon
     // of the in-fence path — the original cascade root cause.
     let buf = "> ```rust";
     assert!(
-        gpui_markdown_editor::analysis::is_in_fenced_code(buf.as_bytes(), buf.len()),
+        gpui_markdown_editor::analysis::is_in_fenced_code(buf, buf.len()),
         "EOF position of unterminated fence should classify as inside the construct",
     );
     // For terminated fences the boundary remains exclusive so the
     // byte right after the closer's trailing `\n` is *outside*.
     let closed = "> ```\n> a\n> ```\n";
     assert!(
-        !gpui_markdown_editor::analysis::is_in_fenced_code(closed.as_bytes(), closed.len()),
+        !gpui_markdown_editor::analysis::is_in_fenced_code(closed, closed.len()),
         "EOF position past a terminated fence should classify as outside",
     );
+}
+
+#[gpui::test]
+fn shift_tab_in_li_li_bq_does_not_panic_on_overlapping_strips(cx: &mut TestAppContext) {
+    // Headline regression for refactor C. With chain `[LI, LI, BQ]`,
+    // pressing Shift+Tab on a row inside the BQ used to compute
+    // `above_parent_chain = &chain[..chain.len() - 2]` — which
+    // assumed the trailing two chain entries were parent-LI and
+    // innermost-LI. With BQ trailing the inner LI, that slice still
+    // included the parent LI itself, so `above_skip` was 2 (the
+    // parent's marker_width). The strip walker then walked past line
+    // terminators into adjacent lines, producing overlapping byte
+    // ranges that panicked `apply_edits`'s sortedness check.
+    //
+    // The fix in refactor C: locate the parent LI's actual position
+    // in the chain (rather than slicing by `chain.len() - 2`) and
+    // bound the strip walker to a single line.
+    let src = "- List\n  - Child\n\n    > Blockquote\n    > \n    > ```js\n    > content\n    > ```\n    > ";
+    let initial = EditorState {
+        markdown: src.into(),
+        selection: Selection::Cursor(src.len()),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    // Shift+Tab on the trailing row inside the BQ — must not panic.
+    dispatch(cx, handle, &editor, ShiftTab);
+    editor.read_with(cx, |e, _| {
+        // Survive without panic; the buffer should be valid markdown.
+        let _ = e.state.markdown.len();
+    });
+}
+
+#[gpui::test]
+fn auto_close_fence_fires_in_li_li_bq_chain(cx: &mut TestAppContext) {
+    // Headline regression for refactor A. The cursor sits inside an
+    // unterminated fence in chain `[LI, LI, BQ]`; pressing Enter
+    // should auto-close the fence. The byte scanner's
+    // `count_line_markers` only tolerates 3 spaces between consecutive
+    // `>` markers, so two LIs of 2sp each (= 4sp before the inner `> `)
+    // makes the fence invisible to a byte scan — but pulldown sees it.
+    // After refactor A, every fence containment query reads off the
+    // parse tree, and auto-close fires correctly here.
+    let initial = EditorState {
+        markdown: "- List\n  - Child\n\n    > Blockquote\n    > \n    > ```js".into(),
+        selection: Selection::Cursor(53), // end of `> ```js`
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // The buffer should now be terminated — auto-close injected a
+        // body row + matching closer below the cursor, both carrying
+        // the chain's continuation prefix.
+        assert!(
+            !gpui_markdown_editor::analysis::is_in_fenced_code(
+                &e.state.markdown,
+                e.state.markdown.len(),
+            ),
+            "after Enter the fence should be terminated; got: {:?}",
+            e.state.markdown,
+        );
+        // And the cursor should sit on the new body row, past the
+        // chain prefix.
+        let cursor = e.cursor_offset();
+        let expected_body = "\n    > ";
+        assert!(
+            e.state.markdown[..cursor].ends_with(expected_body),
+            "cursor should land on the new body row past `{expected_body}`; got buffer {:?} cursor {cursor}",
+            e.state.markdown,
+        );
+    });
 }

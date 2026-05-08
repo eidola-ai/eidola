@@ -59,7 +59,7 @@
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::analysis::{
-    self, count_line_markers, fenced_code_content_ranges, is_forbidden_position, is_in_ranges,
+    self, count_line_markers, fenced_code_ranges, is_forbidden_position, is_in_ranges,
     is_soft_break, line_depth_ending_at, nearest_allowed_position, next_allowed_position,
     pair_at_end, pair_at_start, prev_allowed_position,
 };
@@ -411,24 +411,17 @@ fn apply_edits(state: EditorState, edits: &[analysis::SourceEdit]) -> EditorStat
     }
 }
 
-/// Hard cap on the chain depth at which `promote_soft_breaks`'s
-/// missing-prefix-repair fires. Set well above any human nesting
-/// (sixteen `> ` markers around a paragraph would be unreadable),
-/// well below where the divergence pattern surfaces in stress tests.
+/// Defensive cap on the chain depth at which `promote_soft_breaks`'s
+/// missing-prefix-repair fires. With refactor A's tree-based fence
+/// detection in place, the repair only fires when pulldown classifies
+/// the line as fence body — so the runaway divergence the cap was
+/// originally protecting against (byte scanner missing fences and
+/// counting their `>`s as BQ markers, growing the chain on each
+/// re-parse) can no longer produce ever-deeper chains. The cap stays
+/// as defense-in-depth: 16 `>` markers around a paragraph is well
+/// past any human nesting, so capping there is a no-op for legit
+/// docs and a guardrail for genuinely corrupted buffers.
 const MAX_REPAIR_DEPTH: usize = 16;
-
-/// Hard cap on the number of bytes the missing-prefix-repair will
-/// inject in a single splice. A "modest" gap (one or two missing
-/// `> ` markers, or an LI continuation indent) is a real repair
-/// case — paste that drops a marker on the second line, an editor
-/// state that needs the BQ prefix carried through. A "huge" gap
-/// (40+ bytes of missing prefix) is the divergence shape: the
-/// previous repair created a deep prefix on one line and now we'd
-/// re-create it on the next, which compounds across keystrokes.
-/// At that point we let pulldown's re-parse pick up whatever
-/// shallower scope the bytes actually open instead of forcing the
-/// next line back to the previous depth.
-const MAX_REPAIR_BYTES: usize = 4;
 
 /// Recursively gather every `CodeBlock` node in document order.
 fn collect_code_blocks<'a>(
@@ -459,7 +452,7 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
     //     (item separators, marker continuation, indented paragraphs,
     //     lazy continuations). Promoting `\n` to `\n\n` between two
     //     items would split the list.
-    let code_ranges = fenced_code_content_ranges(bytes);
+    let code_ranges = fenced_code_ranges(&state.markdown);
     let list_ranges = analysis::list_content_ranges(&state.markdown);
 
     // Each entry: (insertion_position, inserted_string). Computed in a
@@ -543,9 +536,6 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
                 continue;
             }
             let missing = &expected_prefix[have..];
-            if missing.len() > MAX_REPAIR_BYTES {
-                continue;
-            }
             // Skip the repair when the missing tail consists only of
             // *prefix bytes* (BQ markers, spaces, tabs) AND the rest
             // of the next line is empty / whitespace. Two cases roll
@@ -692,7 +682,7 @@ fn promote_soft_breaks(state: EditorState) -> EditorState {
 /// are literal `>` characters, not blockquote markers.
 fn normalize_blockquote_prefixes(state: EditorState) -> EditorState {
     let bytes = state.markdown.as_bytes();
-    let code_ranges = fenced_code_content_ranges(bytes);
+    let code_ranges = fenced_code_ranges(&state.markdown);
     let (cursor_head, cursor_anchor) = match state.selection {
         Selection::Cursor(p) => (p, p),
         Selection::Range { anchor, head } => (head, anchor),
@@ -931,7 +921,7 @@ fn delete_backward(state: EditorState) -> EditorState {
     // fenced code-block content, `\n`s are literal line separators —
     // fall through to the regular grapheme-delete path instead.
     let bytes = state.markdown.as_bytes();
-    if !analysis::is_in_fenced_code(bytes, cursor) {
+    if !analysis::is_in_fenced_code(&state.markdown, cursor) {
         let snapped = next_allowed_position(&state.markdown, cursor);
         // Blockquote outdent: at the start of a non-first paragraph
         // inside a BQ, Backspace pops one level of nesting from
@@ -1045,7 +1035,10 @@ fn delete_backward(state: EditorState) -> EditorState {
     // line including its `\n`. Forward progress is guaranteed: the
     // line above can't reappear from any normalize pass because its
     // content was empty to begin with.
-    if analysis::is_in_fenced_code(bytes, cursor) && cursor > 0 && bytes[cursor - 1] == b'\n' {
+    if analysis::is_in_fenced_code(&state.markdown, cursor)
+        && cursor > 0
+        && bytes[cursor - 1] == b'\n'
+    {
         let cursor_line_end = cursor - 1;
         let mut prev_line_start = cursor_line_end;
         while prev_line_start > 0 && bytes[prev_line_start - 1] != b'\n' {
@@ -1089,7 +1082,7 @@ fn delete_forward(state: EditorState) -> EditorState {
     }
 
     let bytes = state.markdown.as_bytes();
-    if !analysis::is_in_fenced_code(bytes, cursor) {
+    if !analysis::is_in_fenced_code(&state.markdown, cursor) {
         let snapped = prev_allowed_position(&state.markdown, cursor);
         if let Some(pair_end) = pair_at_start(bytes, snapped) {
             return splice(&state.markdown, cursor, snapped, pair_end);
