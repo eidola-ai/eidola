@@ -28,7 +28,7 @@ const DEMO_DOCUMENT: &str = "\
 # gpui-markdown-editor
 
 A WYSIWYG markdown editor. The first cut covers ATX headings, **bold**,
-*italic*, and ~~strikethrough~~.
+*italic*, ~~strikethrough~~, `inline code`, and [links](https://example.com).
 
 ## Cursor-aware delimiters
 
@@ -39,7 +39,14 @@ inside they reveal in a dimmed color. Try clicking around in the
 ### Mix and match
 
 You can combine ***bold and italic*** as a triple-asterisk run, or use
-~~strikethrough~~ inside a paragraph alongside other styling.
+~~strikethrough~~ inside a paragraph alongside other styling. Inline
+code like `let x = 42;` shapes in the mono font with a faint background.
+
+---
+
+Thematic breaks (`---` / `***` / `___`) render as a thin horizontal
+rule. The source bytes hide when the cursor is elsewhere and reveal
+(dimmed) when the cursor is on the rule line.
 
 ### Lists
 
@@ -54,6 +61,13 @@ You can combine ***bold and italic*** as a triple-asterisk run, or use
    1. First sub-item.
    2. Second sub-item.
 3. And so on.
+
+### Task lists
+
+- [x] Plan the work
+- [x] Implement parsing
+- [ ] Implement rendering
+- [ ] Polish visuals
 ";
 
 fn bind_keys(cx: &mut App) {

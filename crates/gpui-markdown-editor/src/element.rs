@@ -468,12 +468,30 @@ impl Element for BlockElement {
             source_range: self.block.source_range.clone(),
         };
 
+        // Marker-overlay cursor: when the cursor is inside a task
+        // item's marker chrome (`- [ ] ` / `- [x] `) the line has
+        // those bytes hidden — `local_position_for_source_offset`
+        // would map to display column 0 and paint the caret at the
+        // content edge. Detect the case here and compute the caret's
+        // x position inside the painted overlay glyph instead.
+        let marker_caret = compute_marker_overlay_caret(
+            &self.block.marker_overlays,
+            &self.block.containers,
+            &self.block.kind,
+            selection.head(),
+            &laid_out.lines,
+            bounds.origin.x,
+            &style,
+            window,
+        );
+
         let (mut cursor_quad, selection_quads) = build_caret_and_selection(
             &laid_out,
             selection,
             &style,
             self.is_last_block,
             self.next_block_start,
+            marker_caret,
         );
 
         if cursor_quad.is_none() && source.is_empty() && self.block_index == 0 {
@@ -693,6 +711,24 @@ impl Element for BlockElement {
                     self.style.code_block_content_background,
                 ));
             }
+        }
+
+        // Thematic break: paint a thin horizontal rule centered on
+        // the block's content row. The shaped line (`---` etc.)
+        // continues to live in `lines`, but its source bytes are
+        // hidden when the cursor is outside the construct (the
+        // common case) so the user only sees the rule. When the
+        // cursor is on the line the source dims into view in the
+        // delimiter color so the user can see what they typed.
+        if matches!(self.block.kind, BlockKind::ThematicBreak) {
+            let indent = containers_left_indent(&self.block.containers, &self.style, window);
+            paint_thematic_break(
+                window,
+                &prepaint.laid_out.lines,
+                bounds.origin.x + indent,
+                (bounds.size.width - indent).max(px(1.0)),
+                &self.style,
+            );
         }
 
         let cursor_quad = prepaint.cursor_quad.take();
@@ -1006,6 +1042,119 @@ fn paint_list_marker_overlay(
     );
 }
 
+/// Compute the cursor caret quad for a cursor that lands inside a
+/// task-item's marker chrome (`- [ ] ` / `- [x] `).
+///
+/// When the cursor's source offset sits inside a list item's
+/// `marker_overlays[i].source_range`, the line has those bytes
+/// hidden — the regular `display_to_source` path would map every
+/// hidden byte to display column 0, painting the caret at the
+/// content edge regardless of which marker byte the cursor is on.
+/// That's wrong for task items, where the user navigates *into* the
+/// brackets to toggle the checkbox: they need to see their caret
+/// inside the brackets.
+///
+/// This helper detects the case by:
+///   1. finding a marker overlay whose source_range contains the
+///      cursor offset;
+///   2. checking that the corresponding container is a task-list
+///      `ListItem` with `cursor_inside == true` (so the overlay is
+///      currently rendering raw `- [ ] ` chrome);
+///   3. shaping the overlay text in the marker font, computing the
+///      column inside it for `cursor_offset - source_range.start`,
+///      and converting that to an absolute pixel x position.
+///
+/// Returns `None` for cursors that don't match. The bullet-only
+/// overlay path (non-task unordered) bypasses this because bytes
+/// 0..2 are forbidden by `is_list_indent_interior` — the cursor
+/// never lands there.
+#[allow(clippy::too_many_arguments)]
+fn compute_marker_overlay_caret(
+    overlays: &[crate::render_spec::MarkerOverlay],
+    containers: &[Container],
+    kind: &BlockKind,
+    cursor_offset: usize,
+    lines: &[LaidOutLine],
+    block_origin_x: Pixels,
+    style: &MarkdownStyle,
+    window: &mut Window,
+) -> Option<TaggedQuad> {
+    for overlay in overlays {
+        if cursor_offset < overlay.source_range.start || cursor_offset > overlay.source_range.end {
+            continue;
+        }
+        let level_container = containers.get(overlay.level)?.clone();
+        let (item_kind, cursor_inside) = match level_container {
+            Container::ListItem {
+                kind,
+                cursor_inside,
+                ..
+            } => (kind, cursor_inside),
+            // Blockquote markers don't host a cursor — bytes are
+            // forbidden positions, so the cursor never lands there.
+            Container::BlockQuote { .. } => continue,
+        };
+        // Only task items currently render an editable raw form
+        // when cursor_inside; the cursor wouldn't land on bullet
+        // bytes for plain unordered items because they're
+        // forbidden positions.
+        if !matches!(item_kind, ListItemKind::Unordered(_, Some(_))) || !cursor_inside {
+            continue;
+        }
+        let display = list_marker_display_text(item_kind, cursor_inside);
+        let glyph = shape_marker_text(&display, style, window)?;
+        let line = lines.iter().find(|l| {
+            l.source_range.start <= overlay.source_range.start
+                && overlay.source_range.start < l.source_range.end
+        })?;
+        // The overlay paints right-aligned ending at the level's
+        // content edge. Mirror `paint_list_marker_overlay`'s x
+        // calculation so the caret lands inside the painted glyph.
+        let strip_right =
+            block_origin_x + container_x_at_level(containers, overlay.level + 1, style, window);
+        let glyph_left = strip_right - glyph.width();
+        let byte_in_overlay = cursor_offset - overlay.source_range.start;
+        let local = glyph
+            .position_for_index(byte_in_overlay, line.row_height)
+            .unwrap_or_else(|| point(px(0.0), px(0.0)));
+        let caret_x = glyph_left + local.x;
+        let caret_y = line.origin.y + local.y;
+        return Some(TaggedQuad {
+            quad: fill(
+                Bounds::new(point(caret_x, caret_y), size(px(2.0), line.row_height)),
+                style.caret_color,
+            ),
+            is_delimiter: line.is_delimiter,
+        });
+    }
+    let _ = kind;
+    None
+}
+
+/// Paint the rule for a `BlockKind::ThematicBreak` — a thin
+/// horizontal line centered vertically on the block's content row.
+/// The block's `lines` list always contains exactly one shaped line
+/// (the source bytes, possibly hidden); its `origin.y` plus half its
+/// `row_height` gives the vertical center for the rule.
+fn paint_thematic_break(
+    window: &mut Window,
+    lines: &[LaidOutLine],
+    left: Pixels,
+    width: Pixels,
+    style: &MarkdownStyle,
+) {
+    let Some(line) = lines.first() else {
+        return;
+    };
+    let center_y = line.origin.y + line.row_height / 2.0;
+    let half_thickness = style.thematic_break_thickness / 2.0;
+    let bar = Bounds::from_corners(
+        point(left, center_y - half_thickness),
+        point(left + width, center_y + half_thickness),
+    );
+    window.paint_quad(fill(bar, style.thematic_break_color));
+}
+
 fn paint_horizontal_scrollbar(window: &mut Window, cb: &CodeBlockPaint, style: &MarkdownStyle) {
     let track_h = px(3.0);
     // Sit on the seam between the content strip and the closing fence
@@ -1073,7 +1222,7 @@ fn empty_shaped_line(font_size: Pixels, window: &mut Window) -> Option<Arc<Wrapp
 fn font_size_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
     match kind {
         BlockKind::Heading { level } => style.size_for_heading(*level),
-        BlockKind::Paragraph => style.font_size,
+        BlockKind::Paragraph | BlockKind::ThematicBreak => style.font_size,
         BlockKind::CodeBlock { .. } => style.mono_font_size,
     }
 }
@@ -1091,7 +1240,9 @@ fn spacing_above_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
     let rems_factor = match kind {
         BlockKind::Heading { level } if *level <= 2 => 1.5,
         BlockKind::Heading { .. } => 1.25,
-        BlockKind::Paragraph | BlockKind::CodeBlock { .. } => style.paragraph_gap.0,
+        BlockKind::Paragraph | BlockKind::CodeBlock { .. } | BlockKind::ThematicBreak => {
+            style.paragraph_gap.0
+        }
     };
     px(f32::from(style.font_size) * rems_factor / 2.0)
 }
@@ -1333,13 +1484,26 @@ fn shape_marker_text(
 /// users expect them stable.
 fn list_marker_display_text(kind: ListItemKind, cursor_inside: bool) -> String {
     match kind {
-        ListItemKind::Unordered(b) if cursor_inside => {
+        // Task items, cursor outside: render a single checkbox
+        // glyph in place of the bullet+brackets. The user sees a
+        // clean `☐ todo` / `☑ done` row.
+        ListItemKind::Unordered(_, Some(true)) if !cursor_inside => "☑ ".to_string(),
+        ListItemKind::Unordered(_, Some(false)) if !cursor_inside => "☐ ".to_string(),
+        // Task items, cursor inside: render the raw source bytes
+        // (`- [ ] ` / `- [x] `) so the user can navigate their
+        // cursor into the brackets and toggle the checkbox by
+        // typing `x` / space directly. The chrome paints in the
+        // indent strip via the overlay-cursor path so the content
+        // edge doesn't shift between focus states.
+        ListItemKind::Unordered(b, Some(true)) => format!("{} [x] ", b as char),
+        ListItemKind::Unordered(b, Some(false)) => format!("{} [ ] ", b as char),
+        ListItemKind::Unordered(b, None) if cursor_inside => {
             let mut s = String::with_capacity(2);
             s.push(b as char);
             s.push(' ');
             s
         }
-        ListItemKind::Unordered(_) => "• ".to_string(),
+        ListItemKind::Unordered(_, None) => "• ".to_string(),
         ListItemKind::Ordered { number } => format!("{}. ", number),
     }
 }
@@ -1660,6 +1824,12 @@ fn build_runs_for_line(
 
         let merged = here_style;
         let mut run_font = base_font.clone();
+        // Inline code swaps the run's font family to mono. Don't
+        // override the heading weight — bold inline code inside a
+        // heading should still shape with the heading's weight.
+        if merged.code {
+            run_font.family = style.mono_font_family.clone();
+        }
         if merged.bold || base_weight == FontWeight::BOLD {
             run_font.weight = FontWeight::BOLD;
         } else if base_weight != FontWeight::NORMAL {
@@ -1671,6 +1841,8 @@ fn build_runs_for_line(
 
         let color = if merged.dimmed {
             style.delimiter_color
+        } else if merged.link {
+            style.link_color
         } else {
             base_color
         };
@@ -1684,12 +1856,35 @@ fn build_runs_for_line(
             None
         };
 
+        // Inline code: paint a faint background under the run so the
+        // span reads as a chip. Dim takes precedence (the delimiter
+        // backticks share the run color but should *not* paint a
+        // background — only the content does).
+        let background_color = if merged.code && !merged.dimmed {
+            Some(style.inline_code_background)
+        } else {
+            None
+        };
+
+        // Inline link: single underline beneath the link text. No
+        // underline on the bracket / url delimiters (those are
+        // hidden when the cursor is outside, dimmed when inside).
+        let underline = if merged.link && !merged.dimmed {
+            Some(gpui::UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(color),
+                wavy: false,
+            })
+        } else {
+            None
+        };
+
         runs.push(TextRun {
             len: j - i,
             font: run_font,
             color,
-            background_color: None,
-            underline: None,
+            background_color,
+            underline,
             strikethrough,
         });
         i = j;
@@ -1754,12 +1949,13 @@ fn build_caret_and_selection(
     style: &MarkdownStyle,
     is_last_block: bool,
     next_block_start: Option<usize>,
+    marker_overlay_caret: Option<TaggedQuad>,
 ) -> (Option<TaggedQuad>, Vec<TaggedQuad>) {
     let cursor_offset = selection.head();
     let cursor_color = style.caret_color;
     let selection_color = style.selection_color;
 
-    let mut cursor: Option<TaggedQuad> = None;
+    let mut cursor: Option<TaggedQuad> = marker_overlay_caret;
     let mut boundary_fallback: Option<TaggedQuad> = None;
     let mut sel_quads: Vec<TaggedQuad> = Vec::new();
 

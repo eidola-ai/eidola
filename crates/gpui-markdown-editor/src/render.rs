@@ -203,6 +203,7 @@ fn should_merge_hard_break_continuation(
                 item_index: 0,
                 item_range: 0..0,
                 marker_range: 0..*marker_byte_len,
+                task: None,
             }),
         })
         .collect();
@@ -301,9 +302,42 @@ fn render_node(
             render_blockquote(node, prefix_ranges, tree, source, cursor, containers, out)
         }
         NodeKind::List { kind } => render_list(node, *kind, tree, source, cursor, containers, out),
+        NodeKind::ThematicBreak => render_thematic_break(node, source, cursor, containers, out),
         // Anything else at top level — nothing to do yet.
         _ => {}
     }
+}
+
+/// Render a thematic break (`---`, `***`, `___`).
+///
+/// The block kind is its own variant so the element layer can paint a
+/// horizontal rule decoration. The source bytes follow the standard
+/// cursor rule — hidden when the cursor is outside the construct,
+/// dimmed when the cursor is on the line so the user can see and
+/// edit the raw markdown.
+///
+/// The delimiter range is pre-trimmed of any trailing `\n` so it
+/// matches the shaped-line bounds the element layer compares against:
+/// `inject_empty_paragraphs` trims the block's `source_range` of
+/// trailing `\n`s downstream, and the hidden-range lookup in
+/// `build_display_line` requires `r.end <= line_logical_end`. Without
+/// the trim, a hide range that includes the `\n` silently fails the
+/// match and the `---` characters render as plain text.
+fn render_thematic_break(
+    node: &SyntaxNode,
+    source: &str,
+    cursor: CursorRange,
+    containers: &[Container],
+    out: &mut Vec<RenderBlock>,
+) {
+    let mut block = RenderBlock::new(node.range.clone(), BlockKind::ThematicBreak);
+    block.containers = containers.to_vec();
+    let cursor_inside = cursor.overlaps(&node.range);
+    let bytes = source.as_bytes();
+    let trimmed_end = block_content_end_excl(bytes, &node.range).max(node.range.start);
+    let delim_range = node.range.start..trimmed_end;
+    apply_delimiter_visibility(&[delim_range], cursor_inside, &mut block);
+    out.push(block);
 }
 
 fn render_paragraph(
@@ -558,11 +592,13 @@ fn render_list(
     // their own marker's width.
     let max_marker_text = compute_list_max_marker_text(node, kind);
     for child in &node.children {
-        let NodeKind::ListItem { marker_range } = &child.kind else {
+        let NodeKind::ListItem { marker_range, task } = &child.kind else {
             continue;
         };
         let item_kind = match &kind {
-            ListKind::Unordered => ListItemKind::Unordered(marker_char(source, marker_range)),
+            ListKind::Unordered => {
+                ListItemKind::Unordered(marker_char(source, marker_range), *task)
+            }
             ListKind::Ordered { .. } => {
                 let n = next_number.unwrap_or(1);
                 next_number = Some(n + 1);
@@ -585,10 +621,21 @@ fn render_list(
 
 /// Widest marker *text* anywhere in this list.
 ///
-/// For unordered lists every marker is two bytes (`- `, `* `, or `+ `);
-/// they shape to nearly identical pixel widths. We canonicalize to
-/// `"- "` so the indent computation is stable regardless of which
-/// bullet char a particular item uses.
+/// For unordered lists with no task items, every marker is two bytes
+/// (`- `, `* `, or `+ `); they shape to nearly identical pixel
+/// widths. We canonicalize to `"- "` so the indent computation is
+/// stable regardless of which bullet char a particular item uses.
+///
+/// **Task list items** (`- [ ] todo` / `- [x] done`) carry an extra
+/// `[ ] ` (4 bytes) of GFM chrome on top of the bullet. When the
+/// cursor is inside such an item the overlay renders the *raw*
+/// chrome bytes so the user can edit them directly; the indent
+/// column has to be wide enough to fit that raw form, otherwise the
+/// content edge would shift between focus states. We canonicalize
+/// to `"- [ ] "` whenever the list contains *any* task item, so
+/// every sibling — task or plain — aligns at the same content
+/// column. (The non-task siblings still paint with a `• ` bullet
+/// overlay; the wider indent just leaves extra space to its left.)
 ///
 /// For ordered lists the widest marker is whichever item has the most
 /// digits — `start + child_count - 1`. We format it back with the
@@ -597,7 +644,17 @@ fn render_list(
 /// punctuation.
 fn compute_list_max_marker_text(node: &SyntaxNode, kind: ListKind) -> String {
     match kind {
-        ListKind::Unordered => "- ".to_string(),
+        ListKind::Unordered => {
+            let has_task = node
+                .children
+                .iter()
+                .any(|c| matches!(c.kind, NodeKind::ListItem { task: Some(_), .. }));
+            if has_task {
+                "- [ ] ".to_string()
+            } else {
+                "- ".to_string()
+            }
+        }
         ListKind::Ordered { start } => {
             let count = node
                 .children
@@ -808,12 +865,36 @@ fn render_list_item(
                 .hidden_ranges
                 .push(first_leaf.source_range.start..hide_end);
         }
+        // Task list items (`- [ ] todo` / `- [x] done`): hide the
+        // GFM task marker bytes that sit immediately after the
+        // bullet so the rendered first line reads `todo` / `done`
+        // and the marker chrome (checkbox glyph or raw `- [ ]`)
+        // paints as an overlay in the indent strip. We don't extend
+        // `marker_range` itself because that would inflate the
+        // continuation-indent requirement (a task item with a
+        // multi-paragraph body uses 2-space continuation matching
+        // the bullet, not 6 spaces). The overlay's `source_range`
+        // *does* cover the full chrome (bullet + brackets) so the
+        // cursor can be placed inside the brackets via overlay-aware
+        // cursor positioning when the user navigates there.
+        let is_task = matches!(item_kind, ListItemKind::Unordered(_, Some(_)));
+        let mut overlay_range = marker_range.clone();
+        if is_task {
+            let task_start = marker_range.end;
+            let task_end = (task_start + 4).min(line_end);
+            if task_end > task_start && task_start < bytes.len() && bytes[task_start] == b'[' {
+                first_leaf.hidden_ranges.push(task_start..task_end);
+                overlay_range.end = task_end;
+            }
+        }
         // Push the marker overlay so the element layer paints the
-        // marker text in this item's indent strip. The element layer
-        // resolves the marker text to display from `containers[level]`
-        // (kind + cursor_inside).
+        // marker text in this item's indent strip. The element
+        // layer resolves the marker text to display from
+        // `containers[level]` (kind + cursor_inside) and can place
+        // the cursor inside the overlay when source position is
+        // within `overlay_range`.
         first_leaf.marker_overlays.push(MarkerOverlay {
-            source_range: marker_range.clone(),
+            source_range: overlay_range,
             level: item_level,
         });
     }
@@ -1210,6 +1291,61 @@ fn walk_inline(node: &SyntaxNode, cursor: CursorRange, base: InlineStyle, block:
             style.strikethrough = true;
             walk_styled_children(node, content_range, cursor, style, block);
         }
+        NodeKind::InlineCode {
+            delimiter_ranges,
+            content_range,
+        } => {
+            // Pulldown's `Event::Code` is a leaf event — there are
+            // no `Text` children, so we can't rely on
+            // `walk_styled_children` to emit the run. Build it
+            // directly: hide / dim the backtick delimiters per the
+            // cursor rule, then emit one `code`-styled inline run
+            // covering the content range. The element layer reads
+            // `InlineStyle::code` and switches to the mono font with
+            // a faint background fill.
+            let inside = cursor.overlaps(&node.range);
+            apply_delimiter_visibility(delimiter_ranges, inside, block);
+            if content_range.start < content_range.end {
+                let mut style = base.clone().merge(InlineStyle::code());
+                if inside {
+                    // No-op: the content of an inline code span is
+                    // *not* dimmed when the cursor is inside — the
+                    // delimiters are. The content stays in the
+                    // normal text color so the user can still read
+                    // the code while editing it.
+                    let _ = &mut style;
+                }
+                block.inlines.push(InlineRun {
+                    source_range: content_range.clone(),
+                    style,
+                });
+            }
+        }
+        NodeKind::Link {
+            delimiter_ranges,
+            text_range,
+            ..
+        } => {
+            let inside = cursor.overlaps(&node.range);
+            apply_delimiter_visibility(delimiter_ranges, inside, block);
+            // Walk children for the link text so nested styles
+            // (`[**bold link**](url)`) compose. The merged `link`
+            // bit drives color + underline at paint time. If a link
+            // has no children (e.g. an autolink with no text node)
+            // emit a single run covering `text_range` so the URL
+            // text still picks up link styling.
+            let style = base.clone().merge(InlineStyle::link());
+            if node.children.is_empty() {
+                if text_range.start < text_range.end {
+                    block.inlines.push(InlineRun {
+                        source_range: text_range.clone(),
+                        style,
+                    });
+                }
+            } else {
+                walk_styled_children(node, text_range, cursor, style, block);
+            }
+        }
         NodeKind::Text => {
             if !base.is_default() {
                 block.inlines.push(InlineRun {
@@ -1507,6 +1643,7 @@ fn hide_chain_continuation_prefix(leaf: &mut RenderBlock, bytes: &[u8]) {
                 // Synthesize a marker_range whose width equals
                 // marker_byte_len; only the width matters here.
                 marker_range: 0..*marker_byte_len,
+                task: None,
             }),
         })
         .collect();
@@ -1617,10 +1754,12 @@ fn list_context_for_item(
     source: &str,
     ctx: &crate::analysis::ListItemContext,
 ) -> (String, ListItemKind) {
-    if let Some((list, kind)) = find_owning_list(tree, &ctx.marker_range) {
+    if let Some((list, kind, task)) = find_owning_list(tree, &ctx.marker_range) {
         let max_marker_text = compute_list_max_marker_text(list, kind);
         let item_kind = match kind {
-            ListKind::Unordered => ListItemKind::Unordered(marker_char(source, &ctx.marker_range)),
+            ListKind::Unordered => {
+                ListItemKind::Unordered(marker_char(source, &ctx.marker_range), task)
+            }
             ListKind::Ordered { start } => ListItemKind::Ordered {
                 number: start + ctx.item_index as u64,
             },
@@ -1632,7 +1771,9 @@ fn list_context_for_item(
             ListKind::Ordered { start } => format!("{}. ", start),
         };
         let item_kind = match ctx.list_kind {
-            ListKind::Unordered => ListItemKind::Unordered(marker_char(source, &ctx.marker_range)),
+            ListKind::Unordered => {
+                ListItemKind::Unordered(marker_char(source, &ctx.marker_range), None)
+            }
             ListKind::Ordered { start } => ListItemKind::Ordered {
                 number: start + ctx.item_index as u64,
             },
@@ -1644,14 +1785,14 @@ fn list_context_for_item(
 fn find_owning_list<'a>(
     nodes: &'a [SyntaxNode],
     item_marker_range: &Range<usize>,
-) -> Option<(&'a SyntaxNode, ListKind)> {
+) -> Option<(&'a SyntaxNode, ListKind, Option<bool>)> {
     for node in nodes {
         if let NodeKind::List { kind } = &node.kind {
             for child in &node.children {
-                if let NodeKind::ListItem { marker_range } = &child.kind
+                if let NodeKind::ListItem { marker_range, task } = &child.kind
                     && marker_range == item_marker_range
                 {
-                    return Some((node, *kind));
+                    return Some((node, *kind, *task));
                 }
             }
         }
@@ -2506,7 +2647,7 @@ mod tests {
             assert!(matches!(
                 b.containers[0],
                 Container::ListItem {
-                    kind: ListItemKind::Unordered(b'-'),
+                    kind: ListItemKind::Unordered(b'-', None),
                     ..
                 }
             ));
@@ -2596,5 +2737,255 @@ mod tests {
             .filter(|c| *c)
             .count();
         assert_eq!(second_inside_count, 1);
+    }
+
+    // ---- Inline code ----------------------------------------------------
+
+    #[test]
+    fn inline_code_hides_backticks_when_cursor_outside() {
+        let src = "see `foo()` end";
+        let spec = render_with_cursor(src, 0);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        // Backticks at 4..5 and 10..11.
+        assert!(block.has_hidden_range(4..5));
+        assert!(block.has_hidden_range(10..11));
+        // Content range 5..10 carries a code-styled inline run.
+        assert!(
+            block
+                .inlines
+                .iter()
+                .any(|r| r.source_range == (5..10) && r.style.code),
+            "expected code-styled inline run for the span content",
+        );
+    }
+
+    #[test]
+    fn inline_code_dims_backticks_when_cursor_inside() {
+        let src = "x `code` y";
+        // Cursor inside "code".
+        let spec = render_with_cursor(src, 4);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(block.has_dimmed_range(2..3));
+        assert!(block.has_dimmed_range(7..8));
+    }
+
+    // ---- Thematic break -------------------------------------------------
+
+    #[test]
+    fn thematic_break_emits_its_own_block_kind() {
+        let src = "above\n\n---\n\nbelow";
+        let spec = render_with_cursor(src, 0);
+        let rule = spec
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::ThematicBreak))
+            .expect("thematic break block");
+        // Source range covers `---` (the trailing `\n` is trimmed by
+        // `inject_empty_paragraphs`).
+        assert!(rule.source_range.end - rule.source_range.start >= 3);
+    }
+
+    #[test]
+    fn thematic_break_hides_source_when_cursor_outside() {
+        let src = "above\n\n---\n\nbelow";
+        // Cursor in "below".
+        let cursor = src.find("below").unwrap() + 1;
+        let spec = render_with_cursor(src, cursor);
+        let rule = spec
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::ThematicBreak))
+            .expect("thematic break block");
+        let r = rule.source_range.clone();
+        assert!(rule.has_hidden_range(r));
+    }
+
+    #[test]
+    fn thematic_break_dims_source_when_cursor_inside() {
+        let src = "---\n";
+        // Cursor at byte 1 (between `-` and `-`).
+        let spec = render_with_cursor(src, 1);
+        let rule = spec
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::ThematicBreak))
+            .expect("thematic break block");
+        // The dimmed inline run covers the trimmed range (no trailing
+        // newline). Verify the run exists with the dimmed style.
+        assert!(
+            rule.inlines.iter().any(|r| r.style.dimmed),
+            "expected dimmed inline run when cursor is on the rule",
+        );
+    }
+
+    // ---- Links ----------------------------------------------------------
+
+    #[test]
+    fn link_hides_brackets_and_url_when_cursor_outside() {
+        let src = "see [docs](u) end";
+        // Cursor at byte 0 — outside the link span.
+        let spec = render_with_cursor(src, 0);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        // `[` at 4..5; `](u)` at 9..13.
+        assert!(block.has_hidden_range(4..5));
+        assert!(block.has_hidden_range(9..13));
+    }
+
+    #[test]
+    fn link_emits_link_styled_inline_run_for_text() {
+        let src = "[docs](u)";
+        let spec = render_with_cursor(src, 99);
+        let block = &spec.blocks[0];
+        assert!(
+            block.inlines.iter().any(|r| r.style.link),
+            "expected link-styled inline run for link text",
+        );
+    }
+
+    #[test]
+    fn link_dims_brackets_when_cursor_inside() {
+        let src = "[docs](u)";
+        // Cursor inside "docs".
+        let spec = render_with_cursor(src, 3);
+        let block = &spec.blocks[0];
+        assert!(block.has_dimmed_range(0..1));
+        assert!(block.has_dimmed_range(5..9));
+    }
+
+    // ---- Task list items -----------------------------------------------
+
+    #[test]
+    fn task_item_carries_task_state_in_container() {
+        let src = "- [ ] todo\n- [x] done\n";
+        let spec = render_with_cursor(src, 0);
+        let kinds: Vec<_> = spec
+            .blocks
+            .iter()
+            .filter_map(|b| match b.containers.first() {
+                Some(Container::ListItem { kind, .. }) => Some(*kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds.len(), 2);
+        assert!(matches!(
+            kinds[0],
+            ListItemKind::Unordered(b'-', Some(false))
+        ));
+        assert!(matches!(
+            kinds[1],
+            ListItemKind::Unordered(b'-', Some(true))
+        ));
+    }
+
+    #[test]
+    fn task_item_hides_full_marker_when_cursor_outside() {
+        // Cursor outside the item: bullet `- ` and task marker
+        // `[ ] ` are both hidden so the line reads `todo` and a
+        // checkbox glyph paints in the indent strip.
+        let src = "- [ ] todo\n\nbody";
+        let cursor = src.find("body").unwrap() + 1;
+        let spec = render_with_cursor(src, cursor);
+        let item = spec
+            .blocks
+            .iter()
+            .find(|b| !b.containers.is_empty())
+            .expect("list item leaf");
+        // After `merge_hidden_ranges` collapses adjacent hides,
+        // 0..2 (bullet) and 2..6 (`[ ] `) become 0..6.
+        assert!(item.has_hidden_range(0..6));
+        // And a marker overlay is queued for the indent strip.
+        assert!(
+            !item.marker_overlays.is_empty(),
+            "expected a checkbox overlay when cursor is outside",
+        );
+    }
+
+    #[test]
+    fn mixed_task_and_plain_items_track_per_item_task_state() {
+        // GFM allows intermingling task and non-task items in the
+        // same list. Our parse + render keeps each item's state
+        // independent — no auto-promotion or demotion.
+        let src = "- [ ] todo\n- plain\n- [x] done\n";
+        let spec = render_with_cursor(src, 0);
+        let kinds: Vec<_> = spec
+            .blocks
+            .iter()
+            .filter_map(|b| match b.containers.first() {
+                Some(Container::ListItem { kind, .. }) => Some(*kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds.len(), 3);
+        assert!(matches!(
+            kinds[0],
+            ListItemKind::Unordered(b'-', Some(false))
+        ));
+        assert!(matches!(kinds[1], ListItemKind::Unordered(b'-', None)));
+        assert!(matches!(
+            kinds[2],
+            ListItemKind::Unordered(b'-', Some(true))
+        ));
+    }
+
+    #[test]
+    fn mixed_list_uses_widest_marker_text_for_indent() {
+        // When any item in the list is a task, every sibling
+        // (task or plain) gets the wider `"- [ ] "` indent so all
+        // marker overlays right-align at the same content edge.
+        let src = "- [ ] task\n- plain\n";
+        let spec = render_with_cursor(src, 0);
+        let plain_item = spec
+            .blocks
+            .iter()
+            .find(|b| {
+                matches!(
+                    b.containers.first(),
+                    Some(Container::ListItem {
+                        kind: ListItemKind::Unordered(_, None),
+                        ..
+                    })
+                )
+            })
+            .expect("plain item leaf");
+        match plain_item.containers.first().unwrap() {
+            Container::ListItem {
+                list_max_marker_text,
+                ..
+            } => assert_eq!(
+                list_max_marker_text, "- [ ] ",
+                "plain items in mixed lists carry the wider indent",
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn task_item_overlay_covers_full_chrome_when_cursor_inside() {
+        // Cursor inside the task item: the marker chrome (bullet +
+        // `[ ]`) is hidden from the shaped line and the marker
+        // overlay's source_range covers the full chrome (0..6) so
+        // the element layer's overlay-cursor path can place the
+        // caret inside the brackets when the user navigates there.
+        let src = "- [ ] todo\n";
+        // Cursor at byte 8 — inside "todo".
+        let spec = render_with_cursor(src, 8);
+        let item = spec
+            .blocks
+            .iter()
+            .find(|b| !b.containers.is_empty())
+            .expect("list item leaf");
+        assert!(
+            item.has_hidden_range(0..6),
+            "marker chrome stays hidden so content lands at the same column regardless of focus",
+        );
+        let overlay = item
+            .marker_overlays
+            .first()
+            .expect("expected a marker overlay for the task item");
+        assert_eq!(
+            overlay.source_range,
+            0..6,
+            "overlay should cover the full chrome (bullet + brackets)",
+        );
     }
 }

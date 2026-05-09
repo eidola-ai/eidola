@@ -204,10 +204,30 @@ The first cut covers:
 - Cursor + selection geometry, mouse hit-test, basic keyboard navigation
   (arrows / home / end / doc start / doc end), basic editing (insert text,
   backspace / delete, newline / line break), select-all.
+- Inline code (`` `code` ``): mono font + faint background fill on the
+  span content, hide / dim of the backtick delimiters per the cursor
+  rule. Multi-backtick spans (`` ``a`b`` ``) work — the parser
+  detects the opener / closer run lengths from the source bytes.
+- Inline links (`[text](url)`): link-colored, single-underline text;
+  hide / dim of the `[`, `](url)` delimiter pair per the cursor
+  rule. Nested styling inside the link text composes (a `**bold**`
+  inside a link picks up both the link color and the bold weight).
+- Thematic breaks (`---` / `***` / `___`): a `BlockKind::ThematicBreak`
+  block kind with a thin horizontal rule painted as a per-block
+  decoration centered on the row. The source bytes hide when the
+  cursor is outside, dim when inside.
+- GFM task list items (`- [ ] todo` / `- [x] done`): the parser sets
+  a `task: Option<bool>` field on `NodeKind::ListItem` whenever
+  pulldown emits `Event::TaskListMarker(checked)` inside an item.
+  The bullet's `marker_range` stays at `- ` (2 bytes) so the
+  continuation-indent math is unchanged; the renderer adds a
+  separate hide for the `[ ] ` / `[x] ` task bytes that follow,
+  and the marker overlay paints `☐ ` / `☑ ` in place of the
+  bullet glyph.
 
-Explicitly *out* of this first phase: setext-heading normalization, inline
-code, links, images, thematic rules, tables, HTML, IME marked-text,
-word / line-aware delete. Each will land as a follow-up.
+Explicitly *out* of this phase: setext-heading normalization, images,
+tables, HTML, IME marked-text, word / line-aware delete. Each will
+land as a follow-up.
 
 ### Container chain (composability invariant)
 

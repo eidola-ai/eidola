@@ -388,7 +388,9 @@ fn fmt_block_chain(chain: &[Container]) -> String {
             } => {
                 let k = match kind {
                     gpui_markdown_editor::ListItemKind::Ordered { .. } => "ord",
-                    gpui_markdown_editor::ListItemKind::Unordered(_) => "unord",
+                    gpui_markdown_editor::ListItemKind::Unordered(_, Some(true)) => "task✓",
+                    gpui_markdown_editor::ListItemKind::Unordered(_, Some(false)) => "task☐",
+                    gpui_markdown_editor::ListItemKind::Unordered(_, None) => "unord",
                 };
                 if *cursor_inside {
                     format!("LI*({k})")
@@ -409,6 +411,7 @@ fn fmt_block_kind(kind: &BlockKind) -> String {
             Some(l) if !l.is_empty() => format!("CodeBlock({l})"),
             _ => "CodeBlock".to_string(),
         },
+        BlockKind::ThematicBreak => "ThematicBreak".to_string(),
     }
 }
 

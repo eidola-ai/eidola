@@ -96,6 +96,21 @@ pub struct MarkdownStyle {
     pub background: Hsla,
     pub caret_color: Hsla,
     pub selection_color: Hsla,
+
+    /// Background color of an inline code span. Defaults to the
+    /// theme's `muted` (same as the outer code-block fill) so block
+    /// and inline code read cohesive.
+    pub inline_code_background: Hsla,
+    /// Text color for inline link text. Defaults to the theme's
+    /// `primary` (the accent color used for actionable text in
+    /// `gpui-component`).
+    pub link_color: Hsla,
+    /// Color used to paint the rule line of a thematic break.
+    /// Defaults to the theme's `border` so rules read as chrome
+    /// rather than content.
+    pub thematic_break_color: Hsla,
+    /// Thickness (in px) of the thematic-break rule line.
+    pub thematic_break_thickness: Pixels,
 }
 
 impl MarkdownStyle {
@@ -132,6 +147,11 @@ impl MarkdownStyle {
             background: theme.background,
             caret_color: theme.caret,
             selection_color: theme.selection,
+
+            inline_code_background: theme.muted,
+            link_color: theme.link,
+            thematic_break_color: theme.border,
+            thematic_break_thickness: px(1.0),
         }
     }
 

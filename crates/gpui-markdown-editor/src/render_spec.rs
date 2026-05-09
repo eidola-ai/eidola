@@ -126,7 +126,10 @@ pub enum Container {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListItemKind {
     /// Bullet item; the byte is the bullet character (`-`, `*`, or `+`).
-    Unordered(u8),
+    /// `task` is `Some(checked)` for GFM task list items
+    /// (`- [ ] todo` / `- [x] done`); the renderer paints a checkbox
+    /// glyph in place of the bullet when the cursor is outside.
+    Unordered(u8, Option<bool>),
     /// Numbered item. `number` is *this* item's parsed number; the next
     /// item produced by Enter is `number + 1`. Renumbering of later
     /// items in the list is not yet implemented.
@@ -190,6 +193,12 @@ pub enum BlockKind {
     CodeBlock {
         lang: Option<String>,
     },
+    /// Thematic break — `---` / `***` / `___` on its own line.
+    /// Rendered as a thin horizontal rule painted across the
+    /// content width. The source bytes are hidden when the cursor
+    /// is outside the construct and dimmed when inside, mirroring
+    /// the delimiter rule used elsewhere.
+    ThematicBreak,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -204,6 +213,12 @@ pub struct InlineStyle {
     pub italic: bool,
     pub strikethrough: bool,
     pub dimmed: bool,
+    /// Inline code — render in the mono font with a faint
+    /// background. Set on the content of an `` `code` `` span.
+    pub code: bool,
+    /// Inline link text — render with the link color and an
+    /// underline. Set on the content of a `[text](url)` span.
+    pub link: bool,
 }
 
 impl InlineStyle {
@@ -228,15 +243,36 @@ impl InlineStyle {
         }
     }
 
+    pub fn code() -> Self {
+        Self {
+            code: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn link() -> Self {
+        Self {
+            link: true,
+            ..Self::default()
+        }
+    }
+
     pub fn merge(mut self, other: InlineStyle) -> Self {
         self.bold |= other.bold;
         self.italic |= other.italic;
         self.strikethrough |= other.strikethrough;
         self.dimmed |= other.dimmed;
+        self.code |= other.code;
+        self.link |= other.link;
         self
     }
 
     pub fn is_default(&self) -> bool {
-        !self.bold && !self.italic && !self.strikethrough && !self.dimmed
+        !self.bold
+            && !self.italic
+            && !self.strikethrough
+            && !self.dimmed
+            && !self.code
+            && !self.link
     }
 }

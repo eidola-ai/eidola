@@ -2017,7 +2017,7 @@ fn nested_ordered_inside_unordered(cx: &mut TestAppContext) {
     assert!(matches!(
         kinds[0],
         Container::ListItem {
-            kind: ListItemKind::Unordered(b'-'),
+            kind: ListItemKind::Unordered(b'-', None),
             ..
         }
     ));
@@ -3657,32 +3657,68 @@ fn enter_past_post_list_separator_does_not_reanimate_list(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn split_list_renumbers_trailing_orphan_to_one(cx: &mut TestAppContext) {
+fn manually_typed_ordered_list_start_is_preserved(cx: &mut TestAppContext) {
+    // User types `5. foo` at top level — the list should stay at 5.
+    let initial = EditorState {
+        markdown: "5. foo".into(),
+        selection: Selection::Cursor(6),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    // Trigger a no-op enforce_invariants pass via SelectAll (no
+    // structural change, but the post-update normalization runs).
+    dispatch(cx, handle, &editor, SelectAll);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "5. foo");
+    });
+}
+
+#[gpui::test]
+fn manually_typed_ordered_list_in_blockquote_preserves_start(cx: &mut TestAppContext) {
+    // Inside a blockquote, typing `> 7. foo` should keep the list at 7.
+    let initial = EditorState {
+        markdown: "> 7. foo".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, SelectAll);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> 7. foo");
+    });
+}
+
+#[gpui::test]
+fn ordered_list_with_manual_start_renumbers_subsequent_items_from_that_start(
+    cx: &mut TestAppContext,
+) {
+    // Typed `5. one\n2. two\n3. three`. Pulldown sees one list with
+    // start=5; renumber pass uses 5 as the basis and rewrites items
+    // 2..3 to 6..7. The user's manual `5` is preserved as the first
+    // item's number, and subsequent siblings count up from there.
+    let initial = EditorState {
+        markdown: "5. one\n2. two\n3. three".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, SelectAll);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "5. one\n6. two\n7. three");
+    });
+}
+
+#[gpui::test]
+fn split_list_preserves_trailing_orphan_start(cx: &mut TestAppContext) {
     // User-reported scenario:
     //   1. one
     //   2. |two              <-- cursor after the "2. " marker
     //   3. three
     //
     // Backspace dedents item 2 to a paragraph, splitting the
-    // ordered list. The trailing portion ("3. three") used to
-    // keep its original number — pulldown reports the new
-    // standalone list with `start=3` and the source preserves the
-    // `3. ` marker, leaving the user with a leftover-numbered
-    // orphan list.
-    //
-    // The split-orphan heuristic in `effective_list_start`
-    // recognizes that any single-item ordered list with `start>1`
-    // is almost always such a leftover from a list split (no user
-    // intentionally types or pastes a one-item list at start>1
-    // with the expectation that it stay there once the editor
-    // canonicalizes), and renumbers it to start at 1.
-    //
-    // The reordering of `enforce_invariants` (promote soft breaks
-    // *before* normalize_lists) is what makes the heuristic fire
-    // on the post-dedent buffer: before the soft break is
-    // promoted, pulldown sees `paragraph + lazy continuation`
-    // rather than `paragraph + standalone list`, so normalize
-    // wouldn't see the trailing list to renumber.
+    // ordered list. The trailing portion ("3. three") keeps its
+    // typed start number — manual start values are first-class
+    // (a user *can* legitimately type `5. foo` to start a list at
+    // 5), and we'd rather preserve the source they typed than
+    // second-guess their intent. If the user wants the trailing
+    // list to start at 1 they can edit the marker themselves.
     let initial = EditorState {
         markdown: "1. one\n2. two\n3. three".into(),
         selection: Selection::Cursor(10),
@@ -3690,7 +3726,7 @@ fn split_list_renumbers_trailing_orphan_to_one(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. one\n\ntwo\n\n1. three");
+        assert_eq!(e.state.markdown, "1. one\n\ntwo\n\n3. three");
     });
 }
 
@@ -4526,6 +4562,233 @@ fn typing_a_blockquote_marker_into_a_list_item_deepens_scope(cx: &mut TestAppCon
             "outer list-item marker preserved, got: {:?}",
             e.state.markdown,
         );
+    });
+}
+
+#[gpui::test]
+fn enter_on_empty_task_item_outdents_to_paragraph(cx: &mut TestAppContext) {
+    // Pressing Enter on an empty task item (`- [ ] ` with nothing
+    // after the brackets) drops the item back to a paragraph —
+    // parity with the empty-bullet and empty-numbered behavior.
+    let initial = EditorState {
+        markdown: "- [ ] ".into(),
+        selection: Selection::Cursor(6),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // The marker chrome is gone; the buffer now has just the
+        // empty paragraph the cursor lands on.
+        assert!(
+            !e.state.markdown.contains("[ ]"),
+            "task chrome should be gone after empty-Enter outdent, got {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn enter_on_empty_checked_task_item_outdents(cx: &mut TestAppContext) {
+    // Same rule for `- [x] ` — checked-state shouldn't matter.
+    let initial = EditorState {
+        markdown: "- [x] ".into(),
+        selection: Selection::Cursor(6),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert!(
+            !e.state.markdown.contains("[x]"),
+            "checked task chrome should be gone after empty-Enter outdent, got {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn enter_on_empty_task_in_a_list_drops_only_that_item(cx: &mut TestAppContext) {
+    // The trailing empty task item exits the list cleanly; the
+    // earlier non-empty items stay intact.
+    let initial = EditorState {
+        markdown: "- [x] one\n- [ ] ".into(),
+        selection: Selection::Cursor(16),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert!(
+            e.state.markdown.starts_with("- [x] one"),
+            "first item should be preserved, got {:?}",
+            e.state.markdown,
+        );
+        // The trailing `- [ ] ` is gone (the empty task triggered
+        // the outdent path).
+        assert!(
+            !e.state.markdown.ends_with("- [ ] "),
+            "empty task item should be removed, got {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn enter_at_end_of_task_item_creates_another_task_item(cx: &mut TestAppContext) {
+    // Pressing Enter at the end of `- [x] done` continues the task
+    // list — the new sibling carries `- [ ] ` (fresh-unchecked) so
+    // the user keeps typing todos without re-typing the brackets.
+    let initial = EditorState {
+        markdown: "- [x] done".into(),
+        selection: Selection::Cursor(10),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- [x] done\n- [ ] ");
+        // Cursor lands at the start of the new item's content.
+        assert_eq!(e.cursor_offset(), 17);
+    });
+}
+
+#[gpui::test]
+fn enter_at_end_of_unchecked_task_item_creates_another_task_item(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "- [ ] todo".into(),
+        selection: Selection::Cursor(10),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- [ ] todo\n- [ ] ");
+        assert_eq!(e.cursor_offset(), 17);
+    });
+}
+
+#[gpui::test]
+fn enter_at_end_of_plain_unordered_item_does_not_become_task(cx: &mut TestAppContext) {
+    // Regression: the task continuation must not leak into plain
+    // unordered items.
+    let initial = EditorState {
+        markdown: "- foo".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- foo\n- ");
+    });
+}
+
+#[gpui::test]
+fn typing_dash_then_letter_injects_marker_space(cx: &mut TestAppContext) {
+    // Typing `-foo` is a clear list intent — CommonMark requires
+    // `<marker><space>` to open a list, but the editor injects the
+    // missing space so the user gets a list rather than text.
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "-foo");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- foo");
+    });
+}
+
+#[gpui::test]
+fn typing_star_then_letter_injects_marker_space(cx: &mut TestAppContext) {
+    // Same rule applies to `*` and `+`. Trade-off: `*foo*` typed at
+    // line start gets converted to a list opener — users who want
+    // italic at the start of a paragraph type the leading text first
+    // or escape the star.
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "*x");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "* x");
+    });
+}
+
+#[gpui::test]
+fn typing_plus_then_letter_injects_marker_space(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "+x");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "+ x");
+    });
+}
+
+#[gpui::test]
+fn typing_double_dash_does_not_inject_space(cx: &mut TestAppContext) {
+    // `--` could be in progress towards `---` (a thematic break) or
+    // just typed-in-a-row marker chars. The repeat-marker exception
+    // skips injection so the user can complete the thematic break.
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "--");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "--");
+    });
+}
+
+#[gpui::test]
+fn typing_three_dashes_remains_thematic_break_candidate(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "---");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "---");
+    });
+}
+
+#[gpui::test]
+fn typing_inside_existing_list_item_does_not_inject_space(cx: &mut TestAppContext) {
+    // The user types `-x` as content of an existing item — no space
+    // injection. `chain_for_position` returns a chain containing
+    // `ListItem` for this byte, which suppresses the rule.
+    let initial = EditorState {
+        markdown: "- foo\n  ".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "-bar");
+    editor.read_with(cx, |e, _| {
+        // The continuation line carries the LI indent, so the `-bar`
+        // content is part of the item's continuation, not a new
+        // sibling marker. The `-` stays adjacent to `bar`.
+        assert!(
+            e.state.markdown.contains("-bar"),
+            "expected unchanged `-bar` inside item, got {:?}",
+            e.state.markdown,
+        );
+    });
+}
+
+#[gpui::test]
+fn typing_dash_alone_does_not_inject_space(cx: &mut TestAppContext) {
+    // `-` alone (followed by EOF or `\n`) is still ambiguous —
+    // could be the start of a list, thematic break, or text. Don't
+    // touch it until the user types a non-marker character.
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "-");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "-");
     });
 }
 

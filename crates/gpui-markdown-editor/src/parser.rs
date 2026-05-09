@@ -16,6 +16,13 @@ use crate::syntax::{ListKind, NodeKind, SyntaxNode};
 pub fn parse(markdown: &str) -> Vec<SyntaxNode> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
+    // Recognize GFM task list markers (`- [ ] todo`, `- [x] done`)
+    // so pulldown emits `Event::TaskListMarker(bool)` for them. The
+    // parser folds the marker into the surrounding ListItem's
+    // `task` field and extends `marker_range` to include the
+    // `[x] ` bytes; the renderer paints a checkbox glyph in place
+    // of the bullet when the cursor is outside the item.
+    opts.insert(Options::ENABLE_TASKLISTS);
     // Treat empty nested item lines (`  - \n`, `  1. \n`, etc.) as
     // genuine list items rather than lazy-continuation text. Needed so
     // the chain query inside the editor's invariant passes still
@@ -61,6 +68,12 @@ impl<'a> Walker<'a> {
             Event::Text(_) => self.commit_leaf(SyntaxNode::new(NodeKind::Text, range)),
             Event::SoftBreak => self.commit_leaf(SyntaxNode::new(NodeKind::SoftBreak, range)),
             Event::HardBreak => self.commit_leaf(SyntaxNode::new(NodeKind::HardBreak, range)),
+            Event::Code(_) => {
+                let kind = self.inline_code_kind(&range);
+                self.commit_leaf(SyntaxNode::new(kind, range));
+            }
+            Event::Rule => self.commit_leaf(SyntaxNode::new(NodeKind::ThematicBreak, range)),
+            Event::TaskListMarker(checked) => self.set_task_marker(checked, &range),
             // For now, anything we don't model becomes plain text so cursor
             // geometry on the source bytes still works.
             _ => self.commit_leaf(SyntaxNode::new(NodeKind::Text, range)),
@@ -100,7 +113,24 @@ impl<'a> Walker<'a> {
             }
             Tag::Item => {
                 let marker_range = self.list_item_marker_range(&range);
-                self.push_frame(SyntaxNode::new(NodeKind::ListItem { marker_range }, range));
+                self.push_frame(SyntaxNode::new(
+                    NodeKind::ListItem {
+                        marker_range,
+                        task: None,
+                    },
+                    range,
+                ));
+            }
+            Tag::Link { dest_url, .. } => {
+                let (delim, text_range) = self.link_delimiters(&range);
+                self.push_frame(SyntaxNode::new(
+                    NodeKind::Link {
+                        delimiter_ranges: delim,
+                        text_range,
+                        dest_url: dest_url.into_string(),
+                    },
+                    range,
+                ));
             }
             Tag::Emphasis => {
                 let (delim, content) = self.symmetric_delimiters(&range, 1);
@@ -417,6 +447,114 @@ impl<'a> Walker<'a> {
         marker_start..q
     }
 
+    /// Compute delimiter and content ranges for an inline code span.
+    ///
+    /// Pulldown's `Event::Code(text)` reports the *full* construct
+    /// range — opening backticks, optional leading space, content,
+    /// optional trailing space, closing backticks. CommonMark allows
+    /// any number of opening backticks (n) so long as the closer
+    /// uses the same n. We detect by counting the leading run of
+    /// `` ` `` from `range.start`; the closer is the symmetric run
+    /// at the trailing edge.
+    ///
+    /// Spec edge case: if the content begins with a space and ends
+    /// with a space *and* contains a non-space, exactly one leading
+    /// and trailing space is stripped. We don't reflect that
+    /// stripping in `content_range` because the renderer shapes raw
+    /// bytes — the user expects to see what they typed inside the
+    /// span. The visual stripping only matters at HTML render time.
+    fn inline_code_kind(&self, range: &Range<usize>) -> NodeKind {
+        let bytes = self.source.as_bytes();
+        let mut p = range.start;
+        while p < range.end && bytes[p] == b'`' {
+            p += 1;
+        }
+        let opener_end = p;
+        let mut q = range.end;
+        while q > opener_end && bytes[q - 1] == b'`' {
+            q -= 1;
+        }
+        let closer_start = q;
+        let opener = range.start..opener_end;
+        let closer = closer_start..range.end;
+        let content = opener_end..closer_start;
+        NodeKind::InlineCode {
+            delimiter_ranges: vec![opener, closer],
+            content_range: content,
+        }
+    }
+
+    /// Compute delimiter ranges for an inline link `[text](url)`.
+    ///
+    /// Pulldown's `Tag::Link` range covers the whole construct from
+    /// `[` through `)`. We split it into:
+    /// * `[` opening bracket (1 byte)
+    /// * `](url "title"?)` middle + closing — covers the closing `]`
+    ///   through the trailing `)` so the entire URL portion hides
+    ///   when the cursor is outside the link.
+    ///
+    /// Reference / collapsed links (`[text]`, `[text][label]`) use
+    /// the same shape minus the `(url)` portion; we still produce
+    /// two delimiter ranges (opening `[` and the trailing `]` /
+    /// `][label]`) so the cursor rule treats them uniformly. The
+    /// text in between is `text_range`.
+    fn link_delimiters(&self, range: &Range<usize>) -> (Vec<Range<usize>>, Range<usize>) {
+        let bytes = self.source.as_bytes();
+        let len = range.end.saturating_sub(range.start);
+        if len < 2 || bytes.get(range.start).copied() != Some(b'[') {
+            // Autolinks (`<https://…>`) and other unusual shapes —
+            // fall back to a no-delimiter span so cursor geometry
+            // still works on the bytes.
+            return (Vec::new(), range.clone());
+        }
+        // Find the matching `]` — first unescaped `]` after the
+        // opening `[`. We scan forward respecting backslash escapes
+        // so `[a\]b](u)` finds the second `]`. Nested `[ ]` aren't
+        // valid in the link text per spec.
+        let mut p = range.start + 1;
+        while p < range.end {
+            if bytes[p] == b'\\' && p + 1 < range.end {
+                p += 2;
+                continue;
+            }
+            if bytes[p] == b']' {
+                break;
+            }
+            p += 1;
+        }
+        if p >= range.end {
+            // No closing `]` inside the parser-reported range —
+            // unusual; fall back.
+            return (Vec::new(), range.clone());
+        }
+        let opener = range.start..range.start + 1;
+        let closer = p..range.end;
+        let text_range = opener.end..p;
+        (vec![opener, closer], text_range)
+    }
+
+    /// Mark the currently-open `Item` frame as a task item. Pulldown
+    /// emits `Event::TaskListMarker(checked)` as the *first* event
+    /// inside an `Item` whose first content is `[ ]` / `[x]` / `[X]`.
+    ///
+    /// We *don't* extend `marker_range` here — that field drives
+    /// continuation-indent math (`- ` is 2 bytes, so continuation
+    /// lines carry 2 spaces of indent in standard GFM task lists),
+    /// and inflating it to 6 would produce a phantom 6-space
+    /// continuation requirement. Instead we just record the `task`
+    /// bit; the renderer locates the `[x] ` bytes on the first line
+    /// (immediately after the bullet) and hides them as task-marker
+    /// chrome separately from the bullet's own hide pass.
+    fn set_task_marker(&mut self, checked: bool, _marker_range: &Range<usize>) {
+        let Some(frame) = self.stack.last_mut() else {
+            return;
+        };
+        let NodeKind::ListItem { task, .. } = &mut frame.node.kind else {
+            return;
+        };
+        *task = Some(checked);
+    }
+
     fn blockquote_prefix_ranges(
         &self,
         range: &Range<usize>,
@@ -727,5 +865,178 @@ mod tests {
             .iter()
             .any(|c| matches!(c.kind, NodeKind::Strong { .. }));
         assert!(!has_strong, "code block must not contain inline parses");
+    }
+
+    // ---- Inline code ----------------------------------------------------
+
+    #[test]
+    fn parses_inline_code_span() {
+        let src = "see `foo()` here";
+        let nodes = parse(src);
+        let para = first(&nodes);
+        assert!(matches!(para.kind, NodeKind::Paragraph));
+        let code = para
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, NodeKind::InlineCode { .. }))
+            .expect("inline code child");
+        match &code.kind {
+            NodeKind::InlineCode {
+                delimiter_ranges,
+                content_range,
+            } => {
+                assert_eq!(delimiter_ranges.len(), 2);
+                assert_eq!(&src[delimiter_ranges[0].clone()], "`");
+                assert_eq!(&src[delimiter_ranges[1].clone()], "`");
+                assert_eq!(&src[content_range.clone()], "foo()");
+            }
+            other => panic!("expected inline code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_inline_code_with_doubled_backticks() {
+        // ``a`b`` — content "a`b" wrapped in `` `` `` delimiters so the
+        // inner literal backtick survives.
+        let src = "x ``a`b`` y";
+        let nodes = parse(src);
+        let para = first(&nodes);
+        let code = para
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, NodeKind::InlineCode { .. }))
+            .expect("inline code child");
+        match &code.kind {
+            NodeKind::InlineCode {
+                delimiter_ranges,
+                content_range,
+            } => {
+                assert_eq!(&src[delimiter_ranges[0].clone()], "``");
+                assert_eq!(&src[delimiter_ranges[1].clone()], "``");
+                assert_eq!(&src[content_range.clone()], "a`b");
+            }
+            other => panic!("expected inline code, got {other:?}"),
+        }
+    }
+
+    // ---- Thematic break -------------------------------------------------
+
+    #[test]
+    fn parses_thematic_break_dashes() {
+        let src = "before\n\n---\n\nafter";
+        let nodes = parse(src);
+        assert!(
+            nodes
+                .iter()
+                .any(|n| matches!(n.kind, NodeKind::ThematicBreak)),
+            "expected a ThematicBreak block"
+        );
+    }
+
+    #[test]
+    fn parses_thematic_break_asterisks_and_underscores() {
+        for src in ["***\n", "___\n", "* * *\n"] {
+            let nodes = parse(src);
+            assert!(
+                nodes
+                    .iter()
+                    .any(|n| matches!(n.kind, NodeKind::ThematicBreak)),
+                "expected ThematicBreak for {src:?}",
+            );
+        }
+    }
+
+    // ---- Links ----------------------------------------------------------
+
+    #[test]
+    fn parses_inline_link() {
+        let src = "see [docs](https://example.com) please";
+        let nodes = parse(src);
+        let para = first(&nodes);
+        let link = para
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, NodeKind::Link { .. }))
+            .expect("link child");
+        match &link.kind {
+            NodeKind::Link {
+                delimiter_ranges,
+                text_range,
+                dest_url,
+            } => {
+                assert_eq!(delimiter_ranges.len(), 2);
+                assert_eq!(&src[delimiter_ranges[0].clone()], "[");
+                assert_eq!(&src[delimiter_ranges[1].clone()], "](https://example.com)");
+                assert_eq!(&src[text_range.clone()], "docs");
+                assert_eq!(dest_url, "https://example.com");
+            }
+            other => panic!("expected link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_text_can_contain_styled_children() {
+        // `[**bold**](url)` — the link text has a Strong child node.
+        let src = "[**bold**](u)";
+        let nodes = parse(src);
+        let para = first(&nodes);
+        let link = para
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, NodeKind::Link { .. }))
+            .expect("link child");
+        let has_strong = link
+            .children
+            .iter()
+            .any(|c| matches!(c.kind, NodeKind::Strong { .. }));
+        assert!(has_strong, "link text must preserve nested styling");
+    }
+
+    // ---- Task list items -----------------------------------------------
+
+    #[test]
+    fn parses_unchecked_task_item() {
+        let src = "- [ ] todo\n";
+        let nodes = parse(src);
+        let list = first(&nodes);
+        assert!(matches!(list.kind, NodeKind::List { .. }));
+        let item = &list.children[0];
+        match &item.kind {
+            NodeKind::ListItem { task, marker_range } => {
+                assert_eq!(*task, Some(false));
+                // `marker_range` stays the bullet's `- ` (2 bytes) —
+                // the GFM task-marker bytes are the renderer's
+                // concern, not the structural marker.
+                assert_eq!(&src[marker_range.clone()], "- ");
+            }
+            other => panic!("expected list item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_checked_task_item() {
+        let src = "- [x] done\n";
+        let nodes = parse(src);
+        let list = first(&nodes);
+        let item = &list.children[0];
+        match &item.kind {
+            NodeKind::ListItem { task, marker_range } => {
+                assert_eq!(*task, Some(true));
+                assert_eq!(&src[marker_range.clone()], "- ");
+            }
+            other => panic!("expected list item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regular_list_item_has_no_task_marker() {
+        let src = "- plain\n";
+        let nodes = parse(src);
+        let list = first(&nodes);
+        let item = &list.children[0];
+        match &item.kind {
+            NodeKind::ListItem { task, .. } => assert_eq!(*task, None),
+            other => panic!("expected list item, got {other:?}"),
+        }
     }
 }

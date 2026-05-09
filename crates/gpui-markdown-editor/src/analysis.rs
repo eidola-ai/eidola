@@ -396,7 +396,7 @@ fn sum_overlapping_item_marker_widths(markdown: &str, start: usize, end: usize) 
             if node.range.start >= end || node.range.end <= start {
                 continue;
             }
-            if let crate::syntax::NodeKind::ListItem { marker_range } = &node.kind {
+            if let crate::syntax::NodeKind::ListItem { marker_range, .. } = &node.kind {
                 *total += marker_range.end - marker_range.start;
             }
             walk(&node.children, start, end, total);
@@ -1033,6 +1033,11 @@ pub struct ListItemContext {
     pub item_range: Range<usize>,
     /// Source range of the marker bytes (e.g. `- ` or `1. `).
     pub marker_range: Range<usize>,
+    /// `Some(checked)` for GFM task list items. Carried so that
+    /// `next_marker_text` can append `[ ] ` to the next sibling's
+    /// marker — pressing Enter at the end of a task item creates
+    /// another task item rather than a plain bullet.
+    pub task: Option<bool>,
 }
 
 impl ListItemContext {
@@ -1049,7 +1054,9 @@ impl ListItemContext {
 
     /// Marker text for the *next* item the user creates by pressing
     /// Enter at the end of this one. For unordered, repeat the
-    /// bullet char from this item; for ordered, increment.
+    /// bullet char from this item; for ordered, increment. Task
+    /// items continue as fresh-unchecked task items so the user
+    /// stays in the same list shape.
     fn next_marker_text(&self, markdown: &str) -> String {
         match self.list_kind {
             crate::syntax::ListKind::Unordered => {
@@ -1057,7 +1064,15 @@ impl ListItemContext {
                 // char actually used in source; default to `-` if
                 // we can't find it.
                 let bullet = bullet_for_item_index(markdown, self.item_index).unwrap_or(b'-');
-                format!("{} ", bullet as char)
+                if self.task.is_some() {
+                    // The new item starts unchecked regardless of
+                    // this item's checked state — users typically
+                    // type a fresh todo, not a copy of the previous
+                    // one's progress.
+                    format!("{} [ ] ", bullet as char)
+                } else {
+                    format!("{} ", bullet as char)
+                }
             }
             crate::syntax::ListKind::Ordered { start } => {
                 // `start` is the parsed list-start; `item_index`
@@ -1221,7 +1236,7 @@ fn node_has_content_on_line(
         // descend into the list. Same for blockquote prefix
         // markers.
         match &node.kind {
-            crate::syntax::NodeKind::ListItem { marker_range } => {
+            crate::syntax::NodeKind::ListItem { marker_range, .. } => {
                 if overlaps(marker_range, line_start, line_end) {
                     return true;
                 }
@@ -1340,28 +1355,34 @@ fn walk_chain_inner(
             // item's positional index in the list (for
             // `next_marker_text` numbering), so we open-code rather
             // than reusing `pick_chain_target`.
-            let mut item_target: Option<(usize, &crate::syntax::SyntaxNode, Range<usize>)> = None;
+            let mut item_target: Option<(
+                usize,
+                &crate::syntax::SyntaxNode,
+                Range<usize>,
+                Option<bool>,
+            )> = None;
             let mut item_is_strict = false;
             let mut idx = 0;
             for child in &node.children {
-                if let crate::syntax::NodeKind::ListItem { marker_range } = &child.kind {
+                if let crate::syntax::NodeKind::ListItem { marker_range, task } = &child.kind {
                     let effective_end = effective_node_end(child, bytes);
                     if cursor >= child.range.start && cursor <= effective_end {
                         let is_strict = cursor < effective_end;
                         if is_strict || !item_is_strict {
-                            item_target = Some((idx, child, marker_range.clone()));
+                            item_target = Some((idx, child, marker_range.clone(), *task));
                             item_is_strict = is_strict || item_is_strict;
                         }
                     }
                     idx += 1;
                 }
             }
-            if let Some((item_idx, item, marker_range)) = item_target {
+            if let Some((item_idx, item, marker_range, task)) = item_target {
                 out.push(EnclosingContainer::ListItem(ListItemContext {
                     list_kind: *kind,
                     item_index: item_idx,
                     item_range: item.range.clone(),
                     marker_range,
+                    task,
                 }));
                 // Descending into a ListItem's content — set the
                 // `parent_is_list_item` flag so a nested List
@@ -1766,7 +1787,7 @@ fn bullet_for_item_index(markdown: &str, item_index: usize) -> Option<u8> {
             {
                 let mut idx = 0;
                 for child in &n.children {
-                    if let crate::syntax::NodeKind::ListItem { marker_range } = &child.kind {
+                    if let crate::syntax::NodeKind::ListItem { marker_range, .. } = &child.kind {
                         if idx == target {
                             let bytes = source.as_bytes();
                             for &b in &bytes[marker_range.clone()] {
@@ -2357,7 +2378,7 @@ fn previous_sibling_marker_width(markdown: &str, item_range: &Range<usize>) -> O
             if let crate::syntax::NodeKind::List { .. } = &node.kind {
                 let mut prev_width: Option<usize> = None;
                 for child in &node.children {
-                    if let crate::syntax::NodeKind::ListItem { marker_range } = &child.kind {
+                    if let crate::syntax::NodeKind::ListItem { marker_range, .. } = &child.kind {
                         if child.range.start == target_start {
                             return prev_width;
                         }
@@ -2480,7 +2501,23 @@ fn item_is_empty_at_cursor(markdown: &str, item: &ListItemContext, cursor: usize
         return false;
     }
     let bytes = markdown.as_bytes();
-    let content = &bytes[item.marker_range.end..item.item_range.end];
+    let mut content_start = item.marker_range.end;
+    // For GFM task items the `[ ] ` / `[x] ` bytes are part of the
+    // marker chrome — an item containing only those bytes has no
+    // user content and triggers the same outdent path as a bare
+    // `- ` followed by Enter. Without this, an empty task item
+    // would just keep adding newlines instead of dropping the
+    // marker.
+    if item.task.is_some() {
+        let task_end = (content_start + 4).min(item.item_range.end);
+        if task_end >= content_start + 3
+            && bytes.get(content_start) == Some(&b'[')
+            && bytes.get(content_start + 2) == Some(&b']')
+        {
+            content_start = task_end;
+        }
+    }
+    let content = &bytes[content_start..item.item_range.end];
     content
         .iter()
         .all(|&b| b == b' ' || b == b'\t' || b == b'\n')
@@ -2825,7 +2862,7 @@ fn walk_normalize_lists(
                 // grows accordingly.
                 let mut item_idx: u64 = 0;
                 for child in &n.children {
-                    if let crate::syntax::NodeKind::ListItem { marker_range } = &child.kind {
+                    if let crate::syntax::NodeKind::ListItem { marker_range, .. } = &child.kind {
                         let target_width = match kind {
                             crate::syntax::ListKind::Unordered => {
                                 marker_range.end - marker_range.start
@@ -2848,41 +2885,21 @@ fn walk_normalize_lists(
 /// What number this list's first item should canonically carry.
 ///
 /// For an unordered list, the answer is unused (returns 0). For an
-/// ordered list, it's the parsed `start` *unless* the list is a
-/// "split orphan" — a single-item list whose `start` is `> 1`. Such
-/// lists almost always result from edits that remove one item from
-/// the middle of a longer list (Backspace dedent, empty-Enter exit,
-/// forward-delete merge): pulldown re-parses the trailing items as
-/// a fresh list whose `start` carries the original number, leaving
-/// the user with `1. one\n\n3. three` (their list "split" into a
-/// `1.` part and a leftover `3.` part).
+/// ordered list, the parsed `start` is preserved verbatim — typing
+/// `5. foo` produces a list that *stays* at 5, and renumbering of
+/// subsequent items in the same list counts up from there. Splits
+/// (e.g. Backspace dedent of an interior item) leave the trailing
+/// list with whatever `start` pulldown reports; the user can
+/// renumber explicitly if they want a fresh `1.` start.
 ///
-/// The user expectation is that splits restart at 1, so we
-/// renumber. Multi-item lists with `start > 1` are preserved —
-/// those are far more likely to be intentional (typed multi-item
-/// at start>1, or pasted content the user hasn't yet decided how
-/// to renumber).
-///
-/// The cost: a user who *types* `5. foo` and pauses sees their
-/// `5` flip to `1` after the post-pass runs. We accept this — it
-/// would only matter if the user then typed enough siblings to
-/// resemble a `5..N` sequence, and the `1..N` sequence they get
-/// is more often what they actually want.
-fn effective_list_start(list: &crate::syntax::SyntaxNode, kind: crate::syntax::ListKind) -> u64 {
+/// (An earlier rule renumbered single-item lists with `start > 1`
+/// to 1 to handle the split-orphan case automatically. That broke
+/// the ability to manually start at any value other than 1, so the
+/// rule was removed in favor of trusting the user's typed `start`.)
+fn effective_list_start(_list: &crate::syntax::SyntaxNode, kind: crate::syntax::ListKind) -> u64 {
     match kind {
         crate::syntax::ListKind::Unordered => 0,
-        crate::syntax::ListKind::Ordered { start } => {
-            let item_count = list
-                .children
-                .iter()
-                .filter(|c| matches!(c.kind, crate::syntax::NodeKind::ListItem { .. }))
-                .count();
-            if start > 1 && item_count <= 1 {
-                1
-            } else {
-                start
-            }
-        }
+        crate::syntax::ListKind::Ordered { start } => start,
     }
 }
 
@@ -2911,7 +2928,7 @@ fn normalize_list_node(
     // belongs to the *preceding* item.
     let last_idx = items.len().saturating_sub(1);
     for (idx, item) in items.iter().enumerate() {
-        let crate::syntax::NodeKind::ListItem { marker_range } = &item.kind else {
+        let crate::syntax::NodeKind::ListItem { marker_range, .. } = &item.kind else {
             continue;
         };
         // For ordered lists we re-number every item from

@@ -87,15 +87,52 @@ pub enum NodeKind {
         kind: ListKind,
     },
     /// One list item. `marker_range` covers the marker plus the
-    /// trailing space (e.g. `- ` or `1. `). Children are the item's
-    /// content blocks. For tight single-paragraph items pulldown
-    /// emits a `Text` leaf directly; for loose items it wraps the
-    /// content in `Paragraph`. The renderer treats both shapes the
-    /// same — one leaf per item, with the marker hidden / dimmed
-    /// according to the cursor-visibility rule.
+    /// trailing space (e.g. `- ` or `1. `) — and for a GFM task
+    /// item, also the `[ ] ` / `[x] ` task marker that follows.
+    /// Children are the item's content blocks. For tight
+    /// single-paragraph items pulldown emits a `Text` leaf
+    /// directly; for loose items it wraps the content in
+    /// `Paragraph`. The renderer treats both shapes the same — one
+    /// leaf per item, with the marker hidden / dimmed according to
+    /// the cursor-visibility rule.
+    ///
+    /// `task` is `Some(checked)` for GFM task list items
+    /// (`- [ ] todo`, `- [x] done`) and `None` for regular items.
+    /// Pulldown emits `Event::TaskListMarker(bool)` as the first
+    /// child of a task item; the parser sets this field and
+    /// extends `marker_range` to cover the `[x] ` bytes so they're
+    /// hidden / overlaid as part of the item's marker chrome.
     ListItem {
         marker_range: ByteRange,
+        task: Option<bool>,
     },
+    /// Inline code span (`` `code` ``). `delimiter_ranges` are the
+    /// opening and closing backtick runs (one or more backticks);
+    /// `content_range` is the inner text. The renderer hides /
+    /// dims delimiters per the cursor rule and paints the content
+    /// in the mono font with a faint background.
+    InlineCode {
+        delimiter_ranges: Vec<ByteRange>,
+        content_range: ByteRange,
+    },
+    /// Inline link. `text_range` covers the visible link text
+    /// (between `[` and `]`); `delimiter_ranges` covers `[` , the
+    /// middle `](` , and the trailing `)` so the renderer can hide
+    /// or dim them by the standard cursor rule. Children are the
+    /// inline content of the link text — they're walked to inherit
+    /// any nested styling (strong / em). `dest_url` is captured
+    /// for future tooltip / open-on-cmd-click but isn't rendered
+    /// inline.
+    Link {
+        delimiter_ranges: Vec<ByteRange>,
+        text_range: ByteRange,
+        dest_url: String,
+    },
+    /// Thematic break — `---`, `***`, or `___` on its own line.
+    /// Pulldown emits this as a leaf `Event::Rule`; the renderer
+    /// paints a horizontal rule decoration and hides / dims the
+    /// source bytes per the cursor rule.
+    ThematicBreak,
     SoftBreak,
     HardBreak,
     Text,

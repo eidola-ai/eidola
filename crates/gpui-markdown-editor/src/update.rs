@@ -155,8 +155,120 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
     let state = dedupe_orphan_fence_closer(state, &mut cache);
     let state = unify_fence_chain(state, &mut cache);
     let state = promote_soft_breaks(state, &mut cache);
+    let state = inject_unordered_marker_space(state, &mut cache);
     let state = normalize_lists(state, &mut cache);
     normalize_blockquote_prefixes(state, &mut cache)
+}
+
+/// Inject a space after a bare unordered list marker (`-`, `*`, `+`)
+/// when the next byte is non-space, non-newline, and not a repeat of
+/// the marker character.
+///
+/// Rationale: CommonMark requires `<marker><space>` to open a list,
+/// but typing `-foo` is a clear list intent that the editor can
+/// salvage by injecting the missing space. The repeat-character
+/// exception preserves thematic-break candidates (`---`, `***`,
+/// `___`) and emphasis runs of `*`/`*` from being prematurely
+/// converted into list items.
+///
+/// Cursor guard: skip injection when the cursor would land at the
+/// would-be insertion point (the user is mid-typing — either they
+/// just typed the marker and are about to continue, or they're
+/// editing the gap directly). Without this, every `-` keystroke
+/// would race the next keystroke for the cursor's column.
+///
+/// Scope guards:
+///
+/// - Lines whose chain has a `ListItem` are skipped — they're
+///   continuation / content of an existing item, where `-foo`
+///   means literal text rather than a sibling marker.
+/// - Lines inside a fenced code block are skipped — fence content
+///   is literal source.
+/// - Lines starting with extra leading whitespace beyond the chain
+///   prefix are skipped — pulldown would see them as code-block
+///   indent or lazy continuation, not a fresh list opener.
+///
+/// The pass runs *before* `normalize_lists` so the canonicalization
+/// step sees the just-injected space as part of a regular list.
+fn inject_unordered_marker_space(state: EditorState, cache: &mut ParseCache) -> EditorState {
+    let inserts: Vec<usize> = {
+        let bytes = state.markdown.as_bytes();
+        let cursor_head = state.selection.head();
+        let cursor_anchor = state.selection.anchor();
+        let tree = cache.tree(&state.markdown);
+        let fences = analysis::fenced_code_blocks_in_tree(tree, bytes);
+        let mut out = Vec::new();
+        let mut p = 0usize;
+        while p <= bytes.len() {
+            let line_start = p;
+            // Find the chain at this line's start byte. An empty
+            // chain means top-level. A chain containing `ListItem`
+            // means we're inside an existing item's source range —
+            // skip injection (it'd flip a continuation line into a
+            // nested list opener).
+            let chain = analysis::enclosing_containers_at_in_tree(tree, bytes, line_start);
+            let in_li = chain
+                .iter()
+                .any(|c| matches!(c, analysis::EnclosingContainer::ListItem(_)));
+            if !in_li {
+                let prefix_len = analysis::chain_continuation_prefix_bytes(&chain);
+                let content_start = line_start + prefix_len;
+                if content_start < bytes.len()
+                    && !analysis::is_in_fenced_code_blocks(&fences, content_start)
+                {
+                    let c = bytes[content_start];
+                    if matches!(c, b'-' | b'*' | b'+') {
+                        let next = content_start + 1;
+                        if next < bytes.len() {
+                            let nb = bytes[next];
+                            let cursor_at_gap = cursor_head == next || cursor_anchor == next;
+                            if nb != b' ' && nb != b'\n' && nb != c && !cursor_at_gap {
+                                out.push(next);
+                            }
+                        }
+                    }
+                }
+            }
+            // Advance to the next line.
+            while p < bytes.len() && bytes[p] != b'\n' {
+                p += 1;
+            }
+            if p < bytes.len() {
+                p += 1;
+            } else {
+                break;
+            }
+        }
+        out
+    };
+
+    if inserts.is_empty() {
+        return state;
+    }
+    cache.invalidate();
+    let mut new_md = String::with_capacity(state.markdown.len() + inserts.len());
+    let mut last = 0;
+    for &pos in &inserts {
+        new_md.push_str(&state.markdown[last..pos]);
+        new_md.push(' ');
+        last = pos;
+    }
+    new_md.push_str(&state.markdown[last..]);
+    let map = |off: usize| -> usize {
+        let shift = inserts.iter().filter(|&&pos| pos <= off).count();
+        off + shift
+    };
+    let new_sel = match state.selection {
+        Selection::Cursor(p) => Selection::Cursor(map(p)),
+        Selection::Range { anchor, head } => Selection::Range {
+            anchor: map(anchor),
+            head: map(head),
+        },
+    };
+    EditorState {
+        markdown: new_md,
+        selection: new_sel,
+    }
 }
 
 /// Propagate a fence's opener-line chain to its body and closer lines.
