@@ -131,9 +131,22 @@ impl LaidOutLine {
 
     pub fn local_position_for_source_offset(&self, source_offset: usize) -> Point<Pixels> {
         let display = self.display_offset_for_source(source_offset);
-        self.line
-            .position_for_index(display, self.row_height)
-            .unwrap_or_else(|| point(px(0.0), px(0.0)))
+        if let Some(p) = self.line.position_for_index(display, self.row_height) {
+            return p;
+        }
+        // Fallback for end-of-line cursors when the shaped text
+        // ended in whitespace that gpui collapsed at a soft-break
+        // boundary. `display` sits at `text.len()` but is past the
+        // last *glyph* in the wrap layout, so `position_for_index`
+        // walks all wrap rows and returns `None`. Place the caret
+        // at the line's right edge on its last row instead — that's
+        // where the user expects the typing position after a
+        // trailing space. Without this, the caret quad lands at
+        // `(0, 0)` and visually disappears against the leftmost
+        // glyph of the line.
+        let last_row = self.line.wrap_boundaries().len();
+        let y = self.row_height * (last_row as f32);
+        point(self.line.width(), y)
     }
 
     pub fn source_offset_for_local_point(&self, local: Point<Pixels>) -> usize {
@@ -1257,6 +1270,42 @@ fn spacing_below_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
     spacing_above_for_block(kind, style)
 }
 
+/// Structural equality for two chain entries — ignores
+/// `cursor_inside`, which is purely a focus-state flag and must not
+/// affect inter-block layout. Without this discriminator,
+/// `container_boundary_extra` and `level_shared_with_neighbor` would
+/// compare two list items in the same list as "different chains"
+/// whenever the cursor moved between them, injecting / removing a
+/// `container_boundary_gap` half on the boundary and shifting the
+/// list's vertical spacing every keystroke.
+fn containers_match_structurally(a: &Container, b: &Container) -> bool {
+    match (a, b) {
+        (Container::BlockQuote { .. }, Container::BlockQuote { .. }) => true,
+        (
+            Container::ListItem {
+                kind: ka,
+                marker_byte_len: ma,
+                list_max_marker_text: la,
+                ..
+            },
+            Container::ListItem {
+                kind: kb,
+                marker_byte_len: mb,
+                list_max_marker_text: lb,
+                ..
+            },
+        ) => ka == kb && ma == mb && la == lb,
+        _ => false,
+    }
+}
+
+fn chains_match_structurally(a: &[Container], b: &[Container]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| containers_match_structurally(x, y))
+}
+
 /// Extra breathing room added on the side of `containers` that faces
 /// `neighbor` when the two chains differ (paragraph → blockquote, or
 /// the move into / out of a nested level). Splits
@@ -1274,7 +1323,7 @@ fn container_boundary_extra(
     let Some(neighbor) = neighbor else {
         return px(0.0);
     };
-    if neighbor == containers {
+    if chains_match_structurally(neighbor, containers) {
         return px(0.0);
     }
     px(f32::from(style.font_size) * style.container_boundary_gap.0 / 2.0)
@@ -1296,7 +1345,13 @@ fn level_shared_with_neighbor(
     let Some(neighbor) = neighbor else {
         return false;
     };
-    neighbor.len() > level && containers.len() > level && containers[..=level] == neighbor[..=level]
+    if neighbor.len() <= level || containers.len() <= level {
+        return false;
+    }
+    containers[..=level]
+        .iter()
+        .zip(neighbor[..=level].iter())
+        .all(|(a, b)| containers_match_structurally(a, b))
 }
 
 /// Inner padding for a block's visible region — non-zero only for
@@ -2164,6 +2219,74 @@ mod tests {
                 .collect()
         })
         .expect("update window")
+    }
+
+    /// Shape each block and return the cursor's local-x position
+    /// for the supplied source offset (relative to the block's
+    /// origin). Used to verify the cursor lands at a non-zero
+    /// column for end-of-line cases that include trailing
+    /// whitespace.
+    fn cursor_x_for_offset(cx: &mut TestAppContext, src: &str, offset: usize) -> Pixels {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(offset),
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let src_owned = src.to_string();
+
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            for b in &blocks {
+                let font_size = font_size_for_block(&b.kind, &style);
+                let line_height = font_size * style.line_height.0;
+                let shaped =
+                    shape_block_lines(&src_owned, b, &style, font_size, Some(px(720.0)), window);
+                for sl in shaped {
+                    if sl.source_range.start <= offset && offset <= sl.source_range.end {
+                        let laid = LaidOutLine {
+                            line: sl.line,
+                            origin: point(px(0.0), px(0.0)),
+                            row_height: line_height,
+                            wrapped_height: line_height,
+                            source_range: sl.source_range,
+                            display_to_source: sl.display_to_source,
+                            is_delimiter: sl.is_delimiter,
+                        };
+                        return laid.local_position_for_source_offset(offset).x;
+                    }
+                }
+            }
+            px(0.0)
+        })
+        .expect("update window")
+    }
+
+    #[gpui::test]
+    fn cursor_at_end_of_list_item_with_trailing_space_lands_past_content(cx: &mut TestAppContext) {
+        // `- foo ` (trailing space, no newline). Cursor at byte 6.
+        // The display line is `foo ` (`- ` hidden as marker chrome).
+        // The cursor must land at a non-zero column — i.e. *past*
+        // the `foo` content — even though pulldown's parsed leaf
+        // range typically excludes trailing whitespace. Without
+        // extending the block's source_range to swallow trailing
+        // whitespace on the last content line, the byte at the
+        // cursor's position falls outside every block and no caret
+        // paints at all.
+        let plain_x = cursor_x_for_offset(cx, "- foo", 5);
+        let trailing_x = cursor_x_for_offset(cx, "- foo ", 6);
+        assert!(
+            trailing_x > plain_x,
+            "trailing-space cursor x ({:?}) should be greater than no-trail ({:?})",
+            trailing_x,
+            plain_x,
+        );
     }
 
     #[gpui::test]

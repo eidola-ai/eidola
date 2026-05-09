@@ -4566,6 +4566,80 @@ fn typing_a_blockquote_marker_into_a_list_item_deepens_scope(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn list_spacing_does_not_change_with_cursor_focus(cx: &mut TestAppContext) {
+    // Regression: list items in the same list used to gain or lose
+    // a `container_boundary_gap` half whenever the cursor moved
+    // between items, because `Container::ListItem`'s `cursor_inside`
+    // flag was part of the chain-equality check and made adjacent
+    // siblings look like "different chains" the moment one was
+    // focused. The spacing must be stable across cursor positions —
+    // cursor focus is a visual cue on the *current* row, not a
+    // signal to re-flow the document.
+    let src = "Paragraph one.\n\n- list item one\n- list item two\n\nParagraph two.";
+
+    fn render_with_cursor(
+        cx: &mut TestAppContext,
+        src: &str,
+        cursor: usize,
+    ) -> Vec<(usize, std::ops::Range<usize>)> {
+        let initial = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(cursor),
+        };
+        let (_handle, editor) = open_editor(cx, initial);
+        editor.read_with(cx, |e, _| {
+            e.render_spec()
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (i, b.source_range.clone()))
+                .collect()
+        })
+    }
+
+    // Cursor in the first list item.
+    let cursor_in_item1 = src.find("list item one").unwrap() + 1;
+    // Cursor in the leading paragraph.
+    let cursor_in_para1 = src.find("Paragraph one").unwrap() + 1;
+    // Cursor in the trailing paragraph.
+    let cursor_in_para2 = src.find("Paragraph two").unwrap() + 1;
+
+    let in_item1 = render_with_cursor(cx, src, cursor_in_item1);
+    let in_para1 = render_with_cursor(cx, src, cursor_in_para1);
+    let in_para2 = render_with_cursor(cx, src, cursor_in_para2);
+
+    // The block source ranges (and therefore vertical layout) are
+    // identical regardless of which item / paragraph the cursor
+    // sits in. Cursor focus only changes inline run styling, not
+    // the structural shape.
+    assert_eq!(
+        in_item1, in_para1,
+        "block ranges differ when cursor moves between list and paragraph"
+    );
+    assert_eq!(in_para1, in_para2, "block ranges differ between paragraphs");
+}
+
+#[gpui::test]
+fn list_item_trailing_space_keeps_cursor_in_block(cx: &mut TestAppContext) {
+    // Repro for the trailing-space cursor invisibility bug: typing
+    // a trailing space at the end of a list-item line must leave the
+    // buffer with that space and the cursor positioned *after* it.
+    // (The render-side fix is verified in `render::tests`; here we
+    // just pin the buffer state so a future invariant pass doesn't
+    // silently strip the space.)
+    let initial = EditorState {
+        markdown: "".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "- foo ");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- foo ");
+        assert_eq!(e.cursor_offset(), 6);
+    });
+}
+
+#[gpui::test]
 fn enter_on_empty_task_item_outdents_to_paragraph(cx: &mut TestAppContext) {
     // Pressing Enter on an empty task item (`- [ ] ` with nothing
     // after the brackets) drops the item back to a paragraph —

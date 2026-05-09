@@ -1167,7 +1167,24 @@ pub fn enclosing_containers_at_in_tree(
 /// drop them (they're "after the construct" structural units in
 /// the pairs model). A single trailing `\n` is the last content
 /// line's terminator and stays.
-fn effective_node_end(node: &crate::syntax::SyntaxNode, bytes: &[u8]) -> usize {
+/// Range-only variant of [`effective_node_end`] for callers that
+/// have a raw container range (e.g. from an `EnclosingChain` entry)
+/// rather than the full `SyntaxNode`. Trims a 2+ `\n` trailing run
+/// off the range's end; a single `\n` is kept (it's the last
+/// content line's terminator).
+pub fn effective_range_end(range: &Range<usize>, bytes: &[u8]) -> usize {
+    let raw_end = range.end;
+    let start = range.start;
+    let mut p = raw_end;
+    let mut trailing = 0;
+    while p > start && bytes[p - 1] == b'\n' {
+        p -= 1;
+        trailing += 1;
+    }
+    if trailing >= 2 { p } else { raw_end }
+}
+
+pub fn effective_node_end(node: &crate::syntax::SyntaxNode, bytes: &[u8]) -> usize {
     let raw_end = node.range.end;
     let trims = matches!(
         node.kind,

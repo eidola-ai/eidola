@@ -284,6 +284,23 @@ impl CursorRange {
         }
         false
     }
+
+    /// Container-aware variant of [`overlaps`]. Pulldown's range for a
+    /// `List` / `ListItem` / `BlockQuote` often extends past the last
+    /// content line into trailing structural separators (the `\n\n`
+    /// pair following the construct, or further empty rows). Without
+    /// trimming, a cursor parked on the post-construct empty row
+    /// would still match by boundary equality and the renderer would
+    /// flag the construct as "focused" — bullets stay raw, blockquote
+    /// markers dim into view, etc. The trimming rule is the same one
+    /// `analysis::effective_node_end` uses for the cursor walker, so
+    /// chain queries and render decisions agree.
+    fn overlaps_node(self, node: &SyntaxNode, source: &str) -> bool {
+        let bytes = source.as_bytes();
+        let effective_end = crate::analysis::effective_node_end(node, bytes);
+        let trimmed = node.range.start..effective_end;
+        self.overlaps(&trimmed)
+    }
 }
 
 fn render_node(
@@ -391,7 +408,7 @@ fn render_blockquote(
     containers: &[Container],
     out: &mut Vec<RenderBlock>,
 ) {
-    let cursor_inside = cursor.overlaps(&node.range);
+    let cursor_inside = cursor.overlaps_node(node, source);
     // The level of *this* blockquote's prefix markers is the number
     // of containers wrapping it (outer blockquotes / list items, etc.)
     // — the element layer uses it to look up the matching border bar
@@ -723,7 +740,7 @@ fn render_list_item(
     containers: &[Container],
     out: &mut Vec<RenderBlock>,
 ) {
-    let cursor_inside = cursor.overlaps(&node.range);
+    let cursor_inside = cursor.overlaps_node(node, source);
     let item_marker_byte_len = marker_range.end - marker_range.start;
     let mut chain = containers.to_vec();
     chain.push(Container::ListItem {
@@ -1462,7 +1479,33 @@ fn inject_empty_paragraphs(
     let mut real_blocks = real_blocks;
     for block in &mut real_blocks {
         let trimmed_start = block_content_start(bytes, &block.source_range);
-        let trimmed_end = block_content_end_excl(bytes, &block.source_range).max(trimmed_start);
+        let mut trimmed_end = block_content_end_excl(bytes, &block.source_range).max(trimmed_start);
+        // Extend past any trailing horizontal whitespace on the
+        // block's last content line. Pulldown's leaf range typically
+        // excludes trailing spaces (CommonMark "ignored" trailing
+        // whitespace); without this extension, a cursor parked at
+        // the byte right after a typed trailing space falls outside
+        // every block's range — no row claims it, and the caret
+        // never paints.
+        //
+        // Two guards:
+        //   1. Only extend when `trimmed_end` is *not* immediately
+        //      preceded by a `\n`. If it is, the trim already
+        //      walked past the line terminator (or the block ended
+        //      with a hard break that kept its `\n` inside the
+        //      range), and any further bytes belong to the *next*
+        //      line — extending across a `\n` would reach into
+        //      another block's territory.
+        //   2. Stop at the next `\n` so we never cross a line
+        //      boundary in the forward direction either.
+        let already_past_nl = trimmed_end > 0 && bytes[trimmed_end - 1] == b'\n';
+        if !already_past_nl {
+            while trimmed_end < bytes.len()
+                && (bytes[trimmed_end] == b' ' || bytes[trimmed_end] == b'\t')
+            {
+                trimmed_end += 1;
+            }
+        }
         block.source_range = trimmed_start..trimmed_end;
     }
 
@@ -1725,16 +1768,21 @@ fn translate_enclosing_chain(
     cursor: CursorRange,
     chain: crate::analysis::EnclosingChain,
 ) -> Vec<Container> {
+    let bytes = source.as_bytes();
     chain
         .into_iter()
         .map(|c| match c {
-            crate::analysis::EnclosingContainer::BlockQuote { range } => Container::BlockQuote {
-                cursor_inside: cursor.overlaps(&range),
-            },
+            crate::analysis::EnclosingContainer::BlockQuote { range } => {
+                let trimmed_end = crate::analysis::effective_range_end(&range, bytes);
+                Container::BlockQuote {
+                    cursor_inside: cursor.overlaps(&(range.start..trimmed_end)),
+                }
+            }
             crate::analysis::EnclosingContainer::ListItem(ctx) => {
                 let (max_marker_text, item_kind) = list_context_for_item(tree, source, &ctx);
+                let trimmed_end = crate::analysis::effective_range_end(&ctx.item_range, bytes);
                 Container::ListItem {
-                    cursor_inside: cursor.overlaps(&ctx.item_range),
+                    cursor_inside: cursor.overlaps(&(ctx.item_range.start..trimmed_end)),
                     kind: item_kind,
                     marker_byte_len: ctx.marker_width(),
                     list_max_marker_text: max_marker_text,
@@ -2706,6 +2754,57 @@ mod tests {
             .find(|b| !b.containers.is_empty())
             .expect("list item leaf");
         assert_eq!(item.source_range.start, 0);
+    }
+
+    #[test]
+    fn cursor_in_paragraph_after_list_does_not_mark_last_item_inside() {
+        // Pulldown's List/Item ranges sometimes extend past the
+        // last content line into trailing structural separators —
+        // the cursor parked in a post-list empty paragraph would
+        // then match the item's range via boundary equality and
+        // render the item as if focused. The item's `cursor_inside`
+        // must be false for any cursor strictly past the trimmed
+        // content extent.
+        let src = "- foo\n\n";
+        // Cursor at byte 7 (end of buffer, in the trailing empty
+        // paragraph row).
+        let spec = render_with_cursor(src, 7);
+        let item = spec
+            .blocks
+            .iter()
+            .find(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+            .expect("list item leaf");
+        match item.containers.first().unwrap() {
+            Container::ListItem { cursor_inside, .. } => {
+                assert!(
+                    !*cursor_inside,
+                    "cursor in trailing empty paragraph should NOT mark the last item as inside",
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn cursor_two_paragraphs_after_list_does_not_mark_last_item_inside() {
+        let src = "- foo\n\n\n\n";
+        // Cursor at end of buffer — multiple empty paragraphs after
+        // the list.
+        let spec = render_with_cursor(src, 9);
+        let item = spec
+            .blocks
+            .iter()
+            .find(|b| matches!(b.containers.first(), Some(Container::ListItem { .. })))
+            .expect("list item leaf");
+        match item.containers.first().unwrap() {
+            Container::ListItem { cursor_inside, .. } => {
+                assert!(
+                    !*cursor_inside,
+                    "cursor far past the list should not mark the last item as inside",
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
