@@ -153,9 +153,153 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
     let mut cache = ParseCache::new();
     let state = collapse_consecutive_hard_breaks(state); // doesn't parse
     let state = dedupe_orphan_fence_closer(state, &mut cache);
+    let state = unify_fence_chain(state, &mut cache);
     let state = promote_soft_breaks(state, &mut cache);
     let state = normalize_lists(state, &mut cache);
     normalize_blockquote_prefixes(state, &mut cache)
+}
+
+/// Propagate a fence's opener-line chain to its body and closer lines.
+///
+/// When the user types a chain marker (e.g. `>` or `> `) at the start
+/// of a fence's opener line, pulldown sometimes reads the opener as
+/// being in a deeper chain than the body and closer — the body lacks
+/// the BQ marker and parses as either lazy continuation or a separate
+/// top-level construct. This pass detects two adjacent unterminated
+/// fences with matching fence chars where the first sits in a BQ
+/// chain and the second doesn't, and inserts the missing chain prefix
+/// on every line between them so the two halves merge into a single
+/// terminated BQ-wrapped fence.
+///
+/// Mirrors the user-rule "context changes to the first line of the
+/// code block apply to the entire code block" — applied during
+/// `enforce_invariants` so the user sees the fully-nested fence
+/// immediately after one keystroke.
+fn unify_fence_chain(state: EditorState, cache: &mut ParseCache) -> EditorState {
+    let inserts = {
+        let tree = cache.tree(&state.markdown);
+        let mut blocks: Vec<&crate::syntax::SyntaxNode> = Vec::new();
+        collect_code_blocks(tree, &mut blocks);
+        let bytes = state.markdown.as_bytes();
+        let mut inserts: Vec<(usize, String)> = Vec::new();
+        for pair in blocks.windows(2) {
+            let (first, second) = (pair[0], pair[1]);
+            let (first_delims, _) = match &first.kind {
+                crate::syntax::NodeKind::CodeBlock {
+                    delimiter_ranges,
+                    info_string_range,
+                    ..
+                } => (delimiter_ranges, info_string_range.as_ref()),
+                _ => continue,
+            };
+            let (second_delims, second_info) = match &second.kind {
+                crate::syntax::NodeKind::CodeBlock {
+                    delimiter_ranges,
+                    info_string_range,
+                    ..
+                } => (delimiter_ranges, info_string_range.as_ref()),
+                _ => continue,
+            };
+            // Both must be unterminated (1 delimiter range each).
+            if first_delims.len() != 1 || second_delims.len() != 1 {
+                continue;
+            }
+            // Second must have no info string (it's the closer the
+            // first was waiting for, just at the wrong scope).
+            if second_info.is_some() {
+                continue;
+            }
+            // Matching fence chars and length.
+            let first_d = &first_delims[0];
+            let second_d = &second_delims[0];
+            let len_match = first_d.end - first_d.start == second_d.end - second_d.start;
+            let chars_match = bytes.get(first_d.start) == bytes.get(second_d.start)
+                && matches!(bytes.get(first_d.start), Some(b'`' | b'~'));
+            if !len_match || !chars_match {
+                continue;
+            }
+            // First's chain must be deeper than second's at the
+            // opener bytes — propagate the difference.
+            let first_chain = analysis::enclosing_containers_at_in_tree(tree, bytes, first_d.start);
+            let second_chain =
+                analysis::enclosing_containers_at_in_tree(tree, bytes, second_d.start);
+            if first_chain.len() <= second_chain.len() {
+                continue;
+            }
+            // Build the prefix to add on each in-between line: the
+            // chain segment that's in `first` but not in `second`.
+            // For the common case `[BQ]` vs `[]`, that's `> `.
+            //
+            // Conservative implementation: only handle the case where
+            // the difference is BQ-only. (LI continuation indents on
+            // the body lines would interact with `> ` insertion in
+            // ways the simple per-line prepend doesn't get right.)
+            let extra_chain = &first_chain[second_chain.len()..];
+            if !extra_chain
+                .iter()
+                .all(|c| matches!(c, analysis::EnclosingContainer::BlockQuote { .. }))
+            {
+                continue;
+            }
+            let prefix = analysis::chain_continuation_prefix(extra_chain);
+            // Walk lines from `first.range.end` through `second.range.end`,
+            // inserting `prefix` at each line's start.
+            let mut p = first.range.end;
+            let limit = second.range.end;
+            while p < limit {
+                let line_start = p;
+                // Skip blank-only line (no content) — pulldown
+                // wouldn't re-classify it anyway, so the chain
+                // continuation isn't observably needed there.
+                inserts.push((line_start, prefix.clone()));
+                while p < bytes.len() && bytes[p] != b'\n' {
+                    p += 1;
+                }
+                if p < bytes.len() {
+                    p += 1;
+                }
+            }
+            // One pair per pass — the apply step rebuilds and
+            // re-parses, so subsequent passes pick up the next
+            // pair if any.
+            break;
+        }
+        inserts
+    };
+
+    if inserts.is_empty() {
+        return state;
+    }
+    cache.invalidate();
+    let total_added: usize = inserts.iter().map(|(_, s)| s.len()).sum();
+    let mut new_md = String::with_capacity(state.markdown.len() + total_added);
+    let mut last = 0;
+    for (pos, ins) in &inserts {
+        new_md.push_str(&state.markdown[last..*pos]);
+        new_md.push_str(ins);
+        last = *pos;
+    }
+    new_md.push_str(&state.markdown[last..]);
+    let map = |off: usize| -> usize {
+        let mut shift = 0usize;
+        for (pos, ins) in &inserts {
+            if *pos < off {
+                shift += ins.len();
+            }
+        }
+        off + shift
+    };
+    let new_sel = match state.selection {
+        Selection::Cursor(p) => Selection::Cursor(map(p)),
+        Selection::Range { anchor, head } => Selection::Range {
+            anchor: map(anchor),
+            head: map(head),
+        },
+    };
+    EditorState {
+        markdown: new_md,
+        selection: new_sel,
+    }
 }
 
 /// Lazy parse-tree cache shared across `enforce_invariants` passes.
@@ -877,10 +1021,18 @@ fn insert_line_break(state: EditorState) -> EditorState {
 
 fn increase_list_depth(state: EditorState) -> EditorState {
     let cursor = state.selection.head();
-    let Some(edits) = analysis::list_item_indent_edits(&state.markdown, cursor) else {
-        return state;
-    };
-    apply_edits(state, &edits)
+    if let Some(edits) = analysis::list_item_indent_edits(&state.markdown, cursor) {
+        return apply_edits(state, &edits);
+    }
+    // Fallback: when the indent path doesn't apply (no list item at
+    // cursor, or cursor inside a fenced code body where the code's
+    // rules win), Tab inserts a literal `\t`. This is what users
+    // expect inside a fence body — same behavior as any plain text
+    // editor, code is verbatim.
+    if analysis::is_in_fenced_code(&state.markdown, cursor) {
+        return insert_text(state, "\t");
+    }
+    state
 }
 
 fn decrease_list_depth(state: EditorState) -> EditorState {
@@ -954,6 +1106,17 @@ fn delete_backward(state: EditorState) -> EditorState {
     if analysis::cursor_at_item_marker_end(&state.markdown, cursor)
         && let Some(edits) = analysis::list_item_dedent_edits(&state.markdown, cursor)
     {
+        return apply_edits(state, &edits);
+    }
+
+    // Fence BQ-outdent: Backspace at the byte right before a
+    // fenced code block's opener chars unwraps the innermost BQ
+    // around the whole fence in one keystroke (rule: "context
+    // changes to the first line of the code block apply to the
+    // entire code block"). The LI variant is covered by
+    // `list_item_dedent_edits` above when the cursor coincides
+    // with the LI's marker_end byte.
+    if let Some(edits) = analysis::fence_bq_outdent_edits(&state.markdown, cursor) {
         return apply_edits(state, &edits);
     }
 
@@ -1090,6 +1253,33 @@ fn delete_backward(state: EditorState) -> EditorState {
         }
         if is_prefix_only_line(bytes, prev_line_start, cursor_line_end) {
             return splice(&state.markdown, cursor, prev_line_start, cursor);
+        }
+    }
+
+    // **In-fence "delete the prefix-only line" gesture.**
+    //
+    // When the cursor sits anywhere on a prefix-only line inside a
+    // fenced code body (the line is purely chain prefix — BQ markers,
+    // LI continuation indent — with no content), Backspace removes
+    // the entire line including its leading `\n`. Without this, the
+    // user has to press Backspace once per byte of hidden prefix to
+    // remove an empty body row that to them looks like one keystroke
+    // worth of content (the user-reported "deleting invisible,
+    // forbidden characters" case in `bugs.md`).
+    if analysis::is_in_fenced_code(&state.markdown, cursor) && cursor > 0 {
+        let mut line_start = cursor;
+        while line_start > 0 && bytes[line_start - 1] != b'\n' {
+            line_start -= 1;
+        }
+        let mut line_end = cursor;
+        while line_end < bytes.len() && bytes[line_end] != b'\n' {
+            line_end += 1;
+        }
+        if line_start > 0
+            && line_start < line_end
+            && is_prefix_only_line(bytes, line_start, line_end)
+        {
+            return splice(&state.markdown, cursor, line_start - 1, cursor);
         }
     }
 

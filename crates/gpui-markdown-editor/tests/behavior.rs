@@ -3179,6 +3179,212 @@ fn empty_enter_on_top_level_item_becomes_paragraph(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn backspace_at_li_wrapped_fence_start_unwraps_li(cx: &mut TestAppContext) {
+    // Cursor right before the opener fence chars of an LI-wrapped
+    // fence, Backspace. Per the rule "context changes to the first
+    // line of the fence apply to the entire fence", the entire
+    // fence drops its LI wrapper — the LI marker disappears and
+    // the body / closer continuation indent is stripped. Reuses
+    // the existing `list_item_dedent_edits` top-level dedent path
+    // (with my new `is_in_fenced_code` guard now allowing this
+    // boundary position to route through, since strict-start
+    // semantics treat the fence's first-byte cursor as outside).
+    let initial = EditorState {
+        markdown: "1. ```js\n   body\n   ```".into(),
+        selection: Selection::Cursor(3),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "```js\nbody\n```");
+    });
+}
+
+#[gpui::test]
+fn backspace_at_bq_wrapped_fence_start_unwraps_bq(cx: &mut TestAppContext) {
+    // Cursor right before the opener fence chars of a BQ-wrapped
+    // fence, Backspace. New `fence_bq_outdent_edits` strips the
+    // innermost-BQ marker (`> `) from every line of the fence in
+    // one keystroke. Without it, Backspace would just delete the
+    // single space after `>` and leave the rest of the fence
+    // BQ-wrapped (the user-reported behavior).
+    let initial = EditorState {
+        markdown: "> ```js\n> body\n> ```".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "```js\nbody\n```");
+    });
+}
+
+#[gpui::test]
+fn backspace_on_empty_body_line_in_bq_fence_removes_whole_line(cx: &mut TestAppContext) {
+    // User-reported bug: Backspace on an empty body line inside a
+    // BQ-wrapped fence (`> ```js\n> |\n> ``` `) used to delete one
+    // hidden prefix byte at a time — the user pressed Backspace
+    // once and saw nothing happen visually. Now the in-fence
+    // "delete prefix-only line" gesture removes the whole line in
+    // one keystroke.
+    let initial = EditorState {
+        markdown: "> ```js\n> \n> ```".into(),
+        selection: Selection::Cursor(10),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // Empty body line gone; opener and closer untouched.
+        assert_eq!(e.state.markdown, "> ```js\n> ```");
+    });
+}
+
+#[gpui::test]
+fn backspace_on_empty_body_line_in_li_fence_removes_whole_line(cx: &mut TestAppContext) {
+    // User-reported bug: in an LI-wrapped fence, pressing Enter
+    // twice from the body then Backspace used to delete one space
+    // of the LI continuation indent at a time (the "deleting
+    // invisible, forbidden characters" report). Now the gesture
+    // collapses the whole prefix-only body line in one keystroke.
+    let initial = EditorState {
+        markdown: "1. ```js\n   body\n   ```".into(),
+        selection: Selection::Cursor(16),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown, "1. ```js\n   body\n   \n   \n   ```",
+            "two Enters add two empty body lines",
+        );
+    });
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // One empty body line removed; one remains.
+        assert_eq!(e.state.markdown, "1. ```js\n   body\n   \n   ```");
+    });
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // Second empty body line removed.
+        assert_eq!(e.state.markdown, "1. ```js\n   body\n   ```");
+    });
+}
+
+#[gpui::test]
+fn typing_bq_marker_at_fence_opener_nests_entire_fence(cx: &mut TestAppContext) {
+    // User-reported bug: typing `>` (or `> `) at the start of a
+    // top-level fence used to nest the body but leave the closer at
+    // top level. Per the rule "context changes to the first line of
+    // the fence apply to the entire fence", `enforce_invariants`'s
+    // `unify_fence_chain` pass detects the unterminated-BQ-fence +
+    // orphan-top-level-fence pattern and propagates the BQ prefix
+    // to every line in between.
+    fn run(src: &str, insert: &str, cx: &mut TestAppContext) -> String {
+        let initial = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+        };
+        let (handle, editor) = open_editor(cx, initial);
+        cx.update_window(handle, |_, _, cx| {
+            editor.update(cx, |e, cx| {
+                let next = std::mem::take(&mut e.state);
+                e.state = gpui_markdown_editor::update::update(
+                    next,
+                    gpui_markdown_editor::EditorEvent::InsertText(insert.into()),
+                );
+                cx.notify();
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| e.state.markdown.clone())
+    }
+    // Typing just `>` (no space) — every line of the fence gains a
+    // BQ prefix. The opener line keeps `>` without a trailing
+    // space because the cursor is parked right after the `>`
+    // (`normalize_blockquote_prefixes` defers the space-add until
+    // the cursor moves off the marker boundary). Body and closer
+    // get the canonical `> ` directly.
+    let bare = run("```js\nbody\n```", ">", cx);
+    assert_eq!(bare, ">```js\n> body\n> ```");
+    // Typing the full `> ` — same outcome with the opener already
+    // canonical.
+    let with_space = run("```js\nbody\n```", "> ", cx);
+    assert_eq!(with_space, "> ```js\n> body\n> ```");
+}
+
+#[gpui::test]
+fn enter_repeated_in_bq_wrapped_fence_body_keeps_bq_prefixes(cx: &mut TestAppContext) {
+    // User-reported bug: Enter x N in a BQ-wrapped fence body used
+    // to outdent the BQ scope on the third press. The chain-aware
+    // empty-BQ-paragraph exit edit was firing on what looked like a
+    // `\n> \n> ` pair ending at the cursor — even though the cursor
+    // sat in fenced-code body where `\n` is a literal line
+    // separator, not a structural pair. Guarding
+    // `empty_bq_paragraph_exit_edit` with `is_in_fenced_code` keeps
+    // the fence intact across repeats.
+    let initial = EditorState {
+        markdown: "> ```js\n> body\n> ```".into(),
+        selection: Selection::Cursor(14),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    for _ in 0..4 {
+        dispatch(cx, handle, &editor, Enter);
+    }
+    editor.read_with(cx, |e, _| {
+        // Each Enter inserts `\n> ` (literal newline + BQ
+        // continuation prefix); 4 Enters add 4 such pairs and
+        // never strip an existing BQ marker. The fence stays
+        // terminated.
+        assert_eq!(e.state.markdown, "> ```js\n> body\n> \n> \n> \n> \n> ```",);
+        assert!(gpui_markdown_editor::analysis::is_in_fenced_code(
+            &e.state.markdown,
+            e.cursor_offset(),
+        ));
+    });
+}
+
+#[gpui::test]
+fn enter_at_opener_fence_start_in_li_inserts_new_list_item(cx: &mut TestAppContext) {
+    // User-reported bug: Enter at the byte right before the opener
+    // fence chars in a list-wrapped fence (`1. |` `` js`) used to
+    // route through the in-fence path and inject a soft break.
+    // Per the rule "interactions before the first character of the
+    // opening fence behave as not part of the code block", the
+    // fence-containment query is now strict at `range.start`, so
+    // the cursor at that boundary lands in the LI's chain and
+    // Enter inserts a new list item.
+    let initial = EditorState {
+        markdown: "1. ```js\n   body\n   ```".into(),
+        selection: Selection::Cursor(3),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. \n2. ```js\n   body\n   ```");
+    });
+}
+
+#[gpui::test]
+fn tab_inside_li_wrapped_fence_body_inserts_literal_tab(cx: &mut TestAppContext) {
+    // User-reported bug: Tab inside the body of a list-wrapped
+    // fence used to nest the enclosing LI. Per the rule "the
+    // innermost block dictates interaction behavior", code-block
+    // body wins — Tab here inserts a literal `\t`.
+    let initial = EditorState {
+        markdown: "1. ```js\n   body\n   ```".into(),
+        selection: Selection::Cursor(16),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Tab);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. ```js\n   body\t\n   ```");
+        assert_eq!(e.cursor_offset(), 17);
+    });
+}
+
+#[gpui::test]
 fn code_block_fences_are_delimiter_rows_at_every_chain(cx: &mut TestAppContext) {
     // Fence rows (opener + closer) must be reported as
     // `delimiter_lines` covering the *whole source line*, not just

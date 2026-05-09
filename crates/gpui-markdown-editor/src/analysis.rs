@@ -155,18 +155,25 @@ pub fn fenced_code_ranges_in_tree(
         .collect()
 }
 
-/// `true` if byte index `p` falls inside any fenced code block (opener,
-/// content, or closer). The cursor at the EOF position of an
-/// **unterminated** fence is treated as inside the construct — there's
-/// no closer to sit "after", and the user typing more content there is
-/// still composing inside the code block. For terminated blocks the
-/// byte right after the closer's trailing `\n` (i.e. exactly at
-/// `range.end`) is *outside*, so a paragraph immediately following a
-/// closed fence doesn't get classified as code.
+/// `true` if byte index `p` falls inside any fenced code block — strict
+/// at the opener boundary, inclusive at the trailing edge of an
+/// unterminated fence.
+///
+/// **Boundary semantics.**
+/// - `p == range.start` is *outside*: the cursor sits before the
+///   first opener-fence char, on the chain prefix that introduces
+///   the line. Interactions there should behave as if the fence
+///   isn't there yet — Enter creates a new list sibling, Backspace
+///   unnests the BQ scope, Tab indents the LI.
+/// - `range.start < p < range.end` is inside (body content,
+///   delimiter chars, info string).
+/// - `p == range.end` is outside for terminated fences (after the
+///   closer's trailing `\n`) and inside for unterminated fences
+///   (cursor at EOF, still composing inside the construct).
 pub fn is_in_fenced_code(markdown: &str, p: usize) -> bool {
     fenced_code_blocks(markdown)
         .iter()
-        .any(|b| p >= b.range.start && (p < b.range.end || (!b.terminated && p == b.range.end)))
+        .any(|b| p > b.range.start && (p < b.range.end || (!b.terminated && p == b.range.end)))
 }
 
 /// Variant of [`is_in_fenced_code`] for callers that already have a
@@ -175,7 +182,7 @@ pub fn is_in_fenced_code(markdown: &str, p: usize) -> bool {
 pub fn is_in_fenced_code_blocks(blocks: &[FencedCodeBlock], p: usize) -> bool {
     blocks
         .iter()
-        .any(|b| p >= b.range.start && (p < b.range.end || (!b.terminated && p == b.range.end)))
+        .any(|b| p > b.range.start && (p < b.range.end || (!b.terminated && p == b.range.end)))
 }
 
 pub(crate) fn is_in_ranges(p: usize, ranges: &[Range<usize>]) -> bool {
@@ -1860,7 +1867,76 @@ pub fn enter_insertion(markdown: &str, cursor: usize) -> String {
 /// would be the only way. Mirrors [`empty_item_exit_edit`] for list
 /// items: empty-LI Enter and empty-BQ Enter both decrease nesting
 /// depth by one.
+/// Edits that strip the innermost-BQ prefix from every line of the
+/// fenced code block whose opener begins at `cursor`. Used by
+/// Backspace at the byte right before a fence's opener chars to
+/// "unwrap" the BQ around the whole fence in one keystroke — the
+/// rule "context changes to the first line of the fence apply to
+/// the entire fence" applied to the BQ scope.
+///
+/// Returns `None` when the cursor isn't at any fence's opener byte
+/// or the cursor's chain doesn't end in `BlockQuote`. The LI variant
+/// of this gesture is already covered by `list_item_dedent_edits`'s
+/// top-level dedent (Backspace at the LI's marker_end position),
+/// which strips `marker_width` from every continuation line — including
+/// the body and closer of an LI-wrapped fence.
+pub fn fence_bq_outdent_edits(markdown: &str, cursor: usize) -> Option<Vec<SourceEdit>> {
+    let bytes = markdown.as_bytes();
+    let blocks = fenced_code_blocks(markdown);
+    let block = blocks.iter().find(|b| cursor == b.range.start)?;
+    let chain = enclosing_containers_at(markdown, cursor);
+    if !matches!(chain.last(), Some(EnclosingContainer::BlockQuote { .. })) {
+        return None;
+    }
+    let outer_skip = chain_outer_prefix_bytes(&chain);
+    // Walk every line that's part of the fence (opener line through
+    // closer line) and strip the innermost-BQ marker (`> ` or just
+    // `>` if no trailing space) at `line_start + outer_skip`.
+    let mut p = {
+        let mut s = block.range.start;
+        while s > 0 && bytes[s - 1] != b'\n' {
+            s -= 1;
+        }
+        s
+    };
+    let fence_end = block.range.end;
+    let mut edits = SourceEditList::new();
+    while p < fence_end {
+        let line_end = {
+            let mut e = p;
+            while e < fence_end && bytes[e] != b'\n' {
+                e += 1;
+            }
+            e
+        };
+        let strip_start = p + outer_skip;
+        if strip_start <= line_end && bytes.get(strip_start) == Some(&b'>') {
+            let mut strip_end = strip_start + 1;
+            if strip_end < line_end && bytes[strip_end] == b' ' {
+                strip_end += 1;
+            }
+            edits.push(SourceEdit {
+                range: strip_start..strip_end,
+                replacement: String::new(),
+            });
+        }
+        p = line_end + 1;
+    }
+    let edits = edits.finish();
+    if edits.is_empty() { None } else { Some(edits) }
+}
+
 pub fn empty_bq_paragraph_exit_edit(markdown: &str, cursor: usize) -> Option<DepthDecreaseEdit> {
+    // Inside a fenced code body the innermost block is the code
+    // block — its rules win, and its `\n` bytes are literal line
+    // separators rather than structural pair-shapes. Without this
+    // guard, repeatedly pressing Enter inside a BQ-wrapped fence's
+    // body lands a chain-aware pair-shape at the most recent two
+    // empty body lines and outdents the BQ scope, breaking the
+    // fence into a top-level paragraph break.
+    if is_in_fenced_code(markdown, cursor) {
+        return None;
+    }
     let bytes = markdown.as_bytes();
     let chain = enclosing_containers_at(markdown, cursor);
     if !matches!(chain.last(), Some(EnclosingContainer::BlockQuote { .. })) {
@@ -1954,6 +2030,16 @@ pub fn auto_close_fence_edit(markdown: &str, cursor: usize) -> Option<DepthDecre
 ///    list with prior siblings (rewriting `1.` back to `2.`,
 ///    etc.).
 pub fn list_item_indent_edits(markdown: &str, cursor: usize) -> Option<Vec<SourceEdit>> {
+    // Inside a fenced code body the code block's rules win — Tab
+    // inserts a literal `\t` rather than nesting the enclosing LI.
+    // Returning `None` here lets the Tab dispatcher fall through to
+    // the literal-tab insertion path. (The "before the opener
+    // fence" position — cursor at fence range.start — is treated as
+    // outside the fence by `is_in_fenced_code`'s strict-start
+    // rule, so it correctly nests the LI as the user expects.)
+    if is_in_fenced_code(markdown, cursor) {
+        return None;
+    }
     let chain = enclosing_containers_at(markdown, cursor);
     let innermost = chain_innermost_list_item(&chain)?;
     let prev_marker_width = previous_sibling_marker_width(markdown, &innermost.item_range)?;
@@ -2044,6 +2130,13 @@ pub fn list_item_indent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
 ///
 /// Returns `None` outside of a list.
 pub fn list_item_dedent_edits(markdown: &str, cursor: usize) -> Option<Vec<SourceEdit>> {
+    // Same fence-body guard as `list_item_indent_edits`: the code
+    // block's rules win when the cursor is in body content.
+    // Shift+Tab there should be a no-op (we don't have a literal-
+    // dedent operation in code, just a literal-tab insert for Tab).
+    if is_in_fenced_code(markdown, cursor) {
+        return None;
+    }
     let chain = enclosing_containers_at(markdown, cursor);
     let items: Vec<&ListItemContext> = chain
         .iter()
@@ -2359,6 +2452,13 @@ pub struct DepthDecreaseEdit {
 /// nested item the marker bytes are dropped and the line becomes a
 /// continuation of the parent item.
 pub fn empty_item_exit_edit(markdown: &str, cursor: usize) -> Option<DepthDecreaseEdit> {
+    // Same reasoning as `empty_bq_paragraph_exit_edit`: inside a
+    // fenced code body the code block is the innermost construct and
+    // its rules win — Enter inserts `\n` + chain prefix, not a
+    // chain-pair outdent.
+    if is_in_fenced_code(markdown, cursor) {
+        return None;
+    }
     let item = innermost_list_item_at(markdown, cursor)?;
     if !item_is_empty_at_cursor(markdown, &item, cursor) {
         return None;
