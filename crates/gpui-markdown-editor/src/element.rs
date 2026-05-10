@@ -223,24 +223,35 @@ struct InlineMathPaintSpec {
     display_style: bool,
 }
 
+/// Padding character for math substitutions. U+202F NARROW NO-BREAK
+/// SPACE: ~⅙ em wide in fonts that include it, non-breaking so a
+/// pad-run never wraps mid-construct. Most modern body fonts ship
+/// this glyph; fonts that don't fall back to whatever the platform
+/// substitutes (typically a regular-width space) — `measure_pad_advance`
+/// reads the actual shaped advance, so the math is sized to whatever
+/// the font produces, just with worse precision in the fallback case.
+const MATH_PAD_CHAR: char = '\u{202F}';
+
 /// Pre-pass that turns each `MathOverlay` on a block into a
-/// width-matched `Substitution` of non-breaking spaces and produces
-/// a paint spec the element layer paints atop the shaped line.
+/// width-matched `Substitution` of narrow non-breaking spaces and
+/// produces a paint spec the element layer paints atop the shaped
+/// line.
 ///
 /// The substitution mechanism is what reserves horizontal space for
 /// the typeset math: `build_display_line` replaces the math's
-/// source bytes with a run of NBSPs whose total advance approximates
-/// the math's pixel width, so surrounding text shapes around it
-/// instead of overlapping. The math paints on top of those NBSPs at
-/// their shaped-line position.
+/// source bytes with a run of [`MATH_PAD_CHAR`]s whose total advance
+/// approximates the math's pixel width, so surrounding text shapes
+/// around it instead of overlapping. The math paints on top of
+/// those padding glyphs at their shaped-line position. Narrow no-
+/// break spaces minimize the per-construct rounding-up slack to ~1
+/// pad-glyph advance (~1 px in body text), and their non-breaking
+/// classification keeps line-wrap from splitting a math construct
+/// across lines.
 ///
 /// Returns a clone of `block` with the math substitutions appended,
 /// plus one `InlineMathPaintSpec` per successfully-typeset overlay.
-/// Overlays whose LaTeX fails to parse are dropped — the pre-existing
-/// hidden range covering the construct stays in place, leaving a
-/// blank gap rather than a crash. (A future iteration could fall
-/// back to shaping the raw LaTeX for failed overlays; v1 prefers
-/// the silent gap.)
+/// Overlays whose LaTeX fails to parse fall back to dim/mono
+/// shaping of the raw source — see [`push_failed_overlay_fallback`].
 fn augment_block_with_math(
     block: &RenderBlock,
     source: &str,
@@ -255,7 +266,7 @@ fn augment_block_with_math(
     // Hosts may also have called this already at app init.
     let _ = crate::math::register_katex_fonts(&window.text_system().clone());
 
-    let nbsp_advance = measure_nbsp_advance(em_px, style, &block.kind, window);
+    let pad_advance = measure_pad_advance(em_px, style, &block.kind, window);
 
     let mut augmented = block.clone();
     let mut paint_specs: Vec<InlineMathPaintSpec> = Vec::new();
@@ -291,12 +302,13 @@ fn augment_block_with_math(
         let math_width = math_layout.size(em_px).width;
         // Round up so the math has a tiny bit of trailing slack
         // rather than visually overlapping the next text glyph.
-        // Floor would risk over-cropping. Min 1 NBSP guarantees
-        // at least one substitution character lands in the line so
-        // `display_to_source` carries the math's source position.
-        let nbsp_count =
-            ((f32::from(math_width) / f32::from(nbsp_advance).max(1.0)).ceil() as usize).max(1);
-        let display: String = "\u{00A0}".repeat(nbsp_count);
+        // Floor would risk over-cropping. Min 1 pad glyph
+        // guarantees at least one substitution character lands in
+        // the line so `display_to_source` carries the math's
+        // source position.
+        let pad_count =
+            ((f32::from(math_width) / f32::from(pad_advance).max(1.0)).ceil() as usize).max(1);
+        let display: String = MATH_PAD_CHAR.to_string().repeat(pad_count);
         augmented.substitutions.push(Substitution {
             source_range: overlay.source_range.clone(),
             display,
@@ -340,19 +352,19 @@ fn push_failed_overlay_fallback(block: &mut RenderBlock, overlay: &MathOverlay) 
     }
 }
 
-/// Shape one non-breaking space at the block's body font and report
+/// Shape one [`MATH_PAD_CHAR`] at the block's body font and report
 /// its advance — used to size math substitutions in
 /// [`augment_block_with_math`].
-fn measure_nbsp_advance(
+fn measure_pad_advance(
     em_px: Pixels,
     style: &MarkdownStyle,
     kind: &BlockKind,
     window: &mut Window,
 ) -> Pixels {
     let font = base_font_for_block(kind, style);
+    let s: String = MATH_PAD_CHAR.to_string();
     let runs = [TextRun {
-        // U+00A0 (NBSP) is 2 bytes in UTF-8.
-        len: "\u{00A0}".len(),
+        len: s.len(),
         font,
         color: gpui::black(),
         background_color: None,
@@ -361,10 +373,10 @@ fn measure_nbsp_advance(
     }];
     let line = window
         .text_system()
-        .shape_text(SharedString::from("\u{00A0}"), em_px, &runs, None, None)
+        .shape_text(SharedString::from(s), em_px, &runs, None, None)
         .ok()
         .and_then(|mut v| v.drain(..).next());
-    line.map(|l| l.width()).unwrap_or(em_px * 0.5)
+    line.map(|l| l.width()).unwrap_or(em_px * 0.2)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1086,6 +1098,7 @@ impl Element for BlockElement {
                 &prepaint.inline_math,
                 &prepaint.laid_out.lines,
                 &self.style,
+                &self.block.kind,
                 window,
                 cx,
             );
@@ -1407,33 +1420,36 @@ fn compute_marker_overlay_caret(
     None
 }
 
-/// Paint each inline math overlay over the NBSP placeholder run
-/// that reserved its horizontal space. For each overlay:
+/// Paint each inline math overlay over the placeholder run that
+/// reserved its horizontal space. For each overlay:
 ///
 /// 1. Find the laid-out line whose source range contains the
 ///    overlay's `source_range.start` (a math construct never spans
 ///    multiple shaped lines because `augment_block_with_math`
-///    substitutes the whole construct with NBSPs that wrap as a
-///    single block).
+///    substitutes the whole construct with non-breaking-padding
+///    that wraps as a single block).
 /// 2. Walk the line's `display_to_source` map to find the display
 ///    byte offset where the substitution begins.
 /// 3. Convert that display offset to a pixel `x` via
 ///    `WrappedLine::position_for_index`.
 /// 4. Compute the `y` so the math's baseline aligns with the line's
-///    text baseline. The line doesn't expose its own ascent, so we
-///    approximate text-baseline-from-top as `0.78 * row_height`
-///    (sane for both serif and sans body fonts at typical sizes —
-///    matches the same heuristic in `crate::math::paint_glyph`).
+///    text baseline. We resolve the body font and read its actual
+///    ascent from gpui's text system rather than approximating —
+///    `0.78 * row_height` was close on Newsreader-like serifs but
+///    visibly off elsewhere.
 fn paint_inline_math_overlays(
     specs: &[InlineMathPaintSpec],
     lines: &[LaidOutLine],
     style: &MarkdownStyle,
+    block_kind: &BlockKind,
     window: &mut Window,
     cx: &mut App,
 ) {
     if specs.is_empty() {
         return;
     }
+    let body_font = base_font_for_block(block_kind, style);
+    let body_font_id = window.text_system().resolve_font(&body_font);
     for spec in specs {
         let Some(line) = lines.iter().find(|l| {
             l.source_range.start <= spec.source_range.start
@@ -1463,10 +1479,10 @@ fn paint_inline_math_overlays(
         let math_left = line.origin.x + local.x;
         // Align math baseline with text baseline. The math's own
         // baseline sits `layout.baseline(em_px)` below its top;
-        // place the math top so that distance lands on the line's
-        // text-baseline (≈ 0.78 of the row height from the row's
-        // top).
-        let text_baseline = line.origin.y + local.y + spec.em_px * 0.78;
+        // place the math top so that distance lands on the body
+        // font's text baseline (= `ascent` below the row top).
+        let body_ascent = window.text_system().ascent(body_font_id, spec.em_px);
+        let text_baseline = line.origin.y + local.y + body_ascent;
         let math_baseline = spec.layout.baseline(spec.em_px);
         let math_top = text_baseline - math_baseline;
         spec.layout.paint(

@@ -272,9 +272,17 @@ fn paint_glyph(
     color: Hsla,
 ) {
     let font = make_gpui_font(font_name);
-    let font_id = ratex_font::FontId::parse(font_name).unwrap_or(ratex_font::FontId::MainRegular);
-    let ch = ratex_font::math_alpha::katex_ttf_glyph_char(font_id, char_code);
+    let ratex_font_id =
+        ratex_font::FontId::parse(font_name).unwrap_or(ratex_font::FontId::MainRegular);
+    let ch = ratex_font::math_alpha::katex_ttf_glyph_char(ratex_font_id, char_code);
     let glyph_em = (em * scale).max(1.0);
+    let glyph_em_px = px(glyph_em);
+    // Resolve the gpui Font to a FontId so we can read the actual
+    // ascent below — the heuristic-baseline approach (ascent ≈
+    // 0.78em) was close-enough for body text but visibly off for
+    // math fonts whose ascent runs nearer 0.85em (e.g. KaTeX_Size4
+    // for stretched delimiters).
+    let gpui_font_id = window.text_system().resolve_font(&font);
     let mut s = String::new();
     s.push(ch);
     let runs = [TextRun {
@@ -287,21 +295,17 @@ fn paint_glyph(
     }];
     let shaped = window
         .text_system()
-        .shape_text(SharedString::from(s), px(glyph_em), &runs, None, None)
+        .shape_text(SharedString::from(s), glyph_em_px, &runs, None, None)
         .ok()
         .and_then(|mut v| v.drain(..).next());
     let Some(line) = shaped else {
         return;
     };
-    // RaTeX's y is the glyph's baseline; gpui's WrappedLine::paint
-    // uses the origin as the *top* of the line, so we offset upward
-    // by the line's ascent. WrappedLine doesn't expose ascent directly,
-    // but since we shape one glyph at glyph_em, the line height is
-    // approximately glyph_em (for Latin / math glyphs the ascent is
-    // typically ~0.8em). For the v1 cut we approximate by using the
-    // glyph_em as the baseline-to-top distance — we'll refine when we
-    // can pull metrics from gpui.
-    let glyph_top = origin.y + px(y_em * em) - px(glyph_em * 0.78);
+    // RaTeX's `y` is the glyph baseline; gpui's `WrappedLine::paint`
+    // origin is the *top* of the shaped line, so offset upward by
+    // the font's actual ascent.
+    let ascent = window.text_system().ascent(gpui_font_id, glyph_em_px);
+    let glyph_top = origin.y + px(y_em * em) - ascent;
     let glyph_left = origin.x + px(x_em * em);
     let _ = line.paint(
         point(glyph_left, glyph_top),
