@@ -419,6 +419,13 @@ fn fmt_block_kind(kind: &BlockKind) -> String {
                 "DisplayMath".to_string()
             }
         }
+        BlockKind::Image { edit_mode, .. } => {
+            if *edit_mode {
+                "Image(edit)".to_string()
+            } else {
+                "Image".to_string()
+            }
+        }
     }
 }
 

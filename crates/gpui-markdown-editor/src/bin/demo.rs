@@ -28,7 +28,19 @@ const DEMO_DOCUMENT: &str = "\
 # gpui-markdown-editor
 
 A WYSIWYG markdown editor. The first cut covers ATX headings, **bold**,
-*italic*, ~~strikethrough~~, `inline code`, and [links](https://example.com).
+*italic*, ~~strikethrough~~, `inline code`, [links](https://example.com),
+and ![inline images](/Users/mike/Code/eidola/apps/macos/Packages/MarkdownEditor/Example.png)
+that sit alongside surrounding prose.
+
+A sole image becomes a block:
+
+![block](/Users/mike/Code/eidola/apps/macos/Packages/MarkdownEditor/Example.png)
+
+Click into either to switch to edit mode and adjust the alt text or
+URL directly. Remote images need a real HTTP client wired into the
+gpui app — the demo uses gpui's `NullHttpClient` default, so a
+`![alt](https://…)` will fall back to showing the dim
+`![alt](https://…)` source so you can fix the URL.
 
 ## Cursor-aware delimiters
 
@@ -82,6 +94,7 @@ Click into the equation above to swap to edit mode and adjust the
 LaTeX directly. CommonMark backslash escapes (`\\*`) and HTML
 entities (`&copy;`, `&mdash;`) render as literals when the cursor
 is elsewhere — try `\\*starred\\*` or 2026 &mdash; it works.
+
 ";
 
 fn bind_keys(cx: &mut App) {

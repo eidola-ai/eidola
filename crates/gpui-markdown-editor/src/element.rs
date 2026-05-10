@@ -22,8 +22,8 @@ use smallvec::SmallVec;
 
 use crate::editor::MarkdownEditor;
 use crate::render_spec::{
-    BlockKind, Container, InlineRun, InlineStyle, ListItemKind, MathOverlay, RenderBlock,
-    Substitution,
+    BlockKind, Container, ImageOverlay, InlineRun, InlineStyle, ListItemKind, MathOverlay,
+    RenderBlock, Substitution,
 };
 use crate::state::Selection;
 use crate::style::MarkdownStyle;
@@ -203,6 +203,18 @@ pub struct PrepaintState {
     /// the paint phase locates the substitution's display offset in
     /// `laid_out.lines` and paints the math there.
     inline_math: Vec<InlineMathPaintSpec>,
+    /// `Some` only for `BlockKind::Image` in *display* mode (cursor
+    /// outside the image). Holds the loaded image + paint bounds.
+    /// Edit mode falls back to text shaping. Loading / failure
+    /// states are absorbed here too: `Loading` reserves a
+    /// placeholder height, `Failed` falls through to the regular
+    /// shaped path which renders the source as raw bytes.
+    image_paint: Option<ImagePaint>,
+    /// Inline-image overlays that were loaded and substituted into
+    /// the shaped lines. Same structure as [`inline_math`] — each
+    /// entry's `source_range` lets the paint phase locate the
+    /// substitution's display offset and paint the image there.
+    inline_images: Vec<InlineImagePaintSpec>,
 }
 
 /// Paint state for a typeset display-math block.
@@ -210,6 +222,14 @@ struct MathPaint {
     layout: crate::math::MathLayout,
     origin: Point<Pixels>,
     em_px: Pixels,
+}
+
+/// Paint state for a sole-image (`BlockKind::Image`) block in
+/// display mode. Mirrors [`MathPaint`] — the image's bounds are
+/// pre-computed in `prepaint` and consumed by `paint`.
+struct ImagePaint {
+    image: std::sync::Arc<gpui::RenderImage>,
+    bounds: Bounds<Pixels>,
 }
 
 /// One inline-math overlay that's been typeset and is awaiting
@@ -221,6 +241,17 @@ struct InlineMathPaintSpec {
     layout: crate::math::MathLayout,
     em_px: Pixels,
     display_style: bool,
+}
+
+/// One inline-image overlay that's been resolved and is awaiting
+/// paint. Mirrors [`InlineMathPaintSpec`] — `source_range` locates
+/// the substitution; `display_size` is the image's painted size
+/// (already aspect-corrected and height-capped by [`crate::image::inline_size`]);
+/// `image` is the `Some` arm of [`crate::image::LoadedImage::Loaded`].
+struct InlineImagePaintSpec {
+    source_range: Range<usize>,
+    image: std::sync::Arc<gpui::RenderImage>,
+    display_size: Size<Pixels>,
 }
 
 /// Padding character for math substitutions. U+202F NARROW NO-BREAK
@@ -414,6 +445,163 @@ fn augment_block_with_math(
     (augmented, paint_specs)
 }
 
+/// Pre-pass that turns each [`ImageOverlay`] on a block into a
+/// width-matched [`Substitution`] of narrow non-breaking spaces and
+/// produces a paint spec the element layer paints atop the shaped
+/// line. Mirrors [`augment_block_with_math`] — the substitution
+/// mechanism is identical, only the size source differs (image
+/// natural size from gpui's cache vs math typesetter dimensions).
+///
+/// **`loaded_for_overlay` must be pre-resolved by the caller** —
+/// `crate::image::load` ultimately calls `window.use_asset`, which
+/// requires the currently-rendering view to be on
+/// `rendered_entity_stack`. The measure callback for
+/// `Window::request_measured_layout` runs *after* `request_layout`
+/// returns and the view is no longer on the stack, so calling
+/// `image::load` directly from there panics. Instead, callers fetch
+/// once in `request_layout`'s body (or `prepaint`, both of which
+/// run with the view on the stack), then pass the resolved states
+/// through.
+///
+/// Loading / failure model parallels math typeset outcomes.
+/// `Loaded` → measure via [`crate::image::inline_size`], substitute a
+/// width-matched pad run, push a paint spec. `Loading` → reserve a
+/// placeholder square (the same height cap), substitute a same-width
+/// pad run, skip the paint spec; the asset cache invalidates the view
+/// when the load resolves so the next frame's measure sees real
+/// dimensions. `Failed` → push a fallback inline run pair (dim
+/// delimiters plus visible alt text on the raw source bytes) so the
+/// user sees the construct and what the broken target is. No
+/// substitution.
+fn augment_block_with_images(
+    block: &RenderBlock,
+    loaded_for_overlay: &[crate::image::LoadedImage],
+    em_px: Pixels,
+    line_height: Pixels,
+    style: &MarkdownStyle,
+    window: &mut Window,
+) -> (RenderBlock, Vec<InlineImagePaintSpec>) {
+    if block.image_overlays.is_empty() {
+        return (block.clone(), Vec::new());
+    }
+    let pad_advance = measure_pad_advance(em_px, style, &block.kind, window);
+
+    let mut augmented = block.clone();
+    let mut paint_specs: Vec<InlineImagePaintSpec> = Vec::new();
+
+    for (idx, overlay) in block.image_overlays.iter().enumerate() {
+        let loaded = loaded_for_overlay
+            .get(idx)
+            .cloned()
+            .unwrap_or(crate::image::LoadedImage::Loading);
+        let (display_size, paint_image) = match loaded {
+            crate::image::LoadedImage::Loaded(img) => {
+                let size = crate::image::inline_size(
+                    img.as_ref(),
+                    line_height,
+                    crate::image::INLINE_HEIGHT_FACTOR,
+                );
+                (size, Some(img))
+            }
+            crate::image::LoadedImage::Loading => {
+                (crate::image::inline_placeholder_size(line_height), None)
+            }
+            crate::image::LoadedImage::Failed => {
+                push_failed_image_overlay_fallback(&mut augmented, overlay);
+                continue;
+            }
+        };
+        let width = display_size.width;
+        if width <= px(0.0) {
+            // Degenerate (zero-size image) — treat as failure so the
+            // user still sees their alt text and can fix the URL.
+            push_failed_image_overlay_fallback(&mut augmented, overlay);
+            continue;
+        }
+        let pad_count =
+            ((f32::from(width) / f32::from(pad_advance).max(1.0)).ceil() as usize).max(1);
+        let display: String = MATH_PAD_CHAR.to_string().repeat(pad_count);
+        augmented.substitutions.push(Substitution {
+            source_range: overlay.source_range.clone(),
+            display,
+        });
+        if let Some(image) = paint_image {
+            paint_specs.push(InlineImagePaintSpec {
+                source_range: overlay.source_range.clone(),
+                image,
+                display_size,
+            });
+        }
+    }
+
+    (augmented, paint_specs)
+}
+
+/// Append fallback inline runs for an image overlay whose load
+/// failed: dim the `![` and `](url)` delimiters and shape the alt
+/// text in the normal text color so the user sees what they typed
+/// and can correct the URL. Mirrors the math typeset-failure
+/// fallback. Equivalent visually to the cursor-inside branch in
+/// `render::walk_inline`.
+fn push_failed_image_overlay_fallback(block: &mut RenderBlock, overlay: &ImageOverlay) {
+    let opener = overlay.source_range.start..overlay.alt_range.start;
+    let closer = overlay.alt_range.end..overlay.source_range.end;
+    for delim in [opener, closer] {
+        if !delim.is_empty() {
+            block.inlines.push(InlineRun {
+                source_range: delim,
+                style: InlineStyle::dimmed(),
+            });
+        }
+    }
+    // Alt text shapes in the default style — it's user-authored
+    // prose, not code, so no mono/code styling here. The default
+    // `InlineStyle` (no flags) renders as the normal body color.
+}
+
+/// Vertical row extra contributed by inline image overlays on a
+/// shaped line. Images are vertically centered on the row (CSS
+/// `vertical-align: middle` style), so an image taller than the row
+/// extends it symmetrically above and below by half the overshoot.
+/// Mirrors [`compute_math_row_extra`] in shape — both return
+/// [`MathRowExtra`] so callers can `max`-merge them.
+fn compute_image_row_extra(
+    line_source_range: &Range<usize>,
+    inline_images: &[InlineImagePaintSpec],
+    line_height: Pixels,
+) -> MathRowExtra {
+    let mut max_overshoot = px(0.0);
+    for spec in inline_images {
+        if spec.source_range.start < line_source_range.start
+            || spec.source_range.start >= line_source_range.end
+        {
+            continue;
+        }
+        if spec.display_size.height > line_height {
+            let overshoot = (spec.display_size.height - line_height) / 2.0;
+            if overshoot > max_overshoot {
+                max_overshoot = overshoot;
+            }
+        }
+    }
+    MathRowExtra {
+        top: max_overshoot,
+        bottom: max_overshoot,
+    }
+}
+
+/// Combine math and image row extras for one shaped line. Both
+/// kinds of overlay can contribute to the same row (a mixed-content
+/// paragraph might have inline math next to inline icons); take the
+/// max on each side so the row reserves enough vertical space for
+/// the taller of the two.
+fn combined_row_extra(math: MathRowExtra, image: MathRowExtra) -> MathRowExtra {
+    MathRowExtra {
+        top: math.top.max(image.top),
+        bottom: math.bottom.max(image.bottom),
+    }
+}
+
 /// Append fallback inline runs for a math overlay whose typeset
 /// failed (or whose source slice was unexpectedly out of bounds).
 /// The construct's source bytes shape as raw text — this just
@@ -527,6 +715,35 @@ impl Element for BlockElement {
         let source = self.editor.read(cx).state.markdown.clone();
         style.size.width = relative(1.0).into();
 
+        // Pre-resolve every image referenced by this block *before*
+        // the measure closure runs. `crate::image::load` ultimately
+        // calls `Window::use_asset`, which on first-cache-miss reads
+        // `Window::current_view()` to register a notify callback —
+        // and `current_view()` panics if the currently-rendering
+        // entity isn't on the window's stack. Measure callbacks run
+        // *after* `request_layout` returns (taffy invokes them
+        // during layout), at which point the entity is no longer on
+        // the stack. By doing the load here (inside `request_layout`
+        // proper, where the entity is on the stack), we both
+        // sidestep the panic and ensure the editor view is wired up
+        // to re-render once the asset loads.
+        let inline_image_loaded: Vec<crate::image::LoadedImage> = self
+            .block
+            .image_overlays
+            .iter()
+            .map(|o| crate::image::load(&o.dest_url, window, cx))
+            .collect();
+        let block_image_loaded: Option<crate::image::LoadedImage> = if let BlockKind::Image {
+            dest_url,
+            edit_mode: false,
+            ..
+        } = &self.block.kind
+        {
+            Some(crate::image::load(dest_url, window, cx))
+        } else {
+            None
+        };
+
         let block_clone = self.block.clone();
         let style_clone = self.style.clone();
         let id = window.request_measured_layout(
@@ -563,6 +780,49 @@ impl Element for BlockElement {
                         height: h,
                     };
                 }
+                // Image block (display mode): height comes from the
+                // loaded image's natural size, scaled to fit
+                // `avail_w`. Mirrors the display-math fast path. A
+                // failed load falls through to the regular shape
+                // path so the dim-delim + alt-text fallback the
+                // render layer pre-staged shows up underneath. The
+                // image was pre-resolved outside this closure —
+                // see the load comment above `request_measured_layout`.
+                if let BlockKind::Image {
+                    edit_mode: false, ..
+                } = &block_clone.kind
+                {
+                    let inner_w = (avail_w - container_indent).max(px(1.0));
+                    let loaded = block_image_loaded
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or(crate::image::LoadedImage::Loading);
+                    let size_opt = match loaded {
+                        crate::image::LoadedImage::Loaded(img) => {
+                            Some(crate::image::block_size(img.as_ref(), inner_w))
+                        }
+                        crate::image::LoadedImage::Loading => {
+                            Some(crate::image::block_placeholder_size(font_size, inner_w))
+                        }
+                        crate::image::LoadedImage::Failed => None,
+                    };
+                    if let Some(size) = size_opt {
+                        let h = extra_above
+                            + spacing_above
+                            + size.height.max(line_height)
+                            + spacing_below
+                            + extra_below;
+                        return Size {
+                            width: avail_w,
+                            height: h,
+                        };
+                    }
+                    // Failed: fall through to the regular shape path so
+                    // the raw `![alt](url)` source shapes underneath
+                    // the dim-delim + alt-text fallback runs the
+                    // render layer staged. The user sees what they
+                    // typed and can fix the broken URL.
+                }
                 // Container chain (blockquotes, future list-items)
                 // eats left indent — content shapes within the
                 // remaining width so soft-wrap lands at the visible
@@ -581,6 +841,19 @@ impl Element for BlockElement {
                 // than the body font.
                 let (augmented_block, paint_specs) =
                     augment_block_with_math(&block_clone, &source, font_size, &style_clone, window);
+                // Inline images: same substitution mechanism as math
+                // (load → measure → pad-run substitution). The loads
+                // themselves happened in `request_layout`'s outer
+                // body (see comment above) so this closure only
+                // consumes the pre-resolved state.
+                let (augmented_block, image_specs) = augment_block_with_images(
+                    &augmented_block,
+                    &inline_image_loaded,
+                    font_size,
+                    line_height,
+                    &style_clone,
+                    window,
+                );
                 let (body_ascent, body_descent) =
                     body_metrics_for_block(&block_clone.kind, &style_clone, font_size, window);
                 let lines = shape_block_lines(
@@ -613,6 +886,7 @@ impl Element for BlockElement {
                         &lines,
                         line_height,
                         &paint_specs,
+                        &image_specs,
                         body_ascent,
                         body_descent,
                         is_code,
@@ -690,6 +964,50 @@ impl Element for BlockElement {
         // gets shaped.
         let (augmented_block, inline_math_specs) =
             augment_block_with_math(&self.block, &source, font_size, &style, window);
+        // Inline images: pre-resolve each overlay via the asset
+        // cache (safe in prepaint — the view is on the stack here),
+        // then hand the loaded states to the augment pass. Async
+        // loads complete via cache-driven view invalidation so a
+        // still-`Loading` frame today is a fully-`Loaded` one
+        // tomorrow.
+        let inline_image_loaded: Vec<crate::image::LoadedImage> = self
+            .block
+            .image_overlays
+            .iter()
+            .map(|o| crate::image::load(&o.dest_url, window, cx))
+            .collect();
+        let (mut augmented_block, inline_image_specs) = augment_block_with_images(
+            &augmented_block,
+            &inline_image_loaded,
+            font_size,
+            line_height,
+            &style,
+            window,
+        );
+        // Block image in display mode: hide the source bytes when
+        // we have a paintable image (Loaded) or a placeholder
+        // (Loading) so the raw `![alt](url)` text doesn't shape
+        // underneath. On Failed we don't hide — the fallback runs
+        // the render layer staged (dim delim + alt) shape on the
+        // raw source bytes so the user sees what they typed.
+        if let BlockKind::Image {
+            edit_mode: false, ..
+        } = &self.block.kind
+        {
+            let loaded = crate::image::load(
+                match &self.block.kind {
+                    BlockKind::Image { dest_url, .. } => dest_url,
+                    _ => unreachable!(),
+                },
+                window,
+                cx,
+            );
+            if !loaded.is_failed() {
+                augmented_block
+                    .hidden_ranges
+                    .push(self.block.source_range.clone());
+            }
+        }
         let (body_ascent, body_descent) =
             body_metrics_for_block(&self.block.kind, &style, font_size, window);
         let shaped =
@@ -736,13 +1054,16 @@ impl Element for BlockElement {
             // overlays paint relative to `line.origin.y + ...`,
             // and the formula in `paint_inline_math_overlays`
             // accounts for gpui's centering using `line.row_height`.
-            let extra = compute_math_row_extra(
+            let math_extra = compute_math_row_extra(
                 &sl.source_range,
                 &inline_math_specs,
                 body_ascent,
                 body_descent,
                 line_height,
             );
+            let image_extra =
+                compute_image_row_extra(&sl.source_range, &inline_image_specs, line_height);
+            let extra = combined_row_extra(math_extra, image_extra);
             let wrap_count = (sl.line.wrap_boundaries().len() as f32) + 1.0;
             let wrapped_h = (line_height + extra.total()) * wrap_count;
             let origin = point(content_left, content_cursor_y + extra.top);
@@ -931,6 +1252,30 @@ impl Element for BlockElement {
             None
         };
 
+        // Block image in display mode: load and stash bounds. Loading
+        // / failed states fall through to the regular shape path
+        // (which renders the source bytes as a fallback row).
+        let image_paint = if let BlockKind::Image {
+            dest_url,
+            edit_mode: false,
+            ..
+        } = &self.block.kind
+        {
+            match crate::image::load(dest_url, window, cx) {
+                crate::image::LoadedImage::Loaded(img) => {
+                    let inner_w = (block_width - inner_pad * 2.).max(px(1.0));
+                    let size = crate::image::block_size(img.as_ref(), inner_w);
+                    Some(ImagePaint {
+                        image: img,
+                        bounds: Bounds::new(point(content_left, content_top), size),
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         PrepaintState {
             laid_out,
             cursor_quad,
@@ -938,6 +1283,8 @@ impl Element for BlockElement {
             code_block_paint,
             math_paint,
             inline_math: inline_math_specs,
+            image_paint,
+            inline_images: inline_image_specs,
         }
     }
 
@@ -1132,6 +1479,15 @@ impl Element for BlockElement {
             );
         }
 
+        // Block image (display mode): paint the loaded image at the
+        // pre-computed bounds. Loading / failed states leave
+        // `image_paint == None` and the regular shape path renders
+        // the source bytes (or a placeholder row from the empty-
+        // block fallback) underneath.
+        if let Some(image_paint) = prepaint.image_paint.take() {
+            crate::image::paint(image_paint.image, image_paint.bounds, window);
+        }
+
         let cursor_quad = prepaint.cursor_quad.take();
         let selection_quads = std::mem::take(&mut prepaint.selection_quads);
         let focused = focus_handle.is_focused(window);
@@ -1226,6 +1582,11 @@ impl Element for BlockElement {
                 window,
                 cx,
             );
+            // Inline image overlays — same paint ordering as math
+            // (over the line text, under the cursor). Each spec
+            // paints exactly where its substitution placed pad
+            // glyphs in the shaped line.
+            paint_inline_image_overlays(&prepaint.inline_images, &prepaint.laid_out.lines, window);
             if focused && let Some(tq) = cursor_quad {
                 window.paint_quad(tq.quad);
             }
@@ -1627,6 +1988,56 @@ fn paint_inline_math_overlays(
     }
 }
 
+/// Paint each inline-image overlay on top of the shaped line that
+/// hosts its substitution. Mirrors [`paint_inline_math_overlays`]
+/// — the substitution display offset gives the x position; the
+/// image is vertically centered on the row (CSS
+/// `vertical-align: middle` style) so it composes naturally with
+/// surrounding text. The row-height extras computed in
+/// [`compute_image_row_extra`] guarantee the row is tall enough for
+/// any image overshoot, so the centered image always fits.
+fn paint_inline_image_overlays(
+    specs: &[InlineImagePaintSpec],
+    lines: &[LaidOutLine],
+    window: &mut Window,
+) {
+    if specs.is_empty() {
+        return;
+    }
+    for spec in specs {
+        let Some(line) = lines.iter().find(|l| {
+            l.source_range.start <= spec.source_range.start
+                && spec.source_range.start < l.source_range.end
+        }) else {
+            continue;
+        };
+        let display_offset = line
+            .display_to_source
+            .iter()
+            .position(|&src| src == spec.source_range.start);
+        let Some(display_offset) = display_offset else {
+            continue;
+        };
+        let local = match line
+            .line
+            .position_for_index(display_offset, line.row_height)
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        let image_left = line.origin.x + local.x;
+        // Vertically center the image on the row. `line.origin.y`
+        // already accounts for any row-extra reservation
+        // (`compute_image_row_extra`) so centering inside
+        // `row_height` gives a row-symmetric position even when
+        // the image is taller than the body font.
+        let image_top =
+            line.origin.y + local.y + (line.row_height - spec.display_size.height) / 2.0;
+        let bounds = Bounds::new(point(image_left, image_top), spec.display_size);
+        crate::image::paint(spec.image.clone(), bounds, window);
+    }
+}
+
 /// Paint the rule for a `BlockKind::ThematicBreak` — a thin
 /// horizontal line centered vertically on the block's content row.
 /// The block's `lines` list always contains exactly one shaped line
@@ -1718,7 +2129,9 @@ fn empty_shaped_line(font_size: Pixels, window: &mut Window) -> Option<Arc<Wrapp
 fn font_size_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
     match kind {
         BlockKind::Heading { level } => style.size_for_heading(*level),
-        BlockKind::Paragraph | BlockKind::ThematicBreak => style.font_size,
+        BlockKind::Paragraph | BlockKind::ThematicBreak | BlockKind::Image { .. } => {
+            style.font_size
+        }
         BlockKind::CodeBlock { .. } => style.mono_font_size,
         // Display math: in edit mode shapes mono LaTeX; in display
         // mode the shaped-text path produces a single zero-width
@@ -1745,7 +2158,8 @@ fn spacing_above_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
         BlockKind::Paragraph
         | BlockKind::CodeBlock { .. }
         | BlockKind::ThematicBreak
-        | BlockKind::DisplayMath { .. } => style.paragraph_gap.0,
+        | BlockKind::DisplayMath { .. }
+        | BlockKind::Image { .. } => style.paragraph_gap.0,
     };
     px(f32::from(style.font_size) * rems_factor / 2.0)
 }
@@ -2073,10 +2487,12 @@ struct ShapedLine {
 /// arithmetic in one place is the only way to be certain the height
 /// `request_layout` returned matches the height `prepaint` actually
 /// fills with shaped lines.
+#[allow(clippy::too_many_arguments)]
 fn shaped_content_height(
     lines: &[ShapedLine],
     line_height: Pixels,
     inline_math: &[InlineMathPaintSpec],
+    inline_images: &[InlineImagePaintSpec],
     body_ascent: Pixels,
     body_descent: Pixels,
     is_code: bool,
@@ -2092,14 +2508,20 @@ fn shaped_content_height(
         // descent extends past the bottom. The row height passed to
         // gpui stays at `line_height` so the body baseline lands at
         // the same fraction of the row regardless of whether math
-        // is present — surrounding lines visually align.
-        let extra = compute_math_row_extra(
+        // is present — surrounding lines visually align. Image
+        // overshoot (image taller than line) extends both edges
+        // symmetrically. Take the max of the two contributions per
+        // edge so a row with both math and an image still reserves
+        // enough space for the taller.
+        let math_extra = compute_math_row_extra(
             &line.source_range,
             inline_math,
             body_ascent,
             body_descent,
             line_height,
         );
+        let image_extra = compute_image_row_extra(&line.source_range, inline_images, line_height);
+        let extra = combined_row_extra(math_extra, image_extra);
         let row_h = line_height + extra.total();
         h += row_h * ((line.line.wrap_boundaries().len() as f32) + 1.0);
     }

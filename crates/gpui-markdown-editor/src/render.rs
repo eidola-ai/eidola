@@ -171,6 +171,18 @@ fn collect_verbatim_ranges(tree: &[SyntaxNode]) -> Vec<Range<usize>> {
                     out.push(closer.clone());
                 }
             }
+            NodeKind::Image {
+                delimiter_ranges, ..
+            } => {
+                // Same reasoning as for `Link` — the destination
+                // portion `](url)` is dim-or-hidden depending on the
+                // cursor, never the target of an escape substitution.
+                // The alt-text children get walked by the regular
+                // recursion below.
+                if let Some(closer) = delimiter_ranges.get(1) {
+                    out.push(closer.clone());
+                }
+            }
             _ => {}
         }
         for child in &node.children {
@@ -559,6 +571,81 @@ fn render_paragraph(
         return;
     }
 
+    // Promote a paragraph whose sole content-bearing child is an
+    // `Image` event into a `BlockKind::Image` block — matches the
+    // standard markdown convention where a `![alt](url)` standalone
+    // construct sits on its own row. Mixed paragraphs (text + image
+    // + text) keep the inline rendering path and the image becomes
+    // an inline overlay alongside the surrounding text.
+    if let Some(image) = sole_image_child(node) {
+        let (alt_range, dest_url, image_range, delimiter_ranges) = match &image.kind {
+            NodeKind::Image {
+                alt_range,
+                dest_url,
+                delimiter_ranges,
+            } => (
+                alt_range.clone(),
+                dest_url.clone(),
+                image.range.clone(),
+                delimiter_ranges.clone(),
+            ),
+            _ => unreachable!("sole_image_child guard"),
+        };
+        // Inclusive overlap (same rule as DisplayMath): a cursor
+        // touching either delimiter — at `image.start` or `image.end`
+        // — flips to edit mode, which is the only path that paints
+        // raw bytes for click hit-testing.
+        let edit_mode = cursor.overlaps(&image_range);
+        let mut block = RenderBlock::new(
+            image_range.clone(),
+            BlockKind::Image {
+                alt_range: alt_range.clone(),
+                dest_url,
+                edit_mode,
+            },
+        );
+        block.containers = containers.to_vec();
+        if edit_mode {
+            // Edit mode: every byte shapes — `![` and `](url)`
+            // delimiters dim, alt text shapes normally. Mirrors the
+            // display-math edit-mode path so cursor navigation
+            // and selection work over the raw bytes.
+            for d in &delimiter_ranges {
+                if !d.is_empty() {
+                    block.inlines.push(InlineRun {
+                        source_range: d.clone(),
+                        style: InlineStyle::dimmed(),
+                    });
+                }
+            }
+            // Walk the image's children so any inline styling inside
+            // the alt text composes (e.g. `![*emphasis*](u)`).
+            collect_inlines_in_range(image, &alt_range, cursor, &mut block);
+        } else {
+            // Display mode: pre-stage the *fallback* shape inline
+            // runs (dim delimiters + visible alt text on the raw
+            // source bytes). The element layer will push a hide
+            // over `image_range` on a successful or in-flight load
+            // — hiding suppresses these runs from shaping. On a
+            // failed load, no hide is added, so the user sees the
+            // dim delimiters + alt text and can correct the URL.
+            // This mirrors the inline-image model: render emits the
+            // construct without committing to a hide, element
+            // commits to a hide only when it has a paintable image.
+            for d in &delimiter_ranges {
+                if !d.is_empty() {
+                    block.inlines.push(InlineRun {
+                        source_range: d.clone(),
+                        style: InlineStyle::dimmed(),
+                    });
+                }
+            }
+            collect_inlines_in_range(image, &alt_range, cursor, &mut block);
+        }
+        out.push(block);
+        return;
+    }
+
     let mut block = RenderBlock::new(node.range.clone(), BlockKind::Paragraph);
     block.containers = containers.to_vec();
     collect_inlines(node, cursor, &mut block);
@@ -588,6 +675,27 @@ fn sole_display_math_child(node: &SyntaxNode) -> Option<&SyntaxNode> {
         }
     }
     math
+}
+
+/// Returns the lone content-bearing `Image` child of `node` if the
+/// paragraph contains exactly one (modulo soft/hard breaks pulldown
+/// emits around standalone images). Mirrors [`sole_display_math_child`]
+/// — same promotion rule for image blocks.
+fn sole_image_child(node: &SyntaxNode) -> Option<&SyntaxNode> {
+    let mut img: Option<&SyntaxNode> = None;
+    for child in &node.children {
+        match &child.kind {
+            NodeKind::Image { .. } => {
+                if img.is_some() {
+                    return None;
+                }
+                img = Some(child);
+            }
+            NodeKind::SoftBreak | NodeKind::HardBreak => {}
+            _ => return None,
+        }
+    }
+    img
 }
 
 /// Render a blockquote container.
@@ -1582,6 +1690,38 @@ fn walk_inline(node: &SyntaxNode, cursor: CursorRange, base: InlineStyle, block:
                 }
             } else {
                 walk_styled_children(node, text_range, cursor, style, block);
+            }
+        }
+        NodeKind::Image {
+            delimiter_ranges,
+            alt_range,
+            dest_url,
+        } => {
+            // Image rendering mirrors inline math:
+            //
+            // **Cursor outside**: hide every byte and queue an
+            // `ImageOverlay`. The element layer loads the image,
+            // reserves horizontal space via a width-matched
+            // substitution, and paints the image at the
+            // substitution's display position.
+            //
+            // **Cursor inside**: fall back to dim delimiters + the
+            // raw alt text shaped in the normal color so the user
+            // can read and edit the markdown directly. (Alt text is
+            // user-authored prose — unlike math's LaTeX content, it
+            // wants normal styling, not mono.)
+            let inside = cursor.overlaps(&node.range);
+            if inside {
+                apply_delimiter_visibility(delimiter_ranges, true, block);
+                // Recurse into alt-text children so nested styling
+                // (`![**bold alt**](u)`) composes.
+                walk_styled_children(node, alt_range, cursor, base.clone(), block);
+            } else {
+                block.image_overlays.push(crate::render_spec::ImageOverlay {
+                    source_range: node.range.clone(),
+                    alt_range: alt_range.clone(),
+                    dest_url: dest_url.clone(),
+                });
             }
         }
         NodeKind::InlineMath {
@@ -3651,6 +3791,201 @@ mod tests {
         // Inner content range specifically — a sub-range of the
         // full hide.
         assert!(block.has_hidden_range(2..5));
+    }
+
+    // ---- Images ---------------------------------------------------------
+
+    #[test]
+    fn inline_image_outside_cursor_emits_image_overlay_only() {
+        // Cursor outside the construct: render emits the overlay
+        // record only (the element layer does the substitution +
+        // paint). No hidden range, no fallback inline runs.
+        let src = "x ![logo](u.png) y";
+        let spec = render_with_cursor(src, 0);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let overlay = block
+            .image_overlays
+            .iter()
+            .find(|o| o.source_range == (2..16))
+            .expect("image overlay emitted for cursor-outside inline image");
+        assert_eq!(overlay.alt_range, 4..8);
+        assert_eq!(overlay.dest_url, "u.png");
+        // Render must not pre-hide — that's the element layer's
+        // call (substitution covers the bytes on success; fallback
+        // shows the raw source on failure).
+        assert!(
+            !block
+                .hidden_ranges
+                .iter()
+                .any(|r| r.start == 2 && r.end == 16),
+            "render must not add the image.range hide; element does it on success"
+        );
+    }
+
+    #[test]
+    fn inline_image_dims_delimiters_when_cursor_inside() {
+        // Cursor inside the construct → fallback: dim `![` and
+        // `](url)`, alt text shapes in normal style so the user
+        // can edit. No overlay emitted (the typeset/load path is
+        // bypassed).
+        let src = "x ![logo](u.png) y";
+        // Cursor at byte 6 sits inside "logo" (the alt text).
+        let spec = render_with_cursor(src, 6);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(block.has_dimmed_range(2..4)); // `![`
+        assert!(block.has_dimmed_range(8..16)); // `](u.png)`
+        assert!(
+            block.image_overlays.is_empty(),
+            "no overlay emitted when cursor is inside the image construct"
+        );
+    }
+
+    #[test]
+    fn image_promotes_paragraph_with_single_image_child() {
+        // `![alt](url)` standalone promotes to an Image block —
+        // mirrors the DisplayMath promotion rule.
+        let src = "![logo](u.png)";
+        let spec = render_with_cursor(src, 999);
+        match &spec.blocks[0].kind {
+            BlockKind::Image {
+                alt_range,
+                dest_url,
+                edit_mode,
+            } => {
+                assert_eq!(alt_range.clone(), 2..6);
+                assert_eq!(dest_url, "u.png");
+                assert!(
+                    !*edit_mode,
+                    "cursor outside the construct should be display mode"
+                );
+            }
+            other => panic!("expected Image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_does_not_promote_mixed_paragraph() {
+        // `before ![alt](u) after` keeps the inline path — the
+        // paragraph has Text + Image + Text children, not a sole
+        // image. Same rule as DisplayMath's mixed-paragraph case.
+        let src = "before ![logo](u.png) after";
+        let spec = render_with_cursor(src, 0);
+        let has_image_block = spec
+            .blocks
+            .iter()
+            .any(|b| matches!(b.kind, BlockKind::Image { .. }));
+        assert!(
+            !has_image_block,
+            "mixed paragraph should keep inline rendering"
+        );
+    }
+
+    #[test]
+    fn image_enters_edit_mode_when_cursor_strictly_inside() {
+        // Cursor at byte 4 sits strictly inside `![logo](u.png)`
+        // (between 0 and 14) → edit_mode = true.
+        let src = "![logo](u.png)";
+        let spec = render_with_cursor(src, 4);
+        match spec.blocks[0].kind {
+            BlockKind::Image { edit_mode, .. } => assert!(edit_mode),
+            ref other => panic!("expected Image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_enters_edit_mode_when_cursor_touches_boundary() {
+        // Cursor at either edge of the construct (byte 0 or byte
+        // 14 in `![logo](u.png)`) counts as inside. Same inclusive-
+        // overlap rule as DisplayMath, for the same click-to-edit
+        // affordance.
+        let src = "![logo](u.png)";
+        for cursor in [0usize, 14] {
+            let spec = render_with_cursor(src, cursor);
+            match spec.blocks[0].kind {
+                BlockKind::Image { edit_mode, .. } => {
+                    assert!(edit_mode, "cursor at boundary {cursor} should be edit mode")
+                }
+                ref other => panic!("expected Image block, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn image_returns_to_display_mode_when_cursor_outside() {
+        let src = "![logo](u.png)\n\nrest";
+        let spec = render_with_cursor(src, 18); // cursor inside "rest"
+        let image_block = spec
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Image { .. }))
+            .expect("image block");
+        match image_block.kind {
+            BlockKind::Image { edit_mode, .. } => assert!(!edit_mode),
+            ref other => panic!("expected Image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_edit_mode_keeps_delimiters_visible_for_navigation() {
+        // Edit mode must leave `![` and `](url)` shaping into the
+        // line — hiding them would collapse bytes out of the
+        // display, breaking click hit-testing over the markdown
+        // source. Same invariant as DisplayMath edit mode.
+        let src = "![logo](u.png)";
+        let spec = render_with_cursor(src, 4);
+        let block = &spec.blocks[0];
+        assert!(
+            !block.has_hidden_range(0..2),
+            "`![` must shape (dimmed, not hidden) in edit mode for navigation"
+        );
+        assert!(
+            !block.has_hidden_range(6..14),
+            "`](url)` must shape (dimmed, not hidden) in edit mode for navigation"
+        );
+        assert!(block.has_dimmed_range(0..2));
+        assert!(block.has_dimmed_range(6..14));
+    }
+
+    #[test]
+    fn image_display_mode_pre_stages_fallback_runs() {
+        // Display mode (cursor outside): render pre-stages the
+        // fallback shape (dim delimiters + visible alt text) on the
+        // raw bytes but does NOT hide them — the element layer
+        // commits a hide only when it has a paintable image. This
+        // way, a failed load falls through to the dim-delim + alt-
+        // text shape (the same visual treatment as cursor-inside
+        // edit mode) so the user can see what went wrong, rather
+        // than staring at a blank row.
+        let src = "![logo](u.png)";
+        let spec = render_with_cursor(src, 999);
+        let block = &spec.blocks[0];
+        assert!(
+            !block.has_hidden_range(0..14),
+            "render must not pre-hide; the element layer owns the hide on success/loading"
+        );
+        assert!(block.has_dimmed_range(0..2));
+        assert!(block.has_dimmed_range(6..14));
+    }
+
+    #[test]
+    fn escapes_do_not_apply_inside_image_url() {
+        // The destination portion `](url)` is verbatim — a `\` in
+        // the URL should not trigger a CommonMark escape
+        // substitution. (Same treatment as link destinations.)
+        let src = r"![alt](foo\bar)";
+        let spec = render_with_cursor(src, 999);
+        let block = &spec.blocks[0];
+        // `\b` is not a CommonMark escape (b isn't punctuation), so
+        // the scanner wouldn't substitute anyway — but the
+        // verbatim coverage guards future-us against picking the
+        // wrong punctuation.
+        assert!(
+            !block
+                .substitutions
+                .iter()
+                .any(|s| s.source_range.start >= 6 && s.source_range.end <= 14),
+            "no markdown-level substitution inside image destination"
+        );
     }
 
     #[test]

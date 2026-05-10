@@ -128,6 +128,26 @@ pub enum NodeKind {
         text_range: ByteRange,
         dest_url: String,
     },
+    /// Inline image (`![alt](url)`). Structurally analogous to
+    /// [`Link`] — pulldown emits `Tag::Image` as a container whose
+    /// children are the inline alt-text content. `delimiter_ranges`
+    /// is `[![, ](url)]` (the opening `![` is two bytes; the closing
+    /// `](url)` covers everything from the closing `]` through the
+    /// trailing `)`). `alt_range` is the visible alt text between
+    /// `[` and `]`; `dest_url` is the image's source URL / path.
+    ///
+    /// Image rendering mirrors LaTeX math: when the cursor is
+    /// outside the construct the element layer loads the image and
+    /// paints it on top of a width-matched substitution; when the
+    /// cursor is inside, the renderer falls back to dim delimiters +
+    /// visible alt text so the user can edit the raw markdown. A
+    /// paragraph whose sole content is a single image promotes to
+    /// `BlockKind::Image` (analog of `BlockKind::DisplayMath`).
+    Image {
+        delimiter_ranges: Vec<ByteRange>,
+        alt_range: ByteRange,
+        dest_url: String,
+    },
     /// Thematic break — `---`, `***`, or `___` on its own line.
     /// Pulldown emits this as a leaf `Event::Rule`; the renderer
     /// paints a horizontal rule decoration and hides / dims the

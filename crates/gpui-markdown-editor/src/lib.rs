@@ -18,6 +18,7 @@ pub mod editor;
 pub mod element;
 pub mod escapes;
 pub mod event;
+pub mod image;
 pub mod math;
 pub mod parser;
 pub mod render;

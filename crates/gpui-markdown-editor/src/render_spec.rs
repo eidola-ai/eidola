@@ -78,6 +78,15 @@ pub struct RenderBlock {
     /// — the existing dim-delimiter / mono-content inline runs
     /// take over.
     pub math_overlays: Vec<MathOverlay>,
+    /// Inline image constructs (`![alt](url)`) the cursor is
+    /// currently outside of. Structurally identical to
+    /// [`math_overlays`](Self::math_overlays): the element layer
+    /// loads the image asynchronously, reserves horizontal space
+    /// via a width-matched [`Substitution`], and paints the image
+    /// at the substitution's display position. Block images
+    /// (sole-image paragraphs) promote to `BlockKind::Image`
+    /// instead and are painted directly by the element layer.
+    pub image_overlays: Vec<ImageOverlay>,
 }
 
 /// One inline math construct flagged for typeset rendering. Emitted
@@ -99,6 +108,24 @@ pub struct MathOverlay {
     /// (text style). Drives the initial math style passed to
     /// RaTeX's typesetter.
     pub display_style: bool,
+}
+
+/// One inline image construct flagged for inline rendering. Emitted
+/// by the render layer when the cursor is outside the construct's
+/// source range; consumed by the element layer. Mirrors
+/// [`MathOverlay`] — the same substitution + paint dance applies,
+/// just with image-cache lookup in place of math typesetting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageOverlay {
+    /// Source range of the *full* construct (`![alt](url)`).
+    pub source_range: Range<usize>,
+    /// Source range of the alt text (between `[` and `]`). The
+    /// element layer uses the alt text as the fallback inline run
+    /// when the image fails to load or while it is still loading.
+    pub alt_range: Range<usize>,
+    /// Image destination URL / file path. The element layer hands
+    /// this to gpui's image-cache loader.
+    pub dest_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,6 +207,7 @@ impl RenderBlock {
             marker_overlays: Vec::new(),
             substitutions: Vec::new(),
             math_overlays: Vec::new(),
+            image_overlays: Vec::new(),
         }
     }
 
@@ -252,6 +280,27 @@ pub enum BlockKind {
     /// `$$`-delimiter pairs).
     DisplayMath {
         content_range: Range<usize>,
+        edit_mode: bool,
+    },
+    /// Image block. Promoted from a paragraph whose sole
+    /// content-bearing child is an `Image` event, mirroring how
+    /// `BlockKind::DisplayMath` promotes from a sole-DisplayMath
+    /// paragraph.
+    ///
+    /// * **Display mode** (`edit_mode == false`) — cursor is *not*
+    ///   strictly inside the construct. The element layer loads
+    ///   `dest_url` via gpui's image cache and paints the image at
+    ///   its natural size, capped to the available content width.
+    /// * **Edit mode** (`edit_mode == true`) — cursor is strictly
+    ///   inside the construct. The block falls back to text shaping:
+    ///   `![` and `](url)` delimiters dim, the alt text shapes in
+    ///   normal weight so the user can edit the raw markdown.
+    ///
+    /// `alt_range` is the inner alt-text bytes (between `[` and `]`).
+    /// `dest_url` is the image source URL / path.
+    Image {
+        alt_range: Range<usize>,
+        dest_url: String,
         edit_mode: bool,
     },
 }

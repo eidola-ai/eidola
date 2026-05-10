@@ -6270,3 +6270,188 @@ fn auto_close_fence_fires_in_li_li_bq_chain(cx: &mut TestAppContext) {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Math navigation + editing
+// ---------------------------------------------------------------------------
+
+fn set_cursor(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    editor: &Entity<MarkdownEditor>,
+    offset: usize,
+) {
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(offset)),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn display_math_flips_to_edit_mode_on_arrow_into_construct(cx: &mut TestAppContext) {
+    // Cursor *just before* the math (byte 0 is also the math start
+    // — inclusive overlap puts it in edit mode immediately). Right
+    // arrow from somewhere outside should land inside; we verify
+    // the state transition by setting the cursor at the boundary
+    // and again one byte further in.
+    let initial = EditorState {
+        markdown: "$$x^2$$".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    // Inclusive overlap means cursor at 0 (boundary) is already
+    // edit mode.
+    let spec = current_spec(cx, &editor);
+    match spec.blocks[0].kind {
+        BlockKind::DisplayMath { edit_mode, .. } => assert!(
+            edit_mode,
+            "cursor at boundary should flip the block to edit mode"
+        ),
+        ref other => panic!("expected DisplayMath, got {other:?}"),
+    }
+    // Move strictly past the construct → display mode returns.
+    set_cursor(cx, handle, &editor, 7);
+    let spec = current_spec(cx, &editor);
+    match spec.blocks[0].kind {
+        BlockKind::DisplayMath { edit_mode, .. } => assert!(
+            edit_mode,
+            "byte 7 == math.end is still boundary-inclusive → edit mode"
+        ),
+        ref other => panic!("expected DisplayMath, got {other:?}"),
+    }
+}
+
+#[gpui::test]
+fn typing_inside_display_math_updates_source(cx: &mut TestAppContext) {
+    // Cursor strictly inside `$$x$$` (byte 3 — between `x` and the
+    // closing `$$`). Typing inserts a char into the LaTeX source;
+    // the block stays a DisplayMath block in edit mode while the
+    // user types.
+    let initial = EditorState {
+        markdown: "$$x$$".into(),
+        selection: Selection::Cursor(3),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("^2".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "$$x^2$$");
+        assert_eq!(e.cursor_offset(), 5);
+    });
+    // Still a DisplayMath block, still in edit mode.
+    let spec = current_spec(cx, &editor);
+    assert!(matches!(
+        spec.blocks[0].kind,
+        BlockKind::DisplayMath {
+            edit_mode: true,
+            ..
+        }
+    ));
+}
+
+#[gpui::test]
+fn backspace_inside_display_math_deletes_one_byte(cx: &mut TestAppContext) {
+    // Standard grapheme-delete inside math source — math isn't
+    // atomic at the byte level; users edit the LaTeX directly.
+    let initial = EditorState {
+        markdown: "$$x^2$$".into(),
+        selection: Selection::Cursor(5), // right after the `2`
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "$$x^$$");
+        assert_eq!(e.cursor_offset(), 4);
+    });
+}
+
+#[gpui::test]
+fn inline_math_outside_cursor_emits_overlay(cx: &mut TestAppContext) {
+    // Cursor not on the math at all (byte 0, before "see "). The
+    // render spec should carry a `MathOverlay` for `$x^2$` and no
+    // competing code-styled inline run for the inner content.
+    let initial = EditorState {
+        markdown: "see $x^2$ here".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let block = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::Paragraph))
+        .expect("paragraph");
+    assert_eq!(block.math_overlays.len(), 1);
+    let overlay = &block.math_overlays[0];
+    assert_eq!(overlay.source_range, 4..9);
+    assert_eq!(overlay.content_range, 5..8);
+    assert!(!overlay.display_style);
+}
+
+#[gpui::test]
+fn inline_math_dims_delimiters_when_cursor_enters(cx: &mut TestAppContext) {
+    // Cursor parked on the inner LaTeX of `$x^2$` (byte 6, between
+    // `x` and `^`). Delimiters dim, content shapes as code-styled
+    // mono text, and no typeset overlay is emitted — the user
+    // wants to read/edit the raw LaTeX.
+    let initial = EditorState {
+        markdown: "see $x^2$ here".into(),
+        selection: Selection::Cursor(6),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let block = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::Paragraph))
+        .expect("paragraph");
+    assert!(
+        block.math_overlays.is_empty(),
+        "cursor inside math should suppress the overlay path"
+    );
+    assert!(block.has_dimmed_range(4..5), "opening `$` should dim");
+    assert!(block.has_dimmed_range(8..9), "closing `$` should dim");
+}
+
+#[gpui::test]
+fn typing_inside_inline_math_extends_latex(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "$x$".into(),
+        selection: Selection::Cursor(2), // between `x` and `$`
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("^2".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "$x^2$");
+        assert_eq!(e.cursor_offset(), 4);
+    });
+}

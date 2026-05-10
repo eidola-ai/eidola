@@ -273,9 +273,41 @@ The first cut covers:
   flips to edit. KaTeX fonts auto-register on first display-math
   paint via `math::register_katex_fonts`; hosts may also call it
   at app init alongside their own font loads.
+- Images (`![alt](url)`): structurally identical to math — pulldown
+  emits `Tag::Image` as a container with the alt text as inline
+  children. `NodeKind::Image { delimiter_ranges, alt_range,
+  dest_url }` records the `![` / `](url)` delimiter pair and the
+  alt span between them. Two cursor-driven paths mirror inline
+  math:
+  - **Cursor outside**: render emits an `ImageOverlay`. The
+    element layer's `augment_block_with_images` pre-pass calls
+    `crate::image::load`, measures the natural size, caps height
+    to `INLINE_HEIGHT_FACTOR * line_height`, and substitutes a
+    width-matched NBSP run so surrounding text reserves space.
+    `paint_inline_image_overlays` paints each loaded image
+    vertically centered on the row that hosts its substitution.
+  - **Cursor inside**: dim-delimiter / visible-alt-text fallback
+    so the user can edit the raw markdown.
+  A paragraph whose sole content is an Image promotes to
+  `BlockKind::Image { alt_range, dest_url, edit_mode }` — same
+  promotion rule and inclusive-overlap edit-mode test as
+  `DisplayMath`. In display mode the element layer scales the
+  image to fit the available content width (`crate::image::block_size`)
+  and paints directly via `window.paint_image`. Image loading is
+  asynchronous: the cache returns `Loading` until the asset
+  resolves, `Failed` on error. `Loading` reserves a placeholder
+  (square at the inline height cap; ~8em-tall banner for block
+  images) and invalidates the view when the load completes;
+  `Failed` falls back to the dim-delimiter + alt-text inline run
+  pair so the user sees the construct and the broken URL. Loaders
+  for `http://`, `https://`, `file://`, and absolute paths come
+  for free via gpui's image cache; relative-path / embedded
+  resolution depends on hosts registering an `AssetSource`.
 
-Explicitly *out* of this phase: setext-heading normalization, images,
-tables, HTML, IME marked-text, word / line-aware delete.
+Explicitly *out* of this phase: setext-heading normalization, tables,
+HTML, IME marked-text, word / line-aware delete, reference-style
+images (`![alt][label]`), the `title` attribute on images, image
+data URIs, image links (`[![alt](img)](url)`).
 
 ### Container chain (composability invariant)
 
@@ -457,6 +489,7 @@ in code; keep both in sync.
 | `editor.rs` | `MarkdownEditor` — gpui `Render` view, owns state, dispatches actions |
 | `escapes.rs` | CommonMark §2.4 / §2.5 source-byte scanner. Returns one `ResolvedSpan` per `\X` or `&entity;` occurrence; the render post-pass turns each into a `Substitution` (cursor outside) or a dimmed `InlineRun` (cursor inside). |
 | `math.rs` | RaTeX adapter. `register_katex_fonts(text_system)` loads the bundled KaTeX TTFs; `typeset(latex, mode) -> MathLayout` parses + lays out a LaTeX expression; `MathLayout::paint(...)` walks RaTeX's `DisplayList` and emits native gpui paint ops (`paint_quad` for fraction bars and rects, `paint_path` for radicals, shaped glyph runs for letters / operators). |
+| `image.rs` | Image-cache adapter. `load(dest_url, window, cx) -> LoadedImage` routes a URL through gpui's image cache (`http`/`https`/`file`/absolute paths supported out of the box, embedded paths via the host's `AssetSource`). `inline_size` / `block_size` apply the height cap / width fit so inline and block images each scale predictably. `paint(image, bounds, window)` is the thin `window.paint_image` wrapper. Asynchronous: `LoadedImage::Loading` while in flight, `Failed` on error — the asset cache invalidates the view when a load resolves so the next frame sees the new state. |
 | `bin/demo.rs` | Standalone demo window |
 
 ## Theme integration

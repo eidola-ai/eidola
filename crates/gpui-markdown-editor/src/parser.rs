@@ -146,6 +146,17 @@ impl<'a> Walker<'a> {
                     range,
                 ));
             }
+            Tag::Image { dest_url, .. } => {
+                let (delim, alt_range) = self.image_delimiters(&range);
+                self.push_frame(SyntaxNode::new(
+                    NodeKind::Image {
+                        delimiter_ranges: delim,
+                        alt_range,
+                        dest_url: dest_url.into_string(),
+                    },
+                    range,
+                ));
+            }
             Tag::Emphasis => {
                 let (delim, content) = self.symmetric_delimiters(&range, 1);
                 self.push_frame(SyntaxNode::new(
@@ -583,6 +594,49 @@ impl<'a> Walker<'a> {
         let closer = p..range.end;
         let text_range = opener.end..p;
         (vec![opener, closer], text_range)
+    }
+
+    /// Compute delimiter and alt-text ranges for an inline image
+    /// `![alt](url)`. Pulldown's `Tag::Image` range covers the whole
+    /// construct from `!` through `)`. We split it into:
+    /// * `![` opening bracket (2 bytes — the bang plus the `[`)
+    /// * `](url "title"?)` — the closing `]` through the trailing
+    ///   `)`, so the entire destination portion hides when the
+    ///   cursor is outside the construct.
+    ///
+    /// The alt text lives between the two delimiter ranges. Reference
+    /// / collapsed images (`![alt]`, `![alt][label]`) follow the same
+    /// shape; the trailing delimiter covers whatever follows `]`.
+    fn image_delimiters(&self, range: &Range<usize>) -> (Vec<Range<usize>>, Range<usize>) {
+        let bytes = self.source.as_bytes();
+        let len = range.end.saturating_sub(range.start);
+        if len < 3
+            || bytes.get(range.start).copied() != Some(b'!')
+            || bytes.get(range.start + 1).copied() != Some(b'[')
+        {
+            // Unusual shape — fall back to a no-delimiter span so
+            // cursor geometry still works on the bytes.
+            return (Vec::new(), range.clone());
+        }
+        // Find the matching `]` — first unescaped `]` after `![`.
+        let mut p = range.start + 2;
+        while p < range.end {
+            if bytes[p] == b'\\' && p + 1 < range.end {
+                p += 2;
+                continue;
+            }
+            if bytes[p] == b']' {
+                break;
+            }
+            p += 1;
+        }
+        if p >= range.end {
+            return (Vec::new(), range.clone());
+        }
+        let opener = range.start..range.start + 2;
+        let closer = p..range.end;
+        let alt_range = opener.end..p;
+        (vec![opener, closer], alt_range)
     }
 
     /// Mark the currently-open `Item` frame as a task item. Pulldown
@@ -1023,6 +1077,62 @@ mod tests {
                 assert_eq!(dest_url, "https://example.com");
             }
             other => panic!("expected link, got {other:?}"),
+        }
+    }
+
+    // ---- Images --------------------------------------------------------
+
+    #[test]
+    fn parses_inline_image() {
+        let src = "see ![logo](https://example.com/img.png) here";
+        let nodes = parse(src);
+        let para = first(&nodes);
+        let image = para
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, NodeKind::Image { .. }))
+            .expect("image child");
+        match &image.kind {
+            NodeKind::Image {
+                delimiter_ranges,
+                alt_range,
+                dest_url,
+            } => {
+                assert_eq!(delimiter_ranges.len(), 2);
+                assert_eq!(&src[delimiter_ranges[0].clone()], "![");
+                assert_eq!(
+                    &src[delimiter_ranges[1].clone()],
+                    "](https://example.com/img.png)"
+                );
+                assert_eq!(&src[alt_range.clone()], "logo");
+                assert_eq!(dest_url, "https://example.com/img.png");
+            }
+            other => panic!("expected image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_image_with_empty_alt_text() {
+        let src = "![](foo.png)";
+        let nodes = parse(src);
+        let para = first(&nodes);
+        let image = para
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, NodeKind::Image { .. }))
+            .expect("image child");
+        match &image.kind {
+            NodeKind::Image {
+                delimiter_ranges,
+                alt_range,
+                dest_url,
+            } => {
+                assert_eq!(&src[delimiter_ranges[0].clone()], "![");
+                assert_eq!(&src[delimiter_ranges[1].clone()], "](foo.png)");
+                assert_eq!(&src[alt_range.clone()], "");
+                assert_eq!(dest_url, "foo.png");
+            }
+            other => panic!("expected image, got {other:?}"),
         }
     }
 
