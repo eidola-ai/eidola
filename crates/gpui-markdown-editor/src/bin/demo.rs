@@ -71,8 +71,10 @@ rule. The source bytes hide when the cursor is elsewhere and reveal
 
 ### Math
 
-Inline math like $x^2 + y^2 = z^2$ shapes in the mono font today
-(typeset rendering coming soon). Display math sits on its own row:
+Inline math like $x^2 + y^2 = z^2$ typesets right next to the
+prose, with a little extra row height for tall constructs such as
+$\\frac{1}{1-x}$ or $\\sqrt{x^2 + y^2}$. Display math sits on its
+own row:
 
 $$\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n$$
 

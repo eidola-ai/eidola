@@ -301,11 +301,16 @@ fn paint_glyph(
     let Some(line) = shaped else {
         return;
     };
-    // RaTeX's `y` is the glyph baseline; gpui's `WrappedLine::paint`
-    // origin is the *top* of the shaped line, so offset upward by
-    // the font's actual ascent.
+    // RaTeX's `y` is the glyph baseline. gpui's `WrappedLine::paint`
+    // vertically centers the shaped text within the row_height we
+    // pass it (here `glyph_em_px`); the actual baseline lands at
+    // `origin.y + (row_height - ascent - descent)/2 + ascent`.
+    // Solve for `glyph_top` so that gpui's centered baseline lands
+    // exactly at `origin.y + y_em*em`.
     let ascent = window.text_system().ascent(gpui_font_id, glyph_em_px);
-    let glyph_top = origin.y + px(y_em * em) - ascent;
+    let descent = window.text_system().descent(gpui_font_id, glyph_em_px);
+    let half_leading = ((glyph_em_px - ascent - descent) / 2.0).max(px(0.0));
+    let glyph_top = origin.y + px(y_em * em) - half_leading - ascent;
     let glyph_left = origin.x + px(x_em * em);
     let _ = line.paint(
         point(glyph_left, glyph_top),

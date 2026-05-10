@@ -232,6 +232,95 @@ struct InlineMathPaintSpec {
 /// the font produces, just with worse precision in the fallback case.
 const MATH_PAD_CHAR: char = '\u{202F}';
 
+/// Vertical reservation a single shaped line needs *beyond* the
+/// body line height to fit the tallest inline-math overlay sitting
+/// on it. `top` extends the row above its natural top edge; `bottom`
+/// extends past its natural bottom. Both are zero for math-free
+/// lines and for math whose ink overshoot fits inside the body
+/// font's natural leading. `gpui::WrappedLine::paint` centers text
+/// within the row_height we pass it, so a math row whose math fits
+/// inside the existing body leading needs no extra reservation —
+/// the math sits in the leading whitespace gpui was going to leave
+/// blank anyway.
+#[derive(Debug, Clone, Copy, Default)]
+struct MathRowExtra {
+    top: Pixels,
+    bottom: Pixels,
+}
+
+impl MathRowExtra {
+    fn total(&self) -> Pixels {
+        self.top + self.bottom
+    }
+}
+
+/// For a given shaped line, find the math overshoot above body
+/// ascent and below body descent among any overlays on the line,
+/// and convert each to a row *extra* — the overshoot that doesn't
+/// fit inside the body's natural half-leading. The layout pads the
+/// row by this extra; gpui's centered baseline still lands where
+/// it would for a body-only row, so math and surrounding text
+/// share a baseline regardless of whether the row was extended.
+fn compute_math_row_extra(
+    line_source_range: &Range<usize>,
+    inline_math: &[InlineMathPaintSpec],
+    body_ascent: Pixels,
+    body_descent: Pixels,
+    line_height: Pixels,
+) -> MathRowExtra {
+    let mut max_ascent_overshoot = px(0.0);
+    let mut max_descent_overshoot = px(0.0);
+    for spec in inline_math {
+        // Math overlays never straddle a logical line boundary
+        // (`augment_block_with_math` substitutes the entire
+        // construct with a non-breaking pad run), so the overlay
+        // belongs to whichever line contains its `source_range.start`.
+        if spec.source_range.start < line_source_range.start
+            || spec.source_range.start >= line_source_range.end
+        {
+            continue;
+        }
+        let math_size = spec.layout.size(spec.em_px);
+        let math_baseline = spec.layout.baseline(spec.em_px);
+        let math_descent = math_size.height - math_baseline;
+        let ascent_over = (math_baseline - body_ascent).max(px(0.0));
+        let descent_over = (math_descent - body_descent).max(px(0.0));
+        if ascent_over > max_ascent_overshoot {
+            max_ascent_overshoot = ascent_over;
+        }
+        if descent_over > max_descent_overshoot {
+            max_descent_overshoot = descent_over;
+        }
+    }
+    // Body's half-leading — half the gap between the line's natural
+    // text height (ascent+descent) and the line_height it's painted
+    // in. Math whose overshoot fits within this half-leading needs
+    // no extra row reservation; gpui's centering already leaves
+    // that much blank space above and below the text glyphs.
+    let body_leading_half = ((line_height - body_ascent - body_descent) / 2.0).max(px(0.0));
+    MathRowExtra {
+        top: (max_ascent_overshoot - body_leading_half).max(px(0.0)),
+        bottom: (max_descent_overshoot - body_leading_half).max(px(0.0)),
+    }
+}
+
+/// Body-font ascent / descent at the given font size for the
+/// block's primary font. Used to compute math-row padding —
+/// any math overlay taller than the body font extends the row
+/// above and/or below.
+fn body_metrics_for_block(
+    kind: &BlockKind,
+    style: &MarkdownStyle,
+    em_px: Pixels,
+    window: &mut Window,
+) -> (Pixels, Pixels) {
+    let body_font = base_font_for_block(kind, style);
+    let body_font_id = window.text_system().resolve_font(&body_font);
+    let ascent = window.text_system().ascent(body_font_id, em_px);
+    let descent = window.text_system().descent(body_font_id, em_px);
+    (ascent, descent)
+}
+
 /// Pre-pass that turns each `MathOverlay` on a block into a
 /// width-matched `Substitution` of narrow non-breaking spaces and
 /// produces a paint spec the element layer paints atop the shaped
@@ -486,10 +575,14 @@ impl Element for BlockElement {
                 let wrap_w = if is_code { None } else { Some(inner_w) };
                 // Inline math: typeset each overlay and substitute a
                 // width-matched run of NBSPs so wrap math sees the
-                // math's pixel width. Paint specs are discarded
-                // here — `request_layout` only needs height.
-                let (augmented_block, _paint_specs) =
+                // math's pixel width. Paint specs flow through to
+                // `shaped_content_height` so the block's reserved
+                // height grows for any line whose math is taller
+                // than the body font.
+                let (augmented_block, paint_specs) =
                     augment_block_with_math(&block_clone, &source, font_size, &style_clone, window);
+                let (body_ascent, body_descent) =
+                    body_metrics_for_block(&block_clone.kind, &style_clone, font_size, window);
                 let lines = shape_block_lines(
                     &source,
                     &augmented_block,
@@ -504,18 +597,27 @@ impl Element for BlockElement {
                 // `extra_below`. The same content arithmetic runs in
                 // `prepaint` to position lines — extracted into
                 // `shaped_content_height` so the two phases can't
-                // drift on wrap math, breathing pads, or the empty-
-                // block fallback. `spacing_below` is part of the
-                // layout box so per-block decorations spanning
-                // `bounds` minus the extras (e.g. the blockquote
-                // border bar) extend symmetric around the content
-                // rows; the extras themselves sit *outside* the
-                // decoration so they read as inter-block breathing
-                // room rather than part of the construct.
+                // drift on wrap math, breathing pads, the empty-
+                // block fallback, or per-line math row padding.
+                // `spacing_below` is part of the layout box so
+                // per-block decorations spanning `bounds` minus the
+                // extras (e.g. the blockquote border bar) extend
+                // symmetric around the content rows; the extras
+                // themselves sit *outside* the decoration so they
+                // read as inter-block breathing room rather than
+                // part of the construct.
                 let h = extra_above
                     + spacing_above
                     + inner_pad * 2.
-                    + shaped_content_height(&lines, line_height, is_code, &style_clone)
+                    + shaped_content_height(
+                        &lines,
+                        line_height,
+                        &paint_specs,
+                        body_ascent,
+                        body_descent,
+                        is_code,
+                        &style_clone,
+                    )
                     + spacing_below
                     + extra_below;
                 Size {
@@ -588,6 +690,8 @@ impl Element for BlockElement {
         // gets shaped.
         let (augmented_block, inline_math_specs) =
             augment_block_with_math(&self.block, &source, font_size, &style, window);
+        let (body_ascent, body_descent) =
+            body_metrics_for_block(&self.block.kind, &style, font_size, window);
         let shaped =
             shape_block_lines(&source, &augmented_block, &style, font_size, wrap_w, window);
 
@@ -620,8 +724,28 @@ impl Element for BlockElement {
                     strip_bottom = Some(content_cursor_y);
                 }
             }
-            let wrapped_h = line_height * ((sl.line.wrap_boundaries().len() as f32) + 1.0);
-            let origin = point(content_left, content_cursor_y);
+            // A line carrying math overlays taller than what the
+            // body's natural half-leading already covers reserves
+            // extra vertical space — `top` above the row's natural
+            // top, `bottom` past its natural bottom. The row_height
+            // passed to gpui stays at `line_height` so its
+            // internal text-vertical-centering keeps the body
+            // baseline in the same place across math and non-math
+            // rows; we shift `origin.y` down by `extra.top` so the
+            // *visible* row top floats up by that amount. Math
+            // overlays paint relative to `line.origin.y + ...`,
+            // and the formula in `paint_inline_math_overlays`
+            // accounts for gpui's centering using `line.row_height`.
+            let extra = compute_math_row_extra(
+                &sl.source_range,
+                &inline_math_specs,
+                body_ascent,
+                body_descent,
+                line_height,
+            );
+            let wrap_count = (sl.line.wrap_boundaries().len() as f32) + 1.0;
+            let wrapped_h = (line_height + extra.total()) * wrap_count;
+            let origin = point(content_left, content_cursor_y + extra.top);
             if !sl.is_delimiter && sl.line.width() > max_content_line_width {
                 max_content_line_width = sl.line.width();
             }
@@ -1477,12 +1601,19 @@ fn paint_inline_math_overlays(
             None => continue,
         };
         let math_left = line.origin.x + local.x;
-        // Align math baseline with text baseline. The math's own
-        // baseline sits `layout.baseline(em_px)` below its top;
-        // place the math top so that distance lands on the body
-        // font's text baseline (= `ascent` below the row top).
+        // gpui's `WrappedLine::paint` vertically *centers* the
+        // shaped text within the row_height: the actual baseline
+        // lands at `origin.y + (row_height - text_height)/2 +
+        // ascent`. We mirror that math here so the math overlay
+        // sits on the same baseline gpui drew the surrounding text
+        // on. Skipping the half-leading offset (using just
+        // `origin.y + ascent`) was what the user spotted as math
+        // sitting too high in body-text rows.
         let body_ascent = window.text_system().ascent(body_font_id, spec.em_px);
-        let text_baseline = line.origin.y + local.y + body_ascent;
+        let body_descent = window.text_system().descent(body_font_id, spec.em_px);
+        let text_height = body_ascent + body_descent;
+        let half_leading = ((line.row_height - text_height) / 2.0).max(px(0.0));
+        let text_baseline = line.origin.y + local.y + half_leading + body_ascent;
         let math_baseline = spec.layout.baseline(spec.em_px);
         let math_top = text_baseline - math_baseline;
         spec.layout.paint(
@@ -1945,6 +2076,9 @@ struct ShapedLine {
 fn shaped_content_height(
     lines: &[ShapedLine],
     line_height: Pixels,
+    inline_math: &[InlineMathPaintSpec],
+    body_ascent: Pixels,
+    body_descent: Pixels,
     is_code: bool,
     style: &MarkdownStyle,
 ) -> Pixels {
@@ -1953,7 +2087,21 @@ fn shaped_content_height(
     }
     let mut h = px(0.0);
     for line in lines {
-        h += line_height * ((line.line.wrap_boundaries().len() as f32) + 1.0);
+        // Math overshoot beyond body ascent + half-leading extends
+        // the row above its natural top; analogous overshoot below
+        // descent extends past the bottom. The row height passed to
+        // gpui stays at `line_height` so the body baseline lands at
+        // the same fraction of the row regardless of whether math
+        // is present — surrounding lines visually align.
+        let extra = compute_math_row_extra(
+            &line.source_range,
+            inline_math,
+            body_ascent,
+            body_descent,
+            line_height,
+        );
+        let row_h = line_height + extra.total();
+        h += row_h * ((line.line.wrap_boundaries().len() as f32) + 1.0);
     }
     if is_code {
         let mut last_was_delim = true; // "above the block" is a fence
@@ -2875,5 +3023,108 @@ mod tests {
     fn empty_doc_offset_zero_claimed_by_anchor_block() {
         let claims = cursor_claims_per_offset("");
         assert_eq!(claims, vec![vec![0]]);
+    }
+
+    /// Run `augment_block_with_math` against the first paragraph
+    /// block of `src` and return per-line row-extra totals (extra
+    /// vertical space the math overlay forces *beyond* the body
+    /// line height).
+    fn math_row_extra_totals(cx: &mut TestAppContext, src: &str) -> Vec<Pixels> {
+        let state = EditorState {
+            markdown: src.into(),
+            selection: Selection::Cursor(0),
+        };
+        let tree = parse(src);
+        let blocks = render(&state, &tree).blocks;
+        let src_owned = src.to_string();
+
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| EmptyRoot))
+                .expect("open window")
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let style = MarkdownStyle::from_theme(cx);
+            let block = blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("paragraph block");
+            let font_size = font_size_for_block(&block.kind, &style);
+            let line_height = font_size * style.line_height.0;
+            let (_aug, paint_specs) =
+                augment_block_with_math(block, &src_owned, font_size, &style, window);
+            let (body_ascent, body_descent) =
+                body_metrics_for_block(&block.kind, &style, font_size, window);
+            let shaped = shape_block_lines(
+                &src_owned,
+                block,
+                &style,
+                font_size,
+                Some(px(720.0)),
+                window,
+            );
+            shaped
+                .into_iter()
+                .map(|sl| {
+                    compute_math_row_extra(
+                        &sl.source_range,
+                        &paint_specs,
+                        body_ascent,
+                        body_descent,
+                        line_height,
+                    )
+                    .total()
+                })
+                .collect()
+        })
+        .expect("update window")
+    }
+
+    #[gpui::test]
+    fn plain_paragraph_has_zero_math_row_extra(cx: &mut TestAppContext) {
+        // Math-free lines never extend their row reservation —
+        // the body font's natural ascent / descent already covers
+        // the shaped text.
+        let totals = math_row_extra_totals(cx, "just plain prose");
+        assert!(totals.iter().all(|p| *p == px(0.0)));
+    }
+
+    #[gpui::test]
+    fn tall_inline_math_extends_row_reservation(cx: &mut TestAppContext) {
+        // `$\frac{a}{b}$` typesets a fraction whose total height
+        // (numerator + bar + denominator) is taller than the body
+        // font's ascent + descent + leading at the same em size.
+        // The row extra must be > 0 — that's the layout-level
+        // guarantee the math doesn't clip into adjacent rows.
+        let totals = math_row_extra_totals(cx, r"see $\frac{a}{b}$ here");
+        assert_eq!(totals.len(), 1, "single shaped line");
+        assert!(
+            totals[0] > px(0.0),
+            "tall fraction must extend row reservation (got {:?})",
+            totals[0]
+        );
+    }
+
+    #[gpui::test]
+    fn tall_math_extends_row_more_than_short_math(cx: &mut TestAppContext) {
+        // The extra scales with the math's ink overshoot beyond
+        // the body font's half-leading. A single italic letter
+        // (`$x$`) typically fits inside the half-leading and adds
+        // zero extra; a fraction (`$\frac{a}{b}$`) overshoots
+        // significantly. We don't pin an exact px value because
+        // the body-vs-math metric delta is font-bound; the
+        // layout-level invariant is just that tall math extends
+        // strictly more than short math.
+        let short = math_row_extra_totals(cx, "see $x$ here");
+        let tall = math_row_extra_totals(cx, r"see $\frac{a}{b}$ here");
+        assert_eq!(short.len(), 1);
+        assert_eq!(tall.len(), 1);
+        assert!(
+            tall[0] > short[0] + px(2.0),
+            "tall math should add noticeably more row extra than short math: tall={:?} short={:?}",
+            tall[0],
+            short[0],
+        );
     }
 }
