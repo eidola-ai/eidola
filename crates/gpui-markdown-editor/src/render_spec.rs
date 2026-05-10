@@ -67,6 +67,38 @@ pub struct RenderBlock {
     /// click on the bullet lands at the start of the original
     /// marker bytes.
     pub substitutions: Vec<Substitution>,
+    /// Inline math constructs (`$..$`, and `$$..$$` that didn't
+    /// promote to a `BlockKind::DisplayMath`) the cursor is
+    /// currently outside of. The element layer typesets each
+    /// overlay via [`crate::math`], inserts a width-matched
+    /// non-breaking-space [`Substitution`] at shape time so the
+    /// surrounding text reserves horizontal space for the typeset
+    /// math, and paints the math layout at the substitution's
+    /// display position. Cursor-inside is the empty-overlays case
+    /// — the existing dim-delimiter / mono-content inline runs
+    /// take over.
+    pub math_overlays: Vec<MathOverlay>,
+}
+
+/// One inline math construct flagged for typeset rendering. Emitted
+/// by the render layer when the cursor is outside the construct's
+/// source range; consumed by the element layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MathOverlay {
+    /// Source range of the *full* construct (delimiter run +
+    /// content + closing delimiter run). The element-layer
+    /// substitution covers the whole range so no source bytes
+    /// shape into the line under the typeset overlay.
+    pub source_range: Range<usize>,
+    /// Source range of the inner LaTeX (between the delimiter
+    /// runs). The element layer slices the source string to feed
+    /// the typesetter — keeping the slice owned by the buffer
+    /// avoids a per-render allocation per math span.
+    pub content_range: Range<usize>,
+    /// `true` for `$$..$$` (display style), `false` for `$..$`
+    /// (text style). Drives the initial math style passed to
+    /// RaTeX's typesetter.
+    pub display_style: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +179,7 @@ impl RenderBlock {
             containers: Vec::new(),
             marker_overlays: Vec::new(),
             substitutions: Vec::new(),
+            math_overlays: Vec::new(),
         }
     }
 

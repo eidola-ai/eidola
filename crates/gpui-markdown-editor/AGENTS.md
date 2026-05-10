@@ -239,9 +239,22 @@ The first cut covers:
 - LaTeX math: inline `$x^2$` and display `$$ ... $$`. Pulldown's
   `Event::InlineMath` / `Event::DisplayMath` produce
   `NodeKind::InlineMath` / `NodeKind::DisplayMath`. Inline math
-  v1 shapes the inner LaTeX in the mono font with `$` delimiters
-  hidden / dimmed per cursor; future iterations will typeset it
-  inline via `crate::math`. Display math promotes a paragraph
+  has two paths driven by the cursor:
+  - **Cursor outside** the construct: the render layer hides
+    every byte and emits a `MathOverlay` record. The element
+    layer's `augment_block_with_math` pre-pass typesets each
+    overlay via `crate::math::typeset`, measures the result,
+    and substitutes a width-matched run of NBSPs (U+00A0) in
+    place of the source bytes. The shaped line reserves
+    horizontal space for the math; surrounding text shapes
+    around it. After painting the line text, the paint phase
+    locates each substitution's display offset and paints the
+    typeset math at that x with baseline aligned to the line's
+    text baseline (≈0.78 of row height from row top).
+  - **Cursor inside** the construct: fall back to the
+    dim-delimiter / mono-content path so the user can read and
+    edit the raw LaTeX directly.
+  Display math promotes a paragraph
   whose sole content is a `DisplayMath` to
   `BlockKind::DisplayMath { content_range, edit_mode }`. The
   block has two render paths:
@@ -262,8 +275,7 @@ The first cut covers:
   at app init alongside their own font loads.
 
 Explicitly *out* of this phase: setext-heading normalization, images,
-tables, HTML, IME marked-text, word / line-aware delete, inline-math
-typeset rendering (the current path shapes raw LaTeX in mono).
+tables, HTML, IME marked-text, word / line-aware delete.
 
 ### Container chain (composability invariant)
 

@@ -21,7 +21,10 @@ use gpui::{
 use smallvec::SmallVec;
 
 use crate::editor::MarkdownEditor;
-use crate::render_spec::{BlockKind, Container, InlineStyle, ListItemKind, RenderBlock};
+use crate::render_spec::{
+    BlockKind, Container, InlineRun, InlineStyle, ListItemKind, MathOverlay, RenderBlock,
+    Substitution,
+};
 use crate::state::Selection;
 use crate::style::MarkdownStyle;
 
@@ -194,6 +197,12 @@ pub struct PrepaintState {
     /// origin. Edit mode falls back to text shaping and uses the
     /// regular `laid_out.lines` path.
     math_paint: Option<MathPaint>,
+    /// Inline-math overlays that were typeset and substituted into
+    /// the shaped lines. Each entry carries the typeset
+    /// `MathLayout` plus the source range that was substituted —
+    /// the paint phase locates the substitution's display offset in
+    /// `laid_out.lines` and paints the math there.
+    inline_math: Vec<InlineMathPaintSpec>,
 }
 
 /// Paint state for a typeset display-math block.
@@ -201,6 +210,161 @@ struct MathPaint {
     layout: crate::math::MathLayout,
     origin: Point<Pixels>,
     em_px: Pixels,
+}
+
+/// One inline-math overlay that's been typeset and is awaiting
+/// paint. `source_range` matches the overlay we substituted into
+/// the shaped line, so the paint phase can find the substitution's
+/// display offset by walking each shaped line's `display_to_source`.
+struct InlineMathPaintSpec {
+    source_range: Range<usize>,
+    layout: crate::math::MathLayout,
+    em_px: Pixels,
+    display_style: bool,
+}
+
+/// Pre-pass that turns each `MathOverlay` on a block into a
+/// width-matched `Substitution` of non-breaking spaces and produces
+/// a paint spec the element layer paints atop the shaped line.
+///
+/// The substitution mechanism is what reserves horizontal space for
+/// the typeset math: `build_display_line` replaces the math's
+/// source bytes with a run of NBSPs whose total advance approximates
+/// the math's pixel width, so surrounding text shapes around it
+/// instead of overlapping. The math paints on top of those NBSPs at
+/// their shaped-line position.
+///
+/// Returns a clone of `block` with the math substitutions appended,
+/// plus one `InlineMathPaintSpec` per successfully-typeset overlay.
+/// Overlays whose LaTeX fails to parse are dropped — the pre-existing
+/// hidden range covering the construct stays in place, leaving a
+/// blank gap rather than a crash. (A future iteration could fall
+/// back to shaping the raw LaTeX for failed overlays; v1 prefers
+/// the silent gap.)
+fn augment_block_with_math(
+    block: &RenderBlock,
+    source: &str,
+    em_px: Pixels,
+    style: &MarkdownStyle,
+    window: &mut Window,
+) -> (RenderBlock, Vec<InlineMathPaintSpec>) {
+    if block.math_overlays.is_empty() {
+        return (block.clone(), Vec::new());
+    }
+    // Idempotent — the OnceLock guard keeps subsequent calls cheap.
+    // Hosts may also have called this already at app init.
+    let _ = crate::math::register_katex_fonts(&window.text_system().clone());
+
+    let nbsp_advance = measure_nbsp_advance(em_px, style, &block.kind, window);
+
+    let mut augmented = block.clone();
+    let mut paint_specs: Vec<InlineMathPaintSpec> = Vec::new();
+
+    for overlay in &block.math_overlays {
+        let Some(latex) = source.get(overlay.content_range.clone()) else {
+            // Source bounds got out from under us — fall back to
+            // raw shaping (no substitution, no overlay). Treat it
+            // the same as a typeset failure so the user at least
+            // sees the construct.
+            push_failed_overlay_fallback(&mut augmented, overlay);
+            continue;
+        };
+        let mode = if overlay.display_style {
+            crate::math::MathMode::Display
+        } else {
+            crate::math::MathMode::Inline
+        };
+        let math_layout = match crate::math::typeset(latex, mode) {
+            Ok(l) => l,
+            Err(_) => {
+                // Typeset failed — render the raw `$..$` source
+                // dimmed (delimiters) + mono (content) so the user
+                // can see and correct the bad LaTeX. This is the
+                // same visual treatment used when the cursor sits
+                // strictly inside a (well-formed) math construct,
+                // so the failure mode reads as "still markdown,
+                // just hasn't been typeset yet."
+                push_failed_overlay_fallback(&mut augmented, overlay);
+                continue;
+            }
+        };
+        let math_width = math_layout.size(em_px).width;
+        // Round up so the math has a tiny bit of trailing slack
+        // rather than visually overlapping the next text glyph.
+        // Floor would risk over-cropping. Min 1 NBSP guarantees
+        // at least one substitution character lands in the line so
+        // `display_to_source` carries the math's source position.
+        let nbsp_count =
+            ((f32::from(math_width) / f32::from(nbsp_advance).max(1.0)).ceil() as usize).max(1);
+        let display: String = "\u{00A0}".repeat(nbsp_count);
+        augmented.substitutions.push(Substitution {
+            source_range: overlay.source_range.clone(),
+            display,
+        });
+        paint_specs.push(InlineMathPaintSpec {
+            source_range: overlay.source_range.clone(),
+            layout: math_layout,
+            em_px,
+            display_style: overlay.display_style,
+        });
+    }
+
+    let _ = (style,); // kept on the signature for future per-overlay font selection
+    (augmented, paint_specs)
+}
+
+/// Append fallback inline runs for a math overlay whose typeset
+/// failed (or whose source slice was unexpectedly out of bounds).
+/// The construct's source bytes shape as raw text — this just
+/// styles them: dim for the `$` / `$$` delimiter runs, code (mono +
+/// faint background) for the content. Mirrors the cursor-inside
+/// branch in `render::walk_inline` so the visual is identical
+/// whether the user is actively editing the construct or simply
+/// looking at a malformed expression.
+fn push_failed_overlay_fallback(block: &mut RenderBlock, overlay: &MathOverlay) {
+    let opener = overlay.source_range.start..overlay.content_range.start;
+    let closer = overlay.content_range.end..overlay.source_range.end;
+    for delim in [opener, closer] {
+        if !delim.is_empty() {
+            block.inlines.push(InlineRun {
+                source_range: delim,
+                style: InlineStyle::dimmed(),
+            });
+        }
+    }
+    if overlay.content_range.start < overlay.content_range.end {
+        block.inlines.push(InlineRun {
+            source_range: overlay.content_range.clone(),
+            style: InlineStyle::code(),
+        });
+    }
+}
+
+/// Shape one non-breaking space at the block's body font and report
+/// its advance — used to size math substitutions in
+/// [`augment_block_with_math`].
+fn measure_nbsp_advance(
+    em_px: Pixels,
+    style: &MarkdownStyle,
+    kind: &BlockKind,
+    window: &mut Window,
+) -> Pixels {
+    let font = base_font_for_block(kind, style);
+    let runs = [TextRun {
+        // U+00A0 (NBSP) is 2 bytes in UTF-8.
+        len: "\u{00A0}".len(),
+        font,
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }];
+    let line = window
+        .text_system()
+        .shape_text(SharedString::from("\u{00A0}"), em_px, &runs, None, None)
+        .ok()
+        .and_then(|mut v| v.drain(..).next());
+    line.map(|l| l.width()).unwrap_or(em_px * 0.5)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -308,9 +472,15 @@ impl Element for BlockElement {
                 // scrolls horizontally to see them. Other blocks wrap
                 // at the indented inner width.
                 let wrap_w = if is_code { None } else { Some(inner_w) };
+                // Inline math: typeset each overlay and substitute a
+                // width-matched run of NBSPs so wrap math sees the
+                // math's pixel width. Paint specs are discarded
+                // here — `request_layout` only needs height.
+                let (augmented_block, _paint_specs) =
+                    augment_block_with_math(&block_clone, &source, font_size, &style_clone, window);
                 let lines = shape_block_lines(
                     &source,
-                    &block_clone,
+                    &augmented_block,
                     &style_clone,
                     font_size,
                     wrap_w,
@@ -400,7 +570,14 @@ impl Element for BlockElement {
         let visible_content_width = (block_width - inner_pad * 2.).max(px(1.0));
 
         let wrap_w = if is_code { None } else { Some(block_width) };
-        let shaped = shape_block_lines(&source, &self.block, &style, font_size, wrap_w, window);
+        // Inline math: typeset overlays and substitute width-matched
+        // NBSPs into a working clone of the block. Paint specs flow
+        // through to the paint phase; the augmented block is what
+        // gets shaped.
+        let (augmented_block, inline_math_specs) =
+            augment_block_with_math(&self.block, &source, font_size, &style, window);
+        let shaped =
+            shape_block_lines(&source, &augmented_block, &style, font_size, wrap_w, window);
 
         let mut lines: Vec<LaidOutLine> = Vec::new();
         let mut content_cursor_y = content_top;
@@ -624,6 +801,7 @@ impl Element for BlockElement {
             selection_quads,
             code_block_paint,
             math_paint,
+            inline_math: inline_math_specs,
         }
     }
 
@@ -900,6 +1078,17 @@ impl Element for BlockElement {
                     cx,
                 );
             }
+            // Inline math overlays paint *after* the line text (so
+            // they sit on top of the NBSP placeholders that
+            // reserved the space) but *before* the cursor (so the
+            // caret remains visible above the math).
+            paint_inline_math_overlays(
+                &prepaint.inline_math,
+                &prepaint.laid_out.lines,
+                &self.style,
+                window,
+                cx,
+            );
             if focused && let Some(tq) = cursor_quad {
                 window.paint_quad(tq.quad);
             }
@@ -1216,6 +1405,79 @@ fn compute_marker_overlay_caret(
     }
     let _ = kind;
     None
+}
+
+/// Paint each inline math overlay over the NBSP placeholder run
+/// that reserved its horizontal space. For each overlay:
+///
+/// 1. Find the laid-out line whose source range contains the
+///    overlay's `source_range.start` (a math construct never spans
+///    multiple shaped lines because `augment_block_with_math`
+///    substitutes the whole construct with NBSPs that wrap as a
+///    single block).
+/// 2. Walk the line's `display_to_source` map to find the display
+///    byte offset where the substitution begins.
+/// 3. Convert that display offset to a pixel `x` via
+///    `WrappedLine::position_for_index`.
+/// 4. Compute the `y` so the math's baseline aligns with the line's
+///    text baseline. The line doesn't expose its own ascent, so we
+///    approximate text-baseline-from-top as `0.78 * row_height`
+///    (sane for both serif and sans body fonts at typical sizes —
+///    matches the same heuristic in `crate::math::paint_glyph`).
+fn paint_inline_math_overlays(
+    specs: &[InlineMathPaintSpec],
+    lines: &[LaidOutLine],
+    style: &MarkdownStyle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if specs.is_empty() {
+        return;
+    }
+    for spec in specs {
+        let Some(line) = lines.iter().find(|l| {
+            l.source_range.start <= spec.source_range.start
+                && spec.source_range.start < l.source_range.end
+        }) else {
+            continue;
+        };
+        // Locate the display offset where this substitution starts.
+        // `display_to_source` is dense — one entry per display byte
+        // plus a sentinel — so the first index whose mapped source
+        // == spec.source_range.start is the substitution's leading
+        // edge.
+        let display_offset = line
+            .display_to_source
+            .iter()
+            .position(|&src| src == spec.source_range.start);
+        let Some(display_offset) = display_offset else {
+            continue;
+        };
+        let local = match line
+            .line
+            .position_for_index(display_offset, line.row_height)
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        let math_left = line.origin.x + local.x;
+        // Align math baseline with text baseline. The math's own
+        // baseline sits `layout.baseline(em_px)` below its top;
+        // place the math top so that distance lands on the line's
+        // text-baseline (≈ 0.78 of the row height from the row's
+        // top).
+        let text_baseline = line.origin.y + local.y + spec.em_px * 0.78;
+        let math_baseline = spec.layout.baseline(spec.em_px);
+        let math_top = text_baseline - math_baseline;
+        spec.layout.paint(
+            point(math_left, math_top),
+            spec.em_px,
+            style.text_color,
+            window,
+            cx,
+        );
+        let _ = spec.display_style; // currently unused; retained for future styling
+    }
 }
 
 /// Paint the rule for a `BlockKind::ThematicBreak` — a thin

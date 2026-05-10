@@ -1592,20 +1592,53 @@ fn walk_inline(node: &SyntaxNode, cursor: CursorRange, base: InlineStyle, block:
             delimiter_ranges,
             content_range,
         } => {
-            // V1: render math source as inline-code-like text — `$` /
-            // `$$` delimiters hide / dim per the cursor rule, inner
-            // LaTeX shapes in the mono font so the user can read and
-            // edit it. Real typesetting via `crate::math` lands in a
-            // follow-up: the structural shape (delimiter ranges,
-            // content range, cursor-inside semantics) is identical
-            // either way, so the swap is a paint-layer change only.
+            // Inline math (and inline-positioned display math —
+            // `$$..$$` that didn't promote to a block because the
+            // host paragraph has surrounding text). Two paths:
+            //
+            // **Cursor outside** the construct: hide every byte and
+            // emit a `MathOverlay`. The element layer typesets,
+            // substitutes a width-matched run of non-breaking
+            // spaces so the line reserves horizontal space, and
+            // paints the typeset math at the substitution's
+            // display position. The result composes with surrounding
+            // text on the same shaped line.
+            //
+            // **Cursor inside** the construct: fall back to
+            // dim-delimiter / mono-content shaping so the user can
+            // read and edit the raw LaTeX directly. No overlay —
+            // `MathOverlay` is for the typeset rendering only.
             let inside = cursor.overlaps(&node.range);
-            apply_delimiter_visibility(delimiter_ranges, inside, block);
-            if content_range.start < content_range.end {
-                let style = base.clone().merge(InlineStyle::code());
-                block.inlines.push(InlineRun {
-                    source_range: content_range.clone(),
-                    style,
+            if inside {
+                apply_delimiter_visibility(delimiter_ranges, true, block);
+                if content_range.start < content_range.end {
+                    let style = base.clone().merge(InlineStyle::code());
+                    block.inlines.push(InlineRun {
+                        source_range: content_range.clone(),
+                        style,
+                    });
+                }
+            } else {
+                // Cursor outside — queue a typeset overlay and
+                // *don't* add a hidden range here. Suppressing the
+                // source bytes is the element layer's job, and it
+                // does it differently per typeset outcome:
+                //
+                //   - **Success**: the NBSP `Substitution` it adds
+                //     replaces the source bytes by definition, so no
+                //     separate hidden range is needed.
+                //   - **Failure**: the source bytes shape as
+                //     fallback (dim delimiters + mono content)
+                //     so the user sees the raw LaTeX they need to
+                //     fix.
+                //
+                // Routing the hide through the element layer keeps
+                // the failure path from leaving a blank gap.
+                let display_style = matches!(node.kind, NodeKind::DisplayMath { .. });
+                block.math_overlays.push(crate::render_spec::MathOverlay {
+                    source_range: node.range.clone(),
+                    content_range: content_range.clone(),
+                    display_style,
                 });
             }
         }
@@ -3422,20 +3455,42 @@ mod tests {
     // ---- Math -----------------------------------------------------------
 
     #[test]
-    fn inline_math_hides_delimiters_when_cursor_outside() {
+    fn inline_math_outside_cursor_emits_math_overlay_only() {
+        // Cursor outside the construct: render emits *only* the
+        // overlay (no hidden range, no fallback inline runs). The
+        // element layer chooses what to do at paint time —
+        // substitution + paint on typeset success, or
+        // dim/mono fallback runs on failure. Routing the source-
+        // hide through the element layer is what enables the
+        // failed-overlay fallback to show raw LaTeX instead of a
+        // blank gap.
         let src = "x $a^2$ y";
         let spec = render_with_cursor(src, 0);
         let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
-        // `$` opener at byte 2..3, closer at byte 6..7.
-        assert!(block.has_hidden_range(2..3));
-        assert!(block.has_hidden_range(6..7));
-        // Inner LaTeX shapes as inline-code-like.
+        let overlay = block
+            .math_overlays
+            .iter()
+            .find(|o| o.source_range == (2..7))
+            .expect("math overlay emitted for cursor-outside inline math");
+        assert_eq!(overlay.content_range, 3..6);
+        assert!(!overlay.display_style, "$..$ is text-style, not display");
+        // Render must not pre-hide — that's the element layer's
+        // call.
         assert!(
-            block
+            !block
+                .hidden_ranges
+                .iter()
+                .any(|r| r.start == 2 && r.end == 7),
+            "render must not add the math.range hide; element does it on success"
+        );
+        // And no competing inline runs for the math source — the
+        // element layer only adds those on typeset failure.
+        assert!(
+            !block
                 .inlines
                 .iter()
                 .any(|r| r.source_range == (3..6) && r.style.code),
-            "inner LaTeX should carry code style for mono shaping"
+            "no inner-LaTeX code run from render when overlay is in effect"
         );
     }
 
@@ -3446,6 +3501,20 @@ mod tests {
         let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
         assert!(block.has_dimmed_range(2..3));
         assert!(block.has_dimmed_range(6..7));
+        // Cursor inside falls back to the dim/mono path: no overlay
+        // should be emitted (the source is shaping normally).
+        assert!(
+            block.math_overlays.is_empty(),
+            "no overlay emitted when cursor is inside the math construct"
+        );
+        // Inner LaTeX shapes as code-styled mono text, as before.
+        assert!(
+            block
+                .inlines
+                .iter()
+                .any(|r| r.source_range == (3..6) && r.style.code),
+            "inner LaTeX shapes mono in cursor-inside fallback"
+        );
     }
 
     #[test]
