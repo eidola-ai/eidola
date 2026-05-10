@@ -133,6 +133,30 @@ pub enum NodeKind {
     /// paints a horizontal rule decoration and hides / dims the
     /// source bytes per the cursor rule.
     ThematicBreak,
+    /// Inline LaTeX math (`$x^2$`). `delimiter_ranges` is the opening
+    /// and closing `$` runs; `content_range` is the inner LaTeX.
+    /// Pulldown emits `Event::InlineMath` when `Options::ENABLE_MATH`
+    /// is on; the construct's source range covers `$...$` inclusive.
+    /// V1 renders the inner content in the mono font with the
+    /// delimiters hidden / dimmed per the cursor rule (the same
+    /// treatment as inline code). A future iteration will typeset
+    /// the inner LaTeX via `crate::math` and paint the result
+    /// inline; the structural shape stays the same.
+    InlineMath {
+        delimiter_ranges: Vec<ByteRange>,
+        content_range: ByteRange,
+    },
+    /// Display LaTeX math (`$$ ... $$`). Pulldown's
+    /// `Event::DisplayMath` is technically an inline event but
+    /// behaves like a block — when a paragraph contains exactly one
+    /// DisplayMath child (with optional surrounding whitespace), the
+    /// renderer promotes it to a `BlockKind::DisplayMath` for atom-
+    /// cursor rendering. Otherwise it falls back to inline-style
+    /// rendering inside its host paragraph.
+    DisplayMath {
+        delimiter_ranges: Vec<ByteRange>,
+        content_range: ByteRange,
+    },
     SoftBreak,
     HardBreak,
     Text,

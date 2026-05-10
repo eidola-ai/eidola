@@ -68,6 +68,18 @@ rule. The source bytes hide when the cursor is elsewhere and reveal
 - [x] Implement parsing
 - [ ] Implement rendering
 - [ ] Polish visuals
+
+### Math
+
+Inline math like $x^2 + y^2 = z^2$ shapes in the mono font today
+(typeset rendering coming soon). Display math sits on its own row:
+
+$$\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n$$
+
+Click into the equation above to swap to edit mode and adjust the
+LaTeX directly. CommonMark backslash escapes (`\\*`) and HTML
+entities (`&copy;`, `&mdash;`) render as literals when the cursor
+is elsewhere — try `\\*starred\\*` or 2026 &mdash; it works.
 ";
 
 fn bind_keys(cx: &mut App) {

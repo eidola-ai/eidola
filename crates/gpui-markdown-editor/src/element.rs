@@ -189,6 +189,18 @@ pub struct PrepaintState {
     /// paint to draw the rounded background, clip content to the
     /// visible band, and overlay the horizontal scrollbar.
     code_block_paint: Option<CodeBlockPaint>,
+    /// `Some` only for `BlockKind::DisplayMath` in *display* mode
+    /// (cursor outside the math). Holds the typeset math + paint
+    /// origin. Edit mode falls back to text shaping and uses the
+    /// regular `laid_out.lines` path.
+    math_paint: Option<MathPaint>,
+}
+
+/// Paint state for a typeset display-math block.
+struct MathPaint {
+    layout: crate::math::MathLayout,
+    origin: Point<Pixels>,
+    em_px: Pixels,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -262,6 +274,30 @@ impl Element for BlockElement {
                         _ => None,
                     })
                     .unwrap_or(px(f32::INFINITY));
+                // Display-math in display mode bypasses text shaping
+                // entirely — the height is whatever the typeset math
+                // requires. A typesetting failure (malformed LaTeX)
+                // falls through to a one-line height so the user can
+                // still see the cursor and edit the source.
+                if let BlockKind::DisplayMath {
+                    content_range,
+                    edit_mode: false,
+                } = &block_clone.kind
+                    && let Some(latex) = source.get(content_range.clone())
+                    && let Ok(math_layout) =
+                        crate::math::typeset(latex, crate::math::MathMode::Display)
+                {
+                    let size = math_layout.size(font_size);
+                    let h = extra_above
+                        + spacing_above
+                        + size.height.max(line_height)
+                        + spacing_below
+                        + extra_below;
+                    return Size {
+                        width: avail_w,
+                        height: h,
+                    };
+                }
                 // Container chain (blockquotes, future list-items)
                 // eats left indent — content shapes within the
                 // remaining width so soft-wrap lands at the visible
@@ -560,11 +596,34 @@ impl Element for BlockElement {
             None
         };
 
+        // Display-math in display mode: typeset and stash the
+        // result. Typesetting failure (malformed LaTeX) falls
+        // through to the regular text-shape path which rendered the
+        // raw source bytes — the user gets a fallback view rather
+        // than a blank block.
+        let math_paint = if let BlockKind::DisplayMath {
+            content_range,
+            edit_mode: false,
+        } = &self.block.kind
+        {
+            source
+                .get(content_range.clone())
+                .and_then(|latex| crate::math::typeset(latex, crate::math::MathMode::Display).ok())
+                .map(|layout| MathPaint {
+                    layout,
+                    origin: point(content_left, content_top),
+                    em_px: font_size,
+                })
+        } else {
+            None
+        };
+
         PrepaintState {
             laid_out,
             cursor_quad,
             selection_quads,
             code_block_paint,
+            math_paint,
         }
     }
 
@@ -741,6 +800,21 @@ impl Element for BlockElement {
                 bounds.origin.x + indent,
                 (bounds.size.width - indent).max(px(1.0)),
                 &self.style,
+            );
+        }
+
+        // Display math (display mode): paint typeset math via the
+        // RaTeX adapter. KaTeX fonts register lazily here on first
+        // paint — hosting apps may also call
+        // `crate::math::register_katex_fonts` at app init.
+        if let Some(math_paint) = prepaint.math_paint.take() {
+            let _ = crate::math::register_katex_fonts(&window.text_system().clone());
+            math_paint.layout.paint(
+                math_paint.origin,
+                math_paint.em_px,
+                self.style.text_color,
+                window,
+                cx,
             );
         }
 
@@ -1237,6 +1311,12 @@ fn font_size_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
         BlockKind::Heading { level } => style.size_for_heading(*level),
         BlockKind::Paragraph | BlockKind::ThematicBreak => style.font_size,
         BlockKind::CodeBlock { .. } => style.mono_font_size,
+        // Display math: in edit mode shapes mono LaTeX; in display
+        // mode the shaped-text path produces a single zero-width
+        // line and the math overlay paints on top — either way the
+        // base font size is the mono one, matching how an inline
+        // code span renders.
+        BlockKind::DisplayMath { .. } => style.mono_font_size,
     }
 }
 
@@ -1253,9 +1333,10 @@ fn spacing_above_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
     let rems_factor = match kind {
         BlockKind::Heading { level } if *level <= 2 => 1.5,
         BlockKind::Heading { .. } => 1.25,
-        BlockKind::Paragraph | BlockKind::CodeBlock { .. } | BlockKind::ThematicBreak => {
-            style.paragraph_gap.0
-        }
+        BlockKind::Paragraph
+        | BlockKind::CodeBlock { .. }
+        | BlockKind::ThematicBreak
+        | BlockKind::DisplayMath { .. } => style.paragraph_gap.0,
     };
     px(f32::from(style.font_size) * rems_factor / 2.0)
 }

@@ -30,6 +30,12 @@ pub fn parse(markdown: &str) -> Vec<SyntaxNode> {
     // this, an empty-marker continuation line drops out of pulldown's
     // tree and the cursor's chain collapses to the surrounding scope.
     opts.insert(Options::ENABLE_EMPTY_NESTED_LISTS);
+    // Recognize `$..$` (inline) and `$$..$$` (display) as math
+    // constructs. Pulldown emits `Event::InlineMath` /
+    // `Event::DisplayMath` with the offset_iter range covering the
+    // full `$` / `$$`-delimited construct; we project to
+    // `NodeKind::InlineMath` / `NodeKind::DisplayMath`.
+    opts.insert(Options::ENABLE_MATH);
 
     let mut walker = Walker::new(markdown);
     for (event, range) in Parser::new_ext(markdown, opts).into_offset_iter() {
@@ -70,6 +76,14 @@ impl<'a> Walker<'a> {
             Event::HardBreak => self.commit_leaf(SyntaxNode::new(NodeKind::HardBreak, range)),
             Event::Code(_) => {
                 let kind = self.inline_code_kind(&range);
+                self.commit_leaf(SyntaxNode::new(kind, range));
+            }
+            Event::InlineMath(_) => {
+                let kind = self.math_kind(&range, /*display=*/ false);
+                self.commit_leaf(SyntaxNode::new(kind, range));
+            }
+            Event::DisplayMath(_) => {
+                let kind = self.math_kind(&range, /*display=*/ true);
                 self.commit_leaf(SyntaxNode::new(kind, range));
             }
             Event::Rule => self.commit_leaf(SyntaxNode::new(NodeKind::ThematicBreak, range)),
@@ -445,6 +459,44 @@ impl<'a> Walker<'a> {
             q += 1;
         }
         marker_start..q
+    }
+
+    /// Compute delimiter / content ranges for an inline (`$..$`) or
+    /// display (`$$..$$`) math construct. Pulldown's range covers the
+    /// full construct including the `$` delimiter run; we count the
+    /// leading `$` run to find the opener boundary and the trailing
+    /// `$` run to find the closer. For display math, the run length
+    /// is 2 on each side; for inline, it's 1. We *don't* assume the
+    /// run length matches the mode — pulldown has already validated
+    /// that — but counting handles the rare degenerate case (e.g.
+    /// inline math whose source happens to span more bytes than
+    /// expected).
+    fn math_kind(&self, range: &Range<usize>, display: bool) -> NodeKind {
+        let bytes = self.source.as_bytes();
+        let mut p = range.start;
+        while p < range.end && bytes[p] == b'$' {
+            p += 1;
+        }
+        let opener_end = p;
+        let mut q = range.end;
+        while q > opener_end && bytes[q - 1] == b'$' {
+            q -= 1;
+        }
+        let closer_start = q;
+        let opener = range.start..opener_end;
+        let closer = closer_start..range.end;
+        let content = opener_end..closer_start;
+        if display {
+            NodeKind::DisplayMath {
+                delimiter_ranges: vec![opener, closer],
+                content_range: content,
+            }
+        } else {
+            NodeKind::InlineMath {
+                delimiter_ranges: vec![opener, closer],
+                content_range: content,
+            }
+        }
     }
 
     /// Compute delimiter and content ranges for an inline code span.
@@ -1038,5 +1090,70 @@ mod tests {
             NodeKind::ListItem { task, .. } => assert_eq!(*task, None),
             other => panic!("expected list item, got {other:?}"),
         }
+    }
+
+    // ---- Math -----------------------------------------------------------
+
+    #[test]
+    fn parses_inline_math_span() {
+        let src = "before $x^2$ after";
+        let nodes = parse(src);
+        let para = first(&nodes);
+        let math = para
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, NodeKind::InlineMath { .. }))
+            .expect("inline math child");
+        match &math.kind {
+            NodeKind::InlineMath {
+                delimiter_ranges,
+                content_range,
+            } => {
+                assert_eq!(delimiter_ranges.len(), 2);
+                assert_eq!(&src[delimiter_ranges[0].clone()], "$");
+                assert_eq!(&src[delimiter_ranges[1].clone()], "$");
+                assert_eq!(&src[content_range.clone()], "x^2");
+            }
+            other => panic!("expected inline math, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_display_math_block() {
+        let src = "$$x^2 + y^2 = z^2$$";
+        let nodes = parse(src);
+        let para = first(&nodes);
+        let math = para
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, NodeKind::DisplayMath { .. }))
+            .expect("display math child");
+        match &math.kind {
+            NodeKind::DisplayMath {
+                delimiter_ranges,
+                content_range,
+            } => {
+                assert_eq!(delimiter_ranges.len(), 2);
+                assert_eq!(&src[delimiter_ranges[0].clone()], "$$");
+                assert_eq!(&src[delimiter_ranges[1].clone()], "$$");
+                assert_eq!(&src[content_range.clone()], "x^2 + y^2 = z^2");
+            }
+            other => panic!("expected display math, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dollar_inside_inline_code_is_not_math() {
+        // Pulldown's math scanner shouldn't claim `$` inside backticks.
+        let src = "x `a $ b` y";
+        let nodes = parse(src);
+        let para = first(&nodes);
+        assert!(
+            !para
+                .children
+                .iter()
+                .any(|c| matches!(c.kind, NodeKind::InlineMath { .. })),
+            "no math construct inside inline code"
+        );
     }
 }

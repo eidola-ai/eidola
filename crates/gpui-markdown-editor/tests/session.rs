@@ -412,6 +412,13 @@ fn fmt_block_kind(kind: &BlockKind) -> String {
             _ => "CodeBlock".to_string(),
         },
         BlockKind::ThematicBreak => "ThematicBreak".to_string(),
+        BlockKind::DisplayMath { edit_mode, .. } => {
+            if *edit_mode {
+                "DisplayMath(edit)".to_string()
+            } else {
+                "DisplayMath".to_string()
+            }
+        }
     }
 }
 

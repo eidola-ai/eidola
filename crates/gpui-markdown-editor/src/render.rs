@@ -118,11 +118,132 @@ pub fn render(state: &EditorState, tree: &[SyntaxNode]) -> RenderSpec {
     let mut blocks = inject_empty_paragraphs(&state.markdown, tree, cursor, real_blocks);
     let bytes = state.markdown.as_bytes();
     merge_hard_break_continuations(&mut blocks, bytes);
+    let verbatim = collect_verbatim_ranges(tree);
     for block in &mut blocks {
         hide_chain_continuation_prefix(block, bytes);
+        apply_escapes_and_entities(block, &state.markdown, &verbatim, cursor);
         merge_hidden_ranges(&mut block.hidden_ranges);
     }
     RenderSpec { blocks }
+}
+
+/// Collect every byte range in which CommonMark §2.4 backslash escapes
+/// and §2.5 entity references **do not** apply: fenced/indented code
+/// blocks, inline code spans, and link destinations (the URL portion
+/// inside `](url)`). Output is sorted by `start` and non-overlapping
+/// — `escapes::scan` skips past these in a single pass.
+///
+/// Autolinks and raw HTML are also verbatim contexts in the spec; we
+/// don't model them as first-class constructs yet, so they fall through
+/// to the scanner. That's a minor visual issue (e.g. an autolink URL
+/// containing `&copy;` would show `©` instead of `&copy;`), which we
+/// can revisit when those constructs land.
+fn collect_verbatim_ranges(tree: &[SyntaxNode]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    fn walk(node: &SyntaxNode, out: &mut Vec<Range<usize>>) {
+        match &node.kind {
+            NodeKind::CodeBlock { .. } => {
+                out.push(node.range.clone());
+            }
+            NodeKind::InlineCode { .. } => {
+                out.push(node.range.clone());
+            }
+            // Math content uses LaTeX-level escapes (`\$`, `\\`,
+            // `\frac`, …), not CommonMark §2.4 escapes. Treating the
+            // entire `$...$` / `$$...$$` construct as verbatim
+            // prevents the markdown scanner from seeing `\$` and
+            // re-rendering it as a literal `$` (which would then
+            // collide with math-delimiter parsing in subtle ways).
+            NodeKind::InlineMath { .. } | NodeKind::DisplayMath { .. } => {
+                out.push(node.range.clone());
+            }
+            NodeKind::Link {
+                delimiter_ranges, ..
+            } => {
+                // The closing delimiter range covers `](url)`. Everything
+                // from the closing `]` through the trailing `)` is the
+                // destination — escapes / entities apply per spec, but
+                // the bytes are hidden when cursor is outside and we
+                // want to show the raw markdown when inside, so skip
+                // the scanner here. Children of the link (the link
+                // text) still get scanned via tree recursion below.
+                if let Some(closer) = delimiter_ranges.get(1) {
+                    out.push(closer.clone());
+                }
+            }
+            _ => {}
+        }
+        for child in &node.children {
+            walk(child, out);
+        }
+    }
+    for node in tree {
+        walk(node, &mut out);
+    }
+    out.sort_by_key(|r| r.start);
+    // Merge overlaps so the linear-probe in `escapes::scan` stays O(n).
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(out.len());
+    for r in out {
+        if let Some(last) = merged.last_mut()
+            && r.start <= last.end
+        {
+            last.end = last.end.max(r.end);
+        } else {
+            merged.push(r);
+        }
+    }
+    merged
+}
+
+/// Apply CommonMark §2.4 backslash escapes and §2.5 entity references
+/// to a single rendered block. Each occurrence becomes either:
+///
+/// * **Cursor outside the construct** — a `Substitution` mapping the
+///   construct's source bytes to the resolved display string, plus a
+///   `hidden_range` over the construct so the raw bytes don't shape
+///   into the line. The substitution's display bytes all map back to
+///   `source_range.start`, so a click on the resolved glyph lands at
+///   the start of the original construct.
+/// * **Cursor inside the construct** — a dimmed `InlineRun` over the
+///   construct's source range. The raw bytes shape normally; the
+///   delimiter color signals "you're editing this construct" exactly
+///   like the cursor-on-emphasis behavior.
+///
+/// Block kinds that are entirely verbatim (`CodeBlock`, `ThematicBreak`)
+/// short-circuit. Inside other blocks, `verbatim` carries the inline
+/// verbatim ranges (inline code spans, link destinations) — the scanner
+/// skips bytes covered by those.
+fn apply_escapes_and_entities(
+    block: &mut RenderBlock,
+    source: &str,
+    verbatim: &[Range<usize>],
+    cursor: CursorRange,
+) {
+    if matches!(
+        block.kind,
+        BlockKind::CodeBlock { .. } | BlockKind::ThematicBreak
+    ) {
+        return;
+    }
+    let bytes = source.as_bytes();
+    for span in crate::escapes::scan(bytes, block.source_range.clone(), verbatim) {
+        let cons = span.source_range.clone();
+        if cursor.overlaps(&cons) {
+            // Reveal raw bytes; mark them dimmed so the user sees the
+            // construct they're editing in the delimiter color.
+            block.inlines.push(InlineRun {
+                source_range: cons,
+                style: InlineStyle::dimmed(),
+            });
+        } else {
+            // Hide raw bytes; substitute the resolved display.
+            block.hidden_ranges.push(cons.clone());
+            block.substitutions.push(crate::render_spec::Substitution {
+                source_range: cons,
+                display: span.display,
+            });
+        }
+    }
 }
 
 /// Merge adjacent paragraph blocks where the boundary is a hard break
@@ -312,7 +433,7 @@ fn render_node(
     out: &mut Vec<RenderBlock>,
 ) {
     match &node.kind {
-        NodeKind::Paragraph => render_paragraph(node, cursor, containers, out),
+        NodeKind::Paragraph => render_paragraph(node, source, cursor, containers, out),
         NodeKind::Heading { .. } => render_heading(node, cursor, containers, out),
         NodeKind::CodeBlock { .. } => render_code_block(node, source, cursor, containers, out),
         NodeKind::BlockQuote { prefix_ranges } => {
@@ -359,14 +480,114 @@ fn render_thematic_break(
 
 fn render_paragraph(
     node: &SyntaxNode,
+    _source: &str,
     cursor: CursorRange,
     containers: &[Container],
     out: &mut Vec<RenderBlock>,
 ) {
+    // Promote a paragraph whose sole content-bearing child is a
+    // `DisplayMath` event into a `BlockKind::DisplayMath` block —
+    // matches GitHub-flavored rendering where a `$$...$$` standalone
+    // construct sits on its own row regardless of whether the source
+    // happens to land it on its own line. Mixed paragraphs (text +
+    // display math + text) keep the inline rendering path.
+    if let Some(math) = sole_display_math_child(node) {
+        let (content_range, math_range) = match &math.kind {
+            NodeKind::DisplayMath { content_range, .. } => {
+                (content_range.clone(), math.range.clone())
+            }
+            _ => unreachable!("sole_display_math_child guard"),
+        };
+        // Inclusive overlap: a cursor *touching* either `$$` fence
+        // (at `math.start` or `math.end`) counts as inside, so the
+        // user sees and can edit the source. Click hit-testing on
+        // the typeset overlay collapses to `math.start` (every
+        // source byte is hidden, so the shaped line is zero-width
+        // and every click maps to display column 0); inclusive
+        // overlap is what makes that click flip into edit mode.
+        // The cost is that arrow-keying past the math also flashes
+        // the source momentarily — the documented "always
+        // navigable" mode.
+        let edit_mode = cursor.overlaps(&math_range);
+        let mut block = RenderBlock::new(
+            math_range.clone(),
+            BlockKind::DisplayMath {
+                content_range: content_range.clone(),
+                edit_mode,
+            },
+        );
+        block.containers = containers.to_vec();
+        if let NodeKind::DisplayMath {
+            delimiter_ranges, ..
+        } = &math.kind
+        {
+            if edit_mode {
+                // Edit mode: every byte shapes — `$$` delimiters dim,
+                // inner LaTeX shapes in mono. Delimiters MUST stay
+                // shaped (not hidden) so click-hit-test, selection
+                // geometry, and arrow navigation can land on them.
+                // Hiding the bytes would also collapse them out of
+                // the display line so the user couldn't see what
+                // they're editing.
+                for d in delimiter_ranges {
+                    if !d.is_empty() {
+                        block.inlines.push(InlineRun {
+                            source_range: d.clone(),
+                            style: InlineStyle::dimmed(),
+                        });
+                    }
+                }
+                if content_range.start < content_range.end {
+                    block.inlines.push(InlineRun {
+                        source_range: content_range,
+                        style: InlineStyle::code(),
+                    });
+                }
+            } else {
+                // Display mode: hide the *entire* math range so no
+                // source text shapes underneath the typeset math
+                // overlay. The element layer's request_layout +
+                // prepaint produce the math's height directly; the
+                // (hidden-only) shaped lines collapse to one empty
+                // fallback line that anchors cursor-at-boundary
+                // hit-testing.
+                block.hidden_ranges.push(math_range.clone());
+                let _ = delimiter_ranges; // bytes covered by math_range hide
+            }
+        }
+        out.push(block);
+        return;
+    }
+
     let mut block = RenderBlock::new(node.range.clone(), BlockKind::Paragraph);
     block.containers = containers.to_vec();
     collect_inlines(node, cursor, &mut block);
     out.push(block);
+}
+
+/// Returns the lone content-bearing `DisplayMath` child of `node` if
+/// the paragraph contains exactly one (modulo whitespace-only `Text`
+/// nodes from leading / trailing source whitespace pulldown collapses
+/// into Text events). Returns `None` for mixed paragraphs.
+fn sole_display_math_child(node: &SyntaxNode) -> Option<&SyntaxNode> {
+    let mut math: Option<&SyntaxNode> = None;
+    for child in &node.children {
+        match &child.kind {
+            NodeKind::DisplayMath { .. } => {
+                if math.is_some() {
+                    return None;
+                }
+                math = Some(child);
+            }
+            NodeKind::SoftBreak | NodeKind::HardBreak => {
+                // OK — pulldown sometimes emits these around math.
+            }
+            _ => {
+                return None;
+            }
+        }
+    }
+    math
 }
 
 /// Render a blockquote container.
@@ -1361,6 +1582,31 @@ fn walk_inline(node: &SyntaxNode, cursor: CursorRange, base: InlineStyle, block:
                 }
             } else {
                 walk_styled_children(node, text_range, cursor, style, block);
+            }
+        }
+        NodeKind::InlineMath {
+            delimiter_ranges,
+            content_range,
+        }
+        | NodeKind::DisplayMath {
+            delimiter_ranges,
+            content_range,
+        } => {
+            // V1: render math source as inline-code-like text — `$` /
+            // `$$` delimiters hide / dim per the cursor rule, inner
+            // LaTeX shapes in the mono font so the user can read and
+            // edit it. Real typesetting via `crate::math` lands in a
+            // follow-up: the structural shape (delimiter ranges,
+            // content range, cursor-inside semantics) is identical
+            // either way, so the swap is a paint-layer change only.
+            let inside = cursor.overlaps(&node.range);
+            apply_delimiter_visibility(delimiter_ranges, inside, block);
+            if content_range.start < content_range.end {
+                let style = base.clone().merge(InlineStyle::code());
+                block.inlines.push(InlineRun {
+                    source_range: content_range.clone(),
+                    style,
+                });
             }
         }
         NodeKind::Text => {
@@ -3086,5 +3332,290 @@ mod tests {
             0..6,
             "overlay should cover the full chrome (bullet + brackets)",
         );
+    }
+
+    // ---- Backslash escapes / HTML entities ------------------------------
+
+    fn first_substitution_for(block: &RenderBlock, range: Range<usize>) -> Option<&str> {
+        block
+            .substitutions
+            .iter()
+            .find(|s| s.source_range == range)
+            .map(|s| s.display.as_str())
+    }
+
+    #[test]
+    fn backslash_escape_substitutes_punctuation_when_cursor_outside() {
+        let src = r"a\*b";
+        let spec = render_with_cursor(src, 0);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(block.has_hidden_range(1..3));
+        assert_eq!(first_substitution_for(block, 1..3), Some("*"));
+        assert!(!block.has_dimmed_range(1..3));
+    }
+
+    #[test]
+    fn backslash_escape_dims_when_cursor_inside() {
+        // Cursor between the backslash and the `*` (byte 2) sits
+        // inside the construct's [1..3) range — reveal raw bytes.
+        let src = r"a\*b";
+        let spec = render_with_cursor(src, 2);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(block.has_dimmed_range(1..3));
+        assert!(first_substitution_for(block, 1..3).is_none());
+    }
+
+    #[test]
+    fn backslash_escape_inside_inline_code_is_not_processed() {
+        // `\*` inside backticks is verbatim per CommonMark §6.1; the
+        // scanner must skip the inline code span entirely.
+        let src = r"a `\*` b";
+        let spec = render_with_cursor(src, 0);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        // No substitution for the in-code escape.
+        assert!(first_substitution_for(block, 3..5).is_none());
+    }
+
+    #[test]
+    fn backslash_escape_inside_fenced_code_is_not_processed() {
+        let src = "```\nfn foo() { let x = r\"\\*\"; }\n```";
+        let spec = render_with_cursor(src, 0);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::CodeBlock { .. }));
+        // No substitutions on a code block at all.
+        assert!(block.substitutions.is_empty());
+    }
+
+    #[test]
+    fn entity_amp_substitutes_when_cursor_outside() {
+        let src = "x &amp; y";
+        let spec = render_with_cursor(src, 0);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(block.has_hidden_range(2..7));
+        assert_eq!(first_substitution_for(block, 2..7), Some("&"));
+    }
+
+    #[test]
+    fn entity_dims_when_cursor_inside() {
+        let src = "x &amp; y";
+        let spec = render_with_cursor(src, 4);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(block.has_dimmed_range(2..7));
+        assert!(first_substitution_for(block, 2..7).is_none());
+    }
+
+    #[test]
+    fn numeric_decimal_entity_substitutes() {
+        let src = "&#169;";
+        let spec = render_with_cursor(src, 999);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert_eq!(first_substitution_for(block, 0..6), Some("©"));
+    }
+
+    #[test]
+    fn unknown_named_entity_does_not_substitute() {
+        let src = "&banana;";
+        let spec = render_with_cursor(src, 999);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(block.substitutions.iter().all(|s| s.source_range != (0..8)));
+    }
+
+    // ---- Math -----------------------------------------------------------
+
+    #[test]
+    fn inline_math_hides_delimiters_when_cursor_outside() {
+        let src = "x $a^2$ y";
+        let spec = render_with_cursor(src, 0);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        // `$` opener at byte 2..3, closer at byte 6..7.
+        assert!(block.has_hidden_range(2..3));
+        assert!(block.has_hidden_range(6..7));
+        // Inner LaTeX shapes as inline-code-like.
+        assert!(
+            block
+                .inlines
+                .iter()
+                .any(|r| r.source_range == (3..6) && r.style.code),
+            "inner LaTeX should carry code style for mono shaping"
+        );
+    }
+
+    #[test]
+    fn inline_math_dims_delimiters_when_cursor_inside() {
+        let src = "x $a^2$ y";
+        let spec = render_with_cursor(src, 4);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(block.has_dimmed_range(2..3));
+        assert!(block.has_dimmed_range(6..7));
+    }
+
+    #[test]
+    fn display_math_renders_with_double_dollar_delimiters() {
+        // `$$a + b$$` standalone promotes to a DisplayMath block —
+        // both `$$` pairs hide unconditionally so the typeset math
+        // can paint without delimiter chrome shaping into the line.
+        let src = "$$a + b$$";
+        let spec = render_with_cursor(src, 999);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::DisplayMath { .. }));
+        assert!(block.has_hidden_range(0..2));
+        assert!(block.has_hidden_range(7..9));
+    }
+
+    #[test]
+    fn display_math_promotes_paragraph_with_single_math_child() {
+        let src = "$$x^2$$";
+        let spec = render_with_cursor(src, 999);
+        match spec.blocks[0].kind {
+            BlockKind::DisplayMath {
+                ref content_range,
+                edit_mode,
+            } => {
+                assert_eq!(content_range.clone(), 2..5);
+                assert!(!edit_mode, "cursor outside the math should be display mode");
+            }
+            ref other => panic!("expected DisplayMath block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_math_does_not_promote_mixed_paragraph() {
+        // `before $$math$$ after` keeps the inline path: the
+        // paragraph has Text + DisplayMath + Text children, which
+        // is *not* a sole-DisplayMath promotion case.
+        let src = "before $$x^2$$ after";
+        let spec = render_with_cursor(src, 0);
+        let has_display_math_block = spec
+            .blocks
+            .iter()
+            .any(|b| matches!(b.kind, BlockKind::DisplayMath { .. }));
+        assert!(
+            !has_display_math_block,
+            "mixed paragraph should keep inline rendering"
+        );
+    }
+
+    #[test]
+    fn display_math_enters_edit_mode_when_cursor_strictly_inside() {
+        // Cursor at byte 4 sits strictly inside `$$x^2$$` (between
+        // 2 and 5) → edit_mode = true.
+        let src = "$$x^2$$";
+        let spec = render_with_cursor(src, 4);
+        match spec.blocks[0].kind {
+            BlockKind::DisplayMath { edit_mode, .. } => assert!(edit_mode),
+            ref other => panic!("expected DisplayMath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_math_enters_edit_mode_when_cursor_touches_boundary() {
+        // A cursor touching either `$$` fence — at `math.start` or
+        // `math.end` — counts as inside (inclusive overlap). This
+        // is what makes click-on-typeset-math switch to edit mode:
+        // every source byte is hidden in display mode, so the
+        // shaped line is zero-width and every click on the math
+        // hits display column 0 → math.start. Inclusive overlap
+        // turns that click into an edit-mode entry.
+        let src = "$$x^2$$";
+        for cursor in [0usize, 7] {
+            let spec = render_with_cursor(src, cursor);
+            match spec.blocks[0].kind {
+                BlockKind::DisplayMath { edit_mode, .. } => {
+                    assert!(edit_mode, "cursor at boundary {cursor} should be edit mode")
+                }
+                ref other => panic!("expected DisplayMath, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn display_math_returns_to_display_mode_when_cursor_is_outside() {
+        // Cursor on a *different* byte (past the math) puts the
+        // math back into display mode. With math at 0..7 in
+        // `$$x^2$$\n\nrest`, cursor at byte 9 (inside `rest`) is
+        // outside the math.
+        let src = "$$x^2$$\n\nrest";
+        let spec = render_with_cursor(src, 11);
+        let math_block = spec
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::DisplayMath { .. }))
+            .expect("math block");
+        match math_block.kind {
+            BlockKind::DisplayMath { edit_mode, .. } => assert!(!edit_mode),
+            ref other => panic!("expected DisplayMath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_math_edit_mode_keeps_fences_visible_for_navigation() {
+        // Edit mode (cursor strictly inside) MUST leave the `$$`
+        // delimiter bytes shaping into the line — hiding them would
+        // collapse 4 bytes out of the display, breaking click
+        // hit-testing and selection geometry over the fences.
+        let src = "$$x^2$$";
+        let spec = render_with_cursor(src, 4);
+        let block = &spec.blocks[0];
+        assert!(
+            !block.has_hidden_range(0..2),
+            "opening `$$` must shape (dimmed, not hidden) in edit mode for navigation"
+        );
+        assert!(
+            !block.has_hidden_range(5..7),
+            "closing `$$` must shape (dimmed, not hidden) in edit mode for navigation"
+        );
+        assert!(block.has_dimmed_range(0..2));
+        assert!(block.has_dimmed_range(5..7));
+    }
+
+    #[test]
+    fn display_math_display_mode_hides_entire_source_range() {
+        // Display mode (cursor outside): every byte of the
+        // construct hides so the typeset overlay doesn't paint on
+        // top of un-hidden source text. Pre-fix this regression
+        // saw `x^2` shape underneath the rendered math.
+        let src = "$$x^2$$";
+        let spec = render_with_cursor(src, 999);
+        let block = &spec.blocks[0];
+        assert!(
+            block.has_hidden_range(0..7),
+            "full math range hidden in display mode"
+        );
+        // Inner content range specifically — a sub-range of the
+        // full hide.
+        assert!(block.has_hidden_range(2..5));
+    }
+
+    #[test]
+    fn escapes_do_not_apply_inside_math_source() {
+        // `$\frac{a}{b}$` — `\f` is not a CommonMark escape (`f` isn't
+        // ASCII punctuation), so the scanner wouldn't substitute it
+        // anyway. Test the case that matters: `\$` inside math should
+        // NOT become a literal `$` substitution because math content
+        // is verbatim from CommonMark's perspective.
+        let src = r"$a\$b$";
+        let spec = render_with_cursor(src, 999);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        // The `\$` at bytes 2..4 inside `$a\$b$` should not produce
+        // a substitution. (Pulldown's math-delimiter parser sees the
+        // construct as `$a\$b$`, with `\$` escaped at the LaTeX
+        // level — that's RaTeX's concern, not ours.)
+        assert!(
+            !block.substitutions.iter().any(|s| s.source_range == (2..4)),
+            "no markdown-level substitution inside math content"
+        );
+    }
+
+    #[test]
+    fn escape_inside_strong_does_not_break_emphasis_styling() {
+        // `xx **a\*b**` keeps the Strong span intact while the inner
+        // `\*` renders as a literal `*`. Cursor on the leading `xx`
+        // (byte 1) sits *outside* the Strong (Strong range is 3..11)
+        // so its delimiters hide; the `\*` at bytes 6..8 is also
+        // outside the cursor's overlap so it substitutes.
+        let src = r"xx **a\*b**";
+        let spec = render_with_cursor(src, 1);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(block.has_hidden_range(3..5));
+        assert!(block.has_hidden_range(9..11));
+        assert_eq!(first_substitution_for(block, 6..8), Some("*"));
     }
 }

@@ -224,10 +224,46 @@ The first cut covers:
   separate hide for the `[ ] ` / `[x] ` task bytes that follow,
   and the marker overlay paints `☐ ` / `☑ ` in place of the
   bullet glyph.
+- CommonMark §2.4 backslash escapes (`\*`, `\\`, …) and §2.5
+  entity references (`&amp;`, `&copy;`, `&#x2014;`). Each
+  occurrence becomes a `Substitution` (cursor outside) that
+  replaces the source bytes with the resolved literal, or a
+  dimmed `InlineRun` (cursor inside) that reveals the raw bytes.
+  The scan happens in a render post-pass driven by `escapes.rs`
+  and skips verbatim contexts (inline code, fenced code, link
+  destinations, math). Pulldown's `Event::Text` content is lossy
+  for these constructs (the backslash byte is uncovered, entities
+  decode to their resolved value), so the editor scans source
+  bytes itself rather than trusting the event stream — see
+  `escapes.rs` module docs.
+- LaTeX math: inline `$x^2$` and display `$$ ... $$`. Pulldown's
+  `Event::InlineMath` / `Event::DisplayMath` produce
+  `NodeKind::InlineMath` / `NodeKind::DisplayMath`. Inline math
+  v1 shapes the inner LaTeX in the mono font with `$` delimiters
+  hidden / dimmed per cursor; future iterations will typeset it
+  inline via `crate::math`. Display math promotes a paragraph
+  whose sole content is a `DisplayMath` to
+  `BlockKind::DisplayMath { content_range, edit_mode }`. The
+  block has two render paths:
+  - **Display mode** (`edit_mode == false`, cursor strictly
+    outside the math range): the element layer typesets via
+    `math::typeset(latex, MathMode::Display)`, allocates the
+    block's height to the math layout's pixel size, and paints
+    the typeset math via `MathLayout::paint`.
+  - **Edit mode** (`edit_mode == true`, cursor strictly inside):
+    falls back to text shaping — `$$` delimiters dim, inner
+    LaTeX shapes in the mono font.
+  The strict-overlap test (boundary cursors don't count as
+  inside) gives the "navigated to enters edit mode" feel: the
+  cursor can park at the math's leading or trailing edge in
+  display mode, and the next arrow press steps inside and
+  flips to edit. KaTeX fonts auto-register on first display-math
+  paint via `math::register_katex_fonts`; hosts may also call it
+  at app init alongside their own font loads.
 
 Explicitly *out* of this phase: setext-heading normalization, images,
-tables, HTML, IME marked-text, word / line-aware delete. Each will
-land as a follow-up.
+tables, HTML, IME marked-text, word / line-aware delete, inline-math
+typeset rendering (the current path shapes raw LaTeX in mono).
 
 ### Container chain (composability invariant)
 
@@ -407,6 +443,8 @@ in code; keep both in sync.
 | `style.rs` | `MarkdownStyle` — derived from `gpui_component::Theme` |
 | `element.rs` | `BlockElement` — paints one block, owns a `display_to_source` map per shaped line |
 | `editor.rs` | `MarkdownEditor` — gpui `Render` view, owns state, dispatches actions |
+| `escapes.rs` | CommonMark §2.4 / §2.5 source-byte scanner. Returns one `ResolvedSpan` per `\X` or `&entity;` occurrence; the render post-pass turns each into a `Substitution` (cursor outside) or a dimmed `InlineRun` (cursor inside). |
+| `math.rs` | RaTeX adapter. `register_katex_fonts(text_system)` loads the bundled KaTeX TTFs; `typeset(latex, mode) -> MathLayout` parses + lays out a LaTeX expression; `MathLayout::paint(...)` walks RaTeX's `DisplayList` and emits native gpui paint ops (`paint_quad` for fraction bars and rects, `paint_path` for radicals, shaped glyph runs for letters / operators). |
 | `bin/demo.rs` | Standalone demo window |
 
 ## Theme integration

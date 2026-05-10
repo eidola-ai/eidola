@@ -199,6 +199,28 @@ pub enum BlockKind {
     /// is outside the construct and dimmed when inside, mirroring
     /// the delimiter rule used elsewhere.
     ThematicBreak,
+    /// Display math block (`$$ ... $$`). Promoted from a paragraph
+    /// whose sole content-bearing child is a `DisplayMath` event.
+    /// The block has two rendering modes that swap based on cursor
+    /// position:
+    ///
+    /// * **Display mode** (`edit_mode == false`) — cursor is *not*
+    ///   strictly inside the math content range. The element layer
+    ///   typesets `source[content_range]` via [`crate::math`] and
+    ///   paints the rendered math; no shaped text rows.
+    /// * **Edit mode** (`edit_mode == true`) — cursor is strictly
+    ///   inside the construct. The block falls back to text
+    ///   shaping: `$$` delimiters dim, inner LaTeX shapes in the
+    ///   mono font so the user can edit it directly. (Future
+    ///   iteration will reuse code-block layout for full-width
+    ///   background; v1 keeps it simple.)
+    ///
+    /// `content_range` is the inner LaTeX bytes (between the
+    /// `$$`-delimiter pairs).
+    DisplayMath {
+        content_range: Range<usize>,
+        edit_mode: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
