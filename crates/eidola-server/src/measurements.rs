@@ -17,17 +17,17 @@ use tinfoil_verifier::{EnclaveMeasurement, TdxMeasurement};
 
 pub static ALLOWED: LazyLock<Vec<EnclaveMeasurement>> = LazyLock::new(|| {
     vec![
-        // === CURRENT: v0.0.93 ===
+        // === CURRENT: v0.0.102 ===
         // Built: 2026-04-03T16:16:04Z
-        // Artifact digest: sha256:35c602aa2f7579bc7105d4c2c68d7f1eba42d3b0de33584bcfebd02a1fcefaf4
-        // Rekor log index: 1412782186
-        // Sigstore: https://search.sigstore.dev/?logIndex=1412782186
-        // GitHub: https://github.com/tinfoilsh/confidential-model-router/releases/tag/v0.0.93
+        // Artifact digest: sha256:53bb76eb6c26eec26f30e9b14d710c8eceeb75ea0c29c5208b5130dfa2b361e4
+        // Rekor log index: 1551094524
+        // Sigstore: https://search.sigstore.dev/?logIndex=1551094524
+        // GitHub: https://github.com/tinfoilsh/confidential-model-router/releases/tag/v0.0.102
         EnclaveMeasurement {
-            snp_measurement: "adbf757c4cadc812beb6dc224418d2c30a9ef0c592782328ce7119decd634df84e3ea5e5ab95de09be8ca171b234fe33".into(),
+            snp_measurement: "0a64f1b64b0b39b86d5b19acf95c746f9b9c99ac3bb4c64bcc976521d97dc46109a965363bc436c3be9b5b3b2c4a9f49".into(),
             tdx_measurement: TdxMeasurement {
                 rtmr1: "4f7be53273f4ed3114e7578574f98eec533d5a18484e4e8a5feef1672b4a94e17646e7ab9e1f3c722faea496bac4dc8d".into(),
-                rtmr2: "d4c59c42226774264b35b5b59238d1ad13a84dc22f2fbbdd49c43bd5673a37d18af164376e9d295a58af9be3c9a0ada3".into(),
+                rtmr2: "12498bc720197443c0753d33bc3e21eba5b92fa51f0bce130f4335e925ea4e3a9cbeca728f0c74f869cb27609fdfd0f8".into(),
             },
         },
         // === PREVIOUS: v0.0.84 ===
