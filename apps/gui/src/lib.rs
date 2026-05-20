@@ -18,7 +18,8 @@ use gpui_component::Root;
 use gpui_component_assets::Assets;
 
 use crate::actions::{
-    About, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenSettings, Quit, ShowAll, Zoom,
+    About, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenSettings, Quit, ShowAll,
+    ToggleInspector, Zoom,
 };
 use crate::chat::ChatView;
 use crate::core::Core;
@@ -177,6 +178,7 @@ fn install_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),
+        KeyBinding::new("cmd-alt-i", ToggleInspector, None),
         KeyBinding::new("cmd-enter", crate::chat::Send, Some("ChatView")),
     ]);
 }
@@ -234,6 +236,26 @@ fn install_action_handlers(cx: &mut App) {
         };
         cx.defer(move |cx| {
             handle.update(cx, |_, window, _| window.zoom_window()).ok();
+        });
+    });
+
+    // Toggle gpui's element inspector on the active window. Same `cx.defer`
+    // pattern as `Minimize`/`Zoom` — `Window::toggle_inspector` requires
+    // `&mut Window`, and dispatching directly on the same window we were
+    // invoked from would fail (slot already taken). `gpui-component`'s
+    // inspector::init also binds the same action under its own
+    // `inspector::ToggleInspector` namespace; ours coexists because the
+    // action types are distinct, and gives us an explicit binding in our
+    // own keymap regardless of whether gpui-component's inspector is
+    // initialized in this build.
+    cx.on_action(|_: &ToggleInspector, cx: &mut App| {
+        let Some(handle) = cx.active_window() else {
+            return;
+        };
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, cx| window.toggle_inspector(cx))
+                .ok();
         });
     });
 

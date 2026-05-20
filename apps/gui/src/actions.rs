@@ -31,5 +31,10 @@ actions!(
         Minimize,
         /// Zoom the focused window (macOS Window menu standard).
         Zoom,
+        /// Toggle the gpui element inspector on the focused window. Bound to
+        /// ⌘⌥I. Requires the `inspector` feature on `gpui` (enabled in
+        /// `Cargo.toml`); the rich element/style editor UI comes from
+        /// `gpui-component`'s inspector renderer, also feature-gated.
+        ToggleInspector,
     ]
 );

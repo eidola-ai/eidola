@@ -14,9 +14,13 @@ path = "src/main.rs"
 # gpui-component pulls gpui/gpui_platform from zed-industries/zed without a rev,
 # so we mirror that spec exactly to avoid resolving two copies of gpui.
 # Cargo.lock is the canonical pin for the resolved zed commit.
-gpui = { git = "https://github.com/zed-industries/zed" }
+#
+# `inspector` enables the in-app element inspector (Window::toggle_inspector +
+# the rich gpui-component renderer). Also auto-enabled in debug builds via
+# `debug_assertions`; the explicit feature ensures it works in release builds.
+gpui = { git = "https://github.com/zed-industries/zed", features = ["inspector"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad", features = ["inspector"] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
 
 eidola-app-core = { path = "../../crates/eidola-app-core" }
