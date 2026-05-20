@@ -204,6 +204,30 @@ The first cut covers:
 - Cursor + selection geometry, mouse hit-test, basic keyboard navigation
   (arrows / home / end / doc start / doc end), basic editing (insert text,
   backspace / delete, newline / line break), select-all.
+- **Word-granular motion and selection-extension.** `MoveWordLeft` /
+  `MoveWordRight` (and the `Extend*` variants) walk Unicode word
+  boundaries via `unicode-segmentation`, skipping whitespace and
+  punctuation. Default macOS bindings: Option+Arrow and
+  Option+Shift+Arrow.
+- **Line- and word-aware deletion.** `DeleteWordBackward` /
+  `DeleteWordForward` consume a word in the cursor's direction;
+  `DeleteToLineStart` / `DeleteToLineEnd` consume to the line's
+  visible content edge / line end. Inside a structural chain (BQ / LI)
+  the target is clamped to the line's chain-prefix end so the `> ` /
+  `- ` / continuation-indent bytes survive — deletion only affects
+  content, not structure.
+- **Visual-position-aware vertical navigation.** Up / Down / Shift+Up
+  / Shift+Down route through `MarkdownEditor::vertical_move`, which
+  consults the previous frame's `LaidOutBlock` layout to step exactly
+  one wrap-row in display coordinates (not source bytes). Two
+  consequences: (a) navigation respects soft-wrap rows inside a single
+  logical line, and (b) a long line → wrapped short row → long line
+  round-trip lands back at the original visual column via an
+  `intended_x` anchor that survives the streak (cleared on any
+  non-vertical event by `dispatch_reset_intended_x_unless_vertical`).
+  Headless tests with no laid-out blocks fall back to the source-byte
+  `MoveUp` / `MoveDown` event so behavior tests still move
+  predictably.
 - Inline code (`` `code` ``): mono font + faint background fill on the
   span content, hide / dim of the backtick delimiters per the cursor
   rule. Multi-backtick spans (`` ``a`b`` ``) work — the parser
@@ -339,9 +363,11 @@ The first cut covers:
   embedded resolution depends on hosts registering an `AssetSource`.
 
 Explicitly *out* of this phase: setext-heading normalization, tables,
-HTML, IME marked-text, word / line-aware delete, reference-style
-images (`![alt][label]`), the `title` attribute on images, image
-data URIs, image links (`[![alt](img)](url)`).
+HTML, IME marked-text, reference-style images (`![alt][label]`), the
+`title` attribute on images, image data URIs, image links
+(`[![alt](img)](url)`), rich-content paste from HTML / RTF (depends
+on a gpui-side clipboard-mime extension that doesn't exist yet — see
+[Clipboard pipeline](#clipboard-pipeline) for the deferred path).
 
 ### Container chain (composability invariant)
 
@@ -507,6 +533,143 @@ New passes that fix follow-on bugs slot into this list with a clear
 rationale. The doc comment on `render::render` carries this same list
 in code; keep both in sync.
 
+## Clipboard pipeline
+
+Three event variants cross the clipboard boundary, each with its own
+update-pipeline branch:
+
+| Event | Triggered by | Behavior |
+|-------|-------------|----------|
+| `EditorEvent::InsertText(String)` | IME composition, programmatic insertion | Splice raw at cursor. Used by the input-handler trait — IME's commit step routes here. No paste-specific transforms. |
+| `EditorEvent::Paste { text, internal }` | Cmd+V | Markdown-aware splice. `internal: true` when the clipboard's `metadata()` matches the [`CLIPBOARD_SENTINEL`] (set on every `copy` / `cut`). |
+| `EditorEvent::PastePlain { text }` | Cmd+Shift+V | Plain-text splice — bypasses markdown parse and soft-break collapse. |
+
+[`CLIPBOARD_SENTINEL`]: src/editor.rs
+
+All three flow through the same `update.rs:paste` router, which drops
+any active selection first (so chain / verbatim analysis runs on the
+post-deletion buffer) and then dispatches:
+
+```text
+Paste { text, internal } ─┬─ in_verbatim_region? → verbatim_paste
+                          └─ otherwise           → markdown_paste
+
+PastePlain { text } ──────┬─ in_verbatim_region? → verbatim_paste
+                          └─ otherwise           → insert_text
+```
+
+### Verbatim paste (`verbatim_paste`, Phase 1)
+
+Cursor sits inside a fenced code block or block-level `$$..$$` math.
+Two transforms apply:
+
+- **Chain-prefix injection.** Every embedded `\n` is followed by
+  [`chain_continuation_prefix`] so continuation lines stay inside any
+  enclosing BQ / LI scope.
+- **Fence widening.** If the pasted bytes contain a run of the
+  enclosing fence's char (`` ` `` or `~`) that matches the
+  closing-fence pattern after chain-prefix stripping, the opener and
+  closer are both widened to `max_run + 1` in lockstep so the pasted
+  content can't accidentally close the construct. Reads opener and
+  closer ranges via [`analysis::fence_with_delimiters_at`]. Display
+  math `$$` has no longer form — the splice lands verbatim and the
+  user fixes any break.
+
+The widening edits and the splice are composed into one
+`SourceEditList` so `apply_edits` handles cursor remapping in a single
+pass.
+
+### Markdown-canonicalize paste (`markdown_paste`, Phase 2)
+
+Cursor sits outside any verbatim region. Three transforms apply in
+order:
+
+1. **Canonicalize.** Parse `text`; walk the tree for every
+   `NodeKind::SoftBreak` leaf (pulldown emits `Event::SoftBreak`
+   *only* for genuine in-paragraph soft breaks — never between sibling
+   list items, never between blocks, never inside verbatim regions,
+   never for hard breaks). For each one, replace the `\n` byte plus
+   the chain continuation prefix that follows it with a single space.
+   This turns `foo\n> bar` into `foo bar` inside a BQ paragraph (not
+   `foo > bar`, which would leave a literal `>` mid-content).
+   Skipped when `internal: true` — internal pastes are already
+   canonical markdown.
+2. **Block-boundary padding.** Re-parse the canonical paste; if its
+   first / last top-level node is non-Paragraph (heading, list, fence,
+   BQ, thematic break, display math), prepend / append `\n\n` (or
+   `\n` if the cursor is one short of a blank-line boundary) so the
+   construct lands on its own line. Cursor's surrounding bytes
+   determine whether padding is needed at all.
+3. **Chain-prefix injection.** Same helper as `verbatim_paste` —
+   every `\n` in the post-padding bytes is followed by
+   `chain_continuation_prefix(chain_at_cursor)`.
+
+The Phase-2 transform deliberately diverges from the editor's "every
+`\n` is structural" invariant *on paste*: a hard-wrapped paragraph
+from any source (markdown, terminal output, browser plaintext)
+collapses to one paragraph, matching CommonMark's rendering rule for
+soft breaks. The trade-off: plaintext where line breaks are meaningful
+(code, poetry, address blocks) also collapses — the user-triggered
+[Plain paste](#plain-paste-plain_paste-phase-3a) path is the escape
+hatch.
+
+**Why walk `NodeKind::SoftBreak` instead of scanning for `\n`s inside
+Paragraph ranges?** Byte-level scanning can't distinguish "`\n`
+between two content lines of one paragraph" from "`\n` between two
+sibling list items" — the trailing `\n` is included in the first
+ListItem's range, and adjacency to other `\n`s doesn't help.
+Pulldown's SoftBreak event is the exact parser-blessed enumeration we
+want, and the parser already lifts it into a `NodeKind::SoftBreak`
+leaf.
+
+### Plain paste (`plain_paste`, Phase 3a)
+
+User-triggered Cmd+Shift+V. Bytes splice raw — no markdown parse, no
+soft-break collapse, no block-boundary padding. Each `\n` becomes a
+paragraph break post-splice (the chain-aware `promote_soft_breaks`
+pass in `enforce_invariants` lifts each lone `\n` into the depth-D
+pair shape for the cursor's chain). Sentinel metadata is ignored —
+the user explicitly chose plain semantics, overriding any "this came
+from our editor" signal.
+
+Markdown markers (`#`, `*`, `` ` ``, etc.) are *not* pre-escaped. The
+contract is "splice raw"; downstream interpretation depends on what
+the pasted bytes happen to parse as. A separate "paste as literal
+text" mode that escapes every CommonMark marker is a follow-up.
+
+### CRLF normalization
+
+`editor::normalize_line_endings` collapses CRLF (Windows) and bare CR
+(legacy macOS) to LF before the bytes ever reach `update::update`, so
+the chain-prefix and parser passes only have to reason about `\n`.
+Applies to both `Paste` and `PastePlain`.
+
+### Sentinel metadata
+
+`copy` / `cut` tag every clipboard write with
+`ClipboardItem::new_string_with_metadata(text, CLIPBOARD_SENTINEL)`.
+`paste` reads the metadata back to set `internal: true`. The sentinel
+literal is intentionally crate-namespaced (`gpui-markdown-editor`),
+not app-namespaced — this crate carries no Eidola-specific symbols.
+
+### Deferred: rich-content paste (Phase 3b/3c)
+
+Real HTML / RTF passthrough depends on a gpui-side
+`ClipboardEntry::Html(String)` (or a generic
+`ClipboardEntry::MimeData { mime, bytes }`) variant that doesn't
+exist yet — gpui's clipboard layer flattens to a single plaintext
+flavor. Once the gpui change lands, the natural next step is an
+HTML → Markdown converter (lean walker over a tag-soup parser,
+covering the subset browsers actually emit: `<p>`, `<h1..h6>`,
+`<a>`, `<strong>`, `<em>`, `<code>`, `<pre>`, `<ul>/<ol>/<li>`,
+`<blockquote>`, `<img>`). Its output feeds into the Phase 2
+pipeline. Heuristic markdown detection on plaintext was considered
+and rejected — too many surprising false positives, and the
+user-triggered Plain paste action is a better UX answer.
+
+[`chain_continuation_prefix`]: src/analysis.rs
+[`analysis::fence_with_delimiters_at`]: src/analysis.rs
+
 ## Module map
 
 | File | Purpose |
@@ -621,6 +784,8 @@ cargo run -p gpui-markdown-editor --bin demo
 | Visual styling (fonts, colors, spacing) | `style.rs` (derived from theme) |
 | Glyph substitution / hidden ranges | `render.rs` (RenderBlock fields) + `element.rs` (consumed at shape time) |
 | Full-width decorations (code bg, blockquote border) | `render.rs::Decoration` + `element.rs::paint_decoration` |
+| Vertical navigation behavior (Up / Down geometry) | `editor.rs::visual_move_caret` + `LaidOutBlock` layout in `element.rs` |
+| Paste / clipboard transforms | `update.rs::{paste, plain_paste, verbatim_paste, markdown_paste}` + `editor.rs` clipboard handlers — see [Clipboard pipeline](#clipboard-pipeline) |
 
 ## Known design notes
 
