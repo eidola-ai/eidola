@@ -1161,6 +1161,31 @@ fn render_list_item(
             *emitted_first = true;
         };
 
+    // Byte after the `\n` that terminates the LI's marker line (or
+    // end-of-buffer for the last line). Used below to detect the
+    // "empty marker line" case — a list item whose marker stands
+    // alone on its line because the item's only block-level child
+    // (a nested list, a blockquote, a code block, …) starts on a
+    // later line. In that case the recurse-then-extend trick would
+    // fold the marker line into the nested block's chain (giving
+    // the marker row the nested block's deeper indent and stacking
+    // both markers on the same shaped row); we emit a *synth*
+    // empty paragraph for the marker line first instead.
+    let marker_line_end_excl = source_line_end(bytes, marker_range.start);
+    let emit_marker_line_synth = |emitted_first: &mut bool, out: &mut Vec<RenderBlock>| {
+        // The synth claims the marker line only — `node.range.start`
+        // through the byte right after the marker line's `\n`
+        // (or end of the item if shorter). Chain is the LI's own
+        // chain entry; cursor at the marker line's content edge
+        // sits inside the synth and lands at this item's indent
+        // (not the nested child's deeper indent).
+        let synth_end = marker_line_end_excl.min(node.range.end);
+        let mut block = RenderBlock::new(node.range.start..synth_end, BlockKind::Paragraph);
+        block.containers = chain.clone();
+        out.push(block);
+        *emitted_first = true;
+    };
+
     for child in &node.children {
         if is_block_level(&child.kind) {
             emit_inline_run(&mut inline_run, &mut emitted_first, out);
@@ -1173,6 +1198,34 @@ fn render_list_item(
                     // heading — recurse with this item's container
                     // chain so any leaves the recursion emits
                     // carry it.
+                    //
+                    // **Empty-marker-line synth.** If this is the
+                    // first leaf the item would emit AND the nested
+                    // child starts on a line *after* the marker
+                    // (i.e. the marker line has no content), emit a
+                    // synth marker-line block *before* recursing.
+                    // That keeps the marker row's chain shallow
+                    // (just this item's chain entry, not the nested
+                    // child's), so the row paints at this item's
+                    // indent and the cursor at the marker line's
+                    // content edge lands at this item's content
+                    // edge instead of the nested block's. See the
+                    // user-reported fixture
+                    // `1. One\n2. \n   1. Two, One`.
+                    //
+                    // When the marker has content on its own line
+                    // (e.g. `1. > content` — the BQ starts on the
+                    // same line as the marker), we skip the synth
+                    // and fall through to the existing
+                    // extend-leading-range trick, which folds the
+                    // marker bytes into the recursed leaf so the
+                    // single shaped row carries both the LI marker
+                    // and the nested block's chrome.
+                    let marker_alone_on_line =
+                        !emitted_first && child.range.start >= marker_line_end_excl;
+                    if marker_alone_on_line {
+                        emit_marker_line_synth(&mut emitted_first, out);
+                    }
                     let before = out.len();
                     let was_first = !emitted_first;
                     render_node(child, tree, source, cursor, &chain, out);

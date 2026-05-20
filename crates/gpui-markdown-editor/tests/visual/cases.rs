@@ -498,6 +498,42 @@ pub fn register(s: &mut Snapshots) {
             MarkdownEditor::with_state(state, window, cx)
         })
     });
+
+    // Ordered list with an empty intermediate item that hosts a
+    // nested sublist (`2. ` followed by `   1. Two, One`). The empty
+    // marker row should sit at the outer LI's indent — same column
+    // as `1. One` above — not jump in to the nested list's deeper
+    // indent. Cursor outside any item.
+    s.add(
+        "empty_intermediate_list_item_cursor_outside",
+        win,
+        |window, cx| {
+            cx.new(|cx| {
+                let state = EditorState {
+                    markdown: "1. One\n2. \n   1. Two, One".into(),
+                    selection: Selection::Cursor(0),
+                };
+                MarkdownEditor::with_state(state, window, cx)
+            })
+        },
+    );
+
+    // Same fixture, cursor on the empty `2. ` row. Verifies that the
+    // caret sits at the outer LI's content edge (not the nested
+    // list's deeper indent).
+    s.add(
+        "empty_intermediate_list_item_cursor_on_empty_row",
+        win,
+        |window, cx| {
+            cx.new(|cx| {
+                let state = EditorState {
+                    markdown: "1. One\n2. \n   1. Two, One".into(),
+                    selection: Selection::Cursor(10), // `\n` ending the `2. ` row
+                };
+                MarkdownEditor::with_state(state, window, cx)
+            })
+        },
+    );
 }
 
 /// Build an editor whose cursor is placed inside `needle` (3 chars in, by

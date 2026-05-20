@@ -12,9 +12,10 @@
 //! Run with `cargo run -p gpui-markdown-editor --bin demo`.
 
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement, KeyBinding,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, WindowBounds,
-    WindowOptions, div, prelude::FluentBuilder, px, rems, size,
+    App, AppContext, Bounds, Context, CursorStyle, Entity, InteractiveElement, IntoElement,
+    KeyBinding, MouseButton, MouseMoveEvent, ParentElement, Pixels, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions, div,
+    prelude::FluentBuilder, px, rems, size,
 };
 use gpui_component::{Root, Theme, h_flex, text::TextView, v_flex};
 use gpui_component_assets::Assets;
@@ -29,38 +30,25 @@ use gpui_markdown_editor::{
 const DEMO_DOCUMENT: &str = "\
 # gpui-markdown-editor
 
-A WYSIWYG markdown editor. The first cut covers ATX headings, **bold**,
-*italic*, ~~strikethrough~~, `inline code`, [links](https://example.com),
-and ![inline images](/Users/mike/Code/eidola/apps/macos/Packages/MarkdownEditor/Example.png)
-that sit alongside surrounding prose.
+A WYSIWYG markdown editor. The first cut covers ATX headings, **bold**, *italic*, ~~strikethrough~~, `inline code`, [links](https://example.com), and ![inline images](/Users/mike/Code/eidola/apps/macos/Packages/MarkdownEditor/Example.png) that sit alongside surrounding prose.
 
 A sole image becomes a block:
 
 ![block](/Users/mike/Code/eidola/apps/macos/Packages/MarkdownEditor/Example.png)
 
-Click into either to switch to edit mode and adjust the alt text or
-URL directly. Remote images need a real HTTP client wired into the
-gpui app — the demo uses gpui's `NullHttpClient` default, so a
-`![alt](https://…)` will fall back to showing the dim
-`![alt](https://…)` source so you can fix the URL.
+Click into either to switch to edit mode and adjust the alt text or URL directly. Remote images need a real HTTP client wired into the gpui app — the demo uses gpui's `NullHttpClient` default, so a `![alt](https://…)` will fall back to showing the dim `![alt](https://…)` source so you can fix the URL.
 
 ## Cursor-aware delimiters
 
-When the cursor is outside a construct the delimiters hide; when it's
-inside they reveal in a dimmed color. Try clicking around in the
-**bold** and *italic* runs above to see them flip in and out.
+When the cursor is outside a construct the delimiters hide; when it's inside they reveal in a dimmed color. Try clicking around in the **bold** and *italic* runs above to see them flip in and out.
 
 ### Mix and match
 
-You can combine ***bold and italic*** as a triple-asterisk run, or use
-~~strikethrough~~ inside a paragraph alongside other styling. Inline
-code like `let x = 42;` shapes in the mono font with a faint background.
+You can combine ***bold and italic*** as a triple-asterisk run, or use ~~strikethrough~~ inside a paragraph alongside other styling. Inline code like `let x = 42;` shapes in the mono font with a faint background.
 
 ---
 
-Thematic breaks (`---` / `***` / `___`) render as a thin horizontal
-rule. The source bytes hide when the cursor is elsewhere and reveal
-(dimmed) when the cursor is on the rule line.
+Thematic breaks (`---` / `***` / `___`) render as a thin horizontal rule. The source bytes hide when the cursor is elsewhere and reveal (dimmed) when the cursor is on the rule line.
 
 ### Lists
 
@@ -85,17 +73,11 @@ rule. The source bytes hide when the cursor is elsewhere and reveal
 
 ### Math
 
-Inline math like $x^2 + y^2 = z^2$ typesets right next to the
-prose, with a little extra row height for tall constructs such as
-$\\frac{1}{1-x}$ or $\\sqrt{x^2 + y^2}$. Display math sits on its
-own row:
+Inline math like $x^2 + y^2 = z^2$ typesets right next to the prose, with a little extra row height for tall constructs such as $\\frac{1}{1-x}$ or $\\sqrt{x^2 + y^2}$. Display math sits on its own row:
 
 $$\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n$$
 
-Click into the equation above to swap to edit mode and adjust the
-LaTeX directly. CommonMark backslash escapes (`\\*`) and HTML
-entities (`&copy;`, `&mdash;`) render as literals when the cursor
-is elsewhere — try `\\*starred\\*` or 2026 &mdash; it works.
+Click into the equation above to swap to edit mode and adjust the LaTeX directly. CommonMark backslash escapes (`\\*`) and HTML entities (`&copy;`, `&mdash;`) render as literals when the cursor is elsewhere — try `\\*starred\\*` or 2026 &mdash; it works.
 
 ";
 
@@ -147,10 +129,19 @@ fn bind_keys(cx: &mut App) {
     ]);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DraggingPane {
+    EditorSource,
+    SourceAst,
+}
+
 /// Top-level demo view. Owns the editor entity and observes it so the
 /// debug panes track edits.
 struct DemoApp {
     editor: Entity<MarkdownEditor>,
+    source_width: Pixels,
+    ast_width: Pixels,
+    dragging: Option<DraggingPane>,
 }
 
 impl DemoApp {
@@ -159,7 +150,12 @@ impl DemoApp {
         // Re-render this view whenever the editor's state changes — that's
         // how the source / AST panes track edits live.
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
-        Self { editor }
+        Self {
+            editor,
+            source_width: px(360.),
+            ast_width: px(360.),
+            dragging: None,
+        }
     }
 }
 
@@ -180,10 +176,98 @@ impl Render for DemoApp {
         let muted = theme.muted_foreground;
         let border = theme.border;
 
+        let is_dragging_editor_source = self.dragging == Some(DraggingPane::EditorSource);
+        let is_dragging_source_ast = self.dragging == Some(DraggingPane::SourceAst);
+
+        let divider_1 = div()
+            .id("divider-editor-source")
+            .w(px(5.))
+            .h_full()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.dragging = Some(DraggingPane::EditorSource);
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(1.))
+                    .h_full()
+                    .mx_auto()
+                    .bg(if is_dragging_editor_source {
+                        fg
+                    } else {
+                        border
+                    }),
+            );
+
+        let divider_2 = div()
+            .id("divider-source-ast")
+            .w(px(5.))
+            .h_full()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.dragging = Some(DraggingPane::SourceAst);
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(1.))
+                    .h_full()
+                    .mx_auto()
+                    .bg(if is_dragging_source_ast { fg } else { border }),
+            );
+
         h_flex()
             .size_full()
             .bg(bg)
             .text_color(fg)
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if let Some(dragging) = &this.dragging {
+                    let w_width = window.viewport_size().width;
+                    let mouse_x = event.position.x;
+                    match dragging {
+                        DraggingPane::EditorSource => {
+                            let min_width = px(100.);
+                            let max_width = w_width - px(200.);
+                            let new_width = (w_width - mouse_x - this.ast_width)
+                                .max(min_width)
+                                .min(max_width);
+                            this.source_width = new_width;
+                        }
+                        DraggingPane::SourceAst => {
+                            let min_width = px(100.);
+                            let max_width = w_width - this.source_width - px(200.);
+                            let new_width = (w_width - mouse_x).max(min_width).min(max_width);
+                            this.ast_width = new_width;
+                        }
+                    }
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.dragging.is_some() {
+                        this.dragging = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.dragging.is_some() {
+                        this.dragging = None;
+                        cx.notify();
+                    }
+                }),
+            )
             // Editor pane.
             .child(
                 div()
@@ -194,12 +278,19 @@ impl Render for DemoApp {
                     .overflow_y_scroll()
                     .child(self.editor.clone()),
             )
-            .child(div().w(px(1.)).h_full().bg(border))
+            .child(divider_1)
             // Source pane.
-            .child(debug_pane("source", Some(cursor_label), &md, muted, border))
-            .child(div().w(px(1.)).h_full().bg(border))
+            .child(debug_pane(
+                "source",
+                Some(cursor_label),
+                &md,
+                self.source_width,
+                muted,
+                border,
+            ))
+            .child(divider_2)
             // AST pane.
-            .child(debug_pane("ast", None, &ast, muted, border))
+            .child(debug_pane("ast", None, &ast, self.ast_width, muted, border))
     }
 }
 
@@ -210,6 +301,7 @@ fn debug_pane(
     label: &'static str,
     subtitle: Option<String>,
     content: &str,
+    width: Pixels,
     muted: gpui::Hsla,
     border: gpui::Hsla,
 ) -> impl IntoElement {
@@ -218,7 +310,7 @@ fn debug_pane(
     let view_id = SharedString::from(format!("pane-md-{label}"));
 
     v_flex()
-        .w(px(360.))
+        .w(width)
         .h_full()
         .child(
             v_flex()
@@ -248,6 +340,7 @@ fn debug_pane(
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
+                .overflow_x_scroll()
                 .px_3()
                 .pb_3()
                 .text_size(rems(0.85))

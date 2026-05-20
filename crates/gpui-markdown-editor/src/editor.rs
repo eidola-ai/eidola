@@ -103,6 +103,14 @@ pub struct MarkdownEditor {
     /// re-shape. Stale entries (block index no longer present in this
     /// frame's spec) are harmless — they're simply not read.
     code_block_scrolls: HashMap<usize, Pixels>,
+    /// Persistent "intended visual column" for consecutive Up / Down
+    /// arrow presses. When the user crosses a short row (or one that
+    /// wraps at a different column), the cursor's source-byte column
+    /// shrinks; we remember the *visual* x from the press that started
+    /// the streak so the cursor returns to that x on the next long
+    /// row. Reset to `None` on any non-vertical event in
+    /// `dispatch_reset_intended_x_unless_vertical`.
+    intended_x: Option<Pixels>,
 }
 
 impl MarkdownEditor {
@@ -131,6 +139,7 @@ impl MarkdownEditor {
             frame_input_handler_set: false,
             marked_range: None,
             code_block_scrolls: HashMap::new(),
+            intended_x: None,
         }
     }
 
@@ -160,8 +169,190 @@ impl MarkdownEditor {
     }
 
     fn dispatch(&mut self, event: EditorEvent, cx: &mut Context<Self>) {
+        // Any non-vertical event invalidates the intended-x streak.
+        // Vertical events (handled by `vertical_move` below) update
+        // `intended_x` directly without going through this helper.
+        self.intended_x = None;
         let next = std::mem::take(&mut self.state);
         self.state = update::update(next, event);
+        self.marked_range = None;
+        cx.notify();
+    }
+
+    /// Common path for Up / Down / Shift+Up / Shift+Down: try a
+    /// *visual* move that respects the laid-out, soft-wrapped row
+    /// geometry from the previous frame. Returns the new caret offset
+    /// (the dispatch site decides between `Cursor` and `Range`
+    /// selection shapes). Falls back to `None` when there's no layout
+    /// to consult (pre-paint state, headless tests); callers can then
+    /// route through the source-byte `MoveUp` / `MoveDown` event as a
+    /// best-effort approximation.
+    ///
+    /// **Intended-x preservation.** The first vertical key press of a
+    /// streak captures the cursor's *visual* x (block origin + local x
+    /// returned by `local_position_for_source_offset`) and stores it
+    /// on `self.intended_x`. Subsequent presses re-use that anchor
+    /// instead of the (possibly column-shrunk) cursor's current x, so
+    /// a long line → wrapped short row → long line round-trip lands
+    /// the caret back at its original visual column. Non-vertical
+    /// events clear the anchor via [`dispatch`].
+    fn visual_move_caret(&mut self, direction: i32) -> Option<usize> {
+        if self.last_blocks.is_empty() {
+            return None;
+        }
+        let cursor = self.state.selection.head();
+        let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
+        keys.sort();
+
+        // Find the LaidOutLine containing the cursor. Each block has
+        // multiple lines; multiple blocks claim no shared bytes (post
+        // `inject_empty_paragraphs` synthesizes them with disjoint
+        // ranges), so the first containing line wins.
+        let mut current: Option<(&crate::element::LaidOutLine, usize)> = None;
+        for k in &keys {
+            let block = &self.last_blocks[k];
+            for line in &block.lines {
+                if line.contains_source_offset(cursor) {
+                    current = Some((line, *k));
+                    break;
+                }
+            }
+            if current.is_some() {
+                break;
+            }
+        }
+        let (line, _) = current?;
+
+        // Local point of the cursor inside the current LaidOutLine.
+        // `local_position_for_source_offset` accounts for soft wraps
+        // via `WrappedLine::position_for_index`, so `local.y` is the
+        // wrap-row's y inside the line and `local.x` is the visual x
+        // within that wrap row.
+        let local = line.local_position_for_source_offset(cursor);
+        let global_x = line.origin.x + local.x;
+        let target_x = self.intended_x.unwrap_or(global_x);
+        let row_h = line.row_height;
+        if row_h <= px(0.) {
+            return None;
+        }
+        // Step exactly one wrap-row vertically. `local.y` from
+        // `position_for_index` is already row-aligned (multiples of
+        // row_height); shifting by ±row_h lands at the next row.
+        let target_global_y = line.origin.y + local.y + row_h * (direction as f32);
+
+        let current_top = line.origin.y;
+        let current_bot = current_top + line.wrapped_height;
+
+        // Intra-line wrap-row navigation: target_y still falls inside
+        // the current logical line's vertical extent. The line wraps,
+        // we're stepping between wrap rows of the same shaped text.
+        let target_line: &crate::element::LaidOutLine =
+            if target_global_y >= current_top && target_global_y < current_bot {
+                line
+            } else {
+                // Cross-line navigation: find the closest line in the
+                // direction of motion. The current line is filtered out
+                // (it's behind us), and lines on the *wrong* side of the
+                // motion are filtered out (so a Down doesn't backtrack to
+                // a line above the cursor when no line below exists, and
+                // vice-versa). Within the direction-filtered set, pick
+                // the line whose vertical bounds are closest to
+                // `target_global_y` — this absorbs the inter-block
+                // paragraph_gap by snapping the target into the nearest
+                // candidate row.
+                let mut best: Option<(&crate::element::LaidOutLine, Pixels)> = None;
+                for k in &keys {
+                    let block = &self.last_blocks[k];
+                    for cand in &block.lines {
+                        let top = cand.origin.y;
+                        let bot = top + cand.wrapped_height;
+                        if direction < 0 {
+                            if bot > current_top {
+                                continue;
+                            }
+                        } else if top < current_bot {
+                            continue;
+                        }
+                        let dist = if target_global_y < top {
+                            top - target_global_y
+                        } else if target_global_y >= bot {
+                            target_global_y - bot
+                        } else {
+                            px(0.)
+                        };
+                        match best {
+                            Some((_, d)) if d <= dist => {}
+                            _ => best = Some((cand, dist)),
+                        }
+                    }
+                }
+                best.map(|(l, _)| l)?
+            };
+
+        // Clamp y to the target line's extent so a target that fell
+        // in a paragraph_gap (no row owned it directly) still picks a
+        // sensible wrap-row inside the snapped-to line.
+        let top = target_line.origin.y;
+        let bot = top + target_line.wrapped_height;
+        let clamped_y = if target_global_y < top {
+            px(0.)
+        } else if target_global_y >= bot {
+            target_line.wrapped_height - px(1.)
+        } else {
+            target_global_y - top
+        };
+        let local_target = Point::new(target_x - target_line.origin.x, clamped_y);
+        let new_offset = target_line.source_offset_for_local_point(local_target);
+
+        // Persist the original visual x for the next press in this
+        // streak.
+        self.intended_x = Some(target_x);
+        Some(new_offset)
+    }
+
+    /// Dispatch path for Up / Down / Shift+Up / Shift+Down. Tries
+    /// `visual_move_caret` first; on success builds the appropriate
+    /// `Selection` and calls `update::update(SetSelection(_))`. On
+    /// failure (no layout / cursor not in any laid-out line) falls
+    /// back to the source-byte event so headless tests and pre-paint
+    /// state still move predictably.
+    fn vertical_move(
+        &mut self,
+        direction: i32,
+        extending: bool,
+        fallback: EditorEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let new_head = match self.visual_move_caret(direction) {
+            Some(offset) => offset,
+            None => {
+                self.intended_x = None;
+                let next = std::mem::take(&mut self.state);
+                self.state = update::update(next, fallback);
+                self.marked_range = None;
+                cx.notify();
+                return;
+            }
+        };
+        let new_sel = if extending {
+            let anchor = match self.state.selection {
+                Selection::Cursor(p) => p,
+                Selection::Range { anchor, .. } => anchor,
+            };
+            if anchor == new_head {
+                Selection::Cursor(new_head)
+            } else {
+                Selection::range(anchor, new_head)
+            }
+        } else {
+            Selection::Cursor(new_head)
+        };
+        // Important: route through update so forbidden-position snap
+        // and any post-pass still applies, but DON'T clear
+        // `intended_x` (dispatch() does that). Hand-roll the update
+        // call here to preserve the anchor.
+        let next = std::mem::take(&mut self.state);
+        self.state = update::update(next, EditorEvent::SetSelection(new_sel));
         self.marked_range = None;
         cx.notify();
     }
@@ -202,10 +393,10 @@ impl MarkdownEditor {
         self.dispatch(EditorEvent::MoveRight, cx);
     }
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::MoveUp, cx);
+        self.vertical_move(-1, false, EditorEvent::MoveUp, cx);
     }
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::MoveDown, cx);
+        self.vertical_move(1, false, EditorEvent::MoveDown, cx);
     }
     fn shift_left(&mut self, _: &ShiftLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorEvent::ExtendLeft, cx);
@@ -214,10 +405,10 @@ impl MarkdownEditor {
         self.dispatch(EditorEvent::ExtendRight, cx);
     }
     fn shift_up(&mut self, _: &ShiftUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::ExtendUp, cx);
+        self.vertical_move(-1, true, EditorEvent::ExtendUp, cx);
     }
     fn shift_down(&mut self, _: &ShiftDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::ExtendDown, cx);
+        self.vertical_move(1, true, EditorEvent::ExtendDown, cx);
     }
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorEvent::MoveLineStart, cx);
@@ -610,7 +801,7 @@ impl Render for MarkdownEditor {
             .key_context("MarkdownEditor")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
-            .size_full()
+            .w_full()
             .flex()
             .flex_col()
             .text_size(self.style.font_size)

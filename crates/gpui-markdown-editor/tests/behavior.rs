@@ -10,7 +10,10 @@
 //!    path keystrokes take in production.
 //! 3. Assert against the editor's public state with `read_with`.
 
-use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
+use gpui::{
+    AnyWindowHandle, AppContext, Bounds, Entity, TestAppContext, WindowBounds, WindowOptions,
+    point, px, size,
+};
 use gpui_component::Root;
 use gpui_markdown_editor::editor::{
     Backspace, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward, DeleteWordForward,
@@ -34,6 +37,37 @@ fn open_editor(
                 inner = Some(editor.clone());
                 cx.new(|cx| Root::new(editor, window, cx))
             })
+            .expect("open window");
+        (window.into(), inner.expect("editor built"))
+    })
+}
+
+/// Variant of [`open_editor`] that fixes the window to a narrow width
+/// so paragraphs reliably soft-wrap. Used by visual-navigation tests
+/// that need a wrap row inside a logical line to exist.
+fn open_editor_narrow(
+    cx: &mut TestAppContext,
+    state: EditorState,
+) -> (AnyWindowHandle, Entity<MarkdownEditor>) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        let mut inner: Option<Entity<MarkdownEditor>> = None;
+        let bounds = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(160.), px(400.)),
+        };
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let editor = cx.new(|cx| MarkdownEditor::with_state(state, window, cx));
+                    inner = Some(editor.clone());
+                    cx.new(|cx| Root::new(editor, window, cx))
+                },
+            )
             .expect("open window");
         (window.into(), inner.expect("editor built"))
     })
@@ -7608,17 +7642,17 @@ fn up_arrow_walks_through_bq_synth_row_to_first_paragraph(cx: &mut TestAppContex
     dispatch(cx, handle, &editor, Up);
     editor.read_with(cx, |e, _| {
         // First Up lands on the synth row's end-of-line position
-        // (= the `\n` boundary at byte 10).
+        // (= the `\n` boundary at byte 10). Visual x at the empty
+        // row maps to the row's only allowed position.
         assert_eq!(e.cursor_offset(), 10);
     });
     dispatch(cx, handle, &editor, Up);
     editor.read_with(cx, |e, _| {
-        // Second Up: column tracked is `cursor - line_start` = 2
-        // (the source-byte column of the synth's `\n` position).
-        // Apply that to "> P1" line → byte 0 + 2 = byte 2 (= `P`).
-        // No persistent intended-column across short rows (current
-        // model: column shrinks to fit each row's source length).
-        assert_eq!(e.cursor_offset(), 2);
+        // Second Up: `intended_x` was captured at end of "P3" on the
+        // first press, so we re-target end-of-line on "> P1" too
+        // (not column 2 = `P`). Visual nav with intended-x
+        // preservation: end of P3 → end of P1.
+        assert_eq!(e.cursor_offset(), 4);
     });
 }
 
@@ -7729,5 +7763,368 @@ fn chain_pair_interior_recognizes_inter_pair_boundary(_cx: &mut TestAppContext) 
     assert!(
         !gpui_markdown_editor::analysis::is_forbidden_position(md, 9),
         "byte 9 must be a cursor-allowed position"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Visual / wrap-aware Up / Down navigation
+//
+// The cursor's Up / Down movement follows the *rendered* row layout, not
+// the source-byte positions. A long soft-wrapped paragraph has multiple
+// wrap rows inside a single logical line; Up from the second wrap row
+// must land on the first wrap row (same logical line), not on the line
+// above. Verified via `open_editor_narrow` which constrains the window
+// width so wrapping reliably triggers.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn down_from_short_paragraph_lands_on_first_wrap_row_of_long_paragraph(cx: &mut TestAppContext) {
+    // Two paragraphs:
+    //   1. "Hi."                                            (line 1, no wrap)
+    //   2. "This is a very long paragraph that wraps."      (wraps into 2+ rows)
+    //
+    // From cursor in paragraph 1, Down lands on the *first wrap row*
+    // of paragraph 2 — not on its last wrap row (the source-byte
+    // model would land near the end since "Hi." line is short).
+    let markdown =
+        "Hi.\n\nThis is a very long paragraph that wraps in the narrow viewport configured by open_editor_narrow.".to_string();
+    let initial = EditorState {
+        markdown,
+        selection: Selection::Cursor(2), // end of "Hi"
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    // Trigger a render so last_blocks is populated before the
+    // visual-move path is consulted. A no-op SetSelection works
+    // because dispatch always runs paint via run_until_parked.
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+    // Now position cursor explicitly at "Hi" column 2.
+    set_cursor(cx, handle, &editor, 2);
+    dispatch(cx, handle, &editor, Down);
+    editor.read_with(cx, |e, _| {
+        let cursor = e.cursor_offset();
+        // Should land on the first wrap row of the second
+        // paragraph — somewhere in the prefix of "This is a very
+        // long paragraph that wraps...". The exact column depends
+        // on font metrics, but the cursor MUST sit before the
+        // (wrap) midpoint of the long paragraph.
+        let para2_start = 5;
+        let para2_end = e.state.markdown.len();
+        let mid = (para2_start + para2_end) / 2;
+        assert!(
+            cursor >= para2_start && cursor < mid,
+            "Down from short paragraph should land in the first half \
+             of the wrapped second paragraph, got cursor={cursor} \
+             (range {para2_start}..{mid})",
+        );
+    });
+}
+
+#[gpui::test]
+fn up_from_second_wrap_row_lands_on_first_wrap_row_same_paragraph(cx: &mut TestAppContext) {
+    // A single paragraph that wraps over multiple visible rows.
+    // Cursor placed deep enough in the content that it lands on the
+    // second wrap row; Up should land on the *first wrap row of the
+    // same logical line*, not jump to a previous paragraph.
+    let para = "This is a very long paragraph that wraps around. \
+                In my viewport it wraps here and this is rendered on the second line.";
+    let markdown = format!("Heading\n\n{para}");
+    let cursor_at = markdown.len() - 10; // near end of long paragraph
+    let initial = EditorState {
+        markdown: markdown.clone(),
+        selection: Selection::Cursor(cursor_at),
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    // Force a paint pass to populate last_blocks.
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+    set_cursor(cx, handle, &editor, cursor_at);
+    dispatch(cx, handle, &editor, Up);
+    editor.read_with(cx, |e, _| {
+        let cursor = e.cursor_offset();
+        let para_start = 9; // "Heading\n\n" = 9 bytes
+        // Up should NOT jump out of the long paragraph back to
+        // "Heading" — the wrap row above the cursor is still part
+        // of the same logical line.
+        assert!(
+            cursor >= para_start,
+            "Up from a wrapped row should stay inside the long \
+             paragraph, got cursor={cursor} (para starts at {para_start})",
+        );
+        assert!(
+            cursor < cursor_at,
+            "Up should move the cursor backward in source bytes \
+             (was at {cursor_at}, ended up at {cursor})",
+        );
+    });
+}
+
+#[gpui::test]
+fn down_from_first_wrap_row_lands_on_second_wrap_row_same_paragraph(cx: &mut TestAppContext) {
+    // Symmetric to the test above: cursor near the start of a long
+    // wrapped paragraph; Down should land on the same paragraph's
+    // second wrap row, not on the next block.
+    let para = "This is a very long paragraph that wraps around. \
+                In my viewport it wraps here and this is rendered on the second line.";
+    let markdown = format!("{para}\n\nNext paragraph.");
+    let initial = EditorState {
+        markdown: markdown.clone(),
+        selection: Selection::Cursor(5), // somewhere in "This is..."
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+    set_cursor(cx, handle, &editor, 5);
+    dispatch(cx, handle, &editor, Down);
+    editor.read_with(cx, |e, _| {
+        let cursor = e.cursor_offset();
+        let para_end = para.len();
+        // Down should NOT skip past the wrapped paragraph into
+        // "Next paragraph." — the cursor stays inside the long
+        // paragraph's bytes.
+        assert!(
+            cursor > 5 && cursor < para_end,
+            "Down from wrap row #1 should stay inside the long \
+             paragraph, got cursor={cursor} (expected in (5, {para_end}))",
+        );
+    });
+}
+
+#[gpui::test]
+fn intended_x_preserved_across_consecutive_up_presses(cx: &mut TestAppContext) {
+    // Press Up Up: the first lands on a short row that shrinks the
+    // visible column to fit; the second should return to the
+    // original *visual* column from before the first press (intended-x
+    // streak). Demonstrates the streak's persistence.
+    //
+    // The fixture is the user's reported bug: long paragraph + short
+    // paragraph + long paragraph. Start at end of paragraph 3, Up to
+    // short-mid, Up to a column on paragraph 1 that matches the
+    // original visual x — past the right edge of "P1" content, so
+    // the cursor lands at end of "P1" (byte 4), NOT at the source-
+    // byte column-mapped position (byte 2 = `P`).
+    let initial = EditorState {
+        markdown: "> P1\n> \n> \n> \n> P3".into(),
+        selection: Selection::Cursor(18),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Up);
+    let first = editor.read_with(cx, |e, _| e.cursor_offset());
+    dispatch(cx, handle, &editor, Up);
+    editor.read_with(cx, |e, _| {
+        // First Up landed on the synth empty BQ row.
+        assert_eq!(first, 10);
+        // Second Up: intended_x was captured at end of "P3" on the
+        // first press; even though the synth row was empty (which
+        // would shrink any source-byte column), the second press
+        // returns to the original x → end of "P1" content (byte 4),
+        // not the synth-row-shrunken column.
+        assert_eq!(e.cursor_offset(), 4);
+    });
+}
+
+#[gpui::test]
+fn intended_x_reset_by_non_vertical_action(cx: &mut TestAppContext) {
+    // Up Up gives the persistent-x behavior. But intervening Left
+    // (or any non-vertical) clears intended_x, so the next Up uses
+    // the cursor's current x as the new anchor.
+    let initial = EditorState {
+        markdown: "> P1\n> \n> \n> \n> P3".into(),
+        selection: Selection::Cursor(18),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Up);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 10));
+    // Break the streak with a Left arrow.
+    dispatch(cx, handle, &editor, Left);
+    // Now Up should NOT remember the original "P3" x — it captures
+    // the current cursor's x (= 0 on the synth row) and maps to the
+    // start of "P1" content on the line above.
+    dispatch(cx, handle, &editor, Up);
+    editor.read_with(cx, |e, _| {
+        // The synth row's visible content is empty, so cursor x on
+        // it is the line's left edge (≈ chain prefix end). Mapped
+        // back to "> P1" line, that's the leading edge of `P` → byte 2.
+        // The exact result depends on font metrics; what matters is
+        // that the cursor is NOT at byte 4 (which would have
+        // indicated stale intended_x).
+        assert_ne!(
+            e.cursor_offset(),
+            4,
+            "intended_x should have been cleared by Left"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Empty marker-line list items
+//
+// A list item whose only block-level child is a non-Paragraph block
+// (nested list, blockquote, code block, …) and whose marker stands
+// alone on its line. Pulldown's parse tree has no Paragraph child for
+// that item, so the render walker used to fold the marker line into
+// the recursed leaf — collapsing the marker row's chain depth to the
+// nested block's chain, painting both markers on the same row, and
+// landing the cursor at the deep indent column. The render-side fix
+// emits a synth marker-line block first, keeping the marker row at
+// the LI's own chain depth.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn empty_intermediate_li_emits_separate_marker_row_block(cx: &mut TestAppContext) {
+    // The user-reported fixture:
+    //
+    //   1. One
+    //   2.
+    //      1. Two, One
+    //
+    // Before fix: 2 blocks, second covered both the empty `2. ` row
+    // AND the nested list with chain=[outer, inner], so the marker
+    // row painted at the inner indent and both marker overlays
+    // stacked on one row.
+    //
+    // After fix: 3 blocks — one per visible row. The synth marker
+    // row carries only the outer LI in its container chain so it
+    // paints at the outer indent.
+    let initial = EditorState {
+        markdown: "1. One\n2. \n   1. Two, One".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    assert_eq!(
+        spec.blocks.len(),
+        3,
+        "expected one block per visible row (got {})",
+        spec.blocks.len(),
+    );
+    // Block 0: "1. One" at the start, containers=1 (outer LI only).
+    assert_eq!(spec.blocks[0].source_range, 0..6);
+    assert_eq!(spec.blocks[0].containers.len(), 1);
+    // Block 1: synth for the empty `2. ` row, containers=1 (outer LI).
+    // The synth's range covers the outer LI's marker through its
+    // line's `\n`-or-EOL (then trimmed of trailing `\n` by
+    // `inject_empty_paragraphs`).
+    assert_eq!(
+        spec.blocks[1].source_range,
+        7..10,
+        "synth marker-row should cover the LI marker line (trimmed of trailing `\\n`)",
+    );
+    assert_eq!(
+        spec.blocks[1].containers.len(),
+        1,
+        "synth marker-row should carry only the outer LI in its chain, not the nested inner",
+    );
+    // Block 2: the nested list's content, containers=2 (outer + inner).
+    assert_eq!(spec.blocks[2].source_range, 14..25);
+    assert_eq!(spec.blocks[2].containers.len(), 2);
+}
+
+#[gpui::test]
+fn cursor_lands_on_empty_intermediate_li_marker_row(cx: &mut TestAppContext) {
+    // The empty marker line's `\n` byte (= line_end) is the canonical
+    // cursor position for "on the empty `2. ` row". The synth block's
+    // source_range covers it (after the `\n` trim), so
+    // block_claims_cursor lands the cursor on the synth and the
+    // visual column corresponds to the outer LI's content edge.
+    let initial = EditorState {
+        markdown: "1. One\n2. \n   1. Two, One".into(),
+        // Cursor at the `\n` ending the `2. ` line.
+        selection: Selection::Cursor(10),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let synth = &spec.blocks[1];
+    assert!(
+        synth.source_range.start <= 10 && 10 <= synth.source_range.end,
+        "cursor at byte 10 must fall within the synth marker-row block range {:?}",
+        synth.source_range,
+    );
+}
+
+#[gpui::test]
+fn typing_on_empty_intermediate_li_marker_row_adds_content_to_item(cx: &mut TestAppContext) {
+    // From the synth marker row, inserting text turns the empty item
+    // into a non-empty one with the nested list as a continuation
+    // child.
+    let initial = EditorState {
+        markdown: "1. One\n2. \n   1. Two, One".into(),
+        selection: Selection::Cursor(10),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("Two".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "1. One\n2. Two\n   1. Two, One");
+        // Cursor lands right after the inserted text.
+        assert_eq!(e.cursor_offset(), 13);
+    });
+}
+
+#[gpui::test]
+fn empty_li_with_only_nested_blockquote_emits_separate_marker_row(cx: &mut TestAppContext) {
+    // Variant: LI's only child is a blockquote on a later line.
+    // Same shape, same synth needed.
+    //
+    //   1.
+    //      > quoted
+    //
+    // Marker line is `1.` followed by a newline; the BQ starts on
+    // the next line via 3-space indented continuation.
+    let initial = EditorState {
+        markdown: "1. \n   > quoted".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let marker_row = spec
+        .blocks
+        .iter()
+        .find(|b| b.source_range.contains(&0) && b.containers.len() == 1)
+        .or_else(|| spec.blocks.first());
+    assert!(
+        marker_row.is_some(),
+        "expected a synth marker-row block at the LI start",
+    );
+}
+
+#[gpui::test]
+fn li_with_paragraph_then_nested_list_does_not_emit_synth(cx: &mut TestAppContext) {
+    // Sanity check the other branch: when the LI has a Paragraph
+    // child (the marker line carries content) followed by a nested
+    // list, the existing path still folds the marker into the
+    // Paragraph leaf — no synth needed.
+    //
+    //   1. one
+    //      1. nested
+    //
+    // The outer LI here has a Paragraph child "one" on the marker
+    // line; the existing extend_leading_range path handles it.
+    let initial = EditorState {
+        markdown: "1. one\n   1. nested".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    // Two blocks: the Paragraph "one" (whose range was extended back
+    // to byte 0 to cover the marker) and the nested list's leaf.
+    assert_eq!(spec.blocks.len(), 2);
+    // No synth: the first block has the LI marker included via
+    // extend_leading_range — its source_range starts at 0 and
+    // includes inline content past the marker.
+    assert!(spec.blocks[0].source_range.start == 0);
+    assert!(
+        spec.blocks[0].source_range.end > 3,
+        "first block should cover marker + paragraph content `one`",
     );
 }
