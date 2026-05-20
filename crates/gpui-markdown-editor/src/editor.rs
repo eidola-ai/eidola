@@ -54,6 +54,33 @@ actions!(
         DocumentEnd,
         ShiftDocumentStart,
         ShiftDocumentEnd,
+        /// Move the cursor to the start of the previous word
+        /// (Unicode word boundary). Default macOS keybinding:
+        /// `alt-left`.
+        WordLeft,
+        /// Move the cursor to the end of the next word. Default macOS
+        /// keybinding: `alt-right`.
+        WordRight,
+        /// Extend the selection to the start of the previous word.
+        /// Default macOS keybinding: `alt-shift-left`.
+        ShiftWordLeft,
+        /// Extend the selection to the end of the next word. Default
+        /// macOS keybinding: `alt-shift-right`.
+        ShiftWordRight,
+        /// Delete back to the start of the previous word. Default
+        /// macOS keybinding: `alt-backspace`.
+        DeleteWordBackward,
+        /// Delete forward to the end of the next word. Default macOS
+        /// keybinding: `alt-delete`.
+        DeleteWordForward,
+        /// Delete from the cursor back to the visible start of the
+        /// current line (past any hidden chain prefix). Default macOS
+        /// keybinding: `cmd-backspace`.
+        DeleteToLineStart,
+        /// Delete from the cursor forward to the end of the current
+        /// line (the byte before its trailing `\n`). Default macOS
+        /// keybinding: `cmd-delete`.
+        DeleteToLineEnd,
         SelectAll,
         Copy,
         Cut,
@@ -220,6 +247,46 @@ impl MarkdownEditor {
     }
     fn shift_document_end(&mut self, _: &ShiftDocumentEnd, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorEvent::ExtendDocumentEnd, cx);
+    }
+
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.dispatch(EditorEvent::MoveWordLeft, cx);
+    }
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.dispatch(EditorEvent::MoveWordRight, cx);
+    }
+    fn shift_word_left(&mut self, _: &ShiftWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.dispatch(EditorEvent::ExtendWordLeft, cx);
+    }
+    fn shift_word_right(&mut self, _: &ShiftWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.dispatch(EditorEvent::ExtendWordRight, cx);
+    }
+    fn delete_word_backward(
+        &mut self,
+        _: &DeleteWordBackward,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(EditorEvent::DeleteWordBackward, cx);
+    }
+    fn delete_word_forward(
+        &mut self,
+        _: &DeleteWordForward,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(EditorEvent::DeleteWordForward, cx);
+    }
+    fn delete_to_line_start(
+        &mut self,
+        _: &DeleteToLineStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(EditorEvent::DeleteToLineStart, cx);
+    }
+    fn delete_to_line_end(&mut self, _: &DeleteToLineEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.dispatch(EditorEvent::DeleteToLineEnd, cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -571,6 +638,14 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(Self::document_end))
             .on_action(cx.listener(Self::shift_document_start))
             .on_action(cx.listener(Self::shift_document_end))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::shift_word_left))
+            .on_action(cx.listener(Self::shift_word_right))
+            .on_action(cx.listener(Self::delete_word_backward))
+            .on_action(cx.listener(Self::delete_word_forward))
+            .on_action(cx.listener(Self::delete_to_line_start))
+            .on_action(cx.listener(Self::delete_to_line_end))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))

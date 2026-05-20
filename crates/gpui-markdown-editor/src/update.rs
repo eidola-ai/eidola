@@ -94,6 +94,8 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
         EditorEvent::MoveLineEnd => move_(state, Move::LineEnd, false),
         EditorEvent::MoveDocumentStart => move_(state, Move::DocStart, false),
         EditorEvent::MoveDocumentEnd => move_(state, Move::DocEnd, false),
+        EditorEvent::MoveWordLeft => move_(state, Move::WordLeft, false),
+        EditorEvent::MoveWordRight => move_(state, Move::WordRight, false),
 
         EditorEvent::ExtendLeft => move_(state, Move::Left, true),
         EditorEvent::ExtendRight => move_(state, Move::Right, true),
@@ -103,6 +105,13 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
         EditorEvent::ExtendLineEnd => move_(state, Move::LineEnd, true),
         EditorEvent::ExtendDocumentStart => move_(state, Move::DocStart, true),
         EditorEvent::ExtendDocumentEnd => move_(state, Move::DocEnd, true),
+        EditorEvent::ExtendWordLeft => move_(state, Move::WordLeft, true),
+        EditorEvent::ExtendWordRight => move_(state, Move::WordRight, true),
+
+        EditorEvent::DeleteWordBackward => delete_word_backward(state),
+        EditorEvent::DeleteWordForward => delete_word_forward(state),
+        EditorEvent::DeleteToLineStart => delete_to_line_start(state),
+        EditorEvent::DeleteToLineEnd => delete_to_line_end(state),
     };
     let next = enforce_invariants(next);
     avoid_forbidden_positions(next, prev_anchor, prev_head)
@@ -1475,6 +1484,136 @@ fn delete_forward(state: EditorState) -> EditorState {
     splice(&state.markdown, cursor, cursor, next)
 }
 
+/// Delete from the start of the previous word through the cursor.
+/// With a non-collapsed selection, falls through to the normal range
+/// delete (matches every other deletion's "selection wins" rule).
+///
+/// **Chain-prefix floor.** When the cursor's line carries a structural
+/// chain prefix (`> ` per BQ level, `- ` / `1. ` / etc on a list-item
+/// marker line, marker-width spaces on a list-item continuation line),
+/// the word-target is clamped to the line's
+/// [`analysis::line_chain_prefix_end`]. Without this clamp,
+/// `prev_word_offset` at the start of a BQ paragraph would scan past
+/// the `> ` (neither `>` nor space contains alphanumeric, so the
+/// word walker treats them as separator and walks past them to the
+/// previous word on a previous line) and the splice would delete the
+/// BQ marker along with content. Top-level lines have no chain
+/// prefix, so the clamp is a no-op there and word-delete crosses
+/// `\n` naturally — matching plain-text editor behavior.
+fn delete_word_backward(state: EditorState) -> EditorState {
+    if !state.selection.is_collapsed() {
+        let (buf, cursor) = delete_selection(&state);
+        return EditorState {
+            markdown: buf,
+            selection: Selection::Cursor(cursor),
+        };
+    }
+    let cursor = state.selection.head();
+    if cursor == 0 {
+        return state;
+    }
+    let mut target = prev_word_offset(&state.markdown, cursor);
+    let prefix_end = analysis::line_chain_prefix_end(&state.markdown, cursor);
+    let line_start = line_start_offset(&state.markdown, cursor);
+    if prefix_end > line_start && target < prefix_end {
+        target = prefix_end;
+    }
+    if target >= cursor {
+        return state;
+    }
+    splice(&state.markdown, cursor, target, cursor)
+}
+
+/// Forward analog of [`delete_word_backward`] — delete from the cursor
+/// through the end of the next word.
+///
+/// **Next-line chain-prefix floor.** When the word-target lies past
+/// the cursor's line end *and* the next line carries a chain prefix,
+/// the target is clamped to the cursor's line end so the splice
+/// doesn't eat the next line's `> ` / `- ` / continuation indent.
+/// Top-level next lines have no chain prefix, so word-delete crosses
+/// `\n` and devours the next line's word naturally.
+fn delete_word_forward(state: EditorState) -> EditorState {
+    if !state.selection.is_collapsed() {
+        let (buf, cursor) = delete_selection(&state);
+        return EditorState {
+            markdown: buf,
+            selection: Selection::Cursor(cursor),
+        };
+    }
+    let cursor = state.selection.head();
+    if cursor >= state.markdown.len() {
+        return state;
+    }
+    let mut target = next_word_offset(&state.markdown, cursor);
+    let cursor_line_end = line_end_offset(&state.markdown, cursor);
+    if target > cursor_line_end {
+        let next_line_start = cursor_line_end + 1;
+        if next_line_start <= state.markdown.len() {
+            let next_prefix_end = analysis::line_chain_prefix_end(&state.markdown, next_line_start);
+            if next_prefix_end > next_line_start {
+                target = cursor_line_end;
+            }
+        }
+    }
+    if target <= cursor {
+        return state;
+    }
+    splice(&state.markdown, cursor, cursor, target)
+}
+
+/// Delete from the cursor back to the *visible content edge* of the
+/// current line — past every byte the renderer treats as chain chrome
+/// (BQ `> ` markers, list-item markers on the marker line,
+/// list-continuation indent on continuation lines) but before any byte
+/// the user thinks of as content.
+///
+/// At top level (no chain) the floor degenerates to the raw line
+/// start, matching the macOS plain-text Cmd+Backspace convention.
+/// Inside a BQ paragraph, list item, or nested combination, the chain
+/// prefix survives and only the user's content disappears — see
+/// [`analysis::line_chain_prefix_end`] for the per-container rules.
+///
+/// No-op when the cursor already sits at the content edge.
+fn delete_to_line_start(state: EditorState) -> EditorState {
+    if !state.selection.is_collapsed() {
+        let (buf, cursor) = delete_selection(&state);
+        return EditorState {
+            markdown: buf,
+            selection: Selection::Cursor(cursor),
+        };
+    }
+    let cursor = state.selection.head();
+    let prefix_end = analysis::line_chain_prefix_end(&state.markdown, cursor);
+    if prefix_end >= cursor {
+        return state;
+    }
+    splice(&state.markdown, cursor, prefix_end, cursor)
+}
+
+/// Delete from the cursor forward to the end of the current line
+/// (the byte right before its terminating `\n`, if any). Forward
+/// analog of [`delete_to_line_start`]; the line `\n` itself is left
+/// in place so the surrounding block structure stays intact.
+///
+/// No chain-prefix concerns: the deletion is bounded by `\n` and
+/// therefore never reaches into the next line's prefix bytes.
+fn delete_to_line_end(state: EditorState) -> EditorState {
+    if !state.selection.is_collapsed() {
+        let (buf, cursor) = delete_selection(&state);
+        return EditorState {
+            markdown: buf,
+            selection: Selection::Cursor(cursor),
+        };
+    }
+    let cursor = state.selection.head();
+    let target = line_end_offset(&state.markdown, cursor);
+    if target <= cursor {
+        return state;
+    }
+    splice(&state.markdown, cursor, cursor, target)
+}
+
 /// Splice out `[del_start, del_end)` from `markdown` and re-anchor the
 /// cursor relative to the deletion. Caller-supplied `cursor` is the
 /// current head; the returned state collapses any range selection to a
@@ -1549,6 +1688,12 @@ enum Move {
     LineEnd,
     DocStart,
     DocEnd,
+    /// Cursor jumps to the start of the previous word (Unicode word
+    /// boundary segments containing at least one alphanumeric char).
+    WordLeft,
+    /// Cursor jumps to the end of the next word. Symmetric with
+    /// [`Move::WordLeft`].
+    WordRight,
 }
 
 fn move_(state: EditorState, direction: Move, extending: bool) -> EditorState {
@@ -1574,6 +1719,8 @@ fn move_(state: EditorState, direction: Move, extending: bool) -> EditorState {
         Move::LineEnd => line_end_offset(&state.markdown, head),
         Move::DocStart => 0,
         Move::DocEnd => state.markdown.len(),
+        Move::WordLeft => prev_word_offset(&state.markdown, head),
+        Move::WordRight => next_word_offset(&state.markdown, head),
     };
 
     let new_sel = if extending {
@@ -1593,10 +1740,10 @@ fn move_(state: EditorState, direction: Move, extending: bool) -> EditorState {
         // Collapse to the appropriate edge (the natural direction the user
         // is moving toward) instead of jumping past the selection.
         match direction {
-            Move::Left | Move::Up | Move::LineStart | Move::DocStart => {
+            Move::Left | Move::WordLeft | Move::Up | Move::LineStart | Move::DocStart => {
                 Selection::Cursor(state.selection.lower_bound())
             }
-            Move::Right | Move::Down | Move::LineEnd | Move::DocEnd => {
+            Move::Right | Move::WordRight | Move::Down | Move::LineEnd | Move::DocEnd => {
                 Selection::Cursor(state.selection.upper_bound())
             }
         }
@@ -1657,6 +1804,51 @@ fn next_grapheme_offset(text: &str, pos: usize) -> usize {
     }
 }
 
+/// Byte position of the start of the previous "word" relative to `pos`,
+/// per Unicode word-boundary segmentation (UAX #29 via
+/// `unicode-segmentation`). The "previous word" is the most recent
+/// segment ending at or before `pos` that contains at least one
+/// alphanumeric char; intervening punctuation / whitespace segments
+/// are skipped so a cursor sitting after `"foo,  "` jumps back to the
+/// `f` of `foo`, not into the comma or one of the spaces.
+///
+/// Returns `0` when `pos` is at start of buffer or the entire prefix
+/// is non-word content (Option+Left from the start of a leading
+/// whitespace / punctuation run lands at byte 0).
+fn prev_word_offset(text: &str, pos: usize) -> usize {
+    let pos = pos.min(text.len());
+    if pos == 0 {
+        return 0;
+    }
+    let mut last_word_start = 0;
+    for (idx, seg) in text[..pos].split_word_bound_indices() {
+        if seg.chars().any(|c| c.is_alphanumeric()) {
+            last_word_start = idx;
+        }
+    }
+    last_word_start
+}
+
+/// Byte position of the end of the next "word" relative to `pos`,
+/// symmetric to [`prev_word_offset`]. Skips any non-word segments
+/// (whitespace, punctuation) starting at `pos` and lands at the end
+/// of the next segment that contains at least one alphanumeric char.
+///
+/// Returns `text.len()` when `pos` is at end of buffer or no word-ish
+/// segment follows the cursor.
+fn next_word_offset(text: &str, pos: usize) -> usize {
+    let pos = pos.min(text.len());
+    if pos >= text.len() {
+        return text.len();
+    }
+    for (idx, seg) in text[pos..].split_word_bound_indices() {
+        if seg.chars().any(|c| c.is_alphanumeric()) {
+            return pos + idx + seg.len();
+        }
+    }
+    text.len()
+}
+
 fn line_start_offset(text: &str, pos: usize) -> usize {
     let bytes = text.as_bytes();
     let pos = pos.min(text.len());
@@ -1683,11 +1875,11 @@ fn line_end_offset(text: &str, pos: usize) -> usize {
 /// `\n\n` pair shows up as two adjacent zero-length "lines" with the
 /// pair interior as the start of the second. That position is forbidden
 /// (no visible row to land on), and `text.split('\n')` doesn't know it.
-/// We test specifically for `is_paragraph_break_interior` rather than
-/// the general `is_forbidden_position` so we *only* skip phantom
-/// no-row segments — list-item line-start bytes are also forbidden
-/// (they collapse onto the line's content edge), but the line itself
-/// is a real visible row and Up/Down should land on it.
+/// We test specifically for [`line_is_phantom`] rather than the general
+/// `is_forbidden_position` so we *only* skip phantom no-row segments
+/// — list-item line-start bytes are also forbidden (they collapse onto
+/// the line's content edge), but the line itself is a real visible row
+/// and Up/Down should land on it.
 fn move_vertical(text: &str, pos: usize, direction: i32) -> usize {
     let bytes = text.as_bytes();
     let line_start = line_start_offset(text, pos);
@@ -1700,13 +1892,13 @@ fn move_vertical(text: &str, pos: usize, direction: i32) -> usize {
             }
             let prev_line_end = probe - 1;
             let prev_line_start = line_start_offset(text, prev_line_end);
-            if analysis::is_paragraph_break_interior(bytes, prev_line_start) {
+            if line_is_phantom(bytes, prev_line_start) {
                 probe = prev_line_start;
                 continue;
             }
             let prev_line_len = prev_line_end - prev_line_start;
             let target = prev_line_start + column.min(prev_line_len);
-            return snap_to_char_boundary(text, target);
+            return snap_within_line(text, target, prev_line_start, prev_line_end);
         }
     } else {
         let mut probe = line_end_offset(text, pos);
@@ -1715,16 +1907,83 @@ fn move_vertical(text: &str, pos: usize, direction: i32) -> usize {
                 return text.len();
             }
             let next_line_start = probe + 1;
-            if analysis::is_paragraph_break_interior(bytes, next_line_start) {
+            if line_is_phantom(bytes, next_line_start) {
                 probe = line_end_offset(text, next_line_start);
                 continue;
             }
             let next_line_end = line_end_offset(text, next_line_start);
             let next_line_len = next_line_end - next_line_start;
             let target = next_line_start + column.min(next_line_len);
-            return snap_to_char_boundary(text, target);
+            return snap_within_line(text, target, next_line_start, next_line_end);
         }
     }
+}
+
+/// Snap a `move_vertical` target byte to the nearest cursor-allowed
+/// position inside the row `[line_start, line_end]`. The raw target is
+/// `line_start + source-byte column`, which on a BQ / list line lands
+/// inside the hidden chain prefix bytes (forbidden positions). Naively
+/// returning the raw target would defer to `avoid_forbidden_positions`,
+/// which uses the *direction of motion* to pick prev- vs next-allowed
+/// — and Up arrow's "moving backward" direction snaps backward across
+/// the line boundary into a row above, undoing the move. Snapping
+/// within the current line keeps the cursor on the row the user
+/// arrowed onto and picks the closest visible column instead.
+///
+/// Forward-first preference: prefer walking toward `line_end` over
+/// `line_start`. The row's content edge typically sits at or after the
+/// raw target (chain prefix is to the left, content to the right), so
+/// forward-first lands at the natural visible column. If forward
+/// search exhausts the line without finding an allowed byte, walk
+/// backward as a fallback. The final fallback is `line_start`
+/// (returned even if forbidden) so the function is always total —
+/// `avoid_forbidden_positions` will then resolve the unreachable case
+/// via the standard direction rule.
+fn snap_within_line(text: &str, target: usize, line_start: usize, line_end: usize) -> usize {
+    let target = snap_to_char_boundary(text, target);
+    for p in target..=line_end {
+        if !analysis::is_forbidden_position(text, p) {
+            return p;
+        }
+    }
+    let mut p = target;
+    while p > line_start {
+        p -= 1;
+        if !analysis::is_forbidden_position(text, p) {
+            return p;
+        }
+    }
+    line_start
+}
+
+/// `true` when the line containing `line_start` is a phantom (no
+/// rendered row in the editor's output). Used by [`move_vertical`] to
+/// skip past `\n\n`-pair interiors in both top-level and chain-aware
+/// (BQ / LI-wrapped-BQ) configurations.
+///
+/// **Why check the line terminator, not the line start.** At top level
+/// a phantom line is a zero-length line, so `line_start == line_end`
+/// and the two checks agree. Inside a BQ pair-run, though, every
+/// prefix-only `> ` line has an interior `line_start` — including the
+/// SYNTHETIC empty paragraph that the renderer paints as a visible
+/// row between two paragraph breaks. The line's terminator (`\n` at
+/// `line_end`, or end-of-buffer for the last line) is the canonical
+/// pair boundary that *is* allowed for that synth row, and is the
+/// cursor's natural resting position at "end of empty BQ line".
+/// Testing the terminator means a synth row gets recognized as
+/// visible and Up/Down correctly stops on it.
+///
+/// Phantom rows in a multi-pair run still have interior terminators
+/// (the `\n` at offset 3, 9, … inside `> a\n> \n> \n> \n> b`), so this
+/// rule cleanly distinguishes "row that visually exists" from "row
+/// pulldown emits but the renderer collapses into a paragraph_gap".
+fn line_is_phantom(bytes: &[u8], line_start: usize) -> bool {
+    let len = bytes.len();
+    let mut line_end = line_start.min(len);
+    while line_end < len && bytes[line_end] != b'\n' {
+        line_end += 1;
+    }
+    analysis::is_paragraph_break_interior(bytes, line_end)
 }
 
 #[cfg(test)]

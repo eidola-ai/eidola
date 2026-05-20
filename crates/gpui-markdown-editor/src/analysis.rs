@@ -418,42 +418,77 @@ pub fn is_chain_pair_interior(markdown: &str, p: usize) -> bool {
         return false;
     }
     let bytes = markdown.as_bytes();
+    let matches_at = |s: usize| -> bool {
+        if s + pair_len > bytes.len() {
+            return false;
+        }
+        if bytes[s] != b'\n' {
+            return false;
+        }
+        // Reject hard-break `\n` (`  \n` / `\\\n`) — those aren't
+        // structural pair `\n`s.
+        if s >= 2 && bytes[s - 1] == b' ' && bytes[s - 2] == b' ' {
+            return false;
+        }
+        if s >= 1 && bytes[s - 1] == b'\\' {
+            return false;
+        }
+        if &bytes[s + 1..s + 1 + blank_bytes.len()] != blank_bytes {
+            return false;
+        }
+        if bytes[s + 1 + blank_bytes.len()] != b'\n' {
+            return false;
+        }
+        if &bytes[s + 2 + blank_bytes.len()..s + pair_len] != content_bytes {
+            return false;
+        }
+        true
+    };
     // Try every candidate pair start `s` such that `s < p < s +
     // pair_len`. Each candidate position is the index of the *first*
     // `\n` of the pair. The pair shape: bytes[s] == '\n', then
     // `blank_prefix`, then '\n', then `content_prefix`.
     let lo = p.saturating_sub(pair_len.saturating_sub(1));
     for s in lo..p {
-        if s + pair_len > bytes.len() {
+        if !matches_at(s) {
+            continue;
+        }
+        // **Maximal run walk.** A naive "found any pair containing
+        // p → interior" approach over-fires in multi-pair runs:
+        // pair shapes overlap themselves (a `\n[blank]\n[content]`
+        // chunk can match starting half-way through the canonical
+        // pair before it), and the shifted overlap reports
+        // canonical pair *boundary* bytes as "interior".
+        //
+        // Concrete failure: in `> a\n> \n> \n> \n> b` (chain `[BQ]`,
+        // pair_len=6) byte 9 (the `\n` between the two canonical
+        // pairs at s=3 and s=9) is a real cursor-landable position
+        // — pair s=3 ends there, pair s=9 starts there, both put it
+        // on a boundary. But a *shifted* pair shape matches at s=6
+        // (bytes 6..12 = `\n> \n> ` taken from the middle of the
+        // run), and offset 9-6=3 is mid-pair → the old code marked
+        // byte 9 interior. Fix: after finding any match, walk back
+        // byte-by-byte to the earliest matching start in the run,
+        // then walk forward by `pair_len` to find the run end, and
+        // classify `p` by its offset within the *maximal* run.
+        let mut run_start = s;
+        'walk_back: loop {
+            let scan_from = run_start.saturating_sub(pair_len);
+            for s2 in (scan_from..run_start).rev() {
+                if matches_at(s2) {
+                    run_start = s2;
+                    continue 'walk_back;
+                }
+            }
             break;
         }
-        if bytes[s] != b'\n' {
-            continue;
+        let mut run_end = run_start + pair_len;
+        while matches_at(run_end) {
+            run_end += pair_len;
         }
-        // Reject hard-break `\n` (`  \n` / `\\\n`) — those aren't
-        // structural pair `\n`s.
-        if s >= 2 && bytes[s - 1] == b' ' && bytes[s - 2] == b' ' {
-            continue;
-        }
-        if s >= 1 && bytes[s - 1] == b'\\' {
-            continue;
-        }
-        if &bytes[s + 1..s + 1 + blank_bytes.len()] != blank_bytes {
-            continue;
-        }
-        if bytes[s + 1 + blank_bytes.len()] != b'\n' {
-            continue;
-        }
-        if &bytes[s + 2 + blank_bytes.len()..s + pair_len] != content_bytes {
-            continue;
-        }
-        // Found a valid pair from s to s + pair_len. Allowed
-        // positions: the pair's start (s) and end (s + pair_len).
-        // Every other interior byte is forbidden.
-        let offset = p - s;
-        if offset > 0 && offset < pair_len {
-            return true;
-        }
+        let offset = p - run_start;
+        let run_len = run_end - run_start;
+        return offset > 0 && offset < run_len && !offset.is_multiple_of(pair_len);
     }
     false
 }
@@ -1742,6 +1777,86 @@ pub fn chain_outer_prefix_bytes(chain: &[EnclosingContainer]) -> usize {
     }
     let last = chain.len() - 1;
     chain_continuation_prefix_bytes(&chain[..last])
+}
+
+/// Byte position of the *visible content edge* on the line containing
+/// `cursor`. The content edge sits past every structural byte the
+/// renderer hides or paints as chain chrome — BQ `> ` markers, list-
+/// item markers on the marker line, and list-continuation indent on
+/// continuation lines — but before any content the user thinks of as
+/// belonging to the line.
+///
+/// This is the right floor for "delete to start of line" gestures
+/// (Cmd+Backspace, Option+Backspace clamp): deleting past it would
+/// destroy the chain prefix the user expects to be permanent, leaving
+/// orphaned content outside its enclosing scope.
+///
+/// **Algorithm.** Walk the cursor's enclosing-container chain
+/// (outermost first). Each container consumes its own prefix bytes
+/// on the cursor's line:
+///
+/// - `BlockQuote` consumes up to 3 leading spaces (CommonMark indent
+///   allowance) plus a `>` plus an optional trailing space.
+/// - `ListItem` on its **marker line** (the line whose source range
+///   contains the item's `marker_range`) advances past the marker
+///   text directly. On a **continuation line** (any subsequent line
+///   of a multi-line item) it consumes `marker_width` leading spaces
+///   of continuation indent.
+///
+/// At top level (empty chain) the result is `line_start_offset(cursor)`
+/// — there's no prefix to preserve, and the floor for delete operations
+/// is the raw line start.
+///
+/// The result is always clamped to the cursor's line end, so a chain
+/// that nominally expects more bytes than the line actually carries
+/// (e.g. an out-of-sync state mid-edit) doesn't run past the `\n`.
+pub fn line_chain_prefix_end(markdown: &str, cursor: usize) -> usize {
+    let bytes = markdown.as_bytes();
+    let line_start = line_start_offset(bytes, cursor.min(bytes.len()));
+    let mut line_end = line_start;
+    while line_end < bytes.len() && bytes[line_end] != b'\n' {
+        line_end += 1;
+    }
+    let chain = enclosing_containers_at(markdown, cursor);
+    let mut p = line_start;
+    for container in &chain {
+        match container {
+            EnclosingContainer::BlockQuote { .. } => {
+                let mut indent = 0;
+                while p < line_end && bytes[p] == b' ' && indent < 3 {
+                    p += 1;
+                    indent += 1;
+                }
+                if p < line_end && bytes[p] == b'>' {
+                    p += 1;
+                    if p < line_end && bytes[p] == b' ' {
+                        p += 1;
+                    }
+                }
+            }
+            EnclosingContainer::ListItem(ctx) => {
+                let marker_on_this_line =
+                    ctx.marker_range.start >= line_start && ctx.marker_range.end <= line_end;
+                if marker_on_this_line {
+                    // Marker line — skip past the marker text itself.
+                    // `p` may already be past `marker_range.start` if an
+                    // outer BQ scope contributed bytes; `max` keeps the
+                    // walk monotonic.
+                    p = p.max(ctx.marker_range.end);
+                } else {
+                    // Continuation line — skip `marker_width` spaces
+                    // (the LI's hidden continuation indent for this row).
+                    let want = ctx.marker_width();
+                    let mut taken = 0;
+                    while p < line_end && bytes[p] == b' ' && taken < want {
+                        p += 1;
+                        taken += 1;
+                    }
+                }
+            }
+        }
+    }
+    p.min(line_end)
 }
 
 /// Chain-aware variant of [`pair_at_end`]: if `cursor` sits at the end

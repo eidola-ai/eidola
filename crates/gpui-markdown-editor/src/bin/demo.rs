@@ -19,9 +19,11 @@ use gpui::{
 use gpui_component::{Root, Theme, h_flex, text::TextView, v_flex};
 use gpui_component_assets::Assets;
 use gpui_markdown_editor::{
-    Backspace, Copy, Cut, Delete, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left,
-    MarkdownEditor, Paste, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown,
-    ShiftEnd, ShiftEnter, ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, Tab, Up, parse,
+    Backspace, Copy, Cut, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward,
+    DeleteWordForward, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, MarkdownEditor,
+    Paste, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown, ShiftEnd, ShiftEnter,
+    ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft, ShiftWordRight, Tab, Up,
+    WordLeft, WordRight, parse,
 };
 
 const DEMO_DOCUMENT: &str = "\
@@ -106,6 +108,11 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-enter", ShiftEnter, None),
         KeyBinding::new("tab", Tab, None),
         KeyBinding::new("shift-tab", ShiftTab, None),
+        // Word / line delete (macOS standard: Option for word, Cmd for line).
+        KeyBinding::new("alt-backspace", DeleteWordBackward, None),
+        KeyBinding::new("alt-delete", DeleteWordForward, None),
+        KeyBinding::new("cmd-backspace", DeleteToLineStart, None),
+        KeyBinding::new("cmd-delete", DeleteToLineEnd, None),
         // Caret motion
         KeyBinding::new("left", Left, None),
         KeyBinding::new("right", Right, None),
@@ -127,6 +134,11 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-down", DocumentEnd, None),
         KeyBinding::new("cmd-shift-up", ShiftDocumentStart, None),
         KeyBinding::new("cmd-shift-down", ShiftDocumentEnd, None),
+        // Word-granular motion (macOS standard: Option+arrows).
+        KeyBinding::new("alt-left", WordLeft, None),
+        KeyBinding::new("alt-right", WordRight, None),
+        KeyBinding::new("alt-shift-left", ShiftWordLeft, None),
+        KeyBinding::new("alt-shift-right", ShiftWordRight, None),
         // Clipboard
         KeyBinding::new("cmd-a", SelectAll, None),
         KeyBinding::new("cmd-c", Copy, None),

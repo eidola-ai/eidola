@@ -13,8 +13,9 @@
 use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
 use gpui_component::Root;
 use gpui_markdown_editor::editor::{
-    Backspace, Delete, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Right, SelectAll,
-    ShiftEnter, ShiftRight, ShiftTab, Tab, Up,
+    Backspace, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward, DeleteWordForward,
+    DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Right, SelectAll, ShiftEnter,
+    ShiftRight, ShiftTab, ShiftWordLeft, ShiftWordRight, Tab, Up, WordLeft, WordRight,
 };
 use gpui_markdown_editor::{
     BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, RenderSpec, Selection,
@@ -6811,4 +6812,922 @@ fn backspace_on_prefix_only_line_in_bq_wrapped_math_eats_the_line(cx: &mut TestA
         assert_eq!(e.state.markdown, "> $$\n> x\n> $$");
         assert_eq!(e.cursor_offset(), 8);
     });
+}
+
+// ---------------------------------------------------------------------------
+// Word- and line-granular navigation and deletion
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn word_left_from_end_of_word_lands_at_start_of_that_word(cx: &mut TestAppContext) {
+    // Cursor at end of "world" in "hello world" → WordLeft jumps to
+    // the `w` (start of the same word). The first call lands at the
+    // word's start; a second call would jump back to the previous
+    // word.
+    let initial = EditorState {
+        markdown: "hello world".into(),
+        selection: Selection::Cursor(11),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, WordLeft);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 6));
+    dispatch(cx, handle, &editor, WordLeft);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 0));
+}
+
+#[gpui::test]
+fn word_left_from_start_of_word_skips_whitespace_to_previous_word(cx: &mut TestAppContext) {
+    // Cursor at the start of "world" → WordLeft skips the space and
+    // lands at the start of "hello".
+    let initial = EditorState {
+        markdown: "hello world".into(),
+        selection: Selection::Cursor(6),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, WordLeft);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 0));
+}
+
+#[gpui::test]
+fn word_right_from_start_of_word_lands_at_end_of_that_word(cx: &mut TestAppContext) {
+    // Cursor at byte 0 of "hello world" → WordRight to the end of
+    // "hello" (byte 5), then again to the end of "world" (byte 11).
+    let initial = EditorState {
+        markdown: "hello world".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, WordRight);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 5));
+    dispatch(cx, handle, &editor, WordRight);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 11));
+}
+
+#[gpui::test]
+fn word_right_at_end_of_doc_is_a_noop(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "abc".into(),
+        selection: Selection::Cursor(3),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, WordRight);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 3));
+}
+
+#[gpui::test]
+fn word_left_skips_runs_of_punctuation(cx: &mut TestAppContext) {
+    // `foo, bar` with cursor at end (`r` + 1 = 8). WordLeft jumps
+    // past the comma + space to the start of "foo".
+    //
+    // Layout:
+    //   `foo, bar`
+    //    0123456 7  (cursor at 8)
+    //
+    // First WordLeft → start of "bar" (byte 5). Second WordLeft →
+    // start of "foo" (byte 0). The punctuation segment between them
+    // never becomes a stopping point.
+    let initial = EditorState {
+        markdown: "foo, bar".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, WordLeft);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 5));
+    dispatch(cx, handle, &editor, WordLeft);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 0));
+}
+
+#[gpui::test]
+fn word_right_skips_runs_of_punctuation(cx: &mut TestAppContext) {
+    // Symmetric: from byte 0 of `foo, bar`, WordRight lands at the
+    // end of "foo" (3), then at end of "bar" (8).
+    let initial = EditorState {
+        markdown: "foo, bar".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, WordRight);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 3));
+    dispatch(cx, handle, &editor, WordRight);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 8));
+}
+
+#[gpui::test]
+fn shift_word_right_extends_selection(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "alpha beta gamma".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftWordRight);
+    editor.read_with(cx, |e, _| match e.state.selection {
+        Selection::Range { anchor, head } => {
+            assert_eq!(anchor, 0);
+            assert_eq!(head, 5);
+        }
+        _ => panic!("expected range selection"),
+    });
+    dispatch(cx, handle, &editor, ShiftWordRight);
+    editor.read_with(cx, |e, _| match e.state.selection {
+        Selection::Range { anchor, head } => {
+            assert_eq!(anchor, 0);
+            assert_eq!(head, 10);
+        }
+        _ => panic!("expected range selection"),
+    });
+}
+
+#[gpui::test]
+fn shift_word_left_extends_selection_backward(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "alpha beta gamma".into(),
+        selection: Selection::Cursor(16),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, ShiftWordLeft);
+    editor.read_with(cx, |e, _| match e.state.selection {
+        Selection::Range { anchor, head } => {
+            assert_eq!(anchor, 16);
+            assert_eq!(head, 11);
+        }
+        _ => panic!("expected range selection"),
+    });
+}
+
+#[gpui::test]
+fn word_left_collapses_existing_selection_to_lower_bound(cx: &mut TestAppContext) {
+    // With a range selection, an unshifted WordLeft collapses to the
+    // lower bound (same behavior as Left / Up). It must NOT additionally
+    // jump back one word — the collapse *is* the move.
+    let initial = EditorState {
+        markdown: "alpha beta gamma".into(),
+        selection: Selection::range(2, 8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, WordLeft);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 2));
+}
+
+#[gpui::test]
+fn word_right_collapses_existing_selection_to_upper_bound(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "alpha beta gamma".into(),
+        selection: Selection::range(2, 8),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, WordRight);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 8));
+}
+
+#[gpui::test]
+fn delete_word_backward_removes_previous_word(cx: &mut TestAppContext) {
+    // Cursor at end of "world" → DeleteWordBackward removes "world",
+    // leaving "hello " with cursor at 6.
+    let initial = EditorState {
+        markdown: "hello world".into(),
+        selection: Selection::Cursor(11),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordBackward);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "hello ");
+        assert_eq!(e.cursor_offset(), 6);
+    });
+}
+
+#[gpui::test]
+fn delete_word_backward_at_start_of_word_eats_preceding_whitespace_and_word(
+    cx: &mut TestAppContext,
+) {
+    // Cursor at start of "world" → DeleteWordBackward eats the
+    // intervening space AND the preceding "hello" (one keystroke
+    // removes back to the start of the previous word).
+    let initial = EditorState {
+        markdown: "hello world".into(),
+        selection: Selection::Cursor(6),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordBackward);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "world");
+        assert_eq!(e.cursor_offset(), 0);
+    });
+}
+
+#[gpui::test]
+fn delete_word_backward_at_buffer_start_is_a_noop(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "hello".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordBackward);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "hello");
+        assert_eq!(e.cursor_offset(), 0);
+    });
+}
+
+#[gpui::test]
+fn delete_word_forward_removes_next_word(cx: &mut TestAppContext) {
+    // Cursor at start → DeleteWordForward removes "hello", leaving
+    // " world".
+    let initial = EditorState {
+        markdown: "hello world".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordForward);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, " world");
+        assert_eq!(e.cursor_offset(), 0);
+    });
+}
+
+#[gpui::test]
+fn delete_word_forward_at_end_of_word_eats_following_whitespace_and_word(cx: &mut TestAppContext) {
+    // Cursor at end of "hello" → DeleteWordForward eats the space and
+    // "world".
+    let initial = EditorState {
+        markdown: "hello world".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordForward);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "hello");
+        assert_eq!(e.cursor_offset(), 5);
+    });
+}
+
+#[gpui::test]
+fn delete_word_backward_with_selection_deletes_the_selection(cx: &mut TestAppContext) {
+    // The "selection wins" rule from the other delete actions: a
+    // range selection is what gets removed, regardless of where the
+    // word boundary would have landed.
+    let initial = EditorState {
+        markdown: "alpha beta gamma".into(),
+        selection: Selection::range(6, 10),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordBackward);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "alpha  gamma");
+        assert_eq!(e.cursor_offset(), 6);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_within_paragraph_removes_prefix(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "hello world".into(),
+        selection: Selection::Cursor(6),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "world");
+        assert_eq!(e.cursor_offset(), 0);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_end_within_paragraph_removes_suffix(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "hello world".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineEnd);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "hello");
+        assert_eq!(e.cursor_offset(), 5);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_at_line_start_is_a_noop(cx: &mut TestAppContext) {
+    // Cursor already at the raw start of the line — no content to
+    // delete back to. Cmd+Backspace must NOT cross the `\n\n` into
+    // the previous paragraph (mirroring macOS standard behavior).
+    // Use canonical `\n\n` separation so `enforce_invariants` doesn't
+    // re-shape the buffer on the no-op path.
+    let initial = EditorState {
+        markdown: "line one\n\nline two".into(),
+        selection: Selection::Cursor(10), // start of "line two"
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "line one\n\nline two");
+        assert_eq!(e.cursor_offset(), 10);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_on_second_paragraph_keeps_first(cx: &mut TestAppContext) {
+    // Two paragraphs; cursor mid-second-paragraph between "beta" and
+    // " gamma". The delete removes "beta" (bytes 7..11) — but NOT
+    // the trailing space; Cmd+Backspace is "delete to line start",
+    // not "delete to start of word" — and does NOT cross the `\n\n`
+    // paragraph break into the first paragraph.
+    let initial = EditorState {
+        markdown: "alpha\n\nbeta gamma".into(),
+        selection: Selection::Cursor(11),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "alpha\n\n gamma");
+        assert_eq!(e.cursor_offset(), 7);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_inside_list_item_preserves_marker(cx: &mut TestAppContext) {
+    // `- hello world` cursor at the end. Cmd+Backspace stops at
+    // the content edge (right after `- `), preserving the marker.
+    // The empty item that's left over is structurally fine —
+    // `enforce_invariants` doesn't touch it because the marker is
+    // still well-formed.
+    let initial = EditorState {
+        markdown: "- hello world".into(),
+        selection: Selection::Cursor(13),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- ");
+        assert_eq!(e.cursor_offset(), 2);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_inside_blockquote_preserves_marker(cx: &mut TestAppContext) {
+    // The reported bug, distilled. Multi-paragraph BQ; cursor mid-
+    // word in the middle paragraph. Cmd+Backspace must keep `> ` and
+    // delete only the user's content past it. Previously deleted the
+    // `> ` along with the content, orphaning ` 2` outside the BQ.
+    //
+    // Layout:
+    //   `> Paragraph 1\n`  (0..14, `\n` at 13)
+    //   `> \n`             (14..17, `\n` at 16)
+    //   `> Paragraph 2\n`  (17..31, `\n` at 30)
+    //   `> \n`             (31..34, `\n` at 33)
+    //   `> Paragraph 3`    (34..47)
+    //
+    // Cursor at 28 sits between `Paragraph` and the space before `2`
+    // on the middle BQ paragraph.
+    let initial = EditorState {
+        markdown: "> Paragraph 1\n> \n> Paragraph 2\n> \n> Paragraph 3".into(),
+        selection: Selection::Cursor(28),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown,
+            "> Paragraph 1\n> \n>  2\n> \n> Paragraph 3",
+        );
+        // Cursor lands at the content edge of the middle BQ line.
+        assert_eq!(e.cursor_offset(), 19);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_inside_nested_blockquote_preserves_all_markers(cx: &mut TestAppContext) {
+    // Triple-nested BQ. The content edge sits past `> > > ` — all
+    // three markers must survive Cmd+Backspace.
+    //
+    // Layout: `> > > foo` is 9 bytes (0..9). Content edge is at 6
+    // (right after the third `> `).
+    let initial = EditorState {
+        markdown: "> > > foo".into(),
+        selection: Selection::Cursor(9),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> > > ");
+        assert_eq!(e.cursor_offset(), 6);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_at_content_edge_is_a_noop(cx: &mut TestAppContext) {
+    // Cursor exactly at the content edge of a BQ paragraph — no
+    // content to delete back to, but ALSO must not eat into the
+    // chain prefix.
+    let initial = EditorState {
+        markdown: "> hello".into(),
+        selection: Selection::Cursor(2), // right after `> `
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> hello");
+        assert_eq!(e.cursor_offset(), 2);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_inside_bq_wrapped_list_item_preserves_both_markers(
+    cx: &mut TestAppContext,
+) {
+    // `> - foo` — BQ wraps a list item. The content edge sits past
+    // `> - ` (4 bytes). Both the BQ marker AND the list-item marker
+    // must survive.
+    let initial = EditorState {
+        markdown: "> - foo".into(),
+        selection: Selection::Cursor(7),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> - ");
+        assert_eq!(e.cursor_offset(), 4);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_on_list_continuation_preserves_indent(cx: &mut TestAppContext) {
+    // Multi-paragraph list item. The continuation line `  bar` (2
+    // spaces of LI continuation indent + content) — Cmd+Backspace
+    // stops past the indent, preserving the 2 spaces.
+    //
+    // Layout:
+    //   `- foo\n`   (0..6, `\n` at 5)
+    //   `\n`        (6..7)         ← paragraph break inside item
+    //   `  bar`     (7..12)
+    let initial = EditorState {
+        markdown: "- foo\n\n  bar".into(),
+        selection: Selection::Cursor(12),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- foo\n\n  ");
+        assert_eq!(e.cursor_offset(), 9);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_in_bq_wrapped_li_continuation_preserves_both_prefixes(
+    cx: &mut TestAppContext,
+) {
+    // BQ-wrapped LI with a continuation line. The line's prefix is
+    // `> ` (BQ marker) + `  ` (LI continuation indent) = 4 bytes.
+    // Cmd+Backspace stops at the visible content edge.
+    //
+    // Layout:
+    //   `> - foo\n`    (0..8, `\n` at 7)
+    //   `>   bar`      (8..15)        ← `> ` + `  ` + `bar`
+    let initial = EditorState {
+        markdown: "> - foo\n>   bar".into(),
+        selection: Selection::Cursor(15),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> - foo\n>   ");
+        assert_eq!(e.cursor_offset(), 12);
+    });
+}
+
+#[gpui::test]
+fn delete_word_backward_inside_blockquote_preserves_marker(cx: &mut TestAppContext) {
+    // Reported-bug symmetry for Option+Backspace: prev_word_offset
+    // at content edge of a BQ line walks past the `> ` (not
+    // alphanumeric) and would return 0 (no prior word). Clamp to
+    // chain-prefix end → no-op. Without the clamp, this would
+    // delete the `> ` marker.
+    let initial = EditorState {
+        markdown: "> hello".into(),
+        selection: Selection::Cursor(2), // content edge
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordBackward);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> hello");
+        assert_eq!(e.cursor_offset(), 2);
+    });
+}
+
+#[gpui::test]
+fn delete_word_backward_inside_blockquote_at_word_boundary_deletes_word(cx: &mut TestAppContext) {
+    // Within the BQ content, word-delete works normally — the clamp
+    // only kicks in when the word target would have landed before
+    // the chain prefix end.
+    let initial = EditorState {
+        markdown: "> hello world".into(),
+        selection: Selection::Cursor(13),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordBackward);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> hello ");
+        assert_eq!(e.cursor_offset(), 8);
+    });
+}
+
+#[gpui::test]
+fn delete_word_forward_does_not_cross_into_next_blockquote_line(cx: &mut TestAppContext) {
+    // Two BQ paragraphs in canonical form. Cursor at end of `world`
+    // on line 1. The next word boundary (`goodbye` on the second BQ
+    // paragraph) would have us splice through `\n> \n> ` to land at
+    // the end of `goodbye`. The next-line chain-prefix clamp pulls
+    // the target back to the cursor's line end, so the deletion
+    // bottoms out at the `\n` and the structural pair + the second
+    // BQ paragraph's `> ` all survive.
+    //
+    // Canonical input is used directly because `enforce_invariants`
+    // would otherwise promote the soft break in `> hello world\n> goodbye`
+    // up to the same pair shape even on a no-op delete — the test
+    // intent is the clamp, not the soft-break promotion.
+    let initial = EditorState {
+        markdown: "> hello world\n> \n> goodbye".into(),
+        selection: Selection::Cursor(13),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordForward);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> hello world\n> \n> goodbye");
+        assert_eq!(e.cursor_offset(), 13);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_preserves_multi_digit_ordered_marker(cx: &mut TestAppContext) {
+    // `10. foo` — ordered item with a 4-byte marker. Cmd+Backspace
+    // must stop at the content edge (byte 4) and leave the marker
+    // intact, regardless of marker width.
+    let initial = EditorState {
+        markdown: "10. foo".into(),
+        selection: Selection::Cursor(7),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "10. ");
+        assert_eq!(e.cursor_offset(), 4);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_start_in_deeply_nested_alternating_chain(cx: &mut TestAppContext) {
+    // `> - > - foo` — BQ wrapping LI wrapping BQ wrapping LI. The
+    // chain prefix walks all four containers in order: `> ` (BQ) +
+    // `- ` (LI marker) + `> ` (BQ) + `- ` (LI marker) = 8 bytes.
+    // Cmd+Backspace preserves every structural marker.
+    let initial = EditorState {
+        markdown: "> - > - foo".into(),
+        selection: Selection::Cursor(11),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineStart);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> - > - ");
+        assert_eq!(e.cursor_offset(), 8);
+    });
+}
+
+#[gpui::test]
+fn delete_word_forward_does_not_cross_into_next_list_item_marker(cx: &mut TestAppContext) {
+    // Two list items, cursor at end of `foo` (end of item 1's content
+    // line). The next word target lies past `\n- ` on item 2. Clamp
+    // to current line end so item 2's `- ` survives.
+    let initial = EditorState {
+        markdown: "- foo\n- bar".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordForward);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- foo\n- bar");
+        assert_eq!(e.cursor_offset(), 5);
+    });
+}
+
+#[gpui::test]
+fn delete_word_backward_at_buffer_start_inside_blockquote_is_noop(cx: &mut TestAppContext) {
+    // Cursor at byte 0 inside the BQ marker itself. The chain may or
+    // may not be reported at this position (pulldown treats byte 0 as
+    // before the BQ scope opens); either way, the delete must be a
+    // no-op — there's no content to delete back to, and we must not
+    // delete forward into the marker bytes.
+    let initial = EditorState {
+        markdown: "> hello".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordBackward);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "> hello");
+        assert_eq!(e.cursor_offset(), 0);
+    });
+}
+
+#[gpui::test]
+fn delete_word_forward_top_level_crosses_newline(cx: &mut TestAppContext) {
+    // Top-level multi-paragraph — no chain prefix on the next line,
+    // so Option+Delete crosses the `\n\n` and eats the next word.
+    // This is plain-text editor behavior.
+    let initial = EditorState {
+        markdown: "alpha\n\nbeta gamma".into(),
+        selection: Selection::Cursor(5), // end of "alpha"
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteWordForward);
+    editor.read_with(cx, |e, _| {
+        // The `\n\n` + "beta" are consumed in one keystroke. The
+        // post-pass leaves the result as-is — no chain prefix to
+        // restore.
+        assert_eq!(e.state.markdown, "alpha gamma");
+        assert_eq!(e.cursor_offset(), 5);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_end_inside_list_item_stops_at_newline(cx: &mut TestAppContext) {
+    // List with two items. Cursor at the start of "world" on item 1.
+    // Cmd+Delete clears the rest of the line — but NOT the `\n` that
+    // separates item 1 from item 2.
+    let initial = EditorState {
+        markdown: "- hello world\n- second".into(),
+        selection: Selection::Cursor(8), // start of "world"
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineEnd);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "- hello \n- second");
+        assert_eq!(e.cursor_offset(), 8);
+    });
+}
+
+#[gpui::test]
+fn delete_to_line_end_at_end_of_line_is_a_noop(cx: &mut TestAppContext) {
+    // Cursor at the very last byte (no trailing `\n` past it).
+    // DeleteToLineEnd should leave the buffer untouched. Single
+    // paragraph avoids the soft-break-promotion gotcha (a
+    // `\n`-separated multi-line input would get re-shaped to
+    // `\n\n` by `enforce_invariants` even on a delete no-op).
+    let initial = EditorState {
+        markdown: "abc".into(),
+        selection: Selection::Cursor(3),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, DeleteToLineEnd);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "abc");
+        assert_eq!(e.cursor_offset(), 3);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Vertical / horizontal navigation across blockquote multi-paragraph runs
+//
+// The pair shape `\n> \n> ` is one BQ paragraph break (collapses to one
+// paragraph_gap visually). N pair shapes back-to-back render as N-1
+// visible empty rows between two BQ paragraphs. Each of those rows is a
+// cursor-landable position; the forbidden-position machinery's notion
+// of "pair interior" has to exempt the inter-pair boundaries, and
+// move_vertical's notion of "phantom row" has to recognize the visible
+// synth rows. Both used to misbehave: chain-pair-interior over-fired
+// on shifted pair patterns and marked the inter-pair `\n` as interior;
+// move_vertical checked line_start (interior for BQ synth rows) instead
+// of line_end (the canonical pair boundary).
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn right_arrow_lands_on_bq_synth_row_then_next_paragraph(cx: &mut TestAppContext) {
+    // `> a\n> \n> \n> \n> b` = two BQ paragraphs separated by one
+    // visible empty row. Right-arrow walks: cursor at end of "> a"
+    // → synth row's `\n` boundary (byte 9) → start of "> b" content
+    // (byte 15).
+    //
+    // Layout:
+    //   0..3   `> a`
+    //   3      `\n`            (pair 1 starts)
+    //   4..6   `> `
+    //   6      `\n`
+    //   7..9   `> `             ← synth row (line_start=7, line_end=9)
+    //   9      `\n`             (= pair boundary; allowed)
+    //   10..12 `> `
+    //   12     `\n`
+    //   13..16 `> b`
+    let initial = EditorState {
+        markdown: "> a\n> \n> \n> \n> b".into(),
+        selection: Selection::Cursor(3),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 9));
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 15));
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 16));
+}
+
+#[gpui::test]
+fn left_arrow_lands_on_bq_synth_row_from_next_paragraph(cx: &mut TestAppContext) {
+    // Symmetric: cursor at start of "> b" content, Left walks back
+    // to the synth row's allowed position, then to the end of "> a".
+    let initial = EditorState {
+        markdown: "> a\n> \n> \n> \n> b".into(),
+        selection: Selection::Cursor(15),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Left);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 9));
+    dispatch(cx, handle, &editor, Left);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 3));
+}
+
+#[gpui::test]
+fn down_arrow_from_bq_paragraph_lands_on_next_paragraph(cx: &mut TestAppContext) {
+    // Basic case: two BQ paragraphs with no synth row between.
+    // Down from end of "> a" should land on "> b" content at the
+    // same column.
+    let initial = EditorState {
+        markdown: "> a\n> \n> b".into(),
+        selection: Selection::Cursor(2), // end of "a"
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Down);
+    editor.read_with(cx, |e, _| {
+        // Column 2 of "> a" (= the `a`) maps to column 2 of "> b"
+        // (= the `b`). Source byte: 7 (start of `> b` line) + 2 = 9.
+        assert_eq!(e.cursor_offset(), 9);
+    });
+}
+
+#[gpui::test]
+fn down_arrow_through_bq_synth_row(cx: &mut TestAppContext) {
+    // Down arrow walks from "> a" → synth empty row → "> b".
+    let initial = EditorState {
+        markdown: "> a\n> \n> \n> \n> b".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Down);
+    editor.read_with(cx, |e, _| {
+        // Lands on the synth row. Source-byte column 2 from "> a"
+        // would map past the synth's content (just `> `, length 2);
+        // we clamp at the row's end-of-line (the `\n` at byte 9).
+        assert_eq!(e.cursor_offset(), 9);
+    });
+    dispatch(cx, handle, &editor, Down);
+    editor.read_with(cx, |e, _| {
+        // Column persists across the synth row; lands at "> b"
+        // column 2 = byte 13 + 2 = 15.
+        assert_eq!(e.cursor_offset(), 15);
+    });
+}
+
+#[gpui::test]
+fn up_arrow_walks_through_bq_synth_row_to_first_paragraph(cx: &mut TestAppContext) {
+    // The reported bug, in test form. Cursor inside "> Paragraph
+    // three." line; Up should land on the visible empty row between
+    // the BQ paragraphs, NOT jump straight to "Paragraph one.".
+    //
+    // Layout for `> P1\n> \n> \n> \n> P3`:
+    //   0..4   `> P1`
+    //   4      `\n`
+    //   5..7   `> `
+    //   7      `\n`
+    //   8..10  `> `             ← synth row (line_start=8, line_end=10)
+    //   10     `\n`             (= pair boundary; allowed)
+    //   11..13 `> `
+    //   13     `\n`
+    //   14..18 `> P3`
+    let initial = EditorState {
+        markdown: "> P1\n> \n> \n> \n> P3".into(),
+        selection: Selection::Cursor(18), // end of "P3"
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Up);
+    editor.read_with(cx, |e, _| {
+        // First Up lands on the synth row's end-of-line position
+        // (= the `\n` boundary at byte 10).
+        assert_eq!(e.cursor_offset(), 10);
+    });
+    dispatch(cx, handle, &editor, Up);
+    editor.read_with(cx, |e, _| {
+        // Second Up: column tracked is `cursor - line_start` = 2
+        // (the source-byte column of the synth's `\n` position).
+        // Apply that to "> P1" line → byte 0 + 2 = byte 2 (= `P`).
+        // No persistent intended-column across short rows (current
+        // model: column shrinks to fit each row's source length).
+        assert_eq!(e.cursor_offset(), 2);
+    });
+}
+
+#[gpui::test]
+fn up_arrow_walks_through_two_bq_synth_rows_one_at_a_time(cx: &mut TestAppContext) {
+    // Three pair shapes between two BQ paragraphs = two visible
+    // empty rows. Up arrow should pause on each one in turn.
+    //
+    // Layout `> a\n> \n> \n> \n> \n> \n> b`:
+    //   0..3   `> a`
+    //   3      `\n`
+    //   4..6   `> `   (phantom)
+    //   6      `\n`
+    //   7..9   `> `   (synth #1; line_end=9 is pair boundary)
+    //   9      `\n`   (allowed boundary)
+    //   10..12 `> `   (phantom)
+    //   12     `\n`
+    //   13..15 `> `   (synth #2; line_end=15 is pair boundary)
+    //   15     `\n`   (allowed boundary)
+    //   16..18 `> `   (phantom)
+    //   18     `\n`
+    //   19..22 `> b`
+    let initial = EditorState {
+        markdown: "> a\n> \n> \n> \n> \n> \n> b".into(),
+        selection: Selection::Cursor(21), // end of "> b" content
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Up);
+    editor.read_with(cx, |e, _| {
+        // First Up: synth #2 line_end = 15.
+        assert_eq!(e.cursor_offset(), 15);
+    });
+    dispatch(cx, handle, &editor, Up);
+    editor.read_with(cx, |e, _| {
+        // Second Up: synth #1 line_end = 9.
+        assert_eq!(e.cursor_offset(), 9);
+    });
+    dispatch(cx, handle, &editor, Up);
+    editor.read_with(cx, |e, _| {
+        // Third Up: first paragraph "> a". Column 2 from previous
+        // synth → byte 0 + 2 = byte 2 (= `a`).
+        assert_eq!(e.cursor_offset(), 2);
+    });
+}
+
+#[gpui::test]
+fn up_arrow_in_user_reported_bug_lands_on_visible_empty_row(cx: &mut TestAppContext) {
+    // Exact reproduction of the user-reported bug:
+    //
+    //   > Paragraph one.
+    //   >
+    //   >
+    //   >
+    //   > |Paragraph three.
+    //
+    // Before fix: Up arrow jumped past all three `> ` empty lines
+    // and landed at "Paragraph one.". After fix: Up lands on the
+    // single visible empty row between the two paragraphs.
+    let initial = EditorState {
+        markdown: "> Paragraph one.\n> \n> \n> \n> Paragraph three.".into(),
+        // Cursor at byte 28 = `P` of "Paragraph three." (right after `> `).
+        selection: Selection::Cursor(28),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Up);
+    editor.read_with(cx, |e, _| {
+        // The synth empty row sits between pair 1 (bytes 16..22) and
+        // pair 2 (bytes 22..28). Source column 2 of "> Paragraph
+        // three." line (line_start=26) → target on synth-row line
+        // (line_start=20, line_end=22) at column 2 → byte 22 (clamped
+        // by snap_within_line to the pair boundary).
+        assert_eq!(e.cursor_offset(), 22);
+    });
+}
+
+#[gpui::test]
+fn left_arrow_in_user_reported_bug_lands_on_visible_empty_row(cx: &mut TestAppContext) {
+    // Same fixture, Left arrow path. The bytes between "Paragraph
+    // three." start (byte 28) and the synth row boundary (byte 22)
+    // are all chain-pair interior; Left collapses them into a single
+    // step to the synth row.
+    let initial = EditorState {
+        markdown: "> Paragraph one.\n> \n> \n> \n> Paragraph three.".into(),
+        selection: Selection::Cursor(28),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Left);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.cursor_offset(), 22);
+    });
+}
+
+#[gpui::test]
+fn chain_pair_interior_recognizes_inter_pair_boundary(_cx: &mut TestAppContext) {
+    // Regression for the shifted-pair-overlap bug: in a 2-pair run
+    // the byte BETWEEN the two canonical pairs (pair_len boundary)
+    // is a real cursor-landable position. The old
+    // `is_chain_pair_interior` matched a shifted pair shape at the
+    // midpoint and marked the boundary byte interior.
+    //
+    // For `> a\n> \n> \n> \n> b` chain `[BQ]` pair_len=6 run [3..15],
+    // the inter-pair boundary is at offset 6 = byte 9.
+    let md = "> a\n> \n> \n> \n> b";
+    assert!(
+        !gpui_markdown_editor::analysis::is_chain_pair_interior(md, 9),
+        "byte 9 is the canonical pair boundary; must not be interior"
+    );
+    assert!(
+        !gpui_markdown_editor::analysis::is_forbidden_position(md, 9),
+        "byte 9 must be a cursor-allowed position"
+    );
 }
