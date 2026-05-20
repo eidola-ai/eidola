@@ -130,6 +130,94 @@ fn collect_fenced_code_blocks(
     }
 }
 
+/// One fenced code block's structural extent plus the *exact* opener
+/// and closer fence-char ranges, projected from the parse tree's
+/// `delimiter_ranges`. The wider [`FencedCodeBlock`] struct only carries
+/// opener metadata (char + length), which is all most call sites need;
+/// `FenceWithDelimiters` is the variant for callers that need to
+/// *modify* the fence delimiters (e.g. widen both opener and closer in
+/// lockstep when a paste injects content that would otherwise close
+/// the block).
+///
+/// `closer_range` is `None` for an unterminated fence — its
+/// `delimiter_ranges` only carries the opener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FenceWithDelimiters {
+    pub range: Range<usize>,
+    pub opener_range: Range<usize>,
+    pub closer_range: Option<Range<usize>>,
+    pub fence_char: u8,
+    pub fence_len: usize,
+}
+
+/// Locate the fenced code block whose body contains byte position `p`
+/// and return its delimiter ranges plus opener metadata. Same boundary
+/// semantics as [`is_in_fenced_code`]: strict at the opener, inclusive
+/// at the trailing edge of an unterminated fence.
+///
+/// Used by the paste pipeline (`update::verbatim_paste`) to decide
+/// whether to widen the enclosing fence when pasted content would form
+/// a valid closer line, and to emit the lock-step opener-and-closer
+/// widening edits if so.
+pub fn fence_with_delimiters_at(markdown: &str, p: usize) -> Option<FenceWithDelimiters> {
+    let tree = crate::parser::parse(markdown);
+    fence_with_delimiters_at_in_tree(&tree, markdown.as_bytes(), p)
+}
+
+/// Variant of [`fence_with_delimiters_at`] for callers that already
+/// hold a parse tree.
+pub fn fence_with_delimiters_at_in_tree(
+    tree: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+    p: usize,
+) -> Option<FenceWithDelimiters> {
+    find_fence_node(tree, p).map(|node| {
+        let crate::syntax::NodeKind::CodeBlock {
+            delimiter_ranges, ..
+        } = &node.kind
+        else {
+            unreachable!("find_fence_node returns CodeBlock nodes");
+        };
+        let opener_range = delimiter_ranges
+            .first()
+            .cloned()
+            .unwrap_or(node.range.start..node.range.start);
+        let closer_range = delimiter_ranges.get(1).cloned();
+        let opener_len = opener_range.end.saturating_sub(opener_range.start);
+        let fence_char = bytes.get(opener_range.start).copied().unwrap_or(b'`');
+        FenceWithDelimiters {
+            range: node.range.clone(),
+            opener_range,
+            closer_range,
+            fence_char,
+            fence_len: opener_len,
+        }
+    })
+}
+
+fn find_fence_node(
+    nodes: &[crate::syntax::SyntaxNode],
+    p: usize,
+) -> Option<&crate::syntax::SyntaxNode> {
+    for node in nodes {
+        if let crate::syntax::NodeKind::CodeBlock {
+            delimiter_ranges, ..
+        } = &node.kind
+        {
+            let terminated = delimiter_ranges.len() == 2;
+            let r = &node.range;
+            let inside = p > r.start && (p < r.end || (!terminated && p == r.end));
+            if inside {
+                return Some(node);
+            }
+        }
+        if let Some(found) = find_fence_node(&node.children, p) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Range-only projection of [`fenced_code_blocks`]. Most callers only
 /// need the spans (e.g. to skip over code content while scanning for
 /// soft-break candidates); cursor-position queries that need to

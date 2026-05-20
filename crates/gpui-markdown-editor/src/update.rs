@@ -75,6 +75,7 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
 
     let next = match event {
         EditorEvent::InsertText(text) => insert_text(state, &text),
+        EditorEvent::Paste { text, internal } => paste(state, &text, internal),
         EditorEvent::InsertNewline => insert_newline(state),
         EditorEvent::InsertLineBreak => insert_line_break(state),
 
@@ -1228,6 +1229,430 @@ fn insert_text(state: EditorState, text: &str) -> EditorState {
     }
 }
 
+/// Route a paste through the appropriate transform:
+///
+/// 1. Drop any active selection first so chain / verbatim analysis runs
+///    on the post-deletion buffer — the buffer the splice actually
+///    lands into.
+/// 2. If the cursor sits inside a verbatim region (fenced code or
+///    block-level `$$..$$` math), apply [`verbatim_paste`]: inject the
+///    chain continuation prefix at every embedded `\n` so nested
+///    content stays inside the enclosing BQ / LI scope, and widen the
+///    enclosing fence if pasted bytes would form a valid closer line.
+/// 3. Otherwise, apply [`markdown_paste`]: parse the pasted text,
+///    collapse paragraph-internal soft breaks to spaces (matching
+///    CommonMark's rendering rather than the editor's
+///    "always-canonical paragraph-break" invariant), pad with `\n\n`
+///    when the paste's first/last block can't merge with the
+///    surrounding line, and inject the chain continuation prefix on
+///    every embedded `\n` so the paste stays nested inside any
+///    enclosing BQ / LI scope.
+///
+/// `internal` short-circuits the canonicalization step — bytes from
+/// this editor's own copy / cut are already canonical, so re-parsing
+/// them risks rounding their structure.
+fn paste(state: EditorState, text: &str, internal: bool) -> EditorState {
+    let (md, cursor) = delete_selection(&state);
+    let mid = EditorState {
+        markdown: md,
+        selection: Selection::Cursor(cursor),
+    };
+    if analysis::is_in_verbatim_region(&mid.markdown, cursor) {
+        return verbatim_paste(mid, cursor, text);
+    }
+    markdown_paste(mid, cursor, text, internal)
+}
+
+/// Phase-1 verbatim paste: splice `text` at `cursor` inside a code
+/// fence or block math construct, preserving line structure exactly.
+///
+/// Two transforms apply:
+///
+/// - **Chain-prefix injection.** Each embedded `\n` is followed by the
+///   cursor's [`chain_continuation_prefix`] so every continuation line
+///   carries the outer BQ / LI markers. Without this, pasting `a\nb`
+///   into a fence at depth 1 inside a blockquote would land `a\nb`
+///   instead of `a\n> b`, breaking the construct's scope.
+/// - **Fence widening.** If the pasted bytes contain a run of the
+///   enclosing fence's char (`` ` `` or `~`) of length ≥
+///   `fence.fence_len`, the opener and closer are both widened to
+///   `max_run + 1` so the pasted content can't accidentally close the
+///   fence. Display-math `$$` has no longer form, so the widening
+///   doesn't apply there — the splice lands verbatim and the user
+///   sees / fixes any break.
+///
+/// The widening edits and the splice are composed into one
+/// [`SourceEdit`] batch so [`apply_edits`] handles cursor remapping in
+/// one pass.
+///
+/// [`chain_continuation_prefix`]: analysis::chain_continuation_prefix
+fn verbatim_paste(state: EditorState, cursor: usize, text: &str) -> EditorState {
+    let chain = analysis::enclosing_containers_at(&state.markdown, cursor);
+    let chain_prefix = analysis::chain_continuation_prefix(&chain);
+    let insertion = inject_chain_prefix_on_newlines(text, &chain_prefix);
+
+    let mut edits = analysis::SourceEditList::new();
+    if let Some(fence) = analysis::fence_with_delimiters_at(&state.markdown, cursor)
+        && let Some(new_len) = fence_widen_target(&fence, &insertion, &chain_prefix)
+    {
+        let widened: String = std::iter::repeat_n(fence.fence_char as char, new_len).collect();
+        edits.push(analysis::SourceEdit {
+            range: fence.opener_range,
+            replacement: widened.clone(),
+        });
+        if let Some(closer_range) = fence.closer_range {
+            edits.push(analysis::SourceEdit {
+                range: closer_range,
+                replacement: widened,
+            });
+        }
+    }
+    edits.push(analysis::SourceEdit {
+        range: cursor..cursor,
+        replacement: insertion,
+    });
+    apply_edits(state, &edits.finish())
+}
+
+/// Insert `prefix` after every `\n` in `text`. No-op when `prefix` is
+/// empty (top-level paste).
+///
+/// The transform is intentionally unconditional: every `\n` gets the
+/// prefix, even if `text` already had bytes that look like the prefix
+/// at the corresponding position. Pre-existing prefix-shaped bytes are
+/// the user's content (e.g. they pasted "> hello" verbatim) and stay as
+/// literal text inside the verbatim region — they just happen to land
+/// after our injected prefix, producing e.g. `> > hello` on that line.
+fn inject_chain_prefix_on_newlines(text: &str, prefix: &str) -> String {
+    if prefix.is_empty() {
+        return text.to_string();
+    }
+    let newlines = text.bytes().filter(|&b| b == b'\n').count();
+    let mut out = String::with_capacity(text.len() + newlines * prefix.len());
+    for chunk in text.split_inclusive('\n') {
+        out.push_str(chunk);
+        if chunk.ends_with('\n') {
+            out.push_str(prefix);
+        }
+    }
+    out
+}
+
+/// Decide whether `fence` needs to widen its delimiter run to safely
+/// host `insertion` as body content. Returns the new (longer)
+/// delimiter length, or `None` when no widening is needed.
+///
+/// The rule: scan every `\n`-separated segment of `insertion` (after
+/// chain-prefix injection has already happened); strip the chain
+/// prefix the same way pulldown would when checking for a closing
+/// fence; check whether the remaining bytes match the closing-fence
+/// pattern `<≤3 spaces><fence_char run ≥ fence.fence_len><optional
+/// whitespace><end of line>`. Widen to the longest matching run + 1
+/// so the construct's opener stays strictly longer than anything in
+/// the body.
+///
+/// Display-math fences (`$$`) don't have a longer form — widening
+/// isn't possible — so the function returns `None` for any
+/// non-`` ` `` / non-`~` fence char. Display math is handled by
+/// `is_in_verbatim_region` being a `FencedCodeBlock`-vs-`DisplayMathBlock`
+/// disjunction: when the paste lands in display math, `fence_at` returns
+/// `None` and this function is never called.
+///
+/// The heuristic over-widens in two boundary cases:
+///
+/// 1. The first segment of `insertion` is concatenated with pre-cursor
+///    content on the same line, so a standalone segment that looks
+///    like a closer might not actually be a complete line.
+/// 2. The last segment of `insertion` is concatenated with post-cursor
+///    content, with the same caveat.
+///
+/// Both cases produce over-widening, never under-widening, so the
+/// fence stays correctly scoped — at worst the user sees a fence with
+/// one extra backtick than strictly needed.
+fn fence_widen_target(
+    fence: &analysis::FenceWithDelimiters,
+    insertion: &str,
+    chain_prefix: &str,
+) -> Option<usize> {
+    if fence.fence_char != b'`' && fence.fence_char != b'~' {
+        return None;
+    }
+    let mut max_run = 0;
+    for segment in insertion.split('\n') {
+        let stripped = segment.strip_prefix(chain_prefix).unwrap_or(segment);
+        if let Some(run) = closer_run_len(stripped, fence.fence_char, fence.fence_len)
+            && run > max_run
+        {
+            max_run = run;
+        }
+    }
+    if max_run >= fence.fence_len {
+        Some(max_run + 1)
+    } else {
+        None
+    }
+}
+
+/// `Some(run_len)` when `line` matches the closing-fence pattern:
+/// `<≤3 spaces><fence_char run ≥ min_run><optional trailing
+/// whitespace><end of string>`. Mirrors CommonMark's closing-fence
+/// rule with one simplification — we treat end-of-string as
+/// end-of-line, since the caller already split `insertion` on `\n`.
+fn closer_run_len(line: &str, fence_char: u8, min_run: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < 3 && i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    let run_start = i;
+    while i < bytes.len() && bytes[i] == fence_char {
+        i += 1;
+    }
+    let run_len = i - run_start;
+    if run_len < min_run {
+        return None;
+    }
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if i == bytes.len() {
+        Some(run_len)
+    } else {
+        None
+    }
+}
+
+/// Phase-2 markdown paste: splice `text` at `cursor` outside any
+/// verbatim region.
+///
+/// Three transforms apply, in order:
+///
+/// 1. **Canonicalize** (skipped when `internal` is true). Parse `text`
+///    as markdown; for every Paragraph node, collapse internal soft-
+///    break `\n`s — and the chain-continuation prefix that follows
+///    each one — to a single space. Hard breaks (`  \n` / `\\\n`) and
+///    block boundaries are preserved as-is. This produces the
+///    CommonMark *rendering* of paragraph text (soft break = space),
+///    not the editor's invariant form (no soft breaks → all `\n`s are
+///    structural). Without this step a hard-wrapped paragraph
+///    explodes into one paragraph per source line after
+///    `enforce_invariants` promotes every soft `\n` to `\n\n`.
+///
+/// 2. **Block-boundary padding.** Parse the canonical paste; if its
+///    first / last top-level block is non-Paragraph (heading, list,
+///    fence, blockquote, …), prepend / append `\n\n` so the construct
+///    starts and ends on its own line. The check inspects the
+///    cursor's surrounding bytes to avoid double-padding when the
+///    splice site already has a fresh block boundary.
+///
+/// 3. **Chain-prefix injection.** Same helper as
+///    [`verbatim_paste`] — every `\n` in the post-padding bytes is
+///    followed by the cursor's [`chain_continuation_prefix`]. Nested
+///    inside a blockquote, a top-level pasted heading lands as a
+///    BQ-wrapped heading rather than escaping the scope.
+///
+/// [`chain_continuation_prefix`]: analysis::chain_continuation_prefix
+fn markdown_paste(state: EditorState, cursor: usize, text: &str, internal: bool) -> EditorState {
+    let canonical = if internal {
+        text.to_string()
+    } else {
+        canonicalize_paste_markdown(text)
+    };
+
+    let canonical_tree = crate::parser::parse(&canonical);
+    let leading_pad = leading_block_pad(&state.markdown, cursor, &canonical_tree);
+    let trailing_pad = trailing_block_pad(&state.markdown, cursor, &canonical_tree);
+
+    let mut padded =
+        String::with_capacity(leading_pad.len() + canonical.len() + trailing_pad.len());
+    padded.push_str(leading_pad);
+    padded.push_str(&canonical);
+    padded.push_str(trailing_pad);
+
+    let chain = analysis::enclosing_containers_at(&state.markdown, cursor);
+    let chain_prefix = analysis::chain_continuation_prefix(&chain);
+    let injected = inject_chain_prefix_on_newlines(&padded, &chain_prefix);
+
+    insert_text(state, &injected)
+}
+
+/// Parse `text` and replace every paragraph-internal soft-break `\n`
+/// (plus the chain continuation prefix that follows it) with a single
+/// space. Hard breaks (`  \n` / `\\\n`) survive verbatim. Block
+/// boundaries survive verbatim. Verbatim regions (fenced code, block
+/// math) survive verbatim.
+///
+/// Implementation pivots on a pulldown guarantee: `Event::SoftBreak`
+/// fires *only* for in-paragraph soft breaks — the `\n` between two
+/// content lines of the same Paragraph or tight ListItem. It does
+/// *not* fire between sibling list items, between blocks, inside
+/// verbatim regions, or for hard breaks (those get
+/// `Event::HardBreak`). Our parser lifts SoftBreak events to
+/// `NodeKind::SoftBreak` leaves whose range is the `\n` byte. Walking
+/// SoftBreak nodes is therefore an exact, parser-blessed enumeration
+/// of every soft break in the paste — no byte-level disambiguation
+/// needed (and no false positives like collapsing the sibling
+/// boundary in `- item 1\n- item 2`).
+///
+/// For each SoftBreak node, the edit replaces `node.range` (the `\n`)
+/// plus the chain continuation prefix immediately after it — `> ` for
+/// a BQ paragraph, `  ` for a list item, the alternating composition
+/// for nested chains — with a single space. Stripping the prefix is
+/// what turns `foo\n> bar` into `foo bar` rather than `foo > bar`
+/// (which would leave a literal `>` mid-content). The strip is
+/// best-effort: if the bytes after the `\n` don't match the expected
+/// prefix (e.g. a lazy continuation), we collapse the `\n` alone and
+/// let `enforce_invariants` fix the rest post-splice.
+fn canonicalize_paste_markdown(text: &str) -> String {
+    let tree = crate::parser::parse(text);
+    let bytes = text.as_bytes();
+    let mut edits = analysis::SourceEditList::new();
+    collect_soft_break_edits(&tree, bytes, text, &mut edits);
+    let edits = edits.finish();
+    if edits.is_empty() {
+        return text.to_string();
+    }
+    apply_text_edits(text, &edits)
+}
+
+fn collect_soft_break_edits(
+    nodes: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+    text: &str,
+    edits: &mut analysis::SourceEditList,
+) {
+    for node in nodes {
+        if matches!(node.kind, crate::syntax::NodeKind::SoftBreak) {
+            let chain = analysis::enclosing_containers_at(text, node.range.start);
+            let prefix = analysis::chain_continuation_prefix(&chain);
+            let prefix_bytes = prefix.as_bytes();
+            let mut end = node.range.end;
+            if !prefix_bytes.is_empty()
+                && end + prefix_bytes.len() <= bytes.len()
+                && &bytes[end..end + prefix_bytes.len()] == prefix_bytes
+            {
+                end += prefix_bytes.len();
+            }
+            edits.push(analysis::SourceEdit {
+                range: node.range.start..end,
+                replacement: " ".to_string(),
+            });
+        }
+        collect_soft_break_edits(&node.children, bytes, text, edits);
+    }
+}
+
+fn apply_text_edits(text: &str, edits: &[analysis::SourceEdit]) -> String {
+    let total_delta: isize = edits
+        .iter()
+        .map(|e| e.replacement.len() as isize - (e.range.end - e.range.start) as isize)
+        .sum();
+    let new_len = (text.len() as isize + total_delta).max(0) as usize;
+    let mut out = String::with_capacity(new_len);
+    let mut last = 0;
+    for e in edits {
+        out.push_str(&text[last..e.range.start]);
+        out.push_str(&e.replacement);
+        last = e.range.end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Padding bytes to prepend to a canonical paste when its first
+/// top-level block is non-Paragraph (heading, list, fence, blockquote,
+/// thematic break, display math) and the cursor isn't already at a
+/// fresh block boundary.
+///
+/// Returns `"\n\n"` (full paragraph break), `"\n"` (cursor at end of a
+/// non-blank line — needs one more `\n`), or `""` (cursor already at a
+/// fresh blank line, or paste starts with a Paragraph that can merge
+/// into surrounding content).
+fn leading_block_pad(
+    buffer: &str,
+    cursor: usize,
+    canonical_tree: &[crate::syntax::SyntaxNode],
+) -> &'static str {
+    if !first_top_level_is_block(canonical_tree) {
+        return "";
+    }
+    block_pad_before(buffer.as_bytes(), cursor)
+}
+
+/// Symmetric to [`leading_block_pad`] for the trailing edge. Returns
+/// the bytes to append after the canonical paste so a trailing
+/// non-Paragraph block (e.g. a heading) doesn't fuse into post-cursor
+/// content on the same line.
+fn trailing_block_pad(
+    buffer: &str,
+    cursor: usize,
+    canonical_tree: &[crate::syntax::SyntaxNode],
+) -> &'static str {
+    if !last_top_level_is_block(canonical_tree) {
+        return "";
+    }
+    block_pad_after(buffer.as_bytes(), cursor)
+}
+
+fn block_pad_before(bytes: &[u8], cursor: usize) -> &'static str {
+    if cursor == 0 {
+        return "";
+    }
+    let mut p = cursor;
+    let mut newlines = 0;
+    while p > 0 && bytes[p - 1] == b'\n' {
+        newlines += 1;
+        p -= 1;
+    }
+    if p == 0 {
+        // The buffer up to the cursor is entirely `\n`s — treat as a
+        // fresh boundary.
+        return "";
+    }
+    match newlines {
+        0 => "\n\n",
+        1 => "\n",
+        _ => "",
+    }
+}
+
+fn block_pad_after(bytes: &[u8], cursor: usize) -> &'static str {
+    if cursor == bytes.len() {
+        return "";
+    }
+    let mut p = cursor;
+    let mut newlines = 0;
+    while p < bytes.len() && bytes[p] == b'\n' {
+        newlines += 1;
+        p += 1;
+    }
+    if p == bytes.len() {
+        return "";
+    }
+    match newlines {
+        0 => "\n\n",
+        1 => "\n",
+        _ => "",
+    }
+}
+
+/// `true` when the first top-level node in `tree` is a block-level
+/// construct that can't merge with a preceding paragraph (heading,
+/// list, fence, blockquote, thematic break, display math, image).
+fn first_top_level_is_block(tree: &[crate::syntax::SyntaxNode]) -> bool {
+    tree.first().is_some_and(is_block_level)
+}
+
+/// Symmetric to [`first_top_level_is_block`].
+fn last_top_level_is_block(tree: &[crate::syntax::SyntaxNode]) -> bool {
+    tree.last().is_some_and(is_block_level)
+}
+
+fn is_block_level(node: &crate::syntax::SyntaxNode) -> bool {
+    use crate::syntax::NodeKind;
+    !matches!(node.kind, NodeKind::Paragraph)
+}
+
 fn delete_backward(state: EditorState) -> EditorState {
     if !state.selection.is_collapsed() {
         let (buf, cursor) = delete_selection(&state);
@@ -2280,6 +2705,335 @@ mod invariant_tests {
         // user with an extra empty paragraph at the bottom.
         let s = update(st("", 0), EditorEvent::InsertText("hello\n".into()));
         assert_eq!(s.markdown, "hello\n");
+    }
+
+    // ---- Phase 1: verbatim paste (Scenario 1 from AGENTS.md paste design) -----
+    //
+    // Cursor sits inside a fenced code block or block `$$..$$` math.
+    // Paste must preserve `\n`s verbatim (no soft-break promotion),
+    // inject the cursor's chain continuation prefix on each `\n`, and
+    // widen the enclosing fence if the pasted bytes contain a run of
+    // fence chars that would otherwise close it.
+
+    fn paste(text: &str) -> EditorEvent {
+        EditorEvent::Paste {
+            text: text.into(),
+            internal: false,
+        }
+    }
+
+    #[test]
+    fn paste_into_top_level_fence_preserves_newlines() {
+        // Pasted `\n`s are line separators inside the fence, not
+        // paragraph-break candidates — the normalize pass must not
+        // promote them.
+        let s = update(st("```\n\n```", 4), paste("a\nb\nc"));
+        assert_eq!(s.markdown, "```\na\nb\nc\n```");
+        // Cursor lands at the end of the inserted bytes.
+        assert_eq!(s.selection, Selection::Cursor(9));
+    }
+
+    #[test]
+    fn paste_into_top_level_fence_replaces_selection() {
+        // Selection inside the fence body is dropped first, then the
+        // verbatim splice lands at the deletion site.
+        let init = EditorState {
+            markdown: "```\nABCD\n```".into(),
+            selection: Selection::range(5, 7),
+        };
+        let s = update(init, paste("X\nY"));
+        assert_eq!(s.markdown, "```\nAX\nYD\n```");
+        assert_eq!(s.selection, Selection::Cursor(8));
+    }
+
+    #[test]
+    fn paste_into_fence_widens_when_pasted_run_matches() {
+        // Pasted `` ``` `` would close the enclosing triple-backtick
+        // fence. Widen opener and closer to 4 backticks so the pasted
+        // run lives in the body as literal text.
+        let s = update(st("```\n\n```", 4), paste("```"));
+        assert_eq!(s.markdown, "````\n```\n````");
+    }
+
+    #[test]
+    fn paste_into_fence_widens_to_max_run_plus_one() {
+        // Pasted bytes contain a 5-backtick run. Widen to 6 so the
+        // pasted run can't terminate the fence.
+        let s = update(st("```\n\n```", 4), paste("`````"));
+        assert_eq!(s.markdown, "``````\n`````\n``````");
+    }
+
+    #[test]
+    fn paste_into_fence_no_widen_for_shorter_run() {
+        // 2-backtick run inside a 3-backtick fence is just body text.
+        let s = update(st("```\n\n```", 4), paste("``"));
+        assert_eq!(s.markdown, "```\n``\n```");
+    }
+
+    #[test]
+    fn paste_into_fence_no_widen_for_unterminated_closer_pattern() {
+        // 3-backtick run followed by non-whitespace on the same line
+        // isn't a valid closer (closer line must be only fence chars +
+        // optional trailing whitespace). Don't widen.
+        let s = update(st("```\n\n```", 4), paste("```rust"));
+        assert_eq!(s.markdown, "```\n```rust\n```");
+    }
+
+    #[test]
+    fn paste_into_tilde_fence_widens_only_tilde_runs() {
+        // Tilde fences widen against `~`, not against `` ` ``.
+        let s = update(st("~~~\n\n~~~", 4), paste("~~~"));
+        assert_eq!(s.markdown, "~~~~\n~~~\n~~~~");
+        // Backticks inside a tilde fence are unrelated to the
+        // delimiter and never trigger widening.
+        let s = update(st("~~~\n\n~~~", 4), paste("```"));
+        assert_eq!(s.markdown, "~~~\n```\n~~~");
+    }
+
+    #[test]
+    fn paste_into_unterminated_fence_widens_opener_only() {
+        // Unterminated fence has only an opener delimiter — widen it
+        // alone. The fence body still extends to EOF.
+        let s = update(st("```\n", 4), paste("```"));
+        assert_eq!(s.markdown, "````\n```");
+    }
+
+    #[test]
+    fn paste_into_bq_wrapped_fence_injects_chain_prefix() {
+        // Depth-1 blockquote-wrapped fence. Every `\n` in pasted bytes
+        // needs a `"> "` prefix so continuation lines stay inside the
+        // BQ scope. Without this, line 2 of the pasted content would
+        // escape the blockquote.
+        let s = update(st("> ```\n> \n> ```", 8), paste("a\nb"));
+        assert_eq!(s.markdown, "> ```\n> a\n> b\n> ```");
+    }
+
+    #[test]
+    fn paste_into_bq_wrapped_fence_widens_chain_prefixed() {
+        // The closer check strips the chain prefix before measuring
+        // the fence-char run, matching what pulldown does. A pasted
+        // line of `"```"` inside a BQ fence at depth 1 lands as
+        // `"> ```"` after injection — pulldown would see that as a
+        // valid closer line (chain prefix stripped first), so we
+        // widen.
+        let s = update(st("> ```\n> \n> ```", 8), paste("```"));
+        assert_eq!(s.markdown, "> ````\n> ```\n> ````");
+    }
+
+    #[test]
+    fn paste_into_li_wrapped_fence_injects_marker_indent() {
+        // List-item-wrapped fence at top-level item: each `\n` in
+        // pasted bytes carries the LI's continuation indent (two
+        // spaces for `- `) so the body stays inside the item.
+        let init = EditorState {
+            markdown: "- ```\n  \n  ```".into(),
+            selection: Selection::Cursor(8),
+        };
+        let s = update(init, paste("a\nb"));
+        assert_eq!(s.markdown, "- ```\n  a\n  b\n  ```");
+    }
+
+    #[test]
+    fn paste_into_display_math_preserves_newlines_no_widen() {
+        // Block `$$..$$` math is verbatim like a fence, but `$$` has
+        // no longer form — no widening, just inject chain prefix on
+        // `\n` and splice verbatim.
+        let s = update(st("$$\n\n$$", 3), paste("a\nb"));
+        assert_eq!(s.markdown, "$$\na\nb\n$$");
+    }
+
+    // ---- Phase 2: markdown paste (Scenario 2 from AGENTS.md paste design) ----
+    //
+    // Cursor is outside any verbatim region. Pasted text is parsed
+    // and canonicalized: paragraph-internal soft breaks collapse to
+    // spaces (CommonMark rendering), hard breaks survive, block
+    // boundaries get `\n\n` padding when needed, and the cursor's
+    // chain continuation prefix is injected on every `\n` so the
+    // paste stays inside any enclosing BQ / LI scope.
+
+    #[test]
+    fn paste_hard_wrapped_paragraph_collapses_to_one_paragraph() {
+        // The canonical case: a paragraph hard-wrapped at 80 columns
+        // shouldn't explode into N paragraphs. CommonMark renders
+        // each internal `\n` as a space; the editor's paste path
+        // matches.
+        let s = update(st("", 0), paste("line1\nline2\nline3"));
+        assert_eq!(s.markdown, "line1 line2 line3");
+    }
+
+    #[test]
+    fn paste_preserves_existing_paragraph_breaks() {
+        let s = update(st("", 0), paste("a\n\nb\n\nc"));
+        assert_eq!(s.markdown, "a\n\nb\n\nc");
+    }
+
+    #[test]
+    fn paste_preserves_hard_breaks() {
+        // `  \n` and `\\\n` are deliberate in-paragraph line breaks
+        // and must survive the canonicalize pass.
+        let s = update(st("", 0), paste("foo  \nbar"));
+        assert_eq!(s.markdown, "foo  \nbar");
+    }
+
+    #[test]
+    fn paste_heading_mid_paragraph_splits_paragraph() {
+        // Cursor mid-paragraph; paste starts with a heading. The
+        // leading-pad pass prepends `\n\n` so the heading lands on
+        // its own line. The trailing-pad pass appends `\n\n` so the
+        // post-cursor content doesn't fuse into the heading text.
+        let s = update(st("before after", 7), paste("# heading"));
+        assert_eq!(s.markdown, "before \n\n# heading\n\nafter");
+    }
+
+    #[test]
+    fn paste_paragraph_mid_paragraph_merges() {
+        // Pasting a plain paragraph into the middle of another
+        // paragraph just splices the text — the soft-break-to-space
+        // canonicalization is the merge mechanism.
+        let s = update(st("before after", 7), paste("middle"));
+        assert_eq!(s.markdown, "before middleafter");
+    }
+
+    #[test]
+    fn paste_into_blockquote_keeps_content_in_scope() {
+        // Top-level paste into a depth-1 BQ. The pasted plain
+        // paragraph inherits the BQ's chain prefix on its trailing
+        // edge (none here — no embedded `\n`s — so the splice is a
+        // raw concat).
+        let init = EditorState {
+            markdown: "> existing".into(),
+            selection: Selection::Cursor(10),
+        };
+        let s = update(init, paste("more"));
+        assert_eq!(s.markdown, "> existingmore");
+    }
+
+    #[test]
+    fn paste_blockquote_into_blockquote_nests() {
+        // The user pastes `"> quoted"` while sitting inside another
+        // blockquote. The pasted BQ gets nested one level deeper.
+        // The leading pad gives the nested BQ its own block break;
+        // chain-prefix injection adds the outer `"> "` on every
+        // continuation row of the paste.
+        let init = EditorState {
+            markdown: "> outer".into(),
+            selection: Selection::Cursor(7),
+        };
+        let s = update(init, paste("> quoted"));
+        assert_eq!(s.markdown, "> outer\n> \n> > quoted");
+    }
+
+    #[test]
+    fn paste_nested_list_into_list_item_nests_deeper() {
+        // Cursor is at the end of a top-level list item; paste is
+        // itself a list. The pasted list gets nested under the
+        // cursor's item via chain-prefix injection.
+        let init = EditorState {
+            markdown: "- outer".into(),
+            selection: Selection::Cursor(7),
+        };
+        let s = update(init, paste("- inner"));
+        assert_eq!(s.markdown, "- outer\n\n  - inner");
+    }
+
+    #[test]
+    fn paste_internal_skips_canonicalization() {
+        // `internal: true` (clipboard sentinel match) keeps the bytes
+        // verbatim — they're already canonical, so re-parsing would
+        // round the structure. Paragraphs separated by `\n\n` round
+        // trip exactly.
+        let s = update(
+            st("", 0),
+            EditorEvent::Paste {
+                text: "foo\n\nbar".into(),
+                internal: true,
+            },
+        );
+        assert_eq!(s.markdown, "foo\n\nbar");
+    }
+
+    #[test]
+    fn paste_internal_does_not_collapse_lone_newlines() {
+        // External pastes collapse `line1\nline2` to "line1 line2"
+        // (CommonMark soft-break rule). Internal pastes assume the
+        // bytes are already canonical, so a lone `\n` survives —
+        // `enforce_invariants` then promotes it to `\n\n` because
+        // the internal flag *skips canonicalization*, not the
+        // post-invariants. This is the deliberate divergence: the
+        // sentinel says "trust these bytes," but the global
+        // no-soft-breaks invariant still applies post-splice.
+        let s = update(
+            st("", 0),
+            EditorEvent::Paste {
+                text: "line1\nline2".into(),
+                internal: true,
+            },
+        );
+        assert_eq!(s.markdown, "line1\n\nline2");
+    }
+
+    #[test]
+    fn paste_preserves_backslash_escapes() {
+        // `\*literal-asterisk\*` is a CommonMark escape — the bytes
+        // must survive canonicalization byte-for-byte so the editor's
+        // escape-resolver can dim / reveal them per cursor position.
+        let s = update(st("", 0), paste("hello \\*world\\*"));
+        assert_eq!(s.markdown, "hello \\*world\\*");
+    }
+
+    #[test]
+    fn paste_preserves_entity_references() {
+        // Same survival requirement for HTML entity references.
+        let s = update(st("", 0), paste("foo &copy; bar"));
+        assert_eq!(s.markdown, "foo &copy; bar");
+    }
+
+    #[test]
+    fn paste_bq_paragraph_into_top_level_collapses_continuation() {
+        // The pasted `"> foo\n> bar"` is one BQ paragraph in
+        // CommonMark — soft break between content lines. Canonicalize
+        // strips the `\n> ` between them and emits a single-line BQ
+        // paragraph.
+        let s = update(st("", 0), paste("> foo\n> bar"));
+        assert_eq!(s.markdown, "> foo bar");
+    }
+
+    #[test]
+    fn paste_sibling_list_items_stay_separate() {
+        // Regression: pulldown emits `\n` between two ListItem nodes
+        // as a sibling boundary, *not* as a SoftBreak event. The
+        // SoftBreak-node walk only collapses true in-paragraph soft
+        // breaks, so the inter-item `\n` survives and the two items
+        // remain distinct.
+        let s = update(st("", 0), paste("- item 1\n- item 2"));
+        assert_eq!(s.markdown, "- item 1\n- item 2");
+    }
+
+    #[test]
+    fn paste_sibling_paragraphs_in_blockquote_stay_separate() {
+        // Same shape inside a BQ: two paragraphs separated by the
+        // chain-aware blank-line pair are sibling blocks, not one
+        // soft-broken paragraph.
+        let s = update(st("", 0), paste("> para1\n>\n> para2"));
+        assert_eq!(s.markdown, "> para1\n>\n> para2");
+    }
+
+    #[test]
+    fn paste_list_item_lazy_continuation_collapses() {
+        // Pasted `"- foo\n  bar"` is one list item; `  bar` is the
+        // continuation. Canonicalize emits `- foo bar`.
+        let s = update(st("", 0), paste("- foo\n  bar"));
+        assert_eq!(s.markdown, "- foo bar");
+    }
+
+    #[test]
+    fn paste_code_fence_preserves_internal_newlines() {
+        // The pasted text contains a fenced code block. Its body's
+        // `\n`s are literal line separators, not soft breaks. The
+        // walker only touches Paragraph nodes, so the fence body is
+        // untouched.
+        let s = update(st("", 0), paste("```\na\nb\nc\n```"));
+        assert_eq!(s.markdown, "```\na\nb\nc\n```");
     }
 
     #[test]

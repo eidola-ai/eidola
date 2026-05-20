@@ -88,6 +88,42 @@ actions!(
     ]
 );
 
+/// Sentinel string tagged onto every `copy` / `cut` clipboard write via
+/// `ClipboardItem::new_string_with_metadata`. Paired with the metadata
+/// check in `paste` so an editor → editor round-trip can skip the
+/// markdown canonicalization pass — the bytes are already canonical
+/// and re-parsing them risks rounding their structure.
+///
+/// The literal is intentionally crate-namespaced (`gpui-markdown-editor`)
+/// rather than app-namespaced (`eidola-markdown`), matching the AGENTS
+/// note that this crate carries no Eidola-specific symbols.
+const CLIPBOARD_SENTINEL: &str = "gpui-markdown-editor";
+
+/// Normalize CRLF (Windows) and bare CR (legacy macOS) line endings to
+/// LF so downstream chain-prefix injection, parser passes, and
+/// `enforce_invariants` only have to reason about `\n`. The clipboard
+/// layer on most modern OSes already delivers LF, but Windows
+/// applications and some web sources still emit CRLF.
+fn normalize_line_endings(text: &str) -> String {
+    if !text.contains('\r') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            out.push('\n');
+            // Swallow the LF half of CRLF; bare CR also collapses to LF.
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub struct MarkdownEditor {
     pub state: EditorState,
     style: MarkdownStyle,
@@ -491,7 +527,10 @@ impl MarkdownEditor {
             return;
         }
         let text = self.state.markdown[range].to_string();
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(
+            text,
+            CLIPBOARD_SENTINEL.to_string(),
+        ));
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
@@ -500,14 +539,27 @@ impl MarkdownEditor {
             return;
         }
         let text = self.state.markdown[range].to_string();
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(
+            text,
+            CLIPBOARD_SENTINEL.to_string(),
+        ));
         self.dispatch(EditorEvent::DeleteForward, cx);
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.dispatch(EditorEvent::InsertText(text.to_string()), cx);
-        }
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let internal = item.metadata().is_some_and(|m| m == CLIPBOARD_SENTINEL);
+        let Some(text) = item.text() else {
+            return;
+        };
+        // Normalize CRLF / CR line endings so downstream chain-prefix
+        // injection and parser passes only have to reason about `\n`.
+        // Clipboards on Windows and some Unix sources deliver CRLF;
+        // legacy macOS sources sometimes deliver bare CR.
+        let text = normalize_line_endings(&text);
+        self.dispatch(EditorEvent::Paste { text, internal }, cx);
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {

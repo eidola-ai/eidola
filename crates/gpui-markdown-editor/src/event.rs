@@ -6,6 +6,24 @@ use crate::state::Selection;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorEvent {
     InsertText(String),
+    /// Insert clipboard content at the cursor (or replacing the active
+    /// selection). Distinct from [`InsertText`](Self::InsertText) so the
+    /// update pipeline can apply paste-specific transforms — verbatim
+    /// handling inside a code fence or block math, soft-break-aware
+    /// canonicalization for raw markdown, chain-prefix injection on
+    /// embedded `\n`s — that don't apply to single-character IME /
+    /// programmatic insertions.
+    ///
+    /// `internal` is `true` when the bytes came from this editor's own
+    /// copy / cut (detected via the clipboard's metadata sentinel —
+    /// see `MarkdownEditor::paste`). Internal pastes are already
+    /// canonical markdown, so the canonicalization step is skipped;
+    /// chain-prefix injection on `\n` still runs because the cursor's
+    /// chain context can differ between copy and paste sites.
+    Paste {
+        text: String,
+        internal: bool,
+    },
     InsertNewline,
     InsertLineBreak,
     DeleteBackward,
