@@ -405,7 +405,8 @@ fn augment_block_with_math(
         } else {
             crate::math::MathMode::Inline
         };
-        let math_layout = match crate::math::typeset(latex, mode) {
+        let sanitized_latex = sanitize_latex(latex, &block.containers);
+        let math_layout = match crate::math::typeset(&sanitized_latex, mode) {
             Ok(l) => l,
             Err(_) => {
                 // Typeset failed — render the raw `$..$` source
@@ -733,16 +734,17 @@ impl Element for BlockElement {
             .iter()
             .map(|o| crate::image::load(&o.dest_url, window, cx))
             .collect();
-        let block_image_loaded: Option<crate::image::LoadedImage> = if let BlockKind::Image {
-            dest_url,
-            edit_mode: false,
-            ..
-        } = &self.block.kind
-        {
-            Some(crate::image::load(dest_url, window, cx))
-        } else {
-            None
-        };
+        // Pre-load the block image in *both* display and edit mode.
+        // Edit mode also needs the image's natural size to honor the
+        // edit-mode min-height rule (block reserves max of the natural
+        // edit-shape height and the natural display-paint height) so
+        // toggling edit mode doesn't shift surrounding content.
+        let block_image_loaded: Option<crate::image::LoadedImage> =
+            if let BlockKind::Image { dest_url, .. } = &self.block.kind {
+                Some(crate::image::load(dest_url, window, cx))
+            } else {
+                None
+            };
 
         let block_clone = self.block.clone();
         let style_clone = self.style.clone();
@@ -761,13 +763,13 @@ impl Element for BlockElement {
                 // requires. A typesetting failure (malformed LaTeX)
                 // falls through to a one-line height so the user can
                 // still see the cursor and edit the source.
-                if let BlockKind::DisplayMath {
-                    content_range,
-                    edit_mode: false,
-                } = &block_clone.kind
-                    && let Some(latex) = source.get(content_range.clone())
-                    && let Ok(math_layout) =
-                        crate::math::typeset(latex, crate::math::MathMode::Display)
+                if matches!(
+                    block_clone.kind,
+                    BlockKind::DisplayMath {
+                        edit_mode: false,
+                        ..
+                    }
+                ) && let Some(math_layout) = typeset_display_math_block(&block_clone, &source)
                 {
                     let size = math_layout.size(font_size);
                     let h = extra_above
@@ -879,9 +881,7 @@ impl Element for BlockElement {
                 // themselves sit *outside* the decoration so they
                 // read as inter-block breathing room rather than
                 // part of the construct.
-                let h = extra_above
-                    + spacing_above
-                    + inner_pad * 2.
+                let mut content_h = inner_pad * 2.
                     + shaped_content_height(
                         &lines,
                         line_height,
@@ -891,9 +891,49 @@ impl Element for BlockElement {
                         body_descent,
                         is_code,
                         &style_clone,
-                    )
-                    + spacing_below
-                    + extra_below;
+                    );
+                // Edit-mode min-height: a `BlockKind::DisplayMath` /
+                // `BlockKind::Image` in edit mode reserves at least
+                // the height the *display*-mode paint would take, so
+                // the user's vertical context doesn't shift when the
+                // cursor enters or leaves the construct. The display
+                // height is computed here from the same typeset /
+                // image-load that display mode uses; on a typeset
+                // failure (malformed LaTeX) or a Failed image load we
+                // fall through with no min — the construct's edit-mode
+                // shape *is* what display mode would show as fallback.
+                let display_min_height = match &block_clone.kind {
+                    BlockKind::DisplayMath {
+                        edit_mode: true, ..
+                    } => typeset_display_math_block(&block_clone, &source)
+                        .map(|layout| layout.size(font_size).height),
+                    BlockKind::Image {
+                        edit_mode: true, ..
+                    } => {
+                        let inner_w = (avail_w - container_indent).max(px(1.0));
+                        match block_image_loaded
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or(crate::image::LoadedImage::Loading)
+                        {
+                            crate::image::LoadedImage::Loaded(img) => {
+                                Some(crate::image::block_size(img.as_ref(), inner_w).height)
+                            }
+                            crate::image::LoadedImage::Loading => Some(
+                                crate::image::block_placeholder_size(font_size, inner_w).height,
+                            ),
+                            crate::image::LoadedImage::Failed => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(min) = display_min_height {
+                    let min_total = inner_pad * 2. + min.max(line_height);
+                    if content_h < min_total {
+                        content_h = min_total;
+                    }
+                }
+                let h = extra_above + spacing_above + content_h + spacing_below + extra_below;
                 Size {
                     width: avail_w,
                     height: h,
@@ -1108,7 +1148,18 @@ impl Element for BlockElement {
             }
         }
 
-        let block_bottom = content_cursor_y + inner_pad;
+        let spacing_below = spacing_below_for_block(&self.block.kind, &style);
+        let extra_below = container_boundary_extra(
+            &self.block.containers,
+            self.next_containers.as_deref(),
+            &style,
+        );
+
+        let natural_bottom = content_cursor_y + inner_pad;
+        let resolved_content_h =
+            (bounds.size.height - extra_above - spacing_above - spacing_below - extra_below)
+                .max(natural_bottom - block_top);
+        let block_bottom = block_top + resolved_content_h;
         // `block_bounds` covers this leaf's *full* width (including the
         // container-indent strip on the left) so hit-testing routes
         // clicks anywhere on the row to this leaf. The code-block
@@ -1235,19 +1286,18 @@ impl Element for BlockElement {
         // through to the regular text-shape path which rendered the
         // raw source bytes — the user gets a fallback view rather
         // than a blank block.
-        let math_paint = if let BlockKind::DisplayMath {
-            content_range,
-            edit_mode: false,
-        } = &self.block.kind
-        {
-            source
-                .get(content_range.clone())
-                .and_then(|latex| crate::math::typeset(latex, crate::math::MathMode::Display).ok())
-                .map(|layout| MathPaint {
-                    layout,
-                    origin: point(content_left, content_top),
-                    em_px: font_size,
-                })
+        let math_paint = if matches!(
+            self.block.kind,
+            BlockKind::DisplayMath {
+                edit_mode: false,
+                ..
+            }
+        ) {
+            typeset_display_math_block(&self.block, &source).map(|layout| MathPaint {
+                layout,
+                origin: point(content_left, content_top),
+                em_px: font_size,
+            })
         } else {
             None
         };
@@ -2751,14 +2801,22 @@ fn build_display_line(
         // its end, then fail to skip the overlapping tail bytes of
         // the longer range. Finding the maximum `r.end` over all
         // ranges that cover `pos` skips the entire union in one step.
+        //
+        // The filter intentionally does *not* require `r.end <= line.end`:
+        // a `BlockKind::DisplayMath` in display mode pushes one hide
+        // covering the entire math source range (multiple lines), so
+        // `r.end` extends past every individual shaped line's `line.end`.
+        // We clamp `pos = end.min(line.end)` below so the advance never
+        // walks past the current line — the cross-line span just means
+        // every line this range covers contributes zero display bytes.
         let cover_end = block
             .hidden_ranges
             .iter()
-            .filter(|r| r.start <= pos && pos < r.end && r.end <= line.end)
+            .filter(|r| r.start <= pos && pos < r.end)
             .map(|r| r.end)
             .max();
         if let Some(end) = cover_end {
-            pos = end;
+            pos = end.min(line.end);
             continue;
         }
         let ch = source[pos..line.end]
@@ -3092,6 +3150,71 @@ fn block_claims_cursor(
     let at_end = cursor_offset == block_end;
     let next_claims = matches!(next_block_start, Some(s) if s == cursor_offset);
     strict || (at_end && !next_claims)
+}
+
+/// Strip the chain continuation prefix (`> `, list-item indent, …) from
+/// every line of `latex` that carries it. Source bytes for block-level
+/// `$$..$$` math that lives inside a blockquote or list item include the
+/// scope-continuation prefix on every line past the opener (pulldown
+/// preserves the raw source slice; only its emitted Cow content is
+/// stripped); RaTeX would choke on a stray `> ` mid-equation, so we
+/// strip those bytes here before handing the LaTeX to `math::typeset`.
+///
+/// Returns `Cow::Borrowed(latex)` when the chain is empty or no line in
+/// fact starts with the prefix — no allocation in the common case
+/// (top-level math, or single-line math whose raw bytes never needed
+/// prefix continuation).
+/// Typeset a block-level `$$..$$` math construct in display mode,
+/// applying [`sanitize_latex`] first. Returns `None` when the content
+/// range is out of bounds, when the block isn't a `BlockKind::DisplayMath`,
+/// or when RaTeX rejects the LaTeX — the caller falls through to the
+/// regular text-shape path (which renders the raw source as a fallback).
+///
+/// Consolidates the sanitize + typeset pattern used in `request_layout`
+/// (display-mode natural height and edit-mode min-height), `prepaint`
+/// (display-mode `MathPaint`), and any future caller. Each phase still
+/// re-typesets — we don't memoize across phases yet — but every site
+/// goes through the same code path, so a future move to a memoized
+/// version only needs to change one function.
+fn typeset_display_math_block(
+    block: &crate::render_spec::RenderBlock,
+    source: &str,
+) -> Option<crate::math::MathLayout> {
+    let content_range = match &block.kind {
+        BlockKind::DisplayMath { content_range, .. } => content_range.clone(),
+        _ => return None,
+    };
+    let latex = source.get(content_range)?;
+    let sanitized = sanitize_latex(latex, &block.containers);
+    crate::math::typeset(&sanitized, crate::math::MathMode::Display).ok()
+}
+
+fn sanitize_latex<'a>(latex: &'a str, containers: &[Container]) -> std::borrow::Cow<'a, str> {
+    if containers.is_empty() {
+        return std::borrow::Cow::Borrowed(latex);
+    }
+    let prefix = crate::render_spec::containers_continuation_prefix(containers);
+    if prefix.is_empty() {
+        return std::borrow::Cow::Borrowed(latex);
+    }
+
+    let has_prefix = latex.split('\n').any(|line| line.starts_with(&prefix));
+    if !has_prefix {
+        return std::borrow::Cow::Borrowed(latex);
+    }
+
+    let mut sanitized = String::with_capacity(latex.len());
+    for (i, line) in latex.split('\n').enumerate() {
+        if i > 0 {
+            sanitized.push('\n');
+        }
+        if line.starts_with(&prefix) {
+            sanitized.push_str(&line[prefix.len()..]);
+        } else {
+            sanitized.push_str(line);
+        }
+    }
+    std::borrow::Cow::Owned(sanitized)
 }
 
 // ---------------------------------------------------------------------------

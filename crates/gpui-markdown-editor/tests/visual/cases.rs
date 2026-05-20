@@ -432,6 +432,72 @@ pub fn register(s: &mut Snapshots) {
             MarkdownEditor::with_state(state, window, cx)
         })
     });
+
+    // Display math — cursor outside (rendered typeset LaTeX).
+    s.add("display_math_cursor_outside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "Intro paragraph.\n\n$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n$$\n\nOutro paragraph.".into(),
+                selection: Selection::Cursor(0), // Cursor at start of document (outside the math block).
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Display math — cursor inside (raw LaTeX edit mode).
+    s.add("display_math_cursor_inside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "Intro paragraph.\n\n$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n$$\n\nOutro paragraph.".into(),
+                selection: Selection::Cursor(25), // Cursor inside the math block.
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Display math inside blockquote — cursor outside (rendered typeset LaTeX).
+    s.add("display_math_inside_blockquote_cursor_outside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "> $$\n> \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n> $$\n\nBody paragraph.".into(),
+                selection: Selection::Cursor(65), // Cursor on "Body paragraph" (outside blockquote and math).
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Display math inside blockquote — cursor inside (raw LaTeX edit mode).
+    s.add("display_math_inside_blockquote_cursor_inside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "> $$\n> \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n> $$\n\nBody paragraph.".into(),
+                selection: Selection::Cursor(25), // Cursor inside the math block.
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Display math inside list — cursor outside (rendered typeset LaTeX).
+    s.add("display_math_inside_list_cursor_outside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "- Item one\n  $$\n  \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n  $$\n- Item two".into(),
+                selection: Selection::Cursor(0), // Cursor at start (outside the math block).
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
+
+    // Display math inside list — cursor inside (raw LaTeX edit mode).
+    s.add("display_math_inside_list_cursor_inside", win, |window, cx| {
+        cx.new(|cx| {
+            let state = EditorState {
+                markdown: "- Item one\n  $$\n  \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n  $$\n- Item two".into(),
+                selection: Selection::Cursor(35), // Cursor inside the math block.
+            };
+            MarkdownEditor::with_state(state, window, cx)
+        })
+    });
 }
 
 /// Build an editor whose cursor is placed inside `needle` (3 chars in, by

@@ -322,25 +322,7 @@ fn should_merge_hard_break_continuation(
     }
     // Build the canonical chain prefix once; each line of `next` must
     // equal it exactly, with no content beyond.
-    let analysis_chain: Vec<crate::analysis::EnclosingContainer> = next
-        .containers
-        .iter()
-        .map(|c| match c {
-            Container::BlockQuote { .. } => {
-                crate::analysis::EnclosingContainer::BlockQuote { range: 0..0 }
-            }
-            Container::ListItem {
-                marker_byte_len, ..
-            } => crate::analysis::EnclosingContainer::ListItem(crate::analysis::ListItemContext {
-                list_kind: crate::syntax::ListKind::Unordered,
-                item_index: 0,
-                item_range: 0..0,
-                marker_range: 0..*marker_byte_len,
-                task: None,
-            }),
-        })
-        .collect();
-    let prefix = crate::analysis::chain_continuation_prefix(&analysis_chain);
+    let prefix = crate::render_spec::containers_continuation_prefix(&next.containers);
     let prefix_bytes = prefix.as_bytes();
     if prefix_bytes.is_empty() {
         return false;
@@ -453,9 +435,126 @@ fn render_node(
         }
         NodeKind::List { kind } => render_list(node, *kind, tree, source, cursor, containers, out),
         NodeKind::ThematicBreak => render_thematic_break(node, source, cursor, containers, out),
+        // Top-level DisplayMath — pulldown emits `$$..$$` constructs
+        // that sit on their own lines (block form, after the
+        // `pulldown-cmark` fork's `parse_display_math_block`) directly
+        // at block scope without a wrapping paragraph. This is the
+        // analog of how fenced code blocks arrive: a top-level leaf,
+        // not nested in a paragraph. The same `BlockKind::DisplayMath`
+        // emission rule applies — `emit_display_math_block` is shared
+        // with the paragraph-promoted single-line case (`$$x$$`
+        // standalone) so both flavors render identically.
+        NodeKind::DisplayMath { .. } => {
+            emit_display_math_block(node, source, cursor, containers, out)
+        }
         // Anything else at top level — nothing to do yet.
         _ => {}
     }
+}
+
+/// Emit a `BlockKind::DisplayMath` block for `math` (a `NodeKind::DisplayMath`
+/// node). Shared between two call sites:
+///
+/// 1. `render_paragraph`'s `sole_display_math_child` promotion — a
+///    paragraph whose only content-bearing child is a single inline
+///    `$$..$$` construct (e.g. `$$x^2$$` standalone on its own line in
+///    source, but parsed by pulldown as inline math inside a paragraph).
+/// 2. `render_node`'s top-level dispatch — the `pulldown-cmark` fork's
+///    block-level `$$..$$` construct, which arrives without a paragraph
+///    wrapper.
+///
+/// Both produce the same render output: the `BlockKind::DisplayMath`
+/// block kind, the inclusive-overlap `edit_mode` test, dim-delimiter +
+/// mono-content shape in edit mode, full-range hide in display mode.
+fn emit_display_math_block(
+    math: &SyntaxNode,
+    source: &str,
+    cursor: CursorRange,
+    containers: &[Container],
+    out: &mut Vec<RenderBlock>,
+) {
+    let (content_range, delimiter_ranges) = match &math.kind {
+        NodeKind::DisplayMath {
+            content_range,
+            delimiter_ranges,
+        } => (content_range.clone(), delimiter_ranges.clone()),
+        // The two call sites (top-level `render_node` dispatch and
+        // `sole_display_math_child` promotion in `render_paragraph`)
+        // both already pattern-match the kind before calling — a
+        // non-DisplayMath here would be a caller bug, not a recoverable
+        // state.
+        _ => unreachable!("emit_display_math_block called on non-DisplayMath kind"),
+    };
+    let math_range = math.range.clone();
+    // Inclusive overlap: a cursor *touching* either `$$` fence (at
+    // `math.start` or `math.end`) counts as inside, so the user sees
+    // and can edit the source. Click hit-testing on the typeset
+    // overlay collapses to `math.start` (every source byte is hidden,
+    // so the shaped line is zero-width and every click maps to display
+    // column 0); inclusive overlap is what makes that click flip into
+    // edit mode. The cost is that arrow-keying past the math also
+    // flashes the source momentarily — the documented "always
+    // navigable" mode.
+    //
+    // `math.range` is the *trimmed* range from `math_kind` (see
+    // `parser.rs`) — the trailing `\n` the fork's
+    // `parse_display_math_block` includes past the closer line has
+    // been stripped — so this overlap test agrees with the closer
+    // delimiter's last byte rather than firing on the byte after.
+    let edit_mode = cursor.overlaps(&math_range);
+    let mut block = RenderBlock::new(
+        math_range.clone(),
+        BlockKind::DisplayMath {
+            content_range: content_range.clone(),
+            edit_mode,
+        },
+    );
+    block.containers = containers.to_vec();
+
+    // Register delimiter lines
+    let bytes = source.as_bytes();
+    block
+        .delimiter_lines
+        .push(line_start_offset(bytes, delimiter_ranges[0].start)..delimiter_ranges[0].end);
+    if let Some(closer) = delimiter_ranges.get(1)
+        && !closer.is_empty()
+    {
+        block
+            .delimiter_lines
+            .push(line_start_offset(bytes, closer.start)..closer.end);
+    }
+
+    if edit_mode {
+        // Edit mode: every byte shapes — `$$` delimiters dim, inner
+        // LaTeX shapes in mono. Delimiters MUST stay shaped (not
+        // hidden) so click-hit-test, selection geometry, and arrow
+        // navigation can land on them. Hiding the bytes would also
+        // collapse them out of the display line so the user couldn't
+        // see what they're editing.
+        for d in &delimiter_ranges {
+            if !d.is_empty() {
+                block.inlines.push(InlineRun {
+                    source_range: d.clone(),
+                    style: InlineStyle::dimmed(),
+                });
+            }
+        }
+        if content_range.start < content_range.end {
+            block.inlines.push(InlineRun {
+                source_range: content_range,
+                style: InlineStyle::code(),
+            });
+        }
+    } else {
+        // Display mode: hide the *entire* math range so no source text
+        // shapes underneath the typeset math overlay. The element
+        // layer's request_layout + prepaint produce the math's height
+        // directly; the (hidden-only) shaped lines collapse to one
+        // empty fallback line that anchors cursor-at-boundary
+        // hit-testing.
+        block.hidden_ranges.push(math_range);
+    }
+    out.push(block);
 }
 
 /// Render a thematic break (`---`, `***`, `___`).
@@ -492,7 +591,7 @@ fn render_thematic_break(
 
 fn render_paragraph(
     node: &SyntaxNode,
-    _source: &str,
+    source: &str,
     cursor: CursorRange,
     containers: &[Container],
     out: &mut Vec<RenderBlock>,
@@ -502,72 +601,12 @@ fn render_paragraph(
     // matches GitHub-flavored rendering where a `$$...$$` standalone
     // construct sits on its own row regardless of whether the source
     // happens to land it on its own line. Mixed paragraphs (text +
-    // display math + text) keep the inline rendering path.
+    // display math + text) keep the inline rendering path. Block-level
+    // `$$\n...\n$$` constructs arrive at top level (no paragraph
+    // wrapper) and dispatch through `render_node`; both call sites
+    // share `emit_display_math_block`.
     if let Some(math) = sole_display_math_child(node) {
-        let (content_range, math_range) = match &math.kind {
-            NodeKind::DisplayMath { content_range, .. } => {
-                (content_range.clone(), math.range.clone())
-            }
-            _ => unreachable!("sole_display_math_child guard"),
-        };
-        // Inclusive overlap: a cursor *touching* either `$$` fence
-        // (at `math.start` or `math.end`) counts as inside, so the
-        // user sees and can edit the source. Click hit-testing on
-        // the typeset overlay collapses to `math.start` (every
-        // source byte is hidden, so the shaped line is zero-width
-        // and every click maps to display column 0); inclusive
-        // overlap is what makes that click flip into edit mode.
-        // The cost is that arrow-keying past the math also flashes
-        // the source momentarily — the documented "always
-        // navigable" mode.
-        let edit_mode = cursor.overlaps(&math_range);
-        let mut block = RenderBlock::new(
-            math_range.clone(),
-            BlockKind::DisplayMath {
-                content_range: content_range.clone(),
-                edit_mode,
-            },
-        );
-        block.containers = containers.to_vec();
-        if let NodeKind::DisplayMath {
-            delimiter_ranges, ..
-        } = &math.kind
-        {
-            if edit_mode {
-                // Edit mode: every byte shapes — `$$` delimiters dim,
-                // inner LaTeX shapes in mono. Delimiters MUST stay
-                // shaped (not hidden) so click-hit-test, selection
-                // geometry, and arrow navigation can land on them.
-                // Hiding the bytes would also collapse them out of
-                // the display line so the user couldn't see what
-                // they're editing.
-                for d in delimiter_ranges {
-                    if !d.is_empty() {
-                        block.inlines.push(InlineRun {
-                            source_range: d.clone(),
-                            style: InlineStyle::dimmed(),
-                        });
-                    }
-                }
-                if content_range.start < content_range.end {
-                    block.inlines.push(InlineRun {
-                        source_range: content_range,
-                        style: InlineStyle::code(),
-                    });
-                }
-            } else {
-                // Display mode: hide the *entire* math range so no
-                // source text shapes underneath the typeset math
-                // overlay. The element layer's request_layout +
-                // prepaint produce the math's height directly; the
-                // (hidden-only) shaped lines collapse to one empty
-                // fallback line that anchors cursor-at-boundary
-                // hit-testing.
-                block.hidden_ranges.push(math_range.clone());
-                let _ = delimiter_ranges; // bytes covered by math_range hide
-            }
-        }
-        out.push(block);
+        emit_display_math_block(math, source, cursor, containers, out);
         return;
     }
 
@@ -1307,6 +1346,7 @@ fn is_block_level(kind: &NodeKind) -> bool {
             | NodeKind::CodeBlock { .. }
             | NodeKind::BlockQuote { .. }
             | NodeKind::List { .. }
+            | NodeKind::DisplayMath { .. }
     )
 }
 
@@ -1452,13 +1492,15 @@ fn find_leaf_for_prefix<'a>(
     // empty paragraph at the prefix's range — overlapping the
     // CodeBlock leaf at the same bytes (see
     // `bugs.md::render_walker_emits_phantom_paragraph_inside_unterminated_fenced_code`).
-    // Detect "prefix lies inside an unterminated fence" via the
-    // unterminated-aware `is_in_fenced_code` predicate and attach the
-    // marker to the existing CodeBlock leaf instead.
-    if crate::analysis::is_in_fenced_code(source, prefix.start) {
+    // Detect "prefix lies inside an unterminated verbatim region"
+    // (fenced code or block-level `$$..$$` math) via the verbatim
+    // predicate and attach the marker to the existing leaf instead.
+    if crate::analysis::is_in_verbatim_region(source, prefix.start) {
         for (i, b) in slice.iter().enumerate() {
-            if matches!(b.kind, BlockKind::CodeBlock { .. })
-                && b.source_range.start <= prefix.start
+            if matches!(
+                b.kind,
+                BlockKind::CodeBlock { .. } | BlockKind::DisplayMath { .. }
+            ) && b.source_range.start <= prefix.start
                 && prefix.start <= b.source_range.end
             {
                 return Some(&mut slice[i]);
@@ -2024,11 +2066,12 @@ fn inject_empty_paragraphs(
             (start + 2).min(bytes.len())
         };
         // Suppress synth-paragraph injection when the trailing position
-        // falls inside a fenced code range (terminated or unterminated).
-        // The CodeBlock leaf already covers those bytes — a synth here
-        // would emit a phantom Paragraph leaf overlapping the
-        // CodeBlock. See `bugs.md::render_walker_emits_phantom_…`.
-        if crate::analysis::is_in_fenced_code(source, start) {
+        // falls inside any verbatim region (fenced code or block-level
+        // `$$..$$` math). The CodeBlock / DisplayMath leaf already
+        // covers those bytes — a synth here would emit a phantom
+        // Paragraph leaf overlapping it. See
+        // `bugs.md::render_walker_emits_phantom_…`.
+        if crate::analysis::is_in_verbatim_region(source, start) {
             continue;
         }
         let mut synth = RenderBlock::new(start..end, BlockKind::Paragraph);

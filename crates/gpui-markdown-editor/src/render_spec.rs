@@ -180,6 +180,40 @@ pub enum Container {
     },
 }
 
+/// Canonical per-line continuation prefix for a slice of [`Container`]s
+/// (outermost first), mirroring [`crate::analysis::chain_continuation_prefix`]
+/// but driven by the render-side container chain so callers that already
+/// hold a `RenderBlock` don't have to synthesize a fake `EnclosingContainer`
+/// list just to compute the prefix bytes.
+///
+/// Each container contributes exactly one segment:
+///
+/// - `BlockQuote` → `"> "` (the marker that introduces a line at this depth).
+/// - `ListItem`   → `marker_byte_len` spaces (the continuation indent that
+///   keeps a continuation line aligned with the item's content edge).
+///
+/// So `[ListItem(2), BlockQuote, ListItem(2), BlockQuote]` produces
+/// `"  >   > "` — outer-LI indent, outer BQ marker, inner-LI indent,
+/// inner BQ marker. Pairs with [`crate::analysis::chain_continuation_prefix`]:
+/// the two helpers must agree by construction (same per-container shape,
+/// same outermost-first walk).
+pub fn containers_continuation_prefix(containers: &[Container]) -> String {
+    let mut out = String::new();
+    for c in containers {
+        match c {
+            Container::BlockQuote { .. } => out.push_str("> "),
+            Container::ListItem {
+                marker_byte_len, ..
+            } => {
+                for _ in 0..*marker_byte_len {
+                    out.push(' ');
+                }
+            }
+        }
+    }
+    out
+}
+
 /// What kind of list item this is — the marker shape that produced it.
 /// Used to choose the next item's marker text on Enter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

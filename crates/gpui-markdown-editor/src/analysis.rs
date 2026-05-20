@@ -190,6 +190,151 @@ pub(crate) fn is_in_ranges(p: usize, ranges: &[Range<usize>]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Block-level display math (`$$\n...\n$$`)
+// ---------------------------------------------------------------------------
+
+/// One block-level display-math construct (the `pulldown-cmark` fork's
+/// `parse_display_math_block` output — a `$$..$$` whose opener and
+/// closer each occupy their own line). Inline display math (`$$x$$`
+/// inside a mixed paragraph, or a single-line `$$x$$` paragraph the
+/// renderer promotes via `sole_display_math_child`) is *not* reported
+/// here — only true block-level constructs that follow code-block-like
+/// rules (multi-line content, blank lines pass through, unterminated
+/// blocks extend to EOF).
+///
+/// Mirrors [`FencedCodeBlock`]: same `terminated` semantics drive the
+/// same boundary rule in [`is_in_display_math_block`] /
+/// [`auto_close_math_edit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayMathBlock {
+    pub range: Range<usize>,
+    pub terminated: bool,
+}
+
+/// Find every block-level `$$..$$` construct's full byte range and
+/// termination state. Walks the parse tree — inline `$$..$$` inside a
+/// `Paragraph` is filtered out by skipping recursion through paragraphs.
+pub fn display_math_blocks(markdown: &str) -> Vec<DisplayMathBlock> {
+    let tree = crate::parser::parse(markdown);
+    display_math_blocks_in_tree(&tree, markdown.as_bytes())
+}
+
+/// Variant of [`display_math_blocks`] for callers already holding a
+/// parse tree (typically a multi-pass `enforce_invariants` step sharing
+/// one parse across passes).
+pub fn display_math_blocks_in_tree(
+    tree: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+) -> Vec<DisplayMathBlock> {
+    let mut out = Vec::new();
+    collect_display_math_blocks(tree, bytes, &mut out);
+    out
+}
+
+fn collect_display_math_blocks(
+    nodes: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+    out: &mut Vec<DisplayMathBlock>,
+) {
+    let _ = bytes;
+    for node in nodes {
+        match &node.kind {
+            crate::syntax::NodeKind::DisplayMath {
+                delimiter_ranges, ..
+            } => {
+                // The fork emits block-level math directly under the
+                // current container; inline math under a Paragraph
+                // never reaches this arm because we skip
+                // Paragraph-recursion below. `terminated` reads off
+                // the closer delimiter range — empty closer means the
+                // construct extends to EOF / end-of-container without
+                // a clean `$$` line.
+                let terminated = delimiter_ranges.get(1).is_some_and(|r| !r.is_empty());
+                out.push(DisplayMathBlock {
+                    range: node.range.clone(),
+                    terminated,
+                });
+            }
+            crate::syntax::NodeKind::Paragraph => {
+                // Inline `$$..$$` lives under a Paragraph — those are
+                // not block constructs and don't follow the verbatim
+                // editing rules; skip recursion so we never report
+                // them here.
+            }
+            _ => {
+                collect_display_math_blocks(&node.children, bytes, out);
+            }
+        }
+    }
+}
+
+/// Range-only projection of [`display_math_blocks`].
+pub fn display_math_block_ranges(markdown: &str) -> Vec<Range<usize>> {
+    display_math_blocks(markdown)
+        .into_iter()
+        .map(|b| b.range)
+        .collect()
+}
+
+/// Variant of [`display_math_block_ranges`] for callers that already
+/// hold a parse tree.
+pub fn display_math_block_ranges_in_tree(
+    tree: &[crate::syntax::SyntaxNode],
+    bytes: &[u8],
+) -> Vec<Range<usize>> {
+    display_math_blocks_in_tree(tree, bytes)
+        .into_iter()
+        .map(|b| b.range)
+        .collect()
+}
+
+/// `true` if byte index `p` falls inside any block-level display-math
+/// construct. Same boundary semantics as [`is_in_fenced_code`]:
+/// strict-start, inclusive-trailing-edge for unterminated blocks.
+pub fn is_in_display_math_block(markdown: &str, p: usize) -> bool {
+    display_math_blocks(markdown)
+        .iter()
+        .any(|b| p > b.range.start && (p < b.range.end || (!b.terminated && p == b.range.end)))
+}
+
+/// Variant of [`is_in_display_math_block`] for callers that already
+/// hold the block list.
+pub fn is_in_display_math_blocks(blocks: &[DisplayMathBlock], p: usize) -> bool {
+    blocks
+        .iter()
+        .any(|b| p > b.range.start && (p < b.range.end || (!b.terminated && p == b.range.end)))
+}
+
+// ---------------------------------------------------------------------------
+// Verbatim regions (fenced code + block display math)
+// ---------------------------------------------------------------------------
+
+/// `true` if byte index `p` falls inside any "verbatim region" — a
+/// construct whose source bytes follow code-block-like editing rules
+/// (literal `\n` line separators, no soft-break promotion, no
+/// chain-pair-shape interior detection). Two kinds of verbatim region
+/// today: fenced code blocks and block-level `$$..$$` math.
+///
+/// Single-line inline `$$x$$` and inline math (`$x$`) are *not*
+/// verbatim regions — they're inline constructs whose source bytes
+/// shape per normal cursor-aware rules.
+pub fn is_in_verbatim_region(markdown: &str, p: usize) -> bool {
+    is_in_fenced_code(markdown, p) || is_in_display_math_block(markdown, p)
+}
+
+/// Variant of [`is_in_verbatim_region`] for callers that already hold
+/// the fenced-code and display-math block lists (e.g. a multi-pass
+/// `enforce_invariants` step that wants to amortize parsing across
+/// passes).
+pub fn is_in_verbatim_region_blocks(
+    code: &[FencedCodeBlock],
+    math: &[DisplayMathBlock],
+    p: usize,
+) -> bool {
+    is_in_fenced_code_blocks(code, p) || is_in_display_math_blocks(math, p)
+}
+
+// ---------------------------------------------------------------------------
 // Forbidden-position detection
 // ---------------------------------------------------------------------------
 
@@ -218,17 +363,19 @@ pub(crate) fn is_in_ranges(p: usize, ranges: &[Range<usize>]) -> bool {
 ///    pausing at invisible byte positions.
 pub fn is_forbidden_position(markdown: &str, p: usize) -> bool {
     let bytes = markdown.as_bytes();
-    // Compute fence membership once and reuse it across the two
-    // exemption checks below — each `is_in_fenced_code` call re-parses
-    // the buffer.
-    let in_fence = is_in_fenced_code(markdown, p);
-    if is_paragraph_break_interior(bytes, p) && !in_fence {
+    // Compute verbatim membership once and reuse it across the two
+    // exemption checks below — each predicate call re-parses the
+    // buffer. "Verbatim" covers fenced code AND block-level `$$..$$`
+    // math: both follow code-block-like rules where `\n`s are literal
+    // line separators rather than structural pair shapes.
+    let in_verbatim = is_in_verbatim_region(markdown, p);
+    if is_paragraph_break_interior(bytes, p) && !in_verbatim {
         return true;
     }
     if is_list_indent_interior(markdown, p) {
         return true;
     }
-    if is_chain_pair_interior(markdown, p) && !in_fence {
+    if is_chain_pair_interior(markdown, p) && !in_verbatim {
         return true;
     }
     false
@@ -1856,7 +2003,11 @@ fn bullet_for_item_index(markdown: &str, item_index: usize) -> Option<u8> {
 ///   render as a single paragraph_gap visually.
 /// - Top level: `\n\n`, the top-level paragraph break.
 pub fn enter_insertion(markdown: &str, cursor: usize) -> String {
-    if is_in_fenced_code(markdown, cursor) {
+    if is_in_verbatim_region(markdown, cursor) {
+        // Both fenced code and block-level `$$..$$` math follow the
+        // code-block-style "Enter inserts `\n` + chain prefix" rule —
+        // no soft-break-to-pair promotion, the `\n` is a literal line
+        // separator inside the verbatim body.
         let chain = enclosing_containers_at(markdown, cursor);
         let prefix = chain_continuation_prefix(&chain);
         return format!("\n{prefix}");
@@ -1965,14 +2116,15 @@ pub fn fence_bq_outdent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
 }
 
 pub fn empty_bq_paragraph_exit_edit(markdown: &str, cursor: usize) -> Option<DepthDecreaseEdit> {
-    // Inside a fenced code body the innermost block is the code
-    // block — its rules win, and its `\n` bytes are literal line
-    // separators rather than structural pair-shapes. Without this
-    // guard, repeatedly pressing Enter inside a BQ-wrapped fence's
-    // body lands a chain-aware pair-shape at the most recent two
-    // empty body lines and outdents the BQ scope, breaking the
-    // fence into a top-level paragraph break.
-    if is_in_fenced_code(markdown, cursor) {
+    // Inside any verbatim region (fenced code or block-level math)
+    // the innermost block is the verbatim construct — its rules win,
+    // and its `\n` bytes are literal line separators rather than
+    // structural pair-shapes. Without this guard, repeatedly pressing
+    // Enter inside a BQ-wrapped verbatim body lands a chain-aware
+    // pair-shape at the most recent two empty body lines and outdents
+    // the BQ scope, breaking the construct into a top-level paragraph
+    // break.
+    if is_in_verbatim_region(markdown, cursor) {
         return None;
     }
     let bytes = markdown.as_bytes();
@@ -2041,6 +2193,41 @@ pub fn auto_close_fence_edit(markdown: &str, cursor: usize) -> Option<DepthDecre
     })
 }
 
+/// `Some(edit)` when the user pressed Enter inside an *unterminated*
+/// block-level `$$..$$` math construct. Mirrors [`auto_close_fence_edit`]
+/// — the user typed `$$` to start a math block, and the natural Enter
+/// extends the buffer with a body row plus a matching `$$` closer below
+/// so the construct never carries an unterminated state across
+/// keystrokes. Without this, every subsequent rule (chain-prefix
+/// normalize, soft-break promote, render-walker prefix-hide) would
+/// have to special-case the unterminated math just like the
+/// fenced-code rules already special-case unterminated fences.
+///
+/// The closer is always `$$` (matching the opener's literal); both the
+/// body row and the closer row carry the cursor's chain continuation
+/// prefix so the new bytes stay inside every enclosing BQ / LI scope.
+pub fn auto_close_math_edit(markdown: &str, cursor: usize) -> Option<DepthDecreaseEdit> {
+    let blocks = display_math_blocks(markdown);
+    let block = blocks.iter().find(|b| {
+        cursor >= b.range.start
+            && (cursor < b.range.end || (!b.terminated && cursor == b.range.end))
+    })?;
+    if block.terminated {
+        return None;
+    }
+    let chain = enclosing_containers_at(markdown, cursor);
+    let prefix = chain_continuation_prefix(&chain);
+    let body_row = format!("\n{prefix}");
+    let closer_row = format!("\n{prefix}$$");
+    let replacement = format!("{body_row}{closer_row}");
+    let new_cursor = cursor + body_row.len();
+    Some(DepthDecreaseEdit {
+        range: cursor..cursor,
+        replacement,
+        cursor: new_cursor,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Depth-change edits (Tab / Shift+Tab)
 // ---------------------------------------------------------------------------
@@ -2068,14 +2255,15 @@ pub fn auto_close_fence_edit(markdown: &str, cursor: usize) -> Option<DepthDecre
 ///    list with prior siblings (rewriting `1.` back to `2.`,
 ///    etc.).
 pub fn list_item_indent_edits(markdown: &str, cursor: usize) -> Option<Vec<SourceEdit>> {
-    // Inside a fenced code body the code block's rules win — Tab
-    // inserts a literal `\t` rather than nesting the enclosing LI.
-    // Returning `None` here lets the Tab dispatcher fall through to
-    // the literal-tab insertion path. (The "before the opener
-    // fence" position — cursor at fence range.start — is treated as
-    // outside the fence by `is_in_fenced_code`'s strict-start
-    // rule, so it correctly nests the LI as the user expects.)
-    if is_in_fenced_code(markdown, cursor) {
+    // Inside any verbatim body (fenced code or block-level `$$..$$`
+    // math) the construct's rules win — Tab inserts a literal `\t`
+    // rather than nesting the enclosing LI. Returning `None` here
+    // lets the Tab dispatcher fall through to the literal-tab
+    // insertion path. (The "before the opener fence" position —
+    // cursor at construct range.start — is treated as outside by
+    // the predicate's strict-start rule, so it correctly nests the
+    // LI as the user expects.)
+    if is_in_verbatim_region(markdown, cursor) {
         return None;
     }
     let chain = enclosing_containers_at(markdown, cursor);
@@ -2168,11 +2356,10 @@ pub fn list_item_indent_edits(markdown: &str, cursor: usize) -> Option<Vec<Sourc
 ///
 /// Returns `None` outside of a list.
 pub fn list_item_dedent_edits(markdown: &str, cursor: usize) -> Option<Vec<SourceEdit>> {
-    // Same fence-body guard as `list_item_indent_edits`: the code
-    // block's rules win when the cursor is in body content.
-    // Shift+Tab there should be a no-op (we don't have a literal-
-    // dedent operation in code, just a literal-tab insert for Tab).
-    if is_in_fenced_code(markdown, cursor) {
+    // Same verbatim-body guard as `list_item_indent_edits`: the
+    // construct's rules win when the cursor is in body content
+    // (fenced code or block math). Shift+Tab there should be a no-op.
+    if is_in_verbatim_region(markdown, cursor) {
         return None;
     }
     let chain = enclosing_containers_at(markdown, cursor);
@@ -2491,10 +2678,10 @@ pub struct DepthDecreaseEdit {
 /// continuation of the parent item.
 pub fn empty_item_exit_edit(markdown: &str, cursor: usize) -> Option<DepthDecreaseEdit> {
     // Same reasoning as `empty_bq_paragraph_exit_edit`: inside a
-    // fenced code body the code block is the innermost construct and
-    // its rules win — Enter inserts `\n` + chain prefix, not a
+    // verbatim body (fenced code or block math) the construct's
+    // rules win — Enter inserts `\n` + chain prefix, not a
     // chain-pair outdent.
-    if is_in_fenced_code(markdown, cursor) {
+    if is_in_verbatim_region(markdown, cursor) {
         return None;
     }
     let item = innermost_list_item_at(markdown, cursor)?;

@@ -182,8 +182,8 @@ pub fn enforce_invariants(state: EditorState) -> EditorState {
 /// - Lines whose chain has a `ListItem` are skipped — they're
 ///   continuation / content of an existing item, where `-foo`
 ///   means literal text rather than a sibling marker.
-/// - Lines inside a fenced code block are skipped — fence content
-///   is literal source.
+/// - Lines inside a verbatim region (fenced code or block-level
+///   `$$..$$` math) are skipped — verbatim content is literal source.
 /// - Lines starting with extra leading whitespace beyond the chain
 ///   prefix are skipped — pulldown would see them as code-block
 ///   indent or lazy continuation, not a fresh list opener.
@@ -197,6 +197,7 @@ fn inject_unordered_marker_space(state: EditorState, cache: &mut ParseCache) -> 
         let cursor_anchor = state.selection.anchor();
         let tree = cache.tree(&state.markdown);
         let fences = analysis::fenced_code_blocks_in_tree(tree, bytes);
+        let math_blocks = analysis::display_math_blocks_in_tree(tree, bytes);
         let mut out = Vec::new();
         let mut p = 0usize;
         while p <= bytes.len() {
@@ -214,7 +215,7 @@ fn inject_unordered_marker_space(state: EditorState, cache: &mut ParseCache) -> 
                 let prefix_len = analysis::chain_continuation_prefix_bytes(&chain);
                 let content_start = line_start + prefix_len;
                 if content_start < bytes.len()
-                    && !analysis::is_in_fenced_code_blocks(&fences, content_start)
+                    && !analysis::is_in_verbatim_region_blocks(&fences, &math_blocks, content_start)
                 {
                     let c = bytes[content_start];
                     if matches!(c, b'-' | b'*' | b'+') {
@@ -751,6 +752,7 @@ fn promote_soft_breaks(state: EditorState, cache: &mut ParseCache) -> EditorStat
     //     items would split the list.
     let tree = cache.tree(&state.markdown);
     let code_ranges = analysis::fenced_code_ranges_in_tree(tree, bytes);
+    let math_ranges = analysis::display_math_block_ranges_in_tree(tree, bytes);
     let list_ranges = analysis::list_content_ranges_in_tree(tree, bytes);
 
     // Each entry: (insertion_position, inserted_string). Computed in a
@@ -760,31 +762,36 @@ fn promote_soft_breaks(state: EditorState, cache: &mut ParseCache) -> EditorStat
     let mut inserts: Vec<(usize, String)> = Vec::new();
     for p in 0..bytes.len() {
         let in_code = is_in_ranges(p, &code_ranges);
+        let in_math = is_in_ranges(p, &math_ranges);
         let in_list = is_in_ranges(p, &list_ranges);
-        // **Fence-opener-boundary exemption.** If `p` is a `\n` whose
-        // next byte starts a fenced code block, skip the soft-break
-        // promotion. The pair-shape `\n[prefix]\n[prefix]` is
-        // appropriate between two regular content lines, but right
-        // before a fence opener it would inject a stray prefix-only
-        // line that the user can never delete via Backspace —
-        // `delete_backward`'s "eat the line above" path removes it,
-        // this pass re-adds it, and the cycle traps the buffer at a
-        // fixed point well above zero.
-        let next_starts_fence = bytes[p] == b'\n'
+        // **Verbatim-opener-boundary exemption.** If `p` is a `\n`
+        // whose next byte starts a fenced code or block-math
+        // construct, skip the soft-break promotion. The pair-shape
+        // `\n[prefix]\n[prefix]` is appropriate between two regular
+        // content lines, but right before a verbatim opener it would
+        // inject a stray prefix-only line that the user can never
+        // delete via Backspace — `delete_backward`'s "eat the line
+        // above" path removes it, this pass re-adds it, and the
+        // cycle traps the buffer at a fixed point well above zero.
+        let next_starts_verbatim = bytes[p] == b'\n'
             && p + 1 < bytes.len()
-            && code_ranges.iter().any(|r| r.start == p + 1);
-        if next_starts_fence && !in_code {
+            && (code_ranges.iter().any(|r| r.start == p + 1)
+                || math_ranges.iter().any(|r| r.start == p + 1));
+        if next_starts_verbatim && !in_code && !in_math {
             continue;
         }
-        // Code-content is exempt from soft-break-to-pair promotion
-        // (the `\n` is a literal line separator, not a soft break),
-        // *but* a fenced code block sitting inside a BQ still demands
-        // each new line carry the surrounding `> ` markers — and a
-        // fence inside an LI demands the LI's continuation indent.
-        // We compute the missing-prefix repair in both list and
-        // non-list cases here so the LI-wrapping case isn't silently
-        // skipped by the list_ranges short-circuit.
-        if in_code {
+        // Verbatim content (fenced code + block-level `$$..$$` math) is
+        // exempt from soft-break-to-pair promotion — the `\n` is a
+        // literal line separator, not a soft break. But a verbatim
+        // block sitting inside a BQ still demands each new line carry
+        // the surrounding `> ` markers, and a verbatim block inside
+        // an LI demands the LI's continuation indent. We compute the
+        // missing-prefix repair in both list and non-list cases here
+        // so the LI-wrapping case isn't silently skipped by the
+        // list_ranges short-circuit. Code and math share the same
+        // shape (literal `\n`s with chain prefix on each continuation
+        // line) so the repair is identical for both.
+        if in_code || in_math {
             if bytes[p] != b'\n' || p + 1 >= bytes.len() {
                 continue;
             }
@@ -977,11 +984,14 @@ fn promote_soft_breaks(state: EditorState, cache: &mut ParseCache) -> EditorStat
 /// `update` call's post-pass normalizes the marker so the parsed
 /// shape stays predictable for the renderer.
 ///
-/// Skips `>` bytes that fall inside fenced code-block content — those
-/// are literal `>` characters, not blockquote markers.
+/// Skips `>` bytes that fall inside a verbatim region (fenced code or
+/// block-level `$$..$$` math) — those are literal `>` characters, not
+/// blockquote markers.
 fn normalize_blockquote_prefixes(state: EditorState, cache: &mut ParseCache) -> EditorState {
     let bytes = state.markdown.as_bytes();
-    let code_ranges = analysis::fenced_code_ranges_in_tree(cache.tree(&state.markdown), bytes);
+    let tree = cache.tree(&state.markdown);
+    let code_ranges = analysis::fenced_code_ranges_in_tree(tree, bytes);
+    let math_ranges = analysis::display_math_block_ranges_in_tree(tree, bytes);
     let (cursor_head, cursor_anchor) = match state.selection {
         Selection::Cursor(p) => (p, p),
         Selection::Range { anchor, head } => (head, anchor),
@@ -1002,7 +1012,11 @@ fn normalize_blockquote_prefixes(state: EditorState, cache: &mut ParseCache) -> 
                 q += 1;
                 indent += 1;
             }
-            if q < line_end && bytes[q] == b'>' && !is_in_ranges(q, &code_ranges) {
+            if q < line_end
+                && bytes[q] == b'>'
+                && !is_in_ranges(q, &code_ranges)
+                && !is_in_ranges(q, &math_ranges)
+            {
                 let after_gt = q + 1;
                 let needs_space =
                     after_gt < line_end && bytes[after_gt] != b' ' && bytes[after_gt] != b'\n';
@@ -1122,6 +1136,15 @@ fn insert_newline(state: EditorState) -> EditorState {
     if let Some(edit) = analysis::auto_close_fence_edit(&state.markdown, cursor) {
         return apply_replace(&state.markdown, edit);
     }
+    // Auto-close-math: same shape as auto-close-fence but for an
+    // unterminated block-level `$$..$$` construct. Fires on the first
+    // Enter after the user types `$$` (or any state where pulldown
+    // sees an open math block without a closer), so subsequent rules
+    // can rely on the math block being terminated and verbatim from
+    // here on.
+    if let Some(edit) = analysis::auto_close_math_edit(&state.markdown, cursor) {
+        return apply_replace(&state.markdown, edit);
+    }
     let insertion = analysis::enter_insertion(&state.markdown, cursor);
     insert_text(state, &insertion)
 }
@@ -1137,11 +1160,11 @@ fn increase_list_depth(state: EditorState) -> EditorState {
         return apply_edits(state, &edits);
     }
     // Fallback: when the indent path doesn't apply (no list item at
-    // cursor, or cursor inside a fenced code body where the code's
+    // cursor, or cursor inside a verbatim body where the construct's
     // rules win), Tab inserts a literal `\t`. This is what users
-    // expect inside a fence body — same behavior as any plain text
-    // editor, code is verbatim.
-    if analysis::is_in_fenced_code(&state.markdown, cursor) {
+    // expect inside a fence or block-math body — same behavior as any
+    // plain text editor, the body is verbatim.
+    if analysis::is_in_verbatim_region(&state.markdown, cursor) {
         return insert_text(state, "\t");
     }
     state
@@ -1236,11 +1259,12 @@ fn delete_backward(state: EditorState) -> EditorState {
     // Both first snap forward over any pair interior — that's where a
     // direct cursor placement (e.g. a click on the visually-collapsed
     // paragraph_gap, or a programmatic SetSelection) might land — then
-    // inspect the structure ending at the snapped position. Inside
-    // fenced code-block content, `\n`s are literal line separators —
-    // fall through to the regular grapheme-delete path instead.
+    // inspect the structure ending at the snapped position. Inside a
+    // verbatim region (fenced code or block math), `\n`s are literal
+    // line separators — fall through to the regular grapheme-delete
+    // path instead.
     let bytes = state.markdown.as_bytes();
-    if !analysis::is_in_fenced_code(&state.markdown, cursor) {
+    if !analysis::is_in_verbatim_region(&state.markdown, cursor) {
         let snapped = next_allowed_position(&state.markdown, cursor);
         // Blockquote outdent: at the start of a non-first paragraph
         // inside a BQ, Backspace pops one level of nesting from
@@ -1335,26 +1359,27 @@ fn delete_backward(state: EditorState) -> EditorState {
         }
     }
 
-    // **Anti-oscillation: in-fence "eat the line above" when
+    // **Anti-oscillation: in-verbatim "eat the line above" when
     // grapheme-delete would just strip a `\n` between two prefix-only
     // lines.**
     //
-    // Inside a deeply-nested fenced code body, the cursor often lands
-    // right after a `\n` on a line whose content is just BQ markers
-    // (the previous repair filled them in). A bare grapheme-delete
-    // there removes the `\n`, the line below merges into the line
-    // above, `enforce_invariants` re-parses the merged line as a
-    // deeper-BQ opener, `normalize_blockquote_prefixes` re-spaces it,
-    // and the buffer ends up the same length. The user's keystroke
-    // appears to do nothing.
+    // Inside a deeply-nested verbatim body (fenced code or block-level
+    // `$$..$$` math), the cursor often lands right after a `\n` on a
+    // line whose content is just BQ markers (the previous repair
+    // filled them in). A bare grapheme-delete there removes the `\n`,
+    // the line below merges into the line above, `enforce_invariants`
+    // re-parses the merged line as a deeper-BQ opener,
+    // `normalize_blockquote_prefixes` re-spaces it, and the buffer
+    // ends up the same length. The user's keystroke appears to do
+    // nothing.
     //
-    // When that pattern is detected (cursor inside fenced code, sitting
-    // at byte `\n+1`, and the *previous* line consists only of BQ
-    // markers + whitespace — no content), delete the whole previous
-    // line including its `\n`. Forward progress is guaranteed: the
-    // line above can't reappear from any normalize pass because its
-    // content was empty to begin with.
-    if analysis::is_in_fenced_code(&state.markdown, cursor)
+    // When that pattern is detected (cursor inside a verbatim region,
+    // sitting at byte `\n+1`, and the *previous* line consists only
+    // of BQ markers + whitespace — no content), delete the whole
+    // previous line including its `\n`. Forward progress is
+    // guaranteed: the line above can't reappear from any normalize
+    // pass because its content was empty to begin with.
+    if analysis::is_in_verbatim_region(&state.markdown, cursor)
         && cursor > 0
         && bytes[cursor - 1] == b'\n'
     {
@@ -1368,17 +1393,18 @@ fn delete_backward(state: EditorState) -> EditorState {
         }
     }
 
-    // **In-fence "delete the prefix-only line" gesture.**
+    // **In-verbatim "delete the prefix-only line" gesture.**
     //
     // When the cursor sits anywhere on a prefix-only line inside a
-    // fenced code body (the line is purely chain prefix — BQ markers,
-    // LI continuation indent — with no content), Backspace removes
-    // the entire line including its leading `\n`. Without this, the
-    // user has to press Backspace once per byte of hidden prefix to
-    // remove an empty body row that to them looks like one keystroke
-    // worth of content (the user-reported "deleting invisible,
-    // forbidden characters" case in `bugs.md`).
-    if analysis::is_in_fenced_code(&state.markdown, cursor) && cursor > 0 {
+    // verbatim body (fenced code or block-level `$$..$$` math), the
+    // line is purely chain prefix — BQ markers, LI continuation
+    // indent — with no content; Backspace removes the entire line
+    // including its leading `\n`. Without this, the user has to press
+    // Backspace once per byte of hidden prefix to remove an empty
+    // body row that to them looks like one keystroke worth of content
+    // (the user-reported "deleting invisible, forbidden characters"
+    // case in `bugs.md`).
+    if analysis::is_in_verbatim_region(&state.markdown, cursor) && cursor > 0 {
         let mut line_start = cursor;
         while line_start > 0 && bytes[line_start - 1] != b'\n' {
             line_start -= 1;
@@ -1428,7 +1454,7 @@ fn delete_forward(state: EditorState) -> EditorState {
     }
 
     let bytes = state.markdown.as_bytes();
-    if !analysis::is_in_fenced_code(&state.markdown, cursor) {
+    if !analysis::is_in_verbatim_region(&state.markdown, cursor) {
         let snapped = prev_allowed_position(&state.markdown, cursor);
         if let Some(pair_end) = pair_at_start(bytes, snapped) {
             return splice(&state.markdown, cursor, snapped, pair_end);

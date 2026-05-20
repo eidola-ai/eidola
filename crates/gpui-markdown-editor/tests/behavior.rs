@@ -6455,3 +6455,360 @@ fn typing_inside_inline_math_extends_latex(cx: &mut TestAppContext) {
         assert_eq!(e.cursor_offset(), 4);
     });
 }
+
+// ---------------------------------------------------------------------------
+// Block-level `$$..$$` math (multi-line edit mode)
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn typing_dollar_dollar_then_enter_auto_closes_block_math(cx: &mut TestAppContext) {
+    // The user just typed `$$` (cursor at byte 2) — pulldown sees an
+    // unterminated block-level math construct. Pressing Enter
+    // auto-closes the construct: replacement is `\n\n$$` injected at
+    // the cursor, with the cursor landing on the empty body row
+    // between opener and closer. After the edit, the buffer parses
+    // as a terminated block-math construct.
+    let initial = EditorState {
+        markdown: "$$".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.state.markdown, "$$\n\n$$");
+        // Cursor lands right after the first `\n`, on the empty body
+        // row (column 0).
+        assert_eq!(e.cursor_offset(), 3);
+    });
+    let spec = current_spec(cx, &editor);
+    assert!(matches!(
+        spec.blocks[0].kind,
+        BlockKind::DisplayMath {
+            edit_mode: true,
+            ..
+        }
+    ));
+}
+
+#[gpui::test]
+fn enter_inside_block_math_inserts_literal_newline(cx: &mut TestAppContext) {
+    // Cursor strictly inside a terminated block math `$$\nx\n$$`,
+    // sitting at the end of the `x` content line. Enter inserts a
+    // *literal* `\n` (no soft-break promotion to `\n\n`), preserving
+    // the verbatim semantics. The block math survives — pulldown still
+    // sees a single DisplayMath construct.
+    let initial = EditorState {
+        markdown: "$$\nx\n$$".into(),
+        selection: Selection::Cursor(4), // after `x`
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // No promotion — single `\n` inserted.
+        assert_eq!(e.state.markdown, "$$\nx\n\n$$");
+        assert_eq!(e.cursor_offset(), 5);
+    });
+    // Still a single block-math leaf, blank line preserved as content.
+    let spec = current_spec(cx, &editor);
+    assert!(matches!(
+        spec.blocks[0].kind,
+        BlockKind::DisplayMath {
+            edit_mode: true,
+            ..
+        }
+    ));
+}
+
+#[gpui::test]
+fn block_math_with_blank_line_in_body_round_trips_as_math(cx: &mut TestAppContext) {
+    // The fork allows blank lines inside `$$..$$`. Verify the parser
+    // surfaces the construct as a block-math leaf with `edit_mode`
+    // gated on cursor position. Cursor outside → display mode;
+    // cursor inside → edit mode.
+    let initial = EditorState {
+        markdown: "$$\nx\n\ny\n$$".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    assert!(
+        spec.blocks
+            .iter()
+            .any(|b| matches!(b.kind, BlockKind::DisplayMath { .. })),
+        "expected block-level DisplayMath leaf, got {:?}",
+        spec.blocks
+    );
+    // Move strictly inside (between `x` and the blank line).
+    set_cursor(cx, handle, &editor, 4);
+    let spec = current_spec(cx, &editor);
+    let block = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::DisplayMath { .. }))
+        .expect("DisplayMath block");
+    match &block.kind {
+        BlockKind::DisplayMath { edit_mode, .. } => assert!(*edit_mode),
+        _ => unreachable!(),
+    }
+}
+
+#[gpui::test]
+fn auto_close_inside_blockquote_carries_chain_prefix(cx: &mut TestAppContext) {
+    // User typed `> $$` inside a blockquote (cursor at byte 4). Enter
+    // auto-closes — both the new body row and the closer row carry
+    // the `> ` continuation prefix so the math stays inside the BQ.
+    let initial = EditorState {
+        markdown: "> $$".into(),
+        selection: Selection::Cursor(4),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // `> $$` + `\n> ` (body) + `\n> $$` (closer) = "> $$\n> \n> $$"
+        assert_eq!(e.state.markdown, "> $$\n> \n> $$");
+    });
+}
+
+#[gpui::test]
+fn block_math_promoted_when_no_paragraph_wrapper(cx: &mut TestAppContext) {
+    // Verify the top-level dispatch path: a multi-line `$$..$$`
+    // arrives without a paragraph wrapper (per the fork) and still
+    // emits a `BlockKind::DisplayMath` leaf with the inner content
+    // range pointing at the LaTeX between delimiters.
+    let initial = EditorState {
+        markdown: "$$\na + b\n$$".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let block = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::DisplayMath { .. }))
+        .expect("DisplayMath block emitted");
+    match &block.kind {
+        BlockKind::DisplayMath { content_range, .. } => {
+            // Content range covers the inner LaTeX between the `$$`
+            // delimiters (inclusive of any leading/trailing `\n`s
+            // pulldown pairs with the construct's content).
+            assert!(
+                content_range.start <= content_range.end
+                    && content_range.end <= "$$\na + b\n$$".len()
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[gpui::test]
+fn multi_line_block_math_with_trailing_newline_is_terminated_and_renders(cx: &mut TestAppContext) {
+    // The fork's `parse_display_math_block` consumes the trailing
+    // newline past the closer. Verify the editor still reports the
+    // construct as terminated, exposes a content_range covering only
+    // the inner LaTeX (not the closer `$$` or its trailing `\n`), and
+    // registers both opener and closer delimiter lines.
+    let initial = EditorState {
+        markdown: "Hello\n\n$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n$$\n".into(),
+        // Cursor on "Hello" — strictly outside the math block.
+        selection: Selection::Cursor(0),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let block = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::DisplayMath { .. }))
+        .expect("expected display math block");
+
+    match &block.kind {
+        BlockKind::DisplayMath {
+            content_range,
+            edit_mode,
+        } => {
+            assert!(
+                !edit_mode,
+                "expected display mode when cursor is outside the math block",
+            );
+            let content = editor.read_with(cx, |e, _| {
+                e.state.markdown[content_range.clone()].to_string()
+            });
+            assert_eq!(content, "\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n");
+        }
+        _ => unreachable!(),
+    }
+
+    assert_eq!(
+        block.delimiter_lines.len(),
+        2,
+        "expected 2 delimiter lines registered",
+    );
+}
+
+#[gpui::test]
+fn enter_inside_terminated_block_math_with_trailing_newline_does_not_duplicate_fence(
+    cx: &mut TestAppContext,
+) {
+    // Terminated block math with a trailing newline. Cursor inside, at
+    // the newline that ends the LaTeX content row:
+    //
+    //   `$$\n`                                       → 3 bytes  (0..3)
+    //   `\frac{1}{1 - x} = \sum_{n=0}^{\infty} x^n`  → 41 bytes (3..44)
+    //   `\n`                                         → 1 byte   (44..45)
+    //   `$$\n`                                       → 3 bytes  (45..48)
+    //
+    // Cursor at 44 sits at the end of the content line (right before
+    // the `\n` that separates content from closer).
+    let initial = EditorState {
+        markdown: "$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n$$\n".into(),
+        selection: Selection::Cursor(44),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Enter);
+    editor.read_with(cx, |e, _| {
+        // Inside a *terminated* block, Enter inserts a literal `\n`
+        // — `auto_close_math_edit` short-circuits to None for
+        // terminated constructs.
+        assert_eq!(
+            e.state.markdown,
+            "$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n\n$$\n",
+        );
+        assert_eq!(e.cursor_offset(), 45);
+    });
+}
+
+#[gpui::test]
+fn cursor_at_start_of_next_block_does_not_flip_math_to_edit_mode(cx: &mut TestAppContext) {
+    // Regression for the trailing-newline range bug. Before
+    // `parser::math_kind` trimmed the range it returned on `node.range`,
+    // the math block's `source_range` extended past the closer's `\n`
+    // — so `cursor.overlaps(&math.range)` fired on the byte immediately
+    // after the closer (the start of the next paragraph), flipping the
+    // math into edit mode while the cursor logically lived on the
+    // paragraph below.
+    //
+    // Layout:
+    //   `$$\n`     → 3 bytes (0..3)
+    //   `x\n`      → 2 bytes (3..5)
+    //   `$$\n`     → 3 bytes (5..8)
+    //   `bar`      → 3 bytes (8..11)
+    //
+    // Cursor at byte 8 is the first byte of "bar". The math must be
+    // in display mode at this position.
+    let initial = EditorState {
+        markdown: "$$\nx\n$$\nbar".into(),
+        selection: Selection::Cursor(8),
+    };
+    let (_, editor) = open_editor(cx, initial);
+    let spec = current_spec(cx, &editor);
+    let block = spec
+        .blocks
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::DisplayMath { .. }))
+        .expect("expected display math block");
+    match &block.kind {
+        BlockKind::DisplayMath { edit_mode, .. } => assert!(
+            !edit_mode,
+            "cursor at start of next paragraph must not put math in edit mode"
+        ),
+        _ => unreachable!(),
+    }
+}
+
+#[gpui::test]
+fn bare_dash_in_block_math_body_does_not_get_marker_space_injected(cx: &mut TestAppContext) {
+    // `inject_unordered_marker_space` would historically inject `- ` →
+    // `- ` (no-op) but `-foo` → `- foo` on any top-level-looking line.
+    // Inside a verbatim region (fenced code or block math) the line is
+    // literal content, so this pass must be skipped.
+    //
+    // Layout:
+    //   `$$\n`   → 3 bytes (0..3)
+    //   `-x\n`   → 3 bytes (3..6)  ← cursor parks here after typing
+    //   `$$`     → 2 bytes (6..8)
+    let initial = EditorState {
+        markdown: "$$\n-x\n$$".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            // Trigger enforce_invariants via an InsertText event — even
+            // a no-op insertion runs the post-pass over the buffer.
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown, "$$\n-x\n$$",
+            "verbatim math body must not have marker space injected",
+        );
+    });
+}
+
+#[gpui::test]
+fn bare_gt_in_block_math_body_does_not_get_bq_space_injected(cx: &mut TestAppContext) {
+    // `normalize_blockquote_prefixes` rewrites `>x` → `> x` at the
+    // start of any line outside a verbatim region. Block math content
+    // is verbatim — `>` is a literal LaTeX character (e.g. `\geq`'s
+    // shorthand siblings), not a blockquote marker.
+    let initial = EditorState {
+        markdown: "$$\n>x\n$$".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| {
+            let next = std::mem::take(&mut e.state);
+            e.state = gpui_markdown_editor::update::update(
+                next,
+                gpui_markdown_editor::EditorEvent::InsertText("".into()),
+            );
+            cx.notify();
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.state.markdown, "$$\n>x\n$$",
+            "verbatim math body must not have BQ-prefix space injected",
+        );
+    });
+}
+
+#[gpui::test]
+fn backspace_on_prefix_only_line_in_bq_wrapped_math_eats_the_line(cx: &mut TestAppContext) {
+    // Inside a BQ-wrapped block math, an empty body row reads as just
+    // `> ` — the BQ continuation prefix and nothing else. The
+    // "in-verbatim delete-the-prefix-only-line" Backspace gesture
+    // should remove the whole row (`\n> `), not nibble it one byte at
+    // a time.
+    //
+    // Layout:
+    //   `> $$\n`   → 5 bytes  (0..5)
+    //   `> x\n`    → 4 bytes  (5..9)
+    //   `> \n`     → 3 bytes  (9..12)   ← prefix-only line; cursor on it
+    //   `> $$`    → 4 bytes  (12..16)
+    //
+    // Cursor at byte 11 (end of the prefix-only line, before its `\n`).
+    let initial = EditorState {
+        markdown: "> $$\n> x\n> \n> $$".into(),
+        selection: Selection::Cursor(11),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Backspace);
+    editor.read_with(cx, |e, _| {
+        // The whole prefix-only line (including its leading `\n`)
+        // disappears; the cursor lands at the end of the previous
+        // content row (right after `x`, before its trailing `\n`).
+        assert_eq!(e.state.markdown, "> $$\n> x\n> $$");
+        assert_eq!(e.cursor_offset(), 8);
+    });
+}

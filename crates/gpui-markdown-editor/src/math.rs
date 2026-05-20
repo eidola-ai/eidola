@@ -109,7 +109,8 @@ pub struct MathLayout {
 /// for repeated repainting. Pass `MathMode::Display` for `$$...$$`
 /// constructs and `MathMode::Inline` for `$...$`.
 pub fn typeset(latex: &str, mode: MathMode) -> Result<MathLayout, String> {
-    let nodes = parse(latex).map_err(|e| e.to_string())?;
+    let trimmed = latex.trim();
+    let nodes = parse(trimmed).map_err(|e| e.to_string())?;
     let style = match mode {
         MathMode::Display => MathStyle::Display,
         MathMode::Inline => MathStyle::Text,

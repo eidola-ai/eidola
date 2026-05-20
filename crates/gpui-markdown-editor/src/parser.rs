@@ -79,12 +79,12 @@ impl<'a> Walker<'a> {
                 self.commit_leaf(SyntaxNode::new(kind, range));
             }
             Event::InlineMath(_) => {
-                let kind = self.math_kind(&range, /*display=*/ false);
-                self.commit_leaf(SyntaxNode::new(kind, range));
+                let (trimmed, kind) = self.math_kind(&range, /*display=*/ false);
+                self.commit_leaf(SyntaxNode::new(kind, trimmed));
             }
             Event::DisplayMath(_) => {
-                let kind = self.math_kind(&range, /*display=*/ true);
-                self.commit_leaf(SyntaxNode::new(kind, range));
+                let (trimmed, kind) = self.math_kind(&range, /*display=*/ true);
+                self.commit_leaf(SyntaxNode::new(kind, trimmed));
             }
             Event::Rule => self.commit_leaf(SyntaxNode::new(NodeKind::ThematicBreak, range)),
             Event::TaskListMarker(checked) => self.set_task_marker(checked, &range),
@@ -482,22 +482,44 @@ impl<'a> Walker<'a> {
     /// that — but counting handles the rare degenerate case (e.g.
     /// inline math whose source happens to span more bytes than
     /// expected).
-    fn math_kind(&self, range: &Range<usize>, display: bool) -> NodeKind {
+    ///
+    /// Returns the *trimmed* range alongside the `NodeKind`. The fork's
+    /// `parse_display_math_block` includes the trailing `\n` (plus a
+    /// skipped blank line) past the closer in its event range, so the
+    /// raw pulldown range can extend past the last `$` of the closer.
+    /// We strip leading / trailing ASCII whitespace once, use those
+    /// trimmed bounds to project `delimiter_ranges` and `content_range`,
+    /// and return the same trimmed range to the caller so
+    /// `SyntaxNode::new(kind, range)` carries a range that *agrees*
+    /// with `delimiter_ranges` / `content_range`. Without this the
+    /// inclusive-overlap edit-mode test (`cursor.overlaps(&math.range)`)
+    /// would fire when the cursor parks on the byte immediately after
+    /// the construct's closer line — flipping math into edit mode while
+    /// the cursor logically lives on the next block.
+    fn math_kind(&self, range: &Range<usize>, display: bool) -> (Range<usize>, NodeKind) {
         let bytes = self.source.as_bytes();
-        let mut p = range.start;
-        while p < range.end && bytes[p] == b'$' {
+        let mut start = range.start;
+        let mut end = range.end;
+        while start < end && bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        while end > start && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        let mut p = start;
+        while p < end && bytes[p] == b'$' {
             p += 1;
         }
         let opener_end = p;
-        let mut q = range.end;
+        let mut q = end;
         while q > opener_end && bytes[q - 1] == b'$' {
             q -= 1;
         }
         let closer_start = q;
-        let opener = range.start..opener_end;
-        let closer = closer_start..range.end;
+        let opener = start..opener_end;
+        let closer = closer_start..end;
         let content = opener_end..closer_start;
-        if display {
+        let kind = if display {
             NodeKind::DisplayMath {
                 delimiter_ranges: vec![opener, closer],
                 content_range: content,
@@ -507,7 +529,8 @@ impl<'a> Walker<'a> {
                 delimiter_ranges: vec![opener, closer],
                 content_range: content,
             }
-        }
+        };
+        (start..end, kind)
     }
 
     /// Compute delimiter and content ranges for an inline code span.

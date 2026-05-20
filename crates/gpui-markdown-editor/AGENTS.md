@@ -254,25 +254,56 @@ The first cut covers:
   - **Cursor inside** the construct: fall back to the
     dim-delimiter / mono-content path so the user can read and
     edit the raw LaTeX directly.
-  Display math promotes a paragraph
-  whose sole content is a `DisplayMath` to
-  `BlockKind::DisplayMath { content_range, edit_mode }`. The
-  block has two render paths:
-  - **Display mode** (`edit_mode == false`, cursor strictly
-    outside the math range): the element layer typesets via
-    `math::typeset(latex, MathMode::Display)`, allocates the
-    block's height to the math layout's pixel size, and paints
-    the typeset math via `MathLayout::paint`.
-  - **Edit mode** (`edit_mode == true`, cursor strictly inside):
-    falls back to text shaping — `$$` delimiters dim, inner
-    LaTeX shapes in the mono font.
-  The strict-overlap test (boundary cursors don't count as
-  inside) gives the "navigated to enters edit mode" feel: the
-  cursor can park at the math's leading or trailing edge in
-  display mode, and the next arrow press steps inside and
-  flips to edit. KaTeX fonts auto-register on first display-math
-  paint via `math::register_katex_fonts`; hosts may also call it
-  at app init alongside their own font loads.
+  Display math becomes a `BlockKind::DisplayMath { content_range,
+  edit_mode }` via two parser paths that both feed the same
+  `render::emit_display_math_block` helper:
+  - **Block-level `$$\n...\n$$`** — the `pulldown-cmark` fork's
+    `parse_display_math_block` (mirrors `parse_fenced_code_block`)
+    emits these as a top-level `Event::DisplayMath` with no
+    wrapping paragraph. Content can span blank lines; the
+    construct is terminated by a `$$`-only line or EOF
+    (unterminated, same shape as an unterminated fenced code
+    block). `analysis::display_math_blocks` projects this to a
+    `DisplayMathBlock { range, terminated }` for cursor queries.
+  - **Sole-paragraph promotion** — a paragraph whose only
+    content-bearing child is a single inline `$$x$$` (e.g.
+    `$$x^2$$` on its own line) is still promoted via
+    `render_paragraph::sole_display_math_child` into the same
+    block kind, so single-line and multi-line constructs render
+    identically.
+
+  The block has two render modes that swap based on cursor
+  position:
+  - **Display mode** (`edit_mode == false`, cursor outside): the
+    element layer typesets via `math::typeset(latex, MathMode::Display)`,
+    allocates the block's height to the math layout's pixel
+    size, and paints the typeset math via `MathLayout::paint`.
+  - **Edit mode** (`edit_mode == true`, cursor inside): falls
+    back to text shaping — `$$` delimiters dim, inner LaTeX
+    shapes in the mono font, multi-line content shapes
+    naturally. The block reserves at least the natural
+    display-mode height (`max(natural edit, natural display)`)
+    so toggling edit mode doesn't shift surrounding content.
+
+  Editing semantics inside a block-level `$$..$$` follow the same
+  rules as fenced code (collected under [`is_in_verbatim_region`]):
+  Enter inserts a literal `\n` plus the chain continuation prefix
+  (no soft-break-to-pair promotion), Tab inserts a literal `\t`,
+  Backspace at structural boundaries falls through to grapheme
+  delete, blank lines pass through as content. The first Enter
+  inside an unterminated `$$` triggers `analysis::auto_close_math_edit`
+  — analog of `auto_close_fence_edit`, injecting a matching `$$`
+  closer below the cursor. After auto-close, every other rule reads
+  off `is_in_display_math_block` (or `is_in_verbatim_region`) without
+  the unterminated-state ambiguity.
+
+  The inclusive-overlap test (boundary cursors *do* count as
+  inside for display-vs-edit) gives the "click to edit" feel:
+  the cursor can park at the math's leading or trailing edge
+  and immediately flip to edit. KaTeX fonts auto-register on
+  first display-math paint via `math::register_katex_fonts`;
+  hosts may also call it at app init alongside their own font
+  loads.
 - Images (`![alt](url)`): structurally identical to math — pulldown
   emits `Tag::Image` as a container with the alt text as inline
   children. `NodeKind::Image { delimiter_ranges, alt_range,
@@ -293,16 +324,19 @@ The first cut covers:
   promotion rule and inclusive-overlap edit-mode test as
   `DisplayMath`. In display mode the element layer scales the
   image to fit the available content width (`crate::image::block_size`)
-  and paints directly via `window.paint_image`. Image loading is
-  asynchronous: the cache returns `Loading` until the asset
-  resolves, `Failed` on error. `Loading` reserves a placeholder
-  (square at the inline height cap; ~8em-tall banner for block
-  images) and invalidates the view when the load completes;
-  `Failed` falls back to the dim-delimiter + alt-text inline run
-  pair so the user sees the construct and the broken URL. Loaders
-  for `http://`, `https://`, `file://`, and absolute paths come
-  for free via gpui's image cache; relative-path / embedded
-  resolution depends on hosts registering an `AssetSource`.
+  and paints directly via `window.paint_image`. Edit mode reserves
+  at least the natural display-mode height (the same
+  `max(natural edit, natural display)` rule as `BlockKind::DisplayMath`)
+  so toggling edit mode doesn't shift surrounding content. Image
+  loading is asynchronous: the cache returns `Loading` until the
+  asset resolves, `Failed` on error. `Loading` reserves a
+  placeholder (square at the inline height cap; ~8em-tall banner
+  for block images) and invalidates the view when the load
+  completes; `Failed` falls back to the dim-delimiter + alt-text
+  inline run pair so the user sees the construct and the broken
+  URL. Loaders for `http://`, `https://`, `file://`, and absolute
+  paths come for free via gpui's image cache; relative-path /
+  embedded resolution depends on hosts registering an `AssetSource`.
 
 Explicitly *out* of this phase: setext-heading normalization, tables,
 HTML, IME marked-text, word / line-aware delete, reference-style
