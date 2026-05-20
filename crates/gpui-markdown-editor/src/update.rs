@@ -76,6 +76,7 @@ pub fn update(state: EditorState, event: EditorEvent) -> EditorState {
     let next = match event {
         EditorEvent::InsertText(text) => insert_text(state, &text),
         EditorEvent::Paste { text, internal } => paste(state, &text, internal),
+        EditorEvent::PastePlain { text } => plain_paste(state, &text),
         EditorEvent::InsertNewline => insert_newline(state),
         EditorEvent::InsertLineBreak => insert_line_break(state),
 
@@ -1261,6 +1262,38 @@ fn paste(state: EditorState, text: &str, internal: bool) -> EditorState {
         return verbatim_paste(mid, cursor, text);
     }
     markdown_paste(mid, cursor, text, internal)
+}
+
+/// Plain-text paste: user explicitly bypassed the markdown
+/// canonicalization (Cmd+Shift+V on macOS by convention). Bytes are
+/// spliced raw — every `\n` survives the splice and gets promoted to
+/// `\n\n` (paragraph break) by `enforce_invariants`'s chain-aware
+/// `promote_soft_breaks` pass, so each pasted line becomes its own
+/// paragraph in the cursor's scope.
+///
+/// Inside a verbatim region (fenced code, block math) the plain
+/// semantics reduce to verbatim semantics — literal `\n`s as line
+/// separators with chain prefix injected. The cursor explicitly chose
+/// plain, and inside a fence "plain" is "literal." Route through the
+/// same [`verbatim_paste`] helper Phase 1 uses so fence-widening still
+/// applies if the pasted bytes would close the construct.
+///
+/// Markdown markers (`#`, `*`, `` ` ``, etc.) are *not* pre-escaped.
+/// The contract is "splice raw"; downstream interpretation depends on
+/// what the pasted bytes happen to parse as. If users want literal
+/// rendering they can backslash-escape at the source — a separate
+/// "paste as literal text" mode that escapes every CommonMark marker
+/// is a follow-up we haven't built.
+fn plain_paste(state: EditorState, text: &str) -> EditorState {
+    let (md, cursor) = delete_selection(&state);
+    let mid = EditorState {
+        markdown: md,
+        selection: Selection::Cursor(cursor),
+    };
+    if analysis::is_in_verbatim_region(&mid.markdown, cursor) {
+        return verbatim_paste(mid, cursor, text);
+    }
+    insert_text(mid, text)
 }
 
 /// Phase-1 verbatim paste: splice `text` at `cursor` inside a code
@@ -3024,6 +3057,112 @@ mod invariant_tests {
         // continuation. Canonicalize emits `- foo bar`.
         let s = update(st("", 0), paste("- foo\n  bar"));
         assert_eq!(s.markdown, "- foo bar");
+    }
+
+    // ---- Phase 3a: paste-as-plain-text (Scenario 3a from AGENTS.md
+    //      paste design) -----------------------------------------------------
+    //
+    // User-triggered alternative to the markdown-canonicalize path.
+    // Bytes splice raw: no parse, no soft-break collapse, no block
+    // padding. `\n` becomes a paragraph break (chain-aware,
+    // post-`enforce_invariants`). Inside a verbatim region the plain
+    // semantics reduce to verbatim semantics.
+
+    fn paste_plain(text: &str) -> EditorEvent {
+        EditorEvent::PastePlain { text: text.into() }
+    }
+
+    #[test]
+    fn paste_plain_promotes_newlines_to_paragraph_breaks() {
+        // The marquee Phase 3a behavior: lines stay as separate
+        // paragraphs instead of being collapsed onto one row. This is
+        // exactly the opposite of Phase 2's
+        // `paste_hard_wrapped_paragraph_collapses_to_one_paragraph`.
+        let s = update(st("", 0), paste_plain("line1\nline2\nline3"));
+        assert_eq!(s.markdown, "line1\n\nline2\n\nline3");
+    }
+
+    #[test]
+    fn paste_plain_does_not_collapse_soft_breaks() {
+        // Even content pulldown would parse as one Paragraph with two
+        // SoftBreaks (the Phase 2 collapse case) stays as three
+        // paragraphs under PastePlain.
+        let s = update(st("", 0), paste_plain("hard\nwrapped\nparagraph"));
+        assert_eq!(s.markdown, "hard\n\nwrapped\n\nparagraph");
+    }
+
+    #[test]
+    fn paste_plain_preserves_existing_paragraph_breaks() {
+        // Idempotent on already-canonical input.
+        let s = update(st("", 0), paste_plain("a\n\nb\n\nc"));
+        assert_eq!(s.markdown, "a\n\nb\n\nc");
+    }
+
+    #[test]
+    fn paste_plain_into_blockquote_keeps_content_in_scope() {
+        // Inside a BQ, `enforce_invariants`'s chain-aware
+        // `promote_soft_breaks` lifts each lone `\n` into the depth-1
+        // pair shape `\n> \n> ` so the new paragraphs stay inside the
+        // BQ.
+        let init = EditorState {
+            markdown: "> existing".into(),
+            selection: Selection::Cursor(10),
+        };
+        let s = update(init, paste_plain("\nmore"));
+        assert_eq!(s.markdown, "> existing\n> \n> more");
+    }
+
+    #[test]
+    fn paste_plain_inside_fence_falls_through_to_verbatim() {
+        // Plain semantics inside a fence reduce to verbatim — literal
+        // `\n` separators, chain prefix injected. Same shape as
+        // regular Paste inside a fence.
+        let s = update(st("```\n\n```", 4), paste_plain("a\nb"));
+        assert_eq!(s.markdown, "```\na\nb\n```");
+    }
+
+    #[test]
+    fn paste_plain_inside_fence_widens_on_conflicting_run() {
+        // Phase-1's fence widening applies via the verbatim_paste
+        // fall-through — PastePlain inside a fence still bumps the
+        // enclosing delimiter if pasted bytes would close it.
+        let s = update(st("```\n\n```", 4), paste_plain("```"));
+        assert_eq!(s.markdown, "````\n```\n````");
+    }
+
+    #[test]
+    fn paste_plain_does_not_pre_escape_markdown_markers() {
+        // PastePlain splices raw — markdown markers in the pasted
+        // bytes are *not* escaped. Pasting `"# heading"` lands as
+        // literal source `"# heading"`, which pulldown will then
+        // parse as a heading. The contract is "splice raw," not
+        // "render as literal text." Users who want literal rendering
+        // can escape at the source.
+        let s = update(st("", 0), paste_plain("# heading"));
+        assert_eq!(s.markdown, "# heading");
+    }
+
+    #[test]
+    fn paste_plain_ignores_clipboard_sentinel() {
+        // Regular Paste with internal=true would skip canonicalization
+        // but still apply Phase 2 padding. PastePlain ignores the
+        // metadata entirely — the user-triggered plain semantics win.
+        // The event-level shape doesn't carry an `internal` flag, so
+        // there's nothing to ignore *in routing* — but verify that
+        // PastePlain output matches regardless of whether the same
+        // bytes would have come from an internal copy.
+        let s = update(st("", 0), paste_plain("foo\nbar"));
+        assert_eq!(s.markdown, "foo\n\nbar");
+    }
+
+    #[test]
+    fn paste_plain_replaces_active_selection() {
+        let init = EditorState {
+            markdown: "before MIDDLE after".into(),
+            selection: Selection::range(7, 13),
+        };
+        let s = update(init, paste_plain("X\nY"));
+        assert_eq!(s.markdown, "before X\n\nY after");
     }
 
     #[test]

@@ -22,9 +22,9 @@ use gpui_component_assets::Assets;
 use gpui_markdown_editor::{
     Backspace, Copy, Cut, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward,
     DeleteWordForward, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, MarkdownEditor,
-    Paste, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown, ShiftEnd, ShiftEnter,
-    ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft, ShiftWordRight, Tab, Up,
-    WordLeft, WordRight, parse,
+    Paste, PastePlain, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown, ShiftEnd,
+    ShiftEnter, ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft, ShiftWordRight,
+    Tab, Up, WordLeft, WordRight, parse,
 };
 
 const DEMO_DOCUMENT: &str = "\
@@ -126,6 +126,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", Copy, None),
         KeyBinding::new("cmd-x", Cut, None),
         KeyBinding::new("cmd-v", Paste, None),
+        KeyBinding::new("cmd-shift-v", PastePlain, None),
     ]);
 }
 

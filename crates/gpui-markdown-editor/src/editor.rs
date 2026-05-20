@@ -85,6 +85,13 @@ actions!(
         Copy,
         Cut,
         Paste,
+        /// Insert clipboard content with plain-text semantics. Bytes
+        /// are spliced raw — no markdown parse, no soft-break-to-space
+        /// collapse, no block-boundary padding. Each `\n` becomes its
+        /// own paragraph break post-splice. Default macOS keybinding:
+        /// `cmd-shift-v`. The dual-keybinding convention matches what
+        /// most editors do for "paste as plain text."
+        PastePlain,
     ]
 );
 
@@ -562,6 +569,17 @@ impl MarkdownEditor {
         self.dispatch(EditorEvent::Paste { text, internal }, cx);
     }
 
+    fn paste_plain(&mut self, _: &PastePlain, _: &mut Window, cx: &mut Context<Self>) {
+        // PastePlain ignores the sentinel metadata: the user explicitly
+        // chose plain semantics, overriding any "this came from our own
+        // editor and is canonical markdown" signal.
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let text = normalize_line_endings(&text);
+        self.dispatch(EditorEvent::PastePlain { text }, cx);
+    }
+
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let offset = self.offset_for_position(event.position);
         self.is_selecting = true;
@@ -893,6 +911,7 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::paste_plain))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

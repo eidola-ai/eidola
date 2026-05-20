@@ -24,6 +24,32 @@ pub enum EditorEvent {
         text: String,
         internal: bool,
     },
+    /// Insert clipboard content with plain-text semantics. Pasted bytes
+    /// are spliced raw — no markdown parse, no soft-break collapse, no
+    /// block-boundary padding. Each `\n` becomes a paragraph break
+    /// post-splice (the chain-aware soft-break promotion in
+    /// `enforce_invariants` handles this), so a multi-line plaintext
+    /// paste like a poem or a terminal capture lands with each line
+    /// preserved as its own paragraph rather than collapsed onto one
+    /// row.
+    ///
+    /// Inside a verbatim region (code fence, block math) the plain
+    /// semantics reduce to the same behavior as a regular
+    /// [`Paste`](Self::Paste): literal `\n`s as line separators, chain
+    /// prefix injected on each one. The user explicitly chose plain
+    /// semantics; inside a fence "plain" *means* literal line
+    /// separators, which is exactly what `verbatim_paste` already
+    /// delivers.
+    ///
+    /// Markdown markers in the pasted bytes (`#`, `*`, `` ` ``, etc.)
+    /// are *not* escaped — the user asked for plain semantics, not
+    /// literal rendering. If they want a heading-like line to display
+    /// as literal text they can escape it themselves. This keeps the
+    /// transform predictable: PastePlain is the raw splice path, not
+    /// an interpretation override.
+    PastePlain {
+        text: String,
+    },
     InsertNewline,
     InsertLineBreak,
     DeleteBackward,
