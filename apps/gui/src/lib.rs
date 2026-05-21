@@ -181,6 +181,85 @@ fn install_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-alt-i", ToggleInspector, None),
         KeyBinding::new("cmd-enter", crate::chat::Send, Some("ChatView")),
     ]);
+
+    install_markdown_editor_keybindings(cx);
+}
+
+/// Keybindings for the WYSIWYG markdown composer used in the chat view.
+///
+/// All bindings are scoped to the `MarkdownEditor` key context (the
+/// `key_context` set by `gpui_markdown_editor::MarkdownEditor::render`) so
+/// they only fire when the editor — or a descendant — is in the focus
+/// chain. That keeps them from competing with `gpui_component::Input`'s
+/// own `Input`-context bindings used by settings/account fields, and lets
+/// the ChatView-context `cmd-enter → Send` binding still win for submit
+/// because the editor itself does not bind `cmd-enter` to anything.
+///
+/// Mirrors the macOS defaults documented in `apps/gui/Cargo.toml`-adjacent
+/// `bin/demo.rs` in the editor crate, minus the global `cmd-up` /
+/// `cmd-down` shortcuts that the chat reserves for future scroll-to-end
+/// navigation.
+fn install_markdown_editor_keybindings(cx: &mut App) {
+    use gpui_markdown_editor::{
+        Backspace, Copy, Cut, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward,
+        DeleteWordForward, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Paste,
+        PastePlain, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown, ShiftEnd,
+        ShiftEnter, ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft,
+        ShiftWordRight, Tab, Up, WordLeft, WordRight,
+    };
+
+    let ctx = Some("MarkdownEditor");
+    cx.bind_keys([
+        // Editing
+        KeyBinding::new("backspace", Backspace, ctx),
+        KeyBinding::new("delete", Delete, ctx),
+        KeyBinding::new("enter", Enter, ctx),
+        KeyBinding::new("shift-enter", ShiftEnter, ctx),
+        KeyBinding::new("tab", Tab, ctx),
+        KeyBinding::new("shift-tab", ShiftTab, ctx),
+        // Word / line delete (macOS standard: Option for word, Cmd for line).
+        KeyBinding::new("alt-backspace", DeleteWordBackward, ctx),
+        KeyBinding::new("alt-delete", DeleteWordForward, ctx),
+        KeyBinding::new("cmd-backspace", DeleteToLineStart, ctx),
+        KeyBinding::new("cmd-delete", DeleteToLineEnd, ctx),
+        // Caret motion
+        KeyBinding::new("left", Left, ctx),
+        KeyBinding::new("right", Right, ctx),
+        KeyBinding::new("up", Up, ctx),
+        KeyBinding::new("down", Down, ctx),
+        KeyBinding::new("shift-left", ShiftLeft, ctx),
+        KeyBinding::new("shift-right", ShiftRight, ctx),
+        KeyBinding::new("shift-up", ShiftUp, ctx),
+        KeyBinding::new("shift-down", ShiftDown, ctx),
+        KeyBinding::new("home", Home, ctx),
+        KeyBinding::new("end", End, ctx),
+        KeyBinding::new("cmd-left", Home, ctx),
+        KeyBinding::new("cmd-right", End, ctx),
+        KeyBinding::new("shift-home", ShiftHome, ctx),
+        KeyBinding::new("shift-end", ShiftEnd, ctx),
+        KeyBinding::new("cmd-shift-left", ShiftHome, ctx),
+        KeyBinding::new("cmd-shift-right", ShiftEnd, ctx),
+        KeyBinding::new("cmd-up", DocumentStart, ctx),
+        KeyBinding::new("cmd-down", DocumentEnd, ctx),
+        KeyBinding::new("cmd-shift-up", ShiftDocumentStart, ctx),
+        KeyBinding::new("cmd-shift-down", ShiftDocumentEnd, ctx),
+        // Word-granular motion (macOS standard: Option+arrows).
+        KeyBinding::new("alt-left", WordLeft, ctx),
+        KeyBinding::new("alt-right", WordRight, ctx),
+        KeyBinding::new("alt-shift-left", ShiftWordLeft, ctx),
+        KeyBinding::new("alt-shift-right", ShiftWordRight, ctx),
+        // Clipboard — scoped to the editor context so they coexist with
+        // `gpui_component::Input`'s `Input`-context bindings used by the
+        // settings/account fields. The Edit menu items remain wired to
+        // `gpui_component::input::*` actions for those inputs; menu-driven
+        // copy/cut from the composer is a known gap pending wiring of
+        // editor actions into the menu.
+        KeyBinding::new("cmd-a", SelectAll, ctx),
+        KeyBinding::new("cmd-c", Copy, ctx),
+        KeyBinding::new("cmd-x", Cut, ctx),
+        KeyBinding::new("cmd-v", Paste, ctx),
+        KeyBinding::new("cmd-shift-v", PastePlain, ctx),
+    ]);
 }
 
 fn install_action_handlers(cx: &mut App) {

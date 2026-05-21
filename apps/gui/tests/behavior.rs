@@ -16,6 +16,7 @@ use eidola_gui::core::Core;
 use eidola_gui::wallet::WalletView;
 use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
 use gpui_component::{Root, Theme};
+use gpui_markdown_editor::EditorState;
 
 // ---------------------------------------------------------------------------
 // Core fixture
@@ -160,15 +161,20 @@ fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
         cx.new(|cx| ChatView::new(core.clone(), window, cx))
     });
 
-    // Populate the prompt input the same way a user would, then dispatch the
-    // Send action through the focus handle — exercising `submit`'s real path
-    // up to the `Some(app_core) else { return }` guard. The stub core has no
-    // backend, so submit early-returns after the local state mutations,
-    // leaving `messages` and `thinking` populated.
-    let prompt_state = view.read_with(cx, |v, _| v.prompt_state_for_test());
-    cx.update_window(window, |_, window, cx| {
-        prompt_state.update(cx, |state, cx| {
-            state.set_value("hi there", window, cx);
+    // Populate the prompt editor the same way a user would, then dispatch
+    // the Send action through the focus handle — exercising `submit`'s
+    // real path up to the `Some(app_core) else { return }` guard. The
+    // stub core has no backend, so submit early-returns after the local
+    // state mutations, leaving `messages` and `streaming` populated.
+    //
+    // We write `EditorState` directly rather than driving the IME path
+    // because behavior tests don't have a real text-input chain; this is
+    // the same shortcut snapshot tests use to set up populated states.
+    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    cx.update_window(window, |_, _, cx| {
+        prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::with_markdown("hi there");
+            cx.notify();
         });
     })
     .unwrap();

@@ -2452,6 +2452,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "gpui-markdown-editor",
  "gpui_platform",
  "image",
  "tokio",

@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use eidola_app_core::{ChatStreamEvent, SpaceMessage};
 use gpui::{
-    AppContext, Context, Div, Entity, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    AppContext, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
     WeakEntity, Window, actions, div, linear_color_stop, linear_gradient, px, relative, rems,
 };
 use gpui_component::{
@@ -11,11 +11,11 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     highlighter::HighlightTheme,
-    input::{Input, InputEvent, InputState},
     label::Label,
     text::{TextView, TextViewStyle},
     v_flex,
 };
+use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownStyle};
 
 use crate::actions::CloseWindow;
 use crate::core::Core;
@@ -82,7 +82,10 @@ impl ChatMessageView {
 
 pub struct ChatView {
     core: Entity<Core>,
-    prompt_state: Entity<InputState>,
+    /// WYSIWYG markdown composer (`gpui-markdown-editor`). The user types
+    /// here in styled-markdown view; on submit we read `state.markdown` and
+    /// send the raw source upstream.
+    prompt_editor: Entity<MarkdownEditor>,
     space_id: Option<String>,
     /// Conversation history shown in the scroll view. `pub` so snapshot tests
     /// can render the view in a populated state without driving async chat.
@@ -92,7 +95,6 @@ pub struct ChatView {
     error: Option<String>,
 
     focus_handle: FocusHandle,
-    _subscriptions: Vec<Subscription>,
 }
 
 impl ChatView {
@@ -102,11 +104,12 @@ impl ChatView {
         self.focus_handle.clone()
     }
 
-    /// Test-only access to the prompt input state, for behavior tests that
-    /// want to populate it the way a typing user would.
+    /// Test-only access to the prompt editor entity, for behavior tests
+    /// that want to populate it the way a typing user would (by writing
+    /// `EditorState` directly).
     #[doc(hidden)]
-    pub fn prompt_state_for_test(&self) -> Entity<InputState> {
-        self.prompt_state.clone()
+    pub fn prompt_editor_for_test(&self) -> Entity<MarkdownEditor> {
+        self.prompt_editor.clone()
     }
 
     /// Test-only setter for snapshot tests. Wraps each `SpaceMessage`
@@ -135,58 +138,44 @@ impl ChatView {
 
 impl ChatView {
     pub fn new(core: Entity<Core>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let prompt_state = cx.new(|cx| {
-            // `auto_grow` with a deliberately huge upper bound is the way we
-            // disable the input's internal scrollbar: the bound caps `rows`
-            // (which becomes the input's auto-height), so as long as the
-            // user can't realistically type 10,000 wrapped lines in one
-            // turn, the input keeps growing with content and the *outer*
-            // scroll container handles overflow as one continuous unit.
-            // This is the journal model — the editor isn't a fixed pane,
-            // it's the page itself.
-            InputState::new(window, cx)
-                .multi_line(true)
-                .auto_grow(1, 10_000)
-                .placeholder("Begin writing…")
-        });
+        // The composer is a WYSIWYG markdown editor configured to match
+        // the chat transcript's prose typography (Newsreader 17px / 1.65×
+        // / gentle heading scale / 1.5 rem paragraph gap), so what the
+        // user types renders the same way the assistant's reply will once
+        // it lands in the transcript. The pixel-fidelity goal is spelled
+        // out in `crates/gpui-markdown-editor/AGENTS.md`.
+        let prompt_editor =
+            cx.new(|cx| MarkdownEditor::new("", window, cx).style(composer_markdown_style(cx)));
 
         let focus_handle = cx.focus_handle();
 
-        // Focus the input so the user can start typing immediately, like
-        // opening a fresh journal page. The view's `focus_handle` is still
-        // tracked on the root v_flex (behavior tests dispatch `Send`
-        // through it), but production focus lives on the input itself —
-        // which is the right cursor home for a "letter writing" feel.
-        prompt_state.update(cx, |state, cx| state.focus(window, cx));
+        // Focus the composer so the user can start typing immediately,
+        // like opening a fresh journal page. The view's `focus_handle` is
+        // still tracked on the root v_flex (behavior tests dispatch
+        // `Send` through it), but production focus lives on the editor
+        // itself — which is the right cursor home for a "letter writing"
+        // feel.
+        let editor_focus = prompt_editor.read(cx).focus_handle(cx);
+        window.focus(&editor_focus, cx);
 
-        // ⌘↩ on macOS lands inside the focused Input, which has its own
-        // `secondary-enter` binding (gpui-component/.../input/state.rs:129):
-        // it inserts a newline and emits `InputEvent::PressEnter { secondary
-        // = true }`. The ChatView keybinding `cmd-enter → Send` therefore
-        // never reaches us when the input has focus. Catch the event here
-        // and trigger submit; `submit` trims the trailing newline before
-        // forwarding the prompt upstream.
-        let subscriptions = vec![cx.subscribe_in(
-            &prompt_state,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { secondary: true }) {
-                    this.submit(&Send, window, cx);
-                }
-            },
-        )];
+        // ⌘↩ submits without a custom subscription dance: the editor's
+        // `MarkdownEditor` key context does not bind `cmd-enter`, so the
+        // ChatView-context `cmd-enter → Send` binding wins as the
+        // innermost matching entry in the focus chain and dispatches
+        // through to `Self::submit` on the v_flex root. Plain `enter`
+        // (no modifier) is bound in the editor's context and inserts
+        // a newline as normal.
 
         core.update(cx, |core, cx| core.fetch_models(cx));
 
         Self {
             core,
-            prompt_state,
+            prompt_editor,
             space_id: None,
             messages: Vec::new(),
             streaming: None,
             error: None,
             focus_handle,
-            _subscriptions: subscriptions,
         }
     }
 
@@ -244,18 +233,19 @@ impl ChatView {
         }
 
         let prompt = self
-            .prompt_state
+            .prompt_editor
             .read(cx)
-            .value()
-            .to_string()
+            .state
+            .markdown
             .trim()
             .to_string();
         if prompt.is_empty() {
             return;
         }
 
-        self.prompt_state.update(cx, |state, cx| {
-            state.set_value("", window, cx);
+        self.prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::default();
+            cx.notify();
         });
         self.messages.push(ChatMessageView::new(SpaceMessage {
             role: "user".to_string(),
@@ -584,19 +574,26 @@ impl Render for ChatView {
             );
         }
 
-        // The composing input lives at the foot of the scroll, styled into
-        // the same prose column the body uses, with no border/background
-        // (`appearance(false)`) so it reads as a continuation of the page
-        // rather than a separate chrome element. A "You" chapter delim
-        // sits above it whenever there's preceding content, mirroring the
-        // way earlier turns are introduced; on a fresh, empty page the
-        // delim is omitted so the cursor sits cleanly at the top.
+        // The composing editor lives at the foot of the scroll, styled
+        // into the same prose column the body uses so it reads as a
+        // continuation of the page rather than a separate chrome
+        // element. A "You" chapter delim sits above it whenever there's
+        // preceding content, mirroring the way earlier turns are
+        // introduced; on a fresh, empty page the delim is omitted so the
+        // cursor sits cleanly at the top.
         //
-        // The input grows freely with content via `auto_grow(1, 10_000)`
-        // — the cap is large enough that no realistic prompt hits it, so
-        // the input's internal scrollbar never engages and the outer
-        // `overflow_y_scroll` div handles all of it (input + preceding
-        // messages) as one continuous unit.
+        // The editor renders one gpui block per markdown block, so it
+        // grows naturally with content. The outer `overflow_y_scroll`
+        // div handles all of it (editor + preceding messages) as one
+        // continuous unit — the editor itself does not scroll
+        // internally.
+        //
+        // `min_h(...)` keeps the empty editor clickable even when its
+        // markdown is "" (the render pipeline emits no blocks in that
+        // state, so without a floor the editor would collapse to zero
+        // height and the user couldn't click back into it after losing
+        // focus). The floor matches one body line at the prose line-
+        // height ratio so it doesn't visually grow once content arrives.
         let has_preceding =
             !self.messages.is_empty() || self.streaming.is_some() || self.error.is_some();
         if has_preceding {
@@ -606,17 +603,13 @@ impl Render for ChatView {
                 theme.muted_foreground,
             ));
         }
+        let composer_min_h = PROSE_FONT_SIZE * PROSE_LINE_HEIGHT;
         messages_col = messages_col.child(
-            div().w_full().px_5().child(
+            div().w_full().px_5().pb(composer_pb).child(
                 prose_row().child(
-                    prose().child(
-                        Input::new(&self.prompt_state)
-                            .appearance(false)
-                            .text_size(PROSE_FONT_SIZE)
-                            .line_height(relative(PROSE_LINE_HEIGHT))
-                            .p_0()
-                            .pb(composer_pb),
-                    ),
+                    prose()
+                        .min_h(composer_min_h)
+                        .child(self.prompt_editor.clone()),
                 ),
             ),
         );
@@ -768,6 +761,27 @@ fn chapter_delim(
             )
             .child(div().h(px(1.)).flex_1().bg(rule_color)),
     )
+}
+
+/// `MarkdownStyle` for the WYSIWYG composer. Shares the prose typography
+/// the transcript uses (Newsreader 17px / 1.65× / gentle heading scale /
+/// 1.5 rem paragraph gap) so what the user types reads pixel-for-pixel
+/// like the assistant's reply will once it lands above as a finalized
+/// message. Theme-derived colors (text, delimiter, background, caret,
+/// selection) are refreshed inside the editor's `Render`, so we only
+/// need to override the typography knobs here.
+fn composer_markdown_style(cx: &gpui::App) -> MarkdownStyle {
+    MarkdownStyle::from_theme(cx)
+        .font_size(PROSE_FONT_SIZE)
+        .line_height(rems(PROSE_LINE_HEIGHT))
+        .paragraph_gap(rems(1.5))
+        .heading_base_font_size(PROSE_FONT_SIZE)
+        .heading_font_size(|level, base| match level {
+            1 => base * 1.5,
+            2 => base * 1.25,
+            3 => base * 1.125,
+            _ => base,
+        })
 }
 
 /// `TextViewStyle` for chat message bodies. Settings:

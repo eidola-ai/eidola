@@ -24,6 +24,7 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
 
 eidola-app-core = { path = "../../crates/eidola-app-core" }
+gpui-markdown-editor = { path = "../../crates/gpui-markdown-editor" }
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
