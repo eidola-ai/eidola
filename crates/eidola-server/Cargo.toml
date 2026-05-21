@@ -40,7 +40,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OpenTelemetry (enabled when OTEL_EXPORTER_OTLP_ENDPOINT is set)
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
 tracing-opentelemetry = "0.32"
 opentelemetry-appender-tracing = "0.31"
 # opentelemetry-otlp pulls in reqwest 0.12 for its HTTP exporter. That transitive
