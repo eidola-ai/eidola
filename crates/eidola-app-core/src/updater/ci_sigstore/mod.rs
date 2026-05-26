@@ -13,13 +13,27 @@
 //!   `inclusionProof` and `inclusionPromise.signedEntryTimestamp` (the
 //!   SET, a Rekor-key-signed assertion about the entry).
 //!
-//! For step 4c.1 (this file), we **parse the bundle into typed structs
-//! and run structural checks** — every expected field present, sizes
-//! plausible, embedded log ID parseable. Cryptographic verification
-//! (chain walk, signature verify, SCT verify, SET verify, inclusion
-//! proof) is stubbed with explicit `TODO` markers; step 4c.2 fills it in
-//! using `x509-cert` + `p256` + sha2 + a small RFC 6962 Merkle proof
-//! checker.
+//! # KNOWN GAPS — deferred defense-in-depth
+//!
+//! Two layers of cryptographic verification that *should* eventually
+//! ship are intentionally **not** implemented today; the verifier is
+//! still load-bearing without them, but they tighten the screws.
+//!
+//! 1. **Signed Certificate Timestamp (SCT) verification.** The Fulcio
+//!    leaf cert embeds an SCT proving the cert was logged in a public
+//!    Certificate Transparency log. Verifying it would catch Fulcio
+//!    misissuance (a malicious or compromised Fulcio issuing certs for
+//!    identities it shouldn't). Our OIDC-identity match + Fulcio chain
+//!    walk make this defense-in-depth, not load-bearing.
+//!
+//! 2. **Rekor checkpoint signature verification.** The inclusion proof
+//!    we compute roots out to `rootHash`; checking the checkpoint
+//!    signature would prove that `rootHash` is the log's *publicly
+//!    announced* root, not a side-tree the log forked just for us. The
+//!    SET already requires the Rekor key to vouch for the entry; the
+//!    checkpoint adds independence-from-private-forks. Future work.
+//!
+//! Both are tracked in `releases/TRUST-ROOT.md` under "Known gaps."
 
 use serde::Deserialize;
 

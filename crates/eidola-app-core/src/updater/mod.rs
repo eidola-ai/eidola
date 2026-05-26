@@ -26,6 +26,8 @@ use crate::error::AppError;
 use crate::trust_root;
 
 pub mod ci_sigstore;
+pub mod human_attestation;
+mod merkle;
 pub mod trust;
 
 // ---------------------------------------------------------------------------
@@ -170,18 +172,51 @@ pub async fn check_for_update(
     .await?;
     let _verified_ci = ci_sigstore::verify_ci_signature(&manifest_bytes, &bundle_bytes, &trust)?;
 
-    // TODO (4d): verify each human attestation (SSH + rekor proof).
+    // ── verify each human attestation ────────────────────────────────────
+    let mut verified_attestations: Vec<human_attestation::VerifiedHumanAttestation> =
+        Vec::with_capacity(release.human_attestations.len());
+    for human in &release.human_attestations {
+        let attestation_bytes = fetch_url(
+            &client,
+            &human.url,
+            &format!("attestation-{}.json", human.attestant_id),
+        )
+        .await?;
+        let bundle_bytes = fetch_url(
+            &client,
+            &human.bundle_url,
+            &format!("attestation-{}.bundle.json", human.attestant_id),
+        )
+        .await?;
+        let verified =
+            human_attestation::verify_human_attestation(&attestation_bytes, &bundle_bytes, &trust)?;
+        verified_attestations.push(verified);
+    }
+
+    // Policy: minimum number of independently-verified attestations.
+    if (verified_attestations.len() as u32) < release.policy.min_human_attestations {
+        return Err(AppError::Update {
+            message: format!(
+                "release verified only {} human attestation(s); policy requires ≥{}",
+                verified_attestations.len(),
+                release.policy.min_human_attestations,
+            ),
+        });
+    }
+
     // TODO (4e): render templates and require character-for-character
     //            equality with the signed `statement`; cross-check resolved
-    //            values against release.git_commit / .previous_release.git_commit;
-    //            policy check on min_human_attestations.
+    //            values against release.git_commit / .previous_release.git_commit.
     // TODO (4e): verify each artifact hash inside artifact-manifest.json.
 
     Err(AppError::Update {
         message: format!(
-            "release {} ({}) passes discover/continuity/CI-structural; human-attestation + \
-             template-equality + artifact-hash stages are not yet implemented in this build",
-            release.git_tag, release.git_commit,
+            "release {} ({}) passes discover/continuity/CI-signature/human-signature ({} \
+             attestation(s)); template-equality + artifact-hash stages are not yet implemented \
+             in this build",
+            release.git_tag,
+            release.git_commit,
+            verified_attestations.len(),
         ),
     })
 }

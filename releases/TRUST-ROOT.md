@@ -298,6 +298,22 @@ enclave measurement. Changing either changes every future URL, so:
    deployment must serve under (configure Tinfoil's container DNS
    accordingly before publishing the release).
 
+## Known gaps
+
+Two cryptographic checks on the CI Sigstore-bundle path are intentionally
+**not** implemented today. The verifier is still load-bearing without
+them, but they each close one specific class of attack and should land
+as follow-up work.
+
+| Gap | What it would catch | Why it's deferred |
+| --- | --- | --- |
+| **SCT (Signed Certificate Timestamp) verification** in the Fulcio leaf cert | A malicious or compromised Fulcio issuing certs for identities it shouldn't — the SCT proves the cert was logged in a public CT log | The OIDC-identity match + Fulcio chain walk are the primary binding; this is defense-in-depth |
+| **Rekor checkpoint signature** verification | The Rekor instance forking a side-tree just for us (the inclusion proof we compute is mathematically valid but roots to a tree the public never sees) | The SET already requires the Rekor key to vouch for the entry; checkpoint adds independence-from-private-forks |
+
+Both are noted at the top of
+[`crates/eidola-app-core/src/updater/ci_sigstore/mod.rs`](../crates/eidola-app-core/src/updater/ci_sigstore/mod.rs)
+and `rekor.rs` so anyone reading the verifier code sees them up front.
+
 ## Acknowledgements
 
 `sigstore-trusted-root.json` is a verbatim copy of the upstream Sigstore

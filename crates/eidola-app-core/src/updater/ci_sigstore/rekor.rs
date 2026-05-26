@@ -21,18 +21,21 @@
 //! the same blob+signature+pubkey the rest of the bundle does — i.e. the
 //! transparency log entry is about *our* signature, not some other one.
 //!
-//! Note: we don't verify the **checkpoint** signature in this v1. The
-//! checkpoint is rekor's signed tree-head and adds defense-in-depth
-//! (proves the root we just computed is the tree's published root, not
-//! a tree the log forked just for us). It's a follow-up; the SET +
-//! inclusion proof gate already requires the rekor key to vouch for the
-//! entry.
+//! # KNOWN GAP — checkpoint signature verification deferred
+//!
+//! We don't verify the **checkpoint** signature in this v1. The
+//! checkpoint is rekor's signed tree-head and would prove that
+//! `rootHash` is the log's *publicly announced* root, not a side-tree
+//! the log forked just for us. The SET already requires the Rekor key
+//! to vouch for the entry; the checkpoint adds defense-in-depth.
+//! Tracked in `releases/TRUST-ROOT.md` under "Known gaps."
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use signature::hazmat::PrehashVerifier;
 
 use crate::error::AppError;
+use crate::updater::merkle;
 use crate::updater::trust::{KeyDetails, RekorKey};
 
 /// `hashedrekord` v0.0.1 body shape — the canonical entry rekor stores.
@@ -203,18 +206,14 @@ pub fn verify_rekor_entry(
     verify_rekor_signature(key, signed_payload.as_bytes(), set_bytes)?;
 
     // ── 3. Merkle inclusion proof. ────────────────────────────────────
-    let leaf_hash = hash_leaf(canonical_body);
-    let computed_root =
-        compute_root_from_proof(proof_leaf_index, &leaf_hash, tree_size, proof_hashes)?;
-    if computed_root != *proof_root_hash {
-        return Err(AppError::Update {
-            message: format!(
-                "rekor inclusion proof's recomputed root `{}` ≠ declared rootHash `{}`",
-                hex_encode(&computed_root),
-                hex_encode(proof_root_hash)
-            ),
-        });
-    }
+    let leaf_hash = merkle::hash_leaf(canonical_body);
+    merkle::verify_inclusion_proof(
+        proof_leaf_index,
+        &leaf_hash,
+        tree_size,
+        proof_hashes,
+        proof_root_hash,
+    )?;
 
     Ok(VerifiedRekorEntry { log_index })
 }
@@ -275,90 +274,6 @@ fn verify_rekor_signature(
                 .into(),
         }),
     }
-}
-
-// ---------------------------------------------------------------------------
-// RFC 6962 Merkle inclusion proof verification
-//
-// The chain_inner / chain_border / decomp_inclusion_proof / inner_proof_size
-// algorithm below is adapted from sigstore-rs (Apache 2.0), originally from
-// transparency-dev's Merkle implementation. The trimmed version here only
-// supports inclusion proofs (we don't need consistency proofs).
-//
-// Reference:
-//   https://github.com/sigstore/sigstore-rs/blob/main/src/crypto/merkle/proof_verification.rs
-// ---------------------------------------------------------------------------
-
-fn hash_leaf(leaf: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update([0x00]);
-    h.update(leaf);
-    h.finalize().into()
-}
-
-fn hash_children(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update([0x01]);
-    h.update(left);
-    h.update(right);
-    h.finalize().into()
-}
-
-fn compute_root_from_proof(
-    index: u64,
-    leaf_hash: &[u8; 32],
-    tree_size: u64,
-    proof_hashes: &[[u8; 32]],
-) -> Result<[u8; 32], AppError> {
-    if index >= tree_size {
-        return Err(AppError::Update {
-            message: format!("inclusion proof: leaf index {index} >= tree size {tree_size}"),
-        });
-    }
-    let (inner, border) = decomp_inclusion_proof(index, tree_size);
-    let expected_len = inner + border;
-    if proof_hashes.len() as u64 != expected_len {
-        return Err(AppError::Update {
-            message: format!(
-                "inclusion proof has {} hashes, expected {}",
-                proof_hashes.len(),
-                expected_len
-            ),
-        });
-    }
-    let after_inner = chain_inner(*leaf_hash, &proof_hashes[..inner as usize], index);
-    Ok(chain_border_right(
-        after_inner,
-        &proof_hashes[inner as usize..],
-    ))
-}
-
-fn chain_inner(mut seed: [u8; 32], proof_hashes: &[[u8; 32]], index: u64) -> [u8; 32] {
-    for (i, h) in proof_hashes.iter().enumerate() {
-        seed = if ((index >> i) & 1) == 0 {
-            hash_children(&seed, h)
-        } else {
-            hash_children(h, &seed)
-        };
-    }
-    seed
-}
-
-fn chain_border_right(mut seed: [u8; 32], proof_hashes: &[[u8; 32]]) -> [u8; 32] {
-    for h in proof_hashes {
-        seed = hash_children(h, &seed);
-    }
-    seed
-}
-
-fn decomp_inclusion_proof(index: u64, tree_size: u64) -> (u64, u64) {
-    let inner = inner_proof_size(index, tree_size);
-    let border = (index >> inner).count_ones() as u64;
-    (inner, border)
-}
-
-fn inner_proof_size(index: u64, tree_size: u64) -> u64 {
-    u64::BITS as u64 - ((index ^ (tree_size - 1)).leading_zeros() as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -424,55 +339,9 @@ fn hex_encode(b: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// RFC 6962 test vectors lifted from transparency-dev's merkle tests.
-    #[test]
-    fn rfc6962_leaf_hash_empty() {
-        let got = hash_leaf(b"");
-        // sha256(0x00 || "") = sha256([0x00])
-        let expected = {
-            let mut h = Sha256::new();
-            h.update([0x00]);
-            let d: [u8; 32] = h.finalize().into();
-            d
-        };
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn inclusion_proof_single_leaf_tree() {
-        // tree_size=1, index=0, no proof hashes needed → root == leaf hash.
-        let leaf = hash_leaf(b"hello");
-        let root = compute_root_from_proof(0, &leaf, 1, &[]).unwrap();
-        assert_eq!(root, leaf);
-    }
-
-    #[test]
-    fn inclusion_proof_two_leaf_tree() {
-        // tree_size=2: leaf 0 path is one sibling (leaf 1's hash).
-        let l0 = hash_leaf(b"a");
-        let l1 = hash_leaf(b"b");
-        let root = hash_children(&l0, &l1);
-
-        let computed = compute_root_from_proof(0, &l0, 2, &[l1]).unwrap();
-        assert_eq!(computed, root);
-
-        let computed = compute_root_from_proof(1, &l1, 2, &[l0]).unwrap();
-        assert_eq!(computed, root);
-    }
-
-    #[test]
-    fn inclusion_proof_rejects_wrong_proof_length() {
-        let l0 = hash_leaf(b"a");
-        let err = compute_root_from_proof(0, &l0, 2, &[]).unwrap_err();
-        assert!(format!("{err}").contains("inclusion proof has"));
-    }
-
-    #[test]
-    fn inclusion_proof_rejects_index_out_of_range() {
-        let l0 = hash_leaf(b"a");
-        let err = compute_root_from_proof(5, &l0, 2, &[]).unwrap_err();
-        assert!(format!("{err}").contains("leaf index"));
-    }
+    // Merkle proof tests live in `super::super::merkle` now; the proof
+    // verification is exercised end-to-end through this module via the
+    // `verify_inclusion_proof` call inside `verify_rekor_entry`.
 
     #[test]
     fn hex_round_trip() {
