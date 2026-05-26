@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": 1,
   "attestant_statement_template": {
     "template": "I, {name}, holder of the private key with fingerprint sha256:{key_fingerprint_sha256}, affirm under penalty of perjury under the laws of the jurisdiction of {jurisdiction} that the following claims are true and correct to the best of my knowledge.",
     "sources": {

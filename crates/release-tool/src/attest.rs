@@ -43,7 +43,7 @@ pub fn run(args: Args) -> Result<()> {
     let trust = trust::load(&args.workspace_root)?;
     let templates_path = args
         .workspace_root
-        .join("releases/schema/attestation-templates-v1.0.0.json");
+        .join("releases/schema/attestation-templates-v1.json");
     let templates = eidola_attestation::load_from_path(&templates_path)?;
 
     validate_attestant_id(&args.attestant_id)?;
@@ -112,7 +112,7 @@ pub fn run(args: Args) -> Result<()> {
     // Build the bare attestation skeleton. We splice in attestant_statement
     // + claims after the engineer affirms them.
     let mut attestation = serde_json::json!({
-        "schema_version": "1.0.0",
+        "schema_version": 1,
         "release_version": release_version,
         "git_commit": git_commit,
         "previous_release_git_commit": previous_release_git_commit,
@@ -220,7 +220,7 @@ pub fn run(args: Args) -> Result<()> {
     // entry body holds the SSH signature + pubkey + signed file hash, plus
     // the inclusion proof + SignedEntryTimestamp.
     let bundle = serde_json::json!({
-        "schema_version": "1.0.0",
+        "schema_version": 1,
         "rekor_log_entry": rekor_entry.raw,
     });
     let bundle_serialized = serde_json::to_string_pretty(&bundle)? + "\n";
@@ -241,7 +241,7 @@ pub fn run(args: Args) -> Result<()> {
     let att_bundle_url = asset_url(&assets, &bundle_filename)?;
 
     let release_json = serde_json::json!({
-        "schema_version": "1.0.0",
+        "schema_version": 1,
         "version": release_version,
         "git_commit": git_commit,
         "git_tag": args.tag,

@@ -63,10 +63,10 @@ Generated into the client at compile time by
 | `TRUSTED_ATTESTANT_FINGERPRINTS`        | `trust-constants.json`                              | `sha256(OpenSSH wire-format pubkey)` in hex, for each authorized human-attestant key               |
 | `EXPECTED_CI_IDENTITY_PATTERN`          | `trust-constants.json`                              | Fulcio cert SAN pattern the release-signing workflow's OIDC identity must match                    |
 | `EXPECTED_CI_ISSUER`                    | `trust-constants.json`                              | OIDC issuer (`https://token.actions.githubusercontent.com`)                                        |
-| `SUPPORTED_RELEASE_SCHEMA_VERSIONS`     | `trust-constants.json`                              | Versions of `release.json` this client will parse                                                  |
-| `SUPPORTED_ATTESTATION_SCHEMA_VERSIONS` | `trust-constants.json`                              | Versions of `attestation.json` this client will parse                                              |
+| `SUPPORTED_RELEASE_SCHEMA_VERSIONS`     | `trust-constants.json`                              | Integer `schema_version` values of `release.json` this client will parse                           |
+| `SUPPORTED_ATTESTATION_SCHEMA_VERSIONS` | `trust-constants.json`                              | Integer `schema_version` values of `attestation.json` this client will parse                       |
 | `UPDATE_DISCOVERY_URL`                  | `trust-constants.json`                              | Where to look for the next release (GitHub releases API)                                           |
-| `ATTESTATION_TEMPLATES_JSON`            | `releases/schema/attestation-templates-v1.0.0.json` | Pinned claim templates the verifier re-renders during equality checks                              |
+| `ATTESTATION_TEMPLATES_JSON`            | `releases/schema/attestation-templates-v1.json`     | Pinned claim templates the verifier re-renders during equality checks                              |
 | `SIGSTORE_TRUSTED_ROOT_JSON`            | `releases/trust/sigstore-trusted-root.json`         | Pinned Sigstore tlog / Fulcio / CT log keys with validity windows                                  |
 
 `config.toml` overrides (`base_url`, `trusted_measurements`) take precedence
@@ -75,17 +75,24 @@ enclave. With overrides unset, the pin is what gets used.
 
 ## Releases
 
-Each JSON document carries an explicit `schema_version` (string, semver
-form). The supported version sets are pinned in `trust-constants.json` so
-the verifier rejects any document outside the set; bumping a schema is
-itself a release-gated trust event.
+Each JSON document carries an explicit `schema_version` (positive
+integer). The supported version sets are pinned in `trust-constants.json`
+so the verifier rejects any document outside the set; bumping a schema
+is itself a release-gated trust event. **There is no semver-style
+"backwards-compatible minor bump"**: each integer denotes a distinct,
+all-or-nothing shape that a verifier either understands fully or
+refuses outright. This deliberately avoids the security weakening that
+would happen if old clients silently tolerated a new claim or field
+without enforcing it. (Product versions — `release.version`,
+`release.previous_release.version` — remain semver strings, since those
+*do* benefit from ordering and matching the Rust/Cargo ecosystem.)
 
 | Document                | Schema                                                | Notes                                                                       |
 | ----------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------- |
-| `artifact-manifest.json` | (no JSON Schema file; format owned by `scripts/artifact-manifest.sh`) | `schema_version: "1.0.0"`. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). |
-| `release.json`          | `releases/schema/release-v1.0.0.schema.json`          | Unsigned index; cross-checked via referenced documents (see caveat below)   |
-| `attestation.json`      | `releases/schema/attestation-v1.0.0.schema.json`      | Signed by the attestant via SSH (`ssh-keygen -Y sign`), logged to Rekor as a `hashedrekord` |
-| Templates               | `releases/schema/attestation-templates-v1.0.0.json`   | Source of truth for both the release-tool and the verifier's equality check |
+| `artifact-manifest.json` | (no JSON Schema file; format owned by `scripts/artifact-manifest.sh`) | `schema_version: 1`. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). |
+| `release.json`          | `releases/schema/release-v1.schema.json`              | Unsigned index; cross-checked via referenced documents (see caveat below)   |
+| `attestation.json`      | `releases/schema/attestation-v1.schema.json`          | Signed by the attestant via SSH (`ssh-keygen -Y sign`), logged to Rekor as a `hashedrekord` |
+| Templates               | `releases/schema/attestation-templates-v1.json`       | Source of truth for both the release-tool and the verifier's equality check |
 
 ### `release.json` carries no hashes
 
@@ -135,7 +142,7 @@ verification code between the two paths.
 ### Attestation templates: flat snake_case keys
 
 Both the `claims` object in `attestation.json` and the `claims` object in
-`attestation-templates-v1.0.0.json` use a flat set of snake_case keys
+`attestation-templates-v1.json` use a flat set of snake_case keys
 (`no_compulsion`, `manifest_reproduced`, …). The verifier walks every
 template entry, renders it from the substitution `sources`, and rejects
 unless the matching claim's `statement` is character-for-character equal.
@@ -179,9 +186,9 @@ a real-but-stale release. Mitigations for v1:
 ```
 releases/
   schema/
-    release-v1.0.0.schema.json
-    attestation-v1.0.0.schema.json
-    attestation-templates-v1.0.0.json     # pinned claim templates
+    release-v1.schema.json
+    attestation-v1.schema.json
+    attestation-templates-v1.json         # pinned claim templates
   trust/
     trust-constants.json                  # non-derivable trust values
     sigstore-trusted-root.json            # upstream Sigstore TrustedRoot snapshot
@@ -245,19 +252,20 @@ as a coordinated rotation:
 
 ### Rotating schema versions
 
-Any change to `attestation-templates-v1.0.0.json`, the release schema, or
-the attestation schema requires bumping `schema_version`:
+Any change to `attestation-templates-v1.json`, the release schema, or
+the attestation schema requires bumping `schema_version` to the next
+integer (never a "patch" or "minor" — every change is fully breaking by
+contract):
 
-1. Copy `attestation-templates-v1.0.0.json` →
-   `attestation-templates-v1.1.0.json`, make the change. Same for the
-   companion schema file if the structural shape changes.
-2. Update `trust-constants.json`:
-   `supported_attestation_schema_versions` lists both `"1.0.0"` and
-   `"1.1.0"`.
-3. Cut a release. Clients now accept both. Engineer continues signing
-   `1.0.0` attestations.
+1. Copy `attestation-templates-v1.json` → `attestation-templates-v2.json`,
+   make the change. Same for the companion schema file if the structural
+   shape changes.
+2. Update `trust-constants.json`: `supported_attestation_schema_versions`
+   lists both `1` and `2`.
+3. Cut a release. Clients now accept both versions. Engineer continues
+   signing schema-`1` attestations.
 4. Once in-the-wild clients have updated, cut another release where the
-   engineer signs `1.1.0` attestations. `1.0.0` can be removed from the
+   engineer signs schema-`2` attestations. `1` can be removed from the
    supported list in a later release.
 
 This is the mechanism that prevents a coerced release from silently

@@ -14,14 +14,14 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct TrustConstants {
-    pub schema_version: String,
+    pub schema_version: u32,
     pub trusted_attestant_fingerprints: Vec<String>,
     pub expected_ci_identity_pattern: String,
     pub expected_ci_issuer: String,
     #[allow(dead_code)]
-    pub supported_release_schema_versions: Vec<String>,
+    pub supported_release_schema_versions: Vec<u32>,
     #[allow(dead_code)]
-    pub supported_attestation_schema_versions: Vec<String>,
+    pub supported_attestation_schema_versions: Vec<u32>,
     #[allow(dead_code)]
     pub update_discovery_url: String,
     #[allow(dead_code)]
@@ -35,9 +35,9 @@ pub fn load(workspace_root: &Path) -> Result<TrustConstants> {
     let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let parsed: TrustConstants =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
-    if parsed.schema_version != "1.0.0" {
+    if parsed.schema_version != 1 {
         anyhow::bail!(
-            "trust-constants.json schema_version `{}` not supported by this release-tool (expected `1.0.0`)",
+            "trust-constants.json schema_version `{}` not supported by this release-tool (expected `1`)",
             parsed.schema_version
         );
     }

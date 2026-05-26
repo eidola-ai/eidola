@@ -2306,7 +2306,7 @@ pub fn iso_to_ms(s: &str) -> Result<i64, AppError> {
     Ok(secs * 1000)
 }
 
-fn load_native_root_store() -> rustls::RootCertStore {
+pub(crate) fn load_native_root_store() -> rustls::RootCertStore {
     let mut store = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     for cert in native.certs {

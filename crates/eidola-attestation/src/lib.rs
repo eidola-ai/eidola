@@ -3,12 +3,12 @@
 //! Both the release-tool (signing side) and the client's updater
 //! (verifier side) MUST agree on rendering output character-for-character.
 //! This crate is the single source of truth; the on-disk templates file
-//! [`releases/schema/attestation-templates-v1.0.0.json`] is just data
+//! [`releases/schema/attestation-templates-v1.json`] is just data
 //! consumed through these functions.
 //!
 //! ## Loading
 //!
-//! - Release-tool reads `releases/schema/attestation-templates-v1.0.0.json`
+//! - Release-tool reads `releases/schema/attestation-templates-v1.json`
 //!   from the working tree at sign time → use [`load_from_path`].
 //! - Client verifier reads the build-time-embedded
 //!   `eidola_app_core::trust_root::ATTESTATION_TEMPLATES_JSON` constant →
@@ -34,11 +34,11 @@ use serde_json::Value;
 /// The single schema version this crate understands. Bumping templates
 /// (adding/removing/changing a claim) requires shipping a new version
 /// alongside the old, then retiring the old over an overlap window.
-pub const SUPPORTED_SCHEMA_VERSION: &str = "1.0.0";
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
 pub struct Templates {
-    pub schema_version: String,
+    pub schema_version: u32,
     pub attestant_statement_template: TemplateEntry,
     pub claims: BTreeMap<String, ClaimTemplate>,
 }
@@ -235,19 +235,19 @@ mod tests {
 
     #[test]
     fn schema_version_mismatch_rejected() {
-        let json = r#"{"schema_version":"2.0.0","attestant_statement_template":{"template":"","sources":{}},"claims":{}}"#;
+        let json = r#"{"schema_version":99,"attestant_statement_template":{"template":"","sources":{}},"claims":{}}"#;
         assert!(load_from_str(json).is_err());
     }
 
     #[test]
     fn parses_minimal_valid_templates() {
         let json = r#"{
-            "schema_version": "1.0.0",
+            "schema_version": 1,
             "attestant_statement_template": {"template": "I", "sources": {}},
             "claims": {}
         }"#;
         let t = load_from_str(json).unwrap();
-        assert_eq!(t.schema_version, "1.0.0");
+        assert_eq!(t.schema_version, 1);
         assert!(t.claims.is_empty());
     }
 }

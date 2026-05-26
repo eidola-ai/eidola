@@ -8,7 +8,7 @@
 //!    the diff against the prior release tag for human review.
 //!
 //! 2. `release-tool attest <tag>` — interactively walks every claim in
-//!    `attestation-templates-v1.0.0.json`, rendering each from the engineer's
+//!    `attestation-templates-v1.json`, rendering each from the engineer's
 //!    inputs. Each claim requires typing the word `yes` to affirm; anything
 //!    else aborts. On full affirmation, signs the attestation file with the
 //!    engineer's hardware-backed SSH key via `ssh-keygen -Y sign`, posts the

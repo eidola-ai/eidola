@@ -2339,6 +2339,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-rustcrypto",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",

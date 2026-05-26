@@ -1,12 +1,12 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": 1,
   "trusted_attestant_fingerprints": [
     "8a43fac439b3509114063274268dd1b3e4cd9616709c6130ebea71d931bc28e6"
   ],
   "expected_ci_identity_pattern": "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*",
   "expected_ci_issuer": "https://token.actions.githubusercontent.com",
-  "supported_release_schema_versions": ["1.0.0"],
-  "supported_attestation_schema_versions": ["1.0.0"],
+  "supported_release_schema_versions": [1],
+  "supported_attestation_schema_versions": [1],
   "update_discovery_url": "https://api.github.com/repos/eidola-ai/eidola/releases/latest",
   "server_url_template": "https://gateway-{hash}.eidola.containers.tinfoil.sh",
   "server_url_hash_length": 16

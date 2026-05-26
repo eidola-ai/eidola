@@ -354,7 +354,7 @@ print_oci_manifest() {
     --arg cli "$cli" \
     --arg postgres "$postgres" \
     '{
-      schema_version: "1.0.0",
+      schema_version: 1,
       artifacts: {
         "eidola-server": { type: "oci", platform: "linux/amd64", digest: $server },
         "eidola-cli": { type: "oci", platform: "linux/amd64", digest: $cli },
@@ -417,7 +417,7 @@ print_macos_manifest() {
   jq -n \
     --arg cli_hash "$cli_hash" \
     '{
-      schema_version: "1.0.0",
+      schema_version: 1,
       artifacts: {
         "eidola-cli-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $cli_hash }
       }
@@ -452,7 +452,7 @@ merge_partials() {
   local merged
   merged="$(jq -s '
     {
-      schema_version: "1.0.0",
+      schema_version: 1,
       artifacts: (reduce .[] as $partial ({}; . + ($partial.artifacts // {})))
     }
   ' "${PARTIAL_FILES[@]}")"
@@ -506,7 +506,7 @@ verify_oci_manifest() {
   actual_norm="$(merge_partials | jq -cS .)"
   committed_subset="$(jq -cS '
     {
-      schema_version: "1.0.0",
+      schema_version: 1,
       artifacts: {
         "eidola-server": .artifacts["eidola-server"],
         "eidola-cli": .artifacts["eidola-cli"],
