@@ -154,10 +154,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
         None => {
             let state = core.config_state();
             println!("config path: {:?}", config::default_config_path());
-            println!(
-                "base_url: {}",
-                state.base_url.as_deref().unwrap_or("<not set>")
-            );
+            println!("base_url: {}", state.base_url);
             println!(
                 "account_id: {}",
                 if state.has_account {
@@ -174,15 +171,11 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     "<not set>"
                 }
             );
-            if state.trusted_measurements.is_empty() {
-                println!("trusted_measurements: <none> (attestation disabled)");
-            } else {
-                println!("trusted_measurements:");
-                for m in &state.trusted_measurements {
-                    println!("  - snp = {}", m.snp);
-                    println!("    tdx.rtmr1 = {}", m.tdx_rtmr1);
-                    println!("    tdx.rtmr2 = {}", m.tdx_rtmr2);
-                }
+            println!("trusted_measurements:");
+            for m in &state.trusted_measurements {
+                println!("  - snp = {}", m.snp);
+                println!("    tdx.rtmr1 = {}", m.tdx_rtmr1);
+                println!("    tdx.rtmr2 = {}", m.tdx_rtmr2);
             }
             println!(
                 "hardware_root_ca: {}",

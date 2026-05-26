@@ -1370,9 +1370,13 @@ public func FfiConverterTypeChatResult_lower(_ value: ChatResult) -> RustBuffer 
 
 /**
  * Snapshot of the current config for display.
+ *
+ * `base_url` and `trusted_measurements` are the *resolved* values: the
+ * user's override if set, the trust-root pin otherwise. UI displays these
+ * directly without needing to know which source they came from.
  */
 public struct ConfigState: Equatable, Hashable {
-  public var baseUrl: String?
+  public var baseUrl: String
   public var hasAccount: Bool
   public var hasAccountSecret: Bool
   public var domainSeparator: String
@@ -1384,7 +1388,7 @@ public struct ConfigState: Equatable, Hashable {
   // Default memberwise initializers are never public by default, so we
   // declare one manually.
   public init(
-    baseUrl: String?, hasAccount: Bool, hasAccountSecret: Bool, domainSeparator: String,
+    baseUrl: String, hasAccount: Bool, hasAccountSecret: Bool, domainSeparator: String,
     trustedMeasurements: [MeasurementInfo], hasHardwareRootCa: Bool,
     hasHardwareIntermediateCa: Bool, attestationUrl: String?
   ) {
@@ -1411,7 +1415,7 @@ public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
   public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConfigState {
     return
       try ConfigState(
-        baseUrl: FfiConverterOptionString.read(from: &buf),
+        baseUrl: FfiConverterString.read(from: &buf),
         hasAccount: FfiConverterBool.read(from: &buf),
         hasAccountSecret: FfiConverterBool.read(from: &buf),
         domainSeparator: FfiConverterString.read(from: &buf),
@@ -1423,7 +1427,7 @@ public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
   }
 
   public static func write(_ value: ConfigState, into buf: inout [UInt8]) {
-    FfiConverterOptionString.write(value.baseUrl, into: &buf)
+    FfiConverterString.write(value.baseUrl, into: &buf)
     FfiConverterBool.write(value.hasAccount, into: &buf)
     FfiConverterBool.write(value.hasAccountSecret, into: &buf)
     FfiConverterString.write(value.domainSeparator, into: &buf)

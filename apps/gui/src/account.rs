@@ -50,7 +50,6 @@ impl Render for AccountView {
         let core_ref = self.core.read(cx);
         let state = core_ref.config_state.as_ref();
         let has_account = state.map(|s| s.has_account).unwrap_or(false);
-        let base_url_set = state.map(|s| s.base_url.is_some()).unwrap_or(false);
 
         let mut col = v_flex().p_4().gap_4().w_full();
 
@@ -77,7 +76,6 @@ impl Render for AccountView {
                     Button::new("create-account")
                         .primary()
                         .label("Create Account")
-                        .disabled(!base_url_set)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.core.update(cx, |c, cx| c.create_account(cx));
                         })),

@@ -34,5 +34,5 @@
       "rtmr2": "998bbf144dbec9e6c5ef5e7aeed86fa75f37a399caea3aeac01538661b1398382f9583730c046260b197542fb7cbf4e0"
     }
   },
-  "version": 1
+  "schema_version": "1.0.0"
 }

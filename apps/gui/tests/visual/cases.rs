@@ -516,7 +516,7 @@ fn stub_core_with_config(cx: &mut App) -> Entity<Core> {
 
 fn stub_config_state(has_account: bool) -> ConfigState {
     ConfigState {
-        base_url: Some("https://eidola.example/v1".into()),
+        base_url: "https://eidola.example/v1".into(),
         has_account,
         has_account_secret: has_account,
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),

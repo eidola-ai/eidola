@@ -1,6 +1,7 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod trust_root;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -27,9 +28,13 @@ uniffi::setup_scaffolding!();
 // ============================================================================
 
 /// Snapshot of the current config for display.
+///
+/// `base_url` and `trusted_measurements` are the *resolved* values: the
+/// user's override if set, the trust-root pin otherwise. UI displays these
+/// directly without needing to know which source they came from.
 #[derive(uniffi::Record)]
 pub struct ConfigState {
-    pub base_url: Option<String>,
+    pub base_url: String,
     pub has_account: bool,
     pub has_account_secret: bool,
     pub domain_separator: String,
@@ -182,14 +187,6 @@ impl Inner {
         Config::load_from(&self.config_path)
     }
 
-    fn require_base_url<'a>(&self, cfg: &'a Config) -> Result<&'a str, AppError> {
-        cfg.base_url
-            .as_deref()
-            .ok_or_else(|| AppError::NotConfigured {
-                message: "base_url not configured".into(),
-            })
-    }
-
     fn require_credentials<'a>(&self, cfg: &'a Config) -> Result<(&'a str, &'a str), AppError> {
         match (&cfg.account_id, &cfg.account_secret) {
             (Some(id), Some(secret)) => Ok((id, secret)),
@@ -213,24 +210,8 @@ impl Inner {
         config: &Config,
         attestation_observer: Option<tinfoil_verifier::AttestationObserver>,
     ) -> Result<reqwest::Client, AppError> {
-        if config.trusted_measurements.is_empty() {
-            let tls_config = rustls::ClientConfig::builder()
-                .with_root_certificates(load_native_root_store())
-                .with_no_client_auth();
-            return reqwest::Client::builder()
-                .tls_backend_preconfigured(tls_config)
-                .build()
-                .map_err(|e| AppError::Network {
-                    message: format!("failed to build HTTP client: {e}"),
-                });
-        }
-
-        let origin = config
-            .base_url
-            .as_deref()
-            .ok_or_else(|| AppError::NotConfigured {
-                message: "base_url is required when attestation is enabled".into(),
-            })?;
+        let origin = config.base_url();
+        let allowed_measurements = config.trusted_measurements();
 
         let hardware_root_der =
             config::parse_cert_config(config.hardware_root_ca.as_deref(), "hardware_root_ca")?;
@@ -240,7 +221,7 @@ impl Inner {
         )?;
 
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &config.trusted_measurements,
+            allowed_measurements: &allowed_measurements,
             inference_base_url: origin,
             atc_url: config.attestation_url.as_deref(),
             enclave_repo: Some(config.attestation_repo()),
@@ -265,7 +246,7 @@ impl Inner {
 impl Inner {
     async fn account_show(&self) -> Result<AccountShowResult, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let (id, secret) = self.require_credentials(&cfg)?;
 
         let client = self.build_client(&cfg, None).await?;
@@ -293,7 +274,7 @@ impl Inner {
 
     async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
 
         if cfg.account_id.is_some() || cfg.account_secret.is_some() {
             return Err(AppError::Config {
@@ -329,7 +310,7 @@ impl Inner {
 
     async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
 
         let client = self.build_client(&cfg, None).await?;
         let resp = client
@@ -381,7 +362,7 @@ impl Inner {
 
     async fn account_checkout(&self, price_id: &str) -> Result<String, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let (id, secret) = self.require_credentials(&cfg)?;
 
         let client = self.build_client(&cfg, None).await?;
@@ -406,7 +387,7 @@ impl Inner {
 
     async fn account_balances(&self) -> Result<BalancesResult, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let (id, secret) = self.require_credentials(&cfg)?;
 
         let client = self.build_client(&cfg, None).await?;
@@ -447,7 +428,7 @@ impl Inner {
         }
 
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let (account_id, secret) = self.require_credentials(&cfg)?;
         let client = self.build_client(&cfg, None).await?;
 
@@ -633,7 +614,7 @@ impl Inner {
 
     async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let client = self.build_client(&cfg, None).await?;
         let db_conn = self.db_conn().await?;
         let params = params_from_domain_separator(cfg.domain_separator())?;
@@ -697,7 +678,7 @@ impl Inner {
 
     async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let client = self.build_client(&cfg, None).await?;
 
         let models = fetch_models(&client, base_url).await?;
@@ -765,7 +746,7 @@ impl Inner {
         space_id: Option<&str>,
     ) -> Result<ChatResult, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let now = now_ms();
 
         let db_conn = self.db_conn().await?;
@@ -1192,7 +1173,7 @@ impl Inner {
         use futures_util::StreamExt;
 
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let now = now_ms();
 
         let db_conn = self.db_conn().await?;
@@ -1763,20 +1744,17 @@ impl AppCore {
 
     pub fn config_state(&self) -> ConfigState {
         let cfg = self.inner.load_config();
+        let to_info = |m: &tinfoil_verifier::EnclaveMeasurement| MeasurementInfo {
+            snp: m.snp_measurement.clone(),
+            tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
+            tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
+        };
         ConfigState {
-            base_url: cfg.base_url.clone(),
+            base_url: cfg.base_url().to_string(),
             has_account: cfg.account_id.is_some(),
             has_account_secret: cfg.account_secret.is_some(),
             domain_separator: cfg.domain_separator().to_string(),
-            trusted_measurements: cfg
-                .trusted_measurements
-                .iter()
-                .map(|m| MeasurementInfo {
-                    snp: m.snp_measurement.clone(),
-                    tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
-                    tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
-                })
-                .collect(),
+            trusted_measurements: cfg.trusted_measurements().iter().map(&to_info).collect(),
             has_hardware_root_ca: cfg.hardware_root_ca.is_some(),
             has_hardware_intermediate_ca: cfg.hardware_intermediate_ca.is_some(),
             attestation_url: cfg.attestation_url.clone(),
@@ -1785,7 +1763,7 @@ impl AppCore {
 
     pub fn set_base_url(&self, url: String) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
-        cfg.base_url = Some(url);
+        cfg.base_url_override = Some(url);
         cfg.save_to(&self.inner.config_path)
     }
 
@@ -1818,13 +1796,13 @@ impl AppCore {
         let spec = format!("{snp}:{tdx_rtmr1}:{tdx_rtmr2}");
         let entry = config::parse_trust_measurement(&spec)?;
         let mut cfg = self.inner.load_config();
-        if cfg.trusted_measurements.iter().any(|m| {
+        if cfg.trusted_measurements_override.iter().any(|m| {
             m.snp_measurement
                 .eq_ignore_ascii_case(&entry.snp_measurement)
         }) {
             return Ok(false);
         }
-        cfg.trusted_measurements.push(entry);
+        cfg.trusted_measurements_override.push(entry);
         cfg.save_to(&self.inner.config_path)?;
         Ok(true)
     }
@@ -1833,11 +1811,11 @@ impl AppCore {
         let key = config::parse_untrust_key(&snp)?;
         let mut cfg = self.inner.load_config();
         if let Some(pos) = cfg
-            .trusted_measurements
+            .trusted_measurements_override
             .iter()
             .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
         {
-            cfg.trusted_measurements.remove(pos);
+            cfg.trusted_measurements_override.remove(pos);
             cfg.save_to(&self.inner.config_path)?;
             Ok(true)
         } else {

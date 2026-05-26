@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eidola.ai/schema/release-v1.0.0.json",
+  "title": "Eidola Release Manifest",
+  "description": "Index of a published Eidola release. Contains no signed material itself — each artifact and attestation it references is independently signed (Sigstore bundles + Rekor). The client cross-checks each referenced document's content against the release's own version / git_commit / previous_release fields, so an adversary substituting this file cannot reroute the client to a release whose internals don't match.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "version",
+    "git_commit",
+    "git_tag",
+    "released_at",
+    "artifact_manifest",
+    "human_attestations",
+    "policy"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$"
+    },
+    "git_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "git_tag": {
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$"
+    },
+    "released_at": { "type": "string", "format": "date-time" },
+    "previous_release": {
+      "type": "object",
+      "required": ["version", "git_commit"],
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$"
+        },
+        "git_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "artifact_manifest": {
+      "type": "object",
+      "required": ["url", "sigstore_bundle_url"],
+      "additionalProperties": false,
+      "properties": {
+        "url": { "type": "string", "format": "uri" },
+        "sigstore_bundle_url": { "type": "string", "format": "uri" }
+      }
+    },
+    "human_attestations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["attestant_id", "url", "sigstore_bundle_url"],
+        "additionalProperties": false,
+        "properties": {
+          "attestant_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]+$"
+          },
+          "url": { "type": "string", "format": "uri" },
+          "sigstore_bundle_url": { "type": "string", "format": "uri" }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "required": ["min_human_attestations"],
+      "additionalProperties": false,
+      "properties": {
+        "min_human_attestations": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

@@ -25,7 +25,7 @@ impl GeneralView {
             .read(cx)
             .config_state
             .as_ref()
-            .and_then(|s| s.base_url.clone())
+            .map(|s| s.base_url.clone())
             .unwrap_or_default();
 
         let base_url_state = cx.new(|cx| {

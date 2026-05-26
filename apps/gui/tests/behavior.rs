@@ -246,7 +246,7 @@ fn stub_core_with_config(cx: &mut TestAppContext) -> Entity<Core> {
         cx.new(|_| {
             let mut c = Core::stub();
             c.config_state = Some(ConfigState {
-                base_url: Some("https://eidola.example/v1".into()),
+                base_url: "https://eidola.example/v1".into(),
                 has_account: true,
                 has_account_secret: true,
                 domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
