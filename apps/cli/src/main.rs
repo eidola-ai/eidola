@@ -59,6 +59,20 @@ enum Command {
         #[command(subcommand)]
         command: SpacesCommand,
     },
+    /// Check for a newer release and run the full verification pipeline
+    /// (CI Sigstore + human SSH+Rekor + template equality). Prints the
+    /// verified attestation prose. Does not install — that's a future
+    /// `--install` flag on this command once step 5 lands.
+    Update {
+        /// Pin the installed version explicitly (default: this binary's
+        /// compile-time version). Useful for testing the continuity gate.
+        #[arg(long)]
+        installed_version: Option<String>,
+        /// Pin the installed git commit (default: none, meaning "first
+        /// install — bypass continuity"). Useful for testing.
+        #[arg(long)]
+        installed_git_commit: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -482,5 +496,107 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
         },
+        Some(Command::Update {
+            installed_version,
+            installed_git_commit,
+        }) => {
+            let installed_version =
+                installed_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+            let installed_git_commit = installed_git_commit.as_deref();
+
+            eprintln!("Checking for updates...");
+            eprintln!(
+                "  installed version: {installed_version}{}",
+                installed_git_commit
+                    .map(|c| format!(" (commit {c})"))
+                    .unwrap_or_else(|| " (first-install; no commit pinned)".into())
+            );
+            eprintln!();
+
+            let summary = eidola_app_core::updater::check_for_update(
+                &installed_version,
+                installed_git_commit,
+            )
+            .await?;
+
+            match summary {
+                None => {
+                    println!("You're already on the latest release.");
+                }
+                Some(s) => print_release_summary(&s),
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_release_summary(s: &eidola_app_core::updater::ReleaseSummary) {
+    println!("=== New release available ===");
+    println!();
+    println!("  version:    {}", s.version);
+    println!("  tag:        {}", s.git_tag);
+    println!("  git_commit: {}", s.git_commit);
+    println!("  released:   {}", s.released_at);
+    if let Some(prev) = &s.previous_release {
+        println!("  previous:   {} ({})", prev.version, prev.git_commit);
+    }
+    println!();
+    println!(
+        "=== Verified human attestations ({} total) ===",
+        s.attestations.len()
+    );
+    for att in &s.attestations {
+        println!();
+        println!("  attestant: {} <{}>", att.attestant_name, att.attestant_id);
+        println!("    jurisdiction:   {}", att.jurisdiction);
+        println!("    key fingerprint: sha256:{}", att.fingerprint_hex);
+        println!(
+            "    rekor entry:    https://search.sigstore.dev/?logIndex={}",
+            att.rekor_log_index
+        );
+        println!("    attested at:    {}", att.attested_at);
+        println!();
+        println!("  preamble:");
+        print_indented(&att.attestant_statement, 4);
+        println!();
+        println!("  claims:");
+        for claim in &att.claims {
+            println!("    {}:", claim.claim_id);
+            print_indented(&claim.statement, 6);
+        }
+    }
+    println!();
+    println!(
+        "All cryptographic verification stages passed: CI Sigstore bundle, every human \
+         signature + Rekor inclusion, and every signed claim matches its pinned template."
+    );
+    println!();
+    println!(
+        "Install is not yet implemented (deferred to step 5). When it lands you'll review \
+         the prose above, then approve the install."
+    );
+}
+
+fn print_indented(text: &str, indent: usize) {
+    let pad = " ".repeat(indent);
+    // Word-wrap at ~76 columns minus the indent so the output stays
+    // readable in a terminal. Falls back gracefully on words longer than
+    // the wrap width.
+    let wrap = 76usize.saturating_sub(indent);
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            if !line.is_empty() && line.len() + 1 + word.len() > wrap {
+                println!("{pad}{line}");
+                line.clear();
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        if !line.is_empty() {
+            println!("{pad}{line}");
+        }
     }
 }
