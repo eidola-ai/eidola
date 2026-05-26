@@ -44,25 +44,21 @@ use crate::trust_root;
 
 use super::merkle;
 use super::trust::{KeyDetails, RekorKey, TrustedRoot};
+use super::{ReleaseIndex, VerifiedAttestation, VerifiedClaim};
 
 pub const SSH_SIG_NAMESPACE: &str = "eidola-attestation@v1";
 
-/// What we glean from a successful human-attestation verification. The
-/// caller (the updater) uses `fingerprint_hex` to display which engineer
-/// signed, and `rekor_log_index` so the user can independently inspect
-/// the entry on rekor.sigstore.dev.
-#[derive(Debug, Clone)]
-pub struct VerifiedHumanAttestation {
-    pub fingerprint_hex: String,
-    pub rekor_log_index: u64,
-}
-
-/// Verify a single human attestation against its bundle.
+/// Verify a single human attestation end-to-end: the SSH signature + the
+/// Rekor inclusion (this file), the structural cross-checks against the
+/// release index, and the character-exact equality of every signed claim
+/// against its pinned template rendering. Returns a fully-populated
+/// [`VerifiedAttestation`] on success.
 pub fn verify_human_attestation(
     attestation_bytes: &[u8],
     bundle_bytes: &[u8],
+    release: &ReleaseIndex,
     trust: &TrustedRoot,
-) -> Result<VerifiedHumanAttestation, AppError> {
+) -> Result<VerifiedAttestation, AppError> {
     let attestation_sha256: [u8; 32] = Sha256::digest(attestation_bytes).into();
 
     // ── 1. Bundle parse ──────────────────────────────────────────────
@@ -256,10 +252,307 @@ pub fn verify_human_attestation(
         &root_hash,
     )?;
 
-    Ok(VerifiedHumanAttestation {
-        fingerprint_hex,
-        rekor_log_index: entry.log_index,
+    // ── 8. Content verification (template equality + cross-checks) ───
+    verify_attestation_content(
+        attestation_bytes,
+        release,
+        &fingerprint_hex,
+        entry.log_index,
+    )
+}
+
+/// Parse the attestation prose, cross-check its top-level fields
+/// against the release index, and verify every signed claim is the
+/// character-for-character rendering of its pinned template (with
+/// declared `cross_checks` resolving to the corresponding `release.x.y`
+/// values).
+fn verify_attestation_content(
+    attestation_bytes: &[u8],
+    release: &ReleaseIndex,
+    fingerprint_hex: &str,
+    rekor_log_index: u64,
+) -> Result<VerifiedAttestation, AppError> {
+    let attestation: serde_json::Value =
+        serde_json::from_slice(attestation_bytes).map_err(|e| AppError::Update {
+            message: format!("parsing attestation JSON: {e}"),
+        })?;
+    let prose: AttestationProse =
+        serde_json::from_value(attestation.clone()).map_err(|e| AppError::Update {
+            message: format!("attestation JSON does not match schema: {e}"),
+        })?;
+
+    // Schema-version gate.
+    if !trust_root::SUPPORTED_ATTESTATION_SCHEMA_VERSIONS.contains(&prose.schema_version) {
+        return Err(AppError::Update {
+            message: format!(
+                "attestation schema_version {} not in supported set {:?}",
+                prose.schema_version,
+                trust_root::SUPPORTED_ATTESTATION_SCHEMA_VERSIONS,
+            ),
+        });
+    }
+
+    // Attestant pubkey fingerprint must match what we observed in the
+    // signature — defends against an attestation file that names a
+    // different attestant than the actual signer.
+    if !prose
+        .attestant
+        .key_fingerprint_sha256
+        .eq_ignore_ascii_case(fingerprint_hex)
+    {
+        return Err(AppError::Update {
+            message: format!(
+                "attestation says key_fingerprint_sha256=`{}` but the actual signing key has \
+                 fingerprint `{}`",
+                prose.attestant.key_fingerprint_sha256, fingerprint_hex
+            ),
+        });
+    }
+
+    // Top-level binding: attestation must pertain to *this* release.
+    if prose.release_version != release.version {
+        return Err(AppError::Update {
+            message: format!(
+                "attestation release_version `{}` ≠ release.version `{}`",
+                prose.release_version, release.version
+            ),
+        });
+    }
+    if !prose.git_commit.eq_ignore_ascii_case(&release.git_commit) {
+        return Err(AppError::Update {
+            message: format!(
+                "attestation git_commit `{}` ≠ release.git_commit `{}`",
+                prose.git_commit, release.git_commit
+            ),
+        });
+    }
+    match (
+        prose.previous_release_git_commit.as_deref(),
+        release.previous_release.as_ref(),
+    ) {
+        (Some(a), Some(r)) if !a.eq_ignore_ascii_case(&r.git_commit) => {
+            return Err(AppError::Update {
+                message: format!(
+                    "attestation previous_release_git_commit `{a}` ≠ release.previous_release.git_commit `{}`",
+                    r.git_commit
+                ),
+            });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(AppError::Update {
+                message: "attestation and release disagree on whether a `previous_release` exists"
+                    .into(),
+            });
+        }
+        _ => {}
+    }
+
+    // Load pinned templates from build-time-embedded JSON, render each,
+    // and require character-exact match with the signed statement.
+    let templates = eidola_attestation::load_from_str(trust_root::ATTESTATION_TEMPLATES_JSON)
+        .map_err(|e| AppError::Update {
+            message: format!("loading pinned attestation templates: {e}"),
+        })?;
+
+    let release_json: serde_json::Value = serde_json::to_value(SerializableRelease::from(release))
+        .map_err(|e| AppError::Update {
+            message: format!("serializing ReleaseIndex for cross-check roots: {e}"),
+        })?;
+    let mut roots: std::collections::BTreeMap<&str, &serde_json::Value> =
+        std::collections::BTreeMap::new();
+    roots.insert("attestation", &attestation);
+    roots.insert("release", &release_json);
+
+    // attestant_statement preamble.
+    let (rendered_preamble, _) = eidola_attestation::render(
+        &templates.attestant_statement_template.template,
+        &templates.attestant_statement_template.sources,
+        &roots,
+    )
+    .map_err(|e| AppError::Update {
+        message: format!("rendering attestant_statement_template: {e}"),
+    })?;
+    if rendered_preamble != prose.attestant_statement {
+        return Err(AppError::Update {
+            message: "signed attestant_statement does not equal the rendered template — \
+                 either the templates have drifted or the attestation prose was tampered with"
+                .into(),
+        });
+    }
+
+    // Each claim.
+    let mut verified_claims: Vec<VerifiedClaim> = Vec::with_capacity(templates.claims.len());
+    for (claim_id, claim_template) in &templates.claims {
+        let signed_claim = prose.claims.get(claim_id).ok_or_else(|| AppError::Update {
+            message: format!(
+                "attestation missing required claim `{claim_id}` (pinned by the template manifest)"
+            ),
+        })?;
+
+        let (rendered, values) =
+            eidola_attestation::render(&claim_template.template, &claim_template.sources, &roots)
+                .map_err(|e| AppError::Update {
+                message: format!("rendering claim `{claim_id}`: {e}"),
+            })?;
+
+        if rendered != signed_claim.statement {
+            return Err(AppError::Update {
+                message: format!("signed claim `{claim_id}` does not equal its rendered template"),
+            });
+        }
+
+        // Cross-checks: for each declared mapping, the resolved
+        // substitution value (taken from the *attestation* roots) must
+        // also equal what's at the corresponding release path.
+        for (placeholder, release_path) in &claim_template.cross_checks {
+            let attestation_value = values.get(placeholder).ok_or_else(|| AppError::Update {
+                message: format!(
+                    "claim `{claim_id}` cross_check refers to placeholder `{placeholder}` \
+                         that the template doesn't use"
+                ),
+            })?;
+            let release_value = eidola_attestation::resolve_dotted_path(release_path, &roots)
+                .map_err(|e| AppError::Update {
+                    message: format!(
+                        "claim `{claim_id}` cross_check `{placeholder}` → `{release_path}`: {e}"
+                    ),
+                })?;
+            if *attestation_value != release_value {
+                return Err(AppError::Update {
+                    message: format!(
+                        "claim `{claim_id}` cross_check `{placeholder}`: attestation value `{}` \
+                         ≠ release[{release_path}] `{}`",
+                        attestation_value, release_value
+                    ),
+                });
+            }
+        }
+
+        // If the signed claim carries a `fields` object, every (key, value)
+        // must equal what we resolved. Catches a coerced engineer who
+        // copies a different `fields` value than the rendered statement.
+        if let Some(fields) = &signed_claim.fields {
+            for (k, v) in fields {
+                let resolved = values.get(k).ok_or_else(|| AppError::Update {
+                    message: format!(
+                        "claim `{claim_id}` declares field `{k}` that the template doesn't use"
+                    ),
+                })?;
+                if v != resolved {
+                    return Err(AppError::Update {
+                        message: format!(
+                            "claim `{claim_id}` field `{k}` value `{v}` ≠ resolved `{resolved}`"
+                        ),
+                    });
+                }
+            }
+            // Every substituted placeholder must be present in `fields`.
+            for k in values.keys() {
+                if !fields.contains_key(k) {
+                    return Err(AppError::Update {
+                        message: format!(
+                            "claim `{claim_id}` is missing `fields.{k}` (the template substitutes it)"
+                        ),
+                    });
+                }
+            }
+        }
+
+        verified_claims.push(VerifiedClaim {
+            claim_id: claim_id.clone(),
+            statement: rendered,
+        });
+    }
+
+    // Sanity: attestation can't carry extra claims the template doesn't
+    // know about — that's a coerced-extra-claim attack surface.
+    for claim_id in prose.claims.keys() {
+        if !templates.claims.contains_key(claim_id) {
+            return Err(AppError::Update {
+                message: format!(
+                    "attestation carries claim `{claim_id}` that the pinned template manifest \
+                     does not declare"
+                ),
+            });
+        }
+    }
+
+    Ok(VerifiedAttestation {
+        attestant_id: prose.attestant.id,
+        attestant_name: prose.attestant.name,
+        jurisdiction: prose.attestant.jurisdiction,
+        fingerprint_hex: fingerprint_hex.to_string(),
+        rekor_log_index,
+        attested_at: prose.attested_at,
+        attestant_statement: prose.attestant_statement,
+        claims: verified_claims,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Attestation prose JSON shape (matches releases/schema/attestation-v1.schema.json)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AttestationProse {
+    schema_version: u32,
+    release_version: String,
+    git_commit: String,
+    #[serde(default)]
+    previous_release_git_commit: Option<String>,
+    attestant: AttestantBlock,
+    attested_at: String,
+    attestant_statement: String,
+    claims: std::collections::BTreeMap<String, SignedClaim>,
+}
+
+#[derive(Deserialize)]
+struct AttestantBlock {
+    id: String,
+    name: String,
+    key_fingerprint_sha256: String,
+    jurisdiction: String,
+}
+
+#[derive(Deserialize)]
+struct SignedClaim {
+    statement: String,
+    #[serde(default)]
+    fields: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// Side-channel shape used to project a [`ReleaseIndex`] into the JSON
+/// roots the template renderer walks. Mirrors the on-disk release.json
+/// keys so paths like `release.previous_release.git_commit` resolve.
+#[derive(serde::Serialize)]
+struct SerializableRelease<'a> {
+    version: &'a str,
+    git_commit: &'a str,
+    git_tag: &'a str,
+    released_at: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_release: Option<SerializablePrev<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct SerializablePrev<'a> {
+    version: &'a str,
+    git_commit: &'a str,
+}
+
+impl<'a> From<&'a ReleaseIndex> for SerializableRelease<'a> {
+    fn from(r: &'a ReleaseIndex) -> Self {
+        SerializableRelease {
+            version: &r.version,
+            git_commit: &r.git_commit,
+            git_tag: &r.git_tag,
+            released_at: &r.released_at,
+            previous_release: r.previous_release.as_ref().map(|p| SerializablePrev {
+                version: &p.version,
+                git_commit: &p.git_commit,
+            }),
+        }
+    }
 }
 
 /// Parse an OpenSSH `.pub`-style line (`ssh-<type> <base64> [comment]`)
@@ -500,7 +793,8 @@ mod tests {
     fn bundle_rejects_wrong_schema_version() {
         let bundle = br#"{"schema_version": 99, "rekor_log_entry": {}}"#;
         let trust = synthesize_empty_trust();
-        let err = verify_human_attestation(b"x", bundle, &trust).unwrap_err();
+        let release = synthesize_release();
+        let err = verify_human_attestation(b"x", bundle, &release, &trust).unwrap_err();
         assert!(format!("{err}").contains("schema_version"));
     }
 
@@ -508,7 +802,8 @@ mod tests {
     fn bundle_rejects_wrong_log_entry_count() {
         let bundle = br#"{"schema_version": 1, "rekor_log_entry": {}}"#;
         let trust = synthesize_empty_trust();
-        let err = verify_human_attestation(b"x", bundle, &trust).unwrap_err();
+        let release = synthesize_release();
+        let err = verify_human_attestation(b"x", bundle, &release, &trust).unwrap_err();
         assert!(format!("{err}").contains("rekor log entries"));
     }
 
@@ -518,5 +813,24 @@ mod tests {
             rekor_keys: vec![],
             ctlog_keys: vec![],
         }
+    }
+
+    fn synthesize_release() -> ReleaseIndex {
+        serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "version": "0.1.0",
+                "git_commit": "9c3a000000000000000000000000000000000001",
+                "git_tag": "v0.1.0",
+                "released_at": "2026-05-26T00:00:00Z",
+                "artifact_manifest": {
+                    "url": "https://example/m.json",
+                    "sigstore_bundle_url": "https://example/m.json.sigstore"
+                },
+                "human_attestations": [],
+                "policy": { "min_human_attestations": 1 }
+            }"#,
+        )
+        .unwrap()
     }
 }

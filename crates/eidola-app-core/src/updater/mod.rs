@@ -109,13 +109,28 @@ pub struct ReleaseSummary {
 }
 
 /// One verified human attestation, ready to render. The verifier guarantees:
-/// every `statement` in `claims` is character-for-character equal to the
-/// rendered output of its pinned template.
+///
+/// - The SSH signature over the attestation bytes is valid (and namespaced
+///   to `eidola-attestation@v1`).
+/// - The signer's pubkey fingerprint (`fingerprint_hex`) is in this
+///   client's pinned `TRUSTED_ATTESTANT_FINGERPRINTS`.
+/// - The signature was logged in Sigstore Rekor (`rekor_log_index`,
+///   SET-signed by a pinned Rekor key, with a valid inclusion proof).
+/// - The attestation's `release_version` / `git_commit` /
+///   `previous_release_git_commit` match the release index's
+///   corresponding fields (so this attestation actually pertains to
+///   *this* release, not a different one).
+/// - Every `statement` in `claims` is character-for-character equal to
+///   the rendered output of its pinned template, with every declared
+///   `cross_check` field also equal to the corresponding `release.x.y`
+///   path.
 #[derive(Debug, Clone)]
 pub struct VerifiedAttestation {
     pub attestant_id: String,
     pub attestant_name: String,
     pub jurisdiction: String,
+    pub fingerprint_hex: String,
+    pub rekor_log_index: u64,
     pub attested_at: String,
     pub attestant_statement: String,
     pub claims: Vec<VerifiedClaim>,
@@ -172,8 +187,8 @@ pub async fn check_for_update(
     .await?;
     let _verified_ci = ci_sigstore::verify_ci_signature(&manifest_bytes, &bundle_bytes, &trust)?;
 
-    // ── verify each human attestation ────────────────────────────────────
-    let mut verified_attestations: Vec<human_attestation::VerifiedHumanAttestation> =
+    // ── verify each human attestation (signature + content) ─────────────
+    let mut verified_attestations: Vec<VerifiedAttestation> =
         Vec::with_capacity(release.human_attestations.len());
     for human in &release.human_attestations {
         let attestation_bytes = fetch_url(
@@ -188,8 +203,25 @@ pub async fn check_for_update(
             &format!("attestation-{}.bundle.json", human.attestant_id),
         )
         .await?;
-        let verified =
-            human_attestation::verify_human_attestation(&attestation_bytes, &bundle_bytes, &trust)?;
+        let verified = human_attestation::verify_human_attestation(
+            &attestation_bytes,
+            &bundle_bytes,
+            &release,
+            &trust,
+        )?;
+        // The attestant_id in release.json must match what the
+        // attestation prose says — defends against a release manifest
+        // listing one attestant_id but pointing to a different person's
+        // signed prose.
+        if verified.attestant_id != human.attestant_id {
+            return Err(AppError::Update {
+                message: format!(
+                    "release.human_attestations[].attestant_id `{}` ≠ attestation prose \
+                     attestant.id `{}`",
+                    human.attestant_id, verified.attestant_id
+                ),
+            });
+        }
         verified_attestations.push(verified);
     }
 
@@ -204,21 +236,14 @@ pub async fn check_for_update(
         });
     }
 
-    // TODO (4e): render templates and require character-for-character
-    //            equality with the signed `statement`; cross-check resolved
-    //            values against release.git_commit / .previous_release.git_commit.
-    // TODO (4e): verify each artifact hash inside artifact-manifest.json.
-
-    Err(AppError::Update {
-        message: format!(
-            "release {} ({}) passes discover/continuity/CI-signature/human-signature ({} \
-             attestation(s)); template-equality + artifact-hash stages are not yet implemented \
-             in this build",
-            release.git_tag,
-            release.git_commit,
-            verified_attestations.len(),
-        ),
-    })
+    Ok(Some(ReleaseSummary {
+        version: release.version,
+        git_commit: release.git_commit,
+        git_tag: release.git_tag,
+        released_at: release.released_at,
+        previous_release: release.previous_release,
+        attestations: verified_attestations,
+    }))
 }
 
 /// Outcome wrapper for the discover→continuity stages: either we have a
