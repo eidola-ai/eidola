@@ -131,3 +131,17 @@ measure:
 # computes enclave measurements. Requires macOS for the Nix-built CLI.
 update-manifest:
     ./scripts/artifact-manifest.sh update --ensure-builder
+
+# Verify a tag that CI has already built+signed. Fetches the signed manifest
+# from the GitHub release, verifies the Sigstore bundle against the embedded
+# trust root, compares against the committed manifest, and shows the diff
+# against the prior release for human review. Run before `release-attest`.
+release-verify tag:
+    cargo run -q -p release-tool -- verify {{ tag }}
+
+# Interactive: render each claim, prompt to type 'yes' to affirm, sign
+# with the configured hardware key, upload attestation + release.json,
+# mark release as latest. Reads attestant identity from EIDOLA_ATTESTANT_*
+# env vars; cosign key from EIDOLA_ATTESTANT_KEY (typically a PKCS#11 URI).
+release-attest tag:
+    cargo run -q -p release-tool -- attest {{ tag }}

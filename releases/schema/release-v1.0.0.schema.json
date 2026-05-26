@@ -59,7 +59,7 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["attestant_id", "url", "sigstore_bundle_url"],
+        "required": ["attestant_id", "url", "bundle_url"],
         "additionalProperties": false,
         "properties": {
           "attestant_id": {
@@ -67,7 +67,7 @@
             "pattern": "^[a-z0-9-]+$"
           },
           "url": { "type": "string", "format": "uri" },
-          "sigstore_bundle_url": { "type": "string", "format": "uri" }
+          "bundle_url": { "type": "string", "format": "uri" }
         }
       }
     },

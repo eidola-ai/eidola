@@ -2,6 +2,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod trust_root;
+pub mod updater;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

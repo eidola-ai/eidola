@@ -1,0 +1,15 @@
+[package]
+name = "eidola-attestation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+description = "Shared attestation template loading + rendering. Used by release-tool (signing side) and eidola-app-core's updater (verifier side); both MUST agree on rendering semantics character-for-character."
+
+[dependencies]
+anyhow = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

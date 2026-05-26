@@ -60,7 +60,7 @@ Generated into the client at compile time by
 | `SERVER_URL`                            | derived from `artifact-manifest.json` enclave block | `gateway-<hash>.eidola.containers.tinfoil.sh`, where `<hash>` ties the URL to a server measurement |
 | `SERVER_SNP_MEASUREMENT`                | `artifact-manifest.json` `enclave.snp_measurement`  | SEV-SNP launch measurement of the paired server enclave                                            |
 | `SERVER_TDX_RTMR1` / `SERVER_TDX_RTMR2` | `artifact-manifest.json` `enclave.tdx_measurement`  | TDX runtime measurements of the paired server enclave                                              |
-| `TRUSTED_ATTESTANT_FINGERPRINTS`        | `trust-constants.json`                              | SHA-256 fingerprints of authorized human-attestant pubkeys                                         |
+| `TRUSTED_ATTESTANT_FINGERPRINTS`        | `trust-constants.json`                              | `sha256(OpenSSH wire-format pubkey)` in hex, for each authorized human-attestant key               |
 | `EXPECTED_CI_IDENTITY_PATTERN`          | `trust-constants.json`                              | Fulcio cert SAN pattern the release-signing workflow's OIDC identity must match                    |
 | `EXPECTED_CI_ISSUER`                    | `trust-constants.json`                              | OIDC issuer (`https://token.actions.githubusercontent.com`)                                        |
 | `SUPPORTED_RELEASE_SCHEMA_VERSIONS`     | `trust-constants.json`                              | Versions of `release.json` this client will parse                                                  |
@@ -82,9 +82,9 @@ itself a release-gated trust event.
 
 | Document                | Schema                                                | Notes                                                                       |
 | ----------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------- |
-| `artifact-manifest.json` | (no JSON Schema file; format owned by `scripts/artifact-manifest.sh`) | `schema_version: "1.0.0"`                                                   |
+| `artifact-manifest.json` | (no JSON Schema file; format owned by `scripts/artifact-manifest.sh`) | `schema_version: "1.0.0"`. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). |
 | `release.json`          | `releases/schema/release-v1.0.0.schema.json`          | Unsigned index; cross-checked via referenced documents (see caveat below)   |
-| `attestation.json`      | `releases/schema/attestation-v1.0.0.schema.json`      | Signed by the attestant's hardware key                                      |
+| `attestation.json`      | `releases/schema/attestation-v1.0.0.schema.json`      | Signed by the attestant via SSH (`ssh-keygen -Y sign`), logged to Rekor as a `hashedrekord` |
 | Templates               | `releases/schema/attestation-templates-v1.0.0.json`   | Source of truth for both the release-tool and the verifier's equality check |
 
 ### `release.json` carries no hashes
@@ -101,6 +101,36 @@ For the same reason, `release.json` does **not** carry
 material — those are pinned in the client's embedded trust root or
 inherent in the Sigstore bundle. Echoing them in `release.json` would let
 an adversary downgrade trust by handing the client a tampered index.
+
+### Signing systems: split by surface
+
+Two cryptographic systems carry the trust chain, dispatched by the verifier
+based on which document is being verified:
+
+| Surface | Signature | Identity binding | Transparency |
+| --- | --- | --- | --- |
+| CI signs `artifact-manifest.json` | Sigstore bundle | Fulcio keyless cert — OIDC identity matches `EXPECTED_CI_IDENTITY_PATTERN` | Rekor inclusion proof embedded in the bundle |
+| Engineer signs `attestation-<id>.json` | SSH signature (`ssh-keygen -Y sign`, namespace `eidola-attestation@v1`) | `sha256(SSH wire-format pubkey)` matches `TRUSTED_ATTESTANT_FINGERPRINTS` | Posted to Rekor as a `hashedrekord` entry; inclusion proof saved in `attestation-<id>.bundle.json` |
+| Engineer signs the git tag | SSH signature (same key) | Same fingerprint | Implicit via the repo |
+
+The CI side uses Sigstore because Fulcio's keyless OIDC binding is *the*
+mechanism that makes "this signature came from the release workflow on a
+specific tag" cryptographically meaningful — no other system offers that.
+
+The engineer side uses SSH because:
+- The hardware-backing options are broader (Secretive's Secure Enclave,
+  YubiKey-SK, 1Password agent, FIDO2 resident keys) — no specific brand
+  required of future contributors.
+- The signature format is dramatically simpler than the Sigstore bundle —
+  the verifier code path is small, well-audited, pure-Rust via the
+  `ssh-key` crate.
+- The same key signs git tags, commits, and attestations, so an engineer
+  has one identity surface.
+
+Both ride the same Sigstore Rekor transparency log via different entry
+kinds (sigstore-bundle's embedded log entry for CI, `hashedrekord` for
+human). The verifier shares its Rekor inclusion-proof + signed-tree-head
+verification code between the two paths.
 
 ### Attestation templates: flat snake_case keys
 
@@ -179,13 +209,20 @@ running against the old values until the user accepts the update.
 
 ### Rotating an attestant key
 
-1. Generate the new YubiKey-resident keypair.
-2. Compute the SHA-256 fingerprint of the new pubkey (DER-encoded SPKI).
+1. Generate a new SSH keypair in your hardware-backed store of choice
+   (Secretive / Secure Enclave on macOS, FIDO2-SK YubiKey, 1Password agent,
+   …). Confirm the agent is reachable via `SSH_AUTH_SOCK` and `ssh-add -L`
+   lists the new identity.
+2. Compute the new fingerprint:
+   ```
+   awk '{print $2}' <path-to-new-pubkey.pub> \
+     | base64 -d | shasum -a 256 | awk '{print $1}'
+   ```
 3. Open a release PR that adds the new fingerprint to
    `releases/trust/trust-constants.json` (`trusted_attestant_fingerprints`).
-   **Keep the old fingerprint** during the overlap window so old releases
-   continue to verify against monitoring tools that pinned them.
-4. Cut a release signed by the **current** attestant key. This release's
+   **Keep the old fingerprint** during the overlap window so prior
+   releases remain verifiable.
+4. Cut a release signed by the **current** attestant key. The new client
    binary embeds both fingerprints.
 5. After the overlap window has passed, open another release PR removing
    the old fingerprint. Sign with the new key.
@@ -256,7 +293,10 @@ enclave measurement. Changing either changes every future URL, so:
 ## Acknowledgements
 
 `sigstore-trusted-root.json` is a verbatim copy of the upstream Sigstore
-TrustedRoot. The schema and verification approach is adapted from
+TrustedRoot. The Sigstore verification approach (CI side) is adapted from
 [tinfoil-rs](https://github.com/tinfoilsh/tinfoil-rs), which in turn
 adapts verification modules from
-[sigstore-rs](https://github.com/sigstore/sigstore-rs) (Apache 2.0).
+[sigstore-rs](https://github.com/sigstore/sigstore-rs) (Apache 2.0). The
+SSH signature verification (human side) uses the
+[`ssh-key`](https://github.com/RustCrypto/SSH/tree/master/ssh-key) crate
+from RustCrypto.

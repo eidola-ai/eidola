@@ -12,6 +12,7 @@ base64 = "0.22"
 blake3 = "1"
 der = { version = "0.7", features = ["pem", "alloc"] }
 dirs = "6"
+eidola-attestation = { path = "../eidola-attestation" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
 futures-util = { version = "0.3", default-features = false }
