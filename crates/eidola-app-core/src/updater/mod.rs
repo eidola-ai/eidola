@@ -25,6 +25,9 @@ use serde::Deserialize;
 use crate::error::AppError;
 use crate::trust_root;
 
+pub mod ci_sigstore;
+pub mod trust;
+
 // ---------------------------------------------------------------------------
 // GitHub releases API — minimal subset we consume
 // ---------------------------------------------------------------------------
@@ -137,31 +140,73 @@ pub async fn check_for_update(
     installed_version: &str,
     installed_git_commit: Option<&str>,
 ) -> Result<Option<ReleaseSummary>, AppError> {
-    let release_json_bytes = fetch_release_json().await?;
-    check_release_index(&release_json_bytes, installed_version, installed_git_commit)
-        .map(Some)
-        .or_else(|e| match e {
-            // A "no newer version" signal isn't an error — the call site
-            // should distinguish between "no update" and "update failed".
-            NoUpdateOrError::NoUpdate => Ok(None),
-            NoUpdateOrError::Error(app_err) => Err(app_err),
-        })
+    let client = build_http_client()?;
+
+    let release_json_bytes = fetch_release_json(&client).await?;
+    let release = match parse_and_gate_release(
+        &release_json_bytes,
+        installed_version,
+        installed_git_commit,
+    ) {
+        Ok(r) => r,
+        Err(NoUpdateOrError::NoUpdate) => return Ok(None),
+        Err(NoUpdateOrError::Error(e)) => return Err(e),
+    };
+
+    let trust = trust::load()?;
+
+    // ── verify CI side ───────────────────────────────────────────────────
+    let manifest_bytes = fetch_url(
+        &client,
+        &release.artifact_manifest.url,
+        "artifact-manifest.json",
+    )
+    .await?;
+    let bundle_bytes = fetch_url(
+        &client,
+        &release.artifact_manifest.sigstore_bundle_url,
+        "artifact-manifest.json.sigstore",
+    )
+    .await?;
+    let _verified_ci = ci_sigstore::verify_ci_signature(&manifest_bytes, &bundle_bytes, &trust)?;
+
+    // TODO (4d): verify each human attestation (SSH + rekor proof).
+    // TODO (4e): render templates and require character-for-character
+    //            equality with the signed `statement`; cross-check resolved
+    //            values against release.git_commit / .previous_release.git_commit;
+    //            policy check on min_human_attestations.
+    // TODO (4e): verify each artifact hash inside artifact-manifest.json.
+
+    Err(AppError::Update {
+        message: format!(
+            "release {} ({}) passes discover/continuity/CI-structural; human-attestation + \
+             template-equality + artifact-hash stages are not yet implemented in this build",
+            release.git_tag, release.git_commit,
+        ),
+    })
 }
 
 /// Outcome wrapper for the discover→continuity stages: either we have a
-/// `ReleaseSummary` placeholder to fill in via the crypto stages, or we
-/// hit the "no newer release" signal (collapses to `Ok(None)` upstream),
-/// or we hit a hard failure.
+/// parsed `ReleaseIndex` to feed to the crypto stages, or we hit the "no
+/// newer release" signal (collapses to `Ok(None)` upstream), or we hit a
+/// hard failure.
+#[derive(Debug)]
 enum NoUpdateOrError {
     NoUpdate,
     Error(AppError),
 }
 
-fn check_release_index(
+impl From<AppError> for NoUpdateOrError {
+    fn from(e: AppError) -> Self {
+        NoUpdateOrError::Error(e)
+    }
+}
+
+fn parse_and_gate_release(
     release_json_bytes: &[u8],
     installed_version: &str,
     installed_git_commit: Option<&str>,
-) -> Result<ReleaseSummary, NoUpdateOrError> {
+) -> Result<ReleaseIndex, NoUpdateOrError> {
     let release: ReleaseIndex = serde_json::from_slice(release_json_bytes).map_err(|e| {
         NoUpdateOrError::Error(AppError::Update {
             message: format!("release.json failed to parse: {e}"),
@@ -186,21 +231,7 @@ fn check_release_index(
 
     check_continuity(&release, installed_git_commit)?;
 
-    // TODO (4c): verify CI sigstore bundle on artifact_manifest.
-    // TODO (4d): verify each human attestation (SSH + rekor proof).
-    // TODO (4e): render templates and require character-for-character
-    //            equality with the signed `statement`; cross-check resolved
-    //            values against release.git_commit / .previous_release.git_commit;
-    //            policy check on min_human_attestations.
-    // TODO (4e): fetch artifact-manifest.json + verify each artifact hash.
-
-    Err(NoUpdateOrError::Error(AppError::Update {
-        message: format!(
-            "release {} ({}) discovered and passes continuity, but cryptographic verification \
-             stages are not yet implemented in this build",
-            release.git_tag, release.git_commit,
-        ),
-    }))
+    Ok(release)
 }
 
 enum VersionCompare {
@@ -267,9 +298,7 @@ fn check_continuity(
 }
 
 /// Fetch the latest `release.json` asset from the GitHub releases API.
-async fn fetch_release_json() -> Result<Vec<u8>, AppError> {
-    let client = build_http_client()?;
-
+async fn fetch_release_json(client: &reqwest::Client) -> Result<Vec<u8>, AppError> {
     let resp = client
         .get(trust_root::UPDATE_DISCOVERY_URL)
         .header("Accept", "application/vnd.github+json")
@@ -305,22 +334,28 @@ async fn fetch_release_json() -> Result<Vec<u8>, AppError> {
                 .to_string(),
         })?;
 
-    let release_json = client
-        .get(&asset.browser_download_url)
+    fetch_url(client, &asset.browser_download_url, "release.json").await
+}
+
+/// Fetch a single URL's body bytes. Errors carry the file label so the
+/// caller doesn't have to reformat them.
+async fn fetch_url(client: &reqwest::Client, url: &str, label: &str) -> Result<Vec<u8>, AppError> {
+    let resp = client
+        .get(url)
         .header("Accept", "application/octet-stream")
         .send()
         .await
         .map_err(|e| AppError::Update {
-            message: format!("GET release.json asset: {e}"),
+            message: format!("GET {label} ({url}): {e}"),
         })?;
-    let status = release_json.status();
-    let bytes = release_json.bytes().await.map_err(|e| AppError::Update {
-        message: format!("reading release.json body: {e}"),
+    let status = resp.status();
+    let bytes = resp.bytes().await.map_err(|e| AppError::Update {
+        message: format!("reading {label} body: {e}"),
     })?;
     if !status.is_success() {
         return Err(AppError::Update {
             message: format!(
-                "release.json asset returned HTTP {} ({})",
+                "{label} ({url}) returned HTTP {} ({})",
                 status,
                 String::from_utf8_lossy(&bytes).trim()
             ),
@@ -351,7 +386,7 @@ fn build_http_client() -> Result<reqwest::Client, AppError> {
 mod tests {
     use super::*;
 
-    fn unwrap_err(r: Result<ReleaseSummary, NoUpdateOrError>) -> AppError {
+    fn unwrap_err(r: Result<ReleaseIndex, NoUpdateOrError>) -> AppError {
         match r {
             Err(NoUpdateOrError::Error(e)) => e,
             Err(NoUpdateOrError::NoUpdate) => panic!("expected Error, got NoUpdate"),
@@ -359,7 +394,7 @@ mod tests {
         }
     }
 
-    fn is_no_update(r: &Result<ReleaseSummary, NoUpdateOrError>) -> bool {
+    fn is_no_update(r: &Result<ReleaseIndex, NoUpdateOrError>) -> bool {
         matches!(r, Err(NoUpdateOrError::NoUpdate))
     }
 
@@ -396,14 +431,14 @@ mod tests {
     #[test]
     fn no_update_when_latest_equals_installed() {
         let bytes = release_json("1.0.0", None);
-        let r = check_release_index(&bytes, "1.0.0", None);
+        let r = parse_and_gate_release(&bytes, "1.0.0", None);
         assert!(is_no_update(&r));
     }
 
     #[test]
     fn no_update_when_latest_older_than_installed() {
         let bytes = release_json("0.9.0", None);
-        let r = check_release_index(&bytes, "1.0.0", None);
+        let r = parse_and_gate_release(&bytes, "1.0.0", None);
         assert!(is_no_update(&r));
     }
 
@@ -420,7 +455,7 @@ mod tests {
             "policy": {"min_human_attestations": 1}
         }"#
         .to_vec();
-        let err = unwrap_err(check_release_index(&bytes, "1.0.0", None));
+        let err = unwrap_err(parse_and_gate_release(&bytes, "1.0.0", None));
         let msg = format!("{err}");
         assert!(msg.contains("schema_version"), "got: {msg}");
     }
@@ -428,41 +463,39 @@ mod tests {
     #[test]
     fn rejects_invalid_semver_in_release() {
         let bytes = release_json("not.semver.at.all", None);
-        let err = unwrap_err(check_release_index(&bytes, "1.0.0", None));
+        let err = unwrap_err(parse_and_gate_release(&bytes, "1.0.0", None));
         let msg = format!("{err}");
         assert!(msg.contains("semver"), "got: {msg}");
     }
 
     #[test]
     fn first_install_bypasses_continuity() {
-        // No installed git_commit + release with previous_release ⇒ OK,
-        // continuity stage skipped. Pipeline then fails at the crypto
-        // verification TODO (which we surface as Update error).
+        // No installed git_commit + release with previous_release ⇒ OK;
+        // continuity stage skipped, returns the parsed ReleaseIndex
+        // ready for the crypto stages.
         let bytes = release_json("1.1.0", Some("5e1f000000000000000000000000000000000002"));
-        let err = unwrap_err(check_release_index(&bytes, "1.0.0", None));
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("verification stages are not yet implemented"),
-            "expected crypto-TODO message, got: {msg}"
-        );
+        let release = parse_and_gate_release(&bytes, "1.0.0", None)
+            .expect("first install with prior release should pass gating");
+        assert_eq!(release.version, "1.1.0");
     }
 
     #[test]
     fn continuity_passes_when_previous_matches_installed() {
         let installed_commit = "5e1f000000000000000000000000000000000002";
         let bytes = release_json("1.1.0", Some(installed_commit));
-        let err = unwrap_err(check_release_index(&bytes, "1.0.0", Some(installed_commit)));
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("verification stages are not yet implemented"),
-            "expected crypto-TODO message, got: {msg}"
+        let release = parse_and_gate_release(&bytes, "1.0.0", Some(installed_commit))
+            .expect("matching continuity should pass gating");
+        assert_eq!(release.version, "1.1.0");
+        assert_eq!(
+            release.previous_release.unwrap().git_commit,
+            installed_commit
         );
     }
 
     #[test]
     fn continuity_fails_when_previous_differs_from_installed() {
         let bytes = release_json("1.1.0", Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-        let err = unwrap_err(check_release_index(
+        let err = unwrap_err(parse_and_gate_release(
             &bytes,
             "1.0.0",
             Some("5e1f000000000000000000000000000000000002"),
@@ -474,7 +507,7 @@ mod tests {
     #[test]
     fn continuity_fails_when_release_has_no_previous_and_client_does() {
         let bytes = release_json("1.1.0", None);
-        let err = unwrap_err(check_release_index(
+        let err = unwrap_err(parse_and_gate_release(
             &bytes,
             "1.0.0",
             Some("5e1f000000000000000000000000000000000002"),
