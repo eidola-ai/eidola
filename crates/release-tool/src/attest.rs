@@ -216,13 +216,22 @@ pub fn run(args: Args) -> Result<()> {
         rekor_entry.log_index, rekor_entry.uuid
     );
 
-    // Build the bundle file the verifier reads — self-contained: the rekor
-    // entry body holds the SSH signature + pubkey + signed file hash, plus
-    // the inclusion proof + SignedEntryTimestamp.
-    let bundle = serde_json::json!({
-        "schema_version": 1,
-        "rekor_log_entry": rekor_entry.raw,
-    });
+    // Build the bundle file the verifier reads as a **Sigstore Bundle v0.3**
+    // (`application/vnd.dev.sigstore.bundle.v0.3+json`) — the same shape
+    // `cosign sign-blob --bundle` emits, but with a `publicKey.hint` in
+    // place of the Fulcio leaf cert. This lets the verifier share its
+    // structural decode + most field handling across the CI and human
+    // paths. See
+    // `crates/eidola-app-core/src/updater/sigstore_bundle.rs` for the
+    // matching consumer side, and
+    // <https://github.com/sigstore/protobuf-specs/blob/main/protos/sigstore_bundle.proto>
+    // for the upstream spec.
+    let bundle = build_sigstore_bundle_v3(
+        &rekor_entry.raw,
+        &signature_bytes,
+        &attestation_path,
+        &key_fingerprint_sha256,
+    )?;
     let bundle_serialized = serde_json::to_string_pretty(&bundle)? + "\n";
     fs::write(&bundle_path, bundle_serialized.as_bytes())?;
 
@@ -240,6 +249,10 @@ pub fn run(args: Args) -> Result<()> {
     let att_url = asset_url(&assets, &attestation_filename)?;
     let att_bundle_url = asset_url(&assets, &bundle_filename)?;
 
+    // `release.json` is a pure URL index. Policy fields (threshold, allowed
+    // identities, allowed schema versions) live in the verifier's embedded
+    // trust root so a forged index can't downgrade them — see
+    // `releases/TRUST-ROOT.md`.
     let release_json = serde_json::json!({
         "schema_version": 1,
         "version": release_version,
@@ -259,7 +272,6 @@ pub fn run(args: Args) -> Result<()> {
             "url": att_url,
             "bundle_url": att_bundle_url,
         }],
-        "policy": { "min_human_attestations": 1 },
     });
     let release_json_path = tmp.path().join("release.json");
     let release_json_str = serde_json::to_string_pretty(&release_json)? + "\n";
@@ -443,9 +455,182 @@ fn rekor_upload_hashedrekord(
 struct RekorLogEntry {
     uuid: String,
     log_index: i64,
-    /// Verbatim Rekor response — embedded as-is in the bundle file so the
-    /// verifier sees exactly what the log returned.
+    /// Verbatim Rekor response — used as the source of facts for building
+    /// the Sigstore Bundle v0.3 we hand to the verifier.
     raw: serde_json::Value,
+}
+
+/// Project the verbatim Rekor REST response into a Sigstore Bundle v0.3
+/// JSON document. Fields are mapped per the spec at
+/// <https://github.com/sigstore/protobuf-specs/blob/main/protos/sigstore_bundle.proto>:
+///
+/// - protobuf int64 → JSON string (`logIndex`, `integratedTime`, `treeSize`)
+/// - hex bytes in the Rekor REST shape → base64 in v0.3 (`logID`,
+///   `rootHash`, inclusion-proof `hashes[]`)
+/// - the SSH-SIG PEM (`-----BEGIN SSH SIGNATURE----- ... -----END...`)
+///   goes into `messageSignature.signature` (base64 of its file bytes).
+///   The rekor body still carries it too, but the spec puts the
+///   authoritative signature on `messageSignature`.
+/// - `verificationMaterial.publicKey.hint` carries the engineer's
+///   SSH-key SHA-256 fingerprint (the same value pinned by
+///   `TRUSTED_ATTESTANT_FINGERPRINTS`); the actual pubkey bytes stay in
+///   the rekor body, since `PublicKeyIdentifier` is a hint, not a key.
+fn build_sigstore_bundle_v3(
+    rekor_response: &serde_json::Value,
+    ssh_sig_pem_bytes: &[u8],
+    attestation_path: &Path,
+    key_fingerprint_sha256: &str,
+) -> Result<serde_json::Value> {
+    // Rekor returns `{ "<uuid>": { body, integratedTime, logID, logIndex,
+    // verification: { inclusionProof, signedEntryTimestamp } } }`. We need
+    // the inner value.
+    let obj = rekor_response
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Rekor response is not an object"))?;
+    let (_, entry) = obj
+        .iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Rekor response is empty"))?;
+
+    let body_b64 = entry
+        .get("body")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Rekor response missing string `body`"))?
+        .to_string();
+    let log_index = entry
+        .get("logIndex")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow::anyhow!("Rekor response missing integer `logIndex`"))?;
+    let integrated_time = entry
+        .get("integratedTime")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow::anyhow!("Rekor response missing integer `integratedTime`"))?;
+    let log_id_hex = entry
+        .get("logID")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Rekor response missing string `logID`"))?;
+    let log_id_bytes = hex_decode(log_id_hex)
+        .with_context(|| format!("hex-decoding Rekor logID `{log_id_hex}`"))?;
+    let log_id_b64 = base64::engine::general_purpose::STANDARD.encode(&log_id_bytes);
+
+    let verification = entry
+        .get("verification")
+        .ok_or_else(|| anyhow::anyhow!("Rekor response missing `verification` block"))?;
+    let signed_entry_timestamp = verification
+        .get("signedEntryTimestamp")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Rekor response missing `verification.signedEntryTimestamp`")
+        })?
+        .to_string();
+    let proof = verification
+        .get("inclusionProof")
+        .ok_or_else(|| anyhow::anyhow!("Rekor response missing `verification.inclusionProof`"))?;
+    let proof_log_index = proof
+        .get("logIndex")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow::anyhow!("inclusionProof missing integer `logIndex`"))?;
+    let proof_tree_size = proof
+        .get("treeSize")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow::anyhow!("inclusionProof missing integer `treeSize`"))?;
+    let proof_root_hash_hex = proof
+        .get("rootHash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("inclusionProof missing string `rootHash`"))?;
+    let proof_root_hash_b64 = base64::engine::general_purpose::STANDARD
+        .encode(hex_decode(proof_root_hash_hex).context("hex-decoding inclusionProof.rootHash")?);
+    let proof_hashes_hex = proof
+        .get("hashes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let proof_hashes_b64: Vec<String> = proof_hashes_hex
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let h = h
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("inclusionProof.hashes[{i}] is not a string"))?;
+            let bytes = hex_decode(h)
+                .with_context(|| format!("hex-decoding inclusionProof.hashes[{i}] `{h}`"))?;
+            Ok::<_, anyhow::Error>(base64::engine::general_purpose::STANDARD.encode(bytes))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut inclusion_proof_obj = serde_json::Map::new();
+    inclusion_proof_obj.insert(
+        "logIndex".to_string(),
+        serde_json::Value::String(proof_log_index.to_string()),
+    );
+    inclusion_proof_obj.insert(
+        "rootHash".to_string(),
+        serde_json::Value::String(proof_root_hash_b64),
+    );
+    inclusion_proof_obj.insert(
+        "treeSize".to_string(),
+        serde_json::Value::String(proof_tree_size.to_string()),
+    );
+    inclusion_proof_obj.insert(
+        "hashes".to_string(),
+        serde_json::Value::Array(
+            proof_hashes_b64
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    // The Rekor REST response surfaces `checkpoint` as a single signed-note
+    // string; v0.3 wraps it as `{ "envelope": "<that string>" }`. Pass it
+    // through if present — it's optional in the spec.
+    if let Some(cp) = proof.get("checkpoint").and_then(|v| v.as_str()) {
+        inclusion_proof_obj.insert(
+            "checkpoint".to_string(),
+            serde_json::json!({ "envelope": cp }),
+        );
+    }
+
+    let attestation_bytes = fs::read(attestation_path)
+        .with_context(|| format!("reading {}", attestation_path.display()))?;
+    let attestation_digest = Sha256::digest(&attestation_bytes);
+    let attestation_digest_b64 =
+        base64::engine::general_purpose::STANDARD.encode(attestation_digest);
+    let ssh_sig_b64 = base64::engine::general_purpose::STANDARD.encode(ssh_sig_pem_bytes);
+
+    Ok(serde_json::json!({
+        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "verificationMaterial": {
+            "publicKey": {
+                "hint": key_fingerprint_sha256,
+            },
+            "tlogEntries": [{
+                "logIndex": log_index.to_string(),
+                "logId": { "keyId": log_id_b64 },
+                "kindVersion": { "kind": "hashedrekord", "version": "0.0.1" },
+                "integratedTime": integrated_time.to_string(),
+                "inclusionPromise": { "signedEntryTimestamp": signed_entry_timestamp },
+                "inclusionProof": serde_json::Value::Object(inclusion_proof_obj),
+                "canonicalizedBody": body_b64,
+            }],
+        },
+        "messageSignature": {
+            "messageDigest": {
+                "algorithm": "SHA2_256",
+                "digest": attestation_digest_b64,
+            },
+            "signature": ssh_sig_b64,
+        },
+    }))
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        bail!("hex string `{s}` has odd length");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow::anyhow!(e)))
+        .collect()
 }
 
 fn git_rev_parse(workspace_root: &Path, refname: &str) -> Result<String> {
@@ -611,5 +796,159 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "only-one-field\n").unwrap();
         assert!(compute_ssh_fingerprint(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn sigstore_bundle_v3_maps_rekor_response() {
+        // logID is a real-looking 32-byte hex; rootHash is 32 bytes; one
+        // sibling hash. Verify the v3 projection produces the right
+        // shape — mediaType, publicKey.hint, hex→base64, int→string.
+        let log_id_hex = "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b959181d";
+        // make it 64 chars (32 bytes): pad with leading zero
+        let log_id_hex = format!("0{log_id_hex}");
+        let root_hash_hex = "aa".repeat(32);
+        let sibling_hex = "bb".repeat(32);
+
+        let rekor_response = serde_json::json!({
+            "abc-uuid": {
+                "body": "Ym9keQ==", // base64 "body"
+                "logIndex": 12345,
+                "integratedTime": 1_700_000_000_i64,
+                "logID": log_id_hex,
+                "verification": {
+                    "signedEntryTimestamp": "U0VUYnl0ZXM=", // "SETbytes" b64
+                    "inclusionProof": {
+                        "logIndex": 12345,
+                        "treeSize": 67890,
+                        "rootHash": root_hash_hex,
+                        "hashes": [sibling_hex],
+                        "checkpoint": "rekor.sigstore.dev - 1193050959916656506\n8\nfoo\n",
+                    },
+                },
+            }
+        });
+
+        // Write a dummy attestation file so build_sigstore_bundle_v3 can hash it.
+        let att = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(att.path(), b"hello attestation").unwrap();
+
+        let ssh_sig_pem = b"-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n";
+
+        let bundle = build_sigstore_bundle_v3(
+            &rekor_response,
+            ssh_sig_pem,
+            att.path(),
+            "deadbeefcafebabe0000000000000000000000000000000000000000000000ff",
+        )
+        .unwrap();
+
+        // mediaType + version-3 marker.
+        assert_eq!(
+            bundle["mediaType"].as_str().unwrap(),
+            "application/vnd.dev.sigstore.bundle.v0.3+json"
+        );
+
+        // publicKey.hint pass-through.
+        assert_eq!(
+            bundle["verificationMaterial"]["publicKey"]["hint"]
+                .as_str()
+                .unwrap(),
+            "deadbeefcafebabe0000000000000000000000000000000000000000000000ff"
+        );
+        assert!(bundle["verificationMaterial"]["certificate"].is_null());
+
+        let entry = &bundle["verificationMaterial"]["tlogEntries"][0];
+
+        // int → string.
+        assert_eq!(entry["logIndex"].as_str().unwrap(), "12345");
+        assert_eq!(entry["integratedTime"].as_str().unwrap(), "1700000000");
+
+        // logID hex → base64.
+        let log_id_b64 = entry["logId"]["keyId"].as_str().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(log_id_b64)
+            .unwrap();
+        assert_eq!(decoded, hex_decode(&log_id_hex).unwrap());
+
+        // Pass-through fields.
+        assert_eq!(entry["canonicalizedBody"].as_str().unwrap(), "Ym9keQ==");
+        assert_eq!(
+            entry["inclusionPromise"]["signedEntryTimestamp"]
+                .as_str()
+                .unwrap(),
+            "U0VUYnl0ZXM="
+        );
+        assert_eq!(
+            entry["kindVersion"]["kind"].as_str().unwrap(),
+            "hashedrekord"
+        );
+        assert_eq!(entry["kindVersion"]["version"].as_str().unwrap(), "0.0.1");
+
+        // inclusionProof: ints→strings; hex→base64.
+        let ip = &entry["inclusionProof"];
+        assert_eq!(ip["logIndex"].as_str().unwrap(), "12345");
+        assert_eq!(ip["treeSize"].as_str().unwrap(), "67890");
+        let root_b64 = ip["rootHash"].as_str().unwrap();
+        let root_bytes = base64::engine::general_purpose::STANDARD
+            .decode(root_b64)
+            .unwrap();
+        assert_eq!(root_bytes, hex_decode(&root_hash_hex).unwrap());
+        let hashes = ip["hashes"].as_array().unwrap();
+        assert_eq!(hashes.len(), 1);
+        let sib_bytes = base64::engine::general_purpose::STANDARD
+            .decode(hashes[0].as_str().unwrap())
+            .unwrap();
+        assert_eq!(sib_bytes, hex_decode(&sibling_hex).unwrap());
+        // checkpoint string → { envelope: <string> }.
+        assert_eq!(
+            ip["checkpoint"]["envelope"].as_str().unwrap(),
+            "rekor.sigstore.dev - 1193050959916656506\n8\nfoo\n"
+        );
+
+        // messageSignature: SHA2_256 + base64(sha256(attestation)).
+        let ms = &bundle["messageSignature"];
+        assert_eq!(
+            ms["messageDigest"]["algorithm"].as_str().unwrap(),
+            "SHA2_256"
+        );
+        let claimed = base64::engine::general_purpose::STANDARD
+            .decode(ms["messageDigest"]["digest"].as_str().unwrap())
+            .unwrap();
+        let expected: [u8; 32] = Sha256::digest(b"hello attestation").into();
+        assert_eq!(claimed, expected);
+        // signature: base64(ssh-sig PEM bytes verbatim).
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(ms["signature"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(sig_bytes, ssh_sig_pem);
+    }
+
+    #[test]
+    fn sigstore_bundle_v3_omits_checkpoint_when_absent() {
+        let rekor_response = serde_json::json!({
+            "uuid": {
+                "body": "Ym9keQ==",
+                "logIndex": 1,
+                "integratedTime": 2,
+                "logID": "00".repeat(32),
+                "verification": {
+                    "signedEntryTimestamp": "AAA=",
+                    "inclusionProof": {
+                        "logIndex": 1,
+                        "treeSize": 1,
+                        "rootHash": "11".repeat(32),
+                        "hashes": [],
+                    },
+                },
+            }
+        });
+        let att = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(att.path(), b"x").unwrap();
+        let bundle = build_sigstore_bundle_v3(&rekor_response, b"PEM", att.path(), "ab").unwrap();
+        assert!(
+            bundle["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]["checkpoint"]
+                .is_null(),
+            "checkpoint key must be absent when Rekor omits it"
+        );
     }
 }

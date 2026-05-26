@@ -31,6 +31,11 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 
+pub mod trust_shapes;
+pub use trust_shapes::{
+    ArtifactManifestRef, HumanAttestationRef, PreviousRelease, ReleaseIndex, TrustConstants,
+};
+
 /// The single schema version this crate understands. Bumping templates
 /// (adding/removing/changing a claim) requires shipping a new version
 /// alongside the old, then retiring the old over an overlap window.

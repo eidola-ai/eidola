@@ -4,7 +4,8 @@
 //! Two cryptographic checks:
 //!
 //! 1. **SignedEntryTimestamp (SET).** Rekor signs an RFC 8785-canonicalized
-//!    JSON of `{body, integratedTime, logIndex, logID}` with one of its
+//!    JSON of `{body, integratedTime, logID, logIndex}` (keys ordered
+//!    lexicographically by ASCII codepoint per RFC 8785) with one of its
 //!    log keys (we pin them via the embedded Sigstore TrustedRoot). The
 //!    SET is the per-entry "yes, I logged this" assertion.
 //!
@@ -196,12 +197,17 @@ pub fn verify_rekor_entry(
             ),
         })?;
     let canonical_body_b64 = base64_std_encode(canonical_body);
+    // Keys ordered lexicographically by ASCII codepoint: body (0x62) <
+    // integratedTime (0x69) < logID (0x6C 0x6F 0x67 0x49 0x44) <
+    // logIndex (0x6C 0x6F 0x67 0x49 0x6E). `D` (0x44) < `n` (0x6E), so
+    // logID precedes logIndex. Must match the human side; both must
+    // match what Rekor actually signed.
     let signed_payload = format!(
-        r#"{{"body":"{body}","integratedTime":{it},"logIndex":{li},"logID":"{lid}"}}"#,
+        r#"{{"body":"{body}","integratedTime":{it},"logID":"{lid}","logIndex":{li}}}"#,
         body = canonical_body_b64,
         it = integrated_time,
-        li = log_index,
         lid = hex_encode(log_id),
+        li = log_index,
     );
     verify_rekor_signature(key, signed_payload.as_bytes(), set_bytes)?;
 

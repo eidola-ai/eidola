@@ -61,6 +61,7 @@ Generated into the client at compile time by
 | `SERVER_SNP_MEASUREMENT`                | `artifact-manifest.json` `enclave.snp_measurement`  | SEV-SNP launch measurement of the paired server enclave                                            |
 | `SERVER_TDX_RTMR1` / `SERVER_TDX_RTMR2` | `artifact-manifest.json` `enclave.tdx_measurement`  | TDX runtime measurements of the paired server enclave                                              |
 | `TRUSTED_ATTESTANT_FINGERPRINTS`        | `trust-constants.json`                              | `sha256(OpenSSH wire-format pubkey)` in hex, for each authorized human-attestant key               |
+| `MIN_HUMAN_ATTESTATIONS`                | `trust-constants.json`                              | Minimum independently-verified human attestations a release must carry (pinned here, not in `release.json`, so a forged index cannot lower it) |
 | `EXPECTED_CI_IDENTITY_PATTERN`          | `trust-constants.json`                              | Fulcio cert SAN pattern the release-signing workflow's OIDC identity must match                    |
 | `EXPECTED_CI_ISSUER`                    | `trust-constants.json`                              | OIDC issuer (`https://token.actions.githubusercontent.com`)                                        |
 | `SUPPORTED_RELEASE_SCHEMA_VERSIONS`     | `trust-constants.json`                              | Integer `schema_version` values of `release.json` this client will parse                           |
@@ -87,14 +88,17 @@ without enforcing it. (Product versions — `release.version`,
 `release.previous_release.version` — remain semver strings, since those
 *do* benefit from ordering and matching the Rust/Cargo ecosystem.)
 
-| Document                | Schema                                                | Notes                                                                       |
-| ----------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------- |
-| `artifact-manifest.json` | (no JSON Schema file; format owned by `scripts/artifact-manifest.sh`) | `schema_version: 1`. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). |
-| `release.json`          | `releases/schema/release-v1.schema.json`              | Unsigned index; cross-checked via referenced documents (see caveat below)   |
-| `attestation.json`      | `releases/schema/attestation-v1.schema.json`          | Signed by the attestant via SSH (`ssh-keygen -Y sign`), logged to Rekor as a `hashedrekord` |
-| Templates               | `releases/schema/attestation-templates-v1.json`       | Source of truth for both the release-tool and the verifier's equality check |
+Each document's shape is owned by the Rust `serde` types shared between the release-tool and the verifier — there is no separately-maintained JSON Schema file. Drift between signing and verifying is impossible because both sides deserialize from the same struct definitions.
 
-### `release.json` carries no hashes
+| Document                 | Shape (source of truth)                                                                                   | Notes                                                                                       |
+| ------------------------ | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `artifact-manifest.json` | format owned by `scripts/artifact-manifest.sh`, consumed as raw JSON in `eidola-app-core/build.rs`        | `schema_version: 1`. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC).              |
+| `release.json`           | `eidola_attestation::ReleaseIndex` — `crates/eidola-attestation/src/trust_shapes.rs`                      | Unsigned URL-only index; cross-checked via referenced documents (see caveat below)          |
+| `attestation.json`       | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via SSH (`ssh-keygen -Y sign`), logged to Rekor as a `hashedrekord` |
+| `trust-constants.json`   | `eidola_attestation::TrustConstants` — `crates/eidola-attestation/src/trust_shapes.rs`                    | Pinned trust values baked into the verifier at build time                                   |
+| Templates                | `releases/schema/attestation-templates-v1.json` (data, not a schema)                                      | Pinned claim templates the verifier re-renders during equality checks                       |
+
+### `release.json` is a pure URL index — no hashes, no policy
 
 `release.json` is an *index*: URLs only. Hashes (the manifest's, each
 attestation's, each Sigstore bundle's) live in the Sigstore bundles
@@ -108,6 +112,13 @@ For the same reason, `release.json` does **not** carry
 material — those are pinned in the client's embedded trust root or
 inherent in the Sigstore bundle. Echoing them in `release.json` would let
 an adversary downgrade trust by handing the client a tampered index.
+
+Policy values (minimum-attestation threshold, allowed identities,
+allowed schema versions) follow the same rule. They live exclusively in
+the *embedded* trust root of the previous client (see
+[`MIN_HUMAN_ATTESTATIONS`](#whats-pinned) and friends). Otherwise an
+attacker who produced a single forged attestation could also forge a
+`release.json` that lowered the threshold to 1.
 
 ### Signing systems: split by surface
 
@@ -186,8 +197,6 @@ a real-but-stale release. Mitigations for v1:
 ```
 releases/
   schema/
-    release-v1.schema.json
-    attestation-v1.schema.json
     attestation-templates-v1.json         # pinned claim templates
   trust/
     trust-constants.json                  # non-derivable trust values
@@ -300,19 +309,35 @@ enclave measurement. Changing either changes every future URL, so:
 
 ## Known gaps
 
-Two cryptographic checks on the CI Sigstore-bundle path are intentionally
-**not** implemented today. The verifier is still load-bearing without
-them, but they each close one specific class of attack and should land
-as follow-up work.
+A consolidated list of every piece of the trust chain that's
+intentionally deferred. The verifier is still load-bearing without
+these — each one closes a specific class of attack that's already
+constrained by other parts of the chain — but they're all worth
+landing as follow-ups.
+
+### Cryptographic verifier
 
 | Gap | What it would catch | Why it's deferred |
 | --- | --- | --- |
 | **SCT (Signed Certificate Timestamp) verification** in the Fulcio leaf cert | A malicious or compromised Fulcio issuing certs for identities it shouldn't — the SCT proves the cert was logged in a public CT log | The OIDC-identity match + Fulcio chain walk are the primary binding; this is defense-in-depth |
 | **Rekor checkpoint signature** verification | The Rekor instance forking a side-tree just for us (the inclusion proof we compute is mathematically valid but roots to a tree the public never sees) | The SET already requires the Rekor key to vouch for the entry; checkpoint adds independence-from-private-forks |
+| **Artifact-hash check at install time** | A tampered binary download — the *manifest* is signed and content-verified, but the bytes we'd run aren't yet hashed against the manifest's declared digests | Lives naturally in step 5 (install/replace), once we know which platform's artifact the user is downloading. The verifier already proves `artifact-manifest.json` itself is authentic |
+| **Multi-hop / fast-forward continuity** | A client that skips multiple releases (e.g. v1.0 → v1.5, missing v1.1–v1.4) — today the continuity gate requires strict equality between `release.previous_release.git_commit` and the installed commit, so an out-of-date client must update through every release in order | Strictly sequential is the safer floor; relaxing to "fast-forward reachable via GitHub commits API" is a small follow-up that's only worth doing once the cadence makes sequential updates painful |
 
-Both are noted at the top of
+These are noted at the top of
 [`crates/eidola-app-core/src/updater/ci_sigstore/mod.rs`](../crates/eidola-app-core/src/updater/ci_sigstore/mod.rs)
-and `rekor.rs` so anyone reading the verifier code sees them up front.
+and `rekor.rs` (the two crypto-side gaps) and at the
+`TODO (step 5)` marker on `verify_each_artifact_hash` in
+[`crates/eidola-app-core/src/updater/mod.rs`](../crates/eidola-app-core/src/updater/mod.rs)
+(the install-side gap) so anyone reading the verifier code sees them up front.
+
+### Operational
+
+| Gap | Current behavior | Future |
+| --- | --- | --- |
+| **Install / atomic-replace** | `eidola update` runs the full verification pipeline and prints the verified attestation prose, but does not download or swap the binary | Step 5: download the artifact for the user's platform from `artifact-manifest.json`, hash-verify, atomic-replace + restart. Platform-specific (CLI = file swap; macOS GUI = staged swap on next launch). |
+| **Single-attestant policy** | `MIN_HUMAN_ATTESTATIONS` (embedded in the client, sourced from `releases/trust/trust-constants.json`) is `1` in current releases — only one engineer needs to attest for a release to verify | Once a co-attestant key is provisioned and added to `trusted_attestant_fingerprints`, bumping `min_human_attestations` to `2` (in a release signed under the *current* threshold) makes every subsequent release require independent corroboration. The verifier already supports arbitrary M-of-N; we just haven't generated the second key yet. |
+| **First-install downgrade** | A fresh client (no prior installed `git_commit`) bypasses continuity, so an adversary serving an internally-consistent older `release.json` could route them onto a real-but-stale release | Mitigations today: client surfaces `released_at`, and we make a public release-cadence statement. Permanent fix: ship a freshness anchor (witness checkpoint, Bitcoin-block reference, or co-signed signed-tree-head). See the [Unsigned `release.json`](#unsigned-releasejson--known-caveat-with-mitigation) section above. |
 
 ## Acknowledgements
 

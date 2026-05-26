@@ -1,5 +1,10 @@
 //! `release-tool verify <tag>` — fetch and verify the CI-built artifact
 //! manifest, then show the diff against the prior release for human review.
+//!
+//! Sigstore verification goes through `eidola-app-core`'s pure-Rust
+//! verifier — the same code path that ships to users. Keeping a single
+//! implementation eliminates the "two versions of the same check drift
+//! apart" risk that the previous `cosign verify-blob` shell-out carried.
 
 use std::fs;
 use std::path::PathBuf;
@@ -7,8 +12,6 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-
-use crate::trust;
 
 pub struct Args {
     pub workspace_root: PathBuf,
@@ -18,10 +21,8 @@ pub struct Args {
 
 pub fn run(args: Args) -> Result<()> {
     require_tool("gh")?;
-    require_tool("cosign")?;
     require_tool("git")?;
 
-    let trust = trust::load(&args.workspace_root)?;
     let prev_tag = previous_release_tag(&args.workspace_root, &args.tag).ok();
 
     let tmp = tempfile::tempdir().context("creating tempdir")?;
@@ -43,30 +44,25 @@ pub fn run(args: Args) -> Result<()> {
     )?;
 
     println!("== verifying Sigstore bundle ==");
-    let certificate_identity_regexp =
-        identity_regex_from_pattern(&trust.expected_ci_identity_pattern);
-    let status = Command::new("cosign")
-        .args([
-            "verify-blob",
-            manifest_path.to_str().unwrap(),
-            "--bundle",
-            bundle_path.to_str().unwrap(),
-            "--certificate-identity-regexp",
-            &certificate_identity_regexp,
-            "--certificate-oidc-issuer",
-            &trust.expected_ci_issuer,
-        ])
-        .status()
-        .context("running `cosign verify-blob`")?;
-    if !status.success() {
-        bail!(
-            "cosign verify-blob failed — CI signature on artifact-manifest.json could not be verified \
-             against expected identity `{}` / issuer `{}`",
-            certificate_identity_regexp,
-            trust.expected_ci_issuer
-        );
-    }
+    let manifest_bytes =
+        fs::read(&manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?;
+    let bundle_bytes =
+        fs::read(&bundle_path).with_context(|| format!("reading {}", bundle_path.display()))?;
+    let trust = eidola_app_core::updater::trust::load()
+        .map_err(|e| anyhow::anyhow!("loading sigstore trust root: {e}"))?;
+    let verified = eidola_app_core::updater::ci_sigstore::verify_ci_signature(
+        &manifest_bytes,
+        &bundle_bytes,
+        &trust,
+    )
+    .map_err(|e| anyhow::anyhow!("verifying CI signature: {e}"))?;
     println!("  ✓ CI signature verified");
+    println!("      identity: {}", verified.ci_identity);
+    println!("      issuer:   {}", verified.ci_issuer);
+    println!(
+        "      rekor:    https://search.sigstore.dev/?logIndex={}",
+        verified.rekor_log_index
+    );
 
     println!("== comparing CI manifest with committed manifest ==");
     let committed_path = args.workspace_root.join("artifact-manifest.json");
@@ -230,40 +226,9 @@ fn show_git_diff(workspace_root: &std::path::Path, from: &str, to: &str) -> Resu
     Ok(())
 }
 
-/// Cosign accepts a regex for the certificate identity; `{}` doesn't need
-/// escaping (literal `*` in our pin's `@refs/tags/v*` is what we want as a
-/// wildcard). Convert the trust-constants glob into a regex.
-fn identity_regex_from_pattern(pattern: &str) -> String {
-    // Escape everything except `*`, then translate `*` → `.*`. Anchor with ^…$.
-    let mut out = String::from("^");
-    for ch in pattern.chars() {
-        match ch {
-            '*' => out.push_str(".*"),
-            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' | '^' | '$' | '?' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            other => out.push(other),
-        }
-    }
-    out.push('$');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn identity_regex_escapes_dots_and_wildcards_star() {
-        let r = identity_regex_from_pattern(
-            "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*",
-        );
-        assert!(r.starts_with('^'));
-        assert!(r.ends_with('$'));
-        assert!(r.contains(r"\."));
-        assert!(r.contains(".*"));
-    }
 
     #[test]
     fn canonical_json_is_order_independent() {

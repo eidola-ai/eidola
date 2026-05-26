@@ -21,10 +21,13 @@
 //! SSH signatures + Rekor `hashedrekord`. Both end up in the same Rekor
 //! transparency log; the verifier dispatches on signature format.
 //!
-//! Shells out to `gh`, `cosign`, `ssh-keygen`, and `git`. All must be on
-//! PATH. `ssh-keygen -Y sign` automatically uses `SSH_AUTH_SOCK` to reach
-//! agent-held keys (Secretive, 1Password, FIDO2-SK, …), so the engineer
-//! does not need the private key on disk.
+//! Shells out to `gh`, `ssh-keygen`, and `git`. All must be on PATH. CI
+//! signature verification goes through `eidola-app-core`'s pure-Rust
+//! verifier — the same code path that ships to users — so `cosign` is no
+//! longer required on the engineer's PATH. `ssh-keygen -Y sign`
+//! automatically uses `SSH_AUTH_SOCK` to reach agent-held keys (Secretive,
+//! 1Password, FIDO2-SK, …), so the engineer does not need the private key
+//! on disk.
 
 use std::path::PathBuf;
 

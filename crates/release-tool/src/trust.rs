@@ -5,30 +5,17 @@
 //! values: when a trust-root rotation lands, the engineer pulls the new
 //! commit and the next `release-tool verify` reads the new constants
 //! without needing a fresh `cargo build`.
+//!
+//! The shared [`TrustConstants`] struct lives in `eidola-attestation` so
+//! the verifier (in `eidola-app-core`'s updater) and this tool agree on
+//! the on-disk shape byte-for-byte.
 
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
-pub struct TrustConstants {
-    pub schema_version: u32,
-    pub trusted_attestant_fingerprints: Vec<String>,
-    pub expected_ci_identity_pattern: String,
-    pub expected_ci_issuer: String,
-    #[allow(dead_code)]
-    pub supported_release_schema_versions: Vec<u32>,
-    #[allow(dead_code)]
-    pub supported_attestation_schema_versions: Vec<u32>,
-    #[allow(dead_code)]
-    pub update_discovery_url: String,
-    #[allow(dead_code)]
-    pub server_url_template: String,
-    #[allow(dead_code)]
-    pub server_url_hash_length: u32,
-}
+pub use eidola_attestation::TrustConstants;
 
 pub fn load(workspace_root: &Path) -> Result<TrustConstants> {
     let path = workspace_root.join("releases/trust/trust-constants.json");

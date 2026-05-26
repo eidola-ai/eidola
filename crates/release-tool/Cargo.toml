@@ -15,6 +15,7 @@ anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+eidola-app-core = { path = "../eidola-app-core" }
 eidola-attestation = { path = "../eidola-attestation" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "blocking"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }

@@ -35,11 +35,10 @@
 //!
 //! Both are tracked in `releases/TRUST-ROOT.md` under "Known gaps."
 
-use serde::Deserialize;
-
 use crate::error::AppError;
 use crate::trust_root;
 
+use super::sigstore_bundle::CosignBundle;
 use super::trust::TrustedRoot;
 
 mod cert;
@@ -330,117 +329,6 @@ fn base64_std_decode(s: &str, field: &str) -> Result<Vec<u8>, AppError> {
         .map_err(|e| AppError::Update {
             message: format!("base64-decoding `{field}`: {e}"),
         })
-}
-
-// ---------------------------------------------------------------------------
-// Cosign Sigstore Bundle v0.3 JSON shape — the subset we consume
-// ---------------------------------------------------------------------------
-//
-// Schema reference:
-// https://github.com/sigstore/protobuf-specs/blob/main/protos/sigstore_bundle.proto
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CosignBundle {
-    media_type: String,
-    verification_material: VerificationMaterial,
-    #[serde(default)]
-    message_signature: Option<MessageSignature>,
-    // DsseEnvelope variant ignored for now — cosign sign-blob emits
-    // messageSignature. If we later sign in-toto attestations, the parser
-    // will need to grow a `dsseEnvelope` arm here.
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct VerificationMaterial {
-    /// Either `certificate` (cosign v2+) or `x509CertificateChain` (older
-    /// cosign / sigstore-rs); we only support the new shape today.
-    #[serde(default)]
-    certificate: Option<RawCert>,
-    tlog_entries: Vec<TlogEntry>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawCert {
-    raw_bytes: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MessageSignature {
-    message_digest: MessageDigest,
-    signature: String,
-}
-
-#[derive(Deserialize)]
-struct MessageDigest {
-    algorithm: String,
-    digest: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TlogEntry {
-    /// Protobuf int64 — sigstore renders as a JSON string.
-    log_index: String,
-    #[allow(dead_code)]
-    log_id: LogId,
-    #[allow(dead_code)]
-    kind_version: KindVersion,
-    /// Protobuf int64 — JSON string of seconds since epoch.
-    #[allow(dead_code)]
-    integrated_time: String,
-    #[serde(default)]
-    inclusion_promise: Option<InclusionPromise>,
-    #[serde(default)]
-    inclusion_proof: Option<InclusionProof>,
-    canonicalized_body: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LogId {
-    #[allow(dead_code)]
-    key_id: String,
-}
-
-#[derive(Deserialize)]
-struct KindVersion {
-    #[allow(dead_code)]
-    kind: String,
-    #[allow(dead_code)]
-    version: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InclusionPromise {
-    signed_entry_timestamp: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InclusionProof {
-    #[allow(dead_code)]
-    log_index: String,
-    root_hash: String,
-    #[allow(dead_code)]
-    tree_size: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    hashes: Vec<String>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    checkpoint: Option<RawCheckpoint>,
-}
-
-#[derive(Deserialize)]
-struct RawCheckpoint {
-    #[allow(dead_code)]
-    #[serde(default)]
-    envelope: String,
 }
 
 #[cfg(test)]

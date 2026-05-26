@@ -3,34 +3,45 @@
 //! Engineers sign the attestation JSON file with their hardware-backed
 //! SSH key via `ssh-keygen -Y sign` (namespace `eidola-attestation@v1`),
 //! then post the resulting signature to Sigstore Rekor as a
-//! `hashedrekord` entry. The release-tool saves Rekor's response as the
-//! `.bundle.json` companion file. This module reads that bundle, walks
-//! every cryptographic binding, and returns the verified facts.
+//! `hashedrekord` entry. `release-tool attest` packages the result into a
+//! **Sigstore Bundle v0.3** companion file (the same protobuf-JSON shape
+//! `cosign sign-blob --bundle` produces, just with a `publicKey.hint`
+//! instead of a Fulcio leaf cert in `verificationMaterial`). This module
+//! reads that bundle, walks every cryptographic binding, and returns the
+//! verified facts.
 //!
 //! Pipeline (one attestation):
 //!
-//! 1. **Bundle parse.** Extract the rekor log entry from
-//!    `{schema_version, rekor_log_entry: {<uuid>: {...}}}`.
-//! 2. **Body parse.** Decode the entry's `body` (base64) into the
-//!    canonical hashedrekord JSON; require `kind=hashedrekord`,
+//! 1. **Bundle parse.** Deserialize as
+//!    [`super::sigstore_bundle::CosignBundle`]; require `mediaType` to
+//!    start with `application/vnd.dev.sigstore.bundle` and exactly one
+//!    tlog entry.
+//! 2. **SSH-SIG extraction.** Base64-decode `messageSignature.signature`
+//!    to the PEM-wrapped SSH-SIG blob.
+//! 3. **Body parse.** Base64-decode the tlog entry's `canonicalizedBody`
+//!    into the canonical hashedrekord JSON; require `kind=hashedrekord`,
 //!    `apiVersion=0.0.1`, `data.hash.algorithm=sha256`.
-//! 3. **Body binding.** The body's `data.hash.value` must equal
-//!    `sha256(attestation_bytes)` in hex.
-//! 4. **Pubkey extraction + fingerprint check.** Decode
-//!    `body.signature.publicKey.content` (base64) into the OpenSSH
-//!    pubkey line, parse it with `ssh-key`, compute `sha256(wire-format
-//!    pubkey bytes)`, assert the hex is in
-//!    [`trust_root::TRUSTED_ATTESTANT_FINGERPRINTS`].
-//! 5. **SSH signature verify.** Decode `body.signature.content`
-//!    (base64) into the PEM-wrapped SSH signature blob, parse with
-//!    `ssh-key`, verify against `attestation_bytes` with the namespace
+//! 4. **Body binding.** The body's `data.hash.value` (hex) must equal
+//!    `sha256(attestation_bytes)`. The body's `messageDigest.digest` must
+//!    independently equal the same sha256.
+//! 5. **Pubkey extraction + fingerprint check.** Decode
+//!    `body.signature.publicKey.content` (base64) into the OpenSSH pubkey
+//!    line, parse with `ssh-key`, compute the standard SHA-256
+//!    fingerprint. Require it equal both
+//!    [`super::sigstore_bundle::RawPublicKeyHint::hint`] *and* a member
+//!    of [`trust_root::TRUSTED_ATTESTANT_FINGERPRINTS`].
+//! 6. **SSH signature verify.** Parse the PEM SSH-SIG from step 2,
+//!    verify against `attestation_bytes` under the namespace
 //!    `eidola-attestation@v1`.
-//! 6. **SET verify.** Reconstruct the canonical JSON
-//!    `{"body":"<b64>","integratedTime":N,"logIndex":N,"logID":"<hex>"}`,
+//! 7. **SET verify.** Reconstruct the canonical JSON
+//!    `{"body":"<b64>","integratedTime":N,"logID":"<hex>","logIndex":N}`,
 //!    select the pinned Rekor key by `logID`, ECDSA-P256 or Ed25519
-//!    verify the SET signature against it.
-//! 7. **Merkle inclusion proof.** RFC 6962 walk via
+//!    verify the SET signature against it. (`logIndex`/`integratedTime`
+//!    arrive as protobuf-JSON strings — parsed to ints before formatting.)
+//! 8. **Merkle inclusion proof.** RFC 6962 walk via
 //!    [`super::merkle`]; recomputed root must equal `rootHash`.
+//!    Inclusion proof hashes and `rootHash` are base64 in v0.3 (the
+//!    legacy Rekor REST API used hex).
 //!
 //! See also the known gap in `releases/TRUST-ROOT.md` on Rekor
 //! checkpoint signature verification (same caveat as the CI side).
@@ -43,6 +54,7 @@ use crate::error::AppError;
 use crate::trust_root;
 
 use super::merkle;
+use super::sigstore_bundle::CosignBundle;
 use super::trust::{KeyDetails, RekorKey, TrustedRoot};
 use super::{ReleaseIndex, VerifiedAttestation, VerifiedClaim};
 
@@ -61,31 +73,87 @@ pub fn verify_human_attestation(
 ) -> Result<VerifiedAttestation, AppError> {
     let attestation_sha256: [u8; 32] = Sha256::digest(attestation_bytes).into();
 
-    // ── 1. Bundle parse ──────────────────────────────────────────────
-    let bundle: AttestationBundle =
+    // ── 1. Bundle parse (Sigstore Bundle v0.3) ──────────────────────
+    let bundle: CosignBundle =
         serde_json::from_slice(bundle_bytes).map_err(|e| AppError::Update {
             message: format!("parsing attestation bundle JSON: {e}"),
         })?;
-    if bundle.schema_version != 1 {
+    if !bundle
+        .media_type
+        .starts_with("application/vnd.dev.sigstore.bundle")
+    {
         return Err(AppError::Update {
             message: format!(
-                "attestation bundle schema_version {} not supported (expected 1)",
-                bundle.schema_version
+                "attestation bundle has unexpected mediaType `{}` (expected \
+                 `application/vnd.dev.sigstore.bundle.*`)",
+                bundle.media_type
             ),
         });
     }
-    if bundle.rekor_log_entry.len() != 1 {
+    let vm = &bundle.verification_material;
+    if vm.tlog_entries.len() != 1 {
         return Err(AppError::Update {
             message: format!(
-                "attestation bundle has {} rekor log entries, expected exactly 1",
-                bundle.rekor_log_entry.len()
+                "attestation bundle has {} tlog entries, expected exactly 1",
+                vm.tlog_entries.len()
             ),
         });
     }
-    let entry = bundle.rekor_log_entry.into_values().next().unwrap();
+    let entry = &vm.tlog_entries[0];
 
-    // ── 2. Body parse ────────────────────────────────────────────────
-    let body_bytes = base64_std_decode(&entry.body, "rekor_log_entry.body")?;
+    // Human attestations use the `publicKey` arm of the `verificationMaterial`
+    // oneof (vs. cosign's `certificate`). Fail loudly on a CI-shaped bundle
+    // arriving here — that's a mismatched-verifier bug.
+    let pubkey_hint = vm.public_key.as_ref().ok_or_else(|| AppError::Update {
+        message: "attestation bundle has no `verificationMaterial.publicKey` — \
+                      human attestations must carry a public key hint, not a Fulcio cert"
+            .into(),
+    })?;
+    if vm.certificate.is_some() {
+        return Err(AppError::Update {
+            message: "attestation bundle carries both `publicKey` and `certificate` in \
+                      `verificationMaterial`; the protobuf `oneof content` requires exactly one"
+                .into(),
+        });
+    }
+
+    // ── 2. messageSignature: SSH-SIG PEM bytes ──────────────────────
+    let msg_sig = bundle
+        .message_signature
+        .as_ref()
+        .ok_or_else(|| AppError::Update {
+            message: "attestation bundle has no `messageSignature` — human attestations carry the \
+                  PEM SSH-SIG blob there"
+                .into(),
+        })?;
+    if msg_sig.message_digest.algorithm != "SHA2_256" {
+        return Err(AppError::Update {
+            message: format!(
+                "attestation bundle messageDigest.algorithm is `{}`, expected `SHA2_256`",
+                msg_sig.message_digest.algorithm
+            ),
+        });
+    }
+    let claimed_digest = base64_std_decode(&msg_sig.message_digest.digest, "messageDigest.digest")?;
+    if claimed_digest.len() != 32 {
+        return Err(AppError::Update {
+            message: format!(
+                "messageDigest.digest is {} bytes, expected 32 (sha256)",
+                claimed_digest.len()
+            ),
+        });
+    }
+    if claimed_digest != attestation_sha256 {
+        return Err(AppError::Update {
+            message: "attestation sha256 does not match the bundle's claimed messageDigest \
+                      — the wrong attestation or bundle file was downloaded"
+                .into(),
+        });
+    }
+    let sig_pem_bytes = base64_std_decode(&msg_sig.signature, "messageSignature.signature")?;
+
+    // ── 3. Body parse ────────────────────────────────────────────────
+    let body_bytes = base64_std_decode(&entry.canonicalized_body, "tlog canonicalizedBody")?;
     let body: HashedRekordBody =
         serde_json::from_slice(&body_bytes).map_err(|e| AppError::Update {
             message: format!("parsing rekor entry body as hashedrekord: {e}"),
@@ -107,7 +175,7 @@ pub fn verify_human_attestation(
         });
     }
 
-    // ── 3. Body binding to attestation bytes ─────────────────────────
+    // ── 4. Body binding to attestation bytes ─────────────────────────
     let body_hash_bytes = hex_decode(&body.spec.data.hash.value).map_err(|e| AppError::Update {
         message: format!("hex-decoding attestation rekor body hash: {e}"),
     })?;
@@ -119,7 +187,7 @@ pub fn verify_human_attestation(
         });
     }
 
-    // ── 4. Pubkey + fingerprint ──────────────────────────────────────
+    // ── 5. Pubkey + fingerprint ──────────────────────────────────────
     let pubkey_pem_bytes = base64_std_decode(
         &body.spec.signature.public_key.content,
         "attestation rekor publicKey.content",
@@ -129,6 +197,15 @@ pub fn verify_human_attestation(
     })?;
     let pubkey = parse_openssh_pubkey(pubkey_text)?;
     let fingerprint_hex = ssh_pubkey_fingerprint_hex(&pubkey);
+    if !fingerprint_hex.eq_ignore_ascii_case(&pubkey_hint.hint) {
+        return Err(AppError::Update {
+            message: format!(
+                "attestation rekor body pubkey fingerprint `{fingerprint_hex}` ≠ \
+                 verificationMaterial.publicKey.hint `{}` — bundle is inconsistent",
+                pubkey_hint.hint
+            ),
+        });
+    }
     if !trust_root::TRUSTED_ATTESTANT_FINGERPRINTS
         .iter()
         .any(|fp| fp.eq_ignore_ascii_case(&fingerprint_hex))
@@ -142,13 +219,9 @@ pub fn verify_human_attestation(
         });
     }
 
-    // ── 5. SSH signature ─────────────────────────────────────────────
-    let sig_pem_bytes = base64_std_decode(
-        &body.spec.signature.content,
-        "attestation rekor signature.content",
-    )?;
+    // ── 6. SSH signature ─────────────────────────────────────────────
     let sig_pem = std::str::from_utf8(&sig_pem_bytes).map_err(|e| AppError::Update {
-        message: format!("attestation rekor signature.content is not UTF-8 PEM: {e}"),
+        message: format!("messageSignature.signature is not UTF-8 PEM: {e}"),
     })?;
     let ssh_sig = ssh_key::SshSig::from_pem(sig_pem.as_bytes()).map_err(|e| AppError::Update {
         message: format!("parsing SSH signature PEM: {e}"),
@@ -170,16 +243,18 @@ pub fn verify_human_attestation(
             message: format!("SSH signature failed cryptographic verify: {e}"),
         })?;
 
-    // ── 6. SET signature ─────────────────────────────────────────────
-    let log_id_bytes = hex_decode(&entry.log_id).map_err(|e| AppError::Update {
-        message: format!("hex-decoding rekor logID: {e}"),
-    })?;
+    // ── 7. SET signature ─────────────────────────────────────────────
+    // v0.3 wire encoding: `logId.keyId` is base64 (was hex in the old
+    // Rekor REST envelope); `logIndex` / `integratedTime` arrive as
+    // protobuf-JSON strings, but the canonical SET payload formats them
+    // as JSON numbers.
+    let log_id_bytes = base64_std_decode(&entry.log_id.key_id, "tlogEntry.logId.keyId")?;
     let log_id: [u8; 32] = log_id_bytes
         .as_slice()
         .try_into()
         .map_err(|_| AppError::Update {
             message: format!(
-                "rekor logID is {} bytes, expected 32 (sha256)",
+                "tlogEntry.logId.keyId is {} bytes, expected 32 (sha256)",
                 log_id_bytes.len()
             ),
         })?;
@@ -191,31 +266,57 @@ pub fn verify_human_attestation(
             message: format!(
                 "no pinned Rekor key matches the bundle's logID `{}` — \
                  trusted root is stale, or this bundle is from a different Rekor instance",
-                entry.log_id
+                hex_encode(&log_id)
             ),
         })?;
+    let log_index: u64 = entry.log_index.parse().map_err(|e| AppError::Update {
+        message: format!(
+            "tlogEntry.logIndex `{}` is not a valid u64: {e}",
+            entry.log_index
+        ),
+    })?;
+    let integrated_time: i64 = entry
+        .integrated_time
+        .parse()
+        .map_err(|e| AppError::Update {
+            message: format!(
+                "tlogEntry.integratedTime `{}` is not a valid i64: {e}",
+                entry.integrated_time
+            ),
+        })?;
+    let inclusion_promise = entry
+        .inclusion_promise
+        .as_ref()
+        .ok_or_else(|| AppError::Update {
+            message: "tlog entry missing inclusionPromise (SignedEntryTimestamp) — required for \
+                  transparency-log binding"
+                .into(),
+        })?;
     let set_bytes = base64_std_decode(
-        &entry.verification.signed_entry_timestamp,
-        "verification.signedEntryTimestamp",
+        &inclusion_promise.signed_entry_timestamp,
+        "inclusionPromise.signedEntryTimestamp",
     )?;
-    // Canonical (RFC 8785) JSON for our known field set. Keys must be in
+    // Canonical (RFC 8785) JSON for our known field set. Keys in
     // lexicographic order: body < integratedTime < logID < logIndex.
     let signed_payload = format!(
         r#"{{"body":"{body}","integratedTime":{it},"logID":"{lid}","logIndex":{li}}}"#,
-        body = entry.body,
-        it = entry.integrated_time,
-        lid = entry.log_id,
-        li = entry.log_index,
+        body = entry.canonicalized_body,
+        it = integrated_time,
+        lid = hex_encode(&log_id),
+        li = log_index,
     );
     verify_rekor_set(rekor_key, signed_payload.as_bytes(), &set_bytes)?;
 
-    // ── 7. Merkle inclusion proof ────────────────────────────────────
-    let root_hash_bytes =
-        hex_decode(&entry.verification.inclusion_proof.root_hash).map_err(|e| {
-            AppError::Update {
-                message: format!("hex-decoding inclusionProof.rootHash: {e}"),
-            }
+    // ── 8. Merkle inclusion proof ────────────────────────────────────
+    let inclusion_proof = entry
+        .inclusion_proof
+        .as_ref()
+        .ok_or_else(|| AppError::Update {
+            message: "tlog entry missing inclusionProof — required to bind the entry to a public \
+                  log root"
+                .into(),
         })?;
+    let root_hash_bytes = base64_std_decode(&inclusion_proof.root_hash, "inclusionProof.rootHash")?;
     let root_hash: [u8; 32] =
         root_hash_bytes
             .as_slice()
@@ -226,15 +327,30 @@ pub fn verify_human_attestation(
                     root_hash_bytes.len()
                 ),
             })?;
-    let proof_hashes: Vec<[u8; 32]> = entry
-        .verification
-        .inclusion_proof
+    let proof_leaf_index: u64 =
+        inclusion_proof
+            .log_index
+            .parse()
+            .map_err(|e| AppError::Update {
+                message: format!(
+                    "inclusionProof.logIndex `{}` is not a valid u64: {e}",
+                    inclusion_proof.log_index
+                ),
+            })?;
+    let tree_size: u64 = inclusion_proof
+        .tree_size
+        .parse()
+        .map_err(|e| AppError::Update {
+            message: format!(
+                "inclusionProof.treeSize `{}` is not a valid u64: {e}",
+                inclusion_proof.tree_size
+            ),
+        })?;
+    let proof_hashes: Vec<[u8; 32]> = inclusion_proof
         .hashes
         .iter()
         .map(|h| {
-            let decoded = hex_decode(h).map_err(|e| AppError::Update {
-                message: format!("hex-decoding inclusionProof.hashes[]: {e}"),
-            })?;
+            let decoded = base64_std_decode(h, "inclusionProof.hashes[]")?;
             decoded.as_slice().try_into().map_err(|_| AppError::Update {
                 message: format!(
                     "inclusionProof.hashes[] entry is {} bytes, expected 32",
@@ -245,20 +361,15 @@ pub fn verify_human_attestation(
         .collect::<Result<_, AppError>>()?;
     let leaf_hash = merkle::hash_leaf(&body_bytes);
     merkle::verify_inclusion_proof(
-        entry.verification.inclusion_proof.log_index,
+        proof_leaf_index,
         &leaf_hash,
-        entry.verification.inclusion_proof.tree_size,
+        tree_size,
         &proof_hashes,
         &root_hash,
     )?;
 
-    // ── 8. Content verification (template equality + cross-checks) ───
-    verify_attestation_content(
-        attestation_bytes,
-        release,
-        &fingerprint_hex,
-        entry.log_index,
-    )
+    // ── 9. Content verification (template equality + cross-checks) ───
+    verify_attestation_content(attestation_bytes, release, &fingerprint_hex, log_index)
 }
 
 /// Parse the attestation prose, cross-check its top-level fields
@@ -490,7 +601,7 @@ fn verify_attestation_content(
 }
 
 // ---------------------------------------------------------------------------
-// Attestation prose JSON shape (matches releases/schema/attestation-v1.schema.json)
+// Attestation prose JSON shape — this struct is the source of truth.
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -636,52 +747,6 @@ fn verify_rekor_set(key: &RekorKey, message: &[u8], signature: &[u8]) -> Result<
 }
 
 // ---------------------------------------------------------------------------
-// Bundle JSON shape (matches what `release-tool attest` writes; the inner
-// `rekor_log_entry` is verbatim Rekor v1 API response).
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct AttestationBundle {
-    schema_version: u32,
-    rekor_log_entry: std::collections::BTreeMap<String, RekorEntry>,
-}
-
-#[derive(Deserialize)]
-struct RekorEntry {
-    body: String,
-    #[serde(rename = "integratedTime")]
-    integrated_time: i64,
-    #[serde(rename = "logID")]
-    log_id: String,
-    #[serde(rename = "logIndex")]
-    log_index: u64,
-    verification: RekorVerification,
-}
-
-#[derive(Deserialize)]
-struct RekorVerification {
-    #[serde(rename = "inclusionProof")]
-    inclusion_proof: RekorInclusionProof,
-    #[serde(rename = "signedEntryTimestamp")]
-    signed_entry_timestamp: String,
-}
-
-#[derive(Deserialize)]
-struct RekorInclusionProof {
-    #[serde(rename = "logIndex")]
-    log_index: u64,
-    #[serde(rename = "rootHash")]
-    root_hash: String,
-    #[serde(rename = "treeSize")]
-    tree_size: u64,
-    #[serde(default)]
-    hashes: Vec<String>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    checkpoint: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // `hashedrekord` v0.0.1 body shape (same as the CI side).
 // ---------------------------------------------------------------------------
 
@@ -712,6 +777,11 @@ struct SpecHash {
 
 #[derive(Deserialize)]
 struct SpecSignature {
+    /// Base64 of the PEM SSH-SIG blob. We don't read it here — the
+    /// authoritative copy lives in `messageSignature.signature` per the
+    /// Sigstore Bundle v0.3 model — but we keep the field in the
+    /// deserialization so the hashedrekord body schema stays complete.
+    #[allow(dead_code)]
     content: String,
     #[serde(rename = "publicKey")]
     public_key: SpecPublicKey,
@@ -743,6 +813,15 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
         .collect()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(out, "{b:02x}").unwrap();
+    }
+    out
 }
 
 #[cfg(test)]
@@ -791,21 +870,67 @@ mod tests {
     }
 
     #[test]
-    fn bundle_rejects_wrong_schema_version() {
-        let bundle = br#"{"schema_version": 99, "rekor_log_entry": {}}"#;
+    fn bundle_rejects_wrong_media_type() {
+        let bundle = br#"{
+            "mediaType": "application/json",
+            "verificationMaterial": {
+                "publicKey": { "hint": "deadbeef" },
+                "tlogEntries": []
+            },
+            "messageSignature": {
+                "messageDigest": { "algorithm": "SHA2_256", "digest": "AAA=" },
+                "signature": "AAA="
+            }
+        }"#;
         let trust = synthesize_empty_trust();
         let release = synthesize_release();
         let err = verify_human_attestation(b"x", bundle, &release, &trust).unwrap_err();
-        assert!(format!("{err}").contains("schema_version"));
+        assert!(format!("{err}").contains("mediaType"));
     }
 
     #[test]
     fn bundle_rejects_wrong_log_entry_count() {
-        let bundle = br#"{"schema_version": 1, "rekor_log_entry": {}}"#;
+        let bundle = br#"{
+            "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "verificationMaterial": {
+                "publicKey": { "hint": "deadbeef" },
+                "tlogEntries": []
+            },
+            "messageSignature": {
+                "messageDigest": { "algorithm": "SHA2_256", "digest": "AAA=" },
+                "signature": "AAA="
+            }
+        }"#;
         let trust = synthesize_empty_trust();
         let release = synthesize_release();
         let err = verify_human_attestation(b"x", bundle, &release, &trust).unwrap_err();
-        assert!(format!("{err}").contains("rekor log entries"));
+        assert!(format!("{err}").contains("tlog entries"));
+    }
+
+    #[test]
+    fn bundle_rejects_certificate_arm_for_humans() {
+        // Sanity: CI-shaped bundles must be rejected by the human verifier.
+        let bundle = br#"{
+            "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "verificationMaterial": {
+                "certificate": { "rawBytes": "AAA=" },
+                "tlogEntries": [{
+                    "logIndex": "1",
+                    "logId": { "keyId": "AAA=" },
+                    "kindVersion": { "kind": "hashedrekord", "version": "0.0.1" },
+                    "integratedTime": "1",
+                    "canonicalizedBody": "AAA="
+                }]
+            },
+            "messageSignature": {
+                "messageDigest": { "algorithm": "SHA2_256", "digest": "AAA=" },
+                "signature": "AAA="
+            }
+        }"#;
+        let trust = synthesize_empty_trust();
+        let release = synthesize_release();
+        let err = verify_human_attestation(b"x", bundle, &release, &trust).unwrap_err();
+        assert!(format!("{err}").contains("publicKey"), "got: {err}");
     }
 
     fn synthesize_empty_trust() -> TrustedRoot {
@@ -828,8 +953,7 @@ mod tests {
                     "url": "https://example/m.json",
                     "sigstore_bundle_url": "https://example/m.json.sigstore"
                 },
-                "human_attestations": [],
-                "policy": { "min_human_attestations": 1 }
+                "human_attestations": []
             }"#,
         )
         .unwrap()

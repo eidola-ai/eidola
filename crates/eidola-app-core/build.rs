@@ -100,6 +100,10 @@ fn main() {
             panic!("trusted_attestant_fingerprint must be 64 lowercase hex chars: {fp:?}");
         }
     }
+    let min_human_attestations = get_u32(&trust_constants, "min_human_attestations");
+    if min_human_attestations == 0 {
+        panic!("min_human_attestations must be ≥1 (got 0)");
+    }
     let supported_release_schema_versions =
         get_u32_array(&trust_constants, "supported_release_schema_versions");
     let supported_attestation_schema_versions =
@@ -126,6 +130,9 @@ fn main() {
         "TRUSTED_ATTESTANT_FINGERPRINTS",
         &trusted_attestant_fingerprints,
     );
+    out.push_str(&format!(
+        "pub const MIN_HUMAN_ATTESTATIONS: u32 = {min_human_attestations};\n"
+    ));
     push_u32_slice_const(
         &mut out,
         "SUPPORTED_RELEASE_SCHEMA_VERSIONS",

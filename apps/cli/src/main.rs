@@ -72,6 +72,18 @@ enum Command {
         /// install — bypass continuity"). Useful for testing.
         #[arg(long)]
         installed_git_commit: Option<String>,
+        /// (dev only) read release bytes from a local directory instead
+        /// of GitHub. The directory must contain `release.json` plus each
+        /// referenced asset by URL basename (e.g. `artifact-manifest.json`,
+        /// `artifact-manifest.json.sigstore`, `attestation-<id>.json`, ...).
+        /// The verifier runs the same crypto checks — only the byte source
+        /// changes — so this is the tight dev loop for iterating on the
+        /// verifier itself.
+        #[arg(long, value_name = "PATH")]
+        fixtures_dir: Option<String>,
+        /// Print one diagnostic line per pipeline stage to stderr.
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
 }
 
@@ -499,6 +511,8 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
         Some(Command::Update {
             installed_version,
             installed_git_commit,
+            fixtures_dir,
+            verbose,
         }) => {
             let installed_version =
                 installed_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
@@ -511,9 +525,19 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     .map(|c| format!(" (commit {c})"))
                     .unwrap_or_else(|| " (first-install; no commit pinned)".into())
             );
+            if let Some(d) = fixtures_dir.as_deref() {
+                eprintln!("  fixtures dir:      {d} (dev mode; no network fetches)");
+            }
             eprintln!();
 
-            let summary = eidola_app_core::updater::check_for_update(
+            let fetcher = match fixtures_dir.as_deref() {
+                Some(dir) => eidola_app_core::updater::Fetcher::fixtures(dir),
+                None => eidola_app_core::updater::Fetcher::network()?,
+            };
+            let opts = eidola_app_core::updater::VerifyOptions { verbose };
+            let summary = eidola_app_core::updater::check_for_update_with(
+                &fetcher,
+                opts,
                 &installed_version,
                 installed_git_commit,
             )
