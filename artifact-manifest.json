@@ -10,11 +10,6 @@
       "platform": "darwin/universal",
       "type": "nix"
     },
-    "eidola-macos-app": {
-      "narHash": "sha256-dtBxvU0Ws83xyv+z+1/zkJf2+CHMgbSyz7jm4H+jc2E=",
-      "platform": "darwin/universal",
-      "type": "nix"
-    },
     "eidola-postgres": {
       "digest": "sha256:a2838b26834655ee4b9527c699252ec8de63de4ceb4ccad7dd4f754c1abab8e9",
       "platform": "linux/amd64",

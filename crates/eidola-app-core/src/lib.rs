@@ -21,10 +21,10 @@ use uuid::Uuid;
 use config::Config;
 use error::AppError;
 
-uniffi::setup_scaffolding!();
-
 // ============================================================================
-// UniFFI record types — data transfer objects crossing the FFI boundary
+// Data transfer types — returned from `AppCore` methods to the apps (CLI,
+// GUI). Plain Rust structs; the SwiftUI FFI layer that previously required
+// `#[derive(uniffi::Record)]` has been removed.
 // ============================================================================
 
 /// Snapshot of the current config for display.
@@ -32,7 +32,6 @@ uniffi::setup_scaffolding!();
 /// `base_url` and `trusted_measurements` are the *resolved* values: the
 /// user's override if set, the trust-root pin otherwise. UI displays these
 /// directly without needing to know which source they came from.
-#[derive(uniffi::Record)]
 pub struct ConfigState {
     pub base_url: String,
     pub has_account: bool,
@@ -44,27 +43,23 @@ pub struct ConfigState {
     pub attestation_url: Option<String>,
 }
 
-#[derive(uniffi::Record)]
 pub struct MeasurementInfo {
     pub snp: String,
     pub tdx_rtmr1: String,
     pub tdx_rtmr2: String,
 }
 
-#[derive(uniffi::Record)]
 pub struct AccountCreateResult {
     pub id: String,
     pub created_at: String,
 }
 
-#[derive(uniffi::Record)]
 pub struct AccountShowResult {
     pub id: String,
     pub stripe_customer_id: Option<String>,
     pub created_at: String,
 }
 
-#[derive(uniffi::Record)]
 pub struct PriceInfo {
     pub id: String,
     pub product_name: String,
@@ -74,27 +69,23 @@ pub struct PriceInfo {
     pub credits: i64,
 }
 
-#[derive(uniffi::Record)]
 pub struct BalancesResult {
     pub available: i64,
     pub pools: Vec<BalancePoolInfo>,
 }
 
-#[derive(uniffi::Record)]
 pub struct BalancePoolInfo {
     pub amount: i64,
     pub source: String,
     pub expires_at: Option<String>,
 }
 
-#[derive(uniffi::Record)]
 pub struct CredentialInfo {
     pub nonce: String,
     pub credits: i64,
     pub generation: i64,
 }
 
-#[derive(uniffi::Record)]
 pub struct InFlightCredentialInfo {
     pub nonce: String,
     pub credits: i64,
@@ -102,14 +93,12 @@ pub struct InFlightCredentialInfo {
     pub spend_amount: i64,
 }
 
-#[derive(uniffi::Record)]
 pub struct AllocateResult {
     pub nonce: String,
     pub credits: i64,
     pub issuer_key_id: String,
 }
 
-#[derive(uniffi::Record)]
 pub struct ChatResult {
     pub space_id: String,
     pub content: String,
@@ -119,20 +108,18 @@ pub struct ChatResult {
     pub credits_charged: i64,
 }
 
-#[derive(uniffi::Record)]
 pub struct SpaceInfo {
     pub id: String,
     pub title: Option<String>,
     pub created_at: i64,
 }
 
-#[derive(uniffi::Record, Clone)]
+#[derive(Clone)]
 pub struct SpaceMessage {
     pub role: String,
     pub content: String,
 }
 
-#[derive(uniffi::Record)]
 pub struct ModelInfo {
     pub id: String,
     pub context_length: u64,
@@ -141,11 +128,6 @@ pub struct ModelInfo {
 /// Incremental events emitted by `AppCore::chat_stream`. The terminal
 /// outcome is the function's `Result<ChatResult, AppError>` return value;
 /// senders close their channel when the function returns.
-///
-/// Not exposed via UniFFI — streaming is Rust-only today (CLI + gpui app).
-/// The Swift macOS app keeps using the blocking `chat()`. If we want to
-/// expose streaming to Swift later, the natural shape is a UniFFI
-/// `callback_interface`.
 #[derive(Clone, Debug)]
 pub enum ChatStreamEvent {
     /// A piece of the model's reasoning ("thinking") output. Append to a
@@ -156,15 +138,13 @@ pub enum ChatStreamEvent {
 }
 
 // ============================================================================
-// Default directory helpers (exported via UniFFI for use from Swift)
+// Default directory helpers
 // ============================================================================
 
-#[uniffi::export]
 pub fn default_config_dir() -> Option<String> {
     config::default_config_path().and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
 }
 
-#[uniffi::export]
 pub fn default_data_dir() -> Option<String> {
     config::default_data_dir().map(|d| d.to_string_lossy().into_owned())
 }
@@ -1661,21 +1641,16 @@ fn find_event_boundary(buf: &[u8]) -> Option<usize> {
 }
 
 // ============================================================================
-// AppCore — the UniFFI entry point.
-//
-// Owns a tokio runtime so that all async Rust code (turso, reqwest, tokio
-// primitives) runs on proper tokio worker threads rather than on whatever
-// thread the UniFFI foreign executor polls from.
+// AppCore — owns the tokio runtime that drives all async work (turso,
+// reqwest, tokio primitives). Consumers (CLI, GUI) hold an `Arc<AppCore>`
+// and call methods directly.
 // ============================================================================
 
-#[derive(uniffi::Object)]
 pub struct AppCore {
     runtime: tokio::runtime::Runtime,
     inner: Arc<Inner>,
 }
 
-/// Rust-only access to the owned runtime (not exported via UniFFI).
-/// The CLI uses this to drive async work with `block_on`.
 impl AppCore {
     pub fn runtime(&self) -> &tokio::runtime::Runtime {
         &self.runtime
@@ -1685,9 +1660,6 @@ impl AppCore {
     /// `sender` and returns the finalized `ChatResult` when the upstream
     /// stream closes. Drops `sender` on return so receivers see channel
     /// closure as the natural "done" signal.
-    ///
-    /// Rust-only: not exposed via UniFFI. The Swift macOS app keeps using
-    /// the blocking `chat()`. See [`ChatStreamEvent`].
     pub async fn chat_stream(
         &self,
         prompt: String,
@@ -1714,13 +1686,11 @@ fn join_err(e: tokio::task::JoinError) -> AppError {
     }
 }
 
-#[uniffi::export]
 impl AppCore {
     /// Create a new core instance.
     ///
     /// `config_dir` — directory containing `config.toml`.
     /// `data_dir` — directory for the local database.
-    #[uniffi::constructor]
     pub fn new(config_dir: String, data_dir: String) -> Self {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let runtime = tokio::runtime::Builder::new_multi_thread()

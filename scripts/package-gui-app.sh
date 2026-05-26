@@ -54,8 +54,8 @@ cp "$EXECUTABLE" "$APP_DIR/Contents/MacOS/Eidola"
 
 cp "$REPO_ROOT/apps/gui/Support/Info.plist" "$APP_DIR/Contents/"
 
-# App icon (if present — share the SwiftUI app's icon for now).
-ICON="$REPO_ROOT/apps/macos/Support/AppIcon.icns"
+# App icon (if present).
+ICON="$REPO_ROOT/apps/gui/Support/AppIcon.icns"
 if [[ -f "$ICON" ]]; then
   cp "$ICON" "$APP_DIR/Contents/Resources/"
 fi

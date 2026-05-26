@@ -8,7 +8,7 @@ Usage:
   scripts/artifact-manifest.sh print [--push] [--metadata-file PATH]
   scripts/artifact-manifest.sh verify [--push] [--metadata-file PATH] [--manifest PATH]
   scripts/artifact-manifest.sh build-macos [--output PATH] [--macos-paths-file PATH]
-  scripts/artifact-manifest.sh print-macos [--macos-paths-file PATH | --app-path PATH --cli-path PATH]
+  scripts/artifact-manifest.sh print-macos [--macos-paths-file PATH | --cli-path PATH]
   scripts/artifact-manifest.sh measure [--config PATH] [--verify-attestations]
   scripts/artifact-manifest.sh merge [--partial PATH ...] [--output PATH]
   scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--output PATH] [--verify-attestations]
@@ -58,7 +58,6 @@ MANIFEST_FILE="$REPO_ROOT/artifact-manifest.json"
 BUILDER_NAME="eidola"
 ENSURE_BUILDER=0
 MACOS_PATHS_FILE=""
-APP_PATH=""
 CLI_PATH=""
 CONFIG_FILE="$REPO_ROOT/tinfoil-config.yml"
 VERIFY_ATTESTATIONS=0
@@ -90,10 +89,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --macos-paths-file)
       MACOS_PATHS_FILE="$2"
-      shift 2
-      ;;
-    --app-path)
-      APP_PATH="$2"
       shift 2
       ;;
     --cli-path)
@@ -369,7 +364,6 @@ print_oci_manifest() {
 }
 
 build_macos_artifacts() {
-  local -a out_paths
   local path
 
   if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -377,43 +371,31 @@ build_macos_artifacts() {
     exit 1
   fi
 
-  out_paths=()
-  while IFS= read -r path; do
-    out_paths+=("$path")
-  done < <(
+  path="$(
     nix build \
-      '.#eidola-macos-app' \
       '.#eidola-cli-macos-universal' \
       --no-link \
       --print-out-paths \
       --show-trace
-  )
+  )"
 
-  if [[ "${#out_paths[@]}" -ne 2 ]]; then
-    echo "error: expected 2 macOS output paths, got ${#out_paths[@]}" >&2
-    exit 1
-  fi
-
-  APP_PATH="${out_paths[0]}"
-  CLI_PATH="${out_paths[1]}"
+  CLI_PATH="$path"
 
   if [[ -n "$MACOS_PATHS_FILE" ]]; then
     jq -n \
-      --arg app_path "$APP_PATH" \
       --arg cli_path "$CLI_PATH" \
-      '{app_path: $app_path, cli_path: $cli_path}' \
+      '{cli_path: $cli_path}' \
       > "$MACOS_PATHS_FILE"
   fi
 }
 
 load_macos_paths() {
   if [[ -n "$MACOS_PATHS_FILE" ]]; then
-    APP_PATH="$(jq -er '.app_path | select(type == "string" and length > 0)' "$MACOS_PATHS_FILE")"
     CLI_PATH="$(jq -er '.cli_path | select(type == "string" and length > 0)' "$MACOS_PATHS_FILE")"
   fi
 
-  if [[ -z "$APP_PATH" || -z "$CLI_PATH" ]]; then
-    echo "error: provide --macos-paths-file or both --app-path and --cli-path" >&2
+  if [[ -z "$CLI_PATH" ]]; then
+    echo "error: provide --macos-paths-file or --cli-path" >&2
     exit 1
   fi
 }
@@ -426,20 +408,17 @@ nix_nar_hash() {
 }
 
 print_macos_manifest() {
-  local app_hash cli_hash
+  local cli_hash
 
   load_macos_paths
 
-  app_hash="$(nix_nar_hash "$APP_PATH")"
   cli_hash="$(nix_nar_hash "$CLI_PATH")"
 
   jq -n \
-    --arg app_hash "$app_hash" \
     --arg cli_hash "$cli_hash" \
     '{
       schema_version: "1.0.0",
       artifacts: {
-        "eidola-macos-app": { type: "nix", platform: "darwin/universal", narHash: $app_hash },
         "eidola-cli-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $cli_hash }
       }
     }'

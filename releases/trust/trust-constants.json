@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0.0",
   "trusted_attestant_fingerprints": [],
-  "expected_ci_identity_pattern": "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-release.yml@refs/tags/v*",
+  "expected_ci_identity_pattern": "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*",
   "expected_ci_issuer": "https://token.actions.githubusercontent.com",
   "supported_release_schema_versions": ["1.0.0"],
   "supported_attestation_schema_versions": ["1.0.0"],

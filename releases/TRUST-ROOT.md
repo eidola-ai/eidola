@@ -193,7 +193,7 @@ running against the old values until the user accepts the update.
 ### Rotating the CI signing workflow
 
 The trust root pins
-`https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-release.yml@refs/tags/v*`.
+`https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*`.
 Changes to the workflow file path or repo path break this pattern. Treat
 as a coordinated rotation:
 

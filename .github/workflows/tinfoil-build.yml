@@ -1,17 +1,25 @@
-# Generate and attest the Tinfoil deployment manifest.
+# Tag-triggered release pipeline.
 #
-# Tinfoil's verification chain works as follows:
-#   1. The pri-build-action recomputes measurements from tinfoil-config.yml,
-#      serving as an independent cross-check against our artifact-manifest.json
-#      (whose measurements are computed by measure-enclave and verified by CI).
-#   2. A verification step ensures both implementations agree.
-#   3. The deployment manifest is attested to Sigstore via actions/attest,
-#      producing a transparency log entry on Rekor.
-#   4. A GitHub release is created with the manifest + its SHA-256 hash.
-#   5. Tinfoil's verifier (tinfoil-go) fetches tinfoil.hash from the release,
-#      retrieves the Sigstore bundle from the GitHub Attestations API, verifies
-#      the OIDC identity + artifact digest, then extracts the measurements and
-#      compares them against the live enclave's hardware attestation report.
+# Two responsibilities, one workflow:
+#
+# 1. **Tinfoil deployment manifest** (driven by the Tinfoil action).
+#    Tinfoil's closed-source deployment system requires this workflow's
+#    file to be named `tinfoil-build.yml` — do not rename. The action
+#    recomputes enclave measurements from `tinfoil-config.yml` using
+#    Python/sevsnpmeasure (independent of our Rust `measure-enclave`),
+#    attests the resulting deployment manifest to Sigstore via
+#    `actions/attest` (producing a Rekor transparency log entry), and
+#    creates the GitHub release with the manifest + its SHA-256 hash.
+#    Tinfoil's verifier (`tinfoil-go`) consumes that release.
+#
+# 2. **Eidola release signing** (the cosign / upload steps below).
+#    `cosign sign-blob` signs `artifact-manifest.json` keyless via the
+#    workflow's Fulcio OIDC identity (matching the
+#    `EXPECTED_CI_IDENTITY_PATTERN` baked into the client trust root).
+#    The signed bundle + the manifest itself are uploaded as release
+#    assets so clients can verify them during self-update. The release is
+#    **not** marked latest here — the engineer's release-tool does that
+#    after their human attestation has been signed and uploaded.
 
 name: Tinfoil Build
 
@@ -90,3 +98,32 @@ jobs:
           fi
 
           echo "All measurements match between artifact-manifest.json and tinfoil-deployment.json"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign artifact-manifest.json (Fulcio keyless via OIDC)
+        run: |
+          # Produces a Sigstore bundle binding the workflow's Fulcio OIDC
+          # identity to sha256(artifact-manifest.json), with a Rekor
+          # inclusion proof embedded. The client trust root pins both the
+          # OIDC issuer and the workflow path (EXPECTED_CI_IDENTITY_PATTERN);
+          # any cert SAN that doesn't match is rejected on verification.
+          cosign sign-blob \
+            artifact-manifest.json \
+            --bundle artifact-manifest.json.sigstore \
+            --yes
+
+          # Sanity: bundle exists and is non-empty.
+          test -s artifact-manifest.json.sigstore
+
+      - name: Upload signed manifest to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG" \
+            artifact-manifest.json \
+            artifact-manifest.json.sigstore \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"

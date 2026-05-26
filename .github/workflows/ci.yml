@@ -233,13 +233,7 @@ jobs:
           name: eidola
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
-      - name: Check Swift formatting
-        run: nix build '.#checks.aarch64-darwin.swift-formatting' --show-trace
-
-      - name: Check Swift bindings freshness
-        run: nix build '.#checks.aarch64-darwin.swift-bindings-current' --show-trace
-
-      - name: Build macOS artifacts
+      - name: Build macOS CLI universal binary
         id: partial
         run: |
           ./scripts/artifact-manifest.sh build-macos \
@@ -249,17 +243,6 @@ jobs:
           echo "actual<<EOF" >> "$GITHUB_OUTPUT"
           cat /tmp/macos-artifact-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Run Swift tests
-        run: |
-          # Build the XCFramework and update the local path for SPM
-          nix run '.#update-eidola-app-core-swift-xcframework'
-
-          # Run Swift tests for app core
-          ( cd crates/eidola-app-core && swift test )
-
-          # Run Swift tests for macOS app
-          ( cd apps/macos && swift test )
 
   artifact-manifest:
     name: Verify artifact manifest

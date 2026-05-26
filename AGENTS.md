@@ -12,7 +12,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 
 **Deployment:** Tinfoil Containers — all services run inside confidential enclaves (AMD SEV-SNP). The Tinfoil shim handles TLS termination with attestation-bearing certificates; the server runs plain HTTP behind it.
 
-**CI:** `ci.yml` contains four jobs — `rust-checks` (ubuntu-24.04: cargo fmt/clippy/test, OpenAPI freshness), `oci` (ubuntu-24.04: OCI image builds, OCI subset verification, GHCR publishing), `apple` (self-hosted Mac: Swift formatting/bindings freshness, Nix-based macOS app and CLI universal binary builds, Swift tests), and `artifact-manifest` (ubuntu-24.04: merges the OCI and macOS artifact digests, recomputes enclave measurements from `tinfoil-config.yml` + CVM artifacts, and verifies the full committed manifest). The `oci` and `apple` jobs gate on `rust-checks` to avoid wasting resources on failing PRs. A separate `cla.yml` workflow verifies that every PR author/committer email is covered by the current `CLA-INDIVIDUAL.md` or `CLA-CORPORATE.md` hash recorded in `CLA-SIGNERS.txt`. A separate `tinfoil-build.yml` workflow runs on `v*` tags to generate `tinfoil-deployment.json` from `artifact-manifest.json`, attest it to Sigstore via `actions/attest`, and create a GitHub release — this is the artifact Tinfoil's verifier chain consumes.
+**CI:** `ci.yml` contains four jobs — `rust-checks` (ubuntu-24.04: cargo fmt/clippy/test, OpenAPI freshness), `oci` (ubuntu-24.04: OCI image builds, OCI subset verification, GHCR publishing), `apple` (self-hosted Mac: Nix-based macOS universal CLI build), and `artifact-manifest` (ubuntu-24.04: merges the OCI and macOS artifact digests, recomputes enclave measurements from `tinfoil-config.yml` + CVM artifacts, and verifies the full committed manifest). The `oci` and `apple` jobs gate on `rust-checks` to avoid wasting resources on failing PRs. A separate `cla.yml` workflow verifies that every PR author/committer email is covered by the current `CLA-INDIVIDUAL.md` or `CLA-CORPORATE.md` hash recorded in `CLA-SIGNERS.txt`. A separate `tinfoil-build.yml` workflow runs on `v*` tags and has two responsibilities: (1) generate `tinfoil-deployment.json` from `artifact-manifest.json`, attest it to Sigstore via `actions/attest`, and create the GitHub release — this is the artifact Tinfoil's verifier chain consumes; (2) sign `artifact-manifest.json` with `cosign sign-blob` (Fulcio keyless via the workflow's OIDC identity) and upload the manifest + its Sigstore bundle as release assets for the client's self-update verifier. The filename `tinfoil-build.yml` is mandated by Tinfoil's closed-source deployment system — do not rename. The release is intentionally not marked `latest` here; the release engineer's tooling does that once their human attestation is signed and uploaded.
 
 **Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidola-server`, `ghcr.io/<owner>/eidola-cli`, and `ghcr.io/<owner>/eidola-postgres`.
 
@@ -96,30 +96,24 @@ This still relies on Tinfoil's TLS private key being sealed inside the enclave: 
 
 ## App Core Architecture
 
-The macOS app, GUI app, and CLI share a common Rust core (`crates/eidola-app-core/`) exposed to Swift via direct [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings and to other Rust callers as a normal library. All business logic — config management, local database, HTTP client construction, account operations, wallet/credential management, and chat inference — lives in the core crate. The CLI (`apps/cli/`) and the gpui-based GUI (`apps/gui/`) are thin Rust wrappers that construct an `AppCore` and call its methods directly; the SwiftUI macOS app (`apps/macos/`) uses the same `AppCore` via UniFFI-generated Swift bindings.
-
-Rust functions and types are exported with `#[uniffi::export]`, `#[derive(uniffi::Object)]`, `#[derive(uniffi::Record)]`, and `#[derive(uniffi::Enum)]`. Async operations use `#[uniffi::export(async)]` to bridge Rust futures to Swift async/await. No serialization layer, event/effect pattern, or Crux dependency — Swift calls Rust functions directly and gets native Swift types back.
+The GUI app and CLI share a common Rust core (`crates/eidola-app-core/`) consumed as a normal library — no FFI layer. All business logic — config management, local database, HTTP client construction, account operations, wallet/credential management, and chat inference — lives in the core crate. Consumers construct an `AppCore` and call its methods directly.
 
 **Core crate modules:**
-- `lib.rs` — `AppCore` object (UniFFI-exported), all high-level operations (account create/show/allocate, chat, wallet), UniFFI record types (`ConfigState`, `ChatResult`, `PriceInfo`, etc.), internal helpers (ACT token serialization, attestation flushing, HTTP response handling)
-- `config.rs` — `Config` struct (TOML serde), load/save with explicit paths, measurement parsing, certificate parsing, domain separator constants
+- `lib.rs` — `AppCore` struct, all high-level operations (account create/show/allocate, chat, wallet), DTO record types (`ConfigState`, `ChatResult`, `PriceInfo`, etc.), internal helpers (ACT token serialization, attestation flushing, HTTP response handling)
+- `config.rs` — `Config` struct (TOML serde) with `*_override` fields and resolver methods that fall back to the embedded trust-root pin, load/save with explicit paths, measurement parsing, certificate parsing
+- `trust_root.rs` — re-exports the build-time-generated `trust_root.gen.rs` constants (server URL, server enclave measurement, attestant fingerprints, CI identity, schema versions, embedded JSON for attestation templates + Sigstore trusted root). Source files live under `releases/`; see `releases/TRUST-ROOT.md` for what's pinned and how it rotates.
 - `db.rs` — Turso (libSQL) database layer with 3-layer schema (wallet, transport, semantic), migrations, all CRUD operations
-- `error.rs` — `AppError` enum (UniFFI-exported), request error classification (attestation vs network vs server)
+- `error.rs` — `AppError` enum, request error classification (attestation vs network vs server)
 
-**CLI usage:** The CLI depends on `eidola-app-core` as a regular Rust crate dependency. It calls `AppCore::new(config_dir, data_dir)` and invokes methods directly — no FFI involved.
+**CLI usage (`apps/cli/`):** Depends on `eidola-app-core` as a regular Rust crate. Calls `AppCore::new(config_dir, data_dir)` and invokes methods directly.
 
-**macOS app usage:** The macOS app depends on the UniFFI-generated Swift package. `Core.swift` wraps `AppCore` in an `@Observable @MainActor` class that bridges async Rust calls to SwiftUI state. Views: `ChatView` (message bubbles, model picker), `AccountView` (balances, allocation, prices), `WalletView` (credential list), `SettingsView` (base URL, credentials, attestation config).
+**GUI usage (`apps/gui/`):** Native Rust gpui app. Depends on `eidola-app-core` as a regular crate; `core.rs` wraps `AppCore` in an `Entity<Core>` that bridges tokio (the core's runtime) to gpui's smol-based executor via `oneshot` channels, and holds cached snapshots that views read reactively. **See `apps/gui/AGENTS.md` for the full architecture** — window model, Circadian theme + Newsreader bundling, transparent titlebar / gradient overlay, macOS menu/keybinding setup and ordering invariants, the per-view `CloseWindow` / `Settings` singleton patterns, the `.app` bundling requirement, and the two-tier test model (behavior tests as the regression gate; visual snapshots as a local debug aid).
 
-**GUI app usage (`apps/gui/`):** A native Rust gpui app that mirrors the SwiftUI macOS app feature-for-feature. Depends on `eidola-app-core` as a regular crate; `core.rs` wraps `AppCore` in an `Entity<Core>` that bridges tokio (the core's runtime) to gpui's smol-based executor via `oneshot` channels, and holds cached snapshots that views read reactively. **See `apps/gui/AGENTS.md` for the full architecture** — window model, Circadian theme + Newsreader bundling, transparent titlebar / gradient overlay, macOS menu/keybinding setup and ordering invariants, the per-view `CloseWindow` / `Settings` singleton patterns, the `.app` bundling requirement, and the two-tier test model (behavior tests as the regression gate; visual snapshots as a local debug aid).
-
-**Crate layout:** Pure Rust crates in `crates/` implement capability logic. The `crates/` tree also contains the Rust code generation binary (`uniffi-bindgen-swift`) plus operational utilities such as `generate-openapi`, `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`.
-
-**Codegen pipeline:**
-- `uniffi-bindgen-swift` (workspace crate under `crates/`) → FFI bridge (Swift bindings + C headers)
+**Crate layout:** Pure Rust crates in `crates/` implement capability logic — `eidola-app-core`, `eidola-server`, `tinfoil-verifier`, `gpui-markdown-editor` — plus operational utilities such as `generate-openapi`, `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`.
 
 ## Local Database & Migrations
 
-Both the CLI and macOS app use an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidola/eidola.db` for local app data (wallet credentials, conversation history, attestation records, etc.). The database layer lives in `crates/eidola-app-core/src/db.rs`.
+Both the CLI and GUI use an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidola/eidola.db` for local app data (wallet credentials, conversation history, attestation records, etc.). The database layer lives in `crates/eidola-app-core/src/db.rs`.
 
 **Schema management:**
 - `crates/eidola-app-core/schema/schema.sql` is the canonical schema — always reflects the current desired state
@@ -142,10 +136,10 @@ Both the CLI and macOS app use an embedded [Turso](https://crates.io/crates/turs
 The `justfile` is the primary development interface. Run `just` to see all available recipes.
 
 **Key recipes:**
-- `just build {server,cli,gui,macos}` — local-toolchain builds for fast iteration. The `macos` target regenerates UniFFI bindings and the XCFramework, runs `swift build`, then assembles a `.app` bundle via `scripts/package-macos-app.sh` into `apps/macos/build/Eidola.app`. The `gui` target on macOS additionally runs `scripts/package-gui-app.sh` to assemble `apps/gui/build/Eidola.app` (the .app wrapper is required for AppKit to treat the binary as a real app rather than a command-line tool — see `apps/gui/AGENTS.md` for why).
-- `just run {server,cli,gui,macos}` — build and run. For `macos` and `gui`, opens the assembled `.app` via `open`. Accepts trailing args (e.g. `just run cli chat "hello"`).
-- `just test` — runs `cargo test` plus Swift tests (`crates/eidola-app-core` and `apps/macos`) on macOS.
-- `just check` — clippy, rustfmt, swift-format lint.
+- `just build {server,cli,gui}` — local-toolchain builds for fast iteration. The `gui` target on macOS additionally runs `scripts/package-gui-app.sh` to assemble `apps/gui/build/Eidola.app` (the .app wrapper is required for AppKit to treat the binary as a real app rather than a command-line tool — see `apps/gui/AGENTS.md` for why).
+- `just run {server,cli,gui}` — build and run. For `gui`, opens the assembled `.app` via `open`. Accepts trailing args (e.g. `just run cli chat "hello"`).
+- `just test` — runs `cargo test`.
+- `just check` — clippy and rustfmt.
 - `just dev` / `just services` / `just down` — container-based development workflows (see Compose files above).
 
 ## Conventions
@@ -154,11 +148,11 @@ The `justfile` is the primary development interface. Run `just` to see all avail
 - Keep Rust workspace packages under `crates/`; do not add a separate top-level `tools/` tree
 - `just` is the task runner — wrap scripts and common commands as recipes
 - Server and CLI OCI images are built with StageX (reproducible, `FROM scratch`, runs as non-root)
-- Nix is used for CI quality gates and Swift/XCFramework builds, not daily Rust development
+- Nix is used for CI quality gates and the reproducible macOS CLI universal-binary build, not daily Rust development
 - `rustup` + `rust-toolchain.toml` manages the Rust toolchain for development
 - OpenAI API format as the canonical interface
 - Server API is documented via utoipa `#[utoipa::path]` annotations on handler functions and `ToSchema` derives on request/response types. `OpenApiRouter` (in `lib.rs::build_router()`) collects paths and recursively discovers schemas automatically — only SSE streaming types that aren't referenced from path annotations are listed manually in `api_doc.rs`. When adding or changing server endpoints, add the annotation on the handler and register it in `build_router()` via `routes!()`, then run `just update-openapi` to regenerate the committed `openapi.json`
-- `artifact-manifest.json` (v1 format) records expected OCI digests, macOS app/CLI Nix `narHash` values, and enclave measurements (SEV-SNP + TDX + cmdline) with type/platform metadata; the enclave block shape matches the Tinfoil `snp-tdx-multiplatform/v1` predicate so `tinfoil-build.yml` can project it directly into `tinfoil-deployment.json`. CI verifies the full file by merging digests captured from the real OCI and macOS build jobs and recomputing enclave measurements from `tinfoil-config.yml`. Use `just update-manifest` to regenerate it on macOS with the pinned amd64 BuildKit builder plus the local Nix macOS builds
+- `artifact-manifest.json` (`schema_version: "1.0.0"`) records expected OCI digests, the macOS universal CLI Nix `narHash`, and enclave measurements (SEV-SNP + TDX + cmdline) with type/platform metadata; the enclave block shape matches the Tinfoil `snp-tdx-multiplatform/v1` predicate so `tinfoil-build.yml` can project it directly into `tinfoil-deployment.json`. CI verifies the full file by merging digests captured from the real OCI and macOS build jobs and recomputing enclave measurements from `tinfoil-config.yml`. Use `just update-manifest` to regenerate it on macOS with the pinned amd64 BuildKit builder plus the local Nix CLI build
 - Contributor agreement state lives in `CLA-INDIVIDUAL.md`, `CLA-CORPORATE.md`, and `CLA-SIGNERS.txt`; the signer ledger plus Git history is the source of truth, and changing either CLA text requires new signer entries because the SHA-256 hash changes
 - Before committing, ensure `README.md` and the relevant `AGENTS.md` are updated to reflect any changes. Workspace-wide context (server, app-core, build commands, conventions) goes in the top-level `AGENTS.md`; gpui-app-specific context goes in `apps/gui/AGENTS.md` (loaded automatically when working in that subtree). Sub-app docs should not duplicate workspace-wide context — link back to it instead.
 - Omit any tool-specific "co-authored by" lines from commit messages

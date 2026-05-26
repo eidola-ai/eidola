@@ -4,7 +4,7 @@ Guidance for AI coding agents working on the gpui macOS app. Cross-cutting works
 
 ## What this app is
 
-A native Rust client for Eidola, built on [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the immediate-mode UI framework Zed is built on) and [gpui-component](https://github.com/longbridge/gpui-component) (a shadcn-style widget library on top of gpui). It mirrors the SwiftUI `apps/macos/` app feature-for-feature, sharing the same `crates/eidola-app-core/` backend. macOS-only today; Linux is the next target.
+A native Rust client for Eidola, built on [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the immediate-mode UI framework Zed is built on) and [gpui-component](https://github.com/longbridge/gpui-component) (a shadcn-style widget library on top of gpui). The sole macOS GUI for the project; the CLI in `apps/cli/` shares the same `crates/eidola-app-core/` backend. macOS-only today; Linux is the next target.
 
 ## Core wrapper (`src/core.rs`)
 
@@ -86,7 +86,7 @@ There is no Send button. ⌘↩ is the sole submit path.
 
 While streaming, `ChatView::streaming: Option<StreamingResponse>` holds the live `reasoning` + `content` buffers and a disclosure-`expanded` flag. It renders as a single row below the user message: a clickable "Thinking…" / "Answering…" / "Thinking (N chars)" header (a `Button` styled with a chevron), the reasoning body when expanded, and the partial markdown content as it grows. On `Done`, `streaming` is dropped and `messages` is re-fetched from the space — only the final content is persisted; reasoning is ephemeral by design (it is not written to the local DB).
 
-`AppCore::chat_stream` is **Rust-only**. It's not exposed via UniFFI — the SwiftUI macOS app keeps using the blocking `chat()`. Wiring it to Swift later would mean a UniFFI `callback_interface` for the event sink. The CLI uses streaming too: `apps/cli/src/main.rs` pumps `ContentDelta` to stdout and `ReasoningDelta` to stderr (dimmed and prefixed with `thinking: ` when stderr is a TTY) so a piped stdout still captures only the final answer.
+The CLI uses streaming too: `apps/cli/src/main.rs` pumps `ContentDelta` to stdout and `ReasoningDelta` to stderr (dimmed and prefixed with `thinking: ` when stderr is a TTY) so a piped stdout still captures only the final answer.
 
 Refund handling for streaming differs from blocking only in *where* the refund token comes from: SSE responses have no inline JSON body to carry it, so the streaming path always goes through the `/v1/credentials/refund` recovery endpoint after the stream ends. Same recovery endpoint as the existing network-error fallback in the blocking `chat()`.
 
@@ -152,7 +152,7 @@ A bare `cargo run -p eidola-gui` binary launches as a command-line tool from App
 
 The fix is a proper macOS bundle:
 
-- `apps/gui/Support/Info.plist` — `CFBundleIdentifier = tech.m6i.eidola-gpui` (distinct from the SwiftUI app's `tech.m6i.eidola` so they coexist), `CFBundleExecutable = Eidola`, `NSPrincipalClass = NSApplication`, `NSHighResolutionCapable = true`.
+- `apps/gui/Support/Info.plist` — `CFBundleIdentifier = tech.m6i.eidola-gpui` (the `-gpui` suffix is a historical artifact from when a separate SwiftUI app existed at `apps/macos/`; not renamed since the bundle ID is what macOS uses to keep per-app state — changing it would invalidate users' preferences and keychain entries), `CFBundleExecutable = Eidola`, `NSPrincipalClass = NSApplication`, `NSHighResolutionCapable = true`.
 - `scripts/package-gui-app.sh` — copies `target/{debug,release}/eidola-gui` to `Contents/MacOS/Eidola` (renamed to match `CFBundleExecutable` — mismatch falls back to tool-mode), copies the Info.plist, ad-hoc codesigns. Output at `apps/gui/build/Eidola.app` (gitignored).
 - `just build gui` runs `cargo build` then the package script on macOS. `just run gui` builds + `open`s the .app. Non-macOS falls back to `cargo run`.
 

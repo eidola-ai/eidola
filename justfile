@@ -26,7 +26,7 @@ db-reset:
 
 # --- Build (local toolchain, fast iteration) ---
 
-# Build a system: server, cli, or macos
+# Build a system: server, cli, or gui
 build system:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -47,23 +47,13 @@ build system:
           ./scripts/package-gui-app.sh debug
         fi
         ;;
-      macos)
-        if [[ "$(uname -s)" != "Darwin" ]]; then
-          echo "error: macOS app can only be built on macOS" >&2
-          exit 1
-        fi
-        just update-bindings
-        just update-xcframework
-        ( cd apps/macos && swift build )
-        ./scripts/package-macos-app.sh
-        ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, macos)" >&2
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui)" >&2
         exit 1
         ;;
     esac
 
-# Build and run a system: server, cli, or macos
+# Build and run a system: server, cli, or gui
 run system *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -88,16 +78,8 @@ run system *args:
           cargo run -p eidola-gui -- {{ args }}
         fi
         ;;
-      macos)
-        if [[ "$(uname -s)" != "Darwin" ]]; then
-          echo "error: macOS app can only run on macOS" >&2
-          exit 1
-        fi
-        just build macos
-        open "apps/macos/build/Eidola.app" {{ args }}
-        ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, macos)" >&2
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui)" >&2
         exit 1
         ;;
     esac
@@ -108,7 +90,6 @@ run system *args:
 check:
     cargo clippy --all-targets -- -D warnings
     cargo fmt --check
-    git ls-files '*.swift' | xargs swift format lint --strict
 
 # Render gpui views to PNGs in apps/gui/tests/snapshots/ — local-only debug
 # aid (gitignored), not a regression gate. Pixel diffs aren't bit-stable
@@ -120,17 +101,9 @@ render-snapshots *args:
 render-snapshots-update:
     UPDATE_SNAPSHOTS=1 cargo test -p eidola-gui --test visual
 
-# Run all tests (Rust + Swift on macOS)
+# Run all tests
 test:
-    #!/usr/bin/env bash
-    set -euo pipefail
     cargo test
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-      echo "--- Swift tests (crates/eidola-app-core) ---"
-      ( cd crates/eidola-app-core && swift test )
-      echo "--- Swift tests (apps/macos) ---"
-      ( cd apps/macos && swift test )
-    fi
 
 # Run integration tests (requires: just services && just db-reset)
 test-integration:
@@ -142,21 +115,9 @@ test-webhook-smoke:
 
 # --- Codegen ---
 
-# Regenerate UniFFI Swift bindings
-update-bindings:
-    ./scripts/update-bindings.sh
-
 # Regenerate OpenAPI spec
 update-openapi:
     ./scripts/update-server-openapi.sh
-
-# Rebuild XCFramework (dev, native arch only)
-update-xcframework:
-    ./scripts/update-xcframework-dev.sh
-
-# Rebuild XCFramework (release, universal binary)
-update-xcframework-release:
-    ./scripts/update-xcframework.sh
 
 # --- CI / Release ---
 
@@ -164,10 +125,9 @@ update-xcframework-release:
 measure:
     ./scripts/artifact-manifest.sh measure
 
-# Update artifact-manifest.json with current build digests and measurements
-# Builds the OCI images plus the macOS app/CLI, then records their digests.
-# Also stamps image digests into tinfoil-config.yml and computes enclave
-
-# measurements. Requires macOS for the Nix-built app and CLI artifacts.
+# Update artifact-manifest.json with current build digests and measurements.
+# Builds the OCI images plus the CLI macOS universal binary, then records
+# their digests. Also stamps image digests into tinfoil-config.yml and
+# computes enclave measurements. Requires macOS for the Nix-built CLI.
 update-manifest:
     ./scripts/artifact-manifest.sh update --ensure-builder
