@@ -48,9 +48,3 @@ updates:
     directory: "/oci/stripe-cli"
     schedule:
       interval: "weekly"
-
-  # Maintain dependencies for Swift Package Manager.
-  - package-ecosystem: "swift"
-    directory: "/core/swift"
-    schedule:
-      interval: "weekly"

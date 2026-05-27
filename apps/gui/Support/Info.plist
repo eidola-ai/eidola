@@ -6,10 +6,6 @@
 	<string>en</string>
 	<key>CFBundleExecutable</key>
 	<string>Eidola</string>
-	<!--
-		Distinct bundle ID from the SwiftUI app (`tech.m6i.eidola`) so the two
-		can coexist on the same machine during the gpui-vs-SwiftUI transition.
-	-->
 	<key>CFBundleIdentifier</key>
 	<string>tech.m6i.eidola-gpui</string>
 	<key>CFBundleInfoDictionaryVersion</key>

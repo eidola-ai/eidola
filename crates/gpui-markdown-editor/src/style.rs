@@ -66,7 +66,7 @@ pub struct MarkdownStyle {
     /// applied to the leaf content's left edge. Includes both the
     /// border-bar width and the gap between the bar and content.
     /// Nested blockquotes apply this indent cumulatively, one per
-    /// level. Mirrors `blockquoteIndent` in the Swift implementation.
+    /// level.
     pub blockquote_indent: Pixels,
     /// Horizontal indent contributed by one list-item container —
     /// applied to the leaf content's left edge so each item's content

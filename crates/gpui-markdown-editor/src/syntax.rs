@@ -72,8 +72,7 @@ pub enum NodeKind {
     /// (or `>`) marker that introduces *this* blockquote level on a
     /// single line — one per line covered by the blockquote.
     /// Outer-blockquote markers on the same line belong to the parent
-    /// `BlockQuote` node's `prefix_ranges`, not this one. Mirrors
-    /// `apps/macos/Packages/MarkdownEditor` `blockquotePrefixRanges`.
+    /// `BlockQuote` node's `prefix_ranges`, not this one.
     /// Children carry the inner block content (paragraphs, code
     /// blocks, nested blockquotes, …).
     BlockQuote {

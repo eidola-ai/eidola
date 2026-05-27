@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Assemble a .app bundle from the cargo-built `eidola-gui` binary. Mirrors
-# scripts/package-macos-app.sh in shape; the gui binary is a single Rust
-# executable with no UniFFI/Swift glue, so this is shorter.
+# Assembles a .app bundle from the cargo-built `eidola-gui` binary.
 #
 # Usage: package-gui-app.sh [debug|release]
 #

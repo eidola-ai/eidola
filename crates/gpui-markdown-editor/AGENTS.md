@@ -4,13 +4,7 @@ A WYSIWYG markdown editor as a `gpui-component`-style widget. Targets
 `apps/gui` (the chat composer) but is intentionally generic so other gpui
 applications can drop it in.
 
-This crate is the Rust / GPUI successor to the SwiftUI / TextKit 2 editor in
-`apps/macos/Packages/MarkdownEditor`. The foundational goals haven't changed
-— the implementation target has. **Read that crate's `AGENTS.md` first** for
-the full design rationale. This file records what's specific to the gpui port
-and what's deliberately *different* from the Swift implementation.
-
-## Foundational Goals (unchanged from Swift)
+## Foundational Goals
 
 1. **Valid, compliant markdown.** The buffer is always valid CommonMark
    (with one exception: two consecutive newlines are preserved as user-visible
@@ -21,17 +15,13 @@ and what's deliberately *different* from the Swift implementation.
 3. **Block composability.** Lists / blockquotes nest arbitrarily; leaf blocks
    (code, math) are inert islands.
 
-## Target Behavior (unchanged from Swift)
+## Target Behavior
 
 The user edits markdown source but sees rich formatting — *except around their
 cursor*. Delimiters hide when the cursor is outside the construct and reveal
 (dimmed) when the cursor or an active selection enters it. Formatting applies
 to content, never to delimiters; the underlying markdown is never modified to
 achieve a visual effect; copy/paste always produces raw markdown.
-
-The full per-construct expectations table from
-`apps/macos/Packages/MarkdownEditor/AGENTS.md` applies verbatim. Any divergence
-is a bug.
 
 ## Pixel-fidelity goal with chat rendering
 
@@ -52,11 +42,9 @@ If a future change forces a fork between the two (e.g. the editor needs a
 gpui-component capability that lands in our crate first), fork forward in the
 chat renderer too rather than letting the surfaces drift.
 
-## Architectural pivot from Swift
+## Architecture
 
-The Swift editor used TextKit 2 with one giant `NSAttributedString` and a
-custom layout-fragment subclass for full-width decorations. The gpui version
-is structurally different:
+The editor is structured as a pure transformation pipeline:
 
 ```
 EditorState + EditorEvent  →  update()  →  new EditorState
@@ -68,25 +56,21 @@ EditorState + EditorEvent  →  update()  →  new EditorState
                                             BlockElement (gpui Element, one per block)
 ```
 
-Key differences from Swift / TextKit 2:
+Architectural decisions:
 
-- **Per-block GPUI `Element`s** instead of one attributed string. Each block
-  is its own painter, which makes full-width code-block backgrounds and
-  blockquote borders trivial — they're per-block decorations, not custom
-  layout fragments.
-- **`display_to_source` per shaped line** replaces the ZWSP length-matching
-  trick from Swift. We *can* shape display strings shorter than their source
-  range (delimiters genuinely removed from the shaped line) because gpui's
-  `WrappedLine` returns positions in display-byte coordinates. We translate
-  back at hit-test / cursor-paint time via a per-line map, mirroring the
-  pattern from `gpui::Editor`.
-- **No `NSTextView` subclass / responder chain.** Keyboard input goes
-  through gpui actions. IME / dead-key composition uses
+- **Per-block GPUI `Element`s** rather than a single attributed string. Each
+  block is its own painter, which makes full-width code-block backgrounds and
+  blockquote borders trivial — they're per-block decorations.
+- **`display_to_source` per shaped line.** We can shape display strings
+  shorter than their source range (delimiters genuinely removed from the
+  shaped line) because gpui's `WrappedLine` returns positions in display-byte
+  coordinates. We translate back at hit-test / cursor-paint time via a
+  per-line map, mirroring the pattern from `gpui::Editor`.
+- **Keyboard input through gpui actions.** IME / dead-key composition uses
   `EntityInputHandler` (the gpui input-handler trait) — see the
   `examples/input.rs` upstream pattern.
-- **No focus-anchor associated objects.** Shift-arrow extension state lives
-  on `Selection::Range::anchor`, which gpui can update from a cursor-state
-  member directly without runtime tricks.
+- **Shift-arrow extension state on `Selection::Range::anchor`**, which gpui
+  updates from a cursor-state member directly.
 
 ## Minimum viable scope (current)
 
@@ -733,9 +717,8 @@ aid for the developer making a UI change, not a CI gate.
 
 ### Required cursor-position coverage
 
-The Swift `AGENTS.md` mandates that every visual test exercise the cursor at
-many positions, not just where typing left it. That requirement carries over.
-Each construct's snapshot suite must include cursor:
+Every visual test must exercise the cursor at many positions, not just
+where typing left it. Each construct's snapshot suite must include cursor:
 
 1. Inside the construct (delimiters dimmed/visible).
 2. Just outside, on either side (delimiters hidden).
@@ -763,7 +746,7 @@ UPDATE_SNAPSHOTS=1 cargo test -p gpui-markdown-editor --test visual
 cargo run -p gpui-markdown-editor --bin demo
 ```
 
-## Process for adding a markdown feature (carried over from Swift)
+## Process for adding a markdown feature
 
 1. **Discover.** Build the feature against the demo, *read every snapshot*,
    identify deviations from expected behavior. Think like a user, not a code

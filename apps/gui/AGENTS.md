@@ -152,7 +152,7 @@ A bare `cargo run -p eidola-gui` binary launches as a command-line tool from App
 
 The fix is a proper macOS bundle:
 
-- `apps/gui/Support/Info.plist` — `CFBundleIdentifier = tech.m6i.eidola-gpui` (the `-gpui` suffix is a historical artifact from when a separate SwiftUI app existed at `apps/macos/`; not renamed since the bundle ID is what macOS uses to keep per-app state — changing it would invalidate users' preferences and keychain entries), `CFBundleExecutable = Eidola`, `NSPrincipalClass = NSApplication`, `NSHighResolutionCapable = true`.
+- `apps/gui/Support/Info.plist` — `CFBundleIdentifier = tech.m6i.eidola-gpui`, `CFBundleExecutable = Eidola`, `NSPrincipalClass = NSApplication`, `NSHighResolutionCapable = true`.
 - `scripts/package-gui-app.sh` — copies `target/{debug,release}/eidola-gui` to `Contents/MacOS/Eidola` (renamed to match `CFBundleExecutable` — mismatch falls back to tool-mode), copies the Info.plist, ad-hoc codesigns. Output at `apps/gui/build/Eidola.app` (gitignored).
 - `just build gui` runs `cargo build` then the package script on macOS. `just run gui` builds + `open`s the .app. Non-macOS falls back to `cargo run`.
 

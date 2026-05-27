@@ -204,9 +204,11 @@ impl ChatView {
                     } else {
                         None
                     },
-                    reasoning_expanded: same_position
-                        .then(|| prior.is_some_and(|p| p.reasoning_expanded))
-                        .unwrap_or(false),
+                    reasoning_expanded: if same_position {
+                        prior.is_some_and(|p| p.reasoning_expanded)
+                    } else {
+                        false
+                    },
                 }
             })
             .collect();

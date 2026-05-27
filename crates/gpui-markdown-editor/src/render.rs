@@ -1,7 +1,7 @@
 //! Pure transformation: `(EditorState, &[SyntaxNode]) -> RenderSpec`.
 //!
-//! Centralizes the cursor-aware delimiter visibility rule from
-//! `apps/macos/Packages/MarkdownEditor/AGENTS.md`:
+//! Centralizes the cursor-aware delimiter visibility rule from this
+//! crate's `AGENTS.md`:
 //!
 //! > Delimiters hide when the cursor is outside the construct. Delimiters
 //! > reveal (dimmed) when the cursor — or an active selection — enters the
@@ -389,7 +389,7 @@ impl CursorRange {
 
     /// Cursor or selection range overlaps the construct's bounds. The
     /// boundary-equality clause keeps a collapsed cursor sitting on the edge
-    /// of the construct treated as "inside" — same rule as the Swift editor.
+    /// of the construct treated as "inside".
     fn overlaps(self, range: &Range<usize>) -> bool {
         if self.start < range.end && self.end > range.start {
             return true;

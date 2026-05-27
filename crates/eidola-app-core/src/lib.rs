@@ -23,9 +23,8 @@ use config::Config;
 use error::AppError;
 
 // ============================================================================
-// Data transfer types — returned from `AppCore` methods to the apps (CLI,
-// GUI). Plain Rust structs; the SwiftUI FFI layer that previously required
-// `#[derive(uniffi::Record)]` has been removed.
+// Data transfer types — returned from `AppCore` methods to the apps
+// (CLI, GUI).
 // ============================================================================
 
 /// Snapshot of the current config for display.

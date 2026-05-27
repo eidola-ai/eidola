@@ -1,21 +1,2 @@
-# Mark generated Swift bindings as generated code
-# This collapses them in GitHub PR diffs and marks them in GitHub's UI
-
-# Core library (eidola/) Swift bindings
-eidola/swift/Sources/EidolaCore/*.swift linguist-generated=true
-eidola/swift/Sources/EidolaCoreFFI/*.h linguist-generated=true
-eidola/swift/Sources/EidolaCoreFFI/*.c linguist-generated=true
-eidola/swift/Sources/EidolaCoreFFI/*.modulemap linguist-generated=true
-
-# Shared core (eidola-shared/) Swift bindings - UniFFI
-crates/eidola-shared/swift/Sources/EidolaShared/*.swift linguist-generated=true
-crates/eidola-shared/swift/Sources/EidolaSharedFFI/*.h linguist-generated=true
-crates/eidola-shared/swift/Sources/EidolaSharedFFI/*.c linguist-generated=true
-crates/eidola-shared/swift/Sources/EidolaSharedFFI/*.modulemap linguist-generated=true
-
-# Shared core (eidola-shared/) Swift bindings - Crux TypeGen
-crates/eidola-shared/swift/generated/SharedTypes/Sources/SharedTypes/*.swift linguist-generated=true
-crates/eidola-shared/swift/generated/SharedTypes/Sources/Serde/*.swift linguist-generated=true
-
 # Server OpenAPI spec
-eidola-server/openapi.json linguist-generated=true
+crates/eidola-server/openapi.json linguist-generated=true
