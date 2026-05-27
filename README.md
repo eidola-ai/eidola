@@ -114,7 +114,7 @@ just run gui        # build and open Eidola.app
 just test           # cargo test
 ```
 
-`just build gui` produces `apps/gui/build/Eidola.app`. See `apps/gui/AGENTS.md` for the architecture details.
+`just build gui` produces `crates/eidola-gui/build/Eidola.app`. See `crates/eidola-gui/AGENTS.md` for the architecture details.
 
 See more available commands:
 

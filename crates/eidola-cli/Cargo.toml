@@ -12,6 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-eidola-app-core = { path = "../../crates/eidola-app-core" }
+eidola-app-core = { path = "../eidola-app-core" }
 open = "5"
 tokio = { version = "1", features = ["sync", "macros"] }

@@ -15,7 +15,7 @@ name = "demo"
 path = "src/bin/demo.rs"
 
 [dependencies]
-# Mirror the apps/gui pin so cargo unifies on a single gpui copy across the
+# Mirror the eidola-gui pin so cargo unifies on a single gpui copy across the
 # workspace.
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }

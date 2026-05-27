@@ -5,7 +5,7 @@
 //! - `cargo test -p eidola-gui --test visual`        — verify against goldens
 //! - `UPDATE_SNAPSHOTS=1 cargo test -p eidola-gui --test visual` — accept new
 //!
-//! Snapshots are written to `apps/gui/tests/snapshots/`.
+//! Snapshots are written to `crates/eidola-gui/tests/snapshots/`.
 
 mod visual {
     pub mod cases;

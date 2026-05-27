@@ -5,11 +5,11 @@ set -euo pipefail
 #
 # Usage: package-gui-app.sh [debug|release]
 #
-# The bundle goes to apps/gui/build/Eidola.app. Without this — i.e. running
+# The bundle goes to crates/eidola-gui/build/Eidola.app. Without this — i.e. running
 # the bare `cargo run -p eidola-gui` binary — AppKit treats the process as a
 # command-line tool, which breaks menu key-equivalent dispatch when no
 # window has key focus (⌘N / ⌘Q etc. after ⌘Tab back, or after closing the
-# last window). See apps/gui/Support/Info.plist for the full rationale.
+# last window). See crates/eidola-gui/Support/Info.plist for the full rationale.
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "error: .app packaging is only supported on macOS" >&2
@@ -39,7 +39,7 @@ if [[ ! -f "$EXECUTABLE" ]]; then
   exit 1
 fi
 
-APP_DIR="$REPO_ROOT/apps/gui/build/Eidola.app"
+APP_DIR="$REPO_ROOT/crates/eidola-gui/build/Eidola.app"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
@@ -50,10 +50,10 @@ echo "Assembling Eidola.app from $CONFIG build..."
 # whether the binary "owns" the bundle; mismatch falls back to tool-mode.
 cp "$EXECUTABLE" "$APP_DIR/Contents/MacOS/Eidola"
 
-cp "$REPO_ROOT/apps/gui/Support/Info.plist" "$APP_DIR/Contents/"
+cp "$REPO_ROOT/crates/eidola-gui/Support/Info.plist" "$APP_DIR/Contents/"
 
 # App icon (if present).
-ICON="$REPO_ROOT/apps/gui/Support/AppIcon.icns"
+ICON="$REPO_ROOT/crates/eidola-gui/Support/AppIcon.icns"
 if [[ -f "$ICON" ]]; then
   cp "$ICON" "$APP_DIR/Contents/Resources/"
 fi

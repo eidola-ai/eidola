@@ -194,7 +194,7 @@ fn install_keybindings(cx: &mut App) {
 /// the ChatView-context `cmd-enter → Send` binding still win for submit
 /// because the editor itself does not bind `cmd-enter` to anything.
 ///
-/// Mirrors the macOS defaults documented in `apps/gui/Cargo.toml`-adjacent
+/// Mirrors the macOS defaults documented in `crates/eidola-gui/Cargo.toml`-adjacent
 /// `bin/demo.rs` in the editor crate, minus the global `cmd-up` /
 /// `cmd-down` shortcuts that the chat reserves for future scroll-to-end
 /// navigation.

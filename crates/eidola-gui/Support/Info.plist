@@ -31,7 +31,7 @@
 	<!--
 		Don't auto-quit when the last window closes; the app stays alive and
 		can be reopened via the dock icon (see `Application::on_reopen` in
-		apps/gui/src/lib.rs).
+		crates/eidola-gui/src/lib.rs).
 	-->
 	<key>LSUIElement</key>
 	<false/>

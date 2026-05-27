@@ -1,7 +1,7 @@
 # gpui-markdown-editor — Agent Development Guide
 
 A WYSIWYG markdown editor as a `gpui-component`-style widget. Targets
-`apps/gui` (the chat composer) but is intentionally generic so other gpui
+`crates/eidola-gui` (the chat composer) but is intentionally generic so other gpui
 applications can drop it in.
 
 ## Foundational Goals
@@ -25,7 +25,7 @@ achieve a visual effect; copy/paste always produces raw markdown.
 
 ## Pixel-fidelity goal with chat rendering
 
-The chat in `apps/gui` already uses `gpui-component`'s `TextView::markdown`
+The chat in `crates/eidola-gui` already uses `gpui-component`'s `TextView::markdown`
 to render messages. The composer uses this editor. **The two must
 match pixel-for-pixel** — what the user types is what they see in the
 transcript after they send. That implies sharing typography, paragraph
@@ -679,10 +679,10 @@ The editor does **not** carry its own color palette. `MarkdownStyle::from_theme`
 derives every color (text, secondary, delimiter, background) from
 `gpui_component::Theme`. Day / Night just work because they're the theme's
 job. Callers can override individual fields after construction (font size,
-heading callback, paragraph gap) the same way `apps/gui::chat::markdown_style`
+heading callback, paragraph gap) the same way `eidola_gui::chat::markdown_style`
 overrides `TextViewStyle`.
 
-## Testing — two tiers (mirrors `apps/gui`)
+## Testing — two tiers (mirrors `crates/eidola-gui`)
 
 ### Behavior tests (`tests/behavior.rs`) — the regression gate
 
@@ -706,7 +706,7 @@ Built on `gpui::VisualTestAppContext`. Configured `harness = false` so
 SIGABRT inside AppKit). Renders each case **twice** — once Day, once Night —
 and writes/compares `tests/snapshots/<name>-{day,night}.png`.
 
-Mirrors `apps/gui/tests/visual.rs` exactly:
+Mirrors `crates/eidola-gui/tests/visual.rs` exactly:
 
 - Missing PNG → write it and report `written`.
 - Mismatch → save `<name>-<mode>.new.png` for review and fail.
@@ -772,8 +772,8 @@ cargo run -p gpui-markdown-editor --bin demo
 
 ## Known design notes
 
-- **`gpui-component` pin is shared with `apps/gui`.** Same git rev. If we
-  bump `apps/gui`, we bump here in lockstep so cargo unifies.
+- **`gpui-component` pin is shared with `crates/eidola-gui`.** Same git rev. If we
+  bump `crates/eidola-gui`, we bump here in lockstep so cargo unifies.
 - **The crate has no Eidola-specific symbols.** It only depends on `gpui`,
   `gpui-component`, `gpui-component-assets`, `pulldown-cmark`,
   `unicode-segmentation`, and `smallvec`. Other gpui apps can use it

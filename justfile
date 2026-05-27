@@ -73,7 +73,7 @@ run system *args:
         # focus. On non-macOS we fall back to `cargo run`.
         if [[ "$(uname -s)" == "Darwin" ]]; then
           just build gui
-          open -W "apps/gui/build/Eidola.app" --args {{ args }}
+          open -W "crates/eidola-gui/build/Eidola.app" --args {{ args }}
         else
           cargo run -p eidola-gui -- {{ args }}
         fi
@@ -91,7 +91,7 @@ check:
     cargo clippy --all-targets -- -D warnings
     cargo fmt --check
 
-# Render gpui views to PNGs in apps/gui/tests/snapshots/ — local-only debug
+# Render gpui views to PNGs in crates/eidola-gui/tests/snapshots/ — local-only debug
 # aid (gitignored), not a regression gate. Pixel diffs aren't bit-stable
 # across machines, so committed regression checks live in tests/behavior.rs.
 render-snapshots *args:

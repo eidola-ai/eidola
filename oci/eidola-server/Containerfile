@@ -23,7 +23,7 @@ WORKDIR /src
 FROM base AS fetch
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY --parents apps/*/Cargo.toml crates/*/Cargo.toml ./
+COPY --parents crates/*/Cargo.toml ./
 
 # Stub source files so cargo can resolve all workspace members.
 # Creates both lib.rs and main.rs (for [[bin]] crates) so that cargo can

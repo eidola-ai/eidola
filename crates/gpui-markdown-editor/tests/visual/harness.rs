@@ -1,4 +1,4 @@
-//! Snapshot harness adapted from `apps/gui/tests/visual/harness.rs`. Runs
+//! Snapshot harness adapted from `crates/eidola-gui/tests/visual/harness.rs`. Runs
 //! every case twice (Light / Dark) and writes / verifies PNG goldens.
 
 use std::path::PathBuf;

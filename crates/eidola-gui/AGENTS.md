@@ -1,10 +1,10 @@
-# apps/gui — gpui-based Eidola
+# crates/eidola-gui — gpui-based Eidola
 
 Guidance for AI coding agents working on the gpui macOS app. Cross-cutting workspace context (server, app-core, build-system, conventions) lives in the top-level `AGENTS.md`.
 
 ## What this app is
 
-A native Rust client for Eidola, built on [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the immediate-mode UI framework Zed is built on) and [gpui-component](https://github.com/longbridge/gpui-component) (a shadcn-style widget library on top of gpui). The sole macOS GUI for the project; the CLI in `apps/cli/` shares the same `crates/eidola-app-core/` backend. macOS-only today; Linux is the next target.
+A native Rust client for Eidola, built on [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the immediate-mode UI framework Zed is built on) and [gpui-component](https://github.com/longbridge/gpui-component) (a shadcn-style widget library on top of gpui). The sole macOS GUI for the project; the CLI in `crates/eidola-cli/` shares the same `crates/eidola-app-core/` backend. macOS-only today; Linux is the next target.
 
 ## Core wrapper (`src/core.rs`)
 
@@ -35,7 +35,7 @@ Two `ThemeConfig`s, "Circadian Day" (Light) and "Circadian Night" (Dark), instal
 
 The starting palette is lifted from the marketing site (`../www.eidola.ai/index.html`); treat it as a historical seed, not a contract.
 
-**Body font is Newsreader 16pt** (SIL OFL 1.1) — five static TTF instances (Regular, Italic, SemiBold, Bold, BoldItalic) from `productiontype/Newsreader`, bundled in `apps/gui/assets/fonts/Newsreader16pt-*.ttf`, embedded via `include_bytes!`, and registered with `cx.text_system().add_fonts`. License at `assets/fonts/OFL.txt`.
+**Body font is Newsreader 16pt** (SIL OFL 1.1) — five static TTF instances (Regular, Italic, SemiBold, Bold, BoldItalic) from `productiontype/Newsreader`, bundled in `crates/eidola-gui/assets/fonts/Newsreader16pt-*.ttf`, embedded via `include_bytes!`, and registered with `cx.text_system().add_fonts`. License at `assets/fonts/OFL.txt`.
 
 We ship statics rather than the variable upright + italic because **gpui's macOS text system does not apply variable-font weight axes**: `gpui_macos::text_system::add_fonts` registers each TTF as one face with the properties of its default instance, and `font_kit::matching::find_best_match` picks the closest face per weight request. With only the variable TTFs registered, every weight request — `**strong**` (BOLD), headings (SEMIBOLD/BOLD), etc. — resolved to the Regular default and rendered un-bold. Five static faces make `find_best_match` pick correctly. Family name in the theme is `"Newsreader 16pt"` (the typographic family — nid 16 — that all five faces report; SemiBold sets nid 16 explicitly to override its nid 1 = `Newsreader 16pt SemiBold`, the canonical workaround for the Windows OS/2 4-style-per-family limit).
 
@@ -86,7 +86,7 @@ There is no Send button. ⌘↩ is the sole submit path.
 
 While streaming, `ChatView::streaming: Option<StreamingResponse>` holds the live `reasoning` + `content` buffers and a disclosure-`expanded` flag. It renders as a single row below the user message: a clickable "Thinking…" / "Answering…" / "Thinking (N chars)" header (a `Button` styled with a chevron), the reasoning body when expanded, and the partial markdown content as it grows. On `Done`, `streaming` is dropped and `messages` is re-fetched from the space — only the final content is persisted; reasoning is ephemeral by design (it is not written to the local DB).
 
-The CLI uses streaming too: `apps/cli/src/main.rs` pumps `ContentDelta` to stdout and `ReasoningDelta` to stderr (dimmed and prefixed with `thinking: ` when stderr is a TTY) so a piped stdout still captures only the final answer.
+The CLI uses streaming too: `crates/eidola-cli/src/main.rs` pumps `ContentDelta` to stdout and `ReasoningDelta` to stderr (dimmed and prefixed with `thinking: ` when stderr is a TTY) so a piped stdout still captures only the final answer.
 
 Refund handling for streaming differs from blocking only in *where* the refund token comes from: SSE responses have no inline JSON body to carry it, so the streaming path always goes through the `/v1/credentials/refund` recovery endpoint after the stream ends. Same recovery endpoint as the existing network-error fallback in the blocking `chat()`.
 
@@ -152,13 +152,13 @@ A bare `cargo run -p eidola-gui` binary launches as a command-line tool from App
 
 The fix is a proper macOS bundle:
 
-- `apps/gui/Support/Info.plist` — `CFBundleIdentifier = tech.m6i.eidola-gpui`, `CFBundleExecutable = Eidola`, `NSPrincipalClass = NSApplication`, `NSHighResolutionCapable = true`.
-- `scripts/package-gui-app.sh` — copies `target/{debug,release}/eidola-gui` to `Contents/MacOS/Eidola` (renamed to match `CFBundleExecutable` — mismatch falls back to tool-mode), copies the Info.plist, ad-hoc codesigns. Output at `apps/gui/build/Eidola.app` (gitignored).
+- `crates/eidola-gui/Support/Info.plist` — `CFBundleIdentifier = tech.m6i.eidola-gpui`, `CFBundleExecutable = Eidola`, `NSPrincipalClass = NSApplication`, `NSHighResolutionCapable = true`.
+- `scripts/package-gui-app.sh` — copies `target/{debug,release}/eidola-gui` to `Contents/MacOS/Eidola` (renamed to match `CFBundleExecutable` — mismatch falls back to tool-mode), copies the Info.plist, ad-hoc codesigns. Output at `crates/eidola-gui/build/Eidola.app` (gitignored).
 - `just build gui` runs `cargo build` then the package script on macOS. `just run gui` builds + `open`s the .app. Non-macOS falls back to `cargo run`.
 
 ## Testing — two tiers
 
-Both run via `cargo test -p eidola-gui`. `apps/gui` has both `[lib]` and `[[bin]]` so the integration tests can import view modules.
+Both run via `cargo test -p eidola-gui`. `crates/eidola-gui` has both `[lib]` and `[[bin]]` so the integration tests can import view modules.
 
 ### Behavior tests (`tests/behavior.rs`) — the regression gate
 
