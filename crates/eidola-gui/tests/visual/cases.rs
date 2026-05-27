@@ -360,7 +360,7 @@ fn register_account(s: &mut Snapshots) {
                         BalancePoolInfo {
                             amount: 3_000,
                             source: "subscription".into(),
-                            expires_at: Some("2026-06-01T00:00:00Z".into()),
+                            expires_at: Some(1_780_000_000_000),
                         },
                         BalancePoolInfo {
                             amount: 1_200,

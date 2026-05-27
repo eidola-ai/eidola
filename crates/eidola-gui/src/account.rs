@@ -101,7 +101,7 @@ impl Render for AccountView {
                         "{} credits",
                         pool.amount
                     ))));
-                if let Some(exp) = pool.expires_at.as_deref() {
+                if let Some(exp) = pool.expires_at {
                     row = row.child(
                         Label::new(SharedString::from(format!("expires {exp}")))
                             .text_color(theme.muted_foreground),

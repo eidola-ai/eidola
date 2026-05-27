@@ -33,10 +33,11 @@ pub struct Core {
 
 impl Core {
     pub fn new(cx: &mut App) -> Entity<Self> {
-        let config_dir = eidola_app_core::default_config_dir()
+        let config_dir = eidola_app_core::config::default_config_path()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .expect("could not determine eidola config directory");
-        let data_dir =
-            eidola_app_core::default_data_dir().expect("could not determine eidola data directory");
+        let data_dir = eidola_app_core::config::default_data_dir()
+            .expect("could not determine eidola data directory");
 
         let inner = Arc::new(AppCore::new(config_dir, data_dir));
         let config_state = Some(inner.config_state());

@@ -149,11 +149,9 @@ enum SpacesCommand {
 
 fn build_core() -> AppCore {
     let config_dir = config::default_config_path()
-        .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .expect("could not determine config directory");
-    let data_dir = config::default_data_dir()
-        .map(|d| d.to_string_lossy().into_owned())
-        .expect("could not determine data directory");
+    let data_dir = config::default_data_dir().expect("could not determine data directory");
     AppCore::new(config_dir, data_dir)
 }
 
@@ -355,7 +353,6 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 for pool in &balances.pools {
                     let expires = pool
                         .expires_at
-                        .as_deref()
                         .map(|e| format!(", expires {e}"))
                         .unwrap_or_default();
                     println!("  {} ({}{})", pool.amount, pool.source, expires);

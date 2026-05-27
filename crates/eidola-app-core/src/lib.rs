@@ -32,6 +32,7 @@ use error::AppError;
 /// `base_url` and `trusted_measurements` are the *resolved* values: the
 /// user's override if set, the trust-root pin otherwise. UI displays these
 /// directly without needing to know which source they came from.
+#[derive(Clone, Debug)]
 pub struct ConfigState {
     pub base_url: String,
     pub has_account: bool,
@@ -43,23 +44,27 @@ pub struct ConfigState {
     pub attestation_url: Option<String>,
 }
 
+#[derive(Clone, Debug)]
 pub struct MeasurementInfo {
     pub snp: String,
     pub tdx_rtmr1: String,
     pub tdx_rtmr2: String,
 }
 
+#[derive(Clone, Debug)]
 pub struct AccountCreateResult {
     pub id: String,
-    pub created_at: String,
+    pub created_at: i64,
 }
 
+#[derive(Clone, Debug)]
 pub struct AccountShowResult {
     pub id: String,
     pub stripe_customer_id: Option<String>,
-    pub created_at: String,
+    pub created_at: i64,
 }
 
+#[derive(Clone, Debug)]
 pub struct PriceInfo {
     pub id: String,
     pub product_name: String,
@@ -69,23 +74,27 @@ pub struct PriceInfo {
     pub credits: i64,
 }
 
+#[derive(Clone, Debug)]
 pub struct BalancesResult {
     pub available: i64,
     pub pools: Vec<BalancePoolInfo>,
 }
 
+#[derive(Clone, Debug)]
 pub struct BalancePoolInfo {
     pub amount: i64,
     pub source: String,
-    pub expires_at: Option<String>,
+    pub expires_at: Option<i64>,
 }
 
+#[derive(Clone, Debug)]
 pub struct CredentialInfo {
     pub nonce: String,
     pub credits: i64,
     pub generation: i64,
 }
 
+#[derive(Clone, Debug)]
 pub struct InFlightCredentialInfo {
     pub nonce: String,
     pub credits: i64,
@@ -93,12 +102,14 @@ pub struct InFlightCredentialInfo {
     pub spend_amount: i64,
 }
 
+#[derive(Clone, Debug)]
 pub struct AllocateResult {
     pub nonce: String,
     pub credits: i64,
     pub issuer_key_id: String,
 }
 
+#[derive(Clone, Debug)]
 pub struct ChatResult {
     pub space_id: String,
     pub content: String,
@@ -108,18 +119,20 @@ pub struct ChatResult {
     pub credits_charged: i64,
 }
 
+#[derive(Clone, Debug)]
 pub struct SpaceInfo {
     pub id: String,
     pub title: Option<String>,
     pub created_at: i64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SpaceMessage {
     pub role: String,
     pub content: String,
 }
 
+#[derive(Clone, Debug)]
 pub struct ModelInfo {
     pub id: String,
     pub context_length: u64,
@@ -135,18 +148,6 @@ pub enum ChatStreamEvent {
     ReasoningDelta(String),
     /// A piece of the assistant's answer text. Append to a running buffer.
     ContentDelta(String),
-}
-
-// ============================================================================
-// Default directory helpers
-// ============================================================================
-
-pub fn default_config_dir() -> Option<String> {
-    config::default_config_path().and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
-}
-
-pub fn default_data_dir() -> Option<String> {
-    config::default_data_dir().map(|d| d.to_string_lossy().into_owned())
 }
 
 // ============================================================================
@@ -248,7 +249,7 @@ impl Inner {
         Ok(AccountShowResult {
             id: account.id.to_string(),
             stripe_customer_id: account.stripe_customer_id,
-            created_at: account.created_at,
+            created_at: iso_to_ms(&account.created_at)?,
         })
     }
 
@@ -284,7 +285,7 @@ impl Inner {
 
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
-            created_at: created.created_at,
+            created_at: iso_to_ms(&created.created_at)?,
         })
     }
 
@@ -391,12 +392,15 @@ impl Inner {
             pools: balances
                 .pools
                 .into_iter()
-                .map(|p| BalancePoolInfo {
-                    amount: p.amount,
-                    source: p.source,
-                    expires_at: p.expires_at,
+                .map(|p| {
+                    let expires_at = p.expires_at.as_deref().map(iso_to_ms).transpose()?;
+                    Ok::<_, AppError>(BalancePoolInfo {
+                        amount: p.amount,
+                        source: p.source,
+                        expires_at,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 
@@ -1691,7 +1695,7 @@ impl AppCore {
     ///
     /// `config_dir` — directory containing `config.toml`.
     /// `data_dir` — directory for the local database.
-    pub fn new(config_dir: String, data_dir: String) -> Self {
+    pub fn new(config_dir: PathBuf, data_dir: PathBuf) -> Self {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1701,8 +1705,8 @@ impl AppCore {
         Self {
             runtime,
             inner: Arc::new(Inner {
-                config_path: PathBuf::from(&config_dir).join("config.toml"),
-                data_dir: PathBuf::from(data_dir),
+                config_path: config_dir.join("config.toml"),
+                data_dir,
                 db: tokio::sync::OnceCell::new(),
             }),
         }
