@@ -15,7 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # This workflow opens a PR via `git push`, which needs the
+      # GITHUB_TOKEN persisted into .git/config. Allowed here.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 # zizmor: ignore[artipacked]
 
       - name: Fetch latest Tinfoil release
         id: release
@@ -60,9 +62,9 @@ jobs:
         id: sigstore
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.release.outputs.artifact_hash }}
         run: |
           REPO="tinfoilsh/confidential-model-router"
-          DIGEST="${{ steps.release.outputs.artifact_hash }}"
 
           LOG_INDEX=$(gh api "repos/${REPO}/attestations/sha256:${DIGEST}" \
             --jq '.attestations[0].bundle.verificationMaterial.tlogEntries[0].logIndex')
