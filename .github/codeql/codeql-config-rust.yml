@@ -1,2 +1,3 @@
 paths-ignore:
-  - apps
+  - crates/eidola-cli
+  - crates/eidola-gui
