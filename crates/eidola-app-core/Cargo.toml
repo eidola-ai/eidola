@@ -36,7 +36,7 @@ thiserror = "2"
 tinfoil-verifier = { path = "../tinfoil-verifier" }
 tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
 toml = "1"
-turso = { git = "https://github.com/eidola-ai/turso", rev = "57f08f4c7675ab865cd025bf7fab12c8bf6b4be1", default-features = false, features = ["pure-rust-crypto"] }
+turso = { version = "0.7.0-pre.4", default-features = false, features = ["pure-rust-crypto"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 x509-cert = "0.2"
 

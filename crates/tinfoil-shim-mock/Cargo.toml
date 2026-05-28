@@ -29,7 +29,7 @@ der = { version = "0.7", features = ["alloc", "pem"] }
 spki = "0.7"
 
 # Attestation chain self-verification (same crate the verifier uses)
-sev = { version = "7", default-features = false, features = ["snp", "crypto_nossl"] }
+sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
 
 # Mock attestation report (ECDSA P-384)
 p384 = { version = "0.13", features = ["ecdsa", "arithmetic", "pkcs8"] }

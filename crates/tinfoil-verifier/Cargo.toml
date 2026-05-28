@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 # SEV-SNP attestation report parsing and certificate chain verification
-sev = { version = "7", default-features = false, features = ["snp", "crypto_nossl"] }
+sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
 
 # TDX Quote V4 parsing and verification (pure Rust, rustcrypto backend).
 #
