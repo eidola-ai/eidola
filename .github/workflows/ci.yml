@@ -64,22 +64,40 @@ jobs:
             exit 1
           fi
 
-  # ── Recompute server-enclave.json (cheap ubuntu runner) ─────────────────────
-  # Single source of truth for the paired-server enclave measurement. The
-  # `oci` and `apple` jobs both consume this output and use it to override
-  # the committed `releases/trust/server-enclave.json` before building
-  # their cli artifacts. That way the cli OCI digest and macOS narHash
-  # they produce are always derived from the *correct* trust root, so
-  # `artifact-manifest`'s PR-comment suggestion is always actionable —
-  # even when the committed `server-enclave.json` has drifted.
-  enclave:
-    name: Recompute server-enclave.json
+  # ── OCI images + enclave recompute (cheap ubuntu runner) ────────────────────
+  # Mirrors the local `just update-manifest` two-phase flow so every
+  # downstream consumer (cli OCI build, apple Nix build, artifact-manifest
+  # verification) sees a single coherent trust root derived from the
+  # freshly-built server image:
+  #
+  #   Phase 1: bake server + postgres → server digest.
+  #   Phase 2: stamp the server digest into tinfoil-config.yml.
+  #   Phase 3: recompute the enclave from the stamped config and overwrite
+  #            releases/trust/server-enclave.json in the workspace.
+  #   Phase 4: bake cli (its OCI Containerfile COPYs server-enclave.json
+  #            from Phase 3, so the cli is hardcoded against the same
+  #            enclave the actually-built server will produce).
+  #   Phase 5: emit the stamped config, recomputed enclave, and combined
+  #            OCI partial as job outputs for apple + artifact-manifest.
+  #
+  # Closing the chain end-to-end inside one job means CI's view of
+  # tinfoil-config.yml ↔ server-enclave.json ↔ cli-digest ↔ manifest is
+  # always internally consistent — so the PR-comment suggestion is too.
+  oci:
+    name: Build OCI images + recompute enclave
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 60
+    env:
+      SERVER_BAKE_METADATA_FILE: ${{ github.workspace }}/.bake-server.json
+      CLI_BAKE_METADATA_FILE: ${{ github.workspace }}/.bake-cli.json
     outputs:
-      server_enclave: ${{ steps.recompute.outputs.content }}
+      stamped_tinfoil_config: ${{ steps.stamp.outputs.config }}
+      server_enclave: ${{ steps.measure.outputs.content }}
+      artifact_manifest: ${{ steps.partial.outputs.actual }}
     permissions:
       contents: read
+      packages: write # push OCI images to ghcr.io on push events
+      pull-requests: write # surfaced through artifact-manifest job; declared here for parity
 
     steps:
       - name: Checkout code
@@ -88,6 +106,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
+        # measure-enclave (Phase 3) is a workspace cargo binary.
         run: rustup show
 
       - name: Cache cargo registry and build artifacts
@@ -101,52 +120,10 @@ jobs:
           path: ~/.cache/eidola/cvm
           key: cvm-${{ hashFiles('tinfoil-config.yml') }}
 
-      - name: Recompute server-enclave.json
-        id: recompute
-        run: |
-          ./scripts/artifact-manifest.sh measure \
-            --server-enclave-output /tmp/server-enclave.json
-
-          echo "content<<EOF" >> "$GITHUB_OUTPUT"
-          cat /tmp/server-enclave.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-  # ── OCI images (cheap ubuntu runner) ─────────────────────────────────────────
-  oci:
-    name: Build and verify OCI images
-    needs: enclave
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      BAKE_METADATA_FILE: ${{ github.workspace }}/.bake-metadata.json
-    outputs:
-      artifact_manifest: ${{ steps.partial.outputs.actual }}
-    permissions:
-      contents: read
-      packages: write # push OCI images to ghcr.io on push events
-      pull-requests: write # surfaced through artifact-manifest job; declared here for parity
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Install recomputed server-enclave.json
-        env:
-          SERVER_ENCLAVE: ${{ needs.enclave.outputs.server_enclave }}
-        run: |
-          # Overwrite the committed file with the authoritative value the
-          # `enclave` job just derived from tinfoil-config.yml. The cli OCI
-          # build below COPYs `releases/` into its build context, so this
-          # makes the cli embed the correct measurement regardless of
-          # whether the committed file was current.
-          printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
-
       - name: Set up Docker Buildx
         # v* tag (release) builds skip the GHA cache entirely so Sigstore-
-        # attested artifacts come from a clean compile (see "Build OCI
-        # images" below). PR/main builds use type=gha cache, which is
+        # attested artifacts come from a clean compile (see Phase 1/4
+        # below). PR/main builds use type=gha cache, which is
         # branch-scoped — PR branches cannot write the main scope.
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0 # zizmor: ignore[cache-poisoning]
         with:
@@ -187,7 +164,7 @@ jobs:
           echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
-      - name: Build OCI images
+      - name: Phase 1 — build server + postgres
         env:
           REGISTRY: ${{ steps.tags.outputs.registry || '' }}
           TAGS: ${{ steps.tags.outputs.tags || 'dev' }}
@@ -208,11 +185,60 @@ jobs:
           fi
 
           ./scripts/artifact-manifest.sh build \
-            ${PUSH_FLAG} \
-            --metadata-file "${BAKE_METADATA_FILE}" \
+            ${PUSH_FLAG} --targets server \
+            --metadata-file "${SERVER_BAKE_METADATA_FILE}" \
             "${CACHE_ARGS[@]}"
 
-      - name: Record OCI artifact manifest
+      - name: Phase 2 — stamp tinfoil-config.yml with built server digest
+        id: stamp
+        run: |
+          ./scripts/artifact-manifest.sh stamp-config \
+            --metadata-file "${SERVER_BAKE_METADATA_FILE}"
+          {
+            echo 'config<<__EIDOLA_EOF__'
+            cat tinfoil-config.yml
+            echo '__EIDOLA_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Phase 3 — recompute server-enclave.json
+        id: measure
+        run: |
+          # Overwrite the workspace file in place. Phase 4 (cli build)
+          # COPYs releases/trust/server-enclave.json into its build
+          # context, so this makes the cli embed the enclave that
+          # corresponds to the actually-built server.
+          ./scripts/artifact-manifest.sh measure \
+            --server-enclave-output releases/trust/server-enclave.json
+          {
+            echo 'content<<__EIDOLA_EOF__'
+            cat releases/trust/server-enclave.json
+            echo '__EIDOLA_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Phase 4 — build cli OCI image
+        env:
+          REGISTRY: ${{ steps.tags.outputs.registry || '' }}
+          TAGS: ${{ steps.tags.outputs.tags || 'dev' }}
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          PUSH_FLAG=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+
+          CACHE_ARGS=()
+          if [[ "${GIT_REF}" != refs/tags/v* ]]; then
+            CACHE_ARGS=(--set "*.cache-from=type=gha" --set "*.cache-to=type=gha,mode=max")
+          fi
+
+          ./scripts/artifact-manifest.sh build \
+            ${PUSH_FLAG} --targets cli \
+            --metadata-file "${CLI_BAKE_METADATA_FILE}" \
+            "${CACHE_ARGS[@]}"
+
+      - name: Phase 5 — record combined OCI partial
+        id: partial
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
@@ -220,10 +246,13 @@ jobs:
           if [ "${EVENT_NAME}" = "push" ]; then
             PUSH_FLAG="--push"
           fi
-          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
-          ./scripts/artifact-manifest.sh print ${PUSH_FLAG} --metadata-file "${BAKE_METADATA_FILE}" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-        id: partial
+          {
+            echo 'actual<<__EIDOLA_EOF__'
+            ./scripts/artifact-manifest.sh print ${PUSH_FLAG} \
+              --metadata-file "${SERVER_BAKE_METADATA_FILE}" --targets "server postgres" \
+              --metadata-file "${CLI_BAKE_METADATA_FILE}" --targets cli
+            echo '__EIDOLA_EOF__'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Verify OCI artifact subset
         id: verify
@@ -234,7 +263,10 @@ jobs:
           if [ "${EVENT_NAME}" = "push" ]; then
             PUSH_FLAG="--push"
           fi
-          if ./scripts/artifact-manifest.sh verify ${PUSH_FLAG} --metadata-file "${BAKE_METADATA_FILE}" --manifest artifact-manifest.json; then
+          if ./scripts/artifact-manifest.sh verify ${PUSH_FLAG} \
+            --metadata-file "${SERVER_BAKE_METADATA_FILE}" --targets "server postgres" \
+            --metadata-file "${CLI_BAKE_METADATA_FILE}" --targets cli \
+            --manifest artifact-manifest.json; then
             echo "match=true" >> "$GITHUB_OUTPUT"
           else
             echo "match=false" >> "$GITHUB_OUTPUT"
@@ -248,8 +280,12 @@ jobs:
           docker buildx inspect --bootstrap 2>/dev/null | head -20
 
           echo ""
-          echo "=== Bake metadata ==="
-          jq . "${BAKE_METADATA_FILE}"
+          echo "=== Server bake metadata ==="
+          jq . "${SERVER_BAKE_METADATA_FILE}"
+
+          echo ""
+          echo "=== Cli bake metadata ==="
+          jq . "${CLI_BAKE_METADATA_FILE}"
 
           echo ""
           echo "=== Committed manifest ==="
@@ -260,7 +296,7 @@ jobs:
   # ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:a914e5b3fc1197d61832009778a77ca30717314fd32702cfdf90a42f2c279ea3
   apple:
     name: Apple builds
-    needs: enclave
+    needs: oci
     runs-on: self-hosted # zizmor: ignore[self-hosted-runner] -- macOS Nix CLI universal-binary build requires an Apple-silicon runner
     timeout-minutes: 30
     # Only main and v* tag pushes acquire the Cachix write token, gated by
@@ -279,15 +315,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install recomputed server-enclave.json
+      - name: Install stamped tinfoil-config.yml + recomputed server-enclave.json
         env:
-          SERVER_ENCLAVE: ${{ needs.enclave.outputs.server_enclave }}
+          STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}
+          SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
         run: |
-          # Overwrite the committed file with the authoritative value the
-          # `enclave` job derived from tinfoil-config.yml. The flake's
-          # source filter picks up the working-tree content (the file is
-          # git-tracked), so this makes the macOS cli embed the correct
-          # measurement regardless of whether the committed file was current.
+          # Overwrite the workspace copies with the authoritative values the
+          # `oci` job produced from its end-to-end run (server build →
+          # stamp → measure). The flake's source filter picks up the
+          # working-tree content (both files are git-tracked), so this
+          # makes the macOS cli embed exactly the same trust root the
+          # linux cli OCI image was built against.
+          printf '%s\n' "$STAMPED_CONFIG" > tinfoil-config.yml
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Install Nix
@@ -351,11 +390,22 @@ jobs:
           path: ~/.cache/eidola/cvm
           key: cvm-${{ hashFiles('tinfoil-config.yml') }}
 
-      - name: Materialize partial manifests
+      - name: Materialize oci outputs and build partials
         env:
+          STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}
+          SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
           OCI_MANIFEST: ${{ needs.oci.outputs.artifact_manifest }}
           APPLE_MANIFEST: ${{ needs.apple.outputs.artifact_manifest }}
         run: |
+          # Overwrite the workspace tinfoil-config.yml and server-enclave.json
+          # with the authoritative values the oci job produced. verify-full
+          # below reads both via --config / --server-enclave and recomputes
+          # the enclave from the stamped config — by construction the
+          # recompute equals the server-enclave we just installed, so the
+          # only thing being verified is "does the committed
+          # artifact-manifest.json equal what the build actually produced?"
+          printf '%s\n' "$STAMPED_CONFIG" > tinfoil-config.yml
+          printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
           printf '%s' "$OCI_MANIFEST" > /tmp/oci-artifact-manifest.json
           printf '%s' "$APPLE_MANIFEST" > /tmp/apple-artifact-manifest.json
 
@@ -368,27 +418,14 @@ jobs:
             --partial /tmp/oci-artifact-manifest.json \
             --partial /tmp/apple-artifact-manifest.json \
             --manifest artifact-manifest.json \
+            --config tinfoil-config.yml \
+            --server-enclave releases/trust/server-enclave.json \
             --output /tmp/artifact-manifest-actual.json \
-            --server-enclave-output /tmp/server-enclave-actual.json \
             --verify-attestations; then
             echo "match=true" >> "$GITHUB_OUTPUT"
           else
             echo "match=false" >> "$GITHUB_OUTPUT"
           fi
-
-          # Each cli build in this run was compiled against the recomputed
-          # (authoritative) server-enclave.json — the `enclave` job above
-          # produces it and the `oci`/`apple` jobs overwrite the committed
-          # file before building — so both suggestion files below are
-          # always internally consistent: a developer committing them
-          # verbatim is guaranteed to pass the next CI run.
-          echo "manifest_actual<<EOF" >> "$GITHUB_OUTPUT"
-          cat /tmp/artifact-manifest-actual.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-          echo "server_enclave_actual<<EOF" >> "$GITHUB_OUTPUT"
-          cat /tmp/server-enclave-actual.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Request manifest update (PR only)
         if: steps.verify.outputs.match == 'false' && github.event_name == 'pull_request'
@@ -396,22 +433,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          MANIFEST_ACTUAL: ${{ steps.verify.outputs.manifest_actual }}
-          SERVER_ENCLAVE_ACTUAL: ${{ steps.verify.outputs.server_enclave_actual }}
+          STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}
+          SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
         run: |
-          MANIFEST_FORMATTED=$(echo "$MANIFEST_ACTUAL" | jq -S '.')
-          SERVER_ENCLAVE_FORMATTED=$(echo "$SERVER_ENCLAVE_ACTUAL" | jq -S '.')
+          MANIFEST_FORMATTED=$(jq -S '.' /tmp/artifact-manifest-actual.json)
+          SERVER_ENCLAVE_FORMATTED=$(printf '%s' "$SERVER_ENCLAVE" | jq -S '.')
 
-          # Post a REQUEST_CHANGES review with both expected files in the
-          # body. The cli builds in this run were compiled against the
-          # *recomputed* `server-enclave.json` (CI overwrites the committed
-          # file before building), so both suggestions are guaranteed
-          # internally consistent: committing them as-is will make the
-          # next CI run pass. We avoid line-level suggestions because
-          # GitHub's UI cannot apply them when the diff contains
-          # deleted-and-replaced lines, which happens on virtually every
-          # manifest update.
-          BODY=$(printf '**Artifact Manifest Update Required**\n\nThe built OCI/macOS artifacts or recomputed enclave measurements differ from what is committed. Run `just update-manifest` on macOS to regenerate, or commit both files below verbatim (the cli digests were built against the recomputed server-enclave so they are guaranteed consistent).\n\n`releases/trust/server-enclave.json`:\n\n```json\n%s\n```\n\n`artifact-manifest.json`:\n\n```json\n%s\n```' "$SERVER_ENCLAVE_FORMATTED" "$MANIFEST_FORMATTED")
+          # Post a REQUEST_CHANGES review with all three expected files.
+          # The oci job built the server, stamped its digest into
+          # tinfoil-config.yml, recomputed the enclave, then built the cli
+          # against that — and apple did the same — so the three files
+          # below form an internally-consistent set: committing them
+          # verbatim is guaranteed to pass the next CI run. We avoid
+          # line-level suggestions because GitHub's UI cannot apply them
+          # when the diff contains deleted-and-replaced lines, which
+          # happens on virtually every manifest update.
+          BODY=$(printf '**Artifact Manifest Update Required**\n\nCI built the server, stamped its digest into `tinfoil-config.yml`, recomputed the enclave, then built the cli (OCI + macOS) against that. The three files below are the result and are internally consistent — committing them verbatim will pass the next CI run. Locally, `just update-manifest` produces the same set.\n\n`tinfoil-config.yml`:\n\n```yaml\n%s\n```\n\n`releases/trust/server-enclave.json`:\n\n```json\n%s\n```\n\n`artifact-manifest.json`:\n\n```json\n%s\n```' "$STAMPED_CONFIG" "$SERVER_ENCLAVE_FORMATTED" "$MANIFEST_FORMATTED")
 
           jq -n \
             --arg body "$BODY" \

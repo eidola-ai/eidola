@@ -5,11 +5,12 @@ usage() {
   cat <<'EOF'
 Usage:
   scripts/artifact-manifest.sh build [--push] [--metadata-file PATH] [--builder NAME] [--ensure-builder] [--targets GROUP] [--set PATTERN=VALUE ...]
-  scripts/artifact-manifest.sh print [--push] [--metadata-file PATH]
-  scripts/artifact-manifest.sh verify [--push] [--metadata-file PATH] [--manifest PATH]
+  scripts/artifact-manifest.sh print [--push] [(--metadata-file PATH [--targets "NAME ..."])...]
+  scripts/artifact-manifest.sh verify [--push] [(--metadata-file PATH [--targets "NAME ..."])...] [--manifest PATH]
   scripts/artifact-manifest.sh build-macos [--output PATH]
   scripts/artifact-manifest.sh measure [--config PATH] [--verify-attestations] [--server-enclave-output PATH]
-  scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--output PATH] [--server-enclave-output PATH] [--verify-attestations]
+  scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--config PATH] [--server-enclave PATH] [--output PATH] [--server-enclave-output PATH] [--verify-attestations]
+  scripts/artifact-manifest.sh stamp-config [--metadata-file PATH] [--config PATH]
   scripts/artifact-manifest.sh update [--output PATH] [--metadata-file PATH] [--builder NAME] [--ensure-builder]
 
 Options:
@@ -19,9 +20,20 @@ Options:
                                without push for digest computation (type=image,push=false).
                                Requires a docker-container driver (--ensure-builder or
                                setup-buildx-action).
-  --targets GROUP              Bake group to build (default: full manifest). Used by the
-                               two-phase local update flow to split server/postgres from cli.
-                               Recognized values: `all` (default), `server`, `cli`.
+  --targets GROUP              For `build`: bake group to build (default: full manifest).
+                               Recognized values: `all` (default), `server`, `cli`. Both push
+                               and non-push modes accept the split selectors so CI's
+                               two-phase build can push each phase independently.
+                               For `print`/`verify`: space-separated list of target names
+                               whose digests to read from the preceding --metadata-file
+                               (e.g. "server postgres" or "cli"). Pairs are matched
+                               positionally with --metadata-file occurrences.
+  --metadata-file PATH         Path to a buildx bake metadata file. May be repeated for
+                               `print`/`verify` to span multiple builds; each repetition
+                               must be paired with a --targets value naming the targets to
+                               read from that file.
+  --server-enclave PATH        Path to server-enclave.json (default:
+                               releases/trust/server-enclave.json). Valid for `verify-full`.
   --server-enclave-output PATH Write the computed enclave block (with `schema_version: 1`
                                envelope) to PATH. Valid for `measure` and `verify-full`.
   --verify-attestations        Verify CVM manifest provenance via Sigstore (requires gh CLI).
@@ -69,11 +81,19 @@ PUSH_MODE=0
 TARGETS="all"
 PARTIAL_FILES=()
 BUILDX_SET_ARGS=()
+# Parallel arrays for `print`/`verify` multi-metadata mode. Each --metadata-file
+# occurrence appends to PRINT_METADATA_FILES, each --targets to PRINT_TARGETS_LIST;
+# the two are paired positionally. If TARGETS_LIST is shorter (i.e. fewer
+# --targets than --metadata-files), the missing trailing entries default to
+# "server cli postgres" for backward compatibility with single-file callers.
+PRINT_METADATA_FILES=()
+PRINT_TARGETS_LIST=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --metadata-file)
       METADATA_FILE="$2"
+      PRINT_METADATA_FILES+=("$2")
       shift 2
       ;;
     --output)
@@ -110,6 +130,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --targets)
       TARGETS="$2"
+      PRINT_TARGETS_LIST+=("$2")
+      shift 2
+      ;;
+    --server-enclave)
+      SERVER_ENCLAVE_FILE="$2"
       shift 2
       ;;
     --server-enclave-output)
@@ -343,15 +368,21 @@ build_metadata() {
 
   # Pick the exact bake targets for this phase. Push mode uses the
   # registry-push variants (`ci-*`) defined in docker-bake.hcl; non-push
-  # mode uses the dev variants. The split `server` / `cli` selectors are
-  # used only by the local two-phase update flow — push callers must
-  # build everything at once (CI's `oci` job does exactly this).
+  # mode uses the dev variants. Both modes accept the split `server` /
+  # `cli` selectors so the two-phase build (server first, then cli after
+  # the enclave is recomputed) can run in either mode — CI's `oci` job
+  # uses this in push mode; the local `update_manifest` uses it without
+  # --push.
   if [[ "$PUSH_MODE" -eq 1 ]]; then
-    if [[ "$TARGETS" != "all" ]]; then
-      echo "error: --push only supports --targets all (got: $TARGETS)" >&2
-      exit 1
-    fi
-    bake_targets=(ci-server ci-cli ci-postgres)
+    case "$TARGETS" in
+      all)    bake_targets=(ci-server ci-cli ci-postgres) ;;
+      server) bake_targets=(ci-server ci-postgres) ;;
+      cli)    bake_targets=(ci-cli) ;;
+      *)
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli)" >&2
+        exit 1
+        ;;
+    esac
   else
     case "$TARGETS" in
       all)    bake_targets=(server cli postgres) ;;
@@ -397,7 +428,45 @@ print_oci_partial_for_targets() {
 }
 
 print_oci_manifest() {
-  print_oci_partial_for_targets server cli postgres
+  # Default behavior (no explicit pairs): emit server+cli+postgres digests
+  # from the single legacy METADATA_FILE. Preserves backward compat with the
+  # one-shot oci bake.
+  if [[ "${#PRINT_METADATA_FILES[@]}" -eq 0 && "${#PRINT_TARGETS_LIST[@]}" -eq 0 ]]; then
+    print_oci_partial_for_targets server cli postgres
+    return
+  fi
+
+  # Single --metadata-file with no --targets: same legacy default but allow
+  # the caller to point at a non-default metadata file.
+  if [[ "${#PRINT_METADATA_FILES[@]}" -eq 1 && "${#PRINT_TARGETS_LIST[@]}" -eq 0 ]]; then
+    print_oci_partial_for_targets server cli postgres
+    return
+  fi
+
+  if [[ "${#PRINT_METADATA_FILES[@]}" != "${#PRINT_TARGETS_LIST[@]}" ]]; then
+    echo "error: --metadata-file and --targets must be paired (got ${#PRINT_METADATA_FILES[@]} metadata files, ${#PRINT_TARGETS_LIST[@]} targets values)" >&2
+    exit 1
+  fi
+
+  # Multi-mode: each (metadata-file, targets) pair produces a partial; merge
+  # them all into a single artifact partial.
+  local i partials_json saved_metadata_file partial
+  saved_metadata_file="$METADATA_FILE"
+  partials_json="[]"
+
+  for ((i = 0; i < ${#PRINT_METADATA_FILES[@]}; i++)); do
+    local -a tgts=()
+    read -ra tgts <<<"${PRINT_TARGETS_LIST[i]}"
+    METADATA_FILE="${PRINT_METADATA_FILES[i]}"
+    partial="$(print_oci_partial_for_targets "${tgts[@]}")"
+    partials_json="$(jq -n --argjson acc "$partials_json" --argjson p "$partial" '$acc + [$p]')"
+  done
+
+  METADATA_FILE="$saved_metadata_file"
+  printf '%s\n' "$partials_json" | jq '{
+    schema_version: 1,
+    artifacts: (reduce .[] as $p ({}; . + ($p.artifacts // {})))
+  }'
 }
 
 build_macos_artifacts() {
@@ -683,6 +752,13 @@ case "$COMMAND" in
     else
       printf '%s\n' "$enclave_json"
     fi
+    ;;
+  stamp-config)
+    # Stamp the freshly-built server digest from --metadata-file into
+    # tinfoil-config.yml. Used by CI's two-phase oci job after the server
+    # bake completes and before the enclave is recomputed.
+    stamp_config_digests
+    echo "Stamped $CONFIG_FILE with server digest from $METADATA_FILE"
     ;;
   verify-full)
     verify_full_manifest
