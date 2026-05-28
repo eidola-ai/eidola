@@ -44,4 +44,5 @@ jobs:
           # `LicenseRef-bad-mitapache-2.0`. Both are really MIT OR Apache-2.0.
           allow-dependencies-licenses: >-
             pkg:cargo/async-tar,
-            pkg:cargo/rangemap
+            pkg:cargo/rangemap,
+            pkg:cargo/filetime
