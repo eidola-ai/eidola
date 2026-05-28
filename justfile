@@ -1,4 +1,4 @@
-set dotenv-load := true
+set dotenv-load
 
 # List available recipes
 default:
