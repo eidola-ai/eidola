@@ -64,9 +64,55 @@ jobs:
             exit 1
           fi
 
+  # ── Recompute server-enclave.json (cheap ubuntu runner) ─────────────────────
+  # Single source of truth for the paired-server enclave measurement. The
+  # `oci` and `apple` jobs both consume this output and use it to override
+  # the committed `releases/trust/server-enclave.json` before building
+  # their cli artifacts. That way the cli OCI digest and macOS narHash
+  # they produce are always derived from the *correct* trust root, so
+  # `artifact-manifest`'s PR-comment suggestion is always actionable —
+  # even when the committed `server-enclave.json` has drifted.
+  enclave:
+    name: Recompute server-enclave.json
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      server_enclave: ${{ steps.recompute.outputs.content }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Cache CVM artifacts
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ~/.cache/eidola/cvm
+          key: cvm-${{ hashFiles('tinfoil-config.yml') }}
+
+      - name: Recompute server-enclave.json
+        id: recompute
+        run: |
+          ./scripts/artifact-manifest.sh measure \
+            --server-enclave-output /tmp/server-enclave.json
+
+          echo "content<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/server-enclave.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
   # ── OCI images (cheap ubuntu runner) ─────────────────────────────────────────
   oci:
     name: Build and verify OCI images
+    needs: enclave
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -83,6 +129,17 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Install recomputed server-enclave.json
+        env:
+          SERVER_ENCLAVE: ${{ needs.enclave.outputs.server_enclave }}
+        run: |
+          # Overwrite the committed file with the authoritative value the
+          # `enclave` job just derived from tinfoil-config.yml. The cli OCI
+          # build below COPYs `releases/` into its build context, so this
+          # makes the cli embed the correct measurement regardless of
+          # whether the committed file was current.
+          printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Set up Docker Buildx
         # v* tag (release) builds skip the GHA cache entirely so Sigstore-
@@ -201,7 +258,8 @@ jobs:
   # ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:a914e5b3fc1197d61832009778a77ca30717314fd32702cfdf90a42f2c279ea3
   apple:
     name: Apple builds
-    runs-on: self-hosted # zizmor: ignore[self-hosted-runner] -- macOS XCFramework + Nix builds require an Apple-silicon runner
+    needs: enclave
+    runs-on: self-hosted # zizmor: ignore[self-hosted-runner] -- macOS Nix CLI universal-binary build requires an Apple-silicon runner
     timeout-minutes: 30
     # Only main and v* tag pushes acquire the Cachix write token, gated by
     # the branch-restricted `cachix-write` environment in repo settings.
@@ -218,6 +276,17 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Install recomputed server-enclave.json
+        env:
+          SERVER_ENCLAVE: ${{ needs.enclave.outputs.server_enclave }}
+        run: |
+          # Overwrite the committed file with the authoritative value the
+          # `enclave` job derived from tinfoil-config.yml. The flake's
+          # source filter picks up the working-tree content (the file is
+          # git-tracked), so this makes the macOS cli embed the correct
+          # measurement regardless of whether the committed file was current.
+          printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Install Nix
         uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
@@ -237,7 +306,6 @@ jobs:
         id: partial
         run: |
           ./scripts/artifact-manifest.sh build-macos \
-            --macos-paths-file /tmp/macos-artifacts.json \
             --output /tmp/macos-artifact-manifest.json
 
           echo "actual<<EOF" >> "$GITHUB_OUTPUT"
@@ -299,14 +367,25 @@ jobs:
             --partial /tmp/apple-artifact-manifest.json \
             --manifest artifact-manifest.json \
             --output /tmp/artifact-manifest-actual.json \
+            --server-enclave-output /tmp/server-enclave-actual.json \
             --verify-attestations; then
             echo "match=true" >> "$GITHUB_OUTPUT"
           else
             echo "match=false" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "actual<<EOF" >> "$GITHUB_OUTPUT"
+          # Each cli build in this run was compiled against the recomputed
+          # (authoritative) server-enclave.json — the `enclave` job above
+          # produces it and the `oci`/`apple` jobs overwrite the committed
+          # file before building — so both suggestion files below are
+          # always internally consistent: a developer committing them
+          # verbatim is guaranteed to pass the next CI run.
+          echo "manifest_actual<<EOF" >> "$GITHUB_OUTPUT"
           cat /tmp/artifact-manifest-actual.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "server_enclave_actual<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/server-enclave-actual.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Request manifest update (PR only)
@@ -315,15 +394,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          ACTUAL: ${{ steps.verify.outputs.actual }}
+          MANIFEST_ACTUAL: ${{ steps.verify.outputs.manifest_actual }}
+          SERVER_ENCLAVE_ACTUAL: ${{ steps.verify.outputs.server_enclave_actual }}
         run: |
-          FORMATTED=$(echo "$ACTUAL" | jq -S '.')
+          MANIFEST_FORMATTED=$(echo "$MANIFEST_ACTUAL" | jq -S '.')
+          SERVER_ENCLAVE_FORMATTED=$(echo "$SERVER_ENCLAVE_ACTUAL" | jq -S '.')
 
-          # Post a REQUEST_CHANGES review with the expected manifest in the
-          # body. We avoid line-level suggestions because GitHub's UI cannot
-          # apply them when the diff contains deleted-and-replaced lines,
-          # which happens on virtually every manifest update.
-          BODY=$(printf '**Artifact Manifest Update Required**\n\nThe built OCI and macOS artifacts or recomputed enclave measurements differ from what is committed in `artifact-manifest.json`.\n\nRun `just update-manifest` on macOS to regenerate it, or replace the file contents with:\n\n```json\n%s\n```' "$FORMATTED")
+          # Post a REQUEST_CHANGES review with both expected files in the
+          # body. The cli builds in this run were compiled against the
+          # *recomputed* `server-enclave.json` (CI overwrites the committed
+          # file before building), so both suggestions are guaranteed
+          # internally consistent: committing them as-is will make the
+          # next CI run pass. We avoid line-level suggestions because
+          # GitHub's UI cannot apply them when the diff contains
+          # deleted-and-replaced lines, which happens on virtually every
+          # manifest update.
+          BODY=$(printf '**Artifact Manifest Update Required**\n\nThe built OCI/macOS artifacts or recomputed enclave measurements differ from what is committed. Run `just update-manifest` on macOS to regenerate, or commit both files below verbatim (the cli digests were built against the recomputed server-enclave so they are guaranteed consistent).\n\n`releases/trust/server-enclave.json`:\n\n```json\n%s\n```\n\n`artifact-manifest.json`:\n\n```json\n%s\n```' "$SERVER_ENCLAVE_FORMATTED" "$MANIFEST_FORMATTED")
 
           jq -n \
             --arg body "$BODY" \

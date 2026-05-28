@@ -29,7 +29,7 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 # upstream PR lands. `std` is required (the v0.13 fork's default
 # disables it via `default-features = false`); we don't need `html` or
 # `getopts`.
-pulldown-cmark = { path = "../../../pulldown-cmark/pulldown-cmark", default-features = false, features = ["std"] }
+pulldown-cmark = { git = "https://github.com/eidola-ai/pulldown-cmark", rev = "3153947232d9e89e0af24c3a0977915be5fbb6b3", default-features = false, features = ["std"] }
 # RaTeX — parse + lay out LaTeX math expressions into a DisplayList of
 # absolute-coordinate drawing commands. We walk the DisplayList and
 # emit native gpui paint ops (paint_quad / paint_path / shaped text)

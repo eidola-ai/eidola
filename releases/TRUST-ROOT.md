@@ -57,9 +57,9 @@ Generated into the client at compile time by
 
 | Constant                                | Source                                              | Purpose                                                                                            |
 | --------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `SERVER_URL`                            | derived from `artifact-manifest.json` enclave block | `gateway-<hash>.eidola.containers.tinfoil.sh`, where `<hash>` ties the URL to a server measurement |
-| `SERVER_SNP_MEASUREMENT`                | `artifact-manifest.json` `enclave.snp_measurement`  | SEV-SNP launch measurement of the paired server enclave                                            |
-| `SERVER_TDX_RTMR1` / `SERVER_TDX_RTMR2` | `artifact-manifest.json` `enclave.tdx_measurement`  | TDX runtime measurements of the paired server enclave                                              |
+| `SERVER_URL`                            | derived from `releases/trust/server-enclave.json`   | `gateway-<hash>.eidola.containers.tinfoil.sh`, where `<hash>` ties the URL to a server measurement |
+| `SERVER_SNP_MEASUREMENT`                | `releases/trust/server-enclave.json` `snp_measurement` | SEV-SNP launch measurement of the paired server enclave                                         |
+| `SERVER_TDX_RTMR1` / `SERVER_TDX_RTMR2` | `releases/trust/server-enclave.json` `tdx_measurement` | TDX runtime measurements of the paired server enclave                                           |
 | `TRUSTED_ATTESTANT_FINGERPRINTS`        | `trust-constants.json`                              | `sha256(OpenSSH wire-format pubkey)` in hex, for each authorized human-attestant key               |
 | `MIN_HUMAN_ATTESTATIONS`                | `trust-constants.json`                              | Minimum independently-verified human attestations a release must carry (pinned here, not in `release.json`, so a forged index cannot lower it) |
 | `EXPECTED_CI_IDENTITY_PATTERN`          | `trust-constants.json`                              | Fulcio cert SAN pattern the release-signing workflow's OIDC identity must match                    |
@@ -69,6 +69,19 @@ Generated into the client at compile time by
 | `UPDATE_DISCOVERY_URL`                  | `trust-constants.json`                              | Where to look for the next release (GitHub releases API)                                           |
 | `ATTESTATION_TEMPLATES_JSON`            | `releases/schema/attestation-templates-v1.json`     | Pinned claim templates the verifier re-renders during equality checks                              |
 | `SIGSTORE_TRUSTED_ROOT_JSON`            | `releases/trust/sigstore-trusted-root.json`         | Pinned Sigstore tlog / Fulcio / CT log keys with validity windows                                  |
+
+The enclave block lives in its own file, **separate from `artifact-manifest.json`**,
+for a single reason: build reproducibility. `artifact-manifest.json` records the
+eidola-cli OCI digest and the eidola-cli-macos-universal narHash among other
+artifacts. If the cli build COPYed (Docker) or filtered-in (Nix) the manifest as
+a build input, every regeneration of the manifest would also be an input to the
+build it's describing — a self-reference that produces a different digest on
+every run instead of converging. `server-enclave.json` is the minimum slice of
+the manifest that the cli build needs, so it can be COPYed without dragging the
+cli's own digest into the build context. CI re-asserts the consistency:
+`scripts/artifact-manifest.sh verify-full` recomputes the enclave block from
+`tinfoil-config.yml` and rejects the build if either `server-enclave.json` or
+`artifact-manifest.json`'s `enclave` field disagrees with it.
 
 `config.toml` overrides (`base_url`, `trusted_measurements`) take precedence
 at runtime — set them to point a build at a local server or alternate
@@ -92,7 +105,9 @@ Each document's shape is owned by the Rust `serde` types shared between the rele
 
 | Document                 | Shape (source of truth)                                                                                   | Notes                                                                                       |
 | ------------------------ | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `artifact-manifest.json` | format owned by `scripts/artifact-manifest.sh`, consumed as raw JSON in `eidola-app-core/build.rs`        | `schema_version: 1`. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC).              |
+| `artifact-manifest.json` | format owned by `scripts/artifact-manifest.sh`                                                            | `schema_version: 1`. Records OCI digests, the macOS narHash, and a denormalized copy of the enclave block. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). |
+| `releases/trust/server-enclave.json` | format owned by `scripts/artifact-manifest.sh`, consumed as raw JSON in `eidola-app-core/build.rs` | `schema_version: 1`. Holds just the enclave block (snp/tdx measurement + cmdline) so the cli build doesn't drag its own digest into its build context. |
+| `releases/trust/tinfoil-enclaves.json` | format owned by `.github/workflows/update-measurements.yml`, consumed as raw JSON in `eidola-server/build.rs` | `schema_version: 1`. Allowed upstream Tinfoil inference-enclave measurements the server's outbound verifier accepts. One entry per Tinfoil release, with provenance metadata (built\_at, artifact digest, Rekor log index); the workflow keeps the most recent two for rolling deploys. |
 | `release.json`           | `eidola_attestation::ReleaseIndex` — `crates/eidola-attestation/src/trust_shapes.rs`                      | Unsigned URL-only index; cross-checked via referenced documents (see caveat below)          |
 | `attestation.json`       | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via SSH (`ssh-keygen -Y sign`), logged to Rekor as a `hashedrekord` |
 | `trust-constants.json`   | `eidola_attestation::TrustConstants` — `crates/eidola-attestation/src/trust_shapes.rs`                    | Pinned trust values baked into the verifier at build time                                   |
@@ -194,28 +209,43 @@ a real-but-stale release. Mitigations for v1:
 
 ## Where each piece lives
 
+Everything under `releases/` is a **build input** — pinned data the
+client and server compile against. `artifact-manifest.json` at the
+repo root is the **build output** — a record of what was actually
+produced, signed by CI. They live in different places on purpose:
+files under `releases/` are bulk-copied/filtered into builds as a
+unit, while `artifact-manifest.json` is deliberately kept out of
+every build context to prevent self-reference cycles (it records
+the eidola-cli OCI digest and macOS narHash that the cli build
+would otherwise see in its own input).
+
 ```
 releases/
   schema/
     attestation-templates-v1.json         # pinned claim templates
   trust/
-    trust-constants.json                  # non-derivable trust values
-    sigstore-trusted-root.json            # upstream Sigstore TrustedRoot snapshot
+    trust-constants.json                  # non-derivable trust values (input)
+    sigstore-trusted-root.json            # upstream Sigstore TrustedRoot snapshot (input)
+    server-enclave.json                   # paired-server enclave measurement (input — projection of artifact-manifest.json's enclave block, materialized as its own file so the cli build context can COPY it without dragging the manifest in)
+    tinfoil-enclaves.json                 # allowed upstream Tinfoil inference-enclave measurements (input — server's build.rs reads this)
   TRUST-ROOT.md                           # this doc
-artifact-manifest.json                    # source of truth for measurements
+artifact-manifest.json                    # full deployment record (output, signed by CI)
 crates/eidola-app-core/
-  build.rs                                # generator
+  build.rs                                # generator: server-enclave.json + trust-constants.json + … → trust_root.gen.rs
   src/trust_root.rs                       # exposes the generated constants
+crates/eidola-server/
+  build.rs                                # generator: tinfoil-enclaves.json → measurements.gen.rs
+  src/measurements.rs                     # exposes the generated ALLOWED static
 ```
 
-The generator (`build.rs`) reads `artifact-manifest.json`'s `enclave`
-block **only** — never the per-artifact digests. The client's own narHash
-appearing in the manifest is therefore not a build-cache input, so
-regenerating the manifest after a client build doesn't trigger another
-client rebuild. The chain that *does* invalidate the pin: server source
-changes → server image digest changes → `tinfoil-config.yml` changes →
-kernel cmdline changes → enclave measurement changes → manifest's
-`enclave` block changes → client rebuilds with the new pin.
+The generator (`build.rs`) reads `releases/trust/server-enclave.json` —
+never the per-artifact digests. The chain that invalidates the pin:
+server source changes → server image digest changes → `tinfoil-config.yml`
+changes → kernel cmdline changes → enclave measurement changes →
+`server-enclave.json` changes → client rebuilds with the new pin. Because
+the client build context never reads `artifact-manifest.json`, regenerating
+the manifest after a client build doesn't trigger another client rebuild,
+so `just update-manifest` reaches a fixed point in a single run.
 
 ## Rotation procedures
 

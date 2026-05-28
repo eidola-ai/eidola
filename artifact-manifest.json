@@ -1,12 +1,12 @@
 {
   "artifacts": {
     "eidola-cli": {
-      "digest": "sha256:aa12c41566e01c73a249a61ae6cf608cb4db054b99b988f0338e7c49eb5932ad",
+      "digest": "sha256:29fd99e88a0fee1c7c1bb76143cae0255727c57d1bf30822a4b652c2c7bbbfd6",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
-      "narHash": "sha256-JvLWyNFqnWr6BLGx8TTeKvm2J11kqPxBlBdF2RWVR2U=",
+      "narHash": "sha256-pYTGOmJ0Y+L1fi9plPtJu/+HeHzNoJkv+I8PQmlU8QE=",
       "platform": "darwin/universal",
       "type": "nix"
     },
@@ -16,17 +16,17 @@
       "type": "oci"
     },
     "eidola-server": {
-      "digest": "sha256:d9eafbd1a8384e8a95c98053f36cf41cb36b2ba8a3d7fabb62479e18cca8349d",
+      "digest": "sha256:614d6630d925345e41c76d1bdcf03c21029b2984f7d8baec6193e1465ef64a3b",
       "platform": "linux/amd64",
       "type": "oci"
     }
   },
   "enclave": {
-    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=3fdad8ccd032be89556392b1b3b59c95538f65a48422b5b1df79180a0d072140",
-    "snp_measurement": "3d256898bde57af958f74edc8f31209e31ada25fba394169cc8b9c51e752f3d34d8fb3e5b9e5512b17516f85ee090d3a",
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=08ac67cdd10fee3ad056e87da3862373121e4d8ae2f5b3dd9d22cfdcf878f586",
+    "snp_measurement": "5b9bc4a3e6c6ba271fbb8778bafcc1c71f566a336f4c3d3b9d62efff1e22eb6c9e71ec1cd434acfc8380cff597d8d5c8",
     "tdx_measurement": {
       "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-      "rtmr2": "998bbf144dbec9e6c5ef5e7aeed86fa75f37a399caea3aeac01538661b1398382f9583730c046260b197542fb7cbf4e0"
+      "rtmr2": "0c1583a2178c27ca8c33efc82ce2b06244bea64582773fd866bab18d36736117f67175fcc9c581667c20e354ce6d53e9"
     }
   },
   "schema_version": 1

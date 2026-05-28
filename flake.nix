@@ -163,10 +163,32 @@
                   matchingCrate = getCrateForPath relPath;
                   # Is this an irrelevant crate? (in a crate dir but not in our set)
                   isIrrelevantCrate = matchingCrate != null && !(crateSet ? ${matchingCrate});
+                  # Both `eidola-app-core/build.rs` and `eidola-server/build.rs`
+                  # consume pinned trust data from `releases/`:
+                  #   * eidola-app-core → all of `releases/trust/*.json` +
+                  #     `releases/schema/*.json` (client trust root)
+                  #   * eidola-server → just `releases/trust/tinfoil-enclaves.json`
+                  #     (allowed upstream Tinfoil inference-enclave measurements)
+                  # Include `releases/` when either crate is in the set, but
+                  # only for those crates — unrelated crates shouldn't
+                  # cache-bust on every manifest regeneration.
+                  # `artifact-manifest.json` is deliberately excluded — it
+                  # records the eidola-cli narHash itself, so including it
+                  # would create a self-reference that prevents the build
+                  # from reaching a fixed point.
+                  trustRootFiles =
+                    crateSet ? "eidola-app-core"
+                    || crateSet ? "eidola-server";
+                  isTrustRootPath =
+                    relPath == "/releases"
+                    || pkgs.lib.hasPrefix "/releases/" relPath;
                 in
                 # Exclude irrelevant crate directories entirely
                 if isIrrelevantCrate then
                   false
+                # Trust-root build inputs for `eidola-app-core/build.rs`.
+                else if trustRootFiles && isTrustRootPath then
+                  true
                 # Keep only root-level files that affect Cargo resolution/builds.
                 # This avoids generated files like artifact-manifest.json from
                 # perturbing package hashes for unrelated Nix builds.

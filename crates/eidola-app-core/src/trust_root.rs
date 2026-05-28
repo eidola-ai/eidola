@@ -2,9 +2,9 @@
 //! enclave.
 //!
 //! The constants below are generated at build time by `build.rs` from
-//! `artifact-manifest.json` (`enclave` block) and the files under
-//! `releases/trust/` + `releases/schema/` at the workspace root. The
-//! generated source is at `$OUT_DIR/trust_root.gen.rs`.
+//! the JSON files under `releases/trust/` + `releases/schema/` at the
+//! workspace root (notably `server-enclave.json` for the paired-server
+//! measurement). The generated source is at `$OUT_DIR/trust_root.gen.rs`.
 //!
 //! This is the *default* trust root for the binary. `Config` overrides
 //! (`base_url`, `trusted_measurements`) take precedence at runtime so

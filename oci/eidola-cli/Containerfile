@@ -55,6 +55,15 @@ ARG CARGO_PROFILE=release
 
 COPY crates/ ./crates/
 
+# Trust-root build inputs: `eidola-app-core/build.rs` reads
+# `releases/trust/server-enclave.json` + sibling pinned-trust JSON from the
+# workspace root to generate the embedded trust constants. We intentionally do
+# NOT copy `artifact-manifest.json` here — it records this very image's digest
+# and would create a circular cache dependency. The fetch stage doesn't need
+# these (build scripts aren't compiled with stub sources), so they're only
+# required here at the real build.
+COPY releases/ ./releases/
+
 # Ensure Cargo detects source changes over the fetch-stage stubs.
 # SOURCE_DATE_EPOCH=0 clamps COPY timestamps to epoch 0, matching the
 # stubs created in the fetch stage, so Cargo's fingerprint check sees

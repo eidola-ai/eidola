@@ -2,9 +2,9 @@
 //! the client embeds at build time.
 //!
 //! Inputs (read from the workspace root):
-//!   * `artifact-manifest.json`  — the `enclave` block only; other entries
-//!     (per-artifact digests, including this crate's own) are intentionally
-//!     ignored so the client build doesn't bust its own cache.
+//!   * `releases/trust/server-enclave.json` — the paired-server enclave
+//!     measurement, isolated from `artifact-manifest.json` so the per-artifact
+//!     digests (including this crate's own) can't cache-bust the build.
 //!   * `releases/trust/trust-constants.json` — non-derivable trust values
 //!     (attestant fingerprints, CI identity, schema version pins, update
 //!     discovery URLs, server URL template).
@@ -32,7 +32,7 @@ fn main() {
         .expect("workspace root above crates/eidola-app-core")
         .to_path_buf();
 
-    let artifact_manifest_path = workspace_root.join("artifact-manifest.json");
+    let server_enclave_path = workspace_root.join("releases/trust/server-enclave.json");
     let trust_constants_path = workspace_root.join("releases/trust/trust-constants.json");
     let sigstore_trusted_root_path =
         workspace_root.join("releases/trust/sigstore-trusted-root.json");
@@ -40,7 +40,7 @@ fn main() {
         workspace_root.join("releases/schema/attestation-templates-v1.json");
 
     for p in [
-        &artifact_manifest_path,
+        &server_enclave_path,
         &trust_constants_path,
         &sigstore_trusted_root_path,
         &attestation_templates_path,
@@ -49,7 +49,7 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=build.rs");
 
-    let artifact_manifest = read_json(&artifact_manifest_path);
+    let server_enclave = read_json(&server_enclave_path);
     let trust_constants = read_json(&trust_constants_path);
 
     // Validate sibling JSON files parse, but include the raw bytes verbatim
@@ -57,23 +57,17 @@ fn main() {
     let _ = read_json(&sigstore_trusted_root_path);
     let _ = read_json(&attestation_templates_path);
 
-    // Gate on artifact-manifest.json schema version so an incompatible
-    // future format fails the build with a clear message instead of
-    // silently producing wrong constants.
-    let manifest_schema_version = get_u32(&artifact_manifest, "schema_version");
-    if manifest_schema_version != 1 {
+    let enclave_schema_version = get_u32(&server_enclave, "schema_version");
+    if enclave_schema_version != 1 {
         panic!(
-            "artifact-manifest.json schema_version `{manifest_schema_version}` is not supported by this build.rs (expected `1`)"
+            "server-enclave.json schema_version `{enclave_schema_version}` is not supported by this build.rs (expected `1`)"
         );
     }
 
-    let enclave = artifact_manifest
-        .get("enclave")
-        .expect("artifact-manifest.json missing `enclave` block");
-    let snp = get_hex_str(enclave, "snp_measurement", 96);
-    let tdx = enclave
+    let snp = get_hex_str(&server_enclave, "snp_measurement", 96);
+    let tdx = server_enclave
         .get("tdx_measurement")
-        .expect("artifact-manifest.json missing `enclave.tdx_measurement`");
+        .expect("server-enclave.json missing `tdx_measurement`");
     let rtmr1 = get_hex_str(tdx, "rtmr1", 96);
     let rtmr2 = get_hex_str(tdx, "rtmr2", 96);
 

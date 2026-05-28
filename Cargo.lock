@@ -6384,6 +6384,7 @@ dependencies = [
 [[package]]
 name = "pulldown-cmark"
 version = "0.13.1"
+source = "git+https://github.com/eidola-ai/pulldown-cmark?rev=3153947232d9e89e0af24c3a0977915be5fbb6b3#3153947232d9e89e0af24c3a0977915be5fbb6b3"
 dependencies = [
  "bitflags 2.11.0",
  "memchr",
@@ -6394,6 +6395,7 @@ dependencies = [
 [[package]]
 name = "pulldown-cmark-escape"
 version = "0.11.0"
+source = "git+https://github.com/eidola-ai/pulldown-cmark?rev=3153947232d9e89e0af24c3a0977915be5fbb6b3#3153947232d9e89e0af24c3a0977915be5fbb6b3"
 
 [[package]]
 name = "pxfm"
