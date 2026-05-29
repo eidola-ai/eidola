@@ -18,8 +18,20 @@ path = "src/main.rs"
 # `inspector` enables the in-app element inspector (Window::toggle_inspector +
 # the rich gpui-component renderer). Also auto-enabled in debug builds via
 # `debug_assertions`; the explicit feature ensures it works in release builds.
+# `runtime_shaders` (passed through to `gpui_macos/runtime_shaders` via
+# gpui_platform) embeds the raw Metal Shading Language source in the binary and
+# compiles it through MTLDevice at app startup instead of invoking Apple's
+# closed-source `metal` compiler at build time. Two reasons we want it:
+# (1) the Nix sandbox has no access to Xcode tooling, so without this the
+# release build fails with `tool 'metal' not found` and the rest of the
+# gpui-component dep tree fails type-inference transitively from
+# gpui_macos's aborted build script; (2) the precompiled `.metallib`
+# otherwise depends on the local Xcode/metal version, defeating
+# reproducibility across developers and CI. Startup cost is a one-time
+# MTLDevice library compile (~50ms). Zed's own Nix package makes the same
+# trade-off.
 gpui = { git = "https://github.com/zed-industries/zed", features = ["inspector"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad", features = ["inspector"] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
 

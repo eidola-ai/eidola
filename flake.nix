@@ -197,8 +197,14 @@
                 # Keep directories that are parents of crate paths
                 else if type == "directory" && isParentOfCrate relPath then
                   true
-                # Include .sql files (used by include_str! in the CLI)
-                else if type == "regular" && pkgs.lib.hasSuffix ".sql" path then
+                # Include .sql files (used by include_str! in the CLI) and
+                # .ttf font files (used by include_bytes! in the GUI). These
+                # both feed compile-time macros; craneLib.filterCargoSources
+                # discards them by default because they aren't Rust source.
+                else if type == "regular" && (
+                  pkgs.lib.hasSuffix ".sql" path
+                  || pkgs.lib.hasSuffix ".ttf" path
+                ) then
                   true
                 # For everything else, use crane's filter (which handles .rs, Cargo.toml, etc.)
                 else
@@ -255,6 +261,46 @@
           CARGO_NET_OFFLINE = "true";
 
           RUSTFLAGS = baseRustFlags;
+
+          # Workaround for an upstream gpui-component packaging bug: its
+          # `icon_named!` proc macro and `build.rs` both read
+          # `../assets/assets/icons` relative to gpui-component's own
+          # CARGO_MANIFEST_DIR. In the upstream repo that resolves to the
+          # sibling `crates/assets/assets/icons` directory, but `cargo
+          # vendor` (which crane uses to stage deps in the Nix sandbox)
+          # rearranges the workspace into <vendor>/<git-source-hash>/
+          # <crate>-<version>/ subdirs — so the assets end up at
+          # <vendor>/<hash>/gpui-component-assets-0.5.1/assets/icons
+          # while the macro keeps looking at
+          # <vendor>/<hash>/assets/assets/icons. We make a writable copy
+          # of just the one hash dir that contains gpui-component, stitch
+          # the expected sibling `assets/assets/icons` symlink (pointing
+          # at the existing gpui-component-assets-0.5.1/assets/icons
+          # tree), and re-point cargo's source-replacement config at the
+          # patched copy. The conditional is a no-op for builds that
+          # don't have gpui-component-assets in their vendor tree (e.g.
+          # the server / cli builds), so this is safe to leave in
+          # commonArgs.
+          preBuild = ''
+            if [ -n "''${cargoVendorDir:-}" ]; then
+              for hashdir in "$cargoVendorDir"/*/; do
+                if [ -d "$hashdir/gpui-component-assets-0.5.1/assets/icons" ] \
+                  && [ ! -e "$hashdir/assets" ]; then
+                  hash="$(basename "$hashdir")"
+                  patched="$NIX_BUILD_TOP/patched-vendor-$hash"
+                  cp -rL "$hashdir" "$patched"
+                  chmod -R u+w "$patched"
+                  mkdir -p "$patched/assets/assets"
+                  ln -s ../../gpui-component-assets-0.5.1/assets/icons \
+                    "$patched/assets/assets/icons"
+                  sed -i \
+                    "s|directory = \"''${cargoVendorDir}/''${hash}\"|directory = \"$patched\"|" \
+                    "$CARGO_HOME/config.toml"
+                  break
+                fi
+              done
+            fi
+          '';
         };
 
         # Target configuration helper
@@ -358,7 +404,14 @@
             }
           );
 
-        # Build individual packages with their own filtered deps
+        # Build individual packages with their own filtered deps. `doCheck`
+        # toggles whether crane runs `cargo test` as part of the build
+        # (default true). Pass false for release artifacts whose
+        # integration tests can't run in the Nix sandbox — e.g. the GUI's
+        # `tests/visual.rs`, which talks to live AppKit and is documented
+        # in crates/eidola-gui/AGENTS.md as a local-only debug aid.
+        # The workspace-wide `checks.tests` target still runs the full
+        # test suite separately, so coverage isn't lost.
         mkPackage =
           {
             pname,
@@ -366,6 +419,7 @@
             nixCrossSystem,
             crateType ? null,
             extraCargoArgs ? "",
+            doCheck ? true,
           }:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
@@ -398,7 +452,7 @@
             // {
               src = filteredSrc;
               cargoArtifacts = packageCargoArtifacts;
-              inherit pname;
+              inherit pname doCheck;
               cargoExtraArgs = "-p ${pname} ${extraCargoArgs}";
             }
           );
@@ -509,6 +563,121 @@ with open(path, "wb") as f:
               };
             };
 
+        # Build the GUI as a reproducible macOS .app bundle (Darwin only).
+        # Layout: $out/Eidola.app/Contents/{MacOS/Eidola, Resources, Info.plist}.
+        # The .app wrapper is *required*, not cosmetic — see
+        # crates/eidola-gui/AGENTS.md (".app bundling") for why bare-binary
+        # mode breaks menu key-equivalent dispatch under AppKit.
+        eidolaGuiMacosUniversal =
+          if !pkgs.stdenv.isDarwin then
+            null
+          else
+            pkgs.stdenv.mkDerivation {
+              pname = "eidola-gui-macos-universal";
+              version = "1.0";
+
+              nativeBuildInputs = [
+                pkgs.darwin.cctools
+                pkgs.darwin.autoSignDarwinBinariesHook
+                pkgs.python3
+              ];
+
+              SOURCE_DATE_EPOCH = "0";
+
+              dontUnpack = true;
+
+              # tests/visual.rs talks to live AppKit (real Metal renderer +
+              # offscreen window); the Nix sandbox can't host it. See the
+              # `mkPackage` doc above and crates/eidola-gui/AGENTS.md's
+              # Testing section for why this is local-only.
+              arm64 = mkPackage {
+                pname = "eidola-gui";
+                rustTarget = "aarch64-apple-darwin";
+                nixCrossSystem = null;
+                doCheck = false;
+              };
+              x86_64 = mkPackage {
+                pname = "eidola-gui";
+                rustTarget = "x86_64-apple-darwin";
+                nixCrossSystem = null;
+                doCheck = false;
+              };
+
+              buildPhase = ''
+                APP="$out/Eidola.app"
+                mkdir -p "$APP/Contents/MacOS"
+                mkdir -p "$APP/Contents/Resources"
+
+                # Lipo into Contents/MacOS/Eidola. The binary is renamed to
+                # match CFBundleExecutable in Info.plist; mismatch makes
+                # AppKit fall back to tool-mode and breaks menu dispatch.
+                lipo -create \
+                  "$arm64/bin/eidola-gui" \
+                  "$x86_64/bin/eidola-gui" \
+                  -output "$APP/Contents/MacOS/Eidola"
+
+                # Zero LC_UUID in each Mach-O slice. lld computes the UUID
+                # from a hash that includes nondeterministic linker state,
+                # producing different values across macOS environments even
+                # when the compiled code is byte-for-byte identical. Same
+                # trick as the cli universal-binary build above.
+                chmod +w "$APP/Contents/MacOS/Eidola"
+                python3 -c '
+import struct, sys
+def zero_uuid(data, offset):
+    magic = struct.unpack_from("<I", data, offset)[0]
+    assert magic == 0xFEEDFACF, f"bad Mach-O magic at {offset:#x}"
+    ncmds = struct.unpack_from("<I", data, offset + 16)[0]
+    pos = offset + 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, pos)
+        if cmd == 0x1B:
+            data[pos + 8 : pos + 24] = b"\x00" * 16
+            return
+        pos += cmdsize
+    sys.exit(f"LC_UUID not found at offset {offset:#x}")
+
+path = sys.argv[1]
+with open(path, "r+b") as f:
+    data = bytearray(f.read())
+magic = struct.unpack_from(">I", data, 0)[0]
+if magic == 0xCAFEBABE:
+    nfat = struct.unpack_from(">I", data, 4)[0]
+    for i in range(nfat):
+        offset = struct.unpack_from(">I", data, 8 + i * 20 + 8)[0]
+        zero_uuid(data, offset)
+else:
+    zero_uuid(data, 0)
+with open(path, "wb") as f:
+    f.write(data)
+' "$APP/Contents/MacOS/Eidola"
+
+                # autoSignDarwinBinariesHook re-signs the binary in
+                # postFixup. The hook uses Nix's sigtool to produce a
+                # deterministic ad-hoc signature, which is sufficient to
+                # launch the binary on Apple Silicon (the bundle wraps it
+                # for AppKit's benefit; signing happens at the Mach-O level).
+                chmod -w "$APP/Contents/MacOS/Eidola"
+
+                # Static bundle resources. Info.plist is referenced as a
+                # direct path (outside the filtered cargo source) so its
+                # content participates in the derivation hash — any edit
+                # invalidates the cached build.
+                cp ${./crates/eidola-gui/Support/Info.plist} "$APP/Contents/Info.plist"
+                chmod -w "$APP/Contents/Info.plist"
+              '';
+
+              installPhase = ''
+                echo "Eidola.app universal binary:"
+                lipo -info "$out/Eidola.app/Contents/MacOS/Eidola"
+              '';
+
+              meta = {
+                description = "Eidola GUI (macOS universal .app bundle)";
+                platforms = [ "aarch64-darwin" ];
+              };
+            };
+
       in
       {
         packages = {
@@ -521,6 +690,9 @@ with open(path, "wb") as f:
         }
         // pkgs.lib.optionalAttrs (eidolaCliMacosUniversal != null) {
           eidola-cli-macos-universal = eidolaCliMacosUniversal;
+        }
+        // pkgs.lib.optionalAttrs (eidolaGuiMacosUniversal != null) {
+          eidola-gui-macos-universal = eidolaGuiMacosUniversal;
         };
 
         # Development shell (lightweight — daily Rust dev uses rustup)

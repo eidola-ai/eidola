@@ -75,6 +75,7 @@ SERVER_ENCLAVE_OUTPUT=""
 BUILDER_NAME="eidola"
 ENSURE_BUILDER=0
 CLI_PATH=""
+GUI_PATH=""
 CONFIG_FILE="$REPO_ROOT/tinfoil-config.yml"
 VERIFY_ATTESTATIONS=0
 PUSH_MODE=0
@@ -470,8 +471,6 @@ print_oci_manifest() {
 }
 
 build_macos_artifacts() {
-  local path
-
   if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "error: macOS artifact builds require a Darwin host" >&2
     exit 1
@@ -480,6 +479,14 @@ build_macos_artifacts() {
   CLI_PATH="$(
     nix build \
       '.#eidola-cli-macos-universal' \
+      --no-link \
+      --print-out-paths \
+      --show-trace
+  )"
+
+  GUI_PATH="$(
+    nix build \
+      '.#eidola-gui-macos-universal' \
       --no-link \
       --print-out-paths \
       --show-trace
@@ -494,21 +501,24 @@ nix_nar_hash() {
 }
 
 print_macos_manifest() {
-  local cli_hash
+  local cli_hash gui_hash
 
-  if [[ -z "$CLI_PATH" ]]; then
+  if [[ -z "${CLI_PATH:-}" || -z "${GUI_PATH:-}" ]]; then
     echo "error: print_macos_manifest called before build_macos_artifacts" >&2
     return 1
   fi
 
   cli_hash="$(nix_nar_hash "$CLI_PATH")"
+  gui_hash="$(nix_nar_hash "$GUI_PATH")"
 
   jq -n \
     --arg cli_hash "$cli_hash" \
+    --arg gui_hash "$gui_hash" \
     '{
       schema_version: 1,
       artifacts: {
-        "eidola-cli-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $cli_hash }
+        "eidola-cli-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $cli_hash },
+        "eidola-gui-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $gui_hash }
       }
     }'
 }

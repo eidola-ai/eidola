@@ -297,8 +297,10 @@ jobs:
   apple:
     name: Apple builds
     needs: oci
-    runs-on: self-hosted # zizmor: ignore[self-hosted-runner] -- macOS Nix CLI universal-binary build requires an Apple-silicon runner
-    timeout-minutes: 30
+    runs-on: self-hosted # zizmor: ignore[self-hosted-runner] -- macOS Nix universal-binary builds require an Apple-silicon runner
+    # 60 minutes covers a cold cachix miss for both the cli and the GUI
+    # (gpui is a large dep tree); warm runs typically finish in <10.
+    timeout-minutes: 60
     # Only main and v* tag pushes acquire the Cachix write token, gated by
     # the branch-restricted `cachix-write` environment in repo settings.
     # Other runs (PRs, schedule, dispatch) get no environment and pull
