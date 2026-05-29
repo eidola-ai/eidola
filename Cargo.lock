@@ -3410,7 +3410,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component?rev=01a116a15e9660963a2aa07d0192e38785d8b9ad#01a116a15e9660963a2aa07d0192e38785d8b9ad"
+source = "git+https://github.com/eidola-ai/gpui-component?rev=e7b5ecbcdbb80ff5626359239f1b663d397296b4#e7b5ecbcdbb80ff5626359239f1b663d397296b4"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3420,6 +3420,7 @@ dependencies = [
  "enum-iterator",
  "futures",
  "gpui",
+ "gpui-component-assets",
  "gpui-component-macros",
  "gpui_macros",
  "html5ever",
@@ -3453,7 +3454,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component?rev=01a116a15e9660963a2aa07d0192e38785d8b9ad#01a116a15e9660963a2aa07d0192e38785d8b9ad"
+source = "git+https://github.com/eidola-ai/gpui-component?rev=e7b5ecbcdbb80ff5626359239f1b663d397296b4#e7b5ecbcdbb80ff5626359239f1b663d397296b4"
 dependencies = [
  "anyhow",
  "gpui",
@@ -3467,7 +3468,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component?rev=01a116a15e9660963a2aa07d0192e38785d8b9ad#01a116a15e9660963a2aa07d0192e38785d8b9ad"
+source = "git+https://github.com/eidola-ai/gpui-component?rev=e7b5ecbcdbb80ff5626359239f1b663d397296b4#e7b5ecbcdbb80ff5626359239f1b663d397296b4"
 dependencies = [
  "proc-macro2",
  "quote",

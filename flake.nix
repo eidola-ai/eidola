@@ -261,46 +261,6 @@
           CARGO_NET_OFFLINE = "true";
 
           RUSTFLAGS = baseRustFlags;
-
-          # Workaround for an upstream gpui-component packaging bug: its
-          # `icon_named!` proc macro and `build.rs` both read
-          # `../assets/assets/icons` relative to gpui-component's own
-          # CARGO_MANIFEST_DIR. In the upstream repo that resolves to the
-          # sibling `crates/assets/assets/icons` directory, but `cargo
-          # vendor` (which crane uses to stage deps in the Nix sandbox)
-          # rearranges the workspace into <vendor>/<git-source-hash>/
-          # <crate>-<version>/ subdirs — so the assets end up at
-          # <vendor>/<hash>/gpui-component-assets-0.5.1/assets/icons
-          # while the macro keeps looking at
-          # <vendor>/<hash>/assets/assets/icons. We make a writable copy
-          # of just the one hash dir that contains gpui-component, stitch
-          # the expected sibling `assets/assets/icons` symlink (pointing
-          # at the existing gpui-component-assets-0.5.1/assets/icons
-          # tree), and re-point cargo's source-replacement config at the
-          # patched copy. The conditional is a no-op for builds that
-          # don't have gpui-component-assets in their vendor tree (e.g.
-          # the server / cli builds), so this is safe to leave in
-          # commonArgs.
-          preBuild = ''
-            if [ -n "''${cargoVendorDir:-}" ]; then
-              for hashdir in "$cargoVendorDir"/*/; do
-                if [ -d "$hashdir/gpui-component-assets-0.5.1/assets/icons" ] \
-                  && [ ! -e "$hashdir/assets" ]; then
-                  hash="$(basename "$hashdir")"
-                  patched="$NIX_BUILD_TOP/patched-vendor-$hash"
-                  cp -rL "$hashdir" "$patched"
-                  chmod -R u+w "$patched"
-                  mkdir -p "$patched/assets/assets"
-                  ln -s ../../gpui-component-assets-0.5.1/assets/icons \
-                    "$patched/assets/assets/icons"
-                  sed -i \
-                    "s|directory = \"''${cargoVendorDir}/''${hash}\"|directory = \"$patched\"|" \
-                    "$CARGO_HOME/config.toml"
-                  break
-                fi
-              done
-            fi
-          '';
         };
 
         # Target configuration helper
