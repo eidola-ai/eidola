@@ -18,8 +18,6 @@ permissions: {}
 jobs:
   analyze:
     name: Analyze (${{ matrix.name }})
-    # Swift analysis runs in the CI workflow's apple job (needs pre-built XCFramework).
-    # C/C++ is excluded (all auto-generated UniFFI bindings).
     runs-on: ubuntu-latest
     permissions:
       security-events: write # upload CodeQL results to the GitHub Security tab

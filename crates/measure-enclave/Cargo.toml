@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # SEV-SNP measurement
-sev = { version = "7", default-features = false, features = ["snp", "crypto_nossl"] }
+sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
 
 # TDX measurement
 tdx-measure = { git = "https://github.com/virtee/tdx-measure", tag = "v0.0.10" }

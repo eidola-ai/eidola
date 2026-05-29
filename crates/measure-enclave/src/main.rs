@@ -3,8 +3,9 @@
 //! Given a `tinfoil-config.yml` and the CVM image artifacts (OVMF firmware,
 //! kernel, initrd), this tool pre-computes the hardware attestation measurements
 //! that a legitimate enclave will produce. These measurements are committed in
-//! `artifact-manifest.json` so clients can verify enclaves without trusting any
-//! third party.
+//! `releases/trust/server-enclave.json` (the cli build input) and in the
+//! `enclave` block of `artifact-manifest.json` (the signed deployment record),
+//! so clients can verify enclaves without trusting any third party.
 //!
 //! The measurement is a deterministic function of:
 //!   1. OVMF firmware binary
@@ -68,8 +69,10 @@ struct TinfoilConfig {
     memory: u64,
 }
 
-/// Output format — matches the enclave block in artifact-manifest.json and the
-/// Tinfoil deployment manifest predicate (`snp-tdx-multiplatform/v1`).
+/// Output format — matches the enclave block in artifact-manifest.json
+/// (and, after envelope-wrapping with `schema_version: 1`, the
+/// `releases/trust/server-enclave.json` file) and the Tinfoil deployment
+/// manifest predicate (`snp-tdx-multiplatform/v1`).
 #[derive(Serialize)]
 struct MeasurementOutput {
     snp_measurement: String,

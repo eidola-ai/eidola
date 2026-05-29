@@ -72,10 +72,6 @@ group "default" {
   targets = ["server", "cli", "postgres", "shim"]
 }
 
-group "manifest" {
-  targets = ["server", "cli", "postgres"]
-}
-
 # ── CI targets (registry push) ────────────────────────────────────────────────
 # These repeat context/dockerfile because they need a different output type
 # (push to registry vs load to local daemon).
@@ -106,8 +102,4 @@ target "ci-postgres" {
   context    = "."
   dockerfile = "oci/postgresql/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-postgres:${t}"]
-}
-
-group "ci" {
-  targets = ["ci-server", "ci-cli", "ci-postgres"]
 }

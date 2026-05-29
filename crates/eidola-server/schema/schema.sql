@@ -241,6 +241,7 @@ CREATE INDEX idx_ledger_reason_created ON credit_ledger (reason, created_at);
 CREATE TABLE nullifier (
     issuer_key_id TEXT NOT NULL REFERENCES issuer_key(id),
     value         BYTEA NOT NULL,
+    refund_token  BYTEA,
     recorded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (issuer_key_id, value)
 );
@@ -263,6 +264,12 @@ COMMENT ON COLUMN nullifier.value IS
     'The raw nullifier scalar (32 bytes for Ristretto255). Revealed in the '
     'clear during the spend proof. Uniqueness within a key is enforced by '
     'the primary key — a duplicate insert fails, indicating a double-spend.';
+
+COMMENT ON COLUMN nullifier.refund_token IS
+    'The CBOR-encoded refund token issued for this spend. Stored so the client '
+    'can recover it via POST /v1/credentials/refund if the original response '
+    'was lost (network error, timeout, etc.). The token is already blinded — '
+    'it is only useful to the client holding the matching PreRefund state.';
 
 COMMENT ON COLUMN nullifier.recorded_at IS
     'When the nullifier was recorded. Useful for debugging and for verifying '
@@ -402,25 +409,6 @@ COMMENT ON FUNCTION debit_account IS
     'insufficient.  Returns an empty array on duplicate stripe_event_id. '
     'For refunds/clawbacks (p_require_balance = FALSE), any remainder '
     'beyond existing pools is placed in the permanent (NULL expiry) pool.';
-
-CREATE FUNCTION record_nullifier(p_issuer_key_id TEXT, p_value BYTEA)
-RETURNS BOOLEAN
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    INSERT INTO nullifier (issuer_key_id, value) VALUES (p_issuer_key_id, p_value);
-    RETURN TRUE;
-EXCEPTION
-    WHEN unique_violation THEN
-        RETURN FALSE;  -- double-spend attempt
-END;
-$$;
-
-COMMENT ON FUNCTION record_nullifier IS
-    'Attempts to record a nullifier. Returns TRUE on success, FALSE if the '
-    'nullifier was already recorded (double-spend). Uses the primary key '
-    'unique constraint for atomicity — no TOCTOU race. The caller MUST NOT '
-    'issue a refund credential unless this function returns TRUE.';
 
 CREATE FUNCTION prune_expired_nullifiers()
 RETURNS BIGINT

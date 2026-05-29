@@ -128,7 +128,16 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "glm-5-1",
         name: "GLM-5.1",
         description: "Advanced language model with strong reasoning and multilingual capabilities",
-        context_length: 128_000,
+        context_length: 200_000,
+        input_per_m: 1.5,
+        output_per_m: 5.25,
+        per_request_usd: 0.0,
+    },
+    CatalogEntry {
+        id: "deepseek-v4-pro",
+        name: "DeepSeek V4 Pro",
+        description: "Long-context reasoning and tool-calling model with an 800K-token context window",
+        context_length: 800_000,
         input_per_m: 1.5,
         output_per_m: 5.25,
         per_request_usd: 0.0,
@@ -137,14 +146,14 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "gemma4-31b",
         name: "Gemma 4 31B",
         description: "Lightweight and efficient language model from Google for versatile use cases",
-        context_length: 128_000,
+        context_length: 256_000,
         input_per_m: 0.45,
         output_per_m: 1.0,
         per_request_usd: 0.0,
     },
     CatalogEntry {
-        id: "kimi-k2-5",
-        name: "Kimi K2.5",
+        id: "kimi-k2-6",
+        name: "Kimi K2.6",
         description: "Unified vision and language model for visual inputs, design-to-code, and multi-agent orchestration",
         context_length: 256_000,
         input_per_m: 1.5,
@@ -155,7 +164,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "gpt-oss-120b",
         name: "GPT-OSS 120B",
         description: "Open-weight model designed for powerful reasoning, agentic tasks, and versatile use cases",
-        context_length: 128_000,
+        context_length: 131_000,
         input_per_m: 0.75,
         output_per_m: 1.25,
         per_request_usd: 0.0,
@@ -164,7 +173,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         id: "gpt-oss-safeguard-120b",
         name: "GPT-OSS Safeguard 120B",
         description: "Safety reasoning model for content classification and trust & safety applications",
-        context_length: 128_000,
+        context_length: 131_000,
         input_per_m: 0.50,
         output_per_m: 1.0,
         per_request_usd: 0.0,
@@ -206,15 +215,6 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         per_request_usd: 0.01,
     },
     CatalogEntry {
-        id: "qwen3-tts",
-        name: "Qwen3-TTS 1.7B",
-        description: "Expressive text-to-speech model with voice cloning, voice design, and multilingual support",
-        context_length: 0,
-        input_per_m: 0.0,
-        output_per_m: 0.0,
-        per_request_usd: 0.01,
-    },
-    CatalogEntry {
         id: "llama3-3-70b",
         name: "Llama 3.3 70B",
         description: "High-performance multilingual language model optimized for speed",
@@ -222,24 +222,6 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         input_per_m: 1.75,
         output_per_m: 2.75,
         per_request_usd: 0.0,
-    },
-    CatalogEntry {
-        id: "doc-upload",
-        name: "Doc Upload",
-        description: "Document ingestion and processing service for file-based inputs",
-        context_length: 0,
-        input_per_m: 0.0,
-        output_per_m: 0.0,
-        per_request_usd: 0.05,
-    },
-    CatalogEntry {
-        id: "websearch",
-        name: "Web Search",
-        description: "Privacy-preserving web search service running inside a confidential enclave",
-        context_length: 0,
-        input_per_m: 0.0,
-        output_per_m: 0.0,
-        per_request_usd: 0.05,
     },
 ];
 
@@ -260,7 +242,7 @@ fn usd_per_req_to_scaled_credits(usd_per_request: f64, markup: f64) -> u64 {
 
 /// Runtime pricing override for a single model, parsed from `TINFOIL_PRICING_OVERRIDES`.
 ///
-/// Example JSON: `{"kimi-k2-5": {"input": 1.5, "output": 5.25}}`
+/// Example JSON: `{"kimi-k2-6": {"input": 1.5, "output": 5.25}}`
 #[derive(Debug, Deserialize)]
 struct PricingOverride {
     /// Override: USD per million input tokens.
@@ -444,9 +426,18 @@ impl ChatBackend for TinfoilBackend {
     ) -> Result<mpsc::Receiver<Result<BackendStreamEvent, ServerError>>, ServerError> {
         let url = format!("{}/chat/completions", self.base_url);
 
-        // Ensure stream=true in the forwarded request
+        // Ensure stream=true in the forwarded request, and force
+        // include_usage on so the upstream emits a final usage chunk.
+        // We need usage to compute the per-token refund; without it we'd
+        // default to a zero refund and effectively bill the client the
+        // worst-case `charge_credits` for every streaming request. This
+        // is server policy, not a client choice — we override whatever
+        // the caller set.
         let mut stream_request = request.clone();
         stream_request.stream = true;
+        stream_request.stream_options = Some(crate::types::StreamOptions {
+            include_usage: true,
+        });
 
         let response = self
             .client
@@ -515,10 +506,16 @@ impl ChatBackend for TinfoilBackend {
                                     }
                                 }
                                 Err(e) => {
+                                    // Privacy: a parse failure is a structural
+                                    // problem, not a content one. We log the
+                                    // error message and the data length only —
+                                    // never `data` itself, since SSE chunks
+                                    // carry model output deltas that can
+                                    // indirectly reflect prompt content.
                                     tracing::warn!(
-                                        "Failed to parse SSE chunk: {} - data: {}",
-                                        e,
-                                        data
+                                        data_len = data.len(),
+                                        "Failed to parse SSE chunk: {}",
+                                        e
                                     );
                                 }
                             }
@@ -566,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_usd_per_m_to_scaled_credits() {
-        // kimi-k2-5 input: $1.5/M tokens with 1.5x markup
+        // kimi-k2-6 input: $1.5/M tokens with 1.5x markup
         // The 1e6 factors (USD→µ$ and /M→/token) cancel:
         // scaled = 1.5 * 1.5 * 1_000_000 = 2_250_000
         assert_eq!(usd_per_m_to_scaled_credits(1.5, 1.5), 2_250_000);
@@ -613,7 +610,7 @@ mod tests {
     fn test_pricing_overrides() {
         let mut overrides = HashMap::new();
         overrides.insert(
-            "kimi-k2-5".to_string(),
+            "kimi-k2-6".to_string(),
             PricingOverride {
                 input: Some(2.0),
                 output: Some(6.0),
@@ -622,7 +619,7 @@ mod tests {
         );
 
         let models = TinfoilBackend::build_model_list(1.0, &overrides);
-        let kimi = models.iter().find(|m| m.id == "kimi-k2-5").unwrap();
+        let kimi = models.iter().find(|m| m.id == "kimi-k2-6").unwrap();
 
         // With 1.0x markup and $2.0/M input override
         assert_eq!(kimi.pricing.per_prompt_token.value, 2_000_000);
@@ -680,7 +677,7 @@ mod tests {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let backend = TinfoilBackend::new(reqwest::Client::new(), String::new(), None, Some(1.5));
 
-        assert!(backend.lookup_model("kimi-k2-5").is_some());
+        assert!(backend.lookup_model("kimi-k2-6").is_some());
         assert!(backend.lookup_model("nonexistent").is_none());
     }
 

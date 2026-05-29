@@ -4,25 +4,40 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/artifact-manifest.sh build [--push] [--metadata-file PATH] [--builder NAME] [--ensure-builder] [--set PATTERN=VALUE ...]
-  scripts/artifact-manifest.sh print [--push] [--metadata-file PATH]
-  scripts/artifact-manifest.sh verify [--push] [--metadata-file PATH] [--manifest PATH]
-  scripts/artifact-manifest.sh build-macos [--output PATH] [--macos-paths-file PATH]
-  scripts/artifact-manifest.sh print-macos [--macos-paths-file PATH | --app-path PATH --cli-path PATH]
-  scripts/artifact-manifest.sh measure [--config PATH] [--verify-attestations]
-  scripts/artifact-manifest.sh merge [--partial PATH ...] [--output PATH]
-  scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--output PATH] [--verify-attestations]
+  scripts/artifact-manifest.sh build [--push] [--metadata-file PATH] [--builder NAME] [--ensure-builder] [--targets GROUP] [--set PATTERN=VALUE ...]
+  scripts/artifact-manifest.sh print [--push] [(--metadata-file PATH [--targets "NAME ..."])...]
+  scripts/artifact-manifest.sh verify [--push] [(--metadata-file PATH [--targets "NAME ..."])...] [--manifest PATH]
+  scripts/artifact-manifest.sh build-macos [--output PATH]
+  scripts/artifact-manifest.sh measure [--config PATH] [--verify-attestations] [--server-enclave-output PATH]
+  scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--config PATH] [--server-enclave PATH] [--output PATH] [--server-enclave-output PATH] [--verify-attestations]
+  scripts/artifact-manifest.sh stamp-config [--metadata-file PATH] [--config PATH]
   scripts/artifact-manifest.sh update [--output PATH] [--metadata-file PATH] [--builder NAME] [--ensure-builder]
 
 Options:
-  --push                  Push images directly from BuildKit to the registry (uses ci
-                          bake group with type=image,push=true). Requires REGISTRY and
-                          TAGS env vars. Without this flag, images are built in BuildKit
-                          without push for digest computation (type=image,push=false).
-                          Requires a docker-container driver (--ensure-builder or
-                          setup-buildx-action).
-  --verify-attestations   Verify CVM manifest provenance via Sigstore (requires gh CLI).
-                          Fails the command if attestation verification fails.
+  --push                       Push images directly from BuildKit to the registry (uses ci
+                               bake group with type=image,push=true). Requires REGISTRY and
+                               TAGS env vars. Without this flag, images are built in BuildKit
+                               without push for digest computation (type=image,push=false).
+                               Requires a docker-container driver (--ensure-builder or
+                               setup-buildx-action).
+  --targets GROUP              For `build`: bake group to build (default: full manifest).
+                               Recognized values: `all` (default), `server`, `cli`. Both push
+                               and non-push modes accept the split selectors so CI's
+                               two-phase build can push each phase independently.
+                               For `print`/`verify`: space-separated list of target names
+                               whose digests to read from the preceding --metadata-file
+                               (e.g. "server postgres" or "cli"). Pairs are matched
+                               positionally with --metadata-file occurrences.
+  --metadata-file PATH         Path to a buildx bake metadata file. May be repeated for
+                               `print`/`verify` to span multiple builds; each repetition
+                               must be paired with a --targets value naming the targets to
+                               read from that file.
+  --server-enclave PATH        Path to server-enclave.json (default:
+                               releases/trust/server-enclave.json). Valid for `verify-full`.
+  --server-enclave-output PATH Write the computed enclave block (with `schema_version: 1`
+                               envelope) to PATH. Valid for `measure` and `verify-full`.
+  --verify-attestations        Verify CVM manifest provenance via Sigstore (requires gh CLI).
+                               Fails the command if attestation verification fails.
 EOF
 }
 
@@ -55,21 +70,31 @@ shift
 METADATA_FILE="/tmp/bake-metadata.json"
 OUTPUT_FILE=""
 MANIFEST_FILE="$REPO_ROOT/artifact-manifest.json"
+SERVER_ENCLAVE_FILE="$REPO_ROOT/releases/trust/server-enclave.json"
+SERVER_ENCLAVE_OUTPUT=""
 BUILDER_NAME="eidola"
 ENSURE_BUILDER=0
-MACOS_PATHS_FILE=""
-APP_PATH=""
 CLI_PATH=""
+GUI_PATH=""
 CONFIG_FILE="$REPO_ROOT/tinfoil-config.yml"
 VERIFY_ATTESTATIONS=0
 PUSH_MODE=0
+TARGETS="all"
 PARTIAL_FILES=()
 BUILDX_SET_ARGS=()
+# Parallel arrays for `print`/`verify` multi-metadata mode. Each --metadata-file
+# occurrence appends to PRINT_METADATA_FILES, each --targets to PRINT_TARGETS_LIST;
+# the two are paired positionally. If TARGETS_LIST is shorter (i.e. fewer
+# --targets than --metadata-files), the missing trailing entries default to
+# "server cli postgres" for backward compatibility with single-file callers.
+PRINT_METADATA_FILES=()
+PRINT_TARGETS_LIST=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --metadata-file)
       METADATA_FILE="$2"
+      PRINT_METADATA_FILES+=("$2")
       shift 2
       ;;
     --output)
@@ -88,18 +113,6 @@ while [[ $# -gt 0 ]]; do
       ENSURE_BUILDER=1
       shift
       ;;
-    --macos-paths-file)
-      MACOS_PATHS_FILE="$2"
-      shift 2
-      ;;
-    --app-path)
-      APP_PATH="$2"
-      shift 2
-      ;;
-    --cli-path)
-      CLI_PATH="$2"
-      shift 2
-      ;;
     --partial)
       PARTIAL_FILES+=("$2")
       shift 2
@@ -114,6 +127,19 @@ while [[ $# -gt 0 ]]; do
       ;;
     --set)
       BUILDX_SET_ARGS+=("$2")
+      shift 2
+      ;;
+    --targets)
+      TARGETS="$2"
+      PRINT_TARGETS_LIST+=("$2")
+      shift 2
+      ;;
+    --server-enclave)
+      SERVER_ENCLAVE_FILE="$2"
+      shift 2
+      ;;
+    --server-enclave-output)
+      SERVER_ENCLAVE_OUTPUT="$2"
       shift 2
       ;;
     --verify-attestations)
@@ -238,20 +264,17 @@ fetch_cvm_artifacts() {
 
 # ── Enclave measurement ──────────────────────────────────────────────────────
 
-# Update image digests in tinfoil-config.yml from build metadata.
+# Update the eidola-server image digest in tinfoil-config.yml from build
+# metadata. (Only the server runs inside the enclave; the database is
+# hosted externally, so eidola-postgres's digest doesn't feed the
+# measurement.)
 stamp_config_digests() {
-  local server_digest postgres_digest tgt_server tgt_postgres
+  local server_digest
 
-  tgt_server="$(target_key server)"
-  tgt_postgres="$(target_key postgres)"
+  server_digest="$(metadata_digest "$METADATA_FILE" "$(target_key server)")"
 
-  server_digest="$(jq -er '."'"$tgt_server"'"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
-  postgres_digest="$(jq -er '."'"$tgt_postgres"'"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
-
-  # Strip the sha256: prefix for the image reference
   sed -i.bak \
     -e "s|ghcr.io/eidola-ai/eidola-server@sha256:[a-f0-9]*|ghcr.io/eidola-ai/eidola-server@${server_digest}|" \
-    -e "s|ghcr.io/eidola-ai/eidola-postgres@sha256:[a-f0-9]*|ghcr.io/eidola-ai/eidola-postgres@${postgres_digest}|" \
     "$CONFIG_FILE"
   rm -f "${CONFIG_FILE}.bak"
 }
@@ -267,6 +290,25 @@ compute_measurements() {
     --kernel "$CVM_KERNEL" \
     --initrd "$CVM_INITRD" \
     --roothash "$CVM_ROOTHASH"
+}
+
+# Wrap a bare enclave-measurement JSON (as emitted by measure-enclave) in the
+# `{schema_version, snp_measurement, tdx_measurement, cmdline}` envelope used
+# by `releases/trust/server-enclave.json`. Writes to PATH if given, else
+# stdout. The schema_version is the same integer-versioned scheme used by
+# the rest of the trust-root JSON files.
+write_server_enclave_envelope() {
+  local enclave="$1" out_path="$2"
+  local enveloped
+
+  enveloped="$(printf '%s\n' "$enclave" | jq -S '{schema_version: 1} + .')"
+
+  if [[ -n "$out_path" ]]; then
+    mkdir -p "$(dirname "$out_path")"
+    printf '%s\n' "$enveloped" > "$out_path"
+  else
+    printf '%s\n' "$enveloped"
+  fi
 }
 
 # ── Builder management ────────────────────────────────────────────────────────
@@ -312,8 +354,7 @@ target_key() {
 }
 
 build_metadata() {
-  local -a builder_args buildx_set_args
-  local bake_group
+  local -a builder_args buildx_set_args bake_targets
   builder_args=()
   buildx_set_args=()
 
@@ -326,96 +367,130 @@ build_metadata() {
     buildx_set_args+=(--set "$buildx_set_arg")
   done
 
+  # Pick the exact bake targets for this phase. Push mode uses the
+  # registry-push variants (`ci-*`) defined in docker-bake.hcl; non-push
+  # mode uses the dev variants. Both modes accept the split `server` /
+  # `cli` selectors so the two-phase build (server first, then cli after
+  # the enclave is recomputed) can run in either mode — CI's `oci` job
+  # uses this in push mode; the local `update_manifest` uses it without
+  # --push.
   if [[ "$PUSH_MODE" -eq 1 ]]; then
-    # Push directly from BuildKit to the registry using OCI media types.
-    # The ci targets already set type=image,push=true,oci-mediatypes=true.
-    bake_group="ci"
+    case "$TARGETS" in
+      all)    bake_targets=(ci-server ci-cli ci-postgres) ;;
+      server) bake_targets=(ci-server ci-postgres) ;;
+      cli)    bake_targets=(ci-cli) ;;
+      *)
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli)" >&2
+        exit 1
+        ;;
+    esac
   else
+    case "$TARGETS" in
+      all)    bake_targets=(server cli postgres) ;;
+      server) bake_targets=(server postgres) ;;
+      cli)    bake_targets=(cli) ;;
+      *)
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli)" >&2
+        exit 1
+        ;;
+    esac
     # Build OCI images locally for digest computation. No push, no daemon load.
     # Requires a docker-container driver (--ensure-builder or setup-buildx-action).
-    bake_group="manifest"
     buildx_set_args+=(--set '*.output=type=image,push=false,rewrite-timestamp=true,force-compression=true,compression=gzip,oci-mediatypes=true')
   fi
 
-  docker buildx bake "$bake_group" \
+  docker buildx bake "${bake_targets[@]}" \
     ${builder_args[@]+"${builder_args[@]}"} \
     ${buildx_set_args[@]+"${buildx_set_args[@]}"} \
     --metadata-file "$METADATA_FILE"
 }
 
+# Extract a single image digest from a bake metadata file by target name.
+# Returns the bare `sha256:...` string. Caller supplies the (push-aware)
+# target key.
+metadata_digest() {
+  local metadata_file="$1" tgt="$2"
+  jq -er '."'"$tgt"'"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$metadata_file"
+}
+
+# Build a partial artifact-manifest from a list of target names.
+# Each target is read from $METADATA_FILE using its push-aware key.
+print_oci_partial_for_targets() {
+  local -a targets=("$@")
+  local target digest jq_filter
+
+  jq_filter='{ schema_version: 1, artifacts: {} }'
+  for target in "${targets[@]}"; do
+    digest="$(metadata_digest "$METADATA_FILE" "$(target_key "$target")")"
+    jq_filter+=" | .artifacts[\"eidola-${target}\"] = { type: \"oci\", platform: \"linux/amd64\", digest: \"${digest}\" }"
+  done
+
+  jq -n "$jq_filter"
+}
+
 print_oci_manifest() {
-  local server cli postgres tgt_server tgt_cli tgt_postgres
+  # Default behavior (no explicit pairs): emit server+cli+postgres digests
+  # from the single legacy METADATA_FILE. Preserves backward compat with the
+  # one-shot oci bake.
+  if [[ "${#PRINT_METADATA_FILES[@]}" -eq 0 && "${#PRINT_TARGETS_LIST[@]}" -eq 0 ]]; then
+    print_oci_partial_for_targets server cli postgres
+    return
+  fi
 
-  tgt_server="$(target_key server)"
-  tgt_cli="$(target_key cli)"
-  tgt_postgres="$(target_key postgres)"
+  # Single --metadata-file with no --targets: same legacy default but allow
+  # the caller to point at a non-default metadata file.
+  if [[ "${#PRINT_METADATA_FILES[@]}" -eq 1 && "${#PRINT_TARGETS_LIST[@]}" -eq 0 ]]; then
+    print_oci_partial_for_targets server cli postgres
+    return
+  fi
 
-  server="$(jq -er '."'"$tgt_server"'"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
-  cli="$(jq -er '."'"$tgt_cli"'"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
-  postgres="$(jq -er '."'"$tgt_postgres"'"."containerimage.digest" | select(type == "string" and startswith("sha256:"))' "$METADATA_FILE")"
+  if [[ "${#PRINT_METADATA_FILES[@]}" != "${#PRINT_TARGETS_LIST[@]}" ]]; then
+    echo "error: --metadata-file and --targets must be paired (got ${#PRINT_METADATA_FILES[@]} metadata files, ${#PRINT_TARGETS_LIST[@]} targets values)" >&2
+    exit 1
+  fi
 
-  jq -n \
-    --arg server "$server" \
-    --arg cli "$cli" \
-    --arg postgres "$postgres" \
-    '{
-      version: 1,
-      artifacts: {
-        "eidola-server": { type: "oci", platform: "linux/amd64", digest: $server },
-        "eidola-cli": { type: "oci", platform: "linux/amd64", digest: $cli },
-        "eidola-postgres": { type: "oci", platform: "linux/amd64", digest: $postgres }
-      }
-    }'
+  # Multi-mode: each (metadata-file, targets) pair produces a partial; merge
+  # them all into a single artifact partial.
+  local i partials_json saved_metadata_file partial
+  saved_metadata_file="$METADATA_FILE"
+  partials_json="[]"
+
+  for ((i = 0; i < ${#PRINT_METADATA_FILES[@]}; i++)); do
+    local -a tgts=()
+    read -ra tgts <<<"${PRINT_TARGETS_LIST[i]}"
+    METADATA_FILE="${PRINT_METADATA_FILES[i]}"
+    partial="$(print_oci_partial_for_targets "${tgts[@]}")"
+    partials_json="$(jq -n --argjson acc "$partials_json" --argjson p "$partial" '$acc + [$p]')"
+  done
+
+  METADATA_FILE="$saved_metadata_file"
+  printf '%s\n' "$partials_json" | jq '{
+    schema_version: 1,
+    artifacts: (reduce .[] as $p ({}; . + ($p.artifacts // {})))
+  }'
 }
 
 build_macos_artifacts() {
-  local -a out_paths
-  local path
-
   if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "error: macOS artifact builds require a Darwin host" >&2
     exit 1
   fi
 
-  out_paths=()
-  while IFS= read -r path; do
-    out_paths+=("$path")
-  done < <(
+  CLI_PATH="$(
     nix build \
-      '.#eidola-macos-app' \
       '.#eidola-cli-macos-universal' \
       --no-link \
       --print-out-paths \
       --show-trace
-  )
+  )"
 
-  if [[ "${#out_paths[@]}" -ne 2 ]]; then
-    echo "error: expected 2 macOS output paths, got ${#out_paths[@]}" >&2
-    exit 1
-  fi
-
-  APP_PATH="${out_paths[0]}"
-  CLI_PATH="${out_paths[1]}"
-
-  if [[ -n "$MACOS_PATHS_FILE" ]]; then
-    jq -n \
-      --arg app_path "$APP_PATH" \
-      --arg cli_path "$CLI_PATH" \
-      '{app_path: $app_path, cli_path: $cli_path}' \
-      > "$MACOS_PATHS_FILE"
-  fi
-}
-
-load_macos_paths() {
-  if [[ -n "$MACOS_PATHS_FILE" ]]; then
-    APP_PATH="$(jq -er '.app_path | select(type == "string" and length > 0)' "$MACOS_PATHS_FILE")"
-    CLI_PATH="$(jq -er '.cli_path | select(type == "string" and length > 0)' "$MACOS_PATHS_FILE")"
-  fi
-
-  if [[ -z "$APP_PATH" || -z "$CLI_PATH" ]]; then
-    echo "error: provide --macos-paths-file or both --app-path and --cli-path" >&2
-    exit 1
-  fi
+  GUI_PATH="$(
+    nix build \
+      '.#eidola-gui-macos-universal' \
+      --no-link \
+      --print-out-paths \
+      --show-trace
+  )"
 }
 
 nix_nar_hash() {
@@ -426,21 +501,24 @@ nix_nar_hash() {
 }
 
 print_macos_manifest() {
-  local app_hash cli_hash
+  local cli_hash gui_hash
 
-  load_macos_paths
+  if [[ -z "${CLI_PATH:-}" || -z "${GUI_PATH:-}" ]]; then
+    echo "error: print_macos_manifest called before build_macos_artifacts" >&2
+    return 1
+  fi
 
-  app_hash="$(nix_nar_hash "$APP_PATH")"
   cli_hash="$(nix_nar_hash "$CLI_PATH")"
+  gui_hash="$(nix_nar_hash "$GUI_PATH")"
 
   jq -n \
-    --arg app_hash "$app_hash" \
     --arg cli_hash "$cli_hash" \
+    --arg gui_hash "$gui_hash" \
     '{
-      version: 1,
+      schema_version: 1,
       artifacts: {
-        "eidola-macos-app": { type: "nix", platform: "darwin/universal", narHash: $app_hash },
-        "eidola-cli-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $cli_hash }
+        "eidola-cli-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $cli_hash },
+        "eidola-gui-macos-universal": { type: "nix", platform: "darwin/universal", narHash: $gui_hash }
       }
     }'
 }
@@ -473,7 +551,7 @@ merge_partials() {
   local merged
   merged="$(jq -s '
     {
-      version: 1,
+      schema_version: 1,
       artifacts: (reduce .[] as $partial ({}; . + ($partial.artifacts // {})))
     }
   ' "${PARTIAL_FILES[@]}")"
@@ -491,10 +569,39 @@ merge_partials() {
 
 verify_full_manifest() {
   local actual_norm committed_norm actual_manifest
+  local expected_envelope committed_envelope rc=0
 
   # Recompute enclave measurements from committed config if not already set
   if [[ -z "${ENCLAVE_MEASUREMENTS:-}" ]]; then
     ENCLAVE_MEASUREMENTS="$(compute_measurements)"
+  fi
+
+  expected_envelope="$(write_server_enclave_envelope "$ENCLAVE_MEASUREMENTS" "")"
+  if [[ -n "$SERVER_ENCLAVE_OUTPUT" ]]; then
+    mkdir -p "$(dirname "$SERVER_ENCLAVE_OUTPUT")"
+    printf '%s\n' "$expected_envelope" > "$SERVER_ENCLAVE_OUTPUT"
+  fi
+
+  # Consistency check: the committed `releases/trust/server-enclave.json`
+  # must match the enclave block we just recomputed from
+  # `tinfoil-config.yml`. CI overwrites the committed file with the
+  # recomputed value before the cli builds run (see the `enclave` job in
+  # ci.yml), so the merged partials already contain reliable cli digests
+  # even when the committed file is stale; this check is what surfaces
+  # the drift to the developer so they know to update the committed file.
+  if [[ -f "$SERVER_ENCLAVE_FILE" ]]; then
+    committed_envelope="$(jq -cS . "$SERVER_ENCLAVE_FILE")"
+    if [[ "$(printf '%s\n' "$expected_envelope" | jq -cS .)" != "$committed_envelope" ]]; then
+      echo "::error::$SERVER_ENCLAVE_FILE does not match the enclave block recomputed from $CONFIG_FILE."
+      echo "Committed:"
+      echo "$committed_envelope" | jq .
+      echo "Recomputed:"
+      printf '%s\n' "$expected_envelope" | jq .
+      rc=1
+    fi
+  else
+    echo "::error::missing $SERVER_ENCLAVE_FILE — run \`just update-manifest\` to regenerate it"
+    rc=1
   fi
 
   actual_manifest="$(merge_partials)"
@@ -504,17 +611,19 @@ verify_full_manifest() {
   actual_norm="$(printf '%s\n' "$actual_manifest" | jq -cS .)"
   committed_norm="$(jq -cS . "$MANIFEST_FILE")"
 
-  if [[ "$actual_norm" = "$committed_norm" ]]; then
-    echo "Artifact manifest matches build output."
-    return 0
+  if [[ "$actual_norm" != "$committed_norm" ]]; then
+    echo "::error::Artifact manifest does not match build output."
+    echo "Committed:"
+    echo "$committed_norm" | jq .
+    echo "Actual:"
+    echo "$actual_norm" | jq .
+    rc=1
   fi
 
-  echo "::error::Artifact manifest does not match build output."
-  echo "Committed:"
-  echo "$committed_norm" | jq .
-  echo "Actual:"
-  echo "$actual_norm" | jq .
-  return 1
+  if [[ "$rc" -eq 0 ]]; then
+    echo "Artifact manifest and server-enclave.json match build output."
+  fi
+  return "$rc"
 }
 
 verify_oci_manifest() {
@@ -527,7 +636,7 @@ verify_oci_manifest() {
   actual_norm="$(merge_partials | jq -cS .)"
   committed_subset="$(jq -cS '
     {
-      version: 1,
+      schema_version: 1,
       artifacts: {
         "eidola-server": .artifacts["eidola-server"],
         "eidola-cli": .artifacts["eidola-cli"],
@@ -554,37 +663,82 @@ verify_oci_manifest() {
   return 1
 }
 
+# Two-phase build:
+#
+#   Phase 1: build {server, postgres}. Neither image consumes the enclave
+#            measurement, so they can be built first.
+#   Phase 2: stamp the new server digest into `tinfoil-config.yml`, recompute
+#            the enclave block, and write `releases/trust/server-enclave.json`.
+#   Phase 3: build the cli OCI image and the macOS universal CLI. Both
+#            consume the freshly-written `server-enclave.json` via
+#            `eidola-app-core/build.rs`, so they have to come after phase 2.
+#   Phase 4: compose `artifact-manifest.json` from all of the above.
+#
+# This breaks the previous self-reference (the cli build's OCI digest is
+# recorded in the very file the cli build was COPYing into its build context),
+# so `just update-manifest` converges in a single run.
 update_manifest() {
-  local oci_partial macos_partial actual_manifest
-  local oci_partial_file macos_partial_file
+  local server_oci_partial cli_oci_partial macos_partial actual_manifest
+  local server_oci_partial_file cli_oci_partial_file macos_partial_file
+  local server_metadata cli_metadata original_metadata original_targets
 
   if [[ -z "$OUTPUT_FILE" ]]; then
     OUTPUT_FILE="$REPO_ROOT/artifact-manifest.json"
   fi
 
+  original_metadata="$METADATA_FILE"
+  original_targets="$TARGETS"
+  server_metadata="${TMPDIR:-/tmp}/bake-metadata-server.json"
+  cli_metadata="${TMPDIR:-/tmp}/bake-metadata-cli.json"
+
+  # ── Phase 1: build server + postgres ────────────────────────────────────
+  METADATA_FILE="$server_metadata"
+  TARGETS="server"
+  build_metadata
+
+  # ── Phase 2: stamp config, compute enclave, write server-enclave.json ───
+  stamp_config_digests
+  ENCLAVE_MEASUREMENTS="$(compute_measurements)"
+  write_server_enclave_envelope "$ENCLAVE_MEASUREMENTS" "$SERVER_ENCLAVE_FILE"
+  echo "Updated $SERVER_ENCLAVE_FILE"
+
+  # Nix flakes only see git-tracked paths under dirty working trees, so a
+  # brand-new `server-enclave.json` would be invisible to the macOS build
+  # below. Mark it intent-to-add (no content staged) so flakes pick it up
+  # via the working tree without staging anything for the developer.
+  if [[ -d "$REPO_ROOT/.git" ]] && ! git -C "$REPO_ROOT" ls-files --error-unmatch releases/trust/server-enclave.json >/dev/null 2>&1; then
+    git -C "$REPO_ROOT" add --intent-to-add releases/trust/server-enclave.json
+  fi
+
+  # ── Phase 3: build cli OCI + macOS universal ────────────────────────────
+  METADATA_FILE="$cli_metadata"
+  TARGETS="cli"
   build_metadata
   build_macos_artifacts
 
-  # Stamp new OCI digests into tinfoil-config.yml before measuring
-  stamp_config_digests
-
-  # Compute enclave measurements from the updated config
-  ENCLAVE_MEASUREMENTS="$(compute_measurements)"
-
-  oci_partial="$(print_oci_manifest)"
+  # ── Phase 4: compose final artifact-manifest.json ───────────────────────
+  METADATA_FILE="$server_metadata"
+  server_oci_partial="$(print_oci_partial_for_targets server postgres)"
+  METADATA_FILE="$cli_metadata"
+  cli_oci_partial="$(print_oci_partial_for_targets cli)"
   macos_partial="$(print_macos_manifest)"
 
-  oci_partial_file="$(write_temp_file "$oci_partial")"
+  server_oci_partial_file="$(write_temp_file "$server_oci_partial")"
+  cli_oci_partial_file="$(write_temp_file "$cli_oci_partial")"
   macos_partial_file="$(write_temp_file "$macos_partial")"
-  PARTIAL_FILES=("$oci_partial_file" "$macos_partial_file")
+  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$macos_partial_file")
 
   actual_manifest="$(merge_partials)"
-  rm -f "$oci_partial_file" "$macos_partial_file"
+  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$macos_partial_file"
 
   write_output "$actual_manifest"
   if [[ -n "$OUTPUT_FILE" ]]; then
     echo "Updated $OUTPUT_FILE"
   fi
+
+  # Restore globals so subsequent commands behave predictably.
+  METADATA_FILE="$original_metadata"
+  TARGETS="$original_targets"
 }
 
 case "$COMMAND" in
@@ -601,14 +755,20 @@ case "$COMMAND" in
     build_macos_artifacts
     write_output "$(print_macos_manifest)"
     ;;
-  print-macos)
-    print_macos_manifest
-    ;;
   measure)
-    compute_measurements
+    enclave_json="$(compute_measurements)"
+    if [[ -n "$SERVER_ENCLAVE_OUTPUT" ]]; then
+      write_server_enclave_envelope "$enclave_json" "$SERVER_ENCLAVE_OUTPUT"
+    else
+      printf '%s\n' "$enclave_json"
+    fi
     ;;
-  merge)
-    write_output "$(merge_partials)"
+  stamp-config)
+    # Stamp the freshly-built server digest from --metadata-file into
+    # tinfoil-config.yml. Used by CI's two-phase oci job after the server
+    # bake completes and before the enclave is recomputed.
+    stamp_config_digests
+    echo "Stamped $CONFIG_FILE with server digest from $METADATA_FILE"
     ;;
   verify-full)
     verify_full_manifest

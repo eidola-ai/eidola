@@ -12,7 +12,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 
 **Deployment:** Tinfoil Containers — all services run inside confidential enclaves (AMD SEV-SNP). The Tinfoil shim handles TLS termination with attestation-bearing certificates; the server runs plain HTTP behind it.
 
-**CI:** `ci.yml` contains four jobs — `rust-checks` (ubuntu-24.04: cargo fmt/clippy/test, OpenAPI freshness), `oci` (ubuntu-24.04: OCI image builds, OCI subset verification, GHCR publishing), `apple` (self-hosted Mac: Swift formatting/bindings freshness, Nix-based macOS app and CLI universal binary builds, Swift tests), and `artifact-manifest` (ubuntu-24.04: merges the OCI and macOS artifact digests, recomputes enclave measurements from `tinfoil-config.yml` + CVM artifacts, and verifies the full committed manifest). The `oci` and `apple` jobs gate on `rust-checks` to avoid wasting resources on failing PRs. A separate `cla.yml` workflow verifies that every PR author/committer email is covered by the current `CLA-INDIVIDUAL.md` or `CLA-CORPORATE.md` hash recorded in `CLA-SIGNERS.txt`. A separate `tinfoil-build.yml` workflow runs on `v*` tags to generate `tinfoil-deployment.json` from `artifact-manifest.json`, attest it to Sigstore via `actions/attest`, and create a GitHub release — this is the artifact Tinfoil's verifier chain consumes.
+**CI:** `ci.yml` contains four jobs — `rust-checks` (ubuntu-24.04: cargo fmt/clippy/test, OpenAPI freshness), `oci` (ubuntu-24.04), `apple` (self-hosted Mac: Nix-based macOS universal-binary builds for both the cli and the GUI .app bundle), and `artifact-manifest` (ubuntu-24.04). The `oci` job mirrors the local `just update-manifest` flow end-to-end in five inline phases — (1) bake server + postgres, (2) stamp the freshly-built server digest into the workspace `tinfoil-config.yml`, (3) recompute the enclave from the stamped config and overwrite `releases/trust/server-enclave.json`, (4) bake cli (its build context COPYs the just-overwritten `server-enclave.json`), (5) emit the stamped config, recomputed enclave, and combined OCI partial as job outputs — and verifies the built OCI subset against the committed `artifact-manifest.json`. `apple` `needs: oci`, installs the stamped config + recomputed enclave from `oci`'s outputs, then builds the macOS universal CLI against that same trust root. `artifact-manifest` gates on `rust-checks`, `oci`, and `apple`; it materializes all three `oci` outputs into the workspace, runs `verify-full` (which recomputes the enclave from the stamped config and compares the composed manifest to the committed `artifact-manifest.json`), and on PRs posts a REQUEST_CHANGES review whose body contains all three files (`tinfoil-config.yml`, `releases/trust/server-enclave.json`, `artifact-manifest.json`) verbatim. Because CI executes the entire generation chain (server build → stamp → measure → cli build → compose) inside one job rather than verifying disjoint partials, those three suggestions are guaranteed internally consistent: committing them as-is reproduces a fixed point of the chain. `rust-checks`, `oci` run in parallel; `apple` follows `oci` so it sees the same trust root the linux cli was built against. A separate `cla.yml` workflow verifies that every PR author/committer email is covered by the current `CLA-INDIVIDUAL.md` or `CLA-CORPORATE.md` hash recorded in `CLA-SIGNERS.txt`. A separate `tinfoil-build.yml` workflow runs on `v*` tags and has two responsibilities: (1) generate `tinfoil-deployment.json` from `artifact-manifest.json`, attest it to Sigstore via `actions/attest`, and create the GitHub release — this is the artifact Tinfoil's verifier chain consumes; (2) sign `artifact-manifest.json` with `cosign sign-blob` (Fulcio keyless via the workflow's OIDC identity) and upload the manifest + its Sigstore bundle as release assets for the client's self-update verifier. The filename `tinfoil-build.yml` is mandated by Tinfoil's closed-source deployment system — do not rename. The release is intentionally not marked `latest` here; the release engineer's tooling does that once their human attestation is signed and uploaded.
 
 **Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidola-server`, `ghcr.io/<owner>/eidola-cli`, and `ghcr.io/<owner>/eidola-postgres`.
 
@@ -20,7 +20,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - Axum-based HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration
 - Plain HTTP internally; TLS terminated by Tinfoil Container shim with attestation-bearing certificates (attestation hash + HPKE key encoded in SANs, issued by public CA)
 - Tinfoil attestation verification via `tinfoil-verifier` crate — verifies SEV-SNP hardware attestation per-connection, caching verified fingerprints for fast reconnections; handles load-balanced deployments
-- Deterministic enclave measurement via `measure-enclave` crate — pre-computes SEV-SNP and TDX measurements from source, committed in `artifact-manifest.json`
+- Deterministic enclave measurement via `measure-enclave` crate — pre-computes SEV-SNP and TDX measurements from source, written to `releases/trust/server-enclave.json` (the cli build input) and recorded in `artifact-manifest.json` (the signed deployment record)
 - Statically linked musl binaries for Linux deployment
 - StageX-based OCI images (reproducible, `FROM scratch`, runs as non-root)
 - Request-based (no sessions/caching in the proxy layer)
@@ -40,7 +40,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 - `STRIPE_WEBHOOK_SECRET` (optional) - Stripe webhook signing secret; webhook endpoint returns 503 without it
 - `TINFOIL_BASE_URL` (optional) - Override the default Tinfoil API base URL (`https://inference.tinfoil.sh/v1`)
 - `TINFOIL_REPO` (optional) - Source repository the upstream enclave is attested against via the Tinfoil ATC `POST /attestation` endpoint (default: `tinfoilsh/confidential-model-router`); must match the GitHub repo whose signed measurements correspond to the running enclave
-- `TINFOIL_PRICING_OVERRIDES` (optional) - JSON object overriding per-model pricing; e.g. `{"kimi-k2-5":{"input":2.0,"output":6.0}}`. Token-based models accept `input`/`output` ($/M tokens); per-request models accept `request` ($/request). See `backend.rs` `MODEL_CATALOG` for defaults
+- `TINFOIL_PRICING_OVERRIDES` (optional) - JSON object overriding per-model pricing; e.g. `{"kimi-k2-6":{"input":2.0,"output":6.0}}`. Token-based models accept `input`/`output` ($/M tokens); per-request models accept `request` ($/request). See `backend.rs` `MODEL_CATALOG` for defaults
 - `PRICING_MARKUP` (optional) - Pricing markup factor applied to all model prices (default: `1.5`)
 - `OTEL_EXPORTER_OTLP_ENDPOINT` (optional) - OTLP endpoint; enables OpenTelemetry export of traces, metrics, and logs when set (e.g. `https://otlp-gateway-prod-us-central-0.grafana.net/otlp`)
 - `OTEL_EXPORTER_OTLP_HEADERS` (optional) - OTLP auth headers (e.g. `Authorization=Basic <base64(instanceID:apiKey)>`)
@@ -73,7 +73,7 @@ The binary uses `sev` (with `crypto_nossl` feature ��� pure Rust, no OpenS
 
 `tinfoil-config.yml` is the Tinfoil Container configuration. It references container images by digest (from `artifact-manifest.json`), declares `_HASH` env vars for measured secrets (Argon2id hashes generated via `cargo run -p hash-secret`), and specifies CVM resources (cpus, memory). The SHA-256 of this file is embedded in the kernel command line and bound into the enclave measurement, so any change to the config produces a different measurement.
 
-The measurement flow: `source → deterministic OCI build → digest → tinfoil-config.yml (with digest) → cmdline (with config hash) → measurement`. All values are committed in `artifact-manifest.json` and verified by CI. CVM artifacts are cached locally at `~/.cache/eidola/cvm/`. Pass `--verify-attestations` to `artifact-manifest.sh` (used by CI) to additionally verify CVM manifest provenance via Sigstore (`gh attestation verify --deny-self-hosted-runners`); this fails hard if verification fails.
+The measurement flow: `source → deterministic OCI build → server digest → tinfoil-config.yml (with digest) → cmdline (with config hash) → measurement → releases/trust/server-enclave.json → cli build embeds it as its trust root → cli OCI/macOS narHash → artifact-manifest.json`. The `server-enclave.json` step exists to break the otherwise-circular self-reference that would happen if the cli build COPYed the manifest containing its own digest; isolating the enclave fields lets the cli build see a stable input even as the manifest is regenerated. All values are committed and verified by CI. CVM artifacts are cached locally at `~/.cache/eidola/cvm/`. Pass `--verify-attestations` to `artifact-manifest.sh` (used by CI) to additionally verify CVM manifest provenance via Sigstore (`gh attestation verify --deny-self-hosted-runners`); this fails hard if verification fails.
 
 **Tinfoil attestation verification (`crates/tinfoil-verifier/`):**
 
@@ -96,28 +96,24 @@ This still relies on Tinfoil's TLS private key being sealed inside the enclave: 
 
 ## App Core Architecture
 
-The macOS app and CLI share a common Rust core (`crates/eidola-app-core/`) exposed to Swift via direct [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings. All business logic — config management, local database, HTTP client construction, account operations, wallet/credential management, and chat inference — lives in the core crate. The CLI (`apps/cli/`) is a thin Clap wrapper that constructs an `AppCore` and formats output; the macOS app (`apps/macos/`) uses the same `AppCore` via UniFFI-generated Swift bindings.
-
-Rust functions and types are exported with `#[uniffi::export]`, `#[derive(uniffi::Object)]`, `#[derive(uniffi::Record)]`, and `#[derive(uniffi::Enum)]`. Async operations use `#[uniffi::export(async)]` to bridge Rust futures to Swift async/await. No serialization layer, event/effect pattern, or Crux dependency — Swift calls Rust functions directly and gets native Swift types back.
+The GUI app and CLI share a common Rust core (`crates/eidola-app-core/`) consumed as a normal library — no FFI layer. All business logic — config management, local database, HTTP client construction, account operations, wallet/credential management, and chat inference — lives in the core crate. Consumers construct an `AppCore` and call its methods directly.
 
 **Core crate modules:**
-- `lib.rs` — `AppCore` object (UniFFI-exported), all high-level operations (account create/show/allocate, chat, wallet), UniFFI record types (`ConfigState`, `ChatResult`, `PriceInfo`, etc.), internal helpers (ACT token serialization, attestation flushing, HTTP response handling)
-- `config.rs` — `Config` struct (TOML serde), load/save with explicit paths, measurement parsing, certificate parsing, domain separator constants
+- `lib.rs` — `AppCore` struct, all high-level operations (account create/show/allocate, chat, wallet), DTO record types (`ConfigState`, `ChatResult`, `PriceInfo`, etc.), internal helpers (ACT token serialization, attestation flushing, HTTP response handling)
+- `config.rs` — `Config` struct (TOML serde) with `*_override` fields and resolver methods that fall back to the embedded trust-root pin, load/save with explicit paths, measurement parsing, certificate parsing
+- `trust_root.rs` — re-exports the build-time-generated `trust_root.gen.rs` constants (server URL, server enclave measurement, attestant fingerprints, CI identity, schema versions, embedded JSON for attestation templates + Sigstore trusted root). Source files live under `releases/`; see `releases/TRUST-ROOT.md` for what's pinned and how it rotates.
 - `db.rs` — Turso (libSQL) database layer with 3-layer schema (wallet, transport, semantic), migrations, all CRUD operations
-- `error.rs` — `AppError` enum (UniFFI-exported), request error classification (attestation vs network vs server)
+- `error.rs` — `AppError` enum, request error classification (attestation vs network vs server)
 
-**CLI usage:** The CLI depends on `eidola-app-core` as a regular Rust crate dependency. It calls `AppCore::new(config_dir, data_dir)` and invokes methods directly — no FFI involved.
+**CLI usage (`crates/eidola-cli/`):** Depends on `eidola-app-core` as a regular Rust crate. Calls `AppCore::new(config_dir, data_dir)` and invokes methods directly.
 
-**macOS app usage:** The macOS app depends on the UniFFI-generated Swift package. `Core.swift` wraps `AppCore` in an `@Observable @MainActor` class that bridges async Rust calls to SwiftUI state. Views: `ChatView` (message bubbles, model picker), `AccountView` (balances, allocation, prices), `WalletView` (credential list), `SettingsView` (base URL, credentials, attestation config).
+**GUI usage (`crates/eidola-gui/`):** Native Rust gpui app. Depends on `eidola-app-core` as a regular crate; `core.rs` wraps `AppCore` in an `Entity<Core>` that bridges tokio (the core's runtime) to gpui's smol-based executor via `oneshot` channels, and holds cached snapshots that views read reactively. **See `crates/eidola-gui/AGENTS.md` for the full architecture** — window model, Circadian theme + Newsreader bundling, transparent titlebar / gradient overlay, macOS menu/keybinding setup and ordering invariants, the per-view `CloseWindow` / `Settings` singleton patterns, the `.app` bundling requirement, and the two-tier test model (behavior tests as the regression gate; visual snapshots as a local debug aid).
 
-**Crate layout:** Pure Rust crates in `crates/` implement capability logic. The `crates/` tree also contains the Rust code generation binary (`uniffi-bindgen-swift`) plus operational utilities such as `generate-openapi`, `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`.
-
-**Codegen pipeline:**
-- `uniffi-bindgen-swift` (workspace crate under `crates/`) → FFI bridge (Swift bindings + C headers)
+**Crate layout:** Pure Rust crates in `crates/` implement capability logic — `eidola-app-core`, `eidola-server`, `tinfoil-verifier`, `gpui-markdown-editor` — plus operational utilities such as `generate-openapi`, `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`.
 
 ## Local Database & Migrations
 
-Both the CLI and macOS app use an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidola/eidola.db` for local app data (wallet credentials, conversation history, attestation records, etc.). The database layer lives in `crates/eidola-app-core/src/db.rs`.
+Both the CLI and GUI use an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidola/eidola.db` for local app data (wallet credentials, conversation history, attestation records, etc.). The database layer lives in `crates/eidola-app-core/src/db.rs`.
 
 **Schema management:**
 - `crates/eidola-app-core/schema/schema.sql` is the canonical schema — always reflects the current desired state
@@ -139,17 +135,26 @@ Both the CLI and macOS app use an embedded [Turso](https://crates.io/crates/turs
 
 The `justfile` is the primary development interface. Run `just` to see all available recipes.
 
+**Key recipes:**
+- `just build {server,cli,gui}` — local-toolchain builds for fast iteration. The `gui` target on macOS additionally runs `scripts/package-gui-app.sh` to assemble `crates/eidola-gui/build/Eidola.app` (the .app wrapper is required for AppKit to treat the binary as a real app rather than a command-line tool — see `crates/eidola-gui/AGENTS.md` for why).
+- `just run {server,cli,gui}` — build and run. For `gui`, opens the assembled `.app` via `open`. Accepts trailing args (e.g. `just run cli chat "hello"`).
+- `just test` — runs `cargo test`.
+- `just check` — clippy and rustfmt.
+- `just dev` / `just services` / `just down` — container-based development workflows (see Compose files above).
+
 ## Conventions
 
 - Pure Rust dependencies preferred (for cross-compilation)
 - Keep Rust workspace packages under `crates/`; do not add a separate top-level `tools/` tree
 - `just` is the task runner — wrap scripts and common commands as recipes
 - Server and CLI OCI images are built with StageX (reproducible, `FROM scratch`, runs as non-root)
-- Nix is used for CI quality gates and Swift/XCFramework builds, not daily Rust development
+- Nix is used for CI quality gates and the reproducible macOS universal-binary builds (CLI binary + GUI `.app` bundle), not daily Rust development
 - `rustup` + `rust-toolchain.toml` manages the Rust toolchain for development
 - OpenAI API format as the canonical interface
 - Server API is documented via utoipa `#[utoipa::path]` annotations on handler functions and `ToSchema` derives on request/response types. `OpenApiRouter` (in `lib.rs::build_router()`) collects paths and recursively discovers schemas automatically — only SSE streaming types that aren't referenced from path annotations are listed manually in `api_doc.rs`. When adding or changing server endpoints, add the annotation on the handler and register it in `build_router()` via `routes!()`, then run `just update-openapi` to regenerate the committed `openapi.json`
-- `artifact-manifest.json` (v1 format) records expected OCI digests, macOS app/CLI Nix `narHash` values, and enclave measurements (SEV-SNP + TDX + cmdline) with type/platform metadata; the enclave block shape matches the Tinfoil `snp-tdx-multiplatform/v1` predicate so `tinfoil-build.yml` can project it directly into `tinfoil-deployment.json`. CI verifies the full file by merging digests captured from the real OCI and macOS build jobs and recomputing enclave measurements from `tinfoil-config.yml`. Use `just update-manifest` to regenerate it on macOS with the pinned amd64 BuildKit builder plus the local Nix macOS builds
+- `artifact-manifest.json` (`schema_version: 1` — integer; see `releases/TRUST-ROOT.md` for why our schema versions are integers, not semver) records expected OCI digests, the macOS universal CLI binary and GUI `.app` bundle Nix `narHash`es, and enclave measurements (SEV-SNP + TDX + cmdline) with type/platform metadata; the enclave block shape matches the Tinfoil `snp-tdx-multiplatform/v1` predicate so `tinfoil-build.yml` can project it directly into `tinfoil-deployment.json`. CI verifies the full file by merging digests captured from the real OCI and macOS build jobs and recomputing enclave measurements from `tinfoil-config.yml`
+- `releases/trust/server-enclave.json` (`schema_version: 1`) holds the same enclave block in isolation — `snp_measurement`, `tdx_measurement: {rtmr1, rtmr2}`, `cmdline`. It is the only build-time input that ties the cli to the server, intentionally separated from `artifact-manifest.json` so the cli build context doesn't drag its own digest into its own inputs. `verify-full` cross-checks both files against the freshly-recomputed enclave so neither can drift unobserved
+- Use `just update-manifest` to regenerate both on macOS with the pinned amd64 BuildKit builder plus the local Nix CLI build. The script runs a two-phase build (server + postgres → stamp tinfoil-config.yml → recompute enclave → write `server-enclave.json` → cli OCI + cli macOS → write `artifact-manifest.json`), so a single invocation reaches a fixed point
 - Contributor agreement state lives in `CLA-INDIVIDUAL.md`, `CLA-CORPORATE.md`, and `CLA-SIGNERS.txt`; the signer ledger plus Git history is the source of truth, and changing either CLA text requires new signer entries because the SHA-256 hash changes
-- Before committing, ensure `README.md` and `AGENTS.md` are updated to reflect any changes (new files, endpoints, env vars, build commands, etc.)
+- Before committing, ensure `README.md` and the relevant `AGENTS.md` are updated to reflect any changes. Workspace-wide context (server, app-core, build commands, conventions) goes in the top-level `AGENTS.md`; gpui-app-specific context goes in `crates/eidola-gui/AGENTS.md` (loaded automatically when working in that subtree). Sub-app docs should not duplicate workspace-wide context — link back to it instead.
 - Omit any tool-specific "co-authored by" lines from commit messages

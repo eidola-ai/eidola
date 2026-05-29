@@ -1,0 +1,9 @@
+{
+  "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=21c11932c07eac2bd955547d4e2b4cfbc535a2e4ac5aa653d8fb89516326d45c",
+  "schema_version": 1,
+  "snp_measurement": "fc0fcc438566ddc489298b99e15a62cf7833acf00d4b0cb8d13b6ca597a5c4a6f0286aca0a47f997f7bb92d455d0449f",
+  "tdx_measurement": {
+    "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
+    "rtmr2": "6cb4ad8d47f959f3a0d770aa9a6b913cdc167e9eff1eec74c04ff693de7300cd81465f84a9710da67c1f201084510731"
+  }
+}

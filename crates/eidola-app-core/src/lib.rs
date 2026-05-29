@@ -1,14 +1,16 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod trust_root;
+pub mod updater;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anonymous_credit_tokens::{
-    CreditToken, IssuanceResponse, Params, PreIssuance, PublicKey, Refund, credit_to_scalar,
-    scalar_to_credit,
+    CreditToken, IssuanceResponse, Params, PreIssuance, PreRefund, PublicKey, Refund, SpendProof,
+    credit_to_scalar, scalar_to_credit,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -20,16 +22,19 @@ use uuid::Uuid;
 use config::Config;
 use error::AppError;
 
-uniffi::setup_scaffolding!();
-
 // ============================================================================
-// UniFFI record types — data transfer objects crossing the FFI boundary
+// Data transfer types — returned from `AppCore` methods to the apps
+// (CLI, GUI).
 // ============================================================================
 
 /// Snapshot of the current config for display.
-#[derive(uniffi::Record)]
+///
+/// `base_url` and `trusted_measurements` are the *resolved* values: the
+/// user's override if set, the trust-root pin otherwise. UI displays these
+/// directly without needing to know which source they came from.
+#[derive(Clone, Debug)]
 pub struct ConfigState {
-    pub base_url: Option<String>,
+    pub base_url: String,
     pub has_account: bool,
     pub has_account_secret: bool,
     pub domain_separator: String,
@@ -39,27 +44,27 @@ pub struct ConfigState {
     pub attestation_url: Option<String>,
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, Debug)]
 pub struct MeasurementInfo {
     pub snp: String,
     pub tdx_rtmr1: String,
     pub tdx_rtmr2: String,
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, Debug)]
 pub struct AccountCreateResult {
     pub id: String,
-    pub created_at: String,
+    pub created_at: i64,
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, Debug)]
 pub struct AccountShowResult {
     pub id: String,
     pub stripe_customer_id: Option<String>,
-    pub created_at: String,
+    pub created_at: i64,
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, Debug)]
 pub struct PriceInfo {
     pub id: String,
     pub product_name: String,
@@ -69,35 +74,44 @@ pub struct PriceInfo {
     pub credits: i64,
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, Debug)]
 pub struct BalancesResult {
     pub available: i64,
     pub pools: Vec<BalancePoolInfo>,
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, Debug)]
 pub struct BalancePoolInfo {
     pub amount: i64,
     pub source: String,
-    pub expires_at: Option<String>,
+    pub expires_at: Option<i64>,
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, Debug)]
 pub struct CredentialInfo {
     pub nonce: String,
     pub credits: i64,
     pub generation: i64,
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, Debug)]
+pub struct InFlightCredentialInfo {
+    pub nonce: String,
+    pub credits: i64,
+    pub generation: i64,
+    pub spend_amount: i64,
+}
+
+#[derive(Clone, Debug)]
 pub struct AllocateResult {
     pub nonce: String,
     pub credits: i64,
     pub issuer_key_id: String,
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, Debug)]
 pub struct ChatResult {
+    pub space_id: String,
     pub content: String,
     pub model: String,
     pub input_tokens: Option<i64>,
@@ -105,24 +119,35 @@ pub struct ChatResult {
     pub credits_charged: i64,
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, Debug)]
+pub struct SpaceInfo {
+    pub id: String,
+    pub title: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpaceMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct ModelInfo {
     pub id: String,
     pub context_length: u64,
 }
 
-// ============================================================================
-// Default directory helpers (exported via UniFFI for use from Swift)
-// ============================================================================
-
-#[uniffi::export]
-pub fn default_config_dir() -> Option<String> {
-    config::default_config_path().and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
-}
-
-#[uniffi::export]
-pub fn default_data_dir() -> Option<String> {
-    config::default_data_dir().map(|d| d.to_string_lossy().into_owned())
+/// Incremental events emitted by `AppCore::chat_stream`. The terminal
+/// outcome is the function's `Result<ChatResult, AppError>` return value;
+/// senders close their channel when the function returns.
+#[derive(Clone, Debug)]
+pub enum ChatStreamEvent {
+    /// A piece of the model's reasoning ("thinking") output. Append to a
+    /// running buffer; treat empty events as no-ops.
+    ReasoningDelta(String),
+    /// A piece of the assistant's answer text. Append to a running buffer.
+    ContentDelta(String),
 }
 
 // ============================================================================
@@ -141,14 +166,6 @@ struct Inner {
 impl Inner {
     fn load_config(&self) -> Config {
         Config::load_from(&self.config_path)
-    }
-
-    fn require_base_url<'a>(&self, cfg: &'a Config) -> Result<&'a str, AppError> {
-        cfg.base_url
-            .as_deref()
-            .ok_or_else(|| AppError::NotConfigured {
-                message: "base_url not configured".into(),
-            })
     }
 
     fn require_credentials<'a>(&self, cfg: &'a Config) -> Result<(&'a str, &'a str), AppError> {
@@ -174,24 +191,8 @@ impl Inner {
         config: &Config,
         attestation_observer: Option<tinfoil_verifier::AttestationObserver>,
     ) -> Result<reqwest::Client, AppError> {
-        if config.trusted_measurements.is_empty() {
-            let tls_config = rustls::ClientConfig::builder()
-                .with_root_certificates(load_native_root_store())
-                .with_no_client_auth();
-            return reqwest::Client::builder()
-                .tls_backend_preconfigured(tls_config)
-                .build()
-                .map_err(|e| AppError::Network {
-                    message: format!("failed to build HTTP client: {e}"),
-                });
-        }
-
-        let origin = config
-            .base_url
-            .as_deref()
-            .ok_or_else(|| AppError::NotConfigured {
-                message: "base_url is required when attestation is enabled".into(),
-            })?;
+        let origin = config.base_url();
+        let allowed_measurements = config.trusted_measurements();
 
         let hardware_root_der =
             config::parse_cert_config(config.hardware_root_ca.as_deref(), "hardware_root_ca")?;
@@ -201,7 +202,7 @@ impl Inner {
         )?;
 
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &config.trusted_measurements,
+            allowed_measurements: &allowed_measurements,
             inference_base_url: origin,
             atc_url: config.attestation_url.as_deref(),
             enclave_repo: Some(config.attestation_repo()),
@@ -226,7 +227,7 @@ impl Inner {
 impl Inner {
     async fn account_show(&self) -> Result<AccountShowResult, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let (id, secret) = self.require_credentials(&cfg)?;
 
         let client = self.build_client(&cfg, None).await?;
@@ -248,13 +249,13 @@ impl Inner {
         Ok(AccountShowResult {
             id: account.id.to_string(),
             stripe_customer_id: account.stripe_customer_id,
-            created_at: account.created_at,
+            created_at: iso_to_ms(&account.created_at)?,
         })
     }
 
     async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
 
         if cfg.account_id.is_some() || cfg.account_secret.is_some() {
             return Err(AppError::Config {
@@ -284,13 +285,13 @@ impl Inner {
 
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
-            created_at: created.created_at,
+            created_at: iso_to_ms(&created.created_at)?,
         })
     }
 
     async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
 
         let client = self.build_client(&cfg, None).await?;
         let resp = client
@@ -342,7 +343,7 @@ impl Inner {
 
     async fn account_checkout(&self, price_id: &str) -> Result<String, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let (id, secret) = self.require_credentials(&cfg)?;
 
         let client = self.build_client(&cfg, None).await?;
@@ -367,7 +368,7 @@ impl Inner {
 
     async fn account_balances(&self) -> Result<BalancesResult, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let (id, secret) = self.require_credentials(&cfg)?;
 
         let client = self.build_client(&cfg, None).await?;
@@ -391,12 +392,15 @@ impl Inner {
             pools: balances
                 .pools
                 .into_iter()
-                .map(|p| BalancePoolInfo {
-                    amount: p.amount,
-                    source: p.source,
-                    expires_at: p.expires_at,
+                .map(|p| {
+                    let expires_at = p.expires_at.as_deref().map(iso_to_ms).transpose()?;
+                    Ok::<_, AppError>(BalancePoolInfo {
+                        amount: p.amount,
+                        source: p.source,
+                        expires_at,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 
@@ -408,7 +412,7 @@ impl Inner {
         }
 
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let (account_id, secret) = self.require_credentials(&cfg)?;
         let client = self.build_client(&cfg, None).await?;
 
@@ -578,9 +582,87 @@ impl Inner {
             .collect())
     }
 
+    async fn wallet_spending_credentials(&self) -> Result<Vec<InFlightCredentialInfo>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_spending_credentials(&db_conn).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| InFlightCredentialInfo {
+                nonce: r.nonce,
+                credits: r.credits,
+                generation: r.generation,
+                spend_amount: r.spend_amount,
+            })
+            .collect())
+    }
+
+    async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
+        let cfg = self.load_config();
+        let base_url = cfg.base_url();
+        let client = self.build_client(&cfg, None).await?;
+        let db_conn = self.db_conn().await?;
+        let params = params_from_domain_separator(cfg.domain_separator())?;
+        let now = now_ms();
+
+        let rows = db::list_spending_credentials(&db_conn).await?;
+        let mut recovered = Vec::new();
+
+        for row in rows {
+            let spend_proof_cbor = row.spend_proof_data;
+
+            let spend_proof = match SpendProof::<128>::from_cbor(&spend_proof_cbor) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let pre_refund = match PreRefund::from_cbor(&row.pre_refund_data) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let public_key = match PublicKey::from_cbor(&row.public_key_data) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let issuer_key_hash = match hex_decode(&row.issuer_key_id) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            // Reconstruct the PrivateToken auth header
+            let challenge_digest = compute_challenge_digest();
+            let mut token_bytes = Vec::new();
+            token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+            token_bytes.extend_from_slice(&challenge_digest);
+            token_bytes.extend_from_slice(&issuer_key_hash);
+            token_bytes.extend_from_slice(&spend_proof_cbor);
+            let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
+            let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+
+            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
+                && process_refund(
+                    &refund_obj,
+                    &params,
+                    &spend_proof,
+                    &pre_refund,
+                    &public_key,
+                    &db_conn,
+                    &row.pre_credential_id,
+                    row.generation + 1,
+                    now,
+                )
+                .await
+                .is_ok()
+            {
+                recovered.push(row.nonce);
+            }
+        }
+
+        Ok(recovered)
+    }
+
     async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let client = self.build_client(&cfg, None).await?;
 
         let models = fetch_models(&client, base_url).await?;
@@ -594,9 +676,61 @@ impl Inner {
             .collect())
     }
 
-    async fn chat(&self, prompt: &str, model: &str) -> Result<ChatResult, AppError> {
+    async fn list_spaces(&self) -> Result<Vec<SpaceInfo>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_spaces(&db_conn).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SpaceInfo {
+                id: r.id,
+                title: r.title,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
+    async fn get_space_messages(&self, space_id: &str) -> Result<Vec<SpaceMessage>, AppError> {
+        let db_conn = self.db_conn().await?;
+        db::get_space(&db_conn, space_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            })?;
+        let action_rows = db::get_space_actions_for_context(&db_conn, space_id).await?;
+        Ok(actions_to_messages(&action_rows))
+    }
+
+    async fn create_space(&self, title: Option<&str>) -> Result<SpaceInfo, AppError> {
+        let db_conn = self.db_conn().await?;
+        let now = now_ms();
+        let space_id = Uuid::now_v7().to_string();
+        db::insert_space(&db_conn, &space_id, title, "unlinked", now).await?;
+
+        let user_participant_id =
+            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+        db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
+            .await?;
+
+        Ok(SpaceInfo {
+            id: space_id,
+            title: title.map(String::from),
+            created_at: now,
+        })
+    }
+
+    async fn archive_space(&self, space_id: &str) -> Result<bool, AppError> {
+        let db_conn = self.db_conn().await?;
+        db::archive_space(&db_conn, space_id, now_ms()).await
+    }
+
+    async fn chat(
+        &self,
+        prompt: &str,
+        model: &str,
+        space_id: Option<&str>,
+    ) -> Result<ChatResult, AppError> {
         let cfg = self.load_config();
-        let base_url = self.require_base_url(&cfg)?;
+        let base_url = cfg.base_url();
         let now = now_ms();
 
         let db_conn = self.db_conn().await?;
@@ -627,10 +761,49 @@ impl Inner {
                 })?;
 
         let max_completion_tokens = (model_entry.context_length).min(4096) as u32;
+
+        let user_participant_id =
+            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+        let model_participant_id =
+            db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
+
+        // Reuse existing space or create a new one
+        let space_id = if let Some(sid) = space_id {
+            db::get_space(&db_conn, sid)
+                .await?
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("space not found: {sid}"),
+                })?;
+            // Ensure model participant is in the space (may be new model for this space)
+            let _ =
+                db::insert_space_participant(&db_conn, sid, &model_participant_id, "member", now)
+                    .await; // ignore duplicate
+            sid.to_string()
+        } else {
+            let sid = Uuid::now_v7().to_string();
+            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
+            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
+                .await?;
+            db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
+                .await?;
+            sid
+        };
+
+        // Load prior actions to build multi-turn context — needed both for
+        // credit estimation (total prompt size) and message assembly.
+        let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
+        let prior_messages = actions_to_messages(&prior_action_rows);
+
+        // Estimate prompt size from ALL messages (prior history + current prompt)
+        let total_prompt_bytes: u128 = prior_messages
+            .iter()
+            .map(|m| m.content.len() as u128)
+            .sum::<u128>()
+            + prompt.len() as u128;
+
         let sf = model_entry.pricing.per_prompt_token.scale_factor as u128;
-        let prompt_bytes = prompt.len() as u128;
         let prompt_rate = model_entry.pricing.per_prompt_token.value as u128;
-        let prompt_credits = (prompt_bytes * prompt_rate).div_ceil(sf);
+        let prompt_credits = (total_prompt_bytes * prompt_rate).div_ceil(sf);
         let completion_rate = model_entry.pricing.per_completion_token.value as u128;
         let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
         let charge_credits = prompt_credits + completion_credits;
@@ -682,6 +855,7 @@ impl Inner {
             &cred.issuer_key_id,
             &pre_refund_cbor,
             charge_credits as i64,
+            &spend_proof_cbor,
             now,
         )
         .await?;
@@ -698,18 +872,10 @@ impl Inner {
         let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
         let auth_value = format!("PrivateToken token=\"{token_b64}\"");
 
-        let user_participant_id =
-            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
-        let model_participant_id =
-            db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
+        // Find the last action in the space for antecedent linking
+        let last_action_id = db::last_action_in_space(&db_conn, &space_id).await?;
 
-        let space_id = Uuid::now_v7().to_string();
-        db::insert_space(&db_conn, &space_id, None, "unlinked", now).await?;
-        db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
-            .await?;
-        db::insert_space_participant(&db_conn, &space_id, &model_participant_id, "member", now)
-            .await?;
-
+        // Insert the new user_input action
         let user_action_id = Uuid::now_v7().to_string();
         db::insert_action(
             &db_conn,
@@ -738,88 +904,111 @@ impl Inner {
         )
         .await?;
 
+        // Link to previous action as antecedent
+        if let Some(ref ante_id) = last_action_id {
+            db::insert_action_antecedent(&db_conn, &user_action_id, ante_id, 0).await?;
+        }
+
+        // Build the messages array: prior history + current prompt
+        let mut messages: Vec<serde_json::Value> = prior_messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
+        messages.push(serde_json::json!({"role": "user", "content": prompt}));
+
         let request_body_json = serde_json::json!({
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_completion_tokens": max_completion_tokens,
         });
         let request_at = now_ms();
 
-        let resp = client
+        // Send the chat request. On failure, attempt refund recovery before
+        // propagating the error so the credential isn't abandoned.
+        let chat_result = client
             .post(format!("{base_url}/v1/chat/completions"))
             .header("Authorization", &auth_value)
             .json(&request_body_json)
             .send()
-            .await
-            .map_err(AppError::from_request)?;
+            .await;
         let response_at = now_ms();
 
-        if let Some(new_cid) =
-            flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?
-        {
-            connection_id = Some(new_cid);
-        }
-
-        let status = resp.status();
-        let response_text = resp.text().await.map_err(|e| AppError::Network {
-            message: format!("failed to read response: {e}"),
-        })?;
-        let body: serde_json::Value =
-            serde_json::from_str(&response_text).map_err(|e| AppError::Network {
-                message: format!("failed to parse response JSON: {e}"),
-            })?;
-
-        if let Some(refund_obj) = body.get("refund") {
-            let refund_b64 = refund_obj
-                .get("refund")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Credential {
-                    message: "missing refund data in response".into(),
-                })?;
-            let refund_key_id = refund_obj
-                .get("issuer_key_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::Credential {
-                    message: "missing issuer_key_id in refund".into(),
-                })?;
-
-            let refund_cbor =
-                URL_SAFE_NO_PAD
-                    .decode(refund_b64)
-                    .map_err(|e| AppError::Credential {
-                        message: format!("invalid refund base64: {e}"),
-                    })?;
-            let refund = Refund::from_cbor(&refund_cbor).map_err(|e| AppError::Credential {
-                message: format!("invalid refund CBOR: {e}"),
-            })?;
-
-            let new_token = pre_refund
-                .to_credit_token::<128>(&params, &spend_proof, &refund, &public_key)
-                .map_err(|e| AppError::Credential {
-                    message: format!("failed to construct refund credit token: {e:?}"),
-                })?;
-
-            let new_token_cbor = new_token.to_cbor().map_err(|e| AppError::Credential {
-                message: format!("failed to encode new credit token: {e}"),
-            })?;
-            let new_nonce = hex_encode(&new_token.nullifier().to_bytes());
-            let new_credits = scalar_to_credit::<128>(&new_token.credits()).map_err(|e| {
-                AppError::Credential {
-                    message: format!("invalid credit amount in refund token: {e}"),
+        let (status, response_text, body) = match chat_result {
+            Ok(resp) => {
+                if let Some(new_cid) =
+                    flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now)
+                        .await?
+                {
+                    connection_id = Some(new_cid);
                 }
-            })?;
 
-            db::insert_credential(
+                let status = resp.status();
+                let text = resp.text().await.map_err(|e| AppError::Network {
+                    message: format!("failed to read response: {e}"),
+                })?;
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|e| AppError::Network {
+                        message: format!("failed to parse response JSON: {e}"),
+                    })?;
+                (status, text, parsed)
+            }
+            Err(e) => {
+                // Network error — the server may or may not have received the
+                // request. Try to recover the refund token.
+                let original_err = AppError::from_request(e);
+                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
+                    let _ = process_refund(
+                        &refund_obj,
+                        &params,
+                        &spend_proof,
+                        &pre_refund,
+                        &public_key,
+                        &db_conn,
+                        &pre_cred_id,
+                        cred.generation + 1,
+                        now,
+                    )
+                    .await;
+                }
+                return Err(original_err);
+            }
+        };
+
+        // Process the refund token from the response. If none is present,
+        // attempt recovery from the server.
+        let mut refund_stored = false;
+        if let Some(refund_obj) = body.get("refund") {
+            process_refund(
+                refund_obj,
+                &params,
+                &spend_proof,
+                &pre_refund,
+                &public_key,
                 &db_conn,
-                &new_nonce,
                 &pre_cred_id,
-                refund_key_id,
-                &new_token_cbor,
-                new_credits as i64,
                 cred.generation + 1,
                 now,
             )
             .await?;
+            refund_stored = true;
+        }
+
+        if !refund_stored {
+            // No refund in the response — try the recovery endpoint.
+            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
+                let _ = process_refund(
+                    &refund_obj,
+                    &params,
+                    &spend_proof,
+                    &pre_refund,
+                    &public_key,
+                    &db_conn,
+                    &pre_cred_id,
+                    cred.generation + 1,
+                    now,
+                )
+                .await;
+            }
         }
 
         let usage = body.get("usage");
@@ -855,6 +1044,7 @@ impl Inner {
         .await?;
         db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0).await?;
 
+        // Record context assembly: all prior actions + the new user action
         let context_assembly_id = Uuid::now_v7().to_string();
         db::insert_context_assembly(
             &db_conn,
@@ -866,8 +1056,15 @@ impl Inner {
             now_ms(),
         )
         .await?;
-        db::insert_context_assembly_action(&db_conn, &context_assembly_id, &user_action_id, 0)
-            .await?;
+
+        let prior_action_ids = db::space_action_ids(&db_conn, &space_id).await?;
+        for (pos, aid) in prior_action_ids.iter().enumerate() {
+            // Skip the inference action we just inserted (it's not context, it's the output)
+            if aid != &inference_action_id {
+                db::insert_context_assembly_action(&db_conn, &context_assembly_id, aid, pos as i64)
+                    .await?;
+            }
+        }
 
         let response_content = body
             .get("choices")
@@ -915,19 +1112,515 @@ impl Inner {
         .await?;
 
         if !status.is_success() {
-            let error_msg = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
             return Err(AppError::Server {
                 status: status.as_u16(),
-                message: error_msg.to_string(),
+                message: parse_server_error_message(&response_text),
             });
         }
 
         Ok(ChatResult {
+            space_id,
             content: response_content,
+            model: model.to_string(),
+            input_tokens,
+            output_tokens,
+            credits_charged: charge_credits as i64,
+        })
+    }
+
+    /// Streaming counterpart to `chat`. Mirrors the same setup (ACT token,
+    /// DB action insertion, prior-context assembly) and post-stream cleanup
+    /// (refund recovery, DB persistence of the inference action and content
+    /// blocks), but sends `stream: true` upstream and forwards each SSE chunk
+    /// to `sender` as it arrives.
+    ///
+    /// Reasoning shape: we accept both `delta.reasoning_content` (OpenAI-style
+    /// extension used by some providers) and `delta.reasoning` (vLLM's
+    /// extension). Either form is forwarded as `ReasoningDelta`. Unknown
+    /// fields are ignored — if Tinfoil's upstream uses a third spelling, the
+    /// thinking section will simply stay empty until we adapt.
+    ///
+    /// Refund handling differs from `chat` only in *where* the refund token
+    /// comes from: SSE responses have no inline body to carry it, so we
+    /// always go through the `/v1/credentials/refund` recovery endpoint
+    /// after the stream ends. The credential is left in `pre_credential`
+    /// state until that recovery completes, same as today's network-error
+    /// path.
+    #[allow(clippy::too_many_arguments)]
+    async fn chat_stream(
+        &self,
+        prompt: &str,
+        model: &str,
+        space_id: Option<&str>,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        use futures_util::StreamExt;
+
+        let cfg = self.load_config();
+        let base_url = cfg.base_url();
+        let now = now_ms();
+
+        let db_conn = self.db_conn().await?;
+        let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
+
+        let attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let log_clone = attestation_log.clone();
+        let observer: Option<tinfoil_verifier::AttestationObserver> = Some(Arc::new(
+            move |att: tinfoil_verifier::VerifiedAttestation| {
+                log_clone.lock().unwrap().push(att);
+            },
+        ));
+
+        let client = self.build_client(&cfg, observer).await?;
+
+        let models = fetch_models(&client, base_url).await?;
+        let mut connection_id =
+            flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?;
+
+        let model_entry =
+            models
+                .data
+                .iter()
+                .find(|m| m.id == model)
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("model not found: {model}"),
+                })?;
+
+        let max_completion_tokens = (model_entry.context_length).min(4096) as u32;
+
+        let user_participant_id =
+            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+        let model_participant_id =
+            db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
+
+        let space_id = if let Some(sid) = space_id {
+            db::get_space(&db_conn, sid)
+                .await?
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("space not found: {sid}"),
+                })?;
+            let _ =
+                db::insert_space_participant(&db_conn, sid, &model_participant_id, "member", now)
+                    .await;
+            sid.to_string()
+        } else {
+            let sid = Uuid::now_v7().to_string();
+            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
+            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
+                .await?;
+            db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
+                .await?;
+            sid
+        };
+
+        let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
+        let prior_messages = actions_to_messages(&prior_action_rows);
+
+        let total_prompt_bytes: u128 = prior_messages
+            .iter()
+            .map(|m| m.content.len() as u128)
+            .sum::<u128>()
+            + prompt.len() as u128;
+
+        let sf = model_entry.pricing.per_prompt_token.scale_factor as u128;
+        let prompt_rate = model_entry.pricing.per_prompt_token.value as u128;
+        let prompt_credits = (total_prompt_bytes * prompt_rate).div_ceil(sf);
+        let completion_rate = model_entry.pricing.per_completion_token.value as u128;
+        let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
+        let charge_credits = prompt_credits + completion_credits;
+
+        if charge_credits == 0 {
+            return Err(AppError::Credential {
+                message: "computed charge is zero — model pricing may be missing".into(),
+            });
+        }
+
+        let cred = db::find_spendable_credential(&db_conn, charge_credits as i64)
+            .await?
+            .ok_or_else(|| AppError::Credential {
+                message: "no credential with sufficient credits found".into(),
+            })?;
+
+        let credit_token =
+            CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
+                message: format!("failed to decode credential: {e}"),
+            })?;
+        let public_key =
+            PublicKey::from_cbor(&cred.public_key_data).map_err(|e| AppError::Credential {
+                message: format!("failed to decode public key: {e}"),
+            })?;
+
+        let params = params_from_domain_separator(cfg.domain_separator())?;
+
+        let charge_scalar =
+            credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
+                message: format!("invalid charge amount: {e:?}"),
+            })?;
+        let (spend_proof, pre_refund) = credit_token
+            .prove_spend::<128>(&params, charge_scalar, OsRng)
+            .map_err(|e| AppError::Credential {
+                message: format!("failed to create spend proof: {e:?}"),
+            })?;
+
+        let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode pre_refund: {e}"),
+        })?;
+        let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode spend proof: {e}"),
+        })?;
+        let pre_cred_id = Uuid::now_v7().to_string();
+        db::insert_pre_credential_refund(
+            &db_conn,
+            &pre_cred_id,
+            &cred.nonce,
+            &cred.issuer_key_id,
+            &pre_refund_cbor,
+            charge_credits as i64,
+            &spend_proof_cbor,
+            now,
+        )
+        .await?;
+
+        let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
+        let challenge_digest = compute_challenge_digest();
+
+        let mut token_bytes = Vec::new();
+        token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+        token_bytes.extend_from_slice(&challenge_digest);
+        token_bytes.extend_from_slice(&issuer_key_hash);
+        token_bytes.extend_from_slice(&spend_proof_cbor);
+
+        let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
+        let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+
+        let last_action_id = db::last_action_in_space(&db_conn, &space_id).await?;
+
+        let user_action_id = Uuid::now_v7().to_string();
+        db::insert_action(
+            &db_conn,
+            &db::ActionEntry {
+                id: user_action_id.clone(),
+                space_id: space_id.clone(),
+                participant_id: user_participant_id,
+                action_type: "user_input".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at: now,
+            },
+        )
+        .await?;
+        db::insert_text_content_block(
+            &db_conn,
+            &Uuid::now_v7().to_string(),
+            &user_action_id,
+            0,
+            "text",
+            prompt,
+        )
+        .await?;
+
+        if let Some(ref ante_id) = last_action_id {
+            db::insert_action_antecedent(&db_conn, &user_action_id, ante_id, 0).await?;
+        }
+
+        let mut messages: Vec<serde_json::Value> = prior_messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
+        messages.push(serde_json::json!({"role": "user", "content": prompt}));
+
+        // No `stream_options` here — the server unconditionally sets
+        // `include_usage: true` when forwarding the streaming request
+        // upstream, since accurate per-token refunds depend on it.
+        // Sending it from the client is harmless (the server ignores
+        // and overrides the value), but it's also unnecessary, so we
+        // keep our outgoing request minimal.
+        let request_body_json = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "max_completion_tokens": max_completion_tokens,
+            "stream": true,
+        });
+        let request_at = now_ms();
+
+        let chat_result = client
+            .post(format!("{base_url}/v1/chat/completions"))
+            .header("Authorization", &auth_value)
+            .header("Accept", "text/event-stream")
+            .json(&request_body_json)
+            .send()
+            .await;
+
+        let resp = match chat_result {
+            Ok(resp) => {
+                if let Some(new_cid) =
+                    flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now)
+                        .await?
+                {
+                    connection_id = Some(new_cid);
+                }
+                resp
+            }
+            Err(e) => {
+                let original_err = AppError::from_request(e);
+                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
+                    let _ = process_refund(
+                        &refund_obj,
+                        &params,
+                        &spend_proof,
+                        &pre_refund,
+                        &public_key,
+                        &db_conn,
+                        &pre_cred_id,
+                        cred.generation + 1,
+                        now,
+                    )
+                    .await;
+                }
+                return Err(original_err);
+            }
+        };
+
+        let status = resp.status();
+
+        // Non-2xx: server returned an error body (typically JSON, not SSE).
+        // Read it normally so we can surface a useful message.
+        if !status.is_success() {
+            let response_text = resp.text().await.unwrap_or_default();
+            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
+                let _ = process_refund(
+                    &refund_obj,
+                    &params,
+                    &spend_proof,
+                    &pre_refund,
+                    &public_key,
+                    &db_conn,
+                    &pre_cred_id,
+                    cred.generation + 1,
+                    now,
+                )
+                .await;
+            }
+            db::insert_request(
+                &db_conn,
+                &db::Request {
+                    id: Uuid::now_v7().to_string(),
+                    connection_id,
+                    action_id: None,
+                    method: "POST".to_string(),
+                    path: "/v1/chat/completions".to_string(),
+                    request_headers: None,
+                    request_body: Some(request_body_json.to_string().into_bytes()),
+                    response_status: Some(status.as_u16() as i64),
+                    response_headers: None,
+                    response_body: Some(response_text.as_bytes().to_vec()),
+                    request_at,
+                    response_at: Some(now_ms()),
+                    duration_ms: Some(now_ms() - request_at),
+                    error: None,
+                    credential_nonce: Some(cred.nonce.clone()),
+                    created_at: now_ms(),
+                },
+            )
+            .await?;
+            return Err(AppError::Server {
+                status: status.as_u16(),
+                message: parse_server_error_message(&response_text),
+            });
+        }
+
+        // Consume the SSE body. We accumulate bytes in a small buffer and
+        // split on the SSE event boundary `\n\n`. Each event is a sequence
+        // of `field: value\n` lines; we only care about `data:` lines (the
+        // chunk JSON) and the sentinel `[DONE]`.
+        let mut byte_stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut full_content = String::new();
+        let mut full_reasoning = String::new();
+        let mut input_tokens: Option<i64> = None;
+        let mut output_tokens: Option<i64> = None;
+        let mut response_buf: Vec<u8> = Vec::new();
+        let mut finished = false;
+
+        while let Some(chunk) = byte_stream.next().await {
+            let bytes = chunk.map_err(|e| AppError::Network {
+                message: format!("stream read failed: {e}"),
+            })?;
+            // Keep the raw bytes for the request log so we can debug
+            // upstream behaviour the same way as the non-streaming path.
+            response_buf.extend_from_slice(&bytes);
+            buf.extend_from_slice(&bytes);
+
+            while let Some(pos) = find_event_boundary(&buf) {
+                let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
+                // Drop the boundary itself (\n\n or \r\n\r\n).
+                let boundary_len = if buf.starts_with(b"\r\n\r\n") { 4 } else { 2 };
+                if buf.len() >= boundary_len {
+                    buf.drain(..boundary_len);
+                }
+                let event_str = match std::str::from_utf8(&event_bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                for line in event_str.lines() {
+                    let line = line.trim_end_matches('\r');
+                    let Some(payload) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let payload = payload.trim_start();
+                    if payload == "[DONE]" {
+                        finished = true;
+                        continue;
+                    }
+                    let json: serde_json::Value = match serde_json::from_str(payload) {
+                        Ok(v) => v,
+                        Err(_) => continue, // ignore comments/heartbeats
+                    };
+
+                    if let Some(usage) = json.get("usage") {
+                        if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
+                            input_tokens = Some(v);
+                        }
+                        if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
+                            output_tokens = Some(v);
+                        }
+                    }
+
+                    let Some(delta) = json
+                        .get("choices")
+                        .and_then(|c| c.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|c| c.get("delta"))
+                    else {
+                        continue;
+                    };
+
+                    if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                        && !text.is_empty()
+                    {
+                        full_content.push_str(text);
+                        let _ = sender.send(ChatStreamEvent::ContentDelta(text.to_string()));
+                    }
+
+                    // OpenAI o1-style ("reasoning_content") and vLLM-style
+                    // ("reasoning"). Either form is forwarded as a
+                    // ReasoningDelta; we tolerate providers that emit one,
+                    // both, or neither.
+                    for key in ["reasoning_content", "reasoning"] {
+                        if let Some(text) = delta.get(key).and_then(|v| v.as_str())
+                            && !text.is_empty()
+                        {
+                            full_reasoning.push_str(text);
+                            let _ = sender.send(ChatStreamEvent::ReasoningDelta(text.to_string()));
+                        }
+                    }
+                }
+            }
+
+            if finished {
+                break;
+            }
+        }
+        let response_at = now_ms();
+
+        if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
+            let _ = process_refund(
+                &refund_obj,
+                &params,
+                &spend_proof,
+                &pre_refund,
+                &public_key,
+                &db_conn,
+                &pre_cred_id,
+                cred.generation + 1,
+                now,
+            )
+            .await;
+        }
+
+        let inference_action_id = Uuid::now_v7().to_string();
+        db::insert_action(
+            &db_conn,
+            &db::ActionEntry {
+                id: inference_action_id.clone(),
+                space_id: space_id.clone(),
+                participant_id: model_participant_id,
+                action_type: "inference".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: Some(model.to_string()),
+                input_tokens,
+                output_tokens,
+                credits_consumed: Some(charge_credits as i64),
+                created_at: now_ms(),
+            },
+        )
+        .await?;
+        db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0).await?;
+
+        let context_assembly_id = Uuid::now_v7().to_string();
+        db::insert_context_assembly(
+            &db_conn,
+            &context_assembly_id,
+            &inference_action_id,
+            None,
+            input_tokens,
+            false,
+            now_ms(),
+        )
+        .await?;
+
+        let prior_action_ids = db::space_action_ids(&db_conn, &space_id).await?;
+        for (pos, aid) in prior_action_ids.iter().enumerate() {
+            if aid != &inference_action_id {
+                db::insert_context_assembly_action(&db_conn, &context_assembly_id, aid, pos as i64)
+                    .await?;
+            }
+        }
+
+        if !full_content.is_empty() {
+            db::insert_text_content_block(
+                &db_conn,
+                &Uuid::now_v7().to_string(),
+                &inference_action_id,
+                0,
+                "text",
+                &full_content,
+            )
+            .await?;
+        }
+
+        db::insert_request(
+            &db_conn,
+            &db::Request {
+                id: Uuid::now_v7().to_string(),
+                connection_id,
+                action_id: Some(inference_action_id),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                request_headers: None,
+                request_body: Some(request_body_json.to_string().into_bytes()),
+                response_status: Some(status.as_u16() as i64),
+                response_headers: None,
+                response_body: Some(response_buf),
+                request_at,
+                response_at: Some(response_at),
+                duration_ms: Some(response_at - request_at),
+                error: None,
+                credential_nonce: Some(cred.nonce.clone()),
+                created_at: now_ms(),
+            },
+        )
+        .await?;
+
+        Ok(ChatResult {
+            space_id,
+            content: full_content,
             model: model.to_string(),
             input_tokens,
             output_tokens,
@@ -936,25 +1629,57 @@ impl Inner {
     }
 }
 
+/// Find the byte offset of the next SSE event boundary (`\n\n` or
+/// `\r\n\r\n`) in `buf`, if any. Returns the position *before* the boundary
+/// — i.e. the length of the next event's body.
+fn find_event_boundary(buf: &[u8]) -> Option<usize> {
+    for i in 0..buf.len() {
+        if buf[i..].starts_with(b"\r\n\r\n") {
+            return Some(i);
+        }
+        if buf[i..].starts_with(b"\n\n") {
+            return Some(i);
+        }
+    }
+    None
+}
+
 // ============================================================================
-// AppCore — the UniFFI entry point.
-//
-// Owns a tokio runtime so that all async Rust code (turso, reqwest, tokio
-// primitives) runs on proper tokio worker threads rather than on whatever
-// thread the UniFFI foreign executor polls from.
+// AppCore — owns the tokio runtime that drives all async work (turso,
+// reqwest, tokio primitives). Consumers (CLI, GUI) hold an `Arc<AppCore>`
+// and call methods directly.
 // ============================================================================
 
-#[derive(uniffi::Object)]
 pub struct AppCore {
     runtime: tokio::runtime::Runtime,
     inner: Arc<Inner>,
 }
 
-/// Rust-only access to the owned runtime (not exported via UniFFI).
-/// The CLI uses this to drive async work with `block_on`.
 impl AppCore {
     pub fn runtime(&self) -> &tokio::runtime::Runtime {
         &self.runtime
+    }
+
+    /// Streaming chat. Pushes incremental `ChatStreamEvent`s through
+    /// `sender` and returns the finalized `ChatResult` when the upstream
+    /// stream closes. Drops `sender` on return so receivers see channel
+    /// closure as the natural "done" signal.
+    pub async fn chat_stream(
+        &self,
+        prompt: String,
+        model: String,
+        space_id: Option<String>,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .chat_stream(&prompt, &model, space_id.as_deref(), sender)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
     }
 }
 
@@ -965,14 +1690,12 @@ fn join_err(e: tokio::task::JoinError) -> AppError {
     }
 }
 
-#[uniffi::export]
 impl AppCore {
     /// Create a new core instance.
     ///
     /// `config_dir` — directory containing `config.toml`.
     /// `data_dir` — directory for the local database.
-    #[uniffi::constructor]
-    pub fn new(config_dir: String, data_dir: String) -> Self {
+    pub fn new(config_dir: PathBuf, data_dir: PathBuf) -> Self {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -982,8 +1705,8 @@ impl AppCore {
         Self {
             runtime,
             inner: Arc::new(Inner {
-                config_path: PathBuf::from(&config_dir).join("config.toml"),
-                data_dir: PathBuf::from(data_dir),
+                config_path: config_dir.join("config.toml"),
+                data_dir,
                 db: tokio::sync::OnceCell::new(),
             }),
         }
@@ -995,20 +1718,17 @@ impl AppCore {
 
     pub fn config_state(&self) -> ConfigState {
         let cfg = self.inner.load_config();
+        let to_info = |m: &tinfoil_verifier::EnclaveMeasurement| MeasurementInfo {
+            snp: m.snp_measurement.clone(),
+            tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
+            tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
+        };
         ConfigState {
-            base_url: cfg.base_url.clone(),
+            base_url: cfg.base_url().to_string(),
             has_account: cfg.account_id.is_some(),
             has_account_secret: cfg.account_secret.is_some(),
             domain_separator: cfg.domain_separator().to_string(),
-            trusted_measurements: cfg
-                .trusted_measurements
-                .iter()
-                .map(|m| MeasurementInfo {
-                    snp: m.snp_measurement.clone(),
-                    tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
-                    tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
-                })
-                .collect(),
+            trusted_measurements: cfg.trusted_measurements().iter().map(&to_info).collect(),
             has_hardware_root_ca: cfg.hardware_root_ca.is_some(),
             has_hardware_intermediate_ca: cfg.hardware_intermediate_ca.is_some(),
             attestation_url: cfg.attestation_url.clone(),
@@ -1017,7 +1737,7 @@ impl AppCore {
 
     pub fn set_base_url(&self, url: String) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
-        cfg.base_url = Some(url);
+        cfg.base_url_override = Some(url);
         cfg.save_to(&self.inner.config_path)
     }
 
@@ -1050,13 +1770,13 @@ impl AppCore {
         let spec = format!("{snp}:{tdx_rtmr1}:{tdx_rtmr2}");
         let entry = config::parse_trust_measurement(&spec)?;
         let mut cfg = self.inner.load_config();
-        if cfg.trusted_measurements.iter().any(|m| {
+        if cfg.trusted_measurements_override.iter().any(|m| {
             m.snp_measurement
                 .eq_ignore_ascii_case(&entry.snp_measurement)
         }) {
             return Ok(false);
         }
-        cfg.trusted_measurements.push(entry);
+        cfg.trusted_measurements_override.push(entry);
         cfg.save_to(&self.inner.config_path)?;
         Ok(true)
     }
@@ -1065,11 +1785,11 @@ impl AppCore {
         let key = config::parse_untrust_key(&snp)?;
         let mut cfg = self.inner.load_config();
         if let Some(pos) = cfg
-            .trusted_measurements
+            .trusted_measurements_override
             .iter()
             .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
         {
-            cfg.trusted_measurements.remove(pos);
+            cfg.trusted_measurements_override.remove(pos);
             cfg.save_to(&self.inner.config_path)?;
             Ok(true)
         } else {
@@ -1157,6 +1877,24 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    pub async fn wallet_spending_credentials(
+        &self,
+    ) -> Result<Vec<InFlightCredentialInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.wallet_spending_credentials().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.recover_spending_credentials().await })
+            .await
+            .map_err(join_err)?
+    }
+
     pub async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -1165,10 +1903,50 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    pub async fn chat(&self, prompt: String, model: String) -> Result<ChatResult, AppError> {
+    pub async fn list_spaces(&self) -> Result<Vec<SpaceInfo>, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.chat(&prompt, &model).await })
+            .spawn(async move { inner.list_spaces().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn get_space_messages(
+        &self,
+        space_id: String,
+    ) -> Result<Vec<SpaceMessage>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.get_space_messages(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn create_space(&self, title: Option<String>) -> Result<SpaceInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.create_space(title.as_deref()).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn archive_space(&self, space_id: String) -> Result<bool, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.archive_space(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn chat(
+        &self,
+        prompt: String,
+        model: String,
+        space_id: Option<String>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.chat(&prompt, &model, space_id.as_deref()).await })
             .await
             .map_err(join_err)?
     }
@@ -1286,8 +2064,156 @@ struct ModelListEntry {
 }
 
 // ============================================================================
+// Refund processing helpers
+// ============================================================================
+
+/// Extract a refund token from a JSON object and store the resulting credential.
+///
+/// `refund_obj` is the `"refund"` value from a server response (either a chat
+/// completion or the recovery endpoint). Returns `true` if the credential was
+/// successfully stored.
+#[allow(clippy::too_many_arguments)]
+async fn process_refund(
+    refund_obj: &serde_json::Value,
+    params: &Params,
+    spend_proof: &SpendProof<128>,
+    pre_refund: &PreRefund,
+    public_key: &PublicKey,
+    db_conn: &turso::Connection,
+    pre_cred_id: &str,
+    generation: i64,
+    now: i64,
+) -> Result<(), AppError> {
+    let refund_b64 = refund_obj
+        .get("refund")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Credential {
+            message: "missing refund data in response".into(),
+        })?;
+    let refund_key_id = refund_obj
+        .get("issuer_key_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Credential {
+            message: "missing issuer_key_id in refund".into(),
+        })?;
+
+    let refund_cbor = URL_SAFE_NO_PAD
+        .decode(refund_b64)
+        .map_err(|e| AppError::Credential {
+            message: format!("invalid refund base64: {e}"),
+        })?;
+    let refund = Refund::from_cbor(&refund_cbor).map_err(|e| AppError::Credential {
+        message: format!("invalid refund CBOR: {e}"),
+    })?;
+
+    let new_token = pre_refund
+        .to_credit_token::<128>(params, spend_proof, &refund, public_key)
+        .map_err(|e| AppError::Credential {
+            message: format!("failed to construct refund credit token: {e:?}"),
+        })?;
+
+    let new_token_cbor = new_token.to_cbor().map_err(|e| AppError::Credential {
+        message: format!("failed to encode new credit token: {e}"),
+    })?;
+    let new_nonce = hex_encode(&new_token.nullifier().to_bytes());
+    let new_credits =
+        scalar_to_credit::<128>(&new_token.credits()).map_err(|e| AppError::Credential {
+            message: format!("invalid credit amount in refund token: {e}"),
+        })?;
+
+    db::insert_credential(
+        db_conn,
+        &new_nonce,
+        pre_cred_id,
+        refund_key_id,
+        &new_token_cbor,
+        new_credits as i64,
+        generation,
+        now,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Attempt to recover a refund token from the server via
+/// `POST /v1/credentials/refund`. Returns the refund JSON object on success.
+async fn recover_refund(
+    client: &reqwest::Client,
+    base_url: &str,
+    auth_value: &str,
+) -> Result<serde_json::Value, AppError> {
+    let resp = client
+        .post(format!("{base_url}/v1/credentials/refund"))
+        .header("Authorization", auth_value)
+        .send()
+        .await
+        .map_err(AppError::from_request)?;
+
+    let status = resp.status();
+    let body_text = resp.text().await.map_err(|e| AppError::Network {
+        message: format!("failed to read recovery response: {e}"),
+    })?;
+    let body: serde_json::Value =
+        serde_json::from_str(&body_text).map_err(|e| AppError::Network {
+            message: format!("failed to parse recovery response: {e}"),
+        })?;
+
+    if !status.is_success() {
+        return Err(AppError::Server {
+            status: status.as_u16(),
+            message: format!(
+                "refund recovery failed: {}",
+                parse_server_error_message(&body_text)
+            ),
+        });
+    }
+
+    body.get("refund")
+        .cloned()
+        .ok_or_else(|| AppError::Credential {
+            message: "recovery response missing refund field".into(),
+        })
+}
+
+// ============================================================================
 // Free-standing helpers
 // ============================================================================
+
+/// Convert space action rows into a sequence of role/content messages suitable
+/// for the OpenAI messages array and for UI display. Groups content blocks by
+/// action and concatenates text.
+fn actions_to_messages(action_rows: &[db::SpaceActionRow]) -> Vec<SpaceMessage> {
+    let mut messages: Vec<SpaceMessage> = Vec::new();
+    let mut current_action_id: Option<&str> = None;
+
+    for row in action_rows {
+        let role = match (row.action_type.as_str(), row.participant_kind.as_str()) {
+            ("user_input", _) => "user",
+            ("inference", _) => "assistant",
+            _ => continue, // skip tool_call, tool_result, etc. for now
+        };
+
+        if current_action_id == Some(row.action_id.as_str()) {
+            // Additional content block for the same action — append text
+            if let Some(text) = &row.text_content
+                && let Some(last) = messages.last_mut()
+            {
+                last.content.push_str(text);
+            }
+        } else {
+            // New action
+            current_action_id = Some(&row.action_id);
+            let content = row.text_content.clone().unwrap_or_default();
+            messages.push(SpaceMessage {
+                role: role.to_string(),
+                content,
+            });
+        }
+    }
+
+    messages
+}
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -1383,7 +2309,7 @@ pub fn iso_to_ms(s: &str) -> Result<i64, AppError> {
     Ok(secs * 1000)
 }
 
-fn load_native_root_store() -> rustls::RootCertStore {
+pub(crate) fn load_native_root_store() -> rustls::RootCertStore {
     let mut store = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     for cert in native.certs {
@@ -1414,7 +2340,21 @@ fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError>
     if status.is_success() {
         return Ok(());
     }
-    let message = serde_json::from_str::<serde_json::Value>(body)
+    Err(AppError::Server {
+        status: status.as_u16(),
+        message: parse_server_error_message(body),
+    })
+}
+
+/// Best-effort extraction of a human-readable error message from a
+/// non-2xx response body. Tries the OpenAI-shaped `{"error":{"message":"..."}}`
+/// envelope first; falls back to the raw body text (trimmed and
+/// length-capped — axum's body-extractor rejection bodies are plain
+/// text, not JSON, and were previously bucketed to "unknown error" by
+/// the old JSON-only path); finally falls back to a literal "unknown
+/// error" only when the body is empty.
+pub(crate) fn parse_server_error_message(body: &str) -> String {
+    if let Some(msg) = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| {
             v.get("error")
@@ -1422,11 +2362,22 @@ fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError>
                 .and_then(|m| m.as_str())
                 .map(String::from)
         })
-        .unwrap_or_else(|| body.to_string());
-    Err(AppError::Server {
-        status: status.as_u16(),
-        message,
-    })
+    {
+        return msg;
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "unknown error".to_string();
+    }
+    // Cap the message so a chatty rejection body doesn't blow up the UI.
+    const MAX_LEN: usize = 500;
+    if trimmed.len() > MAX_LEN {
+        let mut capped: String = trimmed.chars().take(MAX_LEN).collect();
+        capped.push('…');
+        capped
+    } else {
+        trimmed.to_string()
+    }
 }
 
 async fn fetch_models(

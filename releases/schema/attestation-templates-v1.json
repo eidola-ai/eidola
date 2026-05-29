@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "attestant_statement_template": {
+    "template": "I, {name}, holder of the private key with fingerprint sha256:{key_fingerprint_sha256}, affirm under penalty of perjury under the laws of the jurisdiction of {jurisdiction} that the following claims are true and correct to the best of my knowledge.",
+    "sources": {
+      "name": "attestation.attestant.name",
+      "key_fingerprint_sha256": "attestation.attestant.key_fingerprint_sha256",
+      "jurisdiction": "attestation.attestant.jurisdiction"
+    }
+  },
+  "claims": {
+    "no_compulsion": {
+      "template": "I am not currently subject to any legal order, gag, technical capability notice, or other compulsion related to this release or to Eidola generally.",
+      "sources": {},
+      "cross_checks": {}
+    },
+    "no_coercion": {
+      "template": "I have not been threatened or coerced by any party in connection with this release.",
+      "sources": {},
+      "cross_checks": {}
+    },
+    "signing_freely": {
+      "template": "I am signing this attestation of my own volition, on hardware under my exclusive physical control.",
+      "sources": {},
+      "cross_checks": {}
+    },
+    "manifest_reproduced": {
+      "template": "I have personally reproduced artifact-manifest.json (sha256 {artifact_manifest_sha256}) from git commit {git_commit} on hardware under my exclusive physical control, and confirmed bit-for-bit equality with the CI-produced manifest.",
+      "sources": {
+        "artifact_manifest_sha256": "attestation.artifact_manifest_sha256",
+        "git_commit": "attestation.git_commit"
+      },
+      "cross_checks": {
+        "git_commit": "release.git_commit"
+      }
+    },
+    "diff_reviewed": {
+      "template": "I have personally reviewed the diff between git commit {previous_release_git_commit} (the prior release) and git commit {git_commit} (this release).",
+      "sources": {
+        "previous_release_git_commit": "attestation.previous_release_git_commit",
+        "git_commit": "attestation.git_commit"
+      },
+      "cross_checks": {
+        "previous_release_git_commit": "release.previous_release.git_commit",
+        "git_commit": "release.git_commit"
+      }
+    },
+    "no_known_privacy_weakening": {
+      "template": "Based on the review described above, I am not aware of any change in this release that weakens the privacy guarantees stated in PRIVACY-GUARANTEES.md (sha256 {privacy_guarantees_doc_sha256}) as compared with the prior release.",
+      "sources": {
+        "privacy_guarantees_doc_sha256": "attestation.privacy_guarantees_doc_sha256"
+      },
+      "cross_checks": {}
+    },
+    "no_known_backdoor": {
+      "template": "Based on the review described above, I am not aware of any backdoor, covert surveillance mechanism, or undisclosed data exfiltration path in the code that comprises this release.",
+      "sources": {},
+      "cross_checks": {}
+    }
+  }
+}

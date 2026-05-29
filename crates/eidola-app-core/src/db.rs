@@ -147,6 +147,7 @@ pub async fn insert_pre_credential_issuance(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_pre_credential_refund(
     conn: &Connection,
     id: &str,
@@ -154,17 +155,19 @@ pub async fn insert_pre_credential_refund(
     issuer_key_id: &str,
     data: &[u8],
     spend_amount: i64,
+    spend_proof_data: &[u8],
     created_at: i64,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, created_at) \
-         VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6)",
+        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, spend_proof_data, created_at) \
+         VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
         (
             Value::Text(id.to_string()),
             Value::Text(credential_nonce.to_string()),
             Value::Text(issuer_key_id.to_string()),
             Value::Blob(data.to_vec()),
             Value::Integer(spend_amount),
+            Value::Blob(spend_proof_data.to_vec()),
             Value::Integer(created_at),
         ),
     )
@@ -275,6 +278,55 @@ pub async fn list_active_credentials(conn: &Connection) -> Result<Vec<Credential
             generation: row.get::<i64>(2).map_err(AppError::db)?,
             created_at: row.get::<i64>(3).map_err(AppError::db)?,
             state: row.get::<String>(4).map_err(AppError::db)?,
+        });
+    }
+    Ok(results)
+}
+
+pub struct SpendingCredentialRow {
+    pub nonce: String,
+    pub credits: i64,
+    pub generation: i64,
+    pub created_at: i64,
+    pub spend_amount: i64,
+    pub pre_credential_id: String,
+    pub pre_refund_data: Vec<u8>,
+    pub spend_proof_data: Vec<u8>,
+    pub issuer_key_id: String,
+    pub public_key_data: Vec<u8>,
+}
+
+pub async fn list_spending_credentials(
+    conn: &Connection,
+) -> Result<Vec<SpendingCredentialRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.nonce, c.credits, c.generation, c.created_at, \
+                    pc.spend_amount, pc.id, pc.data, pc.spend_proof_data, \
+                    pc.issuer_key_id, ik.public_key_data \
+             FROM credential_lifecycle cl \
+             JOIN credential c ON c.nonce = cl.nonce \
+             JOIN pre_credential pc ON pc.credential_nonce = c.nonce AND pc.type = 'refund' \
+             JOIN issuer_key ik ON ik.id = pc.issuer_key_id \
+             WHERE cl.state = 'spending' \
+             ORDER BY c.created_at",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(SpendingCredentialRow {
+            nonce: row.get::<String>(0).map_err(AppError::db)?,
+            credits: row.get::<i64>(1).map_err(AppError::db)?,
+            generation: row.get::<i64>(2).map_err(AppError::db)?,
+            created_at: row.get::<i64>(3).map_err(AppError::db)?,
+            spend_amount: row.get::<i64>(4).map_err(AppError::db)?,
+            pre_credential_id: row.get::<String>(5).map_err(AppError::db)?,
+            pre_refund_data: row.get::<Vec<u8>>(6).map_err(AppError::db)?,
+            spend_proof_data: row.get::<Vec<u8>>(7).map_err(AppError::db)?,
+            issuer_key_id: row.get::<String>(8).map_err(AppError::db)?,
+            public_key_data: row.get::<Vec<u8>>(9).map_err(AppError::db)?,
         });
     }
     Ok(results)
@@ -752,6 +804,186 @@ pub async fn insert_context_assembly_action(
     .await
     .map_err(|e| AppError::Database {
         message: format!("failed to insert context_assembly_action: {e}"),
+    })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2 — Semantic: Space query operations
+// ---------------------------------------------------------------------------
+
+pub struct SpaceRow {
+    pub id: String,
+    pub title: Option<String>,
+    pub created_at: i64,
+}
+
+pub async fn list_spaces(conn: &Connection) -> Result<Vec<SpaceRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, created_at FROM space \
+             WHERE archived_at IS NULL \
+             ORDER BY created_at DESC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(SpaceRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            title: row.get::<Option<String>>(1).map_err(AppError::db)?,
+            created_at: row.get::<i64>(2).map_err(AppError::db)?,
+        });
+    }
+    Ok(results)
+}
+
+pub async fn get_space(conn: &Connection, space_id: &str) -> Result<Option<SpaceRow>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT id, title, created_at FROM space WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(SpaceRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            title: row.get::<Option<String>>(1).map_err(AppError::db)?,
+            created_at: row.get::<i64>(2).map_err(AppError::db)?,
+        })),
+    }
+}
+
+pub struct SpaceActionRow {
+    pub action_id: String,
+    pub action_type: String,
+    pub participant_kind: String,
+    pub status: String,
+    pub text_content: Option<String>,
+    pub block_ordinal: Option<i64>,
+}
+
+/// Returns actions in a space with their text content blocks, suitable for
+/// building the OpenAI messages array. Filters to terminal statuses and
+/// uses action_resolved to dereference origin references.
+pub async fn get_space_actions_for_context(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Vec<SpaceActionRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ar.action_id, ar.action_type, p.kind, ar.status, \
+                    cb.text_content, cb.ordinal \
+             FROM action_resolved ar \
+             JOIN participant p ON p.id = ar.participant_id \
+             LEFT JOIN content_block cb ON cb.action_id = ar.content_source_id \
+             WHERE ar.space_id = ?1 \
+               AND ar.status IN ('complete', 'cancelled') \
+             ORDER BY ar.created_at ASC, cb.ordinal ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(SpaceActionRow {
+            action_id: row.get::<String>(0).map_err(AppError::db)?,
+            action_type: row.get::<String>(1).map_err(AppError::db)?,
+            participant_kind: row.get::<String>(2).map_err(AppError::db)?,
+            status: row.get::<String>(3).map_err(AppError::db)?,
+            text_content: row.get::<Option<String>>(4).map_err(AppError::db)?,
+            block_ordinal: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+        });
+    }
+    Ok(results)
+}
+
+/// Returns the ID of the last terminal action in a space (for antecedent linking).
+pub async fn last_action_in_space(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM action \
+             WHERE space_id = ?1 AND status IN ('complete', 'cancelled') \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// Returns all action IDs in a space with terminal status, ordered by created_at.
+pub async fn space_action_ids(conn: &Connection, space_id: &str) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM action \
+             WHERE space_id = ?1 AND status IN ('complete', 'cancelled') \
+             ORDER BY created_at ASC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        ids.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(ids)
+}
+
+pub async fn archive_space(
+    conn: &Connection,
+    space_id: &str,
+    archived_at: i64,
+) -> Result<bool, AppError> {
+    let changed = conn
+        .execute(
+            "UPDATE space SET archived_at = ?2 WHERE id = ?1 AND archived_at IS NULL",
+            (
+                Value::Text(space_id.to_string()),
+                Value::Integer(archived_at),
+            ),
+        )
+        .await
+        .map_err(|e| AppError::Database {
+            message: format!("failed to archive space: {e}"),
+        })?;
+    Ok(changed > 0)
+}
+
+pub async fn update_space_title(
+    conn: &Connection,
+    space_id: &str,
+    title: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE space SET title = ?2 WHERE id = ?1",
+        (
+            Value::Text(space_id.to_string()),
+            Value::Text(title.to_string()),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to update space title: {e}"),
     })?;
     Ok(())
 }

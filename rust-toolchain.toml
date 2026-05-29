@@ -1,7 +1,6 @@
 # See https://rust-lang.github.io/rustup/overrides.html for details on how this file works
 # and how you can override the choices made herein.
 #
-# Note that UniFFI also sets their own toolchain (see https://github.com/mozilla/uniffi-rs/blob/main/rust-toolchain.toml).
 # We will attempt to track stable unless we find that this breaks something.
 
 [toolchain]

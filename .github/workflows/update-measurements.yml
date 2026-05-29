@@ -6,28 +6,18 @@ on:
     - cron: "0 */6 * * *"
   workflow_dispatch:
 
-# Only one run at a time; if a scheduled tick overlaps with a manual run,
-# let the running one finish.
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: false
-
-permissions: {}
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
   check-measurements:
-    name: Update Tinfoil measurements
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      contents: write # push the measurements/<tag> branch with the updated file
-      pull-requests: write # open the PR proposing the measurement update
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        # zizmor: ignore[artipacked]
-        # The "Create pull request" step below uses `git push` with the
-        # persisted GITHUB_TOKEN credential helper. Disabling persistence here
-        # would require a manual remote rewrite to keep the push working.
+      # This workflow opens a PR via `git push`, which needs the
+      # GITHUB_TOKEN persisted into .git/config. Allowed here.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 # zizmor: ignore[artipacked]
 
       - name: Fetch latest Tinfoil release
         id: release
@@ -84,22 +74,18 @@ jobs:
       - name: Check if measurements are already known
         id: check
         env:
-          SNP: ${{ steps.release.outputs.snp }}
-          RTMR1: ${{ steps.release.outputs.rtmr1 }}
-          RTMR2: ${{ steps.release.outputs.rtmr2 }}
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
-          FILE="crates/eidola-server/src/measurements.rs"
-          if grep -qF "${SNP}" "${FILE}" \
-             && grep -qF "${RTMR1}" "${FILE}" \
-             && grep -qF "${RTMR2}" "${FILE}"; then
+          FILE="releases/trust/tinfoil-enclaves.json"
+          if jq -e --arg tag "${TAG}" '.allowed | any(.git_tag == $tag)' "${FILE}" >/dev/null; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Measurements already present"
+            echo "Tag ${TAG} already present in ${FILE}"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "New measurements detected"
+            echo "Tag ${TAG} not yet present in ${FILE}"
           fi
 
-      - name: Update measurements.rs
+      - name: Update tinfoil-enclaves.json
         if: steps.check.outputs.changed == 'true'
         env:
           TAG: ${{ steps.release.outputs.tag }}
@@ -110,85 +96,37 @@ jobs:
           ARTIFACT_HASH: ${{ steps.release.outputs.artifact_hash }}
           LOG_INDEX: ${{ steps.sigstore.outputs.log_index }}
         run: |
-          FILE="crates/eidola-server/src/measurements.rs"
+          FILE="releases/trust/tinfoil-enclaves.json"
 
-          # Extract the existing CURRENT block (header comments + struct
-          # literal) verbatim from the committed file, so we can re-emit it as
-          # the new PREVIOUS block with all build metadata preserved (built_at,
-          # artifact digest, Rekor log index, Sigstore + GitHub links). The
-          # block starts at `// === CURRENT:` and ends at the closing `},` of
-          # the EnclaveMeasurement literal.
-          PREV_BLOCK=$(git show HEAD:"${FILE}" | awk '
-            /\/\/ === CURRENT:/ { capture=1 }
-            capture { print }
-            capture && /^        \},[[:space:]]*$/ { exit }
-          ')
-
-          # The previous SNP measurement, used only to detect whether the
-          # CURRENT release actually changed.
-          # After rustfmt the hash may wrap to the next line, so just
-          # grab the first 96-char hex string in the block (always SNP).
-          PREV_SNP=$(printf '%s\n' "${PREV_BLOCK}" \
-            | grep -oP '[a-f0-9]{96}' | head -1 || true)
-
-          HAS_PREV=false
-          if [ -n "${PREV_BLOCK}" ] && [ -n "${PREV_SNP}" ] && [ "${PREV_SNP}" != "${SNP}" ]; then
-            HAS_PREV=true
-          fi
-
-          {
-            echo '//! Allowed code measurements for Tinfoil'\''s inference enclave.'
-            echo '//!'
-            echo '//! Updated by CI when Tinfoil publishes new enclave builds.'
-            echo '//! At least two entries for rolling deploys (current + previous).'
-            echo '//!'
-            echo '//! Each `EnclaveMeasurement` entry pairs the AMD SEV-SNP launch digest with'
-            echo '//! the Intel TDX RTMR1/RTMR2 values for a single Tinfoil release. This mirrors'
-            echo '//! the shape used in Tinfoil'\''s `tinfoil-deployment.json` and our own'
-            echo '//! `artifact-manifest.json`. `tinfoil-verifier` picks the matching field at'
-            echo '//! verification time based on the platform that produced the attestation.'
-            echo '//!'
-            echo '//! Source repo: tinfoilsh/confidential-model-router'
-            echo ''
-            echo 'use std::sync::LazyLock;'
-            echo ''
-            echo 'use tinfoil_verifier::{EnclaveMeasurement, TdxMeasurement};'
-            echo ''
-            echo 'pub static ALLOWED: LazyLock<Vec<EnclaveMeasurement>> = LazyLock::new(|| {'
-            echo '    vec!['
-            echo "        // === CURRENT: ${TAG} ==="
-            echo "        // Built: ${BUILT_AT}"
-            echo "        // Artifact digest: sha256:${ARTIFACT_HASH}"
-            echo "        // Rekor log index: ${LOG_INDEX}"
-            echo "        // Sigstore: https://search.sigstore.dev/?logIndex=${LOG_INDEX}"
-            echo "        // GitHub: https://github.com/tinfoilsh/confidential-model-router/releases/tag/${TAG}"
-            echo '        EnclaveMeasurement {'
-            echo "            snp_measurement: \"${SNP}\".into(),"
-            echo '            tdx_measurement: TdxMeasurement {'
-            echo "                rtmr1: \"${RTMR1}\".into(),"
-            echo "                rtmr2: \"${RTMR2}\".into(),"
-            echo '            },'
-            echo '        },'
-
-            if [ "${HAS_PREV}" = "true" ]; then
-              # Re-emit the captured block with the CURRENT marker rewritten
-              # as PREVIOUS, preserving all build comments (Built / Artifact
-              # digest / Rekor / Sigstore / GitHub) verbatim.
-              printf '%s\n' "${PREV_BLOCK}" \
-                | sed 's|// === CURRENT:|// === PREVIOUS:|'
-            fi
-
-            echo '    ]'
-            echo '});'
-          } > "${FILE}"
+          # Prepend the new release and keep the most recent two entries
+          # (current + previous, for rolling deploys). The existing block
+          # for an earlier release is preserved verbatim so its provenance
+          # metadata (built_at, artifact_digest, rekor_log_index) survives.
+          jq \
+            --arg tag "${TAG}" \
+            --arg built_at "${BUILT_AT}" \
+            --arg artifact_digest "sha256:${ARTIFACT_HASH}" \
+            --argjson rekor_log_index "${LOG_INDEX}" \
+            --arg snp "${SNP}" \
+            --arg rtmr1 "${RTMR1}" \
+            --arg rtmr2 "${RTMR2}" \
+            '
+            .allowed = (
+              [{
+                git_tag: $tag,
+                built_at: $built_at,
+                artifact_digest: $artifact_digest,
+                rekor_log_index: $rekor_log_index,
+                snp_measurement: $snp,
+                tdx_measurement: { rtmr1: $rtmr1, rtmr2: $rtmr2 }
+              }] + (.allowed | map(select(.git_tag != $tag)))
+            )
+            | .allowed |= .[:2]
+            ' "${FILE}" > "${FILE}.new"
+          mv "${FILE}.new" "${FILE}"
 
           echo "Updated ${FILE}:"
           cat "${FILE}"
-
-      - name: Format measurements.rs
-        if: steps.check.outputs.changed == 'true'
-        run: |
-          cargo fmt --manifest-path crates/eidola-server/Cargo.toml
 
       - name: Check for existing PR
         if: steps.check.outputs.changed == 'true'
@@ -221,7 +159,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git checkout -b "${BRANCH}"
-          git add crates/eidola-server/src/measurements.rs
+          git add releases/trust/tinfoil-enclaves.json
           git commit -m "Update Tinfoil enclave measurements to ${TAG}"
           git push -u origin "${BRANCH}"
 
@@ -234,7 +172,7 @@ jobs:
           cat > /tmp/pr-body.md <<EOF
           ## Summary
 
-          Updates the allowed enclave measurements for the Tinfoil inference enclave to match release [\`${TAG}\`](${RELEASE_URL}). Each entry pairs SEV-SNP and TDX measurements per release.
+          Updates the allowed enclave measurements for the Tinfoil inference enclave to match release [\`${TAG}\`](${RELEASE_URL}). Each entry in \`releases/trust/tinfoil-enclaves.json\` pairs SEV-SNP and TDX measurements per release; the server's \`build.rs\` reads this file to generate \`ALLOWED\` at compile time.
 
           - **SEV-SNP measurement:** \`${SHORT_SNP}\`
           - **TDX RTMR1:** \`${SHORT_RTMR1}\`

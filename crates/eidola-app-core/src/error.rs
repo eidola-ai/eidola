@@ -1,8 +1,8 @@
 /// Errors returned by app-core operations.
 ///
-/// Each variant maps to a distinct failure mode so callers (CLI, macOS app)
-/// can display appropriate feedback without parsing error strings.
-#[derive(Debug, thiserror::Error, uniffi::Error)]
+/// Each variant maps to a distinct failure mode so callers (CLI, GUI) can
+/// display appropriate feedback without parsing error strings.
+#[derive(Debug, thiserror::Error)]
 pub enum AppError {
     /// A required configuration value is missing (base_url, account, etc.).
     #[error("not configured: {message}")]
@@ -35,6 +35,14 @@ pub enum AppError {
     /// An internal runtime or system error.
     #[error("internal error: {message}")]
     Internal { message: String },
+
+    /// A self-update verification step failed.
+    ///
+    /// Used by [`crate::updater`] to surface fetch/parse/schema/continuity
+    /// problems before any cryptographic verification stage runs; the
+    /// crypto stages produce [`AppError::Attestation`] instead.
+    #[error("update error: {message}")]
+    Update { message: String },
 }
 
 // ---------------------------------------------------------------------------

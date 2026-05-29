@@ -1,0 +1,48 @@
+name: Dependency Review
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    name: License & vulnerability check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: moderate
+          allow-licenses: >-
+            0BSD,
+            Apache-2.0,
+            Apache-2.0 WITH LLVM-exception,
+            BSD-1-Clause,
+            BSD-2-Clause,
+            BSD-3-Clause,
+            BSL-1.0,
+            bzip2-1.0.6,
+            CC0-1.0,
+            CDLA-Permissive-2.0,
+            ISC,
+            MIT,
+            MIT-0,
+            MPL-2.0,
+            NCSA,
+            Unicode-3.0,
+            Unlicense,
+            Zlib
+          # async-tar and rangemap declare `MIT/Apache-2.0` (deprecated slash form);
+          # the action's SPDX parser can't parse it and emits a synthetic
+          # `LicenseRef-bad-mitapache-2.0`. Both are really MIT OR Apache-2.0.
+          allow-dependencies-licenses: >-
+            pkg:cargo/async-tar,
+            pkg:cargo/rangemap,
+            pkg:cargo/filetime

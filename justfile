@@ -1,4 +1,4 @@
-set dotenv-load := true
+set dotenv-load
 
 # List available recipes
 default:
@@ -6,7 +6,7 @@ default:
 
 # --- Development ---
 
-# Run the full stack with the server in a container (detached).
+# Run the full server stack with the server in a container (detached).
 dev:
     ./scripts/dev.sh --container
 
@@ -24,13 +24,82 @@ db-reset:
     docker compose exec postgres createdb -U eidola eidola
     docker compose exec postgres psql -U eidola -d eidola -f /docker-entrypoint-initdb.d/schema.sql
 
-# --- Rust (inner loop, runs on host) ---
+# --- Build (local toolchain, fast iteration) ---
+
+# Build a system: server, cli, or gui
+build system:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ system }}" in
+      server)
+        cargo build -p eidola-server
+        ;;
+      cli)
+        cargo build -p eidola-cli
+        ;;
+      gui)
+        cargo build -p eidola-gui
+        # On macOS, also assemble a proper .app bundle. AppKit needs an
+        # Info.plist alongside the binary to treat the process as a real
+        # app (vs. a command-line tool); otherwise menu key-equivalent
+        # dispatch breaks when no window has key focus.
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+          ./scripts/package-gui-app.sh debug
+        fi
+        ;;
+      *)
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui)" >&2
+        exit 1
+        ;;
+    esac
+
+# Build and run a system: server, cli, or gui
+run system *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ system }}" in
+      server)
+        cargo run -p eidola-server -- {{ args }}
+        ;;
+      cli)
+        cargo run -p eidola-cli -- {{ args }}
+        ;;
+      gui)
+        # Build + assemble the .app, then `open` it so AppKit launches us
+        # in app-mode (full menu / key-equivalent dispatch). `cargo run`
+        # alone would launch the bare binary, which AppKit treats as a
+        # tool — visible in the menu bar showing "eidola-gui" instead of
+        # "Eidola" and breaking ⌘N / ⌘Q etc. when no window has key
+        # focus. On non-macOS we fall back to `cargo run`.
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+          just build gui
+          open -W "crates/eidola-gui/build/Eidola.app" --args {{ args }}
+        else
+          cargo run -p eidola-gui -- {{ args }}
+        fi
+        ;;
+      *)
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui)" >&2
+        exit 1
+        ;;
+    esac
+
+# --- Checks & Tests (inner loop, runs on host) ---
 
 # Lint and format check
 check:
     cargo clippy --all-targets -- -D warnings
     cargo fmt --check
-    git ls-files '*.swift' | xargs swift format lint --strict
+
+# Render gpui views to PNGs in crates/eidola-gui/tests/snapshots/ — local-only debug
+# aid (gitignored), not a regression gate. Pixel diffs aren't bit-stable
+# across machines, so committed regression checks live in tests/behavior.rs.
+render-snapshots *args:
+    cargo test -p eidola-gui --test visual {{ args }}
+
+# Accept the current rendered output as the new local visual baseline.
+render-snapshots-update:
+    UPDATE_SNAPSHOTS=1 cargo test -p eidola-gui --test visual
 
 # Run all tests
 test:
@@ -46,48 +115,33 @@ test-webhook-smoke:
 
 # --- Codegen ---
 
-# Regenerate UniFFI Swift bindings
-update-bindings:
-    ./scripts/update-bindings.sh
-
 # Regenerate OpenAPI spec
 update-openapi:
     ./scripts/update-server-openapi.sh
 
-# Rebuild XCFramework (dev, native arch only)
-update-xcframework:
-    ./scripts/update-xcframework-dev.sh
-
-# Rebuild XCFramework (release, universal binary)
-update-xcframework-release:
-    ./scripts/update-xcframework.sh
-
 # --- CI / Release ---
-
-build:
-    # Build OCI images (server, cli, postgresql)
-    docker buildx bake
 
 # Compute enclave measurements from tinfoil-config.yml and CVM artifacts
 measure:
     ./scripts/artifact-manifest.sh measure
 
-# Update artifact-manifest.json with current build digests and measurements
-# Builds the OCI images plus the macOS app/CLI, then records their digests.
-# Also stamps image digests into tinfoil-config.yml and computes enclave
-
-# measurements. Requires macOS for the Nix-built app and CLI artifacts.
+# Update artifact-manifest.json with current build digests and measurements.
+# Builds the OCI images plus the CLI macOS universal binary, then records
+# their digests. Also stamps image digests into tinfoil-config.yml and
+# computes enclave measurements. Requires macOS for the Nix-built CLI.
 update-manifest:
     ./scripts/artifact-manifest.sh update --ensure-builder
 
-# Run all Nix checks (formatting, linting, tests, artifact freshness)
-ci-check:
-    nix flake check --show-trace
+# Verify a tag that CI has already built+signed. Fetches the signed manifest
+# from the GitHub release, verifies the Sigstore bundle against the embedded
+# trust root, compares against the committed manifest, and shows the diff
+# against the prior release for human review. Run before `release-attest`.
+release-verify tag:
+    cargo run -q -p release-tool -- verify {{ tag }}
 
-# Build XCFramework via Nix
-ci-build-xcframework:
-    nix run '.#update-eidola-app-core-swift-xcframework'
-
-# Build macOS app via Nix (reproducible, open-source Swift 6.2 toolchain)
-build-macos-app:
-    nix build '.#eidola-macos-app' --show-trace
+# Interactive: render each claim, prompt to type 'yes' to affirm, sign
+# with the configured hardware key, upload attestation + release.json,
+# mark release as latest. Reads attestant identity from EIDOLA_ATTESTANT_*
+# env vars; cosign key from EIDOLA_ATTESTANT_KEY (typically a PKCS#11 URI).
+release-attest tag:
+    cargo run -q -p release-tool -- attest {{ tag }}

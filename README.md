@@ -22,7 +22,7 @@ record; there is no separate PDF or email flow.
 
 The Rust toolchain version is pinned in `rust-toolchain.toml` and installed automatically by rustup. Run `just` to see all available recipes.
 
-All Rust workspace packages now live under `crates/`, including the code generation binaries (`generate-openapi`, `shared-typegen`, and `uniffi-bindgen-swift`) and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`.
+All Rust workspace packages live under `crates/`, including the code generation binary `generate-openapi` and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`.
 
 ### Server
 
@@ -104,24 +104,29 @@ To run the CLI against a local development stack:
 
 Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) for convenience.
 
+### GUI
+
+Build, run, and test the gpui-based macOS app from the command line:
+
+```bash
+just build gui      # cargo build + package Eidola.app (on macOS)
+just run gui        # build and open Eidola.app
+just test           # cargo test
+```
+
+`just build gui` produces `crates/eidola-gui/build/Eidola.app`. See `crates/eidola-gui/AGENTS.md` for the architecture details.
+
 See more available commands:
 
 ```bash
-just --help
+just
 ```
 
 **Updating generated files:**
-If you change Rust APIs or types, update the committed Swift bindings or OpenAPI spec:
-```bash
-just update-bindings      # UniFFI Swift bindings + Crux types
-just update-openapi       # OpenAPI spec
-just update-xcframework   # XCFramework (dev, native arch only)
-```
-
-To refresh `artifact-manifest.json` for the OCI images, macOS app/CLI, and enclave measurements, run:
 
 ```bash
-just update-manifest
+just update-openapi    # OpenAPI spec
+just update-manifest   # artifact-manifest.json (OCI images, macOS CLI, enclave measurements)
 ```
 
 This uses the pinned amd64 BuildKit builder configuration for the OCI images, the local Nix macOS builds for the app and CLI, and the `measure-enclave` binary to compute SEV-SNP and TDX measurements from `tinfoil-config.yml`. It currently needs to run on macOS.

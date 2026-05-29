@@ -27,18 +27,26 @@ pub fn default_data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("eidola"))
 }
 
+/// User-facing client config, deserialized from `config.toml`. Fields
+/// prefixed with `*_override` carry the user's overrides; the resolved
+/// values are exposed through `base_url()` / `trusted_measurements()`,
+/// which fall back to the trust-root pin when no override is set.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
+    #[serde(rename = "base_url", default, skip_serializing_if = "Option::is_none")]
+    pub base_url_override: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain_separator: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub trusted_measurements: Vec<EnclaveMeasurement>,
+    #[serde(
+        rename = "trusted_measurements",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub trusted_measurements_override: Vec<EnclaveMeasurement>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attestation_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,6 +71,25 @@ impl Config {
         self.attestation_repo
             .as_deref()
             .unwrap_or(DEFAULT_ATTESTATION_REPO)
+    }
+
+    /// The server URL to talk to: the user's `base_url` override if set,
+    /// otherwise the trust-root pin baked into this binary.
+    pub fn base_url(&self) -> &str {
+        self.base_url_override
+            .as_deref()
+            .unwrap_or(crate::trust_root::SERVER_URL)
+    }
+
+    /// The set of enclave measurements the client will accept on TLS
+    /// handshake: the user's `trusted_measurements` override list if any,
+    /// otherwise the single pinned server measurement.
+    pub fn trusted_measurements(&self) -> Vec<EnclaveMeasurement> {
+        if self.trusted_measurements_override.is_empty() {
+            vec![crate::trust_root::server_measurement()]
+        } else {
+            self.trusted_measurements_override.clone()
+        }
     }
 
     /// Load config from `path`, returning defaults if the file is missing or
@@ -185,8 +212,8 @@ mod tests {
         let rtmr2 = "34cd93a0c2ea0629323c09145636a25a0ac1ead868ff9337e315fb3ce846763eb5c5c97a4927c34b24bb513e8f74db70";
 
         let original = Config {
-            base_url: Some("https://example.com".into()),
-            trusted_measurements: vec![EnclaveMeasurement {
+            base_url_override: Some("https://example.com".into()),
+            trusted_measurements_override: vec![EnclaveMeasurement {
                 snp_measurement: snp.into(),
                 tdx_measurement: TdxMeasurement {
                     rtmr1: rtmr1.into(),
@@ -199,10 +226,24 @@ mod tests {
         let toml_text = toml::to_string_pretty(&original).expect("serialize");
         let parsed: Config = toml::from_str(&toml_text).expect("deserialize");
 
-        assert_eq!(parsed.trusted_measurements.len(), 1);
-        assert_eq!(parsed.trusted_measurements[0].snp_measurement, snp);
-        assert_eq!(parsed.trusted_measurements[0].tdx_measurement.rtmr1, rtmr1);
-        assert_eq!(parsed.trusted_measurements[0].tdx_measurement.rtmr2, rtmr2);
+        assert_eq!(
+            parsed.base_url_override.as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(parsed.trusted_measurements_override.len(), 1);
+        assert_eq!(parsed.trusted_measurements_override[0].snp_measurement, snp);
+        assert_eq!(
+            parsed.trusted_measurements_override[0]
+                .tdx_measurement
+                .rtmr1,
+            rtmr1
+        );
+        assert_eq!(
+            parsed.trusted_measurements_override[0]
+                .tdx_measurement
+                .rtmr2,
+            rtmr2
+        );
     }
 
     #[test]
@@ -215,10 +256,20 @@ snp_measurement = "aa"
 tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
 "#;
         let cfg: Config = toml::from_str(text).expect("parse");
-        assert_eq!(cfg.trusted_measurements.len(), 1);
-        assert_eq!(cfg.trusted_measurements[0].snp_measurement, "aa");
-        assert_eq!(cfg.trusted_measurements[0].tdx_measurement.rtmr1, "bb");
-        assert_eq!(cfg.trusted_measurements[0].tdx_measurement.rtmr2, "cc");
+        assert_eq!(
+            cfg.base_url_override.as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(cfg.trusted_measurements_override.len(), 1);
+        assert_eq!(cfg.trusted_measurements_override[0].snp_measurement, "aa");
+        assert_eq!(
+            cfg.trusted_measurements_override[0].tdx_measurement.rtmr1,
+            "bb"
+        );
+        assert_eq!(
+            cfg.trusted_measurements_override[0].tdx_measurement.rtmr2,
+            "cc"
+        );
     }
 
     #[test]
@@ -244,5 +295,36 @@ tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
         assert_eq!(parse_untrust_key(&snp).unwrap(), snp);
         let triple = format!("{}:{}:{}", snp, "b".repeat(96), "c".repeat(96));
         assert_eq!(parse_untrust_key(&triple).unwrap(), snp);
+    }
+
+    #[test]
+    fn defaults_fall_back_to_trust_root_pin() {
+        let cfg = Config::default();
+        assert_eq!(cfg.base_url(), crate::trust_root::SERVER_URL);
+        let measurements = cfg.trusted_measurements();
+        assert_eq!(measurements.len(), 1);
+        assert_eq!(
+            measurements[0].snp_measurement,
+            crate::trust_root::SERVER_SNP_MEASUREMENT
+        );
+    }
+
+    #[test]
+    fn overrides_are_preferred() {
+        let cfg = Config {
+            base_url_override: Some("https://override.example".into()),
+            trusted_measurements_override: vec![EnclaveMeasurement {
+                snp_measurement: "a".repeat(96),
+                tdx_measurement: TdxMeasurement {
+                    rtmr1: "b".repeat(96),
+                    rtmr2: "c".repeat(96),
+                },
+            }],
+            ..Config::default()
+        };
+        assert_eq!(cfg.base_url(), "https://override.example");
+        let measurements = cfg.trusted_measurements();
+        assert_eq!(measurements.len(), 1);
+        assert_eq!(measurements[0].snp_measurement, "a".repeat(96));
     }
 }

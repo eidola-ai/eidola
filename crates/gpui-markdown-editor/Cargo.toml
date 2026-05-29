@@ -1,0 +1,56 @@
+[package]
+name = "gpui-markdown-editor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "gpui_markdown_editor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"
+
+[dependencies]
+# Mirror the eidola-gui pin so cargo unifies on a single gpui copy across the
+# workspace.
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
+
+# Local fork that exposes `Options::ENABLE_EMPTY_NESTED_LISTS`. We need
+# pulldown to parse `  - \n` (and similar empty-nested-item shapes) as
+# a list item rather than lazy-continuation text so the editor's chain
+# query stays correct mid-typing. Switch back to crates.io once the
+# upstream PR lands. `std` is required (the v0.13 fork's default
+# disables it via `default-features = false`); we don't need `html` or
+# `getopts`.
+pulldown-cmark = { git = "https://github.com/eidola-ai/pulldown-cmark", rev = "3153947232d9e89e0af24c3a0977915be5fbb6b3", default-features = false, features = ["std"] }
+# RaTeX — parse + lay out LaTeX math expressions into a DisplayList of
+# absolute-coordinate drawing commands. We walk the DisplayList and
+# emit native gpui paint ops (paint_quad / paint_path / shaped text)
+# rather than going through a raster intermediate, so math composes
+# with the editor's text and respects Day/Night themes.
+ratex-types = "0.1.10"
+ratex-parser = "0.1.10"
+ratex-layout = "0.1.10"
+ratex-font = "0.1.10"
+ratex-katex-fonts = "0.1.10"
+smallvec = "1.15"
+unicode-segmentation = "1"
+
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support", "font-kit"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[test]]
+name = "visual"
+path = "tests/visual.rs"
+# `VisualTestAppContext` talks to AppKit and must run on the main thread.
+# `harness = false` lets us run a hand-rolled `fn main()` directly.
+harness = false

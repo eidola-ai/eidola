@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>Eidola</string>
+	<key>CFBundleIdentifier</key>
+	<string>tech.m6i.eidola-gpui</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Eidola</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<!--
+		Required for AppKit to treat the binary as a real app: without an
+		Info.plist visible to the launched binary, NSApplication runs in a
+		"tool" mode where menu key-equivalent dispatch is unreliable when no
+		window is key (post ⌘Tab back, after closing the last window). The
+		bundle name showing as "eidola-gui" in the menu bar is the diagnostic
+		signal that the binary is running tool-mode.
+	-->
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<!--
+		Don't auto-quit when the last window closes; the app stays alive and
+		can be reopened via the dock icon (see `Application::on_reopen` in
+		crates/eidola-gui/src/lib.rs).
+	-->
+	<key>LSUIElement</key>
+	<false/>
+	<!--
+		High-DPI / Retina rendering. Required so Metal-rendered content
+		matches the screen's backing scale instead of looking pixel-doubled.
+	-->
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>

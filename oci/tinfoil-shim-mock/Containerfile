@@ -3,7 +3,7 @@
 FROM rust:1-slim AS fetch
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY --parents apps/*/Cargo.toml crates/*/Cargo.toml ./
+COPY --parents crates/*/Cargo.toml ./
 # Stub source files so cargo can resolve all workspace members.
 RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do \
       dir="$(dirname "$manifest")/src"; mkdir -p "$dir"; \
@@ -13,7 +13,6 @@ RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do
 RUN cargo fetch --locked
 
 FROM fetch AS build
-COPY apps/ ./apps/
 COPY crates/ ./crates/
 RUN --mount=type=cache,target=/src/target \
     cargo build --release -p tinfoil-shim-mock \

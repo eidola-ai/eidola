@@ -471,6 +471,58 @@
         }
       }
     },
+    "/v1/credentials/refund": {
+      "post": {
+        "tags": [
+          "Unlinked"
+        ],
+        "summary": "Recover a refund token for a previously spent ACT.",
+        "description": "If the ACT's nullifier was already recorded (the server received and\nprocessed the original request), the stored refund token is returned.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier, issues a\nfull refund (no credits consumed), stores it, and returns it.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.",
+        "operationId": "recover_refund",
+        "responses": {
+          "200": {
+            "description": "Refund token recovered or issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefundRecoveryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid spend proof",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Nullifier found but refund token not yet available",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/keys": {
       "get": {
         "tags": [
@@ -603,6 +655,19 @@
               "string",
               "null"
             ]
+          },
+          "reasoning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reasoning_content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Reasoning (\"thinking\") output from models that emit it. Two\nspellings are in the wild: OpenAI o-series and many compatible\ngateways use `reasoning_content`; vLLM uses `reasoning`. We\nfaithfully round-trip whichever the upstream sent so clients can\npick. Both stay `None` for non-thinking models."
           },
           "role": {
             "$ref": "#/components/schemas/Role"
@@ -809,6 +874,17 @@
             "type": "boolean",
             "description": "Whether to stream partial responses."
           },
+          "stream_options": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StreamOptions",
+                "description": "Streaming options. The OpenAI-compatible field; we accept it for\nAPI parity with clients that already set it (e.g. an SDK setting\n`include_usage: true` to capture token counts in the final chunk).\nNote: the server overrides `include_usage` to `true` for any\nstreaming request before forwarding upstream — usage is required\nfor accurate per-token refunds and isn't a client choice."
+              }
+            ]
+          },
           "temperature": {
             "type": [
               "number",
@@ -976,6 +1052,19 @@
               "string",
               "null"
             ]
+          },
+          "reasoning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reasoning_content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Reasoning (\"thinking\") deltas — same dual spelling as\n`AssistantMessage`. Without these fields here, serde silently\ndrops the upstream `reasoning_content` / `reasoning` keys during\ndeserialization and the client only ever sees `delta.content`.\nRound-trip whatever the upstream emits."
           },
           "role": {
             "oneOf": [
@@ -1701,6 +1790,19 @@
           }
         }
       },
+      "RefundRecoveryResponse": {
+        "type": "object",
+        "description": "Response from the refund recovery endpoint.",
+        "required": [
+          "refund"
+        ],
+        "properties": {
+          "refund": {
+            "$ref": "#/components/schemas/RefundInfo",
+            "description": "The refund token."
+          }
+        }
+      },
       "Role": {
         "type": "string",
         "description": "The role of a message author.",
@@ -1743,6 +1845,17 @@
           }
         ],
         "description": "Stop sequence can be a single string or array of strings."
+      },
+      "StreamOptions": {
+        "type": "object",
+        "description": "OpenAI-compatible streaming options.",
+        "properties": {
+          "include_usage": {
+            "type": "boolean",
+            "description": "Include token-usage statistics in the final stream chunk. The\nserver forces this on for upstream calls so it can compute\naccurate refunds; the field exists here only to round-trip\nhonest clients."
+          }
+        },
+        "additionalProperties": false
       },
       "SubscriptionResponse": {
         "type": "object",

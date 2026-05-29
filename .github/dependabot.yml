@@ -5,6 +5,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       "GitHub Actions (Minor/Patch)":
         update-types:
@@ -16,6 +18,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       "Cargo Dependencies (Minor/Patch)":
         update-types:
@@ -27,30 +31,34 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
 
   # Maintain dependencies for Docker (Containerfiles).
   - package-ecosystem: "docker"
     directory: "/oci/eidola-server"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: "docker"
     directory: "/oci/postgresql"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: "docker"
     directory: "/oci/tinfoil-shim-mock"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: "docker"
     directory: "/oci/stripe-cli"
     schedule:
       interval: "weekly"
-
-  # Maintain dependencies for Swift Package Manager.
-  - package-ecosystem: "swift"
-    directory: "/core/swift"
-    schedule:
-      interval: "weekly"
+    cooldown:
+      default-days: 7

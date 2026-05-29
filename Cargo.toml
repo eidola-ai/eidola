@@ -1,7 +1,6 @@
 [workspace]
 
 members = [
-    "apps/cli",
     "crates/*",
 ]
 resolver = "2"
@@ -13,10 +12,17 @@ authors = ["Mike Marcacci"]
 repository = "https://github.com/eidola-ai/eidola"
 publish = false
 
-# Override sev crate with crypto_nossl measurement support (snp_calc_launch_digest).
-# Switch to crates.io once https://github.com/virtee/sev merges the upstream PR.
-[patch.crates-io]
-sev = { git = "https://github.com/eidola-ai/sev", rev = "2d9c9ad23f32b53892159274beabffdf00a8835d" }
+# Redirect all three gpui-component crates to the eidola-ai fork, which
+# carries the `fix/asset-paths-link` branch making the icons accessible
+# inside each crate's package boundary (the upstream layout reaches into
+# sibling crates, which breaks under cargo vendor — and embeds
+# NIX_BUILD_TOP into our release binary as a side effect). Drop this block
+# once the upstream PR at longbridge/gpui-component lands and we bump our
+# pinned rev in crates/eidola-gui/Cargo.toml.
+[patch."https://github.com/longbridge/gpui-component"]
+gpui-component = { git = "https://github.com/eidola-ai/gpui-component", rev = "e7b5ecbcdbb80ff5626359239f1b663d397296b4" }
+gpui-component-assets = { git = "https://github.com/eidola-ai/gpui-component", rev = "e7b5ecbcdbb80ff5626359239f1b663d397296b4" }
+gpui-component-macros = { git = "https://github.com/eidola-ai/gpui-component", rev = "e7b5ecbcdbb80ff5626359239f1b663d397296b4" }
 
 [profile.docker-dev]
 inherits = "dev"
@@ -27,8 +33,15 @@ opt-level = 1
 incremental = false
 # Codegen units are set to 1 to avoid potential non-determinism.
 codegen-units = 1
-# Explicit thin link-time optimization
-lto = "thin"
+# Full LTO. Thin LTO is faster but uses LLVM's internal threadpool for
+# parallel codegen, which produces nondeterministic instruction layout
+# even with codegen-units=1 — empirically verified by force-rebuilding
+# eidola-gui from scratch and finding ~26 KB of byte-level drift in the
+# arm64 binary (mostly +4/+8 immediate-operand shifts inside identical
+# function locations, a classic thin-LTO data-placement-reordering
+# signature). Fat LTO is single-threaded by construction. Slower link
+# (~minutes for the GUI), same output bit-for-bit.
+lto = "fat"
 # Explicit optimization level
 opt-level = 3
 # Strip symbols for determinism
