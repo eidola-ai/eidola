@@ -4,7 +4,7 @@
 # We will attempt to track stable unless we find that this breaks something.
 
 [toolchain]
-channel = "1.94.0"
+channel = "1.95.0"
 targets = [
     # macOS
     "aarch64-apple-darwin",
