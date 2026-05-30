@@ -3,7 +3,7 @@
 # ── base ───────────────────────────────────────────────────────────────────────
 # Pin digests for all StageX package dependencies.
 
-FROM stagex/user-postgresql@sha256:4b6d68746a0896735331c4688d2890c2418e6a187e4c01936491dd40dfc747c1 AS pkg-postgresql
+FROM stagex/user-postgresql@sha256:90f17470dbf46086d5ef82e19166e377bad99e87a532f658f569f3fe3d5cbac0 AS pkg-postgresql
 FROM stagex/core-busybox@sha256:d608daa946e4799cf28b105aba461db00187657bd55ea7c2935ff11dac237e27 AS pkg-busybox
 FROM stagex/core-musl@sha256:816a6e097544c23386c95c8614e358ace7c5026c3f53b7b9353b84cbb4ed0096 AS pkg-musl
 FROM stagex/core-zlib@sha256:130afab57ac8e9a9eb1e0c6e2c91758a67f731634d3cdb45ae04ea0534cc3930 AS pkg-zlib

@@ -79,7 +79,7 @@ done
 echo "==> Applying schema (if not already present)..."
 SCHEMA_PRESENT=$(
     docker compose exec -T postgres psql -U eidola -d eidola -tAc \
-        "SELECT 1 FROM information_schema.tables WHERE table_schema='eidola' AND table_name='account'" \
+        "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='account'" \
         2>/dev/null || true
 )
 if [ -z "$SCHEMA_PRESENT" ]; then
@@ -127,7 +127,7 @@ fi
 echo "==> Starting ${UP_SERVICES[*]} (mode: $MODE, detached)..."
 SHIM_UPSTREAM_URL="$SHIM_UPSTREAM_URL" \
 STRIPE_WEBHOOK_SECRET="$STRIPE_WEBHOOK_SECRET" \
-    docker compose "${UP_PROFILES[@]}" up -d "${UP_SERVICES[@]}"
+    docker compose ${UP_PROFILES[@]+"${UP_PROFILES[@]}"} up -d "${UP_SERVICES[@]}"
 
 # ── Host-mode finalization: write .env.local for cargo ───────────────────────
 
