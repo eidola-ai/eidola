@@ -191,8 +191,14 @@ jobs:
 
       - name: Phase 2 — stamp tinfoil-config.yml with built server digest
         id: stamp
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          ./scripts/artifact-manifest.sh stamp-config \
+          PUSH_FLAG=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+          ./scripts/artifact-manifest.sh stamp-config ${PUSH_FLAG} \
             --metadata-file "${SERVER_BAKE_METADATA_FILE}"
           {
             echo 'config<<__EIDOLA_EOF__'
