@@ -1523,18 +1523,17 @@ fn node_has_content_on_line(
         // descend into the list. Same for blockquote prefix
         // markers.
         match &node.kind {
-            crate::syntax::NodeKind::ListItem { marker_range, .. } => {
-                if overlaps(marker_range, line_start, line_end) {
-                    return true;
-                }
+            crate::syntax::NodeKind::ListItem { marker_range, .. }
+                if overlaps(marker_range, line_start, line_end) =>
+            {
+                return true;
             }
-            crate::syntax::NodeKind::BlockQuote { prefix_ranges } => {
+            crate::syntax::NodeKind::BlockQuote { prefix_ranges }
                 if prefix_ranges
                     .iter()
-                    .any(|r| overlaps(r, line_start, line_end))
-                {
-                    return true;
-                }
+                    .any(|r| overlaps(r, line_start, line_end)) =>
+            {
+                return true;
             }
             _ => {}
         }

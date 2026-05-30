@@ -35,10 +35,10 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
-      - name: Cache cargo registry and build artifacts
+      - name: Cache cargo registry and build artifacts  # zizmor: ignore[cache-poisoning]
         # save-if scopes writes to main; this job only runs tests, no
         # artifact from here is published.
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 # zizmor: ignore[cache-poisoning]
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -109,23 +109,23 @@ jobs:
         # measure-enclave (Phase 3) is a workspace cargo binary.
         run: rustup show
 
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 # zizmor: ignore[cache-poisoning]
+      - name: Cache cargo registry and build artifacts  # zizmor: ignore[cache-poisoning]
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache CVM artifacts
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4 # zizmor: ignore[cache-poisoning]
+      - name: Cache CVM artifacts  # zizmor: ignore[cache-poisoning]
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/eidola/cvm
           key: cvm-${{ hashFiles('tinfoil-config.yml') }}
 
-      - name: Set up Docker Buildx
+      - name: Set up Docker Buildx  # zizmor: ignore[cache-poisoning]
         # v* tag (release) builds skip the GHA cache entirely so Sigstore-
         # attested artifacts come from a clean compile (see Phase 1/4
         # below). PR/main builds use type=gha cache, which is
         # branch-scoped — PR branches cannot write the main scope.
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0 # zizmor: ignore[cache-poisoning]
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
           version: v0.31.1
           platforms: linux/amd64
@@ -134,7 +134,7 @@ jobs:
 
       - name: Log in to GHCR
         if: github.event_name == 'push'
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -191,8 +191,14 @@ jobs:
 
       - name: Phase 2 — stamp tinfoil-config.yml with built server digest
         id: stamp
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          ./scripts/artifact-manifest.sh stamp-config \
+          PUSH_FLAG=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+          ./scripts/artifact-manifest.sh stamp-config ${PUSH_FLAG} \
             --metadata-file "${SERVER_BAKE_METADATA_FILE}"
           {
             echo 'config<<__EIDOLA_EOF__'
@@ -340,7 +346,7 @@ jobs:
             sandbox-fallback = false
 
       - name: Configure Nix binary cache
-        uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: eidola
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
@@ -376,18 +382,18 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
-      - name: Cache cargo registry and build artifacts
+      - name: Cache cargo registry and build artifacts  # zizmor: ignore[cache-poisoning]
         # save-if scopes writes to main; this job only verifies the manifest,
         # it does not produce any published artifact.
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 # zizmor: ignore[cache-poisoning]
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache CVM artifacts
+      - name: Cache CVM artifacts  # zizmor: ignore[cache-poisoning]
         # CVM kernel/initrd downloads are Sigstore-verified by the
         # --verify-attestations flag below, so a poisoned cache is rejected
         # at verification time.
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5 # zizmor: ignore[cache-poisoning]
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/eidola/cvm
           key: cvm-${{ hashFiles('tinfoil-config.yml') }}

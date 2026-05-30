@@ -2,6 +2,7 @@ paths:
   - crates/eidola-app-core
   - crates/eidola-cli
   - crates/eidola-gui
+  - crates/release-tool
 
 query-filters:
   # CLI and macOS app print to the user's own terminal — this is intentional
