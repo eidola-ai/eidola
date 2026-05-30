@@ -20,9 +20,9 @@ publish = false
 # once the upstream PR at longbridge/gpui-component lands and we bump our
 # pinned rev in crates/eidola-gui/Cargo.toml.
 [patch."https://github.com/longbridge/gpui-component"]
-gpui-component = { git = "https://github.com/eidola-ai/gpui-component", rev = "e7b5ecbcdbb80ff5626359239f1b663d397296b4" }
-gpui-component-assets = { git = "https://github.com/eidola-ai/gpui-component", rev = "e7b5ecbcdbb80ff5626359239f1b663d397296b4" }
-gpui-component-macros = { git = "https://github.com/eidola-ai/gpui-component", rev = "e7b5ecbcdbb80ff5626359239f1b663d397296b4" }
+gpui-component = { git = "https://github.com/eidola-ai/gpui-component", rev = "ad16cd47faf14ce7d57695b84d3c9b0f4cf05a24" }
+gpui-component-assets = { git = "https://github.com/eidola-ai/gpui-component", rev = "ad16cd47faf14ce7d57695b84d3c9b0f4cf05a24" }
+gpui-component-macros = { git = "https://github.com/eidola-ai/gpui-component", rev = "ad16cd47faf14ce7d57695b84d3c9b0f4cf05a24" }
 
 [profile.docker-dev]
 inherits = "dev"
