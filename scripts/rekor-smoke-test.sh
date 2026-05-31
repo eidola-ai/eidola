@@ -1,15 +1,35 @@
 #!/usr/bin/env bash
 #
-# Rekor SSH-format `hashedrekord` smoke test.
+# Rekor SSH-format `rekord` smoke test.
 #
 # Purpose
 # -------
-# Validate the single biggest untested protocol assumption in the human
-# attestation flow: that rekor.sigstore.dev accepts an SSH-format
-# public key inside a `hashedrekord` v0.0.1 entry, and that the response
-# shape matches what `crates/eidola-app-core/src/updater/human_attestation.rs`
-# expects to parse — `body`, `logIndex`, `logID`, `integratedTime`, and
-# `verification.signedEntryTimestamp` (optionally plus `inclusionProof`).
+# Validate the protocol assumptions in the human attestation flow:
+# that rekor.sigstore.dev accepts an SSH-signed `rekord` v0.0.1 entry
+# (with `signature.format=ssh`), and that the response shape matches
+# what `crates/eidola-app-core/src/updater/human_attestation.rs`
+# expects to parse — `body`, `logIndex`, `logID`, `integratedTime`,
+# `verification.signedEntryTimestamp`, and `verification.inclusionProof`.
+#
+# History — why `rekord` and not `hashedrekord`
+# ---------------------------------------------
+# An earlier version of this script attempted a `hashedrekord` v0.0.1
+# entry with an OpenSSH public key. That doesn't work: Rekor's
+# `hashedrekord` schema hardcodes x509 PKI (PEM-encoded leaf cert).
+# SSH-format keys are routed through the polymorphic `rekord` entry
+# with `signature.format=ssh`. The mistake is preserved here as a
+# lesson: SSH lives in `rekord`, not `hashedrekord`.
+#
+# Two further forced choices documented inline below:
+#   - Rekor REJECTS hash-only data on rekord+ssh (`missing data content`)
+#     — `data.content` (full bytes, base64) is required at POST time.
+#     Rekor then canonicalizes it down to `data.hash` in the persisted
+#     entry, so the public log record is still hash-only.
+#   - Rekor REJECTS any SSH-SIG namespace other than `"file"`
+#     (`invalid signature namespace: <ns>`). The signature must be
+#     produced with `ssh-keygen -Y sign -n file`; this matches the
+#     hardcoded constant in `release-tool`'s `attest.rs` and in
+#     `eidola-app-core`'s `human_attestation::SSH_SIG_NAMESPACE`.
 #
 # WARNING — public transparency log
 # ---------------------------------
@@ -43,7 +63,10 @@ case "${1:-}" in
 esac
 
 REKOR_URL="${REKOR_URL:-https://rekor.sigstore.dev}"
-NAMESPACE="eidola-attestation@v1"
+# Rekor's SSH PKI verifier pins the SSH-SIG namespace to "file"
+# (sigstore/rekor `pkg/pki/ssh/sign.go`). Any other namespace is
+# rejected at POST time with HTTP 400.
+NAMESPACE="file"
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -72,36 +95,46 @@ fi
 echo "✓ payload sha256: $DIGEST"
 
 # ---------------------------------------------------------------------------
-# 3. Sign with ssh-keygen -Y sign (same namespace the engineer flow uses).
+# 3. Sign with `ssh-keygen -Y sign -n file`. The namespace is forced by
+#    Rekor (see header); the release-tool's `attest.rs` uses the same
+#    constant.
 # ---------------------------------------------------------------------------
 ssh-keygen -Y sign -f "$KEY" -n "$NAMESPACE" "$PAYLOAD" >/dev/null
 SIG_FILE="$PAYLOAD.sig"
 echo "✓ ssh signature: $SIG_FILE"
 
 # ---------------------------------------------------------------------------
-# 4. Build hashedrekord v0.0.1 ProposedEntry.
-#    Rekor expects the signature.content field to be base64 of the PEM-armored
-#    ssh-sig blob, and the publicKey.content to be base64 of the OpenSSH
-#    "ssh-ed25519 AAAA... comment" line. `tr -d '\n'` handles GNU vs BSD
-#    base64 differences (no `-w0` on macOS).
+# 4. Build rekord v0.0.1 ProposedEntry with `format: "ssh"`.
+#    - `signature.content` is base64 of the PEM-armored SSH-SIG file.
+#    - `signature.publicKey.content` is base64 of the OpenSSH single-line
+#      `.pub` ("ssh-ed25519 AAAA... comment") format.
+#    - `data.content` is base64 of the full payload. Rekor will
+#      canonicalize this away to `data.hash` in the stored body, but
+#      it's required at POST time — a hash-only entry is rejected.
+#    `tr -d '\n'` handles GNU vs BSD base64 differences (no `-w0` on macOS).
 # ---------------------------------------------------------------------------
 SIG_B64="$(base64 < "$SIG_FILE" | tr -d '\n')"
 PUBKEY_B64="$(base64 < "$KEY.pub" | tr -d '\n')"
+DATA_B64="$(base64 < "$PAYLOAD" | tr -d '\n')"
 
 ENTRY="$WORK_DIR/entry.json"
 jq -n \
-  --arg digest "$DIGEST" \
   --arg sig "$SIG_B64" \
   --arg pubkey "$PUBKEY_B64" \
+  --arg data "$DATA_B64" \
   '{
-     kind: "hashedrekord",
+     kind: "rekord",
      apiVersion: "0.0.1",
      spec: {
-       data: { hash: { algorithm: "sha256", value: $digest } },
-       signature: { content: $sig, publicKey: { content: $pubkey } }
+       data: { content: $data },
+       signature: {
+         format: "ssh",
+         content: $sig,
+         publicKey: { content: $pubkey }
+       }
      }
    }' > "$ENTRY"
-echo "✓ hashedrekord entry built"
+echo "✓ rekord+ssh entry built"
 
 if [[ $DRY_RUN -eq 1 ]]; then
   echo
@@ -144,12 +177,12 @@ HAS_INCLUSION_PROOF="$(jq -r ".\"$UUID\".verification.inclusionProof != null" "$
 
 echo
 echo "=== rekor response ==="
-printf '  uuid:                 %s\n' "$UUID"
-printf '  logIndex:             %s\n' "$LOG_INDEX"
-printf '  logID:                %s\n' "$LOG_ID"
-printf '  integratedTime:       %s\n' "$INTEGRATED_TIME"
-printf '  body (b64) bytes:     %s\n' "${#BODY_B64}"
-printf '  SET (b64) bytes:      %s\n' "${#SET_B64}"
+printf '  uuid:                   %s\n' "$UUID"
+printf '  logIndex:               %s\n' "$LOG_INDEX"
+printf '  logID:                  %s\n' "$LOG_ID"
+printf '  integratedTime:         %s\n' "$INTEGRATED_TIME"
+printf '  body (b64) bytes:       %s\n' "${#BODY_B64}"
+printf '  SET (b64) bytes:        %s\n' "${#SET_B64}"
 printf '  inclusionProof present: %s\n' "$HAS_INCLUSION_PROOF"
 
 if [[ -z "$SET_B64" ]]; then
@@ -158,14 +191,40 @@ if [[ -z "$SET_B64" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Decode the body and confirm Rekor stored exactly what we sent (no
-#    surprise canonicalization of the SSH pubkey or signature).
+# 7. Decode the body and confirm rekor canonicalized `data.content` away,
+#    leaving only `data.hash`. This is the privacy property the producer
+#    side relies on — the engineer's full attestation prose stays out of
+#    the public transparency log.
 # ---------------------------------------------------------------------------
 BODY_JSON="$(echo "$BODY_B64" | base64 -d)"
+STORED_KIND="$(echo "$BODY_JSON" | jq -r '.kind')"
+STORED_FORMAT="$(echo "$BODY_JSON" | jq -r '.spec.signature.format')"
+STORED_HAS_HASH="$(echo "$BODY_JSON" | jq -r '.spec.data.hash.value != null')"
+STORED_HAS_CONTENT="$(echo "$BODY_JSON" | jq -r '.spec.data.content != null')"
+STORED_HASH="$(echo "$BODY_JSON" | jq -r '.spec.data.hash.value // empty')"
 STORED_PUBKEY="$(echo "$BODY_JSON" | jq -r '.spec.signature.publicKey.content')"
 STORED_SIG="$(echo "$BODY_JSON" | jq -r '.spec.signature.content')"
 
 echo
+echo "=== canonicalized body checks ==="
+printf '  kind:                   %s   (expected: rekord)\n' "$STORED_KIND"
+printf '  signature.format:       %s    (expected: ssh)\n' "$STORED_FORMAT"
+printf '  data.hash present:      %s\n' "$STORED_HAS_HASH"
+printf '  data.content present:   %s  (expected: false — rekor strips it)\n' "$STORED_HAS_CONTENT"
+
+if [[ "$STORED_KIND" != "rekord" ]] \
+  || [[ "$STORED_FORMAT" != "ssh" ]] \
+  || [[ "$STORED_HAS_HASH" != "true" ]] \
+  || [[ "$STORED_HAS_CONTENT" != "false" ]]; then
+  echo "✗ canonicalized body does not match expectations" >&2
+  exit 1
+fi
+if [[ "$STORED_HASH" != "$DIGEST" ]]; then
+  echo "✗ canonicalized data.hash.value ($STORED_HASH) ≠ sha256(payload) ($DIGEST)" >&2
+  exit 1
+fi
+echo "✓ data.hash.value matches sha256(payload)"
+
 if [[ "$STORED_PUBKEY" == "$PUBKEY_B64" ]]; then
   echo "✓ stored publicKey.content matches submitted (no canonicalization)"
 else

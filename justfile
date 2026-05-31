@@ -140,8 +140,15 @@ release-verify tag:
     cargo run -q -p release-tool -- verify {{ tag }}
 
 # Interactive: render each claim, prompt to type 'yes' to affirm, sign
-# with the configured hardware key, upload attestation + release.json,
-# mark release as latest. Reads attestant identity from EIDOLA_ATTESTANT_*
-# env vars; cosign key from EIDOLA_ATTESTANT_KEY (typically a PKCS#11 URI).
-release-attest tag:
-    cargo run -q -p release-tool -- attest {{ tag }}
+# with the SSH agent (Secretive / 1Password / FIDO2-SK), upload
+# attestation + release.json, mark release as latest. Reads attestant
+# identity from EIDOLA_ATTESTANT_SSH_PUBKEY / _ID / _NAME / _JURISDICTION
+# env vars (preferred — set once in your shell profile or .envrc).
+# Trailing args are forwarded to `release-tool attest`, so per-invocation
+# overrides also work, e.g.
+#   just release-attest v0.0.8 --ssh-pubkey /path/to/key.pub \
+#       --attestant-id mike-marcacci \
+#       --attestant-name "Michael Marcacci" \
+#       --jurisdiction "the State of California, United States"
+release-attest tag *args:
+    cargo run -q -p release-tool -- attest {{ tag }} {{ args }}

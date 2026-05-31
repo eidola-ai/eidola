@@ -1,7 +1,7 @@
 //! `release-tool attest <tag>` — interactively render every claim, prompt
 //! the engineer to type `yes` to affirm each, sign with their hardware-
 //! backed SSH key via `ssh-keygen -Y sign`, post the signature to Sigstore
-//! Rekor as a `hashedrekord` entry, and upload everything to the GitHub
+//! Rekor as a `rekord` entry with `signature.format=ssh`, and upload everything to the GitHub
 //! release.
 
 use std::collections::BTreeMap;
@@ -17,9 +17,12 @@ use sha2::{Digest, Sha256};
 
 use crate::trust;
 
-/// Namespace mixed into the SSH signature (see PROTOCOL.sshsig). Stable;
-/// changing it invalidates every prior signature.
-const SSH_SIG_NAMESPACE: &str = "eidola-attestation@v1";
+/// Namespace mixed into the SSH signature (see PROTOCOL.sshsig).
+/// Hardcoded to `"file"` because Rekor's SSH PKI verifier rejects any
+/// other namespace (sigstore/rekor's `pkg/pki/ssh/sign.go` pins
+/// `const namespace = "file"`). Must match
+/// [`eidola_app_core::updater::human_attestation::SSH_SIG_NAMESPACE`].
+const SSH_SIG_NAMESPACE: &str = "file";
 
 /// Public Rekor instance — same one Sigstore-rs's TrustedRoot points at.
 /// If we ever run our own Rekor mirror this becomes a trust-root field.
@@ -72,7 +75,23 @@ pub fn run(args: Args) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("tag `{}` must start with `v`", args.tag))?
         .to_string();
     let git_commit = git_rev_parse(&args.workspace_root, &args.tag)?;
-    let previous_release_git_commit = previous_release_commit(&args.workspace_root, &args.tag)?;
+    let prev_tag = previous_release_tag(&args.workspace_root, &args.tag)?;
+    let previous_release_git_commit = git_rev_parse(&args.workspace_root, &prev_tag)?;
+
+    // Print the resolved SHAs in the same format as `release-verify`'s
+    // diff header, before any prompts. The `diff_reviewed` claim later
+    // echoes these same SHAs inside the signed bytes; surfacing them up
+    // front gives the engineer an early visual cross-check against the
+    // verify scrollback so they can spot drift before affirming anything.
+    println!();
+    println!("== commits being attested ==");
+    println!("  previous: {prev_tag}  →  {previous_release_git_commit}");
+    println!("  this:     {tag}  →  {git_commit}", tag = args.tag);
+    println!();
+    println!(
+        "Confirm these SHAs match what `release-verify` showed. They will be\n\
+         recorded verbatim in the signed attestation."
+    );
 
     let manifest_path = args.workspace_root.join("artifact-manifest.json");
     let artifact_manifest_sha256 = sha256_hex(&fs::read(&manifest_path)?);
@@ -203,14 +222,13 @@ pub fn run(args: Args) -> Result<()> {
     let signature_path = ssh_sign(&attestation_path, &args.ssh_pubkey, SSH_SIG_NAMESPACE)?;
     println!("  signature → {}", signature_path.display());
 
-    let attestation_hash_hex = sha256_hex(&fs::read(&attestation_path)?);
+    let attestation_bytes = fs::read(&attestation_path)?;
     let signature_bytes = fs::read(&signature_path)?;
     let pubkey_bytes = fs::read(&args.ssh_pubkey)?;
 
     println!();
     println!("=== Uploading to Rekor ({REKOR_BASE_URL}) ===");
-    let rekor_entry =
-        rekor_upload_hashedrekord(&attestation_hash_hex, &signature_bytes, &pubkey_bytes)?;
+    let rekor_entry = rekor_upload_rekord_ssh(&attestation_bytes, &signature_bytes, &pubkey_bytes)?;
     println!(
         "  ✓ log_index={} uuid={}",
         rekor_entry.log_index, rekor_entry.uuid
@@ -385,25 +403,31 @@ fn ssh_sign(file_to_sign: &Path, pubkey: &Path, namespace: &str) -> Result<PathB
     Ok(PathBuf::from(sig_path))
 }
 
-/// POST a `hashedrekord` entry to Sigstore Rekor and return the parsed log
-/// entry. Rekor identifies SSH-format keys automatically from the pubkey
-/// content; we don't need to declare the format explicitly.
-fn rekor_upload_hashedrekord(
-    artifact_hash_hex: &str,
+/// POST a `rekord` v0.0.1 entry (with `format: "ssh"`) to Sigstore
+/// Rekor and return the parsed log entry. SSH-signed entries are
+/// rejected by `hashedrekord` (x509-only); the polymorphic `rekord`
+/// type is the one Rekor's PKI multiplexer routes to its SSH backend.
+///
+/// Rekor requires `data.content` (rejects hash-only) but canonicalizes
+/// it to `data.hash` in the persisted entry — so the body the verifier
+/// reads has the same hash-only shape we'd have preferred to send, and
+/// the engineer's attestation prose (legal name, jurisdiction, claims)
+/// is NOT permanently recorded in the public transparency log. Only
+/// the in-transit POST under TLS sees the full bytes.
+fn rekor_upload_rekord_ssh(
+    attestation_bytes: &[u8],
     signature_bytes: &[u8],
     pubkey_bytes: &[u8],
 ) -> Result<RekorLogEntry> {
     let body = serde_json::json!({
         "apiVersion": "0.0.1",
-        "kind": "hashedrekord",
+        "kind": "rekord",
         "spec": {
             "data": {
-                "hash": {
-                    "algorithm": "sha256",
-                    "value": artifact_hash_hex,
-                }
+                "content": base64::engine::general_purpose::STANDARD.encode(attestation_bytes),
             },
             "signature": {
+                "format": "ssh",
                 "content": base64::engine::general_purpose::STANDARD.encode(signature_bytes),
                 "publicKey": {
                     "content": base64::engine::general_purpose::STANDARD.encode(pubkey_bytes),
@@ -419,7 +443,7 @@ fn rekor_upload_hashedrekord(
         .header("Accept", "application/json")
         .json(&body)
         .send()
-        .context("posting hashedrekord to Rekor")?;
+        .context("posting rekord to Rekor")?;
 
     let status = response.status();
     let response_text = response.text().context("reading Rekor response body")?;
@@ -606,7 +630,7 @@ fn build_sigstore_bundle_v3(
             "tlogEntries": [{
                 "logIndex": log_index.to_string(),
                 "logId": { "keyId": log_id_b64 },
-                "kindVersion": { "kind": "hashedrekord", "version": "0.0.1" },
+                "kindVersion": { "kind": "rekord", "version": "0.0.1" },
                 "integratedTime": integrated_time.to_string(),
                 "inclusionPromise": { "signedEntryTimestamp": signed_entry_timestamp },
                 "inclusionProof": serde_json::Value::Object(inclusion_proof_obj),
@@ -633,24 +657,24 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+/// Resolve `refname` to the 40-char SHA of the commit it points at. The
+/// `^{commit}` suffix peels through annotated tag objects so a signed
+/// annotated tag resolves to its underlying commit, not the tag-object
+/// SHA. For lightweight tags it's a no-op. The attestation's `git_commit`
+/// field must always be a commit SHA.
 fn git_rev_parse(workspace_root: &Path, refname: &str) -> Result<String> {
     let out = Command::new("git")
         .current_dir(workspace_root)
-        .args(["rev-parse", refname])
+        .args(["rev-parse", &format!("{refname}^{{commit}}")])
         .output()
-        .context("running `git rev-parse`")?;
+        .context("running `git rev-parse <ref>^{commit}`")?;
     if !out.status.success() {
         bail!(
-            "`git rev-parse {refname}` failed: {}",
+            "`git rev-parse {refname}^{{commit}}` failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
-}
-
-fn previous_release_commit(workspace_root: &Path, tag: &str) -> Result<String> {
-    let prev = previous_release_tag(workspace_root, tag)?;
-    git_rev_parse(workspace_root, &prev)
 }
 
 fn previous_release_version(workspace_root: &Path, tag: &str) -> Result<String> {
@@ -878,10 +902,7 @@ mod tests {
                 .unwrap(),
             "U0VUYnl0ZXM="
         );
-        assert_eq!(
-            entry["kindVersion"]["kind"].as_str().unwrap(),
-            "hashedrekord"
-        );
+        assert_eq!(entry["kindVersion"]["kind"].as_str().unwrap(), "rekord");
         assert_eq!(entry["kindVersion"]["version"].as_str().unwrap(), "0.0.1");
 
         // inclusionProof: ints→strings; hex→base64.

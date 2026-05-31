@@ -101,7 +101,9 @@ pub(crate) struct TlogEntry {
     pub inclusion_promise: Option<InclusionPromise>,
     #[serde(default)]
     pub inclusion_proof: Option<InclusionProof>,
-    /// Base64 of the canonical rekor entry body (`hashedrekord` JSON).
+    /// Base64 of the canonical rekor entry body — `hashedrekord` JSON
+    /// for the CI sigstore path, `rekord` (with `signature.format=ssh`)
+    /// JSON for the human attestation path.
     pub canonicalized_body: String,
 }
 

@@ -23,7 +23,20 @@ pub fn run(args: Args) -> Result<()> {
     require_tool("gh")?;
     require_tool("git")?;
 
-    let prev_tag = previous_release_tag(&args.workspace_root, &args.tag).ok();
+    // Resolve the tag to its commit SHA up front. Both the displayed diff
+    // and the `release-attest` step act on this SHA, not on the tag name —
+    // so a reviewer can always re-run the diff later from the SHAs printed
+    // here and get the exact same bytes they signed off on. Using
+    // `<tag>^{commit}` instead of bare `<tag>` so an annotated signed tag
+    // also resolves to its underlying commit, not the tag object.
+    let tag_commit = resolve_to_commit(&args.workspace_root, &args.tag)?;
+    let prev = previous_release_tag(&args.workspace_root, &args.tag)
+        .ok()
+        .map(|prev_tag| -> Result<(String, String)> {
+            let prev_commit = resolve_to_commit(&args.workspace_root, &prev_tag)?;
+            Ok((prev_tag, prev_commit))
+        })
+        .transpose()?;
 
     let tmp = tempfile::tempdir().context("creating tempdir")?;
     let manifest_path = tmp.path().join("artifact-manifest.json");
@@ -84,13 +97,22 @@ pub fn run(args: Args) -> Result<()> {
     }
     println!("  ✓ committed manifest matches CI (reproducible)");
 
-    if let Some(prev) = prev_tag.as_deref() {
+    if let Some((prev_tag, prev_commit)) = prev.as_ref() {
         println!();
-        println!("== diff vs previous release tag (`{prev}`) ==");
-        show_git_diff(&args.workspace_root, prev, &args.tag)?;
+        println!("== diff vs previous release ==");
+        println!("  previous: {prev_tag}  →  {prev_commit}");
+        println!("  this:     {tag}  →  {tag_commit}", tag = args.tag);
+        println!();
+        println!(
+            "These commits are what `release-attest` will record verbatim in the\n\
+             signed attestation; the diff below is between them."
+        );
+        println!();
+        show_git_diff(&args.workspace_root, prev_commit, &tag_commit)?;
     } else {
         println!();
         println!("(no previous release tag found — skipping diff)");
+        println!("  this: {tag}  →  {tag_commit}", tag = args.tag);
     }
 
     println!();
@@ -191,6 +213,25 @@ fn canonicalize(v: &serde_json::Value) -> String {
         }
         other => serde_json::to_string(other).unwrap(),
     }
+}
+
+/// Resolve `refname` to the 40-char SHA of the commit it points at.
+/// `<refname>^{commit}` peels through annotated tag objects so a signed
+/// annotated tag resolves to its underlying commit rather than the tag
+/// object SHA. For lightweight tags it's a no-op.
+fn resolve_to_commit(workspace_root: &std::path::Path, refname: &str) -> Result<String> {
+    let out = Command::new("git")
+        .current_dir(workspace_root)
+        .args(["rev-parse", &format!("{refname}^{{commit}}")])
+        .output()
+        .context("running `git rev-parse <ref>^{commit}`")?;
+    if !out.status.success() {
+        bail!(
+            "`git rev-parse {refname}^{{commit}}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
 fn previous_release_tag(workspace_root: &std::path::Path, tag: &str) -> Result<String> {

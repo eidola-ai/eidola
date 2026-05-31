@@ -109,7 +109,7 @@ Each document's shape is owned by the Rust `serde` types shared between the rele
 | `releases/trust/server-enclave.json` | format owned by `scripts/artifact-manifest.sh`, consumed as raw JSON in `eidola-app-core/build.rs` | `schema_version: 1`. Holds just the enclave block (snp/tdx measurement + cmdline) so the cli build doesn't drag its own digest into its build context. |
 | `releases/trust/tinfoil-enclaves.json` | format owned by `.github/workflows/update-measurements.yml`, consumed as raw JSON in `eidola-server/build.rs` | `schema_version: 1`. Allowed upstream Tinfoil inference-enclave measurements the server's outbound verifier accepts. One entry per Tinfoil release, with provenance metadata (built\_at, artifact digest, Rekor log index); the workflow keeps the most recent two for rolling deploys. |
 | `release.json`           | `eidola_attestation::ReleaseIndex` — `crates/eidola-attestation/src/trust_shapes.rs`                      | Unsigned URL-only index; cross-checked via referenced documents (see caveat below)          |
-| `attestation.json`       | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via SSH (`ssh-keygen -Y sign`), logged to Rekor as a `hashedrekord` |
+| `attestation.json`       | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via SSH (`ssh-keygen -Y sign -n file`), logged to Rekor as a `rekord` v0.0.1 entry with `signature.format=ssh` |
 | `trust-constants.json`   | `eidola_attestation::TrustConstants` — `crates/eidola-attestation/src/trust_shapes.rs`                    | Pinned trust values baked into the verifier at build time                                   |
 | Templates                | `releases/schema/attestation-templates-v1.json` (data, not a schema)                                      | Pinned claim templates the verifier re-renders during equality checks                       |
 
@@ -143,7 +143,7 @@ based on which document is being verified:
 | Surface | Signature | Identity binding | Transparency |
 | --- | --- | --- | --- |
 | CI signs `artifact-manifest.json` | Sigstore bundle | Fulcio keyless cert — OIDC identity matches `EXPECTED_CI_IDENTITY_PATTERN` | Rekor inclusion proof embedded in the bundle |
-| Engineer signs `attestation-<id>.json` | SSH signature (`ssh-keygen -Y sign`, namespace `eidola-attestation@v1`) | `sha256(SSH wire-format pubkey)` matches `TRUSTED_ATTESTANT_FINGERPRINTS` | Posted to Rekor as a `hashedrekord` entry; inclusion proof saved in `attestation-<id>.bundle.json` |
+| Engineer signs `attestation-<id>.json` | SSH signature (`ssh-keygen -Y sign`, namespace `"file"` — forced by Rekor's SSH PKI verifier) | `sha256(SSH wire-format pubkey)` matches `TRUSTED_ATTESTANT_FINGERPRINTS` | Posted to Rekor as a `rekord` v0.0.1 entry with `signature.format=ssh`; Rekor canonicalizes `data.content` away, leaving only `data.hash` in the public log; inclusion proof saved in `attestation-<id>.bundle.json` |
 | Engineer signs the git tag | SSH signature (same key) | Same fingerprint | Implicit via the repo |
 
 The CI side uses Sigstore because Fulcio's keyless OIDC binding is *the*
@@ -161,9 +161,10 @@ The engineer side uses SSH because:
   has one identity surface.
 
 Both ride the same Sigstore Rekor transparency log via different entry
-kinds (sigstore-bundle's embedded log entry for CI, `hashedrekord` for
-human). The verifier shares its Rekor inclusion-proof + signed-tree-head
-verification code between the two paths.
+kinds (`hashedrekord` with x509+ECDSA for CI; `rekord` with
+`signature.format=ssh` for human). The verifier shares its Rekor
+inclusion-proof + signed-tree-head verification code between the two
+paths.
 
 ### Attestation templates: flat snake_case keys
 

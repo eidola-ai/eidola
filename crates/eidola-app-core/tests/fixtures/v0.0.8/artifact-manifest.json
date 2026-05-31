@@ -1,0 +1,38 @@
+{
+  "artifacts": {
+    "eidola-cli": {
+      "digest": "sha256:e98fc6ae6115b18faae267ad72a86aa43d44f1381c9d1c52c0be3f0f0fb98688",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-cli-macos-universal": {
+      "narHash": "sha256-5Zvi9Zt3kS+dixeSLzJtHzRSPxgoPLL9p2+CUDOH+T8=",
+      "platform": "darwin/universal",
+      "type": "nix"
+    },
+    "eidola-gui-macos-universal": {
+      "narHash": "sha256-Z1kOzCnYcWK6pflmWfaE6iFtkFi7Tfr0IqQtP7PPj+Q=",
+      "platform": "darwin/universal",
+      "type": "nix"
+    },
+    "eidola-postgres": {
+      "digest": "sha256:3c3bc53095fde1adbd6c484e751a2b4186b479b731f7c491f6d0bbaa43a1a992",
+      "platform": "linux/amd64",
+      "type": "oci"
+    },
+    "eidola-server": {
+      "digest": "sha256:2781382dc5442ee30e1f4b7b5fb8740bd2175f73535157908cb3a22ea3e4c046",
+      "platform": "linux/amd64",
+      "type": "oci"
+    }
+  },
+  "enclave": {
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=85d6bc3fe339f624fcd6091515029fbf40df40d9196fc3ca80f80421a60c0e14",
+    "snp_measurement": "5b0603597aca0dbf98520285a52a8755d4f53d3942368f86b23a7f0443a9627f192aed52b708d77af07c0ae764eff505",
+    "tdx_measurement": {
+      "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
+      "rtmr2": "569f8848dc9bd017a61f75eb04d783a2095ccd587dde1c2868c7d2874af91c1928f1a977151bccaa273a144396417786"
+    }
+  },
+  "schema_version": 1
+}

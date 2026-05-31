@@ -43,6 +43,7 @@ use crate::updater::trust::{KeyDetails, RekorKey};
 #[derive(Debug, Deserialize)]
 struct HashedRekordBody {
     kind: String,
+    #[serde(rename = "apiVersion")]
     api_version: String,
     spec: HashedRekordSpec,
 }

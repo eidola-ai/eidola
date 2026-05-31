@@ -1,7 +1,8 @@
 //! RFC 6962 Merkle inclusion-proof verification (sha256).
 //!
-//! Used by both [`super::ci_sigstore::rekor`] (CI sigstore bundle path)
-//! and [`super::human_attestation`] (engineer SSH `hashedrekord` path)
+//! Used by both [`super::ci_sigstore::rekor`] (CI sigstore bundle path,
+//! `hashedrekord` entries) and [`super::human_attestation`] (engineer
+//! SSH `rekord` path with `signature.format=ssh`)
 //! to verify that a leaf hash is in a tree of declared `tree_size`
 //! whose root is `proof_root_hash`.
 //!

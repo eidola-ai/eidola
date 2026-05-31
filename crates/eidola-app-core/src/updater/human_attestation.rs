@@ -1,14 +1,14 @@
 //! Verify a human-signed release attestation.
 //!
 //! Engineers sign the attestation JSON file with their hardware-backed
-//! SSH key via `ssh-keygen -Y sign` (namespace `eidola-attestation@v1`),
-//! then post the resulting signature to Sigstore Rekor as a
-//! `hashedrekord` entry. `release-tool attest` packages the result into a
-//! **Sigstore Bundle v0.3** companion file (the same protobuf-JSON shape
-//! `cosign sign-blob --bundle` produces, just with a `publicKey.hint`
-//! instead of a Fulcio leaf cert in `verificationMaterial`). This module
-//! reads that bundle, walks every cryptographic binding, and returns the
-//! verified facts.
+//! SSH key via `ssh-keygen -Y sign` (namespace `file` — see
+//! [`SSH_SIG_NAMESPACE`] for why), then post the resulting signature to
+//! Sigstore Rekor as a `rekord` v0.0.1 entry with `format: "ssh"`.
+//! `release-tool attest` packages the result into a **Sigstore Bundle
+//! v0.3** companion file (the same protobuf-JSON shape `cosign sign-blob
+//! --bundle` produces, just with a `publicKey.hint` instead of a Fulcio
+//! leaf cert in `verificationMaterial`). This module reads that bundle,
+//! walks every cryptographic binding, and returns the verified facts.
 //!
 //! Pipeline (one attestation):
 //!
@@ -19,8 +19,11 @@
 //! 2. **SSH-SIG extraction.** Base64-decode `messageSignature.signature`
 //!    to the PEM-wrapped SSH-SIG blob.
 //! 3. **Body parse.** Base64-decode the tlog entry's `canonicalizedBody`
-//!    into the canonical hashedrekord JSON; require `kind=hashedrekord`,
-//!    `apiVersion=0.0.1`, `data.hash.algorithm=sha256`.
+//!    into the canonical rekord JSON; require `kind=rekord`,
+//!    `apiVersion=0.0.1`, `signature.format=ssh`,
+//!    `data.hash.algorithm=sha256`. Rekor canonicalizes `data.content`
+//!    away in the stored entry, leaving only `data.hash` — so the body
+//!    we read is hash-only even though the producer submitted content.
 //! 4. **Body binding.** The body's `data.hash.value` (hex) must equal
 //!    `sha256(attestation_bytes)`. The body's `messageDigest.digest` must
 //!    independently equal the same sha256.
@@ -31,8 +34,8 @@
 //!    [`super::sigstore_bundle::RawPublicKeyHint::hint`] *and* a member
 //!    of [`trust_root::TRUSTED_ATTESTANT_FINGERPRINTS`].
 //! 6. **SSH signature verify.** Parse the PEM SSH-SIG from step 2,
-//!    verify against `attestation_bytes` under the namespace
-//!    `eidola-attestation@v1`.
+//!    verify against `attestation_bytes` under the namespace `"file"`
+//!    (forced by Rekor — see [`SSH_SIG_NAMESPACE`]).
 //! 7. **SET verify.** Reconstruct the canonical JSON
 //!    `{"body":"<b64>","integratedTime":N,"logID":"<hex>","logIndex":N}`,
 //!    select the pinned Rekor key by `logID`, ECDSA-P256 or Ed25519
@@ -58,7 +61,16 @@ use super::sigstore_bundle::CosignBundle;
 use super::trust::{KeyDetails, RekorKey, TrustedRoot};
 use super::{ReleaseIndex, VerifiedAttestation, VerifiedClaim};
 
-pub const SSH_SIG_NAMESPACE: &str = "eidola-attestation@v1";
+/// SSH-SIG signature namespace. Hardcoded to `"file"` because Rekor's
+/// SSH PKI verifier requires exactly that namespace and rejects any
+/// other (`pkg/pki/ssh/sign.go` in sigstore/rekor pins
+/// `const namespace = "file"`). The cross-context binding we'd prefer
+/// (a dedicated `eidola-attestation@v1` namespace) isn't available; the
+/// residual protection comes from Rekor binding the signature to
+/// `sha256(attestation_bytes)` and from the attestation prose having an
+/// eidola-specific schema that an arbitrary "sign this file" target
+/// wouldn't match.
+pub const SSH_SIG_NAMESPACE: &str = "file";
 
 /// Verify a single human attestation end-to-end: the SSH signature + the
 /// Rekor inclusion (this file), the structural cross-checks against the
@@ -154,15 +166,22 @@ pub fn verify_human_attestation(
 
     // ── 3. Body parse ────────────────────────────────────────────────
     let body_bytes = base64_std_decode(&entry.canonicalized_body, "tlog canonicalizedBody")?;
-    let body: HashedRekordBody =
-        serde_json::from_slice(&body_bytes).map_err(|e| AppError::Update {
-            message: format!("parsing rekor entry body as hashedrekord: {e}"),
-        })?;
-    if body.kind != "hashedrekord" || body.api_version != "0.0.1" {
+    let body: RekordBody = serde_json::from_slice(&body_bytes).map_err(|e| AppError::Update {
+        message: format!("parsing rekor entry body as rekord: {e}"),
+    })?;
+    if body.kind != "rekord" || body.api_version != "0.0.1" {
         return Err(AppError::Update {
             message: format!(
-                "attestation rekor entry has unsupported kind/apiVersion (`{}` / `{}`); expected hashedrekord 0.0.1",
+                "attestation rekor entry has unsupported kind/apiVersion (`{}` / `{}`); expected rekord 0.0.1",
                 body.kind, body.api_version
+            ),
+        });
+    }
+    if body.spec.signature.format != "ssh" {
+        return Err(AppError::Update {
+            message: format!(
+                "attestation rekor entry signature.format is `{}`, expected `ssh`",
+                body.spec.signature.format
             ),
         });
     }
@@ -747,19 +766,22 @@ fn verify_rekor_set(key: &RekorKey, message: &[u8], signature: &[u8]) -> Result<
 }
 
 // ---------------------------------------------------------------------------
-// `hashedrekord` v0.0.1 body shape (same as the CI side).
+// `rekord` v0.0.1 body shape, with `signature.format = "ssh"`. Rekor
+// canonicalizes `data.content` (which the producer must submit) down to
+// `data.hash` in the stored body, so the shape we see at verify time is
+// hash-only.
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct HashedRekordBody {
+struct RekordBody {
     kind: String,
     #[serde(rename = "apiVersion")]
     api_version: String,
-    spec: HashedRekordSpec,
+    spec: RekordSpec,
 }
 
 #[derive(Deserialize)]
-struct HashedRekordSpec {
+struct RekordSpec {
     data: SpecData,
     signature: SpecSignature,
 }
@@ -777,10 +799,14 @@ struct SpecHash {
 
 #[derive(Deserialize)]
 struct SpecSignature {
+    /// `"ssh"`. Distinguishes `rekord` from a PGP / minisign / x509 /
+    /// TUF-signed entry — Rekor's rekord schema is polymorphic over PKI
+    /// type and the consumer must re-check.
+    format: String,
     /// Base64 of the PEM SSH-SIG blob. We don't read it here — the
     /// authoritative copy lives in `messageSignature.signature` per the
     /// Sigstore Bundle v0.3 model — but we keep the field in the
-    /// deserialization so the hashedrekord body schema stays complete.
+    /// deserialization so the rekord body schema stays complete.
     #[allow(dead_code)]
     content: String,
     #[serde(rename = "publicKey")]
@@ -917,7 +943,7 @@ mod tests {
                 "tlogEntries": [{
                     "logIndex": "1",
                     "logId": { "keyId": "AAA=" },
-                    "kindVersion": { "kind": "hashedrekord", "version": "0.0.1" },
+                    "kindVersion": { "kind": "rekord", "version": "0.0.1" },
                     "integratedTime": "1",
                     "canonicalizedBody": "AAA="
                 }]

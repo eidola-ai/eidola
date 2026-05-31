@@ -12,14 +12,17 @@
 //!    inputs. Each claim requires typing the word `yes` to affirm; anything
 //!    else aborts. On full affirmation, signs the attestation file with the
 //!    engineer's hardware-backed SSH key via `ssh-keygen -Y sign`, posts the
-//!    resulting signature to Sigstore Rekor as a `hashedrekord` entry, and
+//!    resulting signature to Sigstore Rekor as a `rekord` entry (with
+//!    `signature.format=ssh`), and
 //!    uploads the attestation JSON + bundle (rekor inclusion proof) to the
 //!    release. Then generates and uploads `release.json` (URL-only index —
 //!    see `releases/TRUST-ROOT.md`) and marks the release as latest.
 //!
-//! CI side uses sigstore + cosign (Fulcio keyless via OIDC). Human side uses
-//! SSH signatures + Rekor `hashedrekord`. Both end up in the same Rekor
-//! transparency log; the verifier dispatches on signature format.
+//! CI side uses sigstore + cosign (Fulcio keyless via OIDC) → Rekor
+//! `hashedrekord`. Human side uses SSH signatures (`ssh-keygen -Y sign`,
+//! namespace `"file"`) → Rekor `rekord` with `signature.format=ssh`.
+//! Both end up in the same Rekor transparency log; the verifier
+//! dispatches on entry kind.
 //!
 //! Shells out to `gh`, `ssh-keygen`, and `git`. All must be on PATH. CI
 //! signature verification goes through `eidola-app-core`'s pure-Rust

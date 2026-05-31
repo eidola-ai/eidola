@@ -11,7 +11,7 @@
 //!   continuity  → release.version > installed; previous matches  [step 4b]
 //!   fetch       → download artifact-manifest.json + both bundles + each attestation
 //!   verify-ci   → tinfoil-rs sigstore verification               [step 4c]
-//!   verify-human→ SSH signature + Rekor hashedrekord per attestation [step 4d]
+//!   verify-human→ SSH signature + Rekor rekord(format=ssh) per attestation [step 4d]
 //!   templates   → render each template; require character-exact match [step 4e]
 //!   cross-check → resolved substitution values match release.x.y paths [step 4e]
 //!   policy      → ≥ trust_root::MIN_HUMAN_ATTESTATIONS human attestations verified [step 4e]
@@ -198,8 +198,8 @@ pub struct ReleaseSummary {
 
 /// One verified human attestation, ready to render. The verifier guarantees:
 ///
-/// - The SSH signature over the attestation bytes is valid (and namespaced
-///   to `eidola-attestation@v1`).
+/// - The SSH signature over the attestation bytes is valid (namespace
+///   `"file"`, forced by Rekor's SSH PKI verifier).
 /// - The signer's pubkey fingerprint (`fingerprint_hex`) is in this
 ///   client's pinned `TRUSTED_ATTESTANT_FINGERPRINTS`.
 /// - The signature was logged in Sigstore Rekor (`rekor_log_index`,
