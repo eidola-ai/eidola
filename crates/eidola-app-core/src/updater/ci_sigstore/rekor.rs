@@ -29,7 +29,7 @@
 //! `rootHash` is the log's *publicly announced* root, not a side-tree
 //! the log forked just for us. The SET already requires the Rekor key
 //! to vouch for the entry; the checkpoint adds defense-in-depth.
-//! Tracked in `releases/TRUST-ROOT.md` under "Known gaps."
+//! Tracked in `docs/gaps.md`.
 
 use serde::Deserialize;
 

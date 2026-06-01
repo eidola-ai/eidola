@@ -1,3 +1,0 @@
-# Privacy Guarantees
-
-TODO

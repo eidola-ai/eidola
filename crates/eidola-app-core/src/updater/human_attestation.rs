@@ -57,7 +57,7 @@
 //!    [`super::merkle`]; recomputed root must equal `rootHash`. Shared
 //!    with the CI path via [`super::rekor_verify`].
 //!
-//! See also the known gap in `releases/TRUST-ROOT.md` on Rekor
+//! See also the known gap in `docs/gaps.md` on Rekor
 //! checkpoint signature verification (same caveat as the CI side).
 
 use serde::Deserialize;

@@ -17,7 +17,7 @@
 //!    `hashedrekord` v0.0.1 entry and emits a Sigstore Bundle v0.3.
 //!    `release-tool` uploads the attestation JSON + bundle + the
 //!    `release.json` URL index to the GitHub release and marks it as
-//!    latest. See `releases/TRUST-ROOT.md`.
+//!    latest. See `docs/trust-root.md`.
 //!
 //! Both CI and engineer sides ride the same Rekor entry shape:
 //! `hashedrekord` v0.0.1. They differ only in the publicKey arm — CI

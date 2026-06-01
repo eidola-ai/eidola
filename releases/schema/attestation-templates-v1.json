@@ -46,7 +46,7 @@
       }
     },
     "no_known_privacy_weakening": {
-      "template": "Based on the review described above, I am not aware of any change in this release that weakens the privacy guarantees stated in PRIVACY-GUARANTEES.md (sha256 {privacy_guarantees_doc_sha256}) as compared with the prior release.",
+      "template": "Based on the review described above, I am not aware of any change in this release that weakens the privacy guarantees stated in docs/privacy-guarantees.md (sha256 {privacy_guarantees_doc_sha256}) as compared with the prior release.",
       "sources": {
         "privacy_guarantees_doc_sha256": "attestation.privacy_guarantees_doc_sha256"
       },

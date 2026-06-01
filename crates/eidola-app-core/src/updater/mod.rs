@@ -423,7 +423,7 @@ pub async fn check_for_update_with(
     // Policy: minimum number of independently-verified attestations. The
     // threshold is pinned in the *embedded* trust root rather than in
     // `release.json` so an adversary who controls the index can't lower
-    // the bar — see module docs and `releases/TRUST-ROOT.md`.
+    // the bar — see module docs and `docs/trust-root.md`.
     if (verified_attestations.len() as u32) < trust_root::MIN_HUMAN_ATTESTATIONS {
         return Err(AppError::Update {
             message: format!(
@@ -451,8 +451,8 @@ pub async fn check_for_update_with(
     // are trustworthy — this stage just turns "manifest authentic" into
     // "downloaded bytes authentic." Lives in step 5 because the natural
     // home is the install/replace flow, where we already need to be
-    // downloading the binary anyway. See `releases/TRUST-ROOT.md`
-    // "Known gaps" for the audit-side description.
+    // downloading the binary anyway. See `docs/gaps.md` for the
+    // audit-side description.
 
     tracer.log("present", format!("release {} verified", release.version));
 

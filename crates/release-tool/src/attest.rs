@@ -100,11 +100,11 @@ pub fn run(args: Args) -> Result<()> {
     let manifest_path = args.workspace_root.join("artifact-manifest.json");
     let artifact_manifest_sha256 = sha256_hex(&fs::read(&manifest_path)?);
 
-    let privacy_doc_path = args.workspace_root.join("PRIVACY-GUARANTEES.md");
+    let privacy_doc_path = args.workspace_root.join("docs/privacy-guarantees.md");
     let privacy_guarantees_doc_sha256 = match fs::read(&privacy_doc_path) {
         Ok(bytes) => sha256_hex(&bytes),
         Err(_) => bail!(
-            "`PRIVACY-GUARANTEES.md` not found at repo root. \
+            "`docs/privacy-guarantees.md` not found. \
              The `no_known_privacy_weakening` claim references its sha256; \
              create the document and commit it before attesting."
         ),
@@ -271,7 +271,7 @@ pub fn run(args: Args) -> Result<()> {
     // `release.json` is a pure URL index. Policy fields (threshold, allowed
     // identities, allowed schema versions) live in the verifier's embedded
     // trust root so a forged index can't downgrade them — see
-    // `releases/TRUST-ROOT.md`.
+    // `docs/trust-root.md`.
     let release_json = serde_json::json!({
         "schema_version": 1,
         "version": release_version,

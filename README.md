@@ -6,6 +6,16 @@ Over the coming months, its shape will change substantially as we port several e
 
 We plan to release the functional components of this repo under appropriate open source licenses, but have not finalized the details.
 
+## Documentation
+
+For an explanation of how Eidola works, what it commits to, and what it doesn't yet defend against, start with [`docs/paradigm.md`](docs/paradigm.md). The full documentation index is at [`docs/README.md`](docs/README.md), and includes:
+
+- [Privacy guarantees](docs/privacy-guarantees.md) — the contract human attestants sign against every release.
+- [Threat model](docs/threat-model.md) — who Eidola defends against, who it doesn't.
+- [The client](docs/client.md), [server](docs/server.md), and [inference upstream](docs/upstream.md) — design pieces.
+- [Releases](docs/releases.md) and [trust root spec](docs/trust-root.md) — how new code becomes trustable.
+- [Known gaps](docs/gaps.md) — what we don't yet defend against.
+
 ## Contributing
 
 Pull requests are checked for CLA coverage. Every Git author and committer
