@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
 
       - name: Suggest action pins
-        uses: suzuki-shunsuke/pinact-action@3132770ecce73073bcd618342c7f4092ed2f994c # v3.0.0
+        uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0
         with:
           fix: "false" # validate-only; implies skip_push:"true" (no files modified, nothing to commit)
           review: "true" # surface unpinned actions as reviewdog PR review comments
