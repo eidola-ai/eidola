@@ -11,7 +11,7 @@
 //!   continuity  → release.version > installed; previous matches  [step 4b]
 //!   fetch       → download artifact-manifest.json + both bundles + each attestation
 //!   verify-ci   → tinfoil-rs sigstore verification               [step 4c]
-//!   verify-human→ SSH signature + Rekor rekord(format=ssh) per attestation [step 4d]
+//!   verify-human→ cosign-signed hashedrekord (PKIX SPKI in body) per attestation [step 4d]
 //!   templates   → render each template; require character-exact match [step 4e]
 //!   cross-check → resolved substitution values match release.x.y paths [step 4e]
 //!   policy      → ≥ trust_root::MIN_HUMAN_ATTESTATIONS human attestations verified [step 4e]
@@ -40,6 +40,7 @@ pub use eidola_attestation::{
 pub mod ci_sigstore;
 pub mod human_attestation;
 mod merkle;
+mod rekor_verify;
 pub mod sigstore_bundle;
 pub mod trust;
 

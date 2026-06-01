@@ -1,82 +1,79 @@
 //! Verify a human-signed release attestation.
 //!
 //! Engineers sign the attestation JSON file with their hardware-backed
-//! SSH key via `ssh-keygen -Y sign` (namespace `file` — see
-//! [`SSH_SIG_NAMESPACE`] for why), then post the resulting signature to
-//! Sigstore Rekor as a `rekord` v0.0.1 entry with `format: "ssh"`.
-//! `release-tool attest` packages the result into a **Sigstore Bundle
-//! v0.3** companion file (the same protobuf-JSON shape `cosign sign-blob
-//! --bundle` produces, just with a `publicKey.hint` instead of a Fulcio
-//! leaf cert in `verificationMaterial`). This module reads that bundle,
-//! walks every cryptographic binding, and returns the verified facts.
+//! key via `cosign sign-blob --key …`; cosign posts the result to
+//! Sigstore Rekor as a `hashedrekord` v0.0.1 entry and writes a
+//! **Sigstore Bundle v0.3** companion file alongside the signature.
+//! This module reads that bundle, walks every cryptographic binding,
+//! and returns the verified facts.
+//!
+//! The bundle is structurally identical to the CI bundle (cosign
+//! produces both) with one difference: the human path carries
+//! `verificationMaterial.publicKey` (a hint plus the actual PEM PKIX
+//! pubkey embedded in the rekor body) instead of
+//! `verificationMaterial.certificate` (a Fulcio leaf cert). Trust is
+//! anchored by pinned key fingerprints rather than by a Fulcio chain +
+//! OIDC identity match.
 //!
 //! Pipeline (one attestation):
 //!
 //! 1. **Bundle parse.** Deserialize as
 //!    [`super::sigstore_bundle::CosignBundle`]; require `mediaType` to
 //!    start with `application/vnd.dev.sigstore.bundle` and exactly one
-//!    tlog entry.
-//! 2. **SSH-SIG extraction.** Base64-decode `messageSignature.signature`
-//!    to the PEM-wrapped SSH-SIG blob.
+//!    tlog entry; require the `publicKey` arm of `verificationMaterial`
+//!    (not `certificate`).
+//! 2. **messageSignature extraction.** Base64-decode
+//!    `messageSignature.signature` to the raw signature bytes (ECDSA
+//!    DER for ECDSA-P256/P384 keys, 64 bytes for Ed25519).
 //! 3. **Body parse.** Base64-decode the tlog entry's `canonicalizedBody`
-//!    into the canonical rekord JSON; require `kind=rekord`,
-//!    `apiVersion=0.0.1`, `signature.format=ssh`,
-//!    `data.hash.algorithm=sha256`. Rekor canonicalizes `data.content`
-//!    away in the stored entry, leaving only `data.hash` — so the body
-//!    we read is hash-only even though the producer submitted content.
+//!    into the canonical hashedrekord JSON; require `kind=hashedrekord`,
+//!    `apiVersion=0.0.1`, `data.hash.algorithm=sha256`.
 //! 4. **Body binding.** The body's `data.hash.value` (hex) must equal
-//!    `sha256(attestation_bytes)`. The body's `messageDigest.digest` must
-//!    independently equal the same sha256.
+//!    `sha256(attestation_bytes)`. The body's `messageDigest.digest`
+//!    must independently equal the same sha256. The body's
+//!    `signature.content` (base64) must equal the bundle's
+//!    `messageSignature.signature` bytes.
 //! 5. **Pubkey extraction + fingerprint check.** Decode
-//!    `body.signature.publicKey.content` (base64) into the OpenSSH pubkey
-//!    line, parse with `ssh-key`, compute the standard SHA-256
-//!    fingerprint. Require it equal both
+//!    `body.signature.publicKey.content` (base64) to the PEM
+//!    `-----BEGIN PUBLIC KEY-----` block, decode to PKIX SubjectPublicKeyInfo
+//!    DER, fingerprint = `sha256(spki_der)`. Require it equal both
 //!    [`super::sigstore_bundle::RawPublicKeyHint::hint`] *and* a member
 //!    of [`trust_root::TRUSTED_ATTESTANT_FINGERPRINTS`].
-//! 6. **SSH signature verify.** Parse the PEM SSH-SIG from step 2,
-//!    verify against `attestation_bytes` under the namespace `"file"`
-//!    (forced by Rekor — see [`SSH_SIG_NAMESPACE`]).
+//! 6. **Blob signature verify.** Dispatch on the SPKI's
+//!    AlgorithmIdentifier OID (ECDSA-P256, ECDSA-P384, Ed25519) and
+//!    verify the messageSignature against `attestation_bytes`. ECDSA
+//!    paths verify against `sha256(attestation_bytes)`; Ed25519
+//!    verifies against the raw bytes. See
+//!    [`super::rekor_verify::verify_blob_signature_with_spki`].
 //! 7. **SET verify.** Reconstruct the canonical JSON
 //!    `{"body":"<b64>","integratedTime":N,"logID":"<hex>","logIndex":N}`,
 //!    select the pinned Rekor key by `logID`, ECDSA-P256 or Ed25519
-//!    verify the SET signature against it. (`logIndex`/`integratedTime`
-//!    arrive as protobuf-JSON strings — parsed to ints before formatting.)
+//!    verify the SET signature against it. Shared with the CI path —
+//!    see [`super::rekor_verify::verify_set_and_inclusion`].
 //! 8. **Merkle inclusion proof.** RFC 6962 walk via
-//!    [`super::merkle`]; recomputed root must equal `rootHash`.
-//!    Inclusion proof hashes and `rootHash` are base64 in v0.3 (the
-//!    legacy Rekor REST API used hex).
+//!    [`super::merkle`]; recomputed root must equal `rootHash`. Shared
+//!    with the CI path via [`super::rekor_verify`].
 //!
 //! See also the known gap in `releases/TRUST-ROOT.md` on Rekor
 //! checkpoint signature verification (same caveat as the CI side).
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use signature::hazmat::PrehashVerifier;
 
 use crate::error::AppError;
 use crate::trust_root;
 
-use super::merkle;
+use super::rekor_verify;
 use super::sigstore_bundle::CosignBundle;
-use super::trust::{KeyDetails, RekorKey, TrustedRoot};
+use super::trust::TrustedRoot;
 use super::{ReleaseIndex, VerifiedAttestation, VerifiedClaim};
 
-/// SSH-SIG signature namespace. Hardcoded to `"file"` because Rekor's
-/// SSH PKI verifier requires exactly that namespace and rejects any
-/// other (`pkg/pki/ssh/sign.go` in sigstore/rekor pins
-/// `const namespace = "file"`). The cross-context binding we'd prefer
-/// (a dedicated `eidola-attestation@v1` namespace) isn't available; the
-/// residual protection comes from Rekor binding the signature to
-/// `sha256(attestation_bytes)` and from the attestation prose having an
-/// eidola-specific schema that an arbitrary "sign this file" target
-/// wouldn't match.
-pub const SSH_SIG_NAMESPACE: &str = "file";
-
-/// Verify a single human attestation end-to-end: the SSH signature + the
-/// Rekor inclusion (this file), the structural cross-checks against the
-/// release index, and the character-exact equality of every signed claim
-/// against its pinned template rendering. Returns a fully-populated
-/// [`VerifiedAttestation`] on success.
+/// Verify a single human attestation end-to-end: the cosign-emitted
+/// signature against the attestant's pinned key fingerprint, the Rekor
+/// inclusion proof (this file), the structural cross-checks against
+/// the release index, and the character-exact equality of every signed
+/// claim against its pinned template rendering. Returns a
+/// fully-populated [`VerifiedAttestation`] on success.
 pub fn verify_human_attestation(
     attestation_bytes: &[u8],
     bundle_bytes: &[u8],
@@ -129,13 +126,13 @@ pub fn verify_human_attestation(
         });
     }
 
-    // ── 2. messageSignature: SSH-SIG PEM bytes ──────────────────────
+    // ── 2. messageSignature: raw signature bytes ─────────────────────
     let msg_sig = bundle
         .message_signature
         .as_ref()
         .ok_or_else(|| AppError::Update {
             message: "attestation bundle has no `messageSignature` — human attestations carry the \
-                  PEM SSH-SIG blob there"
+                  raw signature bytes there"
                 .into(),
         })?;
     if msg_sig.message_digest.algorithm != "SHA2_256" {
@@ -162,26 +159,19 @@ pub fn verify_human_attestation(
                 .into(),
         });
     }
-    let sig_pem_bytes = base64_std_decode(&msg_sig.signature, "messageSignature.signature")?;
+    let signature_bytes = base64_std_decode(&msg_sig.signature, "messageSignature.signature")?;
 
     // ── 3. Body parse ────────────────────────────────────────────────
     let body_bytes = base64_std_decode(&entry.canonicalized_body, "tlog canonicalizedBody")?;
-    let body: RekordBody = serde_json::from_slice(&body_bytes).map_err(|e| AppError::Update {
-        message: format!("parsing rekor entry body as rekord: {e}"),
-    })?;
-    if body.kind != "rekord" || body.api_version != "0.0.1" {
+    let body: HashedRekordBody =
+        serde_json::from_slice(&body_bytes).map_err(|e| AppError::Update {
+            message: format!("parsing rekor entry body as hashedrekord: {e}"),
+        })?;
+    if body.kind != "hashedrekord" || body.api_version != "0.0.1" {
         return Err(AppError::Update {
             message: format!(
-                "attestation rekor entry has unsupported kind/apiVersion (`{}` / `{}`); expected rekord 0.0.1",
+                "attestation rekor entry has unsupported kind/apiVersion (`{}` / `{}`); expected hashedrekord 0.0.1",
                 body.kind, body.api_version
-            ),
-        });
-    }
-    if body.spec.signature.format != "ssh" {
-        return Err(AppError::Update {
-            message: format!(
-                "attestation rekor entry signature.format is `{}`, expected `ssh`",
-                body.spec.signature.format
             ),
         });
     }
@@ -205,18 +195,38 @@ pub fn verify_human_attestation(
                 .into(),
         });
     }
+    // The body's signature.content must equal the bundle's messageSignature
+    // bytes — defends against a bundle that points at a tlog entry for some
+    // other signing event.
+    let body_sig_bytes = base64_std_decode(
+        &body.spec.signature.content,
+        "attestation rekor signature.content",
+    )?;
+    if body_sig_bytes != signature_bytes {
+        return Err(AppError::Update {
+            message:
+                "attestation rekor body signature.content ≠ bundle messageSignature.signature \
+                      — the tlog entry is about a different signing"
+                    .into(),
+        });
+    }
 
     // ── 5. Pubkey + fingerprint ──────────────────────────────────────
     let pubkey_pem_bytes = base64_std_decode(
         &body.spec.signature.public_key.content,
         "attestation rekor publicKey.content",
     )?;
-    let pubkey_text = std::str::from_utf8(&pubkey_pem_bytes).map_err(|e| AppError::Update {
-        message: format!("attestation rekor publicKey.content is not UTF-8: {e}"),
-    })?;
-    let pubkey = parse_openssh_pubkey(pubkey_text)?;
-    let fingerprint_hex = ssh_pubkey_fingerprint_hex(&pubkey);
-    if !fingerprint_hex.eq_ignore_ascii_case(&pubkey_hint.hint) {
+    let spki_der = pem_public_key_to_spki_der(&pubkey_pem_bytes)?;
+    let fingerprint_bytes = Sha256::digest(&spki_der);
+    let fingerprint_hex = hex_encode(fingerprint_bytes.as_slice());
+    // The bundle's publicKey.hint is cosign's `base64(sha256(spki_der))`.
+    // We accept either base64 OR hex to be friendly to other producers,
+    // but cross-check it against the fingerprint we just derived.
+    if !pubkey_hint_matches_fingerprint(
+        &pubkey_hint.hint,
+        &fingerprint_hex,
+        fingerprint_bytes.as_slice(),
+    ) {
         return Err(AppError::Update {
             message: format!(
                 "attestation rekor body pubkey fingerprint `{fingerprint_hex}` ≠ \
@@ -231,42 +241,17 @@ pub fn verify_human_attestation(
     {
         return Err(AppError::Update {
             message: format!(
-                "attestation was signed by SSH key with fingerprint `{fingerprint_hex}`, which is \
-                 NOT in this client's TRUSTED_ATTESTANT_FINGERPRINTS — \
-                 the signer is not authorized for this release line"
+                "attestation was signed by attestant key with fingerprint `{fingerprint_hex}` \
+                 (sha256 of PKIX SubjectPublicKeyInfo DER), which is NOT in this client's \
+                 TRUSTED_ATTESTANT_FINGERPRINTS — the signer is not authorized for this release line"
             ),
         });
     }
 
-    // ── 6. SSH signature ─────────────────────────────────────────────
-    let sig_pem = std::str::from_utf8(&sig_pem_bytes).map_err(|e| AppError::Update {
-        message: format!("messageSignature.signature is not UTF-8 PEM: {e}"),
-    })?;
-    let ssh_sig = ssh_key::SshSig::from_pem(sig_pem.as_bytes()).map_err(|e| AppError::Update {
-        message: format!("parsing SSH signature PEM: {e}"),
-    })?;
-    // Sanity: signature must carry our namespace.
-    if ssh_sig.namespace() != SSH_SIG_NAMESPACE {
-        return Err(AppError::Update {
-            message: format!(
-                "SSH signature namespace is `{}`, expected `{}` — this signature was made for \
-                 a different protocol context",
-                ssh_sig.namespace(),
-                SSH_SIG_NAMESPACE
-            ),
-        });
-    }
-    pubkey
-        .verify(SSH_SIG_NAMESPACE, attestation_bytes, &ssh_sig)
-        .map_err(|e| AppError::Update {
-            message: format!("SSH signature failed cryptographic verify: {e}"),
-        })?;
+    // ── 6. Blob signature verify ─────────────────────────────────────
+    rekor_verify::verify_blob_signature_with_spki(&spki_der, attestation_bytes, &signature_bytes)?;
 
-    // ── 7. SET signature ─────────────────────────────────────────────
-    // v0.3 wire encoding: `logId.keyId` is base64 (was hex in the old
-    // Rekor REST envelope); `logIndex` / `integratedTime` arrive as
-    // protobuf-JSON strings, but the canonical SET payload formats them
-    // as JSON numbers.
+    // ── 7 + 8. Shared SET + Merkle inclusion. ────────────────────────
     let log_id_bytes = base64_std_decode(&entry.log_id.key_id, "tlogEntry.logId.keyId")?;
     let log_id: [u8; 32] = log_id_bytes
         .as_slice()
@@ -275,17 +260,6 @@ pub fn verify_human_attestation(
             message: format!(
                 "tlogEntry.logId.keyId is {} bytes, expected 32 (sha256)",
                 log_id_bytes.len()
-            ),
-        })?;
-    let rekor_key = trust
-        .rekor_keys
-        .iter()
-        .find(|k| k.log_id == log_id)
-        .ok_or_else(|| AppError::Update {
-            message: format!(
-                "no pinned Rekor key matches the bundle's logID `{}` — \
-                 trusted root is stale, or this bundle is from a different Rekor instance",
-                hex_encode(&log_id)
             ),
         })?;
     let log_index: u64 = entry.log_index.parse().map_err(|e| AppError::Update {
@@ -315,18 +289,6 @@ pub fn verify_human_attestation(
         &inclusion_promise.signed_entry_timestamp,
         "inclusionPromise.signedEntryTimestamp",
     )?;
-    // Canonical (RFC 8785) JSON for our known field set. Keys in
-    // lexicographic order: body < integratedTime < logID < logIndex.
-    let signed_payload = format!(
-        r#"{{"body":"{body}","integratedTime":{it},"logID":"{lid}","logIndex":{li}}}"#,
-        body = entry.canonicalized_body,
-        it = integrated_time,
-        lid = hex_encode(&log_id),
-        li = log_index,
-    );
-    verify_rekor_set(rekor_key, signed_payload.as_bytes(), &set_bytes)?;
-
-    // ── 8. Merkle inclusion proof ────────────────────────────────────
     let inclusion_proof = entry
         .inclusion_proof
         .as_ref()
@@ -378,13 +340,17 @@ pub fn verify_human_attestation(
             })
         })
         .collect::<Result<_, AppError>>()?;
-    let leaf_hash = merkle::hash_leaf(&body_bytes);
-    merkle::verify_inclusion_proof(
-        proof_leaf_index,
-        &leaf_hash,
-        tree_size,
-        &proof_hashes,
+    rekor_verify::verify_set_and_inclusion(
+        &body_bytes,
+        &set_bytes,
+        integrated_time,
+        log_index,
+        &log_id,
         &root_hash,
+        &proof_hashes,
+        tree_size,
+        proof_leaf_index,
+        &trust.rekor_keys,
     )?;
 
     // ── 9. Content verification (template equality + cross-checks) ───
@@ -685,103 +651,72 @@ impl<'a> From<&'a ReleaseIndex> for SerializableRelease<'a> {
     }
 }
 
-/// Parse an OpenSSH `.pub`-style line (`ssh-<type> <base64> [comment]`)
-/// into a `ssh_key::PublicKey`.
-fn parse_openssh_pubkey(text: &str) -> Result<ssh_key::PublicKey, AppError> {
-    let line = text.lines().next().unwrap_or("").trim();
-    ssh_key::PublicKey::from_openssh(line).map_err(|e| AppError::Update {
-        message: format!("parsing OpenSSH pubkey line `{line}`: {e}"),
-    })
+/// Decode a single `-----BEGIN PUBLIC KEY-----` PEM block to its inner
+/// PKIX SubjectPublicKeyInfo DER bytes. Tolerant of leading / trailing
+/// whitespace; rejects any other PEM type or content outside the
+/// expected markers.
+fn pem_public_key_to_spki_der(pem_bytes: &[u8]) -> Result<Vec<u8>, AppError> {
+    use base64::Engine;
+    let pem = std::str::from_utf8(pem_bytes).map_err(|e| AppError::Update {
+        message: format!("attestation rekor publicKey.content is not UTF-8 PEM: {e}"),
+    })?;
+    let trimmed = pem.trim();
+    let body = trimmed
+        .strip_prefix("-----BEGIN PUBLIC KEY-----")
+        .and_then(|s| s.strip_suffix("-----END PUBLIC KEY-----"))
+        .ok_or_else(|| AppError::Update {
+            message:
+                "attestation rekor publicKey.content missing `-----BEGIN PUBLIC KEY-----` markers \
+                 — expected PEM PKIX SubjectPublicKeyInfo (cosign sign-blob output), not a cert \
+                 or other key format"
+                    .into(),
+        })?
+        .trim();
+    let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(stripped.as_bytes())
+        .map_err(|e| AppError::Update {
+            message: format!("base64-decoding PEM PUBLIC KEY body: {e}"),
+        })
 }
 
-/// Compute the standard SSH SHA-256 fingerprint of `pubkey` as
-/// lowercase hex. `ssh-key`'s `fingerprint()` performs `sha256` over the
-/// OpenSSH wire-format pubkey bytes — the same algorithm
-/// `ssh-keygen -E sha256 -l` uses, which matches our trust-constants
-/// pin.
-fn ssh_pubkey_fingerprint_hex(pubkey: &ssh_key::PublicKey) -> String {
-    let fp = pubkey.fingerprint(ssh_key::HashAlg::Sha256);
-    sha256_hex_of(fp.as_bytes())
-}
-
-fn sha256_hex_of(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        write!(out, "{b:02x}").unwrap();
+/// `verificationMaterial.publicKey.hint` is producer-defined. cosign
+/// uses `base64(sha256(spki_der))`; other tools may use hex. Accept
+/// either, but require it to match the fingerprint we just derived
+/// from the rekor body's embedded pubkey.
+fn pubkey_hint_matches_fingerprint(
+    hint: &str,
+    fingerprint_hex: &str,
+    fingerprint_bytes: &[u8],
+) -> bool {
+    use base64::Engine;
+    if hint.eq_ignore_ascii_case(fingerprint_hex) {
+        return true;
     }
-    out
-}
-
-fn verify_rekor_set(key: &RekorKey, message: &[u8], signature: &[u8]) -> Result<(), AppError> {
-    match key.key_details {
-        KeyDetails::EcdsaP256Sha256 => {
-            use spki::DecodePublicKey;
-            let vk =
-                p256::ecdsa::VerifyingKey::from_public_key_der(&key.spki_der).map_err(|e| {
-                    AppError::Update {
-                        message: format!("parsing pinned Rekor P-256 pubkey: {e}"),
-                    }
-                })?;
-            let sig =
-                p256::ecdsa::Signature::from_der(signature).map_err(|e| AppError::Update {
-                    message: format!("parsing Rekor SET signature DER (P-256): {e}"),
-                })?;
-            let prehash = Sha256::digest(message);
-            vk.verify_prehash(&prehash, &sig)
-                .map_err(|e| AppError::Update {
-                    message: format!("Rekor SET signature failed P-256 verify: {e}"),
-                })
-        }
-        KeyDetails::Ed25519 => {
-            use ed25519_dalek::pkcs8::DecodePublicKey;
-            let vk =
-                ed25519_dalek::VerifyingKey::from_public_key_der(&key.spki_der).map_err(|e| {
-                    AppError::Update {
-                        message: format!("parsing pinned Rekor Ed25519 pubkey: {e}"),
-                    }
-                })?;
-            if signature.len() != 64 {
-                return Err(AppError::Update {
-                    message: format!(
-                        "Ed25519 SET signature must be 64 bytes, got {}",
-                        signature.len()
-                    ),
-                });
-            }
-            let mut sig_bytes = [0u8; 64];
-            sig_bytes.copy_from_slice(signature);
-            let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-            vk.verify_strict(message, &sig)
-                .map_err(|e| AppError::Update {
-                    message: format!("Rekor SET signature failed Ed25519 verify: {e}"),
-                })
-        }
-        KeyDetails::EcdsaP384Sha384 => Err(AppError::Update {
-            message: "P-384 Rekor signing key encountered; not yet wired (no Rekor instance \
-                      currently uses P-384)"
-                .into(),
-        }),
+    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(hint.as_bytes())
+        && decoded == fingerprint_bytes
+    {
+        return true;
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
-// `rekord` v0.0.1 body shape, with `signature.format = "ssh"`. Rekor
-// canonicalizes `data.content` (which the producer must submit) down to
-// `data.hash` in the stored body, so the shape we see at verify time is
-// hash-only.
+// `hashedrekord` v0.0.1 body shape (same kind as the CI side, with the
+// difference that `publicKey.content` is a PEM `-----BEGIN PUBLIC KEY-----`
+// SPKI block here, vs. a PEM Fulcio certificate on the CI side).
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct RekordBody {
+struct HashedRekordBody {
     kind: String,
     #[serde(rename = "apiVersion")]
     api_version: String,
-    spec: RekordSpec,
+    spec: HashedRekordSpec,
 }
 
 #[derive(Deserialize)]
-struct RekordSpec {
+struct HashedRekordSpec {
     data: SpecData,
     signature: SpecSignature,
 }
@@ -799,15 +734,10 @@ struct SpecHash {
 
 #[derive(Deserialize)]
 struct SpecSignature {
-    /// `"ssh"`. Distinguishes `rekord` from a PGP / minisign / x509 /
-    /// TUF-signed entry — Rekor's rekord schema is polymorphic over PKI
-    /// type and the consumer must re-check.
-    format: String,
-    /// Base64 of the PEM SSH-SIG blob. We don't read it here — the
-    /// authoritative copy lives in `messageSignature.signature` per the
-    /// Sigstore Bundle v0.3 model — but we keep the field in the
-    /// deserialization so the rekord body schema stays complete.
-    #[allow(dead_code)]
+    /// Base64 of the raw signature bytes (ECDSA DER for ECDSA-P256/P384,
+    /// 64 bytes for Ed25519). Cross-checked against the bundle's
+    /// `messageSignature.signature` so a malicious bundle can't point at
+    /// a tlog entry for a different signing event.
     content: String,
     #[serde(rename = "publicKey")]
     public_key: SpecPublicKey,
@@ -851,48 +781,47 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write;
-        write!(out, "{b:02x}").unwrap();
-    }
-    out
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn ssh_fingerprint_matches_shell_pipeline() {
-        // Tests that ssh_pubkey_fingerprint_hex matches what
-        //   `awk '{print $2}' pub.key | base64 -d | shasum -a 256`
-        // produces (the algorithm we documented in TRUST-ROOT.md). For a
-        // fixed Ed25519 pubkey line, both should yield the same hex.
-        let pubkey_line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBzlNbqOgZsQuvOSnk6QklRfL/x6AYHpsLwQy7c6KhM/ test@example";
-        let pk = parse_openssh_pubkey(pubkey_line).unwrap();
-        let computed = ssh_pubkey_fingerprint_hex(&pk);
+    fn pem_public_key_rejects_certificate_block() {
+        // Rejects a PEM CERTIFICATE block (which the CI side uses) —
+        // human attestations carry a `PUBLIC KEY` SPKI block.
+        let pem = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        assert!(pem_public_key_to_spki_der(pem).is_err());
+    }
 
-        // Independent computation: base64-decode the wire field, sha256, hex.
-        use base64::Engine;
-        let parts: Vec<&str> = pubkey_line.split_whitespace().collect();
-        let wire = base64::engine::general_purpose::STANDARD
-            .decode(parts[1])
-            .unwrap();
-        let shell_pipeline = sha256_hex(&wire);
-
+    #[test]
+    fn pem_public_key_decodes_real_p256_spki() {
+        // A real ECDSA-P-256 PEM SPKI taken from a cosign generate-key-pair
+        // output. Confirms the parser produces 91-byte DER (typical SPKI
+        // length for P-256).
+        let pem = b"-----BEGIN PUBLIC KEY-----\n\
+                    MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEJsEXjtQe9u/kRQ006UUEXIt4aY7u\n\
+                    JI4fqwrk1qBM9GyGPqZYJrflz/dWImo3wdF17ZG3kmfSe/rCiQKL3x/unQ==\n\
+                    -----END PUBLIC KEY-----\n";
+        let der = pem_public_key_to_spki_der(pem).unwrap();
         assert_eq!(
-            computed, shell_pipeline,
-            "ssh-key's fingerprint(Sha256) must equal sha256(wire-format pubkey)"
+            der.len(),
+            91,
+            "P-256 SPKI DER is 91 bytes; got {}",
+            der.len()
         );
     }
 
     #[test]
-    fn parse_openssh_pubkey_rejects_malformed() {
-        assert!(parse_openssh_pubkey("not even close").is_err());
-        assert!(parse_openssh_pubkey("").is_err());
+    fn pubkey_hint_matches_both_hex_and_b64_forms() {
+        let fp_bytes = [
+            0x63, 0x09, 0xa2, 0x21, 0x83, 0x6d, 0xcc, 0xc1, 0x31, 0x4b, 0x42, 0x6c, 0xaf, 0x97,
+            0x12, 0xb2, 0x24, 0x42, 0xa2, 0x32, 0x50, 0x48, 0xc6, 0xd6, 0x9a, 0xfe, 0xe1, 0xa6,
+            0xf4, 0x88, 0xf6, 0x7e,
+        ];
+        let fp_hex = "6309a221836dccc1314b426caf9712b22442a2325048c6d69afee1a6f488f67e";
+        let fp_b64 = "YwmiIYNtzMExS0Jsr5cSsiRCojJQSMbWmv7hpvSI9n4=";
+        assert!(pubkey_hint_matches_fingerprint(fp_hex, fp_hex, &fp_bytes));
+        assert!(pubkey_hint_matches_fingerprint(fp_b64, fp_hex, &fp_bytes));
+        assert!(!pubkey_hint_matches_fingerprint("ffff", fp_hex, &fp_bytes));
     }
 
     #[test]

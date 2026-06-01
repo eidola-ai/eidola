@@ -74,9 +74,10 @@ pub(crate) struct RawPublicKeyHint {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MessageSignature {
     pub message_digest: MessageDigest,
-    /// Base64. For the CI side this is the raw ECDSA-P256 signature over
-    /// the manifest digest; for the human side it is the raw bytes of the
-    /// PEM-wrapped SSH-SIG blob produced by `ssh-keygen -Y sign`.
+    /// Base64. The raw signature bytes — ECDSA DER for ECDSA-P256/P384
+    /// keys, 64 bytes for Ed25519. Both the CI bundle (cosign + Fulcio)
+    /// and the human bundle (cosign + local/PKCS#11/KMS key) carry the
+    /// same shape here.
     pub signature: String,
 }
 
@@ -101,9 +102,10 @@ pub(crate) struct TlogEntry {
     pub inclusion_promise: Option<InclusionPromise>,
     #[serde(default)]
     pub inclusion_proof: Option<InclusionProof>,
-    /// Base64 of the canonical rekor entry body — `hashedrekord` JSON
-    /// for the CI sigstore path, `rekord` (with `signature.format=ssh`)
-    /// JSON for the human attestation path.
+    /// Base64 of the canonical `hashedrekord` v0.0.1 JSON. Both the
+    /// CI sigstore path (publicKey arm = Fulcio leaf cert) and the
+    /// human attestation path (publicKey arm = PKIX SPKI) ride this
+    /// same body shape.
     pub canonicalized_body: String,
 }
 

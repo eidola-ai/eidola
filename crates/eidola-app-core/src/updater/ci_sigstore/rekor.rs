@@ -32,12 +32,10 @@
 //! Tracked in `releases/TRUST-ROOT.md` under "Known gaps."
 
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use signature::hazmat::PrehashVerifier;
 
 use crate::error::AppError;
-use crate::updater::merkle;
-use crate::updater::trust::{KeyDetails, RekorKey};
+use crate::updater::rekor_verify;
+use crate::updater::trust::RekorKey;
 
 /// `hashedrekord` v0.0.1 body shape — the canonical entry rekor stores.
 #[derive(Debug, Deserialize)]
@@ -186,101 +184,22 @@ pub fn verify_rekor_entry(
         });
     }
 
-    // ── 2. SET signature verification. ────────────────────────────────
-    let key = rekor_keys
-        .iter()
-        .find(|k| k.log_id == *log_id)
-        .ok_or_else(|| AppError::Update {
-            message: format!(
-                "no pinned Rekor key matches the bundle's logId `{}` — \
-                 either the trusted root is stale, or the bundle is from a different log",
-                hex_encode(log_id)
-            ),
-        })?;
-    let canonical_body_b64 = base64_std_encode(canonical_body);
-    // Keys ordered lexicographically by ASCII codepoint: body (0x62) <
-    // integratedTime (0x69) < logID (0x6C 0x6F 0x67 0x49 0x44) <
-    // logIndex (0x6C 0x6F 0x67 0x49 0x6E). `D` (0x44) < `n` (0x6E), so
-    // logID precedes logIndex. Must match the human side; both must
-    // match what Rekor actually signed.
-    let signed_payload = format!(
-        r#"{{"body":"{body}","integratedTime":{it},"logID":"{lid}","logIndex":{li}}}"#,
-        body = canonical_body_b64,
-        it = integrated_time,
-        lid = hex_encode(log_id),
-        li = log_index,
-    );
-    verify_rekor_signature(key, signed_payload.as_bytes(), set_bytes)?;
-
-    // ── 3. Merkle inclusion proof. ────────────────────────────────────
-    let leaf_hash = merkle::hash_leaf(canonical_body);
-    merkle::verify_inclusion_proof(
-        proof_leaf_index,
-        &leaf_hash,
-        tree_size,
-        proof_hashes,
+    // ── 2 + 3. SET signature + Merkle inclusion (shared with the
+    //          human-attestation path; see `super::rekor_verify`). ──────
+    rekor_verify::verify_set_and_inclusion(
+        canonical_body,
+        set_bytes,
+        integrated_time,
+        log_index,
+        log_id,
         proof_root_hash,
+        proof_hashes,
+        tree_size,
+        proof_leaf_index,
+        rekor_keys,
     )?;
 
     Ok(VerifiedRekorEntry { log_index })
-}
-
-fn verify_rekor_signature(
-    key: &RekorKey,
-    message: &[u8],
-    signature: &[u8],
-) -> Result<(), AppError> {
-    match key.key_details {
-        KeyDetails::EcdsaP256Sha256 => {
-            use spki::DecodePublicKey;
-            let vk =
-                p256::ecdsa::VerifyingKey::from_public_key_der(&key.spki_der).map_err(|e| {
-                    AppError::Update {
-                        message: format!("parsing pinned Rekor P-256 pubkey: {e}"),
-                    }
-                })?;
-            let sig =
-                p256::ecdsa::Signature::from_der(signature).map_err(|e| AppError::Update {
-                    message: format!("parsing Rekor SET signature DER (P-256): {e}"),
-                })?;
-            let prehash = Sha256::digest(message);
-            vk.verify_prehash(&prehash, &sig)
-                .map_err(|e| AppError::Update {
-                    message: format!("Rekor SET signature failed P-256 verify: {e}"),
-                })
-        }
-        KeyDetails::Ed25519 => {
-            // Ed25519 SPKI pubkeys are SPKI-wrapped raw 32-byte pubkeys.
-            // ed25519-dalek can ingest them via the spki adapter.
-            use ed25519_dalek::pkcs8::DecodePublicKey;
-            let vk =
-                ed25519_dalek::VerifyingKey::from_public_key_der(&key.spki_der).map_err(|e| {
-                    AppError::Update {
-                        message: format!("parsing pinned Rekor Ed25519 pubkey: {e}"),
-                    }
-                })?;
-            if signature.len() != 64 {
-                return Err(AppError::Update {
-                    message: format!(
-                        "Ed25519 SET signature must be 64 bytes, got {}",
-                        signature.len()
-                    ),
-                });
-            }
-            let mut sig_bytes = [0u8; 64];
-            sig_bytes.copy_from_slice(signature);
-            let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-            vk.verify_strict(message, &sig)
-                .map_err(|e| AppError::Update {
-                    message: format!("Rekor SET signature failed Ed25519 verify: {e}"),
-                })
-        }
-        KeyDetails::EcdsaP384Sha384 => Err(AppError::Update {
-            message: "P-384 Rekor signing key encountered; not yet wired (no Rekor instance \
-                      currently uses P-384)"
-                .into(),
-        }),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -318,11 +237,6 @@ fn base64_std_decode(s: &str, field: &str) -> Result<Vec<u8>, AppError> {
         })
 }
 
-fn base64_std_encode(b: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(b)
-}
-
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     if !s.len().is_multiple_of(2) {
         return Err(format!("hex string `{s}` has odd length"));
@@ -333,15 +247,6 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-fn hex_encode(b: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(b.len() * 2);
-    for byte in b {
-        write!(out, "{byte:02x}").unwrap();
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,14 +254,6 @@ mod tests {
     // Merkle proof tests live in `super::super::merkle` now; the proof
     // verification is exercised end-to-end through this module via the
     // `verify_inclusion_proof` call inside `verify_rekor_entry`.
-
-    #[test]
-    fn hex_round_trip() {
-        let b: &[u8] = &[0x00, 0xab, 0xcd, 0xef, 0xff];
-        let h = hex_encode(b);
-        assert_eq!(h, "00abcdefff");
-        assert_eq!(hex_decode(&h).unwrap(), b);
-    }
 
     #[test]
     fn hex_rejects_odd_length() {

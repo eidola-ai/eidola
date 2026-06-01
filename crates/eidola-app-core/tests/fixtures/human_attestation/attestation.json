@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "release_version": "0.99.99",
+  "git_commit": "9c3a000000000000000000000000000000000001",
+  "previous_release_git_commit": "9c3a000000000000000000000000000000000000",
+  "artifact_manifest_sha256": "aaaa000000000000000000000000000000000000000000000000000000000000",
+  "privacy_guarantees_doc_sha256": "bbbb000000000000000000000000000000000000000000000000000000000000",
+  "attestant": {
+    "id": "throwaway",
+    "name": "Throwaway Test Key",
+    "key_fingerprint_sha256": "TBD",
+    "jurisdiction": "the Test Jurisdiction"
+  },
+  "attested_at": "2026-05-31T00:00:00Z"
+}

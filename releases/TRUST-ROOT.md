@@ -109,7 +109,7 @@ Each document's shape is owned by the Rust `serde` types shared between the rele
 | `releases/trust/server-enclave.json` | format owned by `scripts/artifact-manifest.sh`, consumed as raw JSON in `eidola-app-core/build.rs` | `schema_version: 1`. Holds just the enclave block (snp/tdx measurement + cmdline) so the cli build doesn't drag its own digest into its build context. |
 | `releases/trust/tinfoil-enclaves.json` | format owned by `.github/workflows/update-measurements.yml`, consumed as raw JSON in `eidola-server/build.rs` | `schema_version: 1`. Allowed upstream Tinfoil inference-enclave measurements the server's outbound verifier accepts. One entry per Tinfoil release, with provenance metadata (built\_at, artifact digest, Rekor log index); the workflow keeps the most recent two for rolling deploys. |
 | `release.json`           | `eidola_attestation::ReleaseIndex` — `crates/eidola-attestation/src/trust_shapes.rs`                      | Unsigned URL-only index; cross-checked via referenced documents (see caveat below)          |
-| `attestation.json`       | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via SSH (`ssh-keygen -Y sign -n file`), logged to Rekor as a `rekord` v0.0.1 entry with `signature.format=ssh` |
+| `attestation.json`       | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via `cosign sign-blob` (local PEM, PKCS#11 URI, or any KMS URI cosign supports), logged to Rekor as a `hashedrekord` v0.0.1 entry with a PKIX SubjectPublicKeyInfo (ECDSA-P256/P384 or Ed25519) in `signature.publicKey.content` |
 | `trust-constants.json`   | `eidola_attestation::TrustConstants` — `crates/eidola-attestation/src/trust_shapes.rs`                    | Pinned trust values baked into the verifier at build time                                   |
 | Templates                | `releases/schema/attestation-templates-v1.json` (data, not a schema)                                      | Pinned claim templates the verifier re-renders during equality checks                       |
 
@@ -143,28 +143,35 @@ based on which document is being verified:
 | Surface | Signature | Identity binding | Transparency |
 | --- | --- | --- | --- |
 | CI signs `artifact-manifest.json` | Sigstore bundle | Fulcio keyless cert — OIDC identity matches `EXPECTED_CI_IDENTITY_PATTERN` | Rekor inclusion proof embedded in the bundle |
-| Engineer signs `attestation-<id>.json` | SSH signature (`ssh-keygen -Y sign`, namespace `"file"` — forced by Rekor's SSH PKI verifier) | `sha256(SSH wire-format pubkey)` matches `TRUSTED_ATTESTANT_FINGERPRINTS` | Posted to Rekor as a `rekord` v0.0.1 entry with `signature.format=ssh`; Rekor canonicalizes `data.content` away, leaving only `data.hash` in the public log; inclusion proof saved in `attestation-<id>.bundle.json` |
+| Engineer signs `attestation-<id>.json` | `cosign sign-blob --key <ref>` — `<ref>` is a local PEM, PKCS#11 URI (YubiKey-PIV / SmartCard), or any cosign KMS URI | `sha256(PKIX SubjectPublicKeyInfo DER)` matches `TRUSTED_ATTESTANT_FINGERPRINTS` | Posted to Rekor as a `hashedrekord` v0.0.1 entry (the entry kind that survives Rekor v2 — `rekord` and SSH PKI are being retired); inclusion proof saved in `attestation-<id>.bundle.json` |
 | Engineer signs the git tag | SSH signature (same key) | Same fingerprint | Implicit via the repo |
 
 The CI side uses Sigstore because Fulcio's keyless OIDC binding is *the*
 mechanism that makes "this signature came from the release workflow on a
 specific tag" cryptographically meaningful — no other system offers that.
 
-The engineer side uses SSH because:
-- The hardware-backing options are broader (Secretive's Secure Enclave,
-  YubiKey-SK, 1Password agent, FIDO2 resident keys) — no specific brand
-  required of future contributors.
-- The signature format is dramatically simpler than the Sigstore bundle —
-  the verifier code path is small, well-audited, pure-Rust via the
-  `ssh-key` crate.
-- The same key signs git tags, commits, and attestations, so an engineer
-  has one identity surface.
+The engineer side uses `cosign sign-blob` with a hardware-held key
+because:
+- `cosign` is the canonical Sigstore client; its `hashedrekord` v0.0.1
+  output is the one Rekor entry shape that's guaranteed to survive
+  Rekor v2 (the upcoming tile-based rewrite drops `rekord` and all
+  non-x509 PKIs including SSH).
+- `--key` accepts a PEM, a PKCS#11 URI, or any cosign-supported KMS
+  URI, so the hardware-backing options range from YubiKey-PIV (the
+  recommended path) through HSMs and cloud KMS backends, without us
+  having to wire each one specifically.
+- The verifier shares the bulk of its code path with the CI side: both
+  parse the same `hashedrekord` body shape and the same Sigstore
+  Bundle v0.3 wrapper; only the trust-pinning step differs (fingerprint
+  for human, Fulcio chain + OIDC identity for CI).
 
-Both ride the same Sigstore Rekor transparency log via different entry
-kinds (`hashedrekord` with x509+ECDSA for CI; `rekord` with
-`signature.format=ssh` for human). The verifier shares its Rekor
-inclusion-proof + signed-tree-head verification code between the two
-paths.
+Both paths ride the same Sigstore Rekor transparency log via the same
+entry kind (`hashedrekord` v0.0.1). On the CI side the public key in
+the body is a Fulcio leaf certificate; on the human side it's a PKIX
+SubjectPublicKeyInfo (the attestant's own key). The verifier shares
+its body parsing, Rekor SET signature verification, and Merkle
+inclusion-proof verification between the two paths — see
+`crates/eidola-app-core/src/updater/rekor_verify.rs`.
 
 ### Attestation templates: flat snake_case keys
 

@@ -1,17 +1,17 @@
 {
   "artifacts": {
     "eidola-cli": {
-      "digest": "sha256:e98fc6ae6115b18faae267ad72a86aa43d44f1381c9d1c52c0be3f0f0fb98688",
+      "digest": "sha256:38224be34642c9bb1d198e3731f7539a109251aec6b96dcc6bf626c0d01d6a1c",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
-      "narHash": "sha256-5Zvi9Zt3kS+dixeSLzJtHzRSPxgoPLL9p2+CUDOH+T8=",
+      "narHash": "sha256-SrG9SHBgqtShLiu1mueij4rJjkb7H443CEbVceE9Gd8=",
       "platform": "darwin/universal",
       "type": "nix"
     },
     "eidola-gui-macos-universal": {
-      "narHash": "sha256-Z1kOzCnYcWK6pflmWfaE6iFtkFi7Tfr0IqQtP7PPj+Q=",
+      "narHash": "sha256-rObEUGdYHFCDMIEX9NBDUKA/IZW/uSmVBoUmk56IXzk=",
       "platform": "darwin/universal",
       "type": "nix"
     },

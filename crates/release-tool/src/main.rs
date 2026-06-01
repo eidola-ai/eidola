@@ -10,27 +10,27 @@
 //! 2. `release-tool attest <tag>` — interactively walks every claim in
 //!    `attestation-templates-v1.json`, rendering each from the engineer's
 //!    inputs. Each claim requires typing the word `yes` to affirm; anything
-//!    else aborts. On full affirmation, signs the attestation file with the
-//!    engineer's hardware-backed SSH key via `ssh-keygen -Y sign`, posts the
-//!    resulting signature to Sigstore Rekor as a `rekord` entry (with
-//!    `signature.format=ssh`), and
-//!    uploads the attestation JSON + bundle (rekor inclusion proof) to the
-//!    release. Then generates and uploads `release.json` (URL-only index —
-//!    see `releases/TRUST-ROOT.md`) and marks the release as latest.
+//!    else aborts. On full affirmation, signs the attestation file via
+//!    `cosign sign-blob --key <ref>` (where `<ref>` is a local PEM, a
+//!    PKCS#11 URI for a YubiKey/SmartCard, or any cosign-supported KMS
+//!    URI), which posts the signature to Sigstore Rekor as a
+//!    `hashedrekord` v0.0.1 entry and emits a Sigstore Bundle v0.3.
+//!    `release-tool` uploads the attestation JSON + bundle + the
+//!    `release.json` URL index to the GitHub release and marks it as
+//!    latest. See `releases/TRUST-ROOT.md`.
 //!
-//! CI side uses sigstore + cosign (Fulcio keyless via OIDC) → Rekor
-//! `hashedrekord`. Human side uses SSH signatures (`ssh-keygen -Y sign`,
-//! namespace `"file"`) → Rekor `rekord` with `signature.format=ssh`.
-//! Both end up in the same Rekor transparency log; the verifier
-//! dispatches on entry kind.
+//! Both CI and engineer sides ride the same Rekor entry shape:
+//! `hashedrekord` v0.0.1. They differ only in the publicKey arm — CI
+//! has a Fulcio keyless leaf cert; engineer has a PKIX
+//! SubjectPublicKeyInfo whose `sha256` fingerprint is pinned by
+//! `TRUSTED_ATTESTANT_FINGERPRINTS`. The Rekor v2 transition keeps
+//! `hashedrekord` (rekord and the SSH PKI are being retired), so this
+//! shape is forward-compatible.
 //!
-//! Shells out to `gh`, `ssh-keygen`, and `git`. All must be on PATH. CI
-//! signature verification goes through `eidola-app-core`'s pure-Rust
-//! verifier — the same code path that ships to users — so `cosign` is no
-//! longer required on the engineer's PATH. `ssh-keygen -Y sign`
-//! automatically uses `SSH_AUTH_SOCK` to reach agent-held keys (Secretive,
-//! 1Password, FIDO2-SK, …), so the engineer does not need the private key
-//! on disk.
+//! Shells out to `gh`, `cosign`, and `git`. All must be on PATH. For
+//! local PEM cosign keys the engineer also needs `COSIGN_PASSWORD` in
+//! the environment; for PKCS#11 / KMS keys, the device or KMS handles
+//! its own auth (PIN, IAM, ...).
 
 use std::path::PathBuf;
 
@@ -65,22 +65,27 @@ enum Command {
     },
 
     /// Interactively render and affirm each claim, sign with the hardware-
-    /// backed SSH key, post to Rekor, upload, and mark the release as
-    /// latest.
+    /// backed attestant key, post to Rekor, upload, and mark the
+    /// release as latest.
     Attest {
         /// The release tag, e.g. `v0.5.0`.
         tag: String,
 
-        /// Path to the SSH public key file (`.pub`). The private key must
-        /// be reachable via `SSH_AUTH_SOCK` (e.g. Secretive, 1Password,
-        /// FIDO2-SK). Read from `EIDOLA_ATTESTANT_SSH_PUBKEY` if set.
-        #[arg(long, env = "EIDOLA_ATTESTANT_SSH_PUBKEY")]
-        ssh_pubkey: std::path::PathBuf,
+        /// Cosign key reference. One of: a local PEM path
+        /// (`/path/to/cosign.key` — passphrase from `COSIGN_PASSWORD`),
+        /// a PKCS#11 URI (`pkcs11:slot-id=0;object=eidola`), or any
+        /// KMS URI cosign supports (`awskms:...`, `gcpkms:...`,
+        /// `azurekms:...`, `hashivault:...`). Passed through to
+        /// `cosign sign-blob --key` verbatim. Read from
+        /// `EIDOLA_ATTESTANT_COSIGN_KEY` if set.
+        #[arg(long, env = "EIDOLA_ATTESTANT_COSIGN_KEY")]
+        cosign_key: String,
 
         /// Short attestant identifier — used as the filename suffix
         /// (`attestation-<id>.json`) and recorded in `release.json`. The
-        /// SSH pubkey's fingerprint is what's actually matched against the
-        /// client's `trusted_attestant_fingerprints`.
+        /// attestant key's fingerprint (`sha256(SPKI DER)`) is what's
+        /// actually matched against the client's
+        /// `trusted_attestant_fingerprints`.
         #[arg(long, env = "EIDOLA_ATTESTANT_ID")]
         attestant_id: String,
 
@@ -113,7 +118,7 @@ fn main() -> Result<()> {
         }),
         Command::Attest {
             tag,
-            ssh_pubkey,
+            cosign_key,
             attestant_id,
             attestant_name,
             jurisdiction,
@@ -121,7 +126,7 @@ fn main() -> Result<()> {
             workspace_root,
             repo,
             tag,
-            ssh_pubkey,
+            cosign_key,
             attestant_id,
             attestant_name,
             jurisdiction,

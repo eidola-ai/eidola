@@ -140,13 +140,15 @@ release-verify tag:
     cargo run -q -p release-tool -- verify {{ tag }}
 
 # Interactive: render each claim, prompt to type 'yes' to affirm, sign
-# with the SSH agent (Secretive / 1Password / FIDO2-SK), upload
-# attestation + release.json, mark release as latest. Reads attestant
-# identity from EIDOLA_ATTESTANT_SSH_PUBKEY / _ID / _NAME / _JURISDICTION
-# env vars (preferred — set once in your shell profile or .envrc).
-# Trailing args are forwarded to `release-tool attest`, so per-invocation
-# overrides also work, e.g.
-#   just release-attest v0.0.8 --ssh-pubkey /path/to/key.pub \
+# with cosign (local PEM, PKCS#11 URI for a YubiKey/SmartCard, or any
+# cosign-supported KMS URI), upload attestation + release.json, mark
+# release as latest. Reads attestant identity from
+# EIDOLA_ATTESTANT_COSIGN_KEY / _ID / _NAME / _JURISDICTION env vars
+# (preferred — set once in your shell profile or .envrc). For local
+# PEM keys, also set COSIGN_PASSWORD (empty string is OK for passphrase-
+# less throwaway keys). Trailing args are forwarded to `release-tool
+# attest`, so per-invocation overrides also work, e.g.
+#   just release-attest v0.0.8 --cosign-key /path/to/cosign.key \
 #       --attestant-id mike-marcacci \
 #       --attestant-name "Michael Marcacci" \
 #       --jurisdiction "the State of California, United States"
