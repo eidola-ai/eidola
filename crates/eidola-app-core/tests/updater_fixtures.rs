@@ -6,8 +6,8 @@
 //! `Fetcher` reads the right file at each pipeline stage, and that the
 //! verifier reaches the cryptographic stages with on-disk bytes — but they
 //! do **not** attempt to construct a fully-passing crypto run. That would
-//! require real Fulcio certs, Rekor entries, SSH signatures, etc., none of
-//! which we want to invent here.
+//! require real Fulcio certs, Rekor entries, cosign-emitted blob
+//! signatures, etc., none of which we want to invent here.
 //!
 //! TODO: capture a real `v0.0.1` release set into
 //! `tests/fixtures/v0.0.1/` once the first signed release lands. With real

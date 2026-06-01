@@ -62,11 +62,13 @@ pub(crate) struct RawCert {
 
 #[derive(Deserialize)]
 pub(crate) struct RawPublicKeyHint {
-    /// Opaque identifier the verifier uses to look up the pubkey. For our
-    /// human attestations this is the SSH pubkey's SHA-256 fingerprint
-    /// (lowercase hex) — the same value
-    /// `compute_ssh_fingerprint` produces and that the trust constants
-    /// pin in `TRUSTED_ATTESTANT_FINGERPRINTS`.
+    /// Producer-defined advisory metadata (cosign emits
+    /// `base64(sha256(spki_der))`; other tools may vary). The verifier
+    /// intentionally does *not* cross-check this field — identity is
+    /// anchored by the SPKI embedded in the rekor body matching
+    /// `TRUSTED_ATTESTANT_FINGERPRINTS`. Kept on the struct so serde
+    /// successfully parses bundles that carry it.
+    #[allow(dead_code)]
     pub hint: String,
 }
 

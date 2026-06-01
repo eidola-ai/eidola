@@ -152,5 +152,13 @@ release-verify tag:
 #       --attestant-id mike-marcacci \
 #       --attestant-name "Michael Marcacci" \
 #       --jurisdiction "the State of California, United States"
+#
+# PKCS#11 note: cosign's PKCS#11 support ships as a separate driver
+# binary (`cosign-pivkey-pkcs11key`) — the default Homebrew and GitHub-
+# release `cosign` binaries do NOT include it. For a YubiKey-PIV key
+# (`pkcs11:slot-id=…`), either install that driver build (e.g.
+# `go install github.com/sigstore/cosign/v2/cmd/cosign-pivkey-pkcs11key@latest`)
+# or use a KMS URI instead. KMS-backed keys (`awskms:`, `gcpkms:`,
+# `azurekms:`, `hashivault:`) work with the stock cosign binary.
 release-attest tag *args:
     cargo run -q -p release-tool -- attest {{ tag }} {{ args }}

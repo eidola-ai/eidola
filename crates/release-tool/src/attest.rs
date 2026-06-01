@@ -290,8 +290,9 @@ fn require_tool(name: &str) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    // Some tools (e.g. ssh-keygen) exit non-zero on --version; accept either
-    // exit-code success or "the binary at least dispatched."
+    // Accept any tool whose `--version` invocation reached the binary;
+    // we just need to confirm it's resolvable on PATH, not that it
+    // implements a specific exit-code convention.
     if status.is_ok() {
         return Ok(());
     }

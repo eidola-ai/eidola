@@ -97,7 +97,11 @@ pub struct VerifiedRekorEntry {
 ///   bytewise — robust to PEM wrap-column / trailing-newline differences.
 /// - `bundle_sig_bytes` — the messageSignature bytes; the entry's
 ///   `signature.content` must base64-decode to these same bytes.
-/// - `canonical_body` — base64-decoded `canonicalizedBody`.
+/// - `canonical_body` — base64-decoded `canonicalizedBody` (used for
+///   the Merkle leaf hash + body schema parsing).
+/// - `canonical_body_b64` — the bundle's `canonicalizedBody` string
+///   verbatim (used for the SET payload — must match Rekor's exact
+///   emitted bytes).
 /// - `set_bytes` — base64-decoded SignedEntryTimestamp.
 /// - `integrated_time` / `log_index` — from the bundle's tlog entry.
 /// - `log_id` — 32-byte sha256 identifying which rekor key signed the SET.
@@ -111,6 +115,7 @@ pub fn verify_rekor_entry(
     leaf_cert_der: &[u8],
     bundle_sig_bytes: &[u8],
     canonical_body: &[u8],
+    canonical_body_b64: &str,
     set_bytes: &[u8],
     integrated_time: i64,
     log_index: u64,
@@ -188,6 +193,7 @@ pub fn verify_rekor_entry(
     //          human-attestation path; see `super::rekor_verify`). ──────
     rekor_verify::verify_set_and_inclusion(
         canonical_body,
+        canonical_body_b64,
         set_bytes,
         integrated_time,
         log_index,

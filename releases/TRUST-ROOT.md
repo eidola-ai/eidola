@@ -144,7 +144,7 @@ based on which document is being verified:
 | --- | --- | --- | --- |
 | CI signs `artifact-manifest.json` | Sigstore bundle | Fulcio keyless cert — OIDC identity matches `EXPECTED_CI_IDENTITY_PATTERN` | Rekor inclusion proof embedded in the bundle |
 | Engineer signs `attestation-<id>.json` | `cosign sign-blob --key <ref>` — `<ref>` is a local PEM, PKCS#11 URI (YubiKey-PIV / SmartCard), or any cosign KMS URI | `sha256(PKIX SubjectPublicKeyInfo DER)` matches `TRUSTED_ATTESTANT_FINGERPRINTS` | Posted to Rekor as a `hashedrekord` v0.0.1 entry (the entry kind that survives Rekor v2 — `rekord` and SSH PKI are being retired); inclusion proof saved in `attestation-<id>.bundle.json` |
-| Engineer signs the git tag | SSH signature (same key) | Same fingerprint | Implicit via the repo |
+| Engineer signs the git tag | SSH signature (separate SSH key in the engineer's git config) | OpenSSH wire-format SHA-256 fingerprint — *not* the same as the cosign SPKI fingerprint above, even if the underlying private key is shared | Implicit via the repo |
 
 The CI side uses Sigstore because Fulcio's keyless OIDC binding is *the*
 mechanism that makes "this signature came from the release workflow on a
@@ -384,6 +384,7 @@ TrustedRoot. The Sigstore verification approach (CI side) is adapted from
 [tinfoil-rs](https://github.com/tinfoilsh/tinfoil-rs), which in turn
 adapts verification modules from
 [sigstore-rs](https://github.com/sigstore/sigstore-rs) (Apache 2.0). The
-SSH signature verification (human side) uses the
-[`ssh-key`](https://github.com/RustCrypto/SSH/tree/master/ssh-key) crate
-from RustCrypto.
+human attestation path runs through the same Sigstore Bundle v0.3 +
+`hashedrekord` v0.0.1 machinery as the CI path; the cosign-side signing
+flow comes from [cosign](https://github.com/sigstore/cosign) (Apache
+2.0).

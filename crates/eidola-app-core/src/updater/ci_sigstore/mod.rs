@@ -303,6 +303,7 @@ pub fn verify_ci_signature(
         &cert_der,
         &signature_bytes,
         &canonical_body,
+        &entry.canonicalized_body,
         &set_bytes,
         integrated_time,
         log_index,

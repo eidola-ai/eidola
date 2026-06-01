@@ -36,9 +36,12 @@
 //! 5. **Pubkey extraction + fingerprint check.** Decode
 //!    `body.signature.publicKey.content` (base64) to the PEM
 //!    `-----BEGIN PUBLIC KEY-----` block, decode to PKIX SubjectPublicKeyInfo
-//!    DER, fingerprint = `sha256(spki_der)`. Require it equal both
-//!    [`super::sigstore_bundle::RawPublicKeyHint::hint`] *and* a member
-//!    of [`trust_root::TRUSTED_ATTESTANT_FINGERPRINTS`].
+//!    DER, fingerprint = `sha256(spki_der)`. Require it equal a member
+//!    of [`trust_root::TRUSTED_ATTESTANT_FINGERPRINTS`]. The bundle's
+//!    `verificationMaterial.publicKey.hint` is producer-defined
+//!    advisory metadata and is intentionally not cross-checked —
+//!    identity is anchored entirely by the rekor body's embedded
+//!    SPKI.
 //! 6. **Blob signature verify.** Dispatch on the SPKI's
 //!    AlgorithmIdentifier OID (ECDSA-P256, ECDSA-P384, Ed25519) and
 //!    verify the messageSignature against `attestation_bytes`. ECDSA
@@ -111,13 +114,19 @@ pub fn verify_human_attestation(
     let entry = &vm.tlog_entries[0];
 
     // Human attestations use the `publicKey` arm of the `verificationMaterial`
-    // oneof (vs. cosign's `certificate`). Fail loudly on a CI-shaped bundle
-    // arriving here — that's a mismatched-verifier bug.
-    let pubkey_hint = vm.public_key.as_ref().ok_or_else(|| AppError::Update {
-        message: "attestation bundle has no `verificationMaterial.publicKey` — \
-                      human attestations must carry a public key hint, not a Fulcio cert"
-            .into(),
-    })?;
+    // oneof (vs. CI's `certificate`). Fail loudly on a CI-shaped bundle
+    // arriving here — that's a mismatched-verifier bug. We only require the
+    // arm to be present; its `hint` value is producer-defined metadata and
+    // intentionally not cross-checked, since identity is anchored entirely
+    // by the SPKI embedded in the rekor body matching
+    // `TRUSTED_ATTESTANT_FINGERPRINTS` (see step 5 below).
+    if vm.public_key.is_none() {
+        return Err(AppError::Update {
+            message: "attestation bundle has no `verificationMaterial.publicKey` — \
+                      human attestations carry the publicKey arm, not a Fulcio cert"
+                .into(),
+        });
+    }
     if vm.certificate.is_some() {
         return Err(AppError::Update {
             message: "attestation bundle carries both `publicKey` and `certificate` in \
@@ -219,22 +228,6 @@ pub fn verify_human_attestation(
     let spki_der = pem_public_key_to_spki_der(&pubkey_pem_bytes)?;
     let fingerprint_bytes = Sha256::digest(&spki_der);
     let fingerprint_hex = hex_encode(fingerprint_bytes.as_slice());
-    // The bundle's publicKey.hint is cosign's `base64(sha256(spki_der))`.
-    // We accept either base64 OR hex to be friendly to other producers,
-    // but cross-check it against the fingerprint we just derived.
-    if !pubkey_hint_matches_fingerprint(
-        &pubkey_hint.hint,
-        &fingerprint_hex,
-        fingerprint_bytes.as_slice(),
-    ) {
-        return Err(AppError::Update {
-            message: format!(
-                "attestation rekor body pubkey fingerprint `{fingerprint_hex}` ≠ \
-                 verificationMaterial.publicKey.hint `{}` — bundle is inconsistent",
-                pubkey_hint.hint
-            ),
-        });
-    }
     if !trust_root::TRUSTED_ATTESTANT_FINGERPRINTS
         .iter()
         .any(|fp| fp.eq_ignore_ascii_case(&fingerprint_hex))
@@ -342,6 +335,7 @@ pub fn verify_human_attestation(
         .collect::<Result<_, AppError>>()?;
     rekor_verify::verify_set_and_inclusion(
         &body_bytes,
+        &entry.canonicalized_body,
         &set_bytes,
         integrated_time,
         log_index,
@@ -680,27 +674,6 @@ fn pem_public_key_to_spki_der(pem_bytes: &[u8]) -> Result<Vec<u8>, AppError> {
         })
 }
 
-/// `verificationMaterial.publicKey.hint` is producer-defined. cosign
-/// uses `base64(sha256(spki_der))`; other tools may use hex. Accept
-/// either, but require it to match the fingerprint we just derived
-/// from the rekor body's embedded pubkey.
-fn pubkey_hint_matches_fingerprint(
-    hint: &str,
-    fingerprint_hex: &str,
-    fingerprint_bytes: &[u8],
-) -> bool {
-    use base64::Engine;
-    if hint.eq_ignore_ascii_case(fingerprint_hex) {
-        return true;
-    }
-    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(hint.as_bytes())
-        && decoded == fingerprint_bytes
-    {
-        return true;
-    }
-    false
-}
-
 // ---------------------------------------------------------------------------
 // `hashedrekord` v0.0.1 body shape (same kind as the CI side, with the
 // difference that `publicKey.content` is a PEM `-----BEGIN PUBLIC KEY-----`
@@ -808,20 +781,6 @@ mod tests {
             "P-256 SPKI DER is 91 bytes; got {}",
             der.len()
         );
-    }
-
-    #[test]
-    fn pubkey_hint_matches_both_hex_and_b64_forms() {
-        let fp_bytes = [
-            0x63, 0x09, 0xa2, 0x21, 0x83, 0x6d, 0xcc, 0xc1, 0x31, 0x4b, 0x42, 0x6c, 0xaf, 0x97,
-            0x12, 0xb2, 0x24, 0x42, 0xa2, 0x32, 0x50, 0x48, 0xc6, 0xd6, 0x9a, 0xfe, 0xe1, 0xa6,
-            0xf4, 0x88, 0xf6, 0x7e,
-        ];
-        let fp_hex = "6309a221836dccc1314b426caf9712b22442a2325048c6d69afee1a6f488f67e";
-        let fp_b64 = "YwmiIYNtzMExS0Jsr5cSsiRCojJQSMbWmv7hpvSI9n4=";
-        assert!(pubkey_hint_matches_fingerprint(fp_hex, fp_hex, &fp_bytes));
-        assert!(pubkey_hint_matches_fingerprint(fp_b64, fp_hex, &fp_bytes));
-        assert!(!pubkey_hint_matches_fingerprint("ffff", fp_hex, &fp_bytes));
     }
 
     #[test]

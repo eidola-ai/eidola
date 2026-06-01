@@ -28,9 +28,19 @@ use super::trust::{KeyDetails, RekorKey};
 /// `{body, integratedTime, logID, logIndex}` payload, then verify the
 /// inclusion proof of `canonical_body`'s leaf hash up to
 /// `proof_root_hash`.
+///
+/// The SET payload uses `canonical_body_b64` *verbatim* — the bundle's
+/// `tlogEntries[].canonicalizedBody` string exactly as Rekor emitted
+/// it — while the Merkle leaf hash is computed over the decoded
+/// `canonical_body` bytes. We don't round-trip the body through our
+/// own base64 encoder for the SET payload: Rekor signed whatever byte
+/// sequence it chose for that b64 string, so any drift in padding,
+/// alphabet, or trailing whitespace from a re-encode would silently
+/// break SET verification.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn verify_set_and_inclusion(
     canonical_body: &[u8],
+    canonical_body_b64: &str,
     set_bytes: &[u8],
     integrated_time: i64,
     log_index: u64,
@@ -51,7 +61,6 @@ pub(super) fn verify_set_and_inclusion(
                 hex_encode(log_id)
             ),
         })?;
-    let canonical_body_b64 = base64_std_encode(canonical_body);
     // Keys ordered lexicographically by ASCII codepoint: body (0x62) <
     // integratedTime (0x69) < logID (0x6C 0x6F 0x67 0x49 0x44) <
     // logIndex (0x6C 0x6F 0x67 0x49 0x6E). `D` (0x44) < `n` (0x6E), so
@@ -270,11 +279,6 @@ fn verify_ed25519_blob(spki_der: &[u8], message: &[u8], signature: &[u8]) -> Res
 // ---------------------------------------------------------------------------
 // Small encoders
 // ---------------------------------------------------------------------------
-
-fn base64_std_encode(b: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(b)
-}
 
 fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;

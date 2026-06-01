@@ -199,10 +199,12 @@ pub struct ReleaseSummary {
 
 /// One verified human attestation, ready to render. The verifier guarantees:
 ///
-/// - The SSH signature over the attestation bytes is valid (namespace
-///   `"file"`, forced by Rekor's SSH PKI verifier).
-/// - The signer's pubkey fingerprint (`fingerprint_hex`) is in this
-///   client's pinned `TRUSTED_ATTESTANT_FINGERPRINTS`.
+/// - The cosign-emitted blob signature over the attestation bytes is
+///   valid under the attestant's pubkey (ECDSA-P256 / ECDSA-P384 /
+///   Ed25519 — dispatched on the SPKI's algorithm OID).
+/// - The signer's pubkey fingerprint (`fingerprint_hex` =
+///   `sha256(PKIX SubjectPublicKeyInfo DER)`) is in this client's
+///   pinned `TRUSTED_ATTESTANT_FINGERPRINTS`.
 /// - The signature was logged in Sigstore Rekor (`rekor_log_index`,
 ///   SET-signed by a pinned Rekor key, with a valid inclusion proof).
 /// - The attestation's `release_version` / `git_commit` /
@@ -385,7 +387,7 @@ pub async fn check_for_update_with(
         tracer.log(
             "verify-human",
             format!(
-                "verifying {} (SSH-SIG + Rekor + templates)",
+                "verifying {} (cosign blob signature + Rekor + templates)",
                 human.attestant_id
             ),
         );
