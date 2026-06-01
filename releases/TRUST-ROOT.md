@@ -159,7 +159,14 @@ because:
 - `--key` accepts a PEM, a PKCS#11 URI, or any cosign-supported KMS
   URI, so the hardware-backing options range from YubiKey-PIV (the
   recommended path) through HSMs and cloud KMS backends, without us
-  having to wire each one specifically.
+  having to wire each one specifically. The underlying key must be
+  ECDSA-P256, ECDSA-P384, or Ed25519 — the updater's
+  `verify_blob_signature_with_spki` dispatches on the SPKI's
+  AlgorithmIdentifier OID and rejects everything else (RSA,
+  ECDSA-P521, …). `release-tool attest` cross-checks the algorithm
+  before signing via the same classifier
+  (`updater::human_attestation::classify_attestant_spki_algorithm`),
+  so a release can't be published in a shape the updater would reject.
 - The verifier shares the bulk of its code path with the CI side: both
   parse the same `hashedrekord` body shape and the same Sigstore
   Bundle v0.3 wrapper; only the trust-pinning step differs (fingerprint

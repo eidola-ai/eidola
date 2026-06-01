@@ -150,27 +150,50 @@ fn verify_rekor_set_signature(
 // (pure Ed25519, not Ed25519ph).
 // ---------------------------------------------------------------------------
 
-/// Verify a blob signature against the message using the public key
-/// encoded as PKIX SubjectPublicKeyInfo DER. Dispatches on the SPKI's
-/// AlgorithmIdentifier OID:
+/// The set of attestant-key algorithms the updater knows how to verify.
+/// Anything else (RSA, ECDSA-P521, …) is rejected by
+/// [`classify_attestant_spki_algorithm`]; the release-tool calls that
+/// classifier at sign time so a release cannot be published in a shape
+/// the updater would later refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestantKeyAlgorithm {
+    EcdsaP256,
+    EcdsaP384,
+    Ed25519,
+}
+
+impl AttestantKeyAlgorithm {
+    /// Short canonical name suitable for log lines and error messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            AttestantKeyAlgorithm::EcdsaP256 => "ECDSA-P256",
+            AttestantKeyAlgorithm::EcdsaP384 => "ECDSA-P384",
+            AttestantKeyAlgorithm::Ed25519 => "Ed25519",
+        }
+    }
+}
+
+/// Inspect a PKIX SubjectPublicKeyInfo DER blob and classify it into one
+/// of the [`AttestantKeyAlgorithm`] variants the updater can verify.
+/// Dispatches on the SPKI's AlgorithmIdentifier OID:
 ///
 /// - `1.2.840.10045.2.1` (id-ecPublicKey) with P-256 curve params →
-///   ECDSA over sha256(message), signature as ASN.1 DER.
-/// - `1.2.840.10045.2.1` with P-384 curve params → ECDSA over
-///   sha256(message), signature as ASN.1 DER.
-/// - `1.3.101.112` (id-Ed25519) → Ed25519 over the raw message, 64-byte
-///   signature.
-pub(super) fn verify_blob_signature_with_spki(
+///   [`AttestantKeyAlgorithm::EcdsaP256`].
+/// - `1.2.840.10045.2.1` with P-384 curve params →
+///   [`AttestantKeyAlgorithm::EcdsaP384`].
+/// - `1.3.101.112` (id-Ed25519) → [`AttestantKeyAlgorithm::Ed25519`].
+/// - Anything else → `Err` — the updater would refuse the resulting
+///   attestation at verify time, so a caller that signs with such a key
+///   would publish a broken release.
+pub fn classify_attestant_spki_algorithm(
     spki_der: &[u8],
-    message: &[u8],
-    signature: &[u8],
-) -> Result<(), AppError> {
+) -> Result<AttestantKeyAlgorithm, AppError> {
     use der::Decode;
     let spki = spki::SubjectPublicKeyInfo::<spki::der::Any, spki::der::asn1::BitString>::from_der(
         spki_der,
     )
     .map_err(|e| AppError::Update {
-        message: format!("parsing SPKI DER for blob signature verify: {e}"),
+        message: format!("parsing SPKI DER for attestant key classification: {e}"),
     })?;
     let alg_oid = spki.algorithm.oid;
     match alg_oid.as_bytes() {
@@ -187,27 +210,52 @@ pub(super) fn verify_blob_signature_with_spki(
             match curve_oid.as_bytes() {
                 // prime256v1 (P-256) — 1.2.840.10045.3.1.7
                 [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07] => {
-                    verify_ecdsa_p256_blob(spki_der, message, signature)
+                    Ok(AttestantKeyAlgorithm::EcdsaP256)
                 }
                 // secp384r1 (P-384) — 1.3.132.0.34
-                [0x2b, 0x81, 0x04, 0x00, 0x22] => {
-                    verify_ecdsa_p384_blob(spki_der, message, signature)
-                }
+                [0x2b, 0x81, 0x04, 0x00, 0x22] => Ok(AttestantKeyAlgorithm::EcdsaP384),
                 other => Err(AppError::Update {
                     message: format!(
-                        "unsupported ECDSA curve OID bytes {other:?}; expected P-256 or P-384"
+                        "unsupported ECDSA curve OID bytes {other:?}; \
+                         updater only accepts ECDSA-P256 or ECDSA-P384"
                     ),
                 }),
             }
         }
         // id-Ed25519 (1.3.101.112)
-        [0x2b, 0x65, 0x70] => verify_ed25519_blob(spki_der, message, signature),
+        [0x2b, 0x65, 0x70] => Ok(AttestantKeyAlgorithm::Ed25519),
+        // id-rsaEncryption (1.2.840.113549.1.1.1) — common cosign /
+        // PIV failure mode; called out explicitly so the error tells
+        // the operator the actual algorithm, not just "unsupported".
+        [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01] => Err(AppError::Update {
+            message: "attestant key is RSA, but the updater only accepts ECDSA-P256, \
+                      ECDSA-P384, or Ed25519. Re-issue the cosign / KMS / PKCS#11 key as \
+                      ECDSA-P256, ECDSA-P384, or Ed25519 before signing the release."
+                .into(),
+        }),
         other => Err(AppError::Update {
             message: format!(
                 "unsupported attestant key algorithm OID bytes {other:?}; \
-                 expected ECDSA-P256, ECDSA-P384, or Ed25519"
+                 updater only accepts ECDSA-P256, ECDSA-P384, or Ed25519"
             ),
         }),
+    }
+}
+
+/// Verify a blob signature against the message using the public key
+/// encoded as PKIX SubjectPublicKeyInfo DER. Dispatches on
+/// [`classify_attestant_spki_algorithm`]; ECDSA paths verify against the
+/// prehashed sha256 (cosign sign-blob signs sha256(blob)); Ed25519
+/// verifies against the raw message bytes (pure Ed25519, not Ed25519ph).
+pub(super) fn verify_blob_signature_with_spki(
+    spki_der: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), AppError> {
+    match classify_attestant_spki_algorithm(spki_der)? {
+        AttestantKeyAlgorithm::EcdsaP256 => verify_ecdsa_p256_blob(spki_der, message, signature),
+        AttestantKeyAlgorithm::EcdsaP384 => verify_ecdsa_p384_blob(spki_der, message, signature),
+        AttestantKeyAlgorithm::Ed25519 => verify_ed25519_blob(spki_der, message, signature),
     }
 }
 
@@ -287,4 +335,94 @@ fn hex_encode(bytes: &[u8]) -> String {
         write!(out, "{b:02x}").unwrap();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Build a minimal SubjectPublicKeyInfo carrying just an algorithm OID
+    // (plus optional params, plus an empty BIT STRING for the key bits) so
+    // the classifier sees a well-formed SPKI DER. The classifier only
+    // inspects the AlgorithmIdentifier, so the key bits' contents don't
+    // matter — only the structural validity required by `from_der`.
+    fn synthetic_spki(alg_oid: &str, ec_curve_oid: Option<&str>) -> Vec<u8> {
+        use der::Encode;
+        use der::asn1::{Any, BitString};
+        let params = ec_curve_oid.map(|curve| {
+            let curve = spki::ObjectIdentifier::new(curve).expect("valid test curve OID");
+            Any::from(curve)
+        });
+        let alg_id = spki::AlgorithmIdentifier {
+            oid: spki::ObjectIdentifier::new(alg_oid).expect("valid test alg OID"),
+            parameters: params,
+        };
+        let spki_obj = spki::SubjectPublicKeyInfo {
+            algorithm: alg_id,
+            subject_public_key: BitString::from_bytes(&[0u8; 32]).unwrap(),
+        };
+        spki_obj.to_der().expect("encoding synthetic SPKI")
+    }
+
+    #[test]
+    fn classify_accepts_p256() {
+        // id-ecPublicKey + prime256v1
+        let der = synthetic_spki("1.2.840.10045.2.1", Some("1.2.840.10045.3.1.7"));
+        assert_eq!(
+            classify_attestant_spki_algorithm(&der).unwrap(),
+            AttestantKeyAlgorithm::EcdsaP256
+        );
+    }
+
+    #[test]
+    fn classify_accepts_p384() {
+        // id-ecPublicKey + secp384r1
+        let der = synthetic_spki("1.2.840.10045.2.1", Some("1.3.132.0.34"));
+        assert_eq!(
+            classify_attestant_spki_algorithm(&der).unwrap(),
+            AttestantKeyAlgorithm::EcdsaP384
+        );
+    }
+
+    #[test]
+    fn classify_accepts_ed25519() {
+        // id-Ed25519 — no curve params
+        let der = synthetic_spki("1.3.101.112", None);
+        assert_eq!(
+            classify_attestant_spki_algorithm(&der).unwrap(),
+            AttestantKeyAlgorithm::Ed25519
+        );
+    }
+
+    #[test]
+    fn classify_rejects_rsa_with_explicit_diagnostic() {
+        // id-rsaEncryption — common cosign / PIV failure mode the
+        // updater would reject at verify time; rejected here at sign
+        // time with a message that names RSA explicitly.
+        let der = synthetic_spki("1.2.840.113549.1.1.1", None);
+        let err = classify_attestant_spki_algorithm(&der).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("RSA"), "expected RSA in error, got: {msg}");
+    }
+
+    #[test]
+    fn classify_rejects_p521() {
+        // id-ecPublicKey + secp521r1 (1.3.132.0.35) — cosign supports
+        // it, the updater does not.
+        let der = synthetic_spki("1.2.840.10045.2.1", Some("1.3.132.0.35"));
+        let err = classify_attestant_spki_algorithm(&der).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ECDSA-P256") && msg.contains("ECDSA-P384"),
+            "expected allowlist in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_rejects_unknown_algorithm() {
+        // Random unassigned-looking OID — should fall through to the
+        // generic rejection.
+        let der = synthetic_spki("1.2.3.4.5", None);
+        assert!(classify_attestant_spki_algorithm(&der).is_err());
+    }
 }

@@ -4,6 +4,15 @@
 //! URI for a YubiKey / SmartCard, or any cosign-supported KMS URI), and
 //! upload the resulting Sigstore Bundle v0.3 + attestation JSON +
 //! release.json index to the GitHub release.
+//!
+//! Before any signing or upload, the underlying key's algorithm is
+//! cross-checked against the updater's allowlist (ECDSA-P256,
+//! ECDSA-P384, or Ed25519) via
+//! [`eidola_app_core::updater::human_attestation::classify_attestant_spki_algorithm`].
+//! RSA / ECDSA-P521 / other algorithms are rejected up front — cosign
+//! would happily sign with them, but every client would reject the
+//! resulting attestation, leaving a `latest`-marked release no one
+//! can install.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -101,7 +110,33 @@ pub fn run(args: Args) -> Result<()> {
         ),
     };
 
-    let key_fingerprint_sha256 = compute_cosign_pubkey_fingerprint(&args.cosign_key)?;
+    let spki_der = fetch_cosign_pubkey_spki_der(&args.cosign_key)?;
+    let key_fingerprint_sha256 = sha256_hex(&spki_der);
+
+    // Pre-flight: reject keys the updater can't verify (RSA, ECDSA-P521, …)
+    // before we sign and publish. Without this, cosign would happily sign
+    // with, say, a YubiKey RSA-2048 slot or an awskms RSA key — the upload
+    // and `--latest` would succeed, but every client's
+    // `verify_blob_signature_with_spki` rejects anything outside
+    // ECDSA-P256 / ECDSA-P384 / Ed25519, leaving us with a "latest"
+    // release no one can install. Same allowlist, same OID dispatch as the
+    // updater (single source of truth in `eidola_app_core`).
+    let attestant_algorithm =
+        eidola_app_core::updater::human_attestation::classify_attestant_spki_algorithm(&spki_der)
+            .with_context(|| {
+            format!(
+                "the public key for `--cosign-key {}` is not a supported attestant key type. \
+             The eidola updater only accepts ECDSA-P256, ECDSA-P384, or Ed25519; \
+             refusing to sign and publish a release the updater would reject. \
+             Re-issue the cosign / KMS / PKCS#11 key with one of those algorithms and retry.",
+                args.cosign_key
+            )
+        })?;
+    println!();
+    println!(
+        "  attestant key algorithm: {} (sha256 SPKI fingerprint: {key_fingerprint_sha256})",
+        attestant_algorithm.name()
+    );
 
     // Surface a loud warning if the signing key is not yet pinned. Expected
     // for the very first release (the seed); harmful for subsequent ones.
@@ -321,10 +356,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Extract the public key for `cosign_key` via `cosign public-key
-/// --key <ref>` and return `sha256(SPKI DER)` as lowercase hex — the
-/// same fingerprint algorithm the verifier uses to match
-/// `TRUSTED_ATTESTANT_FINGERPRINTS`.
-fn compute_cosign_pubkey_fingerprint(cosign_key: &str) -> Result<String> {
+/// --key <ref>` and return the PKIX SubjectPublicKeyInfo DER bytes.
+/// Callers compute `sha256(spki_der)` to match
+/// `TRUSTED_ATTESTANT_FINGERPRINTS` and pass the same bytes through
+/// [`eidola_app_core::updater::human_attestation::classify_attestant_spki_algorithm`]
+/// to verify the algorithm is on the updater's allowlist before signing.
+fn fetch_cosign_pubkey_spki_der(cosign_key: &str) -> Result<Vec<u8>> {
     let out = Command::new("cosign")
         .args(["public-key", "--key", cosign_key])
         .output()
@@ -337,8 +374,7 @@ fn compute_cosign_pubkey_fingerprint(cosign_key: &str) -> Result<String> {
         );
     }
     let pem = String::from_utf8(out.stdout).context("cosign public-key output is not UTF-8")?;
-    let spki_der = pem_public_key_to_spki_der(&pem)?;
-    Ok(sha256_hex(&spki_der))
+    pem_public_key_to_spki_der(&pem)
 }
 
 /// Decode a single `-----BEGIN PUBLIC KEY-----` PEM block to its inner

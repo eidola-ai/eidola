@@ -71,6 +71,12 @@ use super::sigstore_bundle::CosignBundle;
 use super::trust::TrustedRoot;
 use super::{ReleaseIndex, VerifiedAttestation, VerifiedClaim};
 
+// Re-export the attestant-key classifier so external callers (notably
+// `release-tool`) can validate a candidate signing key against the same
+// algorithm allowlist the updater enforces at verify time — guarantees
+// a release can't be published in a shape the updater would later refuse.
+pub use rekor_verify::{AttestantKeyAlgorithm, classify_attestant_spki_algorithm};
+
 /// Verify a single human attestation end-to-end: the cosign-emitted
 /// signature against the attestant's pinned key fingerprint, the Rekor
 /// inclusion proof (this file), the structural cross-checks against

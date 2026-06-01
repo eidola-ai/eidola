@@ -78,6 +78,13 @@ enum Command {
         /// `azurekms:...`, `hashivault:...`). Passed through to
         /// `cosign sign-blob --key` verbatim. Read from
         /// `EIDOLA_ATTESTANT_COSIGN_KEY` if set.
+        ///
+        /// The underlying key must be ECDSA-P256, ECDSA-P384, or
+        /// Ed25519 — RSA, ECDSA-P521, and other algorithms are rejected
+        /// up front because the updater's verifier only accepts those
+        /// three. release-tool fetches the pubkey with
+        /// `cosign public-key --key <ref>` and validates the SPKI
+        /// algorithm OID before signing.
         #[arg(long, env = "EIDOLA_ATTESTANT_COSIGN_KEY")]
         cosign_key: String,
 
