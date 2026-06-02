@@ -55,12 +55,20 @@ The flow:
 
 The issuer key is stored encrypted at rest in Postgres using a
 `CREDENTIAL_MASTER_KEY` that is injected into the server enclave as
-a Tinfoil secret. Even an operator with database access cannot
-recover the issuer private key.
+a Tinfoil secret. If this key were compromised, new ACTs could be
+forged, but the unlinkability property remains.
 
 Domain separation is baked into the credential construction
 (`ACT-v1:eidola:inference:production:<date>`) to prevent
 cross-deployment correlation if the issuer key were ever reused.
+
+EDIT: we should add a section about the annonymity set. We specifically
+chose our credential key rotation and ACT issuance policies (which are part
+of the server codebase) to allow for flexible billing shapes, concurrency
+and just-in-time issuance to multiple devices, while preventing timing
+correlation attacks between linked/unlinked requests and preserving a
+sufficient annonymity set. There is quite a bit here and it's worth
+unpacking a bit.
 
 ## What runs in confidential compute
 

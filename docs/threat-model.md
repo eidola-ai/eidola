@@ -21,10 +21,9 @@ surface and the *unlinked* inference surface is enforced at the type
 level in the server, and the inference surface uses anonymous
 credentials (Privacy Pass ACT). The operator can see *that* a
 credential was redeemed, never *whose* credential it was. Inference
-content never reaches the operator's logging surface at all —
-inference flows through a separate enclave with its own attestation
-path. Telemetry on the inference path is restricted to model name,
-token counts, status, and latency.
+content never reaches the operator's logging surface at all. Telemetry
+on the inference path is restricted to model name, token counts, status,
+and latency.
 
 **Residual exposure:** The operator could attempt to deploy a server
 binary that violates these properties. The client refuses to talk to
@@ -45,6 +44,10 @@ the server's TLS certificate carries the enclave attestation in its
 SAN, so even an attacker with a valid WebPKI cert for the same
 hostname cannot impersonate the server — the client checks the
 attestation, not just the cert chain.
+
+EDIT: the TLS certificate for tinfoil enclaves do *not* contain their
+attestation in a SAN, do they? Our verifier doesn't use this mechanism.
+Is this relevant to a passive network observer anyway?
 
 **Residual exposure:** Network metadata (the fact that a connection
 occurred, its size, its timing) remains visible. Eidola does not
@@ -73,6 +76,18 @@ inside the enclave by the confidential-compute runtime; defeating
 this requires defeating the hardware. Tinfoil is also adding
 per-handshake nonces in `report_data` upstream; once that lands,
 even key exfiltration no longer suffices.
+
+EDIT: Add a new section on a malicious infrastructure operator. It's
+a threat that Tinfoil, who provides our infrastructure, impersonates
+us running an instance with different configuration. This is mitigated
+by committing every relevant configuration property in the attested
+config, including hashes of all injected secrets that are enforced on
+boot. This makes it impossible for them to change anything. Further,
+our client:server pairing prevents rollback attacks where a malicious
+Tinfoil operator or Eidola employee who could deploy with a valid
+WebPKI cert on a real enclave using a real signed old Eidola server
+version with a known vulnerability from ever being accepted by a
+client that has already been updated.
 
 ### A4. An attacker who compromises the Eidola release pipeline
 
@@ -110,12 +125,35 @@ reproduced the build from source. A divergence between CI's build
 output and a reproducer's build output is detectable as a hash
 mismatch on the signed manifest.
 
+EDIT: we might also reference our source-committed artifact-manifest
+approach here.
+
 **Residual exposure:** A dependency compromise that occurred *and*
 was incorporated *and* was reviewed by all attestants without being
 caught is not detected by this mechanism. Defense-in-depth comes
-from minimal dependency surface, pure-Rust preference (to avoid
-opaque C dependencies), and explicit diff review in the attestation
+from minimal dependency surface and explicit diff review in the attestation
 flow.
+
+EDIT: we need to be more realistic about this; tooling is a huge part
+of the "defense in depth" and no single human or even AI read every
+single line of code in every single production and build pipeline dep. The
+most novel thing we do here is full reproducibility with StageX/nix, which eliminates an
+entire category of "undefined" risks, but so much else comes from CVE
+monitoring (via dependabot, etc). And to note, nix on macos is not "fully
+source bootstrapped" in the way stagex is: the latter literally starts
+with hand-written assembly, builds a minimal c compiler, uses it to build
+the full c compiler, uses it to build c++, uses it to build rust, etc. We
+*must* compile for macos on macos, and with that comes opacity. The real
+takeaway is that we are at the bleeding edge of best practices here, and
+to the absolute highest extent possible, dependencies are explicit,
+pinned, and minimal. We probably don't need to say all this here, but
+maybe some? Much of these aren't novel at all and are more like the
+corporate policies I'd put in a SOC2. I've been trying to minimize
+emphesizing "policy" points that are non-structural, at risk of diluting
+the impact of the truly important pieces. Let's think about an approach
+to that issue: do we consolidate "non-structural policies" to some other
+place? That wouldn't read well... I'm not really sure how to approach this?
+
 
 ### A6. A legally-compelled Eidola engineer
 
@@ -189,7 +227,13 @@ acceptable for their threat model:
 | **The user's prior client binary** | Embedded trust root has not been silently subverted before install | Public release record + signed continuity check between releases |
 | **The user's hardware and OS** | Process isolation, key storage, code execution integrity | Outside Eidola's scope; named in [N1](#n1-a-compromised-local-environment) |
 
+EDIT: Our Rekor checks would fail safe, right? If rekor.sigstore.dev is down, we can't verify a new build; or perhaps we're susceptible to WebPKI compromised MITM? Double check the actual gap here.
+
+EDIT: OIDC compromise is mitigated by the human signing. Is the rotation scheme relevant here?
+
 Each of these is a place where a sufficiently motivated and capable
 adversary could break the chain. They are not weaknesses we are
 hiding; they are the cost of building software at all. Where we have
 in-progress mitigations, they are in [gaps.md](gaps.md).
+
+EDIT: Somewhere we need to address potential vulnerabilities of confidential compute hardware itself, including things like side channel attacks, as a residual risk.

@@ -109,7 +109,7 @@ Some operations stay local even when they could be moved to the
 server, because moving them would create privacy or autonomy
 costs:
 
-- **Conversation history** is stored in a local Turso (libSQL)
+- **Conversation history** is stored in a local Turso
   database in the user's application support directory. It is never
   uploaded. (Sync is a future feature that, if it ships, will be
   end-to-end encrypted with keys under the user's control.)

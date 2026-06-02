@@ -17,6 +17,18 @@ written.
 
 ## 1. The client is sovereign
 
+EDIT: Add framing that our approach follws the the old-school
+paradigm where an "app" is installed by an end user on a device they
+control, and is self-contained. We extend this model to include scenarios
+that require remote compute, while leaning on a carefully designed
+architecture and set of technologies to retain similar integrity and
+confidentiality properties. We might want to consider using the term
+"app" over "client" except when specifically describing server/client
+interactions. Our roadmap includes adding limited local inference on 
+supported devices, so while this is a critical framing for the trust
+approach, it's also an accurate description of the product vision as
+well. However, that might get confusing if we mix these terms?
+
 The client is the user's entry point and the arbiter of trust. Every
 decision about *what to run*, *what to trust*, and *whether to talk to a
 given server* is made locally, against values that were compiled into
@@ -26,12 +38,20 @@ A given client binary trusts **exactly one server build**. The trust
 root — the measurements, identity patterns, fingerprints, and policy
 constants — is embedded at compile time. Every Eidola release is a
 coordinated rebuild of clients *and* server so that their values
-correspond. There is no runtime trust handoff, and no API the client
-calls to "discover" who to trust. See [client.md](client.md).
+correspond. There is no runtime trust handoff. See
+[client.md](client.md).
 
 The client is also designed to **fail safe**: if anything in the
 verification chain cannot be confirmed, the connection is refused rather
 than downgraded. There is no quiet fallback to an unverified path.
+
+EDIT: Clarify that all data and history is persisted locally on the
+end user's device only, *not* on a server. (In the future we will
+probably add syncing capability, but this will be e2e encrypted, etc. All
+that is still being designed. We probably don't need to mention all that
+here, but also want to avoid overly aggressive statements like, "data
+will never be written to disk, encrypted or otherwise" since that likely
+won't be true forever.)
 
 ## 2. Code is the trust boundary, not policy
 
@@ -76,6 +96,15 @@ checkpoint verification, artifact-hash check at install time. They are
 written down in one place, with what they would catch and why we
 believe the rest of the chain still holds without them.
 
+EDIT: This is correct, but probably a bit over-done, almost at the
+level of internal guidance for doc writing and communication. In this
+doc, we can slim this and make a brief call to open an issue if a
+scenario is unclear. This claim is a bit more threshold-bound, as
+threat scenarios are infinite in the long tail, and we certainly
+don't want a thousand pages of contrived scenarios. Accordingly, we
+don't want to weight this as highly as strongly enforced and
+bounded claims, like reproducibility, etc.
+
 ## Why the audience matters
 
 Eidola has two audiences who need to read this differently.
@@ -88,8 +117,8 @@ docs offer the design without requiring you to follow every link.
 component pages explain how the design upholds it.
 
 For the **technical reader doing due diligence** — security
-engineers, privacy researchers, the natural tech-expert in any social
-group whose opinion the first audience will rely on — every claim
+engineers, privacy researchers, and the natural tech leaders whose
+recommendations are trusted by friends and family — every claim
 links to source. Where we cite an enclave measurement, you can read
 the code that computes it. Where we describe an attestation flow, you
 can read the verifier that walks it. Where we acknowledge a gap, you
@@ -97,6 +126,11 @@ can read the issue and the workaround.
 
 This is intentional. We can only be trusted to the extent that we are
 checkable, and the deepest layer of that check is the source.
+
+EDIT: This is absolutely the intent, but let's make sure not to over-
+claim here either. Documentation is inherently incomplete (the map is
+not the territory) and *will* inevitably drift. This is another place
+we can add a brief note to open an Issue or PR.
 
 ## Where to read next
 

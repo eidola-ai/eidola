@@ -1,10 +1,9 @@
 # Known Gaps
 
 Every piece of the Eidola trust chain that is intentionally deferred is
-catalogued here. The system is still load-bearing without these — each
-gap closes a specific class of attack that is already constrained by
-other parts of the chain — but they are real and worth landing as
-follow-ups. Reading this page is the fastest way to see what Eidola
+catalogued here. Each gap closes a specific class of attack that is
+already constrained by other parts of the chain — but they are real and
+worth understanding. Reading this page is the fastest way to see what Eidola
 does not yet defend against.
 
 The cryptographic-verifier gaps are also noted at the top of
@@ -24,6 +23,9 @@ Certificate Timestamp proves the cert was logged in a public CT log.
 **What constrains it today.** The OIDC-identity match and the
 Fulcio chain walk are the primary binding. The SCT check is
 defense-in-depth on top of those, not a single point of failure.
+
+EDIT: verify that this is correct. It probably is, but my recollection
+is fuzzy on this topic.
 
 ### Rekor checkpoint signature verification
 
@@ -45,8 +47,8 @@ digests.
 
 **What constrains it today.** The verifier already proves
 `artifact-manifest.json` itself is authentic and unmodified. The
-install-time hash check lives naturally in step 5 (install /
-atomic-replace), once we know which platform's artifact the user is
+install-time hash check lives naturally in a to-be-implemented install /
+atomic-replace step, once we know which platform's artifact the user is
 downloading. The verifier code is in place; only the wiring to the
 download path is deferred.
 
@@ -102,10 +104,18 @@ before approving an install, and a public release-cadence statement
 makes "the latest release is older than the cadence" a question the
 community can ask in the open.
 
+EDIT: This mitigation doesn't make sense to me: the client doesn't
+mediate a fresh install. A user installs this directly by downloading
+and executing it (via the web or some package manager). We currently
+don't have a public release cadence, but will in the future.
+
 **Future.** Ship a freshness anchor: a witness checkpoint, a
 Bitcoin-block reference, or a co-signed signed-tree-head. Any of
 these closes the first-install gap; choosing among them is partly a
 matter of which witness ecosystem matures fastest.
+
+EDIT: I'm not 100% sure how these help, for the same reason. We
+might need to discuss.
 
 ### Multi-jurisdiction attestant distribution
 
@@ -134,6 +144,12 @@ exposure to a single vendor compromise. The attestation chain itself
 is cryptographically witnessed; a forgery would need the vendor's
 hardware-bound signing key.
 
+EDIT: I'm not sure if this is a real mitigation or if it actually
+increases the surface area. By supporting *both* AMD and Intel, a
+compromise of *either* root cert (for example) would allow a forged
+attestion to be accepted. As far as I am concerned, this is not
+mitigated, just accepted. Push back if I'm incorrect about this.
+
 **Future.** Open hardware roots like OpenTitan reduce the scope of
 vendors the trust chain depends on. This is an industry-wide
 direction, not an Eidola-specific roadmap item, but it is the
@@ -158,6 +174,8 @@ have to make their own provision if they need it. See
 [threat-model.md#a2-a-passive-network-observer](threat-model.md#a2-a-passive-network-observer)
 for the explicit residual.
 
+EDIT: we *do* consider this in-scope, but do not have a concrete plan to address it. Explored approaches include offering a Tor hidden service and partnering with other independent organizations to improve unlinkability through use of oHTTP, MASQUE/CONNECT, etc. There are probably actually 2 distinct threats here: passive traffic analysis and network identity as a linking factor. Current guidance is to use Tor to address the first, and to use Tor or a well reputed VPN provider like Mullvad to address the second. We might want to tackle these separately.
+
 ## Inference upstream
 
 ### Sigstore re-verification of upstream measurements at runtime
@@ -179,3 +197,9 @@ time, not runtime.
 hypothetical case where a measurement passed PR review (perhaps via
 a now-rotated key) but is no longer verifiable today. This is
 defense-in-depth on an already-gated path.
+
+EDIT: I don't think we'll ever add continuous re-verification. This
+is static by design. However, we *would* like to run our own inference
+directly in our server, still hosted on Tinfoil's infrastructure. The primary risk with inference upstream is that *their* builds are very rigorous, but don't
+adhere to all the strict properties that we have, including source-
+bootstrapped reproducible builds and human release attestations.

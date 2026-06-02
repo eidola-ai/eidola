@@ -86,6 +86,9 @@ and the resulting Eidola server *build* embeds the new list.
   without it. But that visibility is bounded to a verified enclave
   running attested code, not to the provider's operations team.
 
+EDIT: The above piece needs to be worded better; it reads at first
+as if no cleartext is sent to them (although it's clarified later).
+
 ## Per-connection verification
 
 The Eidola server's outbound HTTPS client (constructed by
@@ -124,3 +127,20 @@ enclave from the Eidola server? Two reasons:
 The cost is one additional verification step (Eidola server → upstream)
 on each inference, which adds a small per-handshake latency cost on
 top of the connection-pooled normal request path.
+
+EDIT: I don't think the "Independent verification" piece is particularly
+strong. It's definitely something, and they have far more users than us
+(we have zero), but I still don't think it's at the critical mass for
+this to be a real selling point.Tinfoil's measures are extremely robust,
+but they don't currently have fully deterministic source-bootstrapped
+builds or quite the same human attestation process (as a side-effect of
+the former), instead relying on GitHub's CI attestations for provenance.
+We should note these caveats. I do plan on a future state where the entire
+inference pipeline exists in this repo (still running in tinfoil's
+infrastructure), but we aren't there today.
+
+Edit: It's also true that cvmimage and ovmf lack fully deterministic builds,
+and while their contents are pinned by the server's measurement, we're
+trusting the build pipeline more than we ideally would. This probably belongs
+in "gaps" or similar, as it's not part of the inference upstream. But worth
+noting.

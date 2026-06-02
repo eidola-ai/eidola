@@ -35,12 +35,14 @@ Sigstore Rekor transparency log via the same entry shape
 |---|---|---|
 | CI signs the manifest | Sigstore bundle | Fulcio keyless cert tied to the GitHub OIDC workflow identity |
 | Engineer signs a release attestation | `cosign sign-blob` against a hardware-held key (YubiKey-PIV, KMS, etc.) | sha256(PKIX SubjectPublicKeyInfo) matches a fingerprint pinned in the client |
-| Engineer signs the git tag | SSH signature | OpenSSH fingerprint (separate key from the cosign key) |
 
 The CI side gives us "this artifact came from the release workflow
 on this tag." The engineer side gives us "a named human, signing
 under their legal identity, attests to the properties this release
 claims." Neither alone is sufficient; both are required.
+
+EDIT: I don't think git tag signing is relevant here? If it's worth mentioning, it probably
+belongs more under source control or SDLC practices, rather than release.
 
 ## What the engineer attests to
 
@@ -76,6 +78,8 @@ into the Sigstore Rekor transparency log, and verified by the client
 during self-update. The verifier re-renders each claim from a
 pinned template and rejects any attestation whose claim text does not
 match character-for-character.
+
+EDIT: These were just updated in the template, and need to be reflected here.
 
 ## How the client verifies a release
 
@@ -122,6 +126,9 @@ engineer's attestation not enough?
   or that the release does not weaken guarantees. The structured
   claims are what add that semantic content.
 
+EDIT: we should note that MIN_HUMAN_ATTESTATIONS is currently set to
+one, but will be increased as we grow.
+
 ## Schema versions: every change is breaking
 
 Every release document carries an integer `schema_version`. The
@@ -150,6 +157,9 @@ This rules out two adversary moves:
    chain on a side branch cannot graft it onto an installed client;
    the continuity check requires the prior commit to match what the
    installed binary recorded.
+
+EDIT: Is the forked-history attack really something that would be
+possible without continuity?
 
 The first-install case (no prior installed commit) is the residual
 gap; see [gaps.md](gaps.md).
