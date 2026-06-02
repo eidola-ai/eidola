@@ -80,14 +80,15 @@ and the resulting Eidola server *build* embeds the new list.
   properties, the *measurement would change* and Eidola's server
   would refuse to connect until that measurement was reviewed and
   added to the allowed set.
-- **Eidola is not trusting the upstream provider with cleartext
-  inference data.** The cleartext is necessarily visible to the
-  enclave performing inference — there is no way to run a model
-  without it. But that visibility is bounded to a verified enclave
-  running attested code, not to the provider's operations team.
-
-EDIT: The above piece needs to be worded better; it reads at first
-as if no cleartext is sent to them (although it's clarified later).
+- **Eidola is not trusting the upstream provider's operators
+  with cleartext inference data.** Cleartext inference data is
+  *necessarily* visible to the enclave performing the inference
+  — that's how the model reads your prompt and generates a
+  response. The trust boundary at this layer is the enclave
+  itself, not the provider's operations team: the same
+  confidential-compute properties that seal the Eidola server
+  enclave against Eidola's operators seal the inference enclave
+  against the upstream provider's operators.
 
 ## Per-connection verification
 
@@ -109,38 +110,43 @@ crosses the wire.
 ## Why a separate enclave at all
 
 A reasonable question: why does the model run in a *different*
-enclave from the Eidola server? Two reasons:
+enclave from the Eidola server? The full answer is partly
+structural and partly transitional.
 
-1. **Concentration of capability.** Confidential-compute infrastructure
-   for serving large language models requires specialized hardware
-   (GPUs with NVIDIA confidential compute) and operational expertise
-   that is currently provided most cleanly by dedicated inference
-   providers. Eidola's role is the privacy *and account* layer
-   around the inference, not the inference itself.
-2. **Independent verification.** Putting the model in a separately-attested
-   enclave means the user's chain of trust ends at the model
-   provider's signed measurement, which the model provider's source
-   code can be audited against independently of Eidola's code. This
-   is a stronger property than "Eidola's operators promise the model
-   is doing what it says."
+**Structurally**, confidential-compute infrastructure for serving
+large language models requires specialized hardware (GPUs with
+NVIDIA confidential compute) and operational expertise that
+dedicated inference providers can supply most cleanly.
+Eidola's role is the privacy and account layer around the
+inference, not the inference itself.
 
-The cost is one additional verification step (Eidola server → upstream)
-on each inference, which adds a small per-handshake latency cost on
-top of the connection-pooled normal request path.
+**Transitionally**, the upstream-provider model has the appealing
+property that the user's trust chain at the inference layer ends
+at a measurement signed against the *upstream's* source — which
+that source can be audited against independently of Eidola.
 
-EDIT: I don't think the "Independent verification" piece is particularly
-strong. It's definitely something, and they have far more users than us
-(we have zero), but I still don't think it's at the critical mass for
-this to be a real selling point.Tinfoil's measures are extremely robust,
-but they don't currently have fully deterministic source-bootstrapped
-builds or quite the same human attestation process (as a side-effect of
-the former), instead relying on GitHub's CI attestations for provenance.
-We should note these caveats. I do plan on a future state where the entire
-inference pipeline exists in this repo (still running in tinfoil's
-infrastructure), but we aren't there today.
+Two caveats apply to that second framing today:
 
-Edit: It's also true that cvmimage and ovmf lack fully deterministic builds,
-and while their contents are pinned by the server's measurement, we're
-trusting the build pipeline more than we ideally would. This probably belongs
-in "gaps" or similar, as it's not part of the inference upstream. But worth
-noting.
+- Tinfoil's release process is robust — signed measurements,
+  Sigstore provenance, public source — but it does not yet match
+  Eidola's: in particular, Tinfoil's builds are not fully
+  source-bootstrapped reproducible in the StageX sense, and
+  release attestation rides on GitHub's CI attestations rather
+  than per-release human attestations under named legal
+  identities. So "independent" is true at the boundary
+  (different code, different signers) but the audit surface on
+  the upstream side is shaped differently than ours.
+- The planned future state is to bring the inference pipeline
+  into this repo (still running on Tinfoil's infrastructure),
+  so the same release-attestation discipline applies end-to-end.
+  That is on the roadmap, not in the current release.
+
+The cost of the current split is one additional verification step
+(Eidola server → upstream) on each inference, which adds a small
+per-handshake latency cost on top of the connection-pooled normal
+request path.
+
+The cvmimage / OVMF non-determinism caveat moved to
+[gaps.md#build-chain-opacity](gaps.md#build-chain-opacity), since
+it cuts across the whole server-side trust chain (not just
+inference upstream).

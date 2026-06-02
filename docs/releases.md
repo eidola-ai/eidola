@@ -41,9 +41,6 @@ on this tag." The engineer side gives us "a named human, signing
 under their legal identity, attests to the properties this release
 claims." Neither alone is sufficient; both are required.
 
-EDIT: I don't think git tag signing is relevant here? If it's worth mentioning, it probably
-belongs more under source control or SDLC practices, rather than release.
-
 ## What the engineer attests to
 
 Every release attestation is a structured JSON document where the
@@ -51,35 +48,51 @@ engineer makes specific claims under their legal identity. The
 full template is at
 `releases/schema/attestation-templates-v1.json`; the claims include:
 
-- `no_compulsion` — the engineer is **not currently subject to any
-  legal order, gag, technical capability notice, or other
-  compulsion** related to this release or to Eidola generally.
-- `no_coercion` — the engineer has **not been threatened or coerced**
-  by any party in connection with this release.
-- `signing_freely` — the engineer is signing **of their own volition,
-  on hardware under their exclusive physical control**.
-- `manifest_reproduced` — the engineer **personally reproduced** the
-  artifact manifest from the source commit on hardware under their
-  exclusive physical control, and confirmed bit-for-bit equality
-  with CI's output.
-- `diff_reviewed` — the engineer **personally reviewed the source
-  diff** between the prior release commit and this release commit.
-- `no_known_privacy_weakening` — based on the diff review, the
-  engineer is **not aware of any change** that weakens the privacy
-  guarantees stated in [`privacy-guarantees.md`](privacy-guarantees.md)
-  as compared with the prior release.
-- `no_known_backdoor` — based on the diff review, the engineer is
-  **not aware of any backdoor**, covert surveillance mechanism, or
-  undisclosed data exfiltration path in the code that comprises this
-  release.
+- `no_compelled_subversion` — the engineer is **not currently
+  subject to any legal order, technical capability notice, or
+  other legal compulsion** that has caused (or that requires
+  them to cause) the release to weaken a privacy or security
+  guarantee, introduce or preserve a backdoor or covert
+  surveillance mechanism, or misrepresent any of these
+  properties.
+- `no_gag_preventing_attestation` — the engineer is **not subject
+  to a gag order or nondisclosure obligation** that prevents
+  them from truthfully making any claim in this attestation.
+- `no_coercion` — the engineer has **not been threatened or
+  coerced** by any party to alter the release, falsify any
+  claim, or conceal any material fact about the privacy or
+  security properties of the release.
+- `signing_freely` — the engineer is signing **of their own
+  volition**, with a key whose private component exists only on
+  hardware under their exclusive physical control.
+- `manifest_reproduced` — the engineer **personally reproduced**
+  `artifact-manifest.json` from the source commit on hardware
+  under their exclusive physical control, and confirmed
+  bit-for-bit equality with CI's output.
+- `diff_reviewed` — the engineer **personally inspected the
+  source-level diff** between the prior release commit and this
+  release commit.
+- `privacy_guarantees_not_weakened` — the version of
+  [`privacy-guarantees.md`](privacy-guarantees.md) at release
+  time **does not weaken, narrow, or remove** any privacy or
+  security guarantee that was stated in the prior release's
+  version. (Required only when a prior release exists.)
+- `code_delivers_guarantees` — based on the diff review, the
+  engineer is **not aware of any change** in this release that
+  causes the code to fail to deliver the privacy and security
+  guarantees stated in `privacy-guarantees.md`.
+- `no_known_backdoor` — based on the diff review, the engineer
+  is **not aware of any backdoor**, covert surveillance
+  mechanism, or undisclosed data path in this release that
+  transmits user data in a manner not described in
+  `privacy-guarantees.md` or the user-facing documentation it
+  references.
 
-These claims are recorded verbatim in the attestation document, hashed
-into the Sigstore Rekor transparency log, and verified by the client
-during self-update. The verifier re-renders each claim from a
-pinned template and rejects any attestation whose claim text does not
-match character-for-character.
-
-EDIT: These were just updated in the template, and need to be reflected here.
+These claims are recorded verbatim in the attestation document,
+hashed into the Sigstore Rekor transparency log, and verified by
+the client during self-update. The verifier re-renders each claim
+from a pinned template and rejects any attestation whose claim text
+does not match character-for-character.
 
 ## How the client verifies a release
 
@@ -115,19 +128,22 @@ engineer's attestation not enough?
   signature. But CI cannot mint a `cosign sign-blob` from an
   engineer's hardware-held key. The human attestation is the
   defense-in-depth against pipeline compromise.
-- **A single human alone is not enough.** A single attestant is one
-  legal target. The minimum-attestant policy (`MIN_HUMAN_ATTESTATIONS`)
-  is pinned in the *prior* client, so a coerced engineer cannot
-  lower the threshold by shipping a release that requires fewer
-  signatures.
+- **A single human alone is not enough.** A single attestant is
+  one legal target. The minimum-attestant policy
+  (`MIN_HUMAN_ATTESTATIONS`) is pinned in the *prior* client, so
+  a coerced engineer cannot lower the threshold by shipping a
+  release that requires fewer signatures. **Today**
+  `MIN_HUMAN_ATTESTATIONS` is `1` — the framework supports
+  arbitrary M-of-N, but only one attestant key is currently
+  provisioned. As additional attestants are onboarded, the
+  threshold will be raised through the same release process that
+  any other trust-constants change uses. See
+  [gaps.md](gaps.md#single-attestant-policy).
 - **Sigstore Rekor is not enough.** Sigstore proves that *a
   signature exists in a public log*. It does not prove that the
   signer was acting freely, that the source matches the release,
   or that the release does not weaken guarantees. The structured
   claims are what add that semantic content.
-
-EDIT: we should note that MIN_HUMAN_ATTESTATIONS is currently set to
-one, but will be increased as we grow.
 
 ## Schema versions: every change is breaking
 
@@ -153,16 +169,15 @@ This rules out two adversary moves:
 1. **Stale-release substitution.** An attacker serving a real but
    older release cannot route an updating client onto it; the
    continuity check fails.
-2. **Forked-history attack.** An attacker who has forged a release
-   chain on a side branch cannot graft it onto an installed client;
-   the continuity check requires the prior commit to match what the
-   installed binary recorded.
-
-EDIT: Is the forked-history attack really something that would be
-possible without continuity?
+2. **Rollback to a known-bad past release.** Even if a past
+   release was later discovered to have a vulnerability and was
+   superseded, the continuity check prevents an attacker from
+   walking an updating client *backwards* into it. The only
+   release the verifier will accept is the one whose
+   `previous_release.git_commit` matches the installed commit.
 
 The first-install case (no prior installed commit) is the residual
-gap; see [gaps.md](gaps.md).
+gap; see [gaps.md](gaps.md#first-install-downgrade).
 
 ## For the technical specification
 

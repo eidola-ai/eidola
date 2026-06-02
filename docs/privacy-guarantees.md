@@ -5,19 +5,17 @@ property that Eidola commits to deliver, and that a release engineer
 signs against under their legal identity at every release (see
 [releases.md](releases.md) for the mechanics).
 
-EDIT: removed section that was more about the release process than the guarantees themselves.
-
-These guarantees describe the behavior of the **released Eidola
-client and server code**, running on hardware whose confidential-compute
-attestation verifies under the trust root [pinned in the client](trust-root.md#whats-pinned).
-They do not describe code paths reachable only by code we did not
-publish, attestants we have not pinned, or hardware whose attestation
-does not verify.
-
-EDIT: let's make the above a bit more friendly while still being correct,
-noting that it covers generally available releases for end users, and
-not situations that might arise while developing or contributing to
-the project.
+These guarantees describe what you get when you install and run a
+**generally-available release of Eidola** — the app downloaded from
+the public release channel, running on hardware whose
+confidential-compute attestation verifies under the trust root
+that release was built with. They do not extend to development
+builds, contributor-installed test versions, or any scenario where
+you have intentionally bypassed the release process (for example,
+running your own server with a local override). See
+[trust-root.md](trust-root.md#whats-pinned) for what's pinned and
+[client.md](client.md#configuration-overrides) for how overrides
+work.
 
 ## Guarantees
 
@@ -40,13 +38,6 @@ inference.**
 - Telemetry on the inference path is limited to model name, token
   counts, status, and latency. It does not contain message content,
   account identifiers, or credential material.
-
-EDIT: we may want to add one note about anonymous credential material
-being persisted (privacy pass ACT flow), but that these are unlinkable
-to an identity. This might be more appropriate under G2, but I want to
-call out that this is persisted so it isn't a surprise to find in
-our postgres schema. Maybe that's more implementation detail and
-doesn't really belong in this document at all?
 
 **What this does not guarantee:**
 
@@ -76,26 +67,16 @@ for it.**
   the credential, because the credential is unlinkable by
   construction. See [server.md#unlinkability](server.md#unlinkability).
 
-**What this does not guarantee:**
-
-- An adversary who controls both the user's device and Eidola's
-  servers can correlate via timing or network-side identifiers. The
-  anonymous-credentials property holds against an Eidola operator who
-  sees only server-side data.  
-
-  EDIT: I'm not sure this matters? If an adversary controls the user's
-  device they already necessarily know their identity.
-- A user who voluntarily includes account-identifying information in
-  their *prompts* loses unlinkability by their own action. Eidola
-  does not redact request bodies.  
-    
-  EDIT: I don't think this matters due to G1. The request bodies should
-  be protected already. The reason account-inference unlinkability
-  matters is that we MUST persist some metadata for the sake of billing,
-  but the way we've constructed it, we don't know which human (in the 
-  linkable account context) paid for any particular inference request,
-  and further we lack any ability to link multiple inference requests
-  by the stored metadate.
+**What this guarantee actually means in practice.** Eidola persists
+billing-related metadata (credential issuance records, accounting
+events) because we need it to charge accounts. The way the system
+is constructed, that persisted metadata does not let us answer
+"which account paid for *this* inference request" or "which
+inference requests came from the same account," even with full
+access to our own database. See
+[server.md#unlinkability](server.md#unlinkability) and
+[server.md#anonymity-set](server.md#anonymity-set) for the
+specific properties of the issuance protocol that make this true.
 
 ### G3. No silent code change
 
@@ -118,26 +99,34 @@ released through the public, signed release process.**
 - A user who manually installs an unsigned build, or who installs a
   build outside the published release channel, has bypassed this
   guarantee by their own action.
-- A first install — a fresh device with no prior pinned trust root —
-  inherits whatever trust root is in the binary they downloaded.  
-
-  EDIT: we don't commit to a release cadence yet, although we hope to
-  in the future.
+- A first install — a fresh device with no prior pinned trust root
+  — inherits whatever trust root is in the binary they downloaded.
+  See [gaps.md](gaps.md#first-install-downgrade) for the residual
+  exposure.
 
 ### G4. Verifiability
 
 **Every claim in this document is verifiable against published
 source and signed artifacts.**
 
-- The source for the client, server, and all build inputs is in a
-  public monorepo with cryptographic Git history. EDIT: I don't think the word "cryptographic" is helpful here? We require signed commits/etc, but I think the core integrity strengths are intrinsic to git, and probably not appropriate to explain here. Perhaps we can elaborate on our approach of having an artifact manifest committed in the repo root that acts as an invariant in our merge policy: a PR can only be merged if it is self-consistent and reproducible.
-- Released binaries are reproducible: anyone can rebuild from source
-  and confirm bit-for-bit equality with what the release ships.
+- The source for the client, server, and all build inputs lives
+  in a public monorepo.
+- A copy of `artifact-manifest.json` — the digests of every
+  released artifact and the server enclave measurement — is
+  **committed in the repo root**, alongside the source it
+  describes. CI re-derives the manifest from source on every PR
+  and refuses to merge if the result differs. This makes
+  reproducibility a *merge invariant*: any commit on `main`
+  reproduces a specific manifest, and the published release is
+  what that manifest names.
+- Released binaries are reproducible: anyone can rebuild from
+  source and confirm bit-for-bit equality with what the release
+  ships.
 - Each release ships with a signed manifest binding the source
   commit, the artifact digests, the enclave measurements, and a
   human attestation, all to a single transparency-log entry.
-- The verifier the client uses to walk this chain is open source and
-  documented in [trust-root.md](trust-root.md).
+- The verifier the client uses to walk this chain is open source
+  and documented in [trust-root.md](trust-root.md).
 
 ### G5. No backdoor
 
@@ -162,11 +151,14 @@ document or the user-facing documentation it references.**
   compromised dependency that we did not catch in review could
   reintroduce a covert path despite this claim. See
   [threat-model.md](threat-model.md).
-
-EDIT: Perhaps we need to note that malicious behavior on our part,
-falsifying such an attestation *is* a possibility, but one that is
-mitigated by twofold accountability: complete verifiability to
-surface discrepancies, as well as legal accountability.
+- **A bad-faith Eidola is in scope, not denied.** We could in
+  principle sign an attestation falsely claiming no backdoor.
+  Two things bound this: every claim in the attestation is
+  independently verifiable against the published source (a
+  reviewer can find a divergence), and the engineer signs under
+  their legal identity in a public, append-only transparency
+  log. The defense is verifiability plus legal accountability,
+  not "trust us."
 
 ### G6. No compelled subversion without disclosure
 
@@ -175,23 +167,24 @@ compulsion without that fact being inferable from the public release
 record.**
 
 - Each release attestation includes a claim, signed under the
-  engineer's legal identity, that they are not currently subject to
-  legal compulsion that has caused, or that requires
-  them to cause, this release to weaken any published guarantee.  
-
-  EDIT: removed "gag order" since that doesn't compel these things;
-  it simply prevents statement making.
+  engineer's legal identity, that they are not currently subject
+  to legal compulsion that has caused, or that requires them to
+  cause, this release to weaken any published guarantee.
+- A separate claim attests that the engineer is not subject to a
+  gag order or other restriction that prevents them from
+  truthfully making any claim in this attestation. (Gag orders
+  don't compel weakening; they constrain disclosure, which is a
+  different surface and needs its own claim.)
 - The attestant signs from hardware under their exclusive control
   and posts the signature to a public transparency log.
-- A coerced engineer who is forbidden from making this claim
-  truthfully must either (a) decline to sign, breaking the release,
-  or (b) sign falsely and incur the disclosed legal exposure.
-
-  EDIT: removed release cadence, which we cannot commit to yet.
+- A coerced engineer who is forbidden from making the compulsion
+  or gag claim truthfully must either (a) decline to sign,
+  breaking the release, or (b) sign falsely and incur the
+  disclosed legal exposure.
 - The minimum number of independent attestants required for a
   release (`MIN_HUMAN_ATTESTATIONS`) is pinned in the **prior**
   client, so a coerced single engineer cannot lower the bar by
-  shipping a release that requires fewer signatures.  
+  shipping a release that requires fewer signatures.
 
 **What this does not guarantee:**
 
@@ -204,26 +197,6 @@ record.**
   from hardware without their knowledge) is a different attack
   surface, addressed by the key being hardware-bound and
   fingerprint-pinned, not by this guarantee.
-
-## Scope
-
-These guarantees describe Eidola's released code. They do not extend to:
-
-- **Local environment compromise.** A malicious app, OS-level
-  surveillance, or a compromised device defeats most user-facing
-  privacy properties regardless of what Eidola does. The client's
-  fail-safe behavior limits damage, but cannot replace a trustworthy
-  local environment.
-- **Hardware attestation forgery by a manufacturer.** If AMD, Intel,
-  or NVIDIA were to issue fake attestation chains, the corresponding
-  layer of confidential-compute verification would fall. Mitigations
-  (open hardware roots like OpenTitan) are tracked in
-  [gaps.md](gaps.md).
-- **Off-platform behavior.** What you do on your own device, whether
-  you choose to copy chat content elsewhere, and whether your network
-  path is private, are outside Eidola's control.
-
-EDIT: This "Scope" section read well at first, but is completely redundant with thread-model.md. Do these still belong here? I'm inclined to remove them, since they are general carve-outs rather than guarantees.
 
 ## How this document evolves
 
@@ -238,7 +211,7 @@ claim will fail.
 If a future release needs to weaken a guarantee — for example, if a
 discovered vulnerability requires a fallback that exposes
 previously-shielded data — the release notes will say so explicitly,
-the attestant will be unable to sign `no_known_privacy_weakening`,
+the attestant will be unable to sign `privacy_guarantees_not_weakened`,
 and the release will not pass the standard verifier. Users would
 have to opt into such a release by an out-of-band mechanism.
 

@@ -39,15 +39,12 @@ blocked by guarantees [G3](privacy-guarantees.md#g3-no-silent-code-change),
 **Capability:** Sees all packets between the user's device and Eidola's
 servers, including TLS metadata (SNI, IP, timing).
 
-**What stops them:** TLS confidentiality and integrity. Beyond that,
-the server's TLS certificate carries the enclave attestation in its
-SAN, so even an attacker with a valid WebPKI cert for the same
-hostname cannot impersonate the server — the client checks the
-attestation, not just the cert chain.
-
-EDIT: the TLS certificate for tinfoil enclaves do *not* contain their
-attestation in a SAN, do they? Our verifier doesn't use this mechanism.
-Is this relevant to a passive network observer anyway?
+**What stops them:** TLS confidentiality and integrity. (The
+deeper attestation binding that protects against an *active*
+attacker with a valid WebPKI cert is described in
+[A3](#a3-an-active-network-attacker-mitm) — a passive observer
+has nothing to gain there, since they can't impersonate the
+server in the first place.)
 
 **Residual exposure:** Network metadata (the fact that a connection
 occurred, its size, its timing) remains visible. Eidola does not
@@ -77,17 +74,63 @@ this requires defeating the hardware. Tinfoil is also adding
 per-handshake nonces in `report_data` upstream; once that lands,
 even key exfiltration no longer suffices.
 
-EDIT: Add a new section on a malicious infrastructure operator. It's
-a threat that Tinfoil, who provides our infrastructure, impersonates
-us running an instance with different configuration. This is mitigated
-by committing every relevant configuration property in the attested
-config, including hashes of all injected secrets that are enforced on
-boot. This makes it impossible for them to change anything. Further,
-our client:server pairing prevents rollback attacks where a malicious
-Tinfoil operator or Eidola employee who could deploy with a valid
-WebPKI cert on a real enclave using a real signed old Eidola server
-version with a known vulnerability from ever being accepted by a
-client that has already been updated.
+### A3.5. A rogue deployer
+
+**Capability:** Anyone with deploy access to the legitimate Eidola
+infrastructure — a confidential-compute platform operator (e.g.
+Tinfoil), an Eidola employee with deploy credentials, or an
+attacker who has compromised one — could attempt to alter what
+runs: substitute the binary, change injected secrets, point the
+server at a different upstream, or roll back to a known-vulnerable
+older Eidola server build.
+
+**What stops them:** The server's behavior is fully determined by
+the **attested configuration** (`tinfoil-config.yml`), which is
+bound into the enclave measurement via the kernel command line.
+This covers the server image digest, the argument list and
+environment-variable schema, and hashes of any injected secrets
+the server enforces at boot. Any change produces a different
+measurement, which the client refuses to connect to. The
+client:server pairing (see [client.md](client.md#one-release-pairs-exactly-one-client-with-one-server))
+additionally blocks rollback: each client release pins exactly
+one server measurement, so even a genuinely-attested *older*
+server build doesn't match the pin compiled into an updated
+client.
+
+**Residual exposure:** Configuration that *isn't* committed into
+the attested boot path is, by definition, not bound into the
+measurement. The defense scales with the rigor of what's actually
+committed; the same discipline has to extend to any new sensitive
+configuration we add.
+
+### A3.6. A server impersonator
+
+**Capability:** Operates a server pretending to be Eidola from
+somewhere outside the legitimate infrastructure — DNS hijack, BGP
+redirection, a server the attacker controls at the real hostname,
+or a fake stack not running confidential compute at all. This
+generalizes the active-network MITM of [A3](#a3-an-active-network-attacker-mitm),
+which is one route by which an impersonator can redirect traffic
+to their fake endpoint.
+
+**What stops them:** The same controls as [A3.5](#a35-a-rogue-deployer).
+The client's pinned measurement names exactly one valid server
+build; only an enclave actually running that build can produce a
+matching attestation, and only confidential-compute hardware with
+valid vendor signing keys can produce a real attestation at all.
+**WebPKI is an additional layer**:
+an impersonator without a valid TLS cert for the real Eidola
+hostname can't reach the attestation step at all, while an
+impersonator who *has* a fraudulent cert (or who tricks the user
+into a lookalike hostname) still fails the measurement check on a
+real or fake enclave.
+
+**Residual exposure:** Same as A3 — an attacker who has both
+exfiltrated the TLS private key from inside a valid enclave and
+possesses a valid attestation document binding that key has
+cleared all three layers. The hardware-sealed-key property is
+what bounds this; Tinfoil is adding per-handshake `report_data`
+nonces upstream as a future close.
 
 ### A4. An attacker who compromises the Eidola release pipeline
 
@@ -117,43 +160,43 @@ itself.
 **Capability:** Has subverted a third-party crate, container base
 image, or build tool that Eidola depends on.
 
-**What stops them:** Source-bootstrapped reproducible builds
-(StageX on Linux, hermetic Nix on macOS), pinned and digest-verified
-container images, and an explicit dependency surface. Every release
-attestation includes a claim that the attestant has personally
-reproduced the build from source. A divergence between CI's build
-output and a reproducer's build output is detectable as a hash
-mismatch on the signed manifest.
+**What stops them:** The structural defenses, in order of how much
+of the attack surface they actually close:
 
-EDIT: we might also reference our source-committed artifact-manifest
-approach here.
+- **Pinned dependency surface.** Every dependency has a fixed
+  version and an expected hash. Updates are explicit commits.
+- **Minimal runtime dependencies.** Distribution of compiled binaries
+  limits exposure to outdated or vulnerable libraries on the
+  end-user's machine.
+- **Source-bootstrapped reproducible builds on Linux** (StageX).
+  This eliminates an entire class of "what was actually in the
+  toolchain" risks: every binary in the chain — down to the assembly
+  that built the c compiler — is built from source whose
+  hash is committed and verified.
+- **Hermetic builds on macOS** (Nix). This is *hermetic*, not fully
+  source-bootstrapped in the StageX sense, but provides similar
+  properties for components of the build environment above the OS. The
+  macOS operating system and parts of its toolchain are opaque inputs
+  we must accept, because cross-compiling to macOS from Linux is not
+  viable today. See [gaps.md](gaps.md#build-chain-opacity).
+- **A committed `artifact-manifest.json` as a merge invariant.**
+  CI re-derives the manifest from source on every PR and refuses
+  to merge if the result differs from the committed copy. This
+  makes reproducibility enforced in the PR flow itself, not
+  just at release time.
+- **Personal reproduction in the release attestation.** Every
+  release attestation includes a claim that the attestant has
+  personally reproduced the manifest from source on hardware
+  under their control.
 
-**Residual exposure:** A dependency compromise that occurred *and*
-was incorporated *and* was reviewed by all attestants without being
-caught is not detected by this mechanism. Defense-in-depth comes
-from minimal dependency surface and explicit diff review in the attestation
-flow.
-
-EDIT: we need to be more realistic about this; tooling is a huge part
-of the "defense in depth" and no single human or even AI read every
-single line of code in every single production and build pipeline dep. The
-most novel thing we do here is full reproducibility with StageX/nix, which eliminates an
-entire category of "undefined" risks, but so much else comes from CVE
-monitoring (via dependabot, etc). And to note, nix on macos is not "fully
-source bootstrapped" in the way stagex is: the latter literally starts
-with hand-written assembly, builds a minimal c compiler, uses it to build
-the full c compiler, uses it to build c++, uses it to build rust, etc. We
-*must* compile for macos on macos, and with that comes opacity. The real
-takeaway is that we are at the bleeding edge of best practices here, and
-to the absolute highest extent possible, dependencies are explicit,
-pinned, and minimal. We probably don't need to say all this here, but
-maybe some? Much of these aren't novel at all and are more like the
-corporate policies I'd put in a SOC2. I've been trying to minimize
-emphesizing "policy" points that are non-structural, at risk of diluting
-the impact of the truly important pieces. Let's think about an approach
-to that issue: do we consolidate "non-structural policies" to some other
-place? That wouldn't read well... I'm not really sure how to approach this?
-
+**Residual exposure:** A dependency compromise that occurred,
+was incorporated, and was not caught by any of the above (PR
+review, attestant diff review, downstream public review) is the
+remaining gap. We supplement with operational practices —
+Dependabot for CVE monitoring, preference for pure-Rust
+dependencies where it reduces audit surface, minimal direct
+dependency count — but these are normal-best-practice rather
+than structural defenses.
 
 ### A6. A legally-compelled Eidola engineer
 
@@ -220,20 +263,29 @@ acceptable for their threat model:
 
 | Trust anchor | What we rely on it for | What lowers the exposure |
 |---|---|---|
-| **Confidential compute vendors** (AMD, Intel, NVIDIA) | The attestation chain proves real enclave execution | Multi-vendor coverage (SEV-SNP + TDX), future OpenTitan-style roots |
-| **WebPKI** (Let's Encrypt) | The TLS cert presented by the server is genuinely the one issued for the hostname | The cert is bound to the enclave attestation by the client; a forged WebPKI cert alone is not enough |
-| **Sigstore Rekor** (Linux Foundation) | The transparency log entry for a release attestation is genuine and never removed | Inclusion proofs are verified locally; checkpoint signatures are a [gap](gaps.md) |
-| **GitHub OIDC** (Fulcio identity binding) | The release-signing CI workflow ran under the identity it claims | Pinned identity pattern + tag; manual escape via [rotation](../releases/README.md#rotating-the-ci-signing-workflow) |
+| **Confidential compute vendors** (AMD, Intel, NVIDIA) | The attestation chain proves real enclave execution | A specific deployment is attested under one vendor's root, not both; supporting multiple vendors broadens the *deployment* surface, not the per-connection trust surface. Future OpenTitan-style roots would reduce vendor count over time. See [N5](#n5-microarchitectural-side-channels-against-confidential-compute-hardware) for the hardware-vulnerability side |
+| **WebPKI** (Let's Encrypt) | The TLS cert presented by the server is genuinely the one issued for the hostname | The cert is bound to the enclave attestation by the client (`report_data[0..32] == sha256(SPKI(peer_cert))`); a forged WebPKI cert alone is not enough |
+| **Sigstore Rekor** (Linux Foundation) | The transparency log entry for a release attestation is genuine and never removed | Rekor public keys are pinned in the client via `sigstore-trusted-root.json`, so a WebPKI MITM against `rekor.sigstore.dev` still can't sign valid Rekor responses. If Rekor is unreachable, update verification fails closed. Checkpoint signature verification is a [gap](gaps.md#rekor-checkpoint-signature-verification) |
+| **GitHub OIDC** (Fulcio identity binding) | The release-signing CI workflow ran under the identity it claims | Pinned identity pattern + tag, plus the human attestation requirement makes OIDC compromise alone insufficient. Manual escape via [rotation](../releases/README.md#rotating-the-ci-signing-workflow) |
 | **The user's prior client binary** | Embedded trust root has not been silently subverted before install | Public release record + signed continuity check between releases |
 | **The user's hardware and OS** | Process isolation, key storage, code execution integrity | Outside Eidola's scope; named in [N1](#n1-a-compromised-local-environment) |
-
-EDIT: Our Rekor checks would fail safe, right? If rekor.sigstore.dev is down, we can't verify a new build; or perhaps we're susceptible to WebPKI compromised MITM? Double check the actual gap here.
-
-EDIT: OIDC compromise is mitigated by the human signing. Is the rotation scheme relevant here?
 
 Each of these is a place where a sufficiently motivated and capable
 adversary could break the chain. They are not weaknesses we are
 hiding; they are the cost of building software at all. Where we have
 in-progress mitigations, they are in [gaps.md](gaps.md).
 
-EDIT: Somewhere we need to address potential vulnerabilities of confidential compute hardware itself, including things like side channel attacks, as a residual risk.
+### N5. Microarchitectural side channels against confidential-compute hardware
+
+Confidential-compute hardware proves *which code is running* in
+an enclave; it does not prove that the host platform is free of
+microarchitectural side channels (Spectre-class branch prediction
+leaks, cache-timing attacks, power-analysis, fault-injection,
+etc.). Past CVEs against SEV-SNP and TDX have shown this is a
+live research area. Mitigations are at the firmware-and-microcode
+layer — the verifier enforces a TCB floor (bl ≥ 0x07, snp ≥ 0x0e,
+ucode ≥ 0x48) on every connection — but Eidola does not promise
+that no future vulnerability will be discovered. A reader for
+whom this is the dominant concern should weigh it against the
+remote-compute threat surface as a whole, not against Eidola
+specifically.

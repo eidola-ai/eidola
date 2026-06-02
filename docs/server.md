@@ -62,13 +62,70 @@ Domain separation is baked into the credential construction
 (`ACT-v1:eidola:inference:production:<date>`) to prevent
 cross-deployment correlation if the issuer key were ever reused.
 
-EDIT: we should add a section about the annonymity set. We specifically
-chose our credential key rotation and ACT issuance policies (which are part
-of the server codebase) to allow for flexible billing shapes, concurrency
-and just-in-time issuance to multiple devices, while preventing timing
-correlation attacks between linked/unlinked requests and preserving a
-sufficient annonymity set. There is quite a bit here and it's worth
-unpacking a bit.
+## Anonymity set
+
+The unlinkability claim in G2 is meaningful only to the extent that
+each token's anonymity set is large and the issuance/redemption
+policy doesn't accidentally re-introduce a linkable identifier. The
+server's issuance and key-rotation policies are tuned specifically
+for these properties.
+
+**Anonymity set = users sharing the same issuer key + domain
+separator.** Every ACT token redeemed against a given issuer key
+is, by the math of the blind-signature scheme, indistinguishable
+from every other token issued under that key. The size of the set
+is the number of distinct accounts that received at least one
+token from that key during its issuance window.
+
+**Issuer keys rotate on a ~7-day epoch.** Each key has an
+`issue_from` timestamp and an `issue_until` timestamp; while
+active, that key signs new credentials. After `issue_until` the
+key stops issuing, but tokens already issued under it remain
+redeemable until `accept_until` (a grace period beyond the
+issuance window). The dual-window design means at any moment
+multiple keys are concurrently spendable, but only one key is
+actively *issuing*. This is intentional:
+
+- It bounds the lifetime of any single issued token, so revocation
+  by retirement (rather than per-token blacklisting) is the
+  primary mechanism.
+- It gives users a meaningful redemption window that doesn't
+  require them to redeem the moment a token is issued. Tokens can
+  be requested in advance, held client-side, and spent later
+  without timing-correlating issuance to redemption.
+
+**The domain separator does *not* rotate on the same schedule —
+deliberately.** The anonymity set is the intersection of "users
+sharing the same key" *and* "users sharing the same domain
+separator." Rotating the domain separator would shrink the
+anonymity set without any compensating gain (nullifiers, which
+prevent double-spending, are partitioned by issuer key, not by
+domain separator). The domain separator only changes on protocol
+upgrades or deployment-identity changes.
+
+**Cross-device and batched issuance.** Because tokens are spendable
+across the full `accept_until` window and don't carry per-device
+binding, a user with multiple devices on a single account can have
+each device hold its own tokens issued under the same key — all
+contributing to the same anonymity set. The same flexibility
+covers JIT issuance scenarios where a device requests tokens on
+demand.
+
+**Why this prevents timing correlation between linked and
+unlinked requests.** Issuance happens on the authenticated
+(linked) account surface. Redemption happens on the anonymous
+(unlinked) inference surface. If issuance and redemption were
+forced to be near-simultaneous, an observer of both surfaces
+could correlate "account X issued at time T, anonymous token
+redeemed at time T+ε" with high confidence. The
+batched-and-deferred-redemption policy decouples those timestamps
+by design: the issuance request is a separate, asynchronous
+event from any individual redemption.
+
+What this policy does *not* defend against is a small total
+anonymity set during the early life of the deployment (when only
+a few users are issuing under a given key). That is named in
+[gaps.md#anonymity-set-size](gaps.md) as an early-stage residual.
 
 ## What runs in confidential compute
 

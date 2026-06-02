@@ -105,7 +105,7 @@ pub fn run(args: Args) -> Result<()> {
         Ok(bytes) => sha256_hex(&bytes),
         Err(_) => bail!(
             "`docs/privacy-guarantees.md` not found. \
-             The `no_known_privacy_weakening` claim references its sha256; \
+             The `privacy_guarantees_not_weakened` claim references its sha256; \
              create the document and commit it before attesting."
         ),
     };

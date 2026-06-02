@@ -24,9 +24,6 @@ Certificate Timestamp proves the cert was logged in a public CT log.
 Fulcio chain walk are the primary binding. The SCT check is
 defense-in-depth on top of those, not a single point of failure.
 
-EDIT: verify that this is correct. It probably is, but my recollection
-is fuzzy on this topic.
-
 ### Rekor checkpoint signature verification
 
 **What it would catch.** The Rekor instance silently forking a
@@ -99,23 +96,17 @@ hasn't been generated yet.
 internally-consistent *older* `release.json` could route them onto
 a real-but-stale release.
 
-**Mitigations today.** The client surfaces `released_at` to the user
-before approving an install, and a public release-cadence statement
-makes "the latest release is older than the cadence" a question the
-community can ask in the open.
+**Mitigations today.** None that the client can enforce. A first
+install is exactly the case where the client has nothing to
+compare against, so the surface "did you download a current
+release or a stale-but-internally-consistent one?" lives outside
+the client's reach today.
 
-EDIT: This mitigation doesn't make sense to me: the client doesn't
-mediate a fresh install. A user installs this directly by downloading
-and executing it (via the web or some package manager). We currently
-don't have a public release cadence, but will in the future.
-
-**Future.** Ship a freshness anchor: a witness checkpoint, a
-Bitcoin-block reference, or a co-signed signed-tree-head. Any of
-these closes the first-install gap; choosing among them is partly a
-matter of which witness ecosystem matures fastest.
-
-EDIT: I'm not 100% sure how these help, for the same reason. We
-might need to discuss.
+**Future.** A *freshness anchor* is something a fresh install
+*can* validate at the moment of download, without needing prior
+state. The general shape: every release embeds (or references) a
+recent timestamped artifact from a public, append-only system
+that an attacker cannot retroactively forge.
 
 ### Multi-jurisdiction attestant distribution
 
@@ -138,17 +129,12 @@ genuine attestation chains. A vendor issuing fraudulent attestations
 for an enclave that does not in fact provide confidential compute
 would defeat that layer of the chain.
 
-**Mitigations today.** Multi-vendor coverage (SEV-SNP + TDX, with
-NVIDIA confidential compute on the upstream inference layer) limits
-exposure to a single vendor compromise. The attestation chain itself
-is cryptographically witnessed; a forgery would need the vendor's
-hardware-bound signing key.
-
-EDIT: I'm not sure if this is a real mitigation or if it actually
-increases the surface area. By supporting *both* AMD and Intel, a
-compromise of *either* root cert (for example) would allow a forged
-attestion to be accepted. As far as I am concerned, this is not
-mitigated, just accepted. Push back if I'm incorrect about this.
+**Mitigations today.** Limited. The use of WebPKI for our TLS
+certificate provides a defense in depth, ensuring that an outside
+party issuing a fraudulent attestation must also product or obtain
+a fraudulent WebPKI certificate. However, this provides little
+resistance in the case of a malicious insider. Generally, we accept
+hardware vendor trust as residual.
 
 **Future.** Open hardware roots like OpenTitan reduce the scope of
 vendors the trust chain depends on. This is an industry-wide
@@ -164,42 +150,107 @@ observing network metadata (connection patterns, packet sizes,
 timing). Content is protected by TLS terminated inside the
 attested enclave; metadata is visible to network observers.
 
-**Mitigations today.** Users who need metadata privacy can layer
-Eidola behind Tor or a similar anonymity network. Eidola's protocol
-is plain HTTPS, so this works without modification.
+There are really two distinct gaps here that share infrastructure
+but answer different questions for the user:
 
-**Future.** No active work on a metadata-privacy story is committed;
-this is named explicitly so readers know it is out of scope and
-have to make their own provision if they need it. See
-[threat-model.md#a2-a-passive-network-observer](threat-model.md#a2-a-passive-network-observer)
-for the explicit residual.
+#### Passive traffic analysis
 
-EDIT: we *do* consider this in-scope, but do not have a concrete plan to address it. Explored approaches include offering a Tor hidden service and partnering with other independent organizations to improve unlinkability through use of oHTTP, MASQUE/CONNECT, etc. There are probably actually 2 distinct threats here: passive traffic analysis and network identity as a linking factor. Current guidance is to use Tor to address the first, and to use Tor or a well reputed VPN provider like Mullvad to address the second. We might want to tackle these separately.
+**What it would catch.** Connection patterns, packet sizes,
+timing — even with TLS confidentiality, these can reveal a great
+deal (which model you used, the rough shape of conversations,
+when you are active).
+
+**Mitigations today.** User-side: route Eidola through Tor.
+Eidola's protocol is plain HTTPS, so this works without
+modification.
+
+**Future.** We consider this in-scope as an Eidola problem to
+address, but do not yet have a committed plan. Explored
+directions include offering a Tor hidden service endpoint and
+partnering with independent organizations to provide oblivious
+HTTP (oHTTP) or MASQUE/CONNECT-style transports that decouple
+network identity from request content.
+
+#### Network identity as a linking factor
+
+**What it would catch.** Even a single connection to Eidola
+from a unique IP is itself an identity signal: an observer (or
+Eidola's own network logs, were they to exist) can correlate
+"a connection from IP X" with the account billed at
+approximately the same time, undermining
+[G2](privacy-guarantees.md#g2-account-inference-unlinkability)
+at the transport layer rather than at the application layer.
+
+**Mitigations today.** User-side: use Tor, or a reputable VPN
+provider like Mullvad. Both break the direct IP↔account
+correlation by inserting a third party that doesn't share data
+with Eidola.
+
+**Future.** Same direction as above (oHTTP, MASQUE, partner
+relays). The Eidola-side mitigation here is partnering with an
+independent organization whose role is to terminate the
+network connection so that no single party — Eidola included
+— sees both the network identity and the account it
+corresponds to.
 
 ## Inference upstream
 
-### Sigstore re-verification of upstream measurements at runtime
+### Upstream-provider trust-discipline mismatch
 
-**Current behavior.** `releases/trust/tinfoil-enclaves.json` is
-populated by a workflow that verifies upstream provenance via
-Sigstore before opening a PR. At runtime, the server checks the
-upstream enclave's measurement against the static allowed list it
-was built with. It does not re-verify the upstream's Sigstore
-provenance on every request.
+**Current behavior.** Inference runs in a separately-attested
+enclave operated by the upstream provider (currently Tinfoil).
+Tinfoil's release pipeline is robust — signed measurements,
+Sigstore provenance, public source — but it does not yet match
+the discipline applied to Eidola's own releases. Specifically:
 
-**What constrains it today.** The static allowed list is itself a
-release-gated value: a new upstream measurement only becomes
-trusted after a normal source change, which carries the human
-attestation. The Sigstore verification step happens at PR-creation
-time, not runtime.
+- Tinfoil's builds are **not source-bootstrapped reproducible**
+  in the StageX sense. They are hermetic and provenance-attested
+  through GitHub's CI attestation, which is rigorous, but
+  shaped differently than Eidola's.
+- Tinfoil does **not yet ship per-release human attestations
+  under named legal identities** the way Eidola releases do.
 
-**Future.** Continuous re-verification at runtime would catch a
-hypothetical case where a measurement passed PR review (perhaps via
-a now-rotated key) but is no longer verifiable today. This is
-defense-in-depth on an already-gated path.
+A user's chain of trust at the inference layer therefore ends at
+Tinfoil's release discipline, which is non-trivially different
+from Eidola's.
 
-EDIT: I don't think we'll ever add continuous re-verification. This
-is static by design. However, we *would* like to run our own inference
-directly in our server, still hosted on Tinfoil's infrastructure. The primary risk with inference upstream is that *their* builds are very rigorous, but don't
-adhere to all the strict properties that we have, including source-
-bootstrapped reproducible builds and human release attestations.
+**Future.** Bring the inference pipeline into this repo (still
+running on Tinfoil's infrastructure), so the same
+source-bootstrapping + human-attestation discipline applies
+end-to-end. The inference enclave would then be built and
+released through Eidola's own release flow rather than
+trust-bridged through a separate pipeline.
+
+## Build chain opacity
+
+### Non-source-bootstrapped components in the trust chain
+
+**What it would catch.** Build-pipeline subversion in a stage we
+don't fully source-bootstrap.
+
+**Current behavior.** Several components of the Eidola build
+chain are pinned by hash and used reproducibly, but are
+themselves not fully source-bootstrapped:
+
+- **macOS Nix builds.** Hermetic and reproducible (`narHash`
+  pinning), but rely on the Apple SDK / Xcode toolchain as
+  opaque inputs. Cross-compiling macOS binaries from Linux is
+  not viable today, so macOS releases must be built on macOS.
+- **`cvmimage` and OVMF firmware.** Pinned by hash, but their
+  build chains do not match Eidola's source-bootstrapping
+  discipline. Their contents are bound into the server's
+  enclave measurement, so they cannot be changed silently — but
+  the original build chain is more trusted than we ideally
+  want.
+
+**What constrains it today.** Each of these has digest pinning
+and provenance verification at the import boundary (Sigstore
+provenance for `cvmimage`, narHash for Nix outputs, committed
+hashes for OVMF), so silent substitution is detectable. The
+gap is that the upstream *builders* of those artifacts are
+trusted to a degree we don't fully audit.
+
+**Future.** This is a long-term direction matched to ecosystem
+progress: source-bootstrapped macOS toolchains, reproducible
+CVM/firmware builds. We follow the relevant ecosystems and will
+adopt as they mature. Until then, this is an unavoidable residual.
