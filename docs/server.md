@@ -64,9 +64,11 @@ cross-deployment correlation if the issuer key were ever reused.
 
 ## Anonymity set
 
-The unlinkability claim in G2 is meaningful only to the extent that
-each token's anonymity set is large and the issuance/redemption
-policy doesn't accidentally re-introduce a linkable identifier. The
+The unlinkability invariants in
+[privacy-guarantees.md §2](privacy-guarantees.md#2-unlinkability)
+are meaningful only to the extent that each token's anonymity set is
+large and the issuance/redemption policy doesn't accidentally
+re-introduce a linkable identifier. The
 server's issuance and key-rotation policies are tuned specifically
 for these properties.
 

@@ -30,9 +30,11 @@ binary that violates these properties. The client refuses to talk to
 any server whose attestation does not match the measurement pinned in
 the client build, so deploying a violating server requires the
 operator to also ship a violating *client release*. That path is
-blocked by guarantees [G3](privacy-guarantees.md#g3-no-silent-code-change),
-[G5](privacy-guarantees.md#g5-no-backdoor), and
-[G6](privacy-guarantees.md#g6-no-compelled-subversion-without-disclosure).
+blocked by the release-integrity invariants in
+[privacy-guarantees.md §6](privacy-guarantees.md#6-release-integrity)
+— in particular, the embedded trust root (§6.5), the human
+attestation requirement (§6.2), the attestant's no-known-backdoor
+claim (§6.3), and the no-compulsion claims (§6.4).
 
 ### A2. A passive network observer
 
@@ -204,8 +206,9 @@ than structural defenses.
 legal compulsion directs an engineer to weaken the privacy
 guarantees or introduce a backdoor.
 
-**What stops them:** Guarantee [G6](privacy-guarantees.md#g6-no-compelled-subversion-without-disclosure)
-requires the attestant to sign, under their legal identity, that they
+**What stops them:** The release-attestation no-compulsion claims
+([privacy-guarantees.md §6.4](privacy-guarantees.md#6-release-integrity))
+require the attestant to sign, under their legal identity, that they
 are *not* under such compulsion. A coerced engineer who is also
 gagged must either (a) decline to sign, breaking the release and
 sending a public signal, or (b) sign falsely and incur the legal
@@ -229,7 +232,8 @@ host process — most user-facing privacy properties fall, regardless
 of what Eidola does. The client's fail-safe defaults and embedded
 trust root limit *what code runs*, but they cannot prevent an
 already-trusted process from observing the user. This is named
-explicitly in [G1's "what this does not guarantee"](privacy-guarantees.md#g1-inference-content-confidentiality).
+explicitly in
+[privacy-guarantees.md §8.1](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise).
 
 ### N2. A hardware-manufacturer forgery
 

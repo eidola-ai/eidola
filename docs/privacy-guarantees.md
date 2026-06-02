@@ -1,219 +1,381 @@
 # Privacy Guarantees
 
-This document contains explicit promises about Eidola. Each numbered guarantee below is a
-property that Eidola commits to deliver, and that a release engineer
-signs against under their legal identity at every release (see
-[releases.md](releases.md) for the mechanics).
+This document enumerates the privacy and integrity properties Eidola
+commits to. It is the referent for the
+`privacy_guarantees_not_weakened`, `code_delivers_guarantees`, and
+`no_known_backdoor` claims in the release attestation schema (see
+[releases.md](releases.md)): a release attestation signed under this
+document's content hash asserts that the release does not weaken any
+item below and that no known code path violates them.
 
-These guarantees describe what you get when you install and run a
+Each item is stated as an invariant. Contributors maintain these
+invariants when changing code. Release attestants walk a diff against
+them before signing.
+
+Items are labelled **[S]** (structurally enforced — broken only by
+code that defeats the architecture, e.g. typed routing, blind-signature
+math, or build-time pinning) or **[P]** (policy — broken by code that
+violates stated discipline).
+
+These invariants describe what you get when you install and run a
 **generally-available release of Eidola** — the app downloaded from
 the public release channel, running on hardware whose
-confidential-compute attestation verifies under the trust root
-that release was built with. They do not extend to development
-builds, contributor-installed test versions, or any scenario where
-you have intentionally bypassed the release process (for example,
-running your own server with a local override). See
-[trust-root.md](trust-root.md#whats-pinned) for what's pinned and
-[client.md](client.md#configuration-overrides) for how overrides
-work.
+confidential-compute attestation verifies under the trust root that
+release was built with. They do not extend to development builds,
+contributor-installed test versions, or any scenario where
+configuration overrides have been set (see
+[client.md](client.md#configuration-overrides) and
+[trust-root.md](trust-root.md#whats-pinned)).
 
-## Guarantees
+---
 
-### G1. Inference content confidentiality
+## 1. Identity and authorization
 
-**The content of your AI inference requests and responses (prompts,
-attachments, model outputs) is never available in cleartext to any
-party other than the confidential-compute enclave performing the
-inference.**
+**1.1.** **[S]** Every server endpoint is classified `linked`,
+`unlinked`, or `public`. The classification is bound to the handler in
+code and checked in middleware before the handler executes. (See
+[server.md](server.md#linked-vs-unlinked).)
 
-- The Eidola client establishes TLS to the inference upstream through
-  a connection whose TLS key is bound to a hardware attestation
-  report. The client refuses the connection if the attestation does
-  not verify against the measurements pinned in the client build.
-  See [client.md](client.md) and [upstream.md](upstream.md).
-- The Eidola server does not log, store, or transmit inference
-  request bodies, response bodies, or any content derived from them
-  beyond what is required to route the request to the upstream
-  inference enclave and the response back to the client.
-- Telemetry on the inference path is limited to model name, token
-  counts, status, and latency. It does not contain message content,
-  account identifiers, or credential material.
+**1.2.** **[S]** `unlinked` endpoints accept only anonymous credential
+tokens (Privacy Pass ACT, `draft-schlesinger-privacypass-act-01`).
+They never receive, derive, persist, or log any identifier that ties
+a request to its issuance transaction, to the account it was issued
+to, or to other requests from the same client.
 
-**What this does not guarantee:**
+**1.3.** **[S]** `linked` endpoints accept only the HTTP Basic
+`(account_uuid, account_secret)` bearer pair. They never accept ACTs,
+and they never receive or emit inference request or response content.
 
-- The content of *local* state on the user's device (chat history,
-  drafts, cached responses) is the user's responsibility to protect.
-  Eidola's client stores conversation history locally; it is no more
-  or less private than any other file on the user's device.
-- Network metadata (the fact that you connected to an Eidola endpoint
-  at a given time, from a given IP) is visible to your network path.
-  Eidola does not commit to defending against traffic analysis.
+**1.4.** **[S]** The two authentication surfaces are disjoint at the
+Rust type level: the `BasicAuth` and `TokenAuth` extractors are
+distinct types, and an endpoint may take only one. Cross-acceptance
+requires a code change visible in a diff.
 
-### G2. Account–inference unlinkability
+**1.5.** **[P]** No personally identifiable information is requested
+or accepted at account creation. Email, phone, name, address, and
+government identifiers are never collected or stored by Eidola.
+Stripe's own retention is governed by Stripe and is out of scope
+(see §8.4).
 
-**Eidola cannot link any inference request to the account that paid
-for it.**
+## 2. Unlinkability
 
-- Inference endpoints authenticate with **anonymous credentials**
-  (Privacy Pass ACT tokens), not with account credentials. The server
-  verifies that the credential was legitimately issued without
-  learning which account it was issued to.
-- Account endpoints (balance, allocation, billing) use HTTP Basic
-  auth tied to an account UUID. Inference endpoints reject Basic auth
-  outright. The two authentication surfaces are disjoint at the type
-  level in the server.
-- No identifier carried on the inference path (credential, request
-  context, token) can be correlated with the account that requested
-  the credential, because the credential is unlinkable by
-  construction. See [server.md#unlinkability](server.md#unlinkability).
+**2.1.** **[S]** *Issuance ↔ redemption.* An ACT presented at an
+`unlinked` endpoint is cryptographically unlinkable, by the
+blind-signature construction, to the issuance transaction that
+produced it. With full access to its own database, the server cannot
+answer "which account paid for *this* inference request."
 
-**What this guarantee actually means in practice.** Eidola persists
-billing-related metadata (credential issuance records, accounting
-events) because we need it to charge accounts. The way the system
-is constructed, that persisted metadata does not let us answer
-"which account paid for *this* inference request" or "which
-inference requests came from the same account," even with full
-access to our own database. See
-[server.md#unlinkability](server.md#unlinkability) and
-[server.md#anonymity-set](server.md#anonymity-set) for the
-specific properties of the issuance protocol that make this true.
+**2.2.** **[S]** *Redemption ↔ redemption.* ACTs presented across
+different requests are cryptographically unlinkable to each other.
+The server cannot answer "which inference requests came from the
+same account."
 
-### G3. No silent code change
+**2.3.** **[S]** The anonymity set for a given token is the set of
+accounts that received at least one token under the same
+`(issuer_key, domain_separator)` during the issuer key's issuance
+window. Issuance and key-rotation policies are tuned to keep this
+set as sufficiently large. (See [server.md](server.md#anonymity-set).)
 
-**Your Eidola client will not begin running code that has not been
-released through the public, signed release process.**
+**2.4.** **[S]** Issuance and redemption are temporally decoupled:
+tokens remain redeemable across an acceptance window that extends
+beyond their issuance window, so the issuance timestamp on the linked
+surface and the redemption timestamp on the unlinked surface are not
+forced to be near-equal.
 
-- The client trust root is **embedded at compile time** from
-  committed source files. There is no runtime API that updates the
-  trust root, alters policy constants, or changes the set of
-  trusted attestant fingerprints.
-- Self-update (when implemented) requires a signed release
-  attestation from a pinned attestant, verified locally before the
-  binary is replaced.
-- The client trusts exactly one server build per release. A server
-  upgrade and a client upgrade ship together; clients reject server
-  attestations that do not match their embedded measurement.
+**2.5.** **[S]** No identifier carried on the inference path
+(credential bytes, request context, nullifier) is correlatable with
+any record on the linked surface. The two surfaces share no
+in-process state and no persistence path beyond the ACT issuance and
+redemption protocol itself. (Notwithstanding network-layer signals —
+IP address, packet timing — which are out of scope; see
+[gaps.md](gaps.md#network-identity-as-a-linking-factor).)
 
-**What this does not guarantee:**
+## 3. Content
 
-- A user who manually installs an unsigned build, or who installs a
-  build outside the published release channel, has bypassed this
-  guarantee by their own action.
-- A first install — a fresh device with no prior pinned trust root
-  — inherits whatever trust root is in the binary they downloaded.
-  See [gaps.md](gaps.md#first-install-downgrade) for the residual
-  exposure.
+**3.1.** **[S]** Inference request and response content (prompts,
+attachments, model outputs, tool inputs and tool results) is never
+written to durable storage on Eidola-controlled infrastructure.
 
-### G4. Verifiability
+**3.2.** **[S]** Inference content is never included in logs,
+telemetry, traces, error reports, or crash dumps, nor in any
+derived form that could meaningfully identify a request or link it
+to other requests — including content hashes, content lengths at
+request granularity, or per-request metadata beyond what is
+needed to bill, route, or operate the request. Aggregate counters
+(e.g. tokens-by-model totals) and request-shaped operational
+fields (status code, latency, route) are not in scope: they do not
+encode content and do not bind to any account identifier.
 
-**Every claim in this document is verifiable against published
-source and signed artifacts.**
+**3.3.** **[P]** Telemetry on the inference path is limited to model
+name, token counts, status code, and latency. The classifier that
+splits telemetry between the linked and unlinked surfaces runs in
+middleware before the span is created. (See
+[server.md](server.md#telemetry-scope-and-boundary).)
 
-- The source for the client, server, and all build inputs lives
-  in a public monorepo.
-- A copy of `artifact-manifest.json` — the digests of every
-  released artifact and the server enclave measurement — is
-  **committed in the repo root**, alongside the source it
-  describes. CI re-derives the manifest from source on every PR
-  and refuses to merge if the result differs. This makes
-  reproducibility a *merge invariant*: any commit on `main`
-  reproduces a specific manifest, and the published release is
-  what that manifest names.
-- Released binaries are reproducible: anyone can rebuild from
-  source and confirm bit-for-bit equality with what the release
-  ships.
-- Each release ships with a signed manifest binding the source
-  commit, the artifact digests, the enclave measurements, and a
-  human attestation, all to a single transparency-log entry.
-- The verifier the client uses to walk this chain is open source
-  and documented in [trust-root.md](trust-root.md).
+**3.4.** **[S]** Eidola service handlers do not persist or emit
+client IP addresses, user-agent strings, TLS fingerprints, or other
+network-layer identifiers. Network infrastructure outside the
+enclave (CDNs, load balancers, ISPs, the user's own network path)
+may log such identifiers and is out of scope for this invariant;
+the application-level promise is that Eidola code does not
+re-introduce them into its own observability or persistence
+surfaces.
 
-### G5. No backdoor
+**3.5.** **[S]** Inference content is never cleartext on the wire.
+It is decrypted only in the ephemeral memory of (a) the Eidola
+server enclave, while being routed to the upstream, and (b) the
+upstream inference enclave, whose attestation the Eidola server
+verifies per-handshake. Every link between client, server enclave,
+and upstream enclave is TLS terminated inside the respective
+enclave; no operator, host, orchestrator, or network observer has
+cleartext access at any point. (See [upstream.md](upstream.md).)
 
-**The released Eidola code contains no covert channel, hidden data
-exfiltration path, or surveillance mechanism not described in this
-document or the user-facing documentation it references.**
+**3.6.** **[P]** The Eidola server is request-based: on the inference path, there is no cross-connection cache persisted outside ephemeral enclave memory, and no per-account learned state. There is no operator-facing interface for inspecting, reviewing, approving, flagging, or replaying inference traffic.
 
-- Each release attestation includes an explicit claim, signed under
-  the engineer's legal identity, that they are not aware of any
-  backdoor or covert mechanism in the release.
-- The engineer's review is informed by a personal diff review against
-  the prior release, on hardware under their exclusive physical
-  control.
+## 4. Transport and server attestation
 
-**What this does not guarantee:**
+**4.1.** **[S]** TLS is terminated inside the Eidola server enclave.
+The TLS private key is sealed to the enclave by the confidential-
+compute runtime; no operator, host, or orchestrator has access to it.
 
-- An undisclosed vulnerability is not a backdoor in this sense, but
-  it could be exploited by an attacker as if it were. Eidola does not
-  promise the absence of bugs; it promises the absence of *intent*
-  to subvert.
-- A compromised hardware vendor (issuing fake attestations) or a
-  compromised dependency that we did not catch in review could
-  reintroduce a covert path despite this claim. See
-  [threat-model.md](threat-model.md).
-- **A bad-faith Eidola is in scope, not denied.** We could in
-  principle sign an attestation falsely claiming no backdoor.
-  Two things bound this: every claim in the attestation is
-  independently verifiable against the published source (a
-  reviewer can find a divergence), and the engineer signs under
-  their legal identity in a public, append-only transparency
-  log. The defense is verifiability plus legal accountability,
-  not "trust us."
+**4.2.** **[S]** The client re-verifies the server's hardware
+attestation on every new TCP+TLS handshake. There is no "verified
+once" cache; policy changes (TCB floor, allowed measurements) take
+effect on the next handshake. (See
+[client.md](client.md#per-handshake-attestation-no-caching).)
 
-### G6. No compelled subversion without disclosure
+**4.3.** **[S]** The attestation report's is
+checked to match the expected peer cert. The inline attestation rides the *same* TCP+TLS
+connection as the subsequent application request, so attestation and
+request share one HTTP lifecycle and the LB-routed backend that
+served the attestation is the one that serves the request.
 
-**Eidola will not weaken these guarantees in response to legal
-compulsion without that fact being inferable from the public release
-record.**
+**4.4.** **[S]** A TCB policy floor is enforced on every attestation.
+Measurements outside `ALLOWED_MEASUREMENTS` are rejected.
 
-- Each release attestation includes a claim, signed under the
-  engineer's legal identity, that they are not currently subject
-  to legal compulsion that has caused, or that requires them to
-  cause, this release to weaken any published guarantee.
-- A separate claim attests that the engineer is not subject to a
-  gag order or other restriction that prevents them from
-  truthfully making any claim in this attestation. (Gag orders
-  don't compel weakening; they constrain disclosure, which is a
-  different surface and needs its own claim.)
-- The attestant signs from hardware under their exclusive control
-  and posts the signature to a public transparency log.
-- A coerced engineer who is forbidden from making the compulsion
-  or gag claim truthfully must either (a) decline to sign,
-  breaking the release, or (b) sign falsely and incur the
-  disclosed legal exposure.
-- The minimum number of independent attestants required for a
-  release (`MIN_HUMAN_ATTESTATIONS`) is pinned in the **prior**
-  client, so a coerced single engineer cannot lower the bar by
-  shipping a release that requires fewer signatures.
+**4.5.** **[S]** The same per-handshake verification discipline
+applies to the Eidola server's outbound connections to the inference
+upstream. (See [upstream.md](upstream.md#per-connection-verification).)
 
-**What this does not guarantee:**
+**4.6.** **[S]** Each client release pins **exactly one** server-
+enclave measurement. There is no minimum-version floor and no
+`any of N` list; a different server build requires a different
+client release. (See
+[client.md](client.md#one-release-pairs-exactly-one-client-with-one-server).)
 
-- A jurisdiction able to compel *every* pinned attestant
-  simultaneously, with credible secrecy, defeats this guarantee
-  silently. The mitigation is distribution of attestants across
-  jurisdictions and a public minimum threshold; that work is ongoing
-  (see [gaps.md](gaps.md)).
-- An out-of-band compromise (an attestant's signing key extracted
-  from hardware without their knowledge) is a different attack
-  surface, addressed by the key being hardware-bound and
-  fingerprint-pinned, not by this guarantee.
+**4.7.** **[S]** Verification is fail-safe. There is no degraded
+mode, no trust-on-first-use fallback, no user prompt to ignore a
+failed attestation. Inability to verify ⇒ the connection does not
+happen. (See [client.md](client.md#fail-safe-by-design).)
+
+## 5. Server measurement and configuration binding
+
+**5.1.** **[S]** The server-enclave measurement is a deterministic
+function of source: OVMF firmware (pinned), CVM kernel + initrd
+(pinned), the kernel command line (which embeds the SHA-256 of
+`tinfoil-config.yml`), and the vCPU count and type. Any change to the
+attested boot path produces a different measurement, which the client
+refuses to connect to. TODO: https://github.com/tinfoilsh/measure-image-action/pull/48
+
+**5.2.** **[S]** The full server runtime configuration —
+image digest, argument list, environment variable schema, and
+hashes of all measured secrets — lives in `tinfoil-config.yml` and
+is therefore bound into the measurement via §5.1. Configuration
+changes are release events.
+
+**5.3.** **[S]** Secrets that allow access to persisted state inside the
+enclave (`CREDENTIAL_MASTER_KEY`, `DATABASE_PASSWORD`) are injected
+as Tinfoil secrets bound to the enclave measurement. A different
+measurement cannot retrieve them; the server image itsle has no
+intrinsic ability to access its own persisted state outside the attested
+boot path.
+
+**5.4.** **[S]** The client trust root pins exactly one upstream-
+inference enclave-measurement set per release
+(`releases/trust/tinfoil-enclaves.json`, baked into the server
+binary at compile time). Updates go through PR review with Sigstore
+provenance verification before merge. (See
+[upstream.md](upstream.md#what-pins-the-upstream-measurement).)
+
+**5.5.** **[S]** Hardware-attestation collateral that the operator
+could plausibly poison (AMD KDS CRLs for SEV-SNP, Intel PCS
+collateral — TCB info, QE identity, PCK CRLs — for TDX) is fetched
+by the verifier directly from the hardware vendor in production
+mode; the operator is never a relay for its own collateral.
+
+## 6. Release integrity
+
+**6.1.** **[S]** Every released binary is bit-reproducible from
+public source. CI re-derives `artifact-manifest.json` on every PR to
+`main` and refuses to merge if the result differs from the committed copy;
+reproducibility is a *merge invariant*, not just a release-time
+property.
+
+**6.2.** **[S]** Every release carries at least `MIN_HUMAN_ATTESTATIONS`
+independent human attestations conforming to the schema pinned in
+the client trust root. Each attestation is signed via `cosign
+sign-blob` under a hardware-bound key whose
+`sha256(PKIX SubjectPublicKeyInfo DER)` matches a fingerprint in
+`TRUSTED_ATTESTANT_FINGERPRINTS`, and is recorded in the Sigstore
+Rekor transparency log as a `hashedrekord` v0.0.1 entry.
+
+**6.3.** **[S]** Every human release attestation contains positive,
+prose-equal claims that the attestant: (a) personally reproduced
+`artifact-manifest.json` from the source commit on hardware under
+exclusive physical control, (b) reviewed the source-level diff
+against the prior release, (c) is not aware of any backdoor, covert
+surveillance mechanism, or undisclosed data path in the release,
+(d) is not aware of any change that causes the code to fail to
+deliver these guarantees, and (e) confirms this document does not
+weaken, narrow, or remove any item that was in effect at the prior
+release. The verifier re-renders each claim from a pinned template
+and rejects any character mismatch. (See
+[releases.md](releases.md#what-the-engineer-attests-to).)
+
+**6.4.** **[S]** Every release attestation contains positive,
+prose-equal claims that the attestant is **not** subject to legal
+compulsion that has caused the release to weaken any guarantee, is
+**not** subject to a gag order preventing truthful attestation,
+is **not** coerced, and is signing of their own volition with a
+hardware-held key under their exclusive physical control.
+
+**6.5.** **[S]** The client trust root (server-enclave measurement,
+attestant fingerprints, CI identity pattern, supported schema
+versions, attestation-claim templates, Sigstore trusted root) is
+embedded at build time from committed source files. There is no
+runtime API to mutate the trust root or alter policy. (See
+[trust-root.md](trust-root.md#whats-pinned).)
+
+**6.6.** **[S]** `MIN_HUMAN_ATTESTATIONS` is pinned in the
+*currently-installed* client, not in the incoming release. A
+coerced single attestant cannot lower the bar by shipping a release
+that requires fewer signatures.
+
+**6.7.** **[S]** Self-update requires that the incoming release's
+`previous_release.git_commit` equal the currently-installed
+`git_commit`. Stale-release substitution and rollback to a known-bad
+past release both fail this check.
+
+**6.8.** **[S]** Release-document `schema_version` values are
+integers with no semver tolerance. The verifier refuses to parse any
+document outside its pinned supported set; new fields cannot be
+silently accepted. (See
+[trust-root.md](trust-root.md#schema-versions-explicit-and-breaking).)
+
+## 7. Source, build, and operational discipline
+
+**7.1.** **[P]** All client code, server code, build configuration,
+and release tooling are published in a public monorepo.
+
+**7.2.** **[S]** Build environments are pinned and reproducible:
+StageX (source-bootstrapped) for Linux OCI images, Nix flake
+(hermetic, narHash-pinned) for the macOS universal-binary builds.
+Build-environment hashes flow into the artifact manifest.
+
+**7.3.** **[S]** Source dependencies are pinned by version and hash.
+Updates are explicit commits.
+
+**7.4.** **[P]** Logging and telemetry destinations are part of the
+attested configuration (§5.2). Changing a destination is a release
+event with a fresh human attestation.
+
+**7.5.** **[P]** No feature is added whose privacy depends on
+operator trustworthiness when a comparable feature with
+cryptographic enforcement is implementable. When a policy-only
+feature is added, it is labelled **[P]** in this document.
+
+**7.6.** **[P]** Any feature whose existence would let an operator
+answer the question "did account X ever do Y" is a violation of
+this document, regardless of operator intent or cited rationale.
+
+---
+
+## 8. Bounded claims (what this document does not promise)
+
+**8.1.** Eidola does not promise resistance to a local adversary
+observing the user's device — keyloggers, compromised endpoints,
+malicious peripherals, OS-level surveillance, or another process
+with sufficient privilege. Local conversation history stored by
+the client is no more or less private than any other file on the
+user's device.
+
+**8.2.** Eidola does not promise that inference models will not
+retain content in weights, activations, or KV caches during a
+request. That is the model author's domain. Eidola promises only
+that *its* infrastructure does not retain content (§3).
+
+**8.3.** Eidola does not promise unforgeability of ACTs from
+a compromised issuer key. Forgery-enabled service abuse is an
+operator-borne financial loss; it is never permitted to become
+a user-borne privacy loss, because unlinkability (§2) survives.
+
+**8.4.** Eidola does not promise anonymity against Stripe with
+respect to payment metadata. The boundary Eidola enforces is
+between payment metadata and service usage (§1.5). Stripe's own
+retention and Eidola's retention of Stripe-collected data are out
+of scope.
+
+**8.5.** Eidola does not promise defense against traffic analysis.
+Network metadata (the fact that a connection occurred, its size,
+timing, originating IP) is visible to network observers. Users
+who need that property should layer Eidola behind Tor or a similar
+anonymity network. (See [gaps.md](gaps.md#traffic-analysis).)
+
+**8.6.** Eidola does not promise the absence of bugs. An
+undisclosed vulnerability is not a backdoor in this document's
+sense (§6.3), but it could be exploited as if it were. The promise
+is the absence of *intent* to subvert, not the absence of error.
+
+**8.7.** Eidola does not promise defense against coordinated legal
+compulsion of *every* pinned attestant simultaneously, under
+credible secrecy. The mitigation is multi-jurisdiction attestant
+distribution, named in
+[gaps.md](gaps.md#multi-jurisdiction-attestant-distribution).
+
+**8.8.** Eidola does not promise that confidential-compute hardware
+vendors (AMD, Intel, NVIDIA) cannot issue fraudulent attestations.
+That is residual trust we currently accept; see
+[gaps.md](gaps.md#trust-in-confidential-compute-vendors).
+
+---
 
 ## How this document evolves
 
-Changes to this document are **append-only in spirit**: subsequent
-releases can add guarantees, narrow scope where doing so does not
-remove a promise, or correct ambiguous wording. They cannot remove,
-weaken, or narrow a guarantee that was in effect at the prior
-release. The verifier enforces this at the attestation level: a
-release whose attestation lacks the `privacy_guarantees_not_weakened`
-claim will fail.
+Changes are **append-only in spirit.** Subsequent releases may
+add items, narrow scope where doing so does not remove a promise,
+or correct ambiguous wording. They may not remove or weaken any
+item that was in effect at the prior release.
 
-If a future release needs to weaken a guarantee — for example, if a
-discovered vulnerability requires a fallback that exposes
-previously-shielded data — the release notes will say so explicitly,
-the attestant will be unable to sign `privacy_guarantees_not_weakened`,
-and the release will not pass the standard verifier. Users would
-have to opt into such a release by an out-of-band mechanism.
+Strengthening goes through the normal release flow. Weakening
+requires the attestant to be unable to sign
+`privacy_guarantees_not_weakened` truthfully; the release notes
+must call out the weakening explicitly, and users would have to
+opt into such a release out of band. The verifier enforces the
+structural side: a release whose attestation lacks
+`privacy_guarantees_not_weakened` will fail.
 
-For the technical history of how this document is hashed, pinned, and
-checked, see [trust-root.md](trust-root.md).
+## How to use this document
+
+**Contributors.** Before opening a release PR, read this document
+in full. Any diff that affects an item above must be called out in
+the PR description, with a justification and any proposed
+amendment.
+
+**Release attestants.** When reviewing a release, walk this
+document item by item against the diff between the previous and
+current release commits. The `code_delivers_guarantees`,
+`no_known_backdoor`, and `privacy_guarantees_not_weakened` claims
+in the release attestation are positive statements that this walk
+has been completed.
+
+**External reviewers and citers.** Every item carries a stable
+`§X.Y` identifier. Cite this file by durable hash (git commit hash
+or file content hash) and item number; the numbers MAY change across
+releases, although new items will generally be appended to preserve
+identification.
+
+---
+
+*This document is versioned by content hash. The hash referenced
+by a given release attestation is the version this document had
+at that release. Prior versions are reachable via git history.*

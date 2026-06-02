@@ -115,8 +115,11 @@ and may share a jurisdiction.
 
 **Future.** Distributing pinned attestants across hardware vendors,
 custody arrangements, and jurisdictions raises the cost of
-coordinated legal compulsion — the central concern of guarantee
-[G6](privacy-guarantees.md#g6-no-compelled-subversion-without-disclosure).
+coordinated legal compulsion — the central concern of the
+no-coercion attestation claims in
+[privacy-guarantees.md §6.4](privacy-guarantees.md#6-release-integrity)
+and the bounded claim in
+[§8.7](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise).
 This is a matter of organizational rollout, not engineering, but it
 is named here because it is part of what the guarantee depends on.
 
@@ -177,8 +180,9 @@ network identity from request content.
 from a unique IP is itself an identity signal: an observer (or
 Eidola's own network logs, were they to exist) can correlate
 "a connection from IP X" with the account billed at
-approximately the same time, undermining
-[G2](privacy-guarantees.md#g2-account-inference-unlinkability)
+approximately the same time, undermining the unlinkability
+invariants in
+[privacy-guarantees.md §2](privacy-guarantees.md#2-unlinkability)
 at the transport layer rather than at the application layer.
 
 **Mitigations today.** User-side: use Tor, or a reputable VPN
