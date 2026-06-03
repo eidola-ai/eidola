@@ -7,9 +7,6 @@
 [global]
 # Rules disabled for project style:
 #
-#   MD013 — line length (default 80). The project deliberately uses long
-#           prose lines that editors wrap visually; AGENTS.md and
-#           crates/eidola-app-core/schema.md routinely exceed 200 chars.
 #   MD041 — first line in file should be a level-1 heading. Several files
 #           (CLAUDE.md, GEMINI.md, crates/eidola-gui/CLAUDE.md) are
 #           intentional one-line stubs that just say `@AGENTS.md`.
@@ -17,7 +14,7 @@
 #           and editor glyphs where the trailing space inside a span
 #           (e.g. `thinking: `, `• `, `1. `) is the semantic content
 #           being shown literally. MD038 strips those spaces.
-disable = ["MD013", "MD041", "MD038"]
+disable = ["MD041", "MD038"]
 
 # Files we never touch:
 #
@@ -40,3 +37,17 @@ style = "dash"
 # ATX headings (`# Heading`), not setext (`Heading\n=====`).
 [MD003]
 style = "atx"
+
+# One paragraph per source line — collapse soft line breaks, preserve
+# paragraph breaks. We let editors soft-wrap visually so the source has
+# no hard wrap to maintain when prose is edited. Mechanism: rumdl's
+# `normalize` reflow repacks paragraphs to fit `line_length`; setting it
+# absurdly high (the upstream test case for this exact use case —
+# `test_issue_76_use_case` in rumdl 0.2.6) means every paragraph fits
+# on one line, so all internal soft breaks are removed. Code blocks
+# stay untouched (`code_block_line_length = 0` = unlimited).
+[MD013]
+line_length = 999999
+code_block_line_length = 0
+reflow = true
+reflow_mode = "normalize"

@@ -18,13 +18,9 @@ For an explanation of how Eidola works, what it commits to, and what it doesn't 
 
 ## Contributing
 
-Pull requests are checked for CLA coverage. Every Git author and committer
-email in a PR must match an entry in `CLA-SIGNERS.txt` for the current hash of
-`CLA-INDIVIDUAL.md` or `CLA-CORPORATE.md`.
+Pull requests are checked for CLA coverage. Every Git author and committer email in a PR must match an entry in `CLA-SIGNERS.txt` for the current hash of `CLA-INDIVIDUAL.md` or `CLA-CORPORATE.md`.
 
-To sign, add the appropriate entry to `CLA-SIGNERS.txt` in a commit to this
-repository. The signer entry plus the relevant Git history are the signature
-record; there is no separate PDF or email flow.
+To sign, add the appropriate entry to `CLA-SIGNERS.txt` in a commit to this repository. The signer entry plus the relevant Git history are the signature record; there is no separate PDF or email flow.
 
 ## Developing
 
@@ -36,17 +32,11 @@ All Rust workspace packages live under `crates/`, including the code generation 
 
 ### Server
 
-The server requires environment variables to work correctly. See .env.example.
-For local development, `DATABASE_URL=postgres://eidola@localhost/eidola` uses the plain Postgres
-container from `compose.yaml`. For production, you can point `DATABASE_URL` at an external Postgres,
-set `DATABASE_PASSWORD` as a secret, and optionally provide `DATABASE_SSL_CERT` with the PEM-encoded
-root CA certificate if the database does not chain to the default WebPKI roots.
+The server requires environment variables to work correctly. See .env.example. For local development, `DATABASE_URL=postgres://eidola@localhost/eidola` uses the plain Postgres container from `compose.yaml`. For production, you can point `DATABASE_URL` at an external Postgres, set `DATABASE_PASSWORD` as a secret, and optionally provide `DATABASE_SSL_CERT` with the PEM-encoded root CA certificate if the database does not chain to the default WebPKI roots.
 
 There are two supported development workflows:
 
-**1. Full container stack** — postgres, server, shim, and stripe-cli all run
-inside docker (detached). Use this when you want a one-shot reproducible
-environment and don't mind rebuilding the server image:
+**1. Full container stack** — postgres, server, shim, and stripe-cli all run inside docker (detached). Use this when you want a one-shot reproducible environment and don't mind rebuilding the server image:
 
 ```bash
 just dev
@@ -54,11 +44,7 @@ docker compose logs -f       # follow logs
 just down                    # stop everything
 ```
 
-**2. Host-mode server** — postgres, the tinfoil shim mock, and stripe-cli run
-in containers; the server runs on the host with cargo. The shim is configured
-to forward to `host.docker.internal:8080`, so requests from the shim and
-Stripe webhooks all flow into the cargo-built server. This is the recommended
-inner loop while iterating on `eidola-server`:
+**2. Host-mode server** — postgres, the tinfoil shim mock, and stripe-cli run in containers; the server runs on the host with cargo. The shim is configured to forward to `host.docker.internal:8080`, so requests from the shim and Stripe webhooks all flow into the cargo-built server. This is the recommended inner loop while iterating on `eidola-server`:
 
 ```bash
 # Bring up postgres + shim + stripe-cli; captures the Stripe webhook secret
@@ -82,17 +68,14 @@ bacon run-long -- -p eidola-server
 just down
 ```
 
-Both modes expose the same endpoints externally: postgres on `localhost:5432`,
-the shim on `https://localhost:8443`, and (in container mode) the server on
-`http://localhost:8080`. CLI configuration is identical across the two modes.
+Both modes expose the same endpoints externally: postgres on `localhost:5432`, the shim on `https://localhost:8443`, and (in container mode) the server on `http://localhost:8080`. CLI configuration is identical across the two modes.
 
 ### CLI
 
 To run the CLI against a local development stack:
 
 1. **Start the stack:** `just dev` (starts Postgres, Server, and the Hardware Shim).
-2. **Trust the Mock TLS Root:**
-   On its first boot the shim generates two independent root CAs in `./.dev-certs/`:
+2. **Trust the Mock TLS Root:** On its first boot the shim generates two independent root CAs in `./.dev-certs/`:
    - `tls-ca.pem` + `tls-ca.key` — the **TLS** trust anchor (RSA PKCS#1 v1.5). This is what you trust in your OS keychain.
    - `ark.pem` + `ark.key` + `ask.pem` + `ask.key` — the **SEV-SNP attestation** chain (RSA-PSS, required by AMD's attestation format). These are *not* TLS roots and should not go in your keychain; they are passed to the CLI via `--hardware-root-ca` / `--hardware-intermediate-ca` instead.
 
