@@ -1,0 +1,30 @@
+[package]
+# Anchor crate for Rust-based developer tools. Each tool below is a normal
+# `[dependencies]` entry, which pulls the upstream crate into the workspace
+# dep graph so its version is pinned by `Cargo.lock`. `.envrc` then builds
+# each tool's binary by its own package name (e.g. `cargo build -p rumdl
+# -p just`) into `target/debug/` and direnv puts that directory on `PATH`,
+# so contributors get the pinned tools from a `cargo` + `direnv` install
+# alone — no separate `brew install just` / `cargo install rumdl` step.
+#
+# The package name intentionally differs from every tool it anchors so
+# `cargo build -p <tool>` resolves unambiguously to the registry crate.
+# Only tools that expose a `lib` target can be anchored this way (a
+# bin-only crate cannot be a `[dependencies]` entry); rumdl and just both
+# do. We build debug, not release — these tools' runtimes are sub-second on
+# a tree this size even unoptimized, and debug keeps cold compile cost down.
+# No bin/lib code of our own — everything is upstream, version-pinned via
+# the `=X.Y.Z` deps below. Bumping a tool is a single edit here.
+name = "eidola-devtools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rumdl = "=0.2.6"
+just = "=1.51.0"

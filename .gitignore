@@ -1,5 +1,5 @@
 .env
-.env.local
+.env.*
 
 # Nix build outputs
 result
@@ -7,7 +7,6 @@ result-*
 
 # direnv
 .direnv
-.envrc
 
 ### Rust
 debug/

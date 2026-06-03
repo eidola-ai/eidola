@@ -52,14 +52,16 @@ jobs:
           echo "::remove-matcher owner=rust::"
 
       - name: Markdown lint
-        # The `rumdl-pinned` anchor crate in crates/rumdl/ pulls the
-        # upstream `rumdl` crate into the workspace dep graph, so its
-        # version is pinned by Cargo.lock. `cargo build -p rumdl` then
-        # resolves unambiguously to the registry crate (our anchor is
-        # named `rumdl-pinned`, not `rumdl`).
+        # rumdl is pinned by the crates/devtools anchor crate and, locally,
+        # is on PATH via direnv (.envrc). CI deliberately doesn't install
+        # direnv (no apt in the build chain); instead it emulates .envrc —
+        # build the one tool it needs and prepend target/debug to PATH — so
+        # the `rumdl` invocation matches the local one without compiling the
+        # rest of the pinned toolset (e.g. just).
         run: |
           cargo build --quiet -p rumdl
-          ./target/debug/rumdl check .
+          export PATH="$PWD/target/debug:$PATH"
+          rumdl check .
 
       - name: Run tests
         run: cargo test

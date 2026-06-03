@@ -90,14 +90,12 @@ run system *args:
 check:
     cargo clippy --all-targets -- -D warnings
     cargo fmt --check
-    cargo build --quiet -p rumdl
-    ./target/debug/rumdl check .
+    rumdl check .
 
 # Apply auto-fixable markdown formatting via rumdl
 format:
     cargo fmt
-    cargo build --quiet -p rumdl
-    ./target/debug/rumdl check . --fix
+    rumdl check . --fix
 
 # Render gpui views to PNGs in crates/eidola-gui/tests/snapshots/ — local-only debug
 # aid (gitignored), not a regression gate. Pixel diffs aren't bit-stable

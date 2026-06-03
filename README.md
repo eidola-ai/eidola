@@ -24,11 +24,11 @@ To sign, add the appropriate entry to `CLA-SIGNERS.txt` in a commit to this repo
 
 ## Developing
 
-**Prerequisites:** `rustup`, `just`, `docker`
+**Prerequisites:** `rustup`, `direnv`, `docker`
 
-The Rust toolchain version is pinned in `rust-toolchain.toml` and installed automatically by rustup. Run `just` to see all available recipes.
+The Rust toolchain version is pinned in `rust-toolchain.toml` and installed automatically by rustup. On first `cd` into the repo, `direnv` builds the pinned Rust-based dev tools (including `just` itself) from `crates/devtools/` and puts them on `PATH`, so `rustup` + `direnv` is the whole setup — no separate `just` install. Run `just` to see all available recipes.
 
-All Rust workspace packages live under `crates/`, including the code generation binary `generate-openapi` and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`. `crates/rumdl/` is an anchor crate that pins the upstream [rumdl](https://rumdl.dev/) markdown linter in `Cargo.lock`; `just check` invokes it, and `just lint-md-fix` applies auto-fixes.
+All Rust workspace packages live under `crates/`, including the code generation binary `generate-openapi` and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`. `crates/devtools/` is an anchor crate that version-pins upstream Rust-based dev tools — `just` and the [rumdl](https://rumdl.dev/) markdown linter — in `Cargo.lock`; `.envrc` builds them and direnv exposes them on `PATH`. `just check` runs rumdl, and `just lint-md-fix` applies auto-fixes.
 
 ### Server
 
