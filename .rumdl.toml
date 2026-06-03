@@ -21,7 +21,9 @@ disable = ["MD041", "MD038"]
 #   CLA-*.md
 #       Legal text whose SHA-256 hashes are recorded in CLA-SIGNERS.txt.
 #       Reformatting them changes the hash and invalidates every signer
-#       entry. See cla.yml.
+#       entry. If a separate intentional change is introduced to either
+#       file, its formatting SHOULD also be updated by overriding or
+#       temporarily commenting out its exclusion.
 exclude = [
     "CLA-INDIVIDUAL.md",
     "CLA-CORPORATE.md",
