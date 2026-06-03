@@ -42,11 +42,13 @@ accepts the update.
    The key must be ECDSA-P256, ECDSA-P384, or Ed25519 — the
    updater's `verify_blob_signature_with_spki` rejects anything else.
 2. Export the public SPKI and compute its sha256:
+
    ```bash
    cosign public-key --key <key-ref> > new-attestant.pem
    openssl pkey -pubin -in new-attestant.pem -outform DER \
      | shasum -a 256 | awk '{print $1}'
    ```
+
 3. Open a release PR that adds the new fingerprint to
    `releases/trust/trust-constants.json`
    (`trusted_attestant_fingerprints`). **Keep the old fingerprint**

@@ -17,6 +17,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 **Image tagging:** `main` (rolling, updated on every merge), `v*` (immutable release tags), `sha-<short>` (per-commit). No `:latest`. Images published to `ghcr.io/<owner>/eidola-server`, `ghcr.io/<owner>/eidola-cli`, and `ghcr.io/<owner>/eidola-postgres`.
 
 **Key design decisions:**
+
 - Axum-based HTTP server with typed routing, extractors, and `utoipa-axum` OpenAPI integration
 - Plain HTTP internally; TLS terminated by Tinfoil Container shim with attestation-bearing certificates (attestation hash + HPKE key encoded in SANs, issued by public CA)
 - Tinfoil attestation verification via `tinfoil-verifier` crate — verifies SEV-SNP hardware attestation per-connection, caching verified fingerprints for fast reconnections; handles load-balanced deployments
@@ -30,6 +31,7 @@ The server is an OpenAI-compatible proxy that translates requests to upstream AI
 **API endpoints:** Defined in `crates/eidola-server/openapi.json` (generated from utoipa annotations — see Conventions).
 
 **Environment variables:**
+
 - `TINFOIL_API_KEY` (required) - Tinfoil inference API key
 - `DATABASE_URL` (required) - PostgreSQL connection string
 - `DATABASE_PASSWORD` (optional) - PostgreSQL password; in production with an external database, inject this as a Tinfoil secret instead of embedding it in `DATABASE_URL`
@@ -88,6 +90,7 @@ TLS trust roots are supplied by the caller via `AttestingClientConfig::tls_roots
 This still relies on Tinfoil's TLS private key being sealed inside the enclave: a static attestation document does not defeat an attacker who has somehow exfiltrated the long-lived TLS key. Closing that gap requires per-handshake nonces in `report_data`, which Tinfoil is adding upstream. Once that lands and v3 documents become fully self-contained, the ATC fallback path will go cold and can be removed entirely.
 
 **Compose files:**
+
 - `compose.yaml` — local development. Two supported workflows share one file:
   - **Full container stack** (`just dev`, → `scripts/dev.sh --container`) — postgres + server + shim + stripe-cli all in containers, detached. Server image is rebuilt each invocation.
   - **Host mode** (`just services`, → `scripts/dev.sh --host`) — postgres + shim + stripe-cli in containers, with `SHIM_UPSTREAM_URL=http://host.docker.internal:8080` so the shim forwards to a cargo-built server running on the host. Writes `.env.local` (`STRIPE_WEBHOOK_SECRET` + `BIND_ADDR=0.0.0.0:8080`) for the host server to source.
@@ -99,6 +102,7 @@ This still relies on Tinfoil's TLS private key being sealed inside the enclave: 
 The GUI app and CLI share a common Rust core (`crates/eidola-app-core/`) consumed as a normal library — no FFI layer. All business logic — config management, local database, HTTP client construction, account operations, wallet/credential management, and chat inference — lives in the core crate. Consumers construct an `AppCore` and call its methods directly.
 
 **Core crate modules:**
+
 - `lib.rs` — `AppCore` struct, all high-level operations (account create/show/allocate, chat, wallet), DTO record types (`ConfigState`, `ChatResult`, `PriceInfo`, etc.), internal helpers (ACT token serialization, attestation flushing, HTTP response handling)
 - `config.rs` — `Config` struct (TOML serde) with `*_override` fields and resolver methods that fall back to the embedded trust-root pin, load/save with explicit paths, measurement parsing, certificate parsing
 - `trust_root.rs` — re-exports the build-time-generated `trust_root.gen.rs` constants (server URL, server enclave measurement, attestant fingerprints, CI identity, schema versions, embedded JSON for attestation templates + Sigstore trusted root). Source files live under `releases/`; see `docs/trust-root.md` for what's pinned and `releases/README.md` for how it rotates.
@@ -109,18 +113,20 @@ The GUI app and CLI share a common Rust core (`crates/eidola-app-core/`) consume
 
 **GUI usage (`crates/eidola-gui/`):** Native Rust gpui app. Depends on `eidola-app-core` as a regular crate; `core.rs` wraps `AppCore` in an `Entity<Core>` that bridges tokio (the core's runtime) to gpui's smol-based executor via `oneshot` channels, and holds cached snapshots that views read reactively. **See `crates/eidola-gui/AGENTS.md` for the full architecture** — window model, Circadian theme + Newsreader bundling, transparent titlebar / gradient overlay, macOS menu/keybinding setup and ordering invariants, the per-view `CloseWindow` / `Settings` singleton patterns, the `.app` bundling requirement, and the two-tier test model (behavior tests as the regression gate; visual snapshots as a local debug aid).
 
-**Crate layout:** Pure Rust crates in `crates/` implement capability logic — `eidola-app-core`, `eidola-server`, `tinfoil-verifier`, `gpui-markdown-editor` — plus operational utilities such as `generate-openapi`, `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`.
+**Crate layout:** Pure Rust crates in `crates/` implement capability logic — `eidola-app-core`, `eidola-server`, `tinfoil-verifier`, `gpui-markdown-editor` — plus operational utilities such as `generate-openapi`, `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`. `crates/rumdl/` is an anchor crate (package name `rumdl-pinned`) whose sole purpose is to pull the upstream `rumdl` markdown linter into the workspace dep graph for lockfile pinning.
 
 ## Local Database & Migrations
 
 Both the CLI and GUI use an embedded [Turso](https://crates.io/crates/turso) (pure-Rust libSQL) database at `~/Library/Application Support/eidola/eidola.db` for local app data (wallet credentials, conversation history, attestation records, etc.). The database layer lives in `crates/eidola-app-core/src/db.rs`.
 
 **Schema management:**
+
 - `crates/eidola-app-core/schema/schema.sql` is the canonical schema — always reflects the current desired state
 - Fresh installs apply `schema.sql` directly via `execute_batch` and set `PRAGMA user_version` to `LATEST_VERSION`
 - Existing databases run incremental migrations in `db.rs` (gated by `user_version`)
 
 **Adding a migration:**
+
 1. Update `schema.sql` to the new desired state
 2. Add a `MIGRATION_N` constant in `db.rs` with the ALTER/CREATE statements
 3. Add an `if current_version < N` block in `migrate()` that runs the migration and sets `user_version`
@@ -136,10 +142,11 @@ Both the CLI and GUI use an embedded [Turso](https://crates.io/crates/turso) (pu
 The `justfile` is the primary development interface. Run `just` to see all available recipes.
 
 **Key recipes:**
+
 - `just build {server,cli,gui}` — local-toolchain builds for fast iteration. The `gui` target on macOS additionally runs `scripts/package-gui-app.sh` to assemble `crates/eidola-gui/build/Eidola.app` (the .app wrapper is required for AppKit to treat the binary as a real app rather than a command-line tool — see `crates/eidola-gui/AGENTS.md` for why).
 - `just run {server,cli,gui}` — build and run. For `gui`, opens the assembled `.app` via `open`. Accepts trailing args (e.g. `just run cli chat "hello"`).
 - `just test` — runs `cargo test`.
-- `just check` — clippy and rustfmt.
+- `just check` — clippy, rustfmt, and `rumdl check` over committed markdown (see `.rumdl.toml`). Run `just lint-md-fix` to apply auto-fixable formatting.
 - `just dev` / `just services` / `just down` — container-based development workflows (see Compose files above).
 
 ## Conventions
@@ -152,6 +159,7 @@ The `justfile` is the primary development interface. Run `just` to see all avail
 - `rustup` + `rust-toolchain.toml` manages the Rust toolchain for development
 - OpenAI API format as the canonical interface
 - Server API is documented via utoipa `#[utoipa::path]` annotations on handler functions and `ToSchema` derives on request/response types. `OpenApiRouter` (in `lib.rs::build_router()`) collects paths and recursively discovers schemas automatically — only SSE streaming types that aren't referenced from path annotations are listed manually in `api_doc.rs`. When adding or changing server endpoints, add the annotation on the handler and register it in `build_router()` via `routes!()`, then run `just update-openapi` to regenerate the committed `openapi.json`
+- Markdown is linted via [rumdl](https://rumdl.dev/), pinned in the workspace `Cargo.lock` through the `crates/rumdl/` anchor crate (package name `rumdl-pinned`, lib-only, no code — just a `rumdl = "=X.Y.Z"` dep so the upstream crate is in our dep graph). The justfile and CI run `cargo build --quiet -p rumdl` followed by `./target/debug/rumdl check .`; `cargo build -p rumdl` resolves unambiguously because the anchor's package name differs. Configure rules in `.rumdl.toml`. Bumping rumdl is a single edit to `crates/rumdl/Cargo.toml`
 - `artifact-manifest.json` (`schema_version: 1` — integer; see `docs/trust-root.md` for why our schema versions are integers, not semver) records expected OCI digests, the macOS universal CLI binary and GUI `.app` bundle Nix `narHash`es, and enclave measurements (SEV-SNP + TDX + cmdline) with type/platform metadata; the enclave block shape matches the Tinfoil `snp-tdx-multiplatform/v1` predicate so `tinfoil-build.yml` can project it directly into `tinfoil-deployment.json`. CI verifies the full file by merging digests captured from the real OCI and macOS build jobs and recomputing enclave measurements from `tinfoil-config.yml`
 - `releases/trust/server-enclave.json` (`schema_version: 1`) holds the same enclave block in isolation — `snp_measurement`, `tdx_measurement: {rtmr1, rtmr2}`, `cmdline`. It is the only build-time input that ties the cli to the server, intentionally separated from `artifact-manifest.json` so the cli build context doesn't drag its own digest into its own inputs. `verify-full` cross-checks both files against the freshly-recomputed enclave so neither can drift unobserved
 - Use `just update-manifest` to regenerate both on macOS with the pinned amd64 BuildKit builder plus the local Nix CLI build. The script runs a two-phase build (server + postgres → stamp tinfoil-config.yml → recompute enclave → write `server-enclave.json` → cli OCI + cli macOS → write `artifact-manifest.json`), so a single invocation reaches a fixed point

@@ -51,6 +51,16 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           echo "::remove-matcher owner=rust::"
 
+      - name: Markdown lint
+        # The `rumdl-pinned` anchor crate in crates/rumdl/ pulls the
+        # upstream `rumdl` crate into the workspace dep graph, so its
+        # version is pinned by Cargo.lock. `cargo build -p rumdl` then
+        # resolves unambiguously to the registry crate (our anchor is
+        # named `rumdl-pinned`, not `rumdl`).
+        run: |
+          cargo build --quiet -p rumdl
+          ./target/debug/rumdl check .
+
       - name: Run tests
         run: cargo test
 

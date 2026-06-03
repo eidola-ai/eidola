@@ -175,7 +175,7 @@ function of source: OVMF firmware (pinned), CVM kernel + initrd
 (pinned), the kernel command line (which embeds the SHA-256 of
 `tinfoil-config.yml`), and the vCPU count and type. Any change to the
 attested boot path produces a different measurement, which the client
-refuses to connect to. TODO: https://github.com/tinfoilsh/measure-image-action/pull/48
+refuses to connect to. TODO: <https://github.com/tinfoilsh/measure-image-action/pull/48>
 
 **5.2.** **[S]** The full server runtime configuration —
 image digest, argument list, environment variable schema, and

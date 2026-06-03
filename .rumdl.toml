@@ -1,0 +1,42 @@
+# Configuration for rumdl — the markdown linter. The upstream binary is
+# pinned via the `crates/rumdl/` anchor crate (package `rumdl-pinned`)
+# and run by `just check` and CI as `cargo build -p rumdl && rumdl check`.
+#
+# rule reference: https://rumdl.dev/
+
+[global]
+# Rules disabled for project style:
+#
+#   MD013 — line length (default 80). The project deliberately uses long
+#           prose lines that editors wrap visually; AGENTS.md and
+#           crates/eidola-app-core/schema.md routinely exceed 200 chars.
+#   MD041 — first line in file should be a level-1 heading. Several files
+#           (CLAUDE.md, GEMINI.md, crates/eidola-gui/CLAUDE.md) are
+#           intentional one-line stubs that just say `@AGENTS.md`.
+#   MD038 — spaces inside code spans. This codebase documents CLI output
+#           and editor glyphs where the trailing space inside a span
+#           (e.g. `thinking: `, `• `, `1. `) is the semantic content
+#           being shown literally. MD038 strips those spaces.
+disable = ["MD013", "MD041", "MD038"]
+
+# Files we never touch:
+#
+#   CLA-*.md
+#       Legal text whose SHA-256 hashes are recorded in CLA-SIGNERS.txt.
+#       Reformatting them changes the hash and invalidates every signer
+#       entry. See cla.yml.
+exclude = [
+    "CLA-INDIVIDUAL.md",
+    "CLA-CORPORATE.md",
+]
+
+# .gitignore covers target/, result*, .dev-certs/, etc.
+respect_gitignore = true
+
+# Lists use `-` markers throughout the repo.
+[MD004]
+style = "dash"
+
+# ATX headings (`# Heading`), not setext (`Heading\n=====`).
+[MD003]
+style = "atx"

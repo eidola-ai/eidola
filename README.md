@@ -32,7 +32,7 @@ record; there is no separate PDF or email flow.
 
 The Rust toolchain version is pinned in `rust-toolchain.toml` and installed automatically by rustup. Run `just` to see all available recipes.
 
-All Rust workspace packages live under `crates/`, including the code generation binary `generate-openapi` and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`.
+All Rust workspace packages live under `crates/`, including the code generation binary `generate-openapi` and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`. `crates/rumdl/` is an anchor crate that pins the upstream [rumdl](https://rumdl.dev/) markdown linter in `Cargo.lock`; `just check` invokes it, and `just lint-md-fix` applies auto-fixes.
 
 ### Server
 
@@ -101,6 +101,7 @@ To run the CLI against a local development stack:
    - **macOS (UI):** Open Keychain Access, drag `tls-ca.pem` into the **System** keychain, double-click it, expand **Trust**, and set "When using this certificate" to **Always Trust**.
    - **Linux:** `sudo cp .dev-certs/tls-ca.pem /usr/local/share/ca-certificates/eidola-dev.crt && sudo update-ca-certificates`
 3. **Configure the CLI:**
+
    ```bash
    cargo run -p eidola-cli -- configure \
      --base-url https://localhost:8443 \
@@ -108,6 +109,7 @@ To run the CLI against a local development stack:
      --hardware-intermediate-ca .dev-certs/ask.pem \
      --trust-measurement 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000:000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000:000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
    ```
+
    `--trust-measurement` takes a `<snp>:<rtmr1>:<rtmr2>` triple — three 96-char hex strings separated by colons — since each Tinfoil release ships paired AMD SEV-SNP and Intel TDX measurements. The mock shim advertises all-zeros for every field, so the dev triple is just three zero blocks. Both `--hardware-root-ca` and `--hardware-intermediate-ca` are required when pointing the CLI at the local mock shim — without ASK, the verifier falls back to AMD's production Genoa ASK, which obviously isn't signed by your local mock ARK and the chain fails to verify. (If you ever rotate `.dev-certs/`, re-run this `configure` command to refresh the embedded certs.)
 
    On macOS, the CLI's configuration is stored in `~/Library/Application Support/eidola/config.toml`.

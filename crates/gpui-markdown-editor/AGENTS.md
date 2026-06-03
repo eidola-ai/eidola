@@ -46,7 +46,7 @@ chat renderer too rather than letting the surfaces drift.
 
 The editor is structured as a pure transformation pipeline:
 
-```
+```text
 EditorState + EditorEvent  →  update()  →  new EditorState
                                                  ↓
                                             parse()  →  SyntaxTree

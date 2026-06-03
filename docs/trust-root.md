@@ -132,6 +132,7 @@ specific tag" cryptographically meaningful — no other system offers that.
 
 The engineer side uses `cosign sign-blob` with a hardware-held key
 because:
+
 - `cosign` is the canonical Sigstore client; its `hashedrekord` v0.0.1
   output is the one Rekor entry shape that's guaranteed to survive
   Rekor v2 (the upcoming tile-based rewrite drops `rekord` and all
@@ -194,7 +195,7 @@ build context to prevent self-reference cycles (it records the
 eidola-cli OCI digest and macOS narHash that the cli build would
 otherwise see in its own input).
 
-```
+```text
 releases/
   README.md                             # contributor README: per-file detail + rotation procedures
   schema/
@@ -237,6 +238,7 @@ from [tinfoil-rs](https://github.com/tinfoilsh/tinfoil-rs), which in
 turn adapts verification modules from
 [sigstore-rs](https://github.com/sigstore/sigstore-rs) (Apache 2.0).
 The human attestation path runs through the same Sigstore Bundle v0.3
-+ `hashedrekord` v0.0.1 machinery as the CI path; the cosign-side
+
+- `hashedrekord` v0.0.1 machinery as the CI path; the cosign-side
 signing flow comes from [cosign](https://github.com/sigstore/cosign)
 (Apache 2.0).
