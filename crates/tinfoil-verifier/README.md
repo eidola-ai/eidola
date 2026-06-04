@@ -9,6 +9,7 @@ Supports both **AMD SEV-SNP** and **Intel TDX** enclaves.
 `attesting_client()` performs a single end-to-end verification on startup and returns a client that re-verifies attestation on each new TLS connection:
 
 ### AMD SEV-SNP
+
 1. **Fetch** the attestation bundle from Tinfoil's ATC service or the server's well-known endpoint
 2. **Verify the VCEK certificate chain** (embedded AMD Genoa ARK → ASK → VCEK) via RSA-PSS(SHA-384)
 3. **Verify the attestation report signature** (ECDSA-P384) against the VCEK public key
@@ -17,6 +18,7 @@ Supports both **AMD SEV-SNP** and **Intel TDX** enclaves.
 6. **Cross-check the enclave TLS certificate** against `report_data[0..32]` (SHA-256 of SPKI)
 
 ### Intel TDX
+
 1. **Fetch** the attestation document from Tinfoil's ATC service or the server's well-known endpoint
 2. **Fetch collateral** (TCB info, QE identity, CRLs) from Intel's Provisioning Certification Service
 3. **Verify the TDX Quote V4** signature against Intel's SGX Provisioning Root CA

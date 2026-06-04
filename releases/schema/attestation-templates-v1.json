@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "attestant_statement_template": {
     "template": "I, {name}, holder of the private key with fingerprint sha256:{key_fingerprint_sha256}, affirm under penalty of perjury under the laws of the jurisdiction of {jurisdiction} that the following claims are true and correct to the best of my knowledge.",
     "sources": {
@@ -9,18 +9,23 @@
     }
   },
   "claims": {
-    "no_compulsion": {
-      "template": "I am not currently subject to any legal order, gag, technical capability notice, or other compulsion related to this release or to Eidola generally.",
+    "no_compelled_subversion": {
+      "template": "I am not currently subject to any legal order, technical capability notice, or other form of legal compulsion that has caused, or that requires me to cause, this release to: (a) weaken any privacy or security guarantee published in docs/privacy-guarantees.md; (b) introduce or preserve any backdoor, covert surveillance mechanism, or covert data path; or (c) misrepresent any of these properties to users.",
+      "sources": {},
+      "cross_checks": {}
+    },
+    "no_gag_preventing_attestation": {
+      "template": "I am not currently subject to any gag order, nondisclosure obligation, or other restriction that prevents me from truthfully making any claim in this attestation.",
       "sources": {},
       "cross_checks": {}
     },
     "no_coercion": {
-      "template": "I have not been threatened or coerced by any party in connection with this release.",
+      "template": "I have not been threatened or coerced by any party to alter the content of this release, to falsify any claim in this attestation, or to conceal any material fact about the privacy or security properties of this release.",
       "sources": {},
       "cross_checks": {}
     },
     "signing_freely": {
-      "template": "I am signing this attestation of my own volition, on hardware under my exclusive physical control.",
+      "template": "I am signing this attestation of my own volition, using a signing key whose private component exists only on hardware under my exclusive physical control.",
       "sources": {},
       "cross_checks": {}
     },
@@ -35,7 +40,7 @@
       }
     },
     "diff_reviewed": {
-      "template": "I have personally reviewed the diff between git commit {previous_release_git_commit} (the prior release) and git commit {git_commit} (this release).",
+      "template": "I have personally inspected the source-level diff between git commit {previous_release_git_commit} (the prior release) and git commit {git_commit} (this release).",
       "sources": {
         "previous_release_git_commit": "attestation.previous_release_git_commit",
         "git_commit": "attestation.git_commit"
@@ -45,15 +50,23 @@
         "git_commit": "release.git_commit"
       }
     },
-    "no_known_privacy_weakening": {
-      "template": "Based on the review described above, I am not aware of any change in this release that weakens the privacy guarantees stated in PRIVACY-GUARANTEES.md (sha256 {privacy_guarantees_doc_sha256}) as compared with the prior release.",
+    "privacy_guarantees_not_weakened": {
+      "template": "docs/privacy-guarantees.md (sha256 {privacy_guarantees_doc_sha256}) at the time of this release does not weaken, narrow, or remove any privacy or security guarantee that was stated in the version of docs/privacy-guarantees.md in effect at the prior release.",
+      "sources": {
+        "privacy_guarantees_doc_sha256": "attestation.privacy_guarantees_doc_sha256"
+      },
+      "cross_checks": {},
+      "required_when": "previous_release_present"
+    },
+    "code_delivers_guarantees": {
+      "template": "Based on the review described above, I am not aware of any change in this release that causes the code to fail to deliver the privacy and security guarantees stated in docs/privacy-guarantees.md (sha256 {privacy_guarantees_doc_sha256}).",
       "sources": {
         "privacy_guarantees_doc_sha256": "attestation.privacy_guarantees_doc_sha256"
       },
       "cross_checks": {}
     },
     "no_known_backdoor": {
-      "template": "Based on the review described above, I am not aware of any backdoor, covert surveillance mechanism, or undisclosed data exfiltration path in the code that comprises this release.",
+      "template": "Based on the review described above, I am not aware of any backdoor, covert surveillance mechanism, or data path in this release that transmits user data to any party in a manner not described in docs/privacy-guarantees.md or the user-facing documentation it references.",
       "sources": {},
       "cross_checks": {}
     }

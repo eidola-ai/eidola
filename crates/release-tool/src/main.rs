@@ -10,24 +10,27 @@
 //! 2. `release-tool attest <tag>` — interactively walks every claim in
 //!    `attestation-templates-v1.json`, rendering each from the engineer's
 //!    inputs. Each claim requires typing the word `yes` to affirm; anything
-//!    else aborts. On full affirmation, signs the attestation file with the
-//!    engineer's hardware-backed SSH key via `ssh-keygen -Y sign`, posts the
-//!    resulting signature to Sigstore Rekor as a `hashedrekord` entry, and
-//!    uploads the attestation JSON + bundle (rekor inclusion proof) to the
-//!    release. Then generates and uploads `release.json` (URL-only index —
-//!    see `releases/TRUST-ROOT.md`) and marks the release as latest.
+//!    else aborts. On full affirmation, signs the attestation file via
+//!    `cosign sign-blob --key <ref>` (where `<ref>` is a local PEM, a
+//!    PKCS#11 URI for a YubiKey/SmartCard, or any cosign-supported KMS
+//!    URI), which posts the signature to Sigstore Rekor as a
+//!    `hashedrekord` v0.0.1 entry and emits a Sigstore Bundle v0.3.
+//!    `release-tool` uploads the attestation JSON + bundle + the
+//!    `release.json` URL index to the GitHub release and marks it as
+//!    latest. See `docs/trust-root.md`.
 //!
-//! CI side uses sigstore + cosign (Fulcio keyless via OIDC). Human side uses
-//! SSH signatures + Rekor `hashedrekord`. Both end up in the same Rekor
-//! transparency log; the verifier dispatches on signature format.
+//! Both CI and engineer sides ride the same Rekor entry shape:
+//! `hashedrekord` v0.0.1. They differ only in the publicKey arm — CI
+//! has a Fulcio keyless leaf cert; engineer has a PKIX
+//! SubjectPublicKeyInfo whose `sha256` fingerprint is pinned by
+//! `TRUSTED_ATTESTANT_FINGERPRINTS`. The Rekor v2 transition keeps
+//! `hashedrekord` (rekord and the SSH PKI are being retired), so this
+//! shape is forward-compatible.
 //!
-//! Shells out to `gh`, `ssh-keygen`, and `git`. All must be on PATH. CI
-//! signature verification goes through `eidola-app-core`'s pure-Rust
-//! verifier — the same code path that ships to users — so `cosign` is no
-//! longer required on the engineer's PATH. `ssh-keygen -Y sign`
-//! automatically uses `SSH_AUTH_SOCK` to reach agent-held keys (Secretive,
-//! 1Password, FIDO2-SK, …), so the engineer does not need the private key
-//! on disk.
+//! Shells out to `gh`, `cosign`, and `git`. All must be on PATH. For
+//! local PEM cosign keys the engineer also needs `COSIGN_PASSWORD` in
+//! the environment; for PKCS#11 / KMS keys, the device or KMS handles
+//! its own auth (PIN, IAM, ...).
 
 use std::path::PathBuf;
 
@@ -35,6 +38,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 mod attest;
+mod pkcs11;
+mod provenance;
 mod trust;
 mod verify;
 
@@ -62,22 +67,35 @@ enum Command {
     },
 
     /// Interactively render and affirm each claim, sign with the hardware-
-    /// backed SSH key, post to Rekor, upload, and mark the release as
-    /// latest.
+    /// backed attestant key, post to Rekor, upload, and mark the
+    /// release as latest.
     Attest {
         /// The release tag, e.g. `v0.5.0`.
         tag: String,
 
-        /// Path to the SSH public key file (`.pub`). The private key must
-        /// be reachable via `SSH_AUTH_SOCK` (e.g. Secretive, 1Password,
-        /// FIDO2-SK). Read from `EIDOLA_ATTESTANT_SSH_PUBKEY` if set.
-        #[arg(long, env = "EIDOLA_ATTESTANT_SSH_PUBKEY")]
-        ssh_pubkey: std::path::PathBuf,
+        /// Cosign key reference. One of: a local PEM path
+        /// (`/path/to/cosign.key` — passphrase from `COSIGN_PASSWORD`),
+        /// a PKCS#11 URI (for a YubiKey, get a PIN-free one from
+        /// `release-tool pkcs11 list` and supply the PIN via
+        /// `COSIGN_PKCS11_PIN`), or any KMS URI cosign supports
+        /// (`awskms:...`, `gcpkms:...`, `azurekms:...`,
+        /// `hashivault:...`). Passed through to `cosign sign-blob --key`
+        /// verbatim. Read from `EIDOLA_ATTESTANT_COSIGN_KEY` if set.
+        ///
+        /// The underlying key must be ECDSA-P256, ECDSA-P384, or
+        /// Ed25519 — RSA, ECDSA-P521, and other algorithms are rejected
+        /// up front because the updater's verifier only accepts those
+        /// three. release-tool fetches the pubkey with
+        /// `cosign public-key --key <ref>` and validates the SPKI
+        /// algorithm OID before signing.
+        #[arg(long, env = "EIDOLA_ATTESTANT_COSIGN_KEY")]
+        cosign_key: String,
 
         /// Short attestant identifier — used as the filename suffix
         /// (`attestation-<id>.json`) and recorded in `release.json`. The
-        /// SSH pubkey's fingerprint is what's actually matched against the
-        /// client's `trusted_attestant_fingerprints`.
+        /// attestant key's fingerprint (`sha256(SPKI DER)`) is what's
+        /// actually matched against the client's
+        /// `trusted_attestant_fingerprints`.
         #[arg(long, env = "EIDOLA_ATTESTANT_ID")]
         attestant_id: String,
 
@@ -91,6 +109,75 @@ enum Command {
         #[arg(long, env = "EIDOLA_ATTESTANT_JURISDICTION")]
         jurisdiction: String,
     },
+
+    /// PKCS#11 helpers for hardware attestant keys (YubiKey / SmartCard /
+    /// HSM).
+    #[command(subcommand)]
+    Pkcs11(Pkcs11Command),
+
+    /// Informational hardware-provenance evidence for attestant keys
+    /// (NOT consulted by trust evaluation — see
+    /// releases/trust/attestant-provenance/README.md).
+    #[command(subcommand)]
+    Provenance(ProvenanceCommand),
+}
+
+#[derive(Subcommand)]
+enum ProvenanceCommand {
+    /// Verify each committed provenance bundle's attestation certificate
+    /// matches the fingerprint its meta.json claims, and report which
+    /// fingerprints are currently pinned.
+    Check {
+        /// Provenance directory (default:
+        /// `releases/trust/attestant-provenance`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// Capture a YubiKey-PIV attestation bundle via `ykman` and fill its
+    /// meta.json from the attestation cert. Other key sources fill the same
+    /// bundle shape by hand.
+    Capture {
+        /// Attestant identifier — the bundle subdirectory name.
+        #[arg(long, env = "EIDOLA_ATTESTANT_ID")]
+        attestant_id: String,
+
+        /// PIV slot holding the signing key.
+        #[arg(long, default_value = "9c")]
+        slot: String,
+
+        /// Provenance directory (default:
+        /// `releases/trust/attestant-provenance`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// (Re)derive meta.json fields from a bundle's committed attestation
+    /// certificate — no device or `ykman` needed. Runs offline over one
+    /// bundle (`--attestant-id`) or all of them.
+    Enrich {
+        /// A single bundle to enrich; omit to enrich every bundle.
+        #[arg(long, env = "EIDOLA_ATTESTANT_ID")]
+        attestant_id: Option<String>,
+
+        /// Provenance directory (default:
+        /// `releases/trust/attestant-provenance`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum Pkcs11Command {
+    /// List signing keys on a PKCS#11 token and print PIN-free cosign
+    /// `--key` URIs (no `pin-value`, no `slot-id`). Reads only public
+    /// objects, so it never prompts for or emits a PIN.
+    List {
+        /// Path to the PKCS#11 module (`libykcs11.dylib` / `.so`).
+        /// Defaults to probing the well-known install locations.
+        #[arg(long, env = "EIDOLA_PKCS11_MODULE")]
+        module_path: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -99,30 +186,69 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
 
     let cli = Cli::parse();
-    let workspace_root = workspace_root()?;
-    let repo = resolve_repo(cli.repo.as_deref(), &workspace_root)?;
 
     match cli.command {
-        Command::Verify { tag } => verify::run(verify::Args {
-            workspace_root,
-            repo,
-            tag,
-        }),
+        // PKCS#11 helpers are device-local and need neither a workspace nor
+        // a GitHub repo, so resolve those only for the release subcommands.
+        Command::Pkcs11(Pkcs11Command::List { module_path }) => {
+            pkcs11::run(pkcs11::Args { module_path })
+        }
+        Command::Provenance(cmd) => {
+            // Needs the workspace (for trust-constants.json and the default
+            // provenance directory) but not a GitHub repo.
+            let workspace_root = workspace_root()?;
+            match cmd {
+                ProvenanceCommand::Check { dir } => provenance::check(provenance::CheckArgs {
+                    workspace_root,
+                    dir,
+                }),
+                ProvenanceCommand::Capture {
+                    attestant_id,
+                    slot,
+                    dir,
+                } => provenance::capture(provenance::CaptureArgs {
+                    workspace_root,
+                    attestant_id,
+                    slot,
+                    dir,
+                }),
+                ProvenanceCommand::Enrich { attestant_id, dir } => {
+                    provenance::enrich(provenance::EnrichArgs {
+                        workspace_root,
+                        attestant_id,
+                        dir,
+                    })
+                }
+            }
+        }
+        Command::Verify { tag } => {
+            let workspace_root = workspace_root()?;
+            let repo = resolve_repo(cli.repo.as_deref(), &workspace_root)?;
+            verify::run(verify::Args {
+                workspace_root,
+                repo,
+                tag,
+            })
+        }
         Command::Attest {
             tag,
-            ssh_pubkey,
+            cosign_key,
             attestant_id,
             attestant_name,
             jurisdiction,
-        } => attest::run(attest::Args {
-            workspace_root,
-            repo,
-            tag,
-            ssh_pubkey,
-            attestant_id,
-            attestant_name,
-            jurisdiction,
-        }),
+        } => {
+            let workspace_root = workspace_root()?;
+            let repo = resolve_repo(cli.repo.as_deref(), &workspace_root)?;
+            attest::run(attest::Args {
+                workspace_root,
+                repo,
+                tag,
+                cosign_key,
+                attestant_id,
+                attestant_name,
+                jurisdiction,
+            })
+        }
     }
 }
 

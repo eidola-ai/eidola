@@ -10,7 +10,6 @@ The client database is organized in three layers, each with a distinct concern.
 
 **Layer 2 (Semantic)** captures the logical structure of interaction — who did what, why, in what context, and how context was assembled for each inference call. This is where the interesting design lives, and the focus of this document.
 
-
 ## Core concepts
 
 ### Spaces
@@ -53,7 +52,6 @@ Antecedent edges carry optional range fields: `content_block_id`, `range_start`,
 
 The `consequent_tree` view walks the antecedent graph forward via recursive CTE, producing the transitive closure of all actions consequent upon a given root. This is how you answer "show me everything that flowed from this action" — useful for impact analysis, cost attribution across a workflow, and understanding how a single user message rippled through the system.
 
-
 ## Context assembly
 
 Context assembly records exactly what was composed into the prompt for each inference action. It answers a different question than the antecedent graph: antecedents record "why did this action happen?" while context assembly records "what information was available when it happened?"
@@ -62,7 +60,6 @@ Each inference action gets one `context_assembly` row, which captures the system
 
 The `context_assembly_action` junction table lists which prior actions were included in the prompt, in order. This junction has no space constraint — it can reference actions from any space. This is a designed capability: a scheduled "dreaming" agent might scan actions across many spaces to synthesize insights; a sub-agent working in a scratch space might have its context assembled from actions in the parent space. Cross-space reads happen here, at the operational layer, while the antecedent graph remains local to the space where work is being done.
 
-
 ## Transport and audit
 
 `request` records raw HTTP request/response pairs. Its FK points *from* `request` *to* `action`, supporting one-to-many: a single action may have multiple request rows (retries), but each request belongs to at most one action. The `retry_of_id` and `attempt_number` fields make the retry chain explicit.
@@ -70,7 +67,6 @@ The `context_assembly_action` junction table lists which prior actions were incl
 `connection` captures the transport channel and, when applicable, the attestation evidence anchoring trust in that channel. A clearnet connection has no attestation fields; a Tor connection through a TEE has an attestation document, its hash, and the platform measurements digest.
 
 The chain from logical to physical is: `action` ← `request` → `connection` → `provider`. For billing: `request.credential_nonce` links to the credential that funded the request, and the `spend_trail` view joins this all the way through to the space and action type.
-
 
 ## Origin references and edit-and-fork
 
@@ -81,7 +77,6 @@ An origin-reference action has `origin_action_id` set to the ID of the action it
 This means cost accounting requires no special logic: `WHERE origin_action_id IS NULL` excludes references, and the `spend_trail` view applies this filter automatically.
 
 For v1, we expect spaces to fork only at leaf positions (creating a fresh scratch space for a sub-agent, with no inherited history to carry over). The `origin_action_id` machinery exists in the schema but is dormant until we implement the edit-and-fork UI. No migration will be needed — all current actions have `origin_action_id = NULL`.
-
 
 ## Patterns
 
@@ -100,7 +95,6 @@ These are not prescriptive; they illustrate how the schema's primitives compose.
 **Regeneration.** User is unhappy with a response. The system creates a new space with `parent_space_id` pointing to the current one, inserts origin-reference actions for the history up to the point of regeneration, and archives the original space. The new inference in the new space has the same antecedent as the rejected response — both are alternative continuations from the same point. The original response and everything that followed it remain in the archived space for audit.
 
 **Streaming cancellation.** An inference action in `streaming` status is interrupted. Its status becomes `cancelled`. Its content blocks contain whatever was generated before interruption. A subsequent user action predicated on the cancelled action can reference it (the agent may benefit from seeing what was already started), or can share the same antecedent as the cancelled action (ignoring it entirely). This is a context assembly decision, not a schema constraint.
-
 
 ## Conventions
 

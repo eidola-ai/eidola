@@ -3,7 +3,7 @@
 //!
 //! The verifier uses these to verify the CI's Fulcio cert chain and the
 //! Rekor inclusion proofs / SET for both the CI sigstore bundle and the
-//! human SSH `hashedrekord` entries. The trust root is a snapshot of
+//! human SSH `rekord` entries. The trust root is a snapshot of
 //! Sigstore's upstream public material (`sigstore-trusted-root.json`),
 //! refreshed in lockstep with each release.
 //!

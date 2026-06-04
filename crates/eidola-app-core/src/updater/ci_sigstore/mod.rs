@@ -33,7 +33,7 @@
 //!    SET already requires the Rekor key to vouch for the entry; the
 //!    checkpoint adds independence-from-private-forks. Future work.
 //!
-//! Both are tracked in `releases/TRUST-ROOT.md` under "Known gaps."
+//! Both are tracked in `docs/gaps.md`.
 
 use crate::error::AppError;
 use crate::trust_root;
@@ -303,6 +303,7 @@ pub fn verify_ci_signature(
         &cert_der,
         &signature_bytes,
         &canonical_body,
+        &entry.canonicalized_body,
         &set_bytes,
         integrated_time,
         log_index,

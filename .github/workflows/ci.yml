@@ -35,7 +35,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
-      - name: Cache cargo registry and build artifacts  # zizmor: ignore[cache-poisoning]
+      - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
         # save-if scopes writes to main; this job only runs tests, no
         # artifact from here is published.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -50,6 +50,18 @@ jobs:
           echo "::add-matcher::.github/rust-problem-matcher.json"
           cargo clippy --all-targets -- -D warnings
           echo "::remove-matcher owner=rust::"
+
+      - name: Markdown lint
+        # rumdl is pinned by the crates/devtools anchor crate and, locally,
+        # is on PATH via direnv (.envrc). CI deliberately doesn't install
+        # direnv (no apt in the build chain); instead it emulates .envrc —
+        # build the one tool it needs and prepend target/debug to PATH — so
+        # the `rumdl` invocation matches the local one without compiling the
+        # rest of the pinned toolset (e.g. just).
+        run: |
+          cargo build --quiet -p rumdl
+          export PATH="$PWD/target/debug:$PATH"
+          rumdl check .
 
       - name: Run tests
         run: cargo test
@@ -109,18 +121,18 @@ jobs:
         # measure-enclave (Phase 3) is a workspace cargo binary.
         run: rustup show
 
-      - name: Cache cargo registry and build artifacts  # zizmor: ignore[cache-poisoning]
+      - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache CVM artifacts  # zizmor: ignore[cache-poisoning]
+      - name: Cache CVM artifacts # zizmor: ignore[cache-poisoning]
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/eidola/cvm
           key: cvm-${{ hashFiles('tinfoil-config.yml') }}
 
-      - name: Set up Docker Buildx  # zizmor: ignore[cache-poisoning]
+      - name: Set up Docker Buildx # zizmor: ignore[cache-poisoning]
         # v* tag (release) builds skip the GHA cache entirely so Sigstore-
         # attested artifacts come from a clean compile (see Phase 1/4
         # below). PR/main builds use type=gha cache, which is
@@ -382,14 +394,14 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
-      - name: Cache cargo registry and build artifacts  # zizmor: ignore[cache-poisoning]
+      - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
         # save-if scopes writes to main; this job only verifies the manifest,
         # it does not produce any published artifact.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache CVM artifacts  # zizmor: ignore[cache-poisoning]
+      - name: Cache CVM artifacts # zizmor: ignore[cache-poisoning]
         # CVM kernel/initrd downloads are Sigstore-verified by the
         # --verify-attestations flag below, so a poisoned cache is rejected
         # at verification time.

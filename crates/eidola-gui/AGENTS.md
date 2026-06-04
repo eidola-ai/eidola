@@ -181,6 +181,7 @@ Cases live in `tests/visual/cases.rs`; the harness in `tests/visual/harness.rs` 
 The PNGs are **gitignored** — pixels are platform- and machine-bound (Metal+CoreText vs wgpu+cosmic-text on Linux; font hinting differs across macOS minor versions), so committing them would mean false-positive regressions in CI and on every other developer's machine. Their value is local: agents/humans can `Read` a PNG to "feel" a view at a state, and a developer iterating on a UI change can re-render and eyeball-diff their previous run.
 
 Behavior:
+
 - Missing PNG → write it and report `written`.
 - Mismatch against a previously-written local PNG → write `<name>-<mode>.new.png` for review and fail.
 - `UPDATE_SNAPSHOTS=1` overwrites.

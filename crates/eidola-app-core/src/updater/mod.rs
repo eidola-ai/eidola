@@ -11,7 +11,7 @@
 //!   continuity  → release.version > installed; previous matches  [step 4b]
 //!   fetch       → download artifact-manifest.json + both bundles + each attestation
 //!   verify-ci   → tinfoil-rs sigstore verification               [step 4c]
-//!   verify-human→ SSH signature + Rekor hashedrekord per attestation [step 4d]
+//!   verify-human→ cosign-signed hashedrekord (PKIX SPKI in body) per attestation [step 4d]
 //!   templates   → render each template; require character-exact match [step 4e]
 //!   cross-check → resolved substitution values match release.x.y paths [step 4e]
 //!   policy      → ≥ trust_root::MIN_HUMAN_ATTESTATIONS human attestations verified [step 4e]
@@ -40,6 +40,7 @@ pub use eidola_attestation::{
 pub mod ci_sigstore;
 pub mod human_attestation;
 mod merkle;
+mod rekor_verify;
 pub mod sigstore_bundle;
 pub mod trust;
 
@@ -198,10 +199,12 @@ pub struct ReleaseSummary {
 
 /// One verified human attestation, ready to render. The verifier guarantees:
 ///
-/// - The SSH signature over the attestation bytes is valid (and namespaced
-///   to `eidola-attestation@v1`).
-/// - The signer's pubkey fingerprint (`fingerprint_hex`) is in this
-///   client's pinned `TRUSTED_ATTESTANT_FINGERPRINTS`.
+/// - The cosign-emitted blob signature over the attestation bytes is
+///   valid under the attestant's pubkey (ECDSA-P256 / ECDSA-P384 /
+///   Ed25519 — dispatched on the SPKI's algorithm OID).
+/// - The signer's pubkey fingerprint (`fingerprint_hex` =
+///   `sha256(PKIX SubjectPublicKeyInfo DER)`) is in this client's
+///   pinned `TRUSTED_ATTESTANT_FINGERPRINTS`.
 /// - The signature was logged in Sigstore Rekor (`rekor_log_index`,
 ///   SET-signed by a pinned Rekor key, with a valid inclusion proof).
 /// - The attestation's `release_version` / `git_commit` /
@@ -384,7 +387,7 @@ pub async fn check_for_update_with(
         tracer.log(
             "verify-human",
             format!(
-                "verifying {} (SSH-SIG + Rekor + templates)",
+                "verifying {} (cosign blob signature + Rekor + templates)",
                 human.attestant_id
             ),
         );
@@ -420,7 +423,7 @@ pub async fn check_for_update_with(
     // Policy: minimum number of independently-verified attestations. The
     // threshold is pinned in the *embedded* trust root rather than in
     // `release.json` so an adversary who controls the index can't lower
-    // the bar — see module docs and `releases/TRUST-ROOT.md`.
+    // the bar — see module docs and `docs/trust-root.md`.
     if (verified_attestations.len() as u32) < trust_root::MIN_HUMAN_ATTESTATIONS {
         return Err(AppError::Update {
             message: format!(
@@ -448,8 +451,8 @@ pub async fn check_for_update_with(
     // are trustworthy — this stage just turns "manifest authentic" into
     // "downloaded bytes authentic." Lives in step 5 because the natural
     // home is the install/replace flow, where we already need to be
-    // downloading the binary anyway. See `releases/TRUST-ROOT.md`
-    // "Known gaps" for the audit-side description.
+    // downloading the binary anyway. See `docs/gaps.md` for the
+    // audit-side description.
 
     tracer.log("present", format!("release {} verified", release.version));
 

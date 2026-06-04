@@ -12,7 +12,7 @@
 //!   uploaded to the GitHub release). Pure URL index — *no* policy fields.
 //!   Threshold and identity policy live in the verifier's embedded trust
 //!   root, never here, because an attacker who controls `release.json`
-//!   must not be able to lower the bar (see `releases/TRUST-ROOT.md`).
+//!   must not be able to lower the bar (see `docs/trust-root.md`).
 //!
 //! These are intentionally data-only: no methods, no business logic, just
 //! `Serialize`/`Deserialize`. Behaviour belongs in the consuming crates.

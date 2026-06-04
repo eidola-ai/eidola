@@ -1,8 +1,18 @@
 //! `release-tool attest <tag>` — interactively render every claim, prompt
-//! the engineer to type `yes` to affirm each, sign with their hardware-
-//! backed SSH key via `ssh-keygen -Y sign`, post the signature to Sigstore
-//! Rekor as a `hashedrekord` entry, and upload everything to the GitHub
-//! release.
+//! the engineer to type `yes` to affirm each, sign with their attestant
+//! key via `cosign sign-blob` (the key can be a local PEM, a PKCS#11
+//! URI for a YubiKey / SmartCard, or any cosign-supported KMS URI), and
+//! upload the resulting Sigstore Bundle v0.3 + attestation JSON +
+//! release.json index to the GitHub release.
+//!
+//! Before any signing or upload, the underlying key's algorithm is
+//! cross-checked against the updater's allowlist (ECDSA-P256,
+//! ECDSA-P384, or Ed25519) via
+//! [`eidola_app_core::updater::human_attestation::classify_attestant_spki_algorithm`].
+//! RSA / ECDSA-P521 / other algorithms are rejected up front — cosign
+//! would happily sign with them, but every client would reject the
+//! resulting attestation, leaving a `latest`-marked release no one
+//! can install.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -11,25 +21,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
 use crate::trust;
 
-/// Namespace mixed into the SSH signature (see PROTOCOL.sshsig). Stable;
-/// changing it invalidates every prior signature.
-const SSH_SIG_NAMESPACE: &str = "eidola-attestation@v1";
-
-/// Public Rekor instance — same one Sigstore-rs's TrustedRoot points at.
-/// If we ever run our own Rekor mirror this becomes a trust-root field.
-const REKOR_BASE_URL: &str = "https://rekor.sigstore.dev";
-
 pub struct Args {
     pub workspace_root: PathBuf,
     pub repo: String,
     pub tag: String,
-    pub ssh_pubkey: PathBuf,
+    /// Cosign `--key` value: a local PEM path, a PKCS#11 URI
+    /// (`pkcs11:slot-id=...;object=...`), or any KMS URI cosign
+    /// supports. Passed through to cosign verbatim.
+    pub cosign_key: String,
     pub attestant_id: String,
     pub attestant_name: String,
     pub jurisdiction: String,
@@ -37,7 +41,7 @@ pub struct Args {
 
 pub fn run(args: Args) -> Result<()> {
     require_tool("gh")?;
-    require_tool("ssh-keygen")?;
+    require_tool("cosign")?;
     require_tool("git")?;
 
     let trust = trust::load(&args.workspace_root)?;
@@ -53,17 +57,41 @@ pub fn run(args: Args) -> Result<()> {
     if args.jurisdiction.trim().is_empty() {
         bail!("--jurisdiction must not be empty");
     }
-    if !args.ssh_pubkey.is_file() {
+    if args.cosign_key.trim().is_empty() {
+        bail!("--cosign-key must not be empty (path to PEM, pkcs11: URI, or KMS URI)");
+    }
+    // Software-keyed cosign keys are passphrase-encrypted. PKCS#11 and
+    // KMS-backed keys don't use COSIGN_PASSWORD — the device prompts
+    // for its own PIN. We can't easily distinguish here, so we warn
+    // only when the path looks like a local file and the env var is
+    // unset.
+    if is_local_key_path(&args.cosign_key) && std::env::var("COSIGN_PASSWORD").is_err() {
         bail!(
-            "--ssh-pubkey path `{}` does not exist or is not a file",
-            args.ssh_pubkey.display()
+            "--cosign-key looks like a local file but COSIGN_PASSWORD is not set. \
+             Local cosign keys are passphrase-encrypted; export COSIGN_PASSWORD \
+             (or empty string for a passphrase-less key) and retry."
         );
     }
-    if std::env::var("SSH_AUTH_SOCK").is_err() {
-        bail!(
-            "SSH_AUTH_SOCK is not set. Configure your SSH agent (e.g. Secretive) so \
-             `ssh-keygen -Y sign` can reach the private key, then retry."
-        );
+    // For a PKCS#11 key, cosign needs the PIN in COSIGN_PKCS11_PIN — its
+    // own interactive prompt is unreachable against a YubiKey (it dies in
+    // GetTokenInfo before prompting; see
+    // docs/contributing/release-attestant-yubikey.md). If the operator
+    // hasn't exported it, prompt once here (no echo) and set it so the
+    // child cosign processes — `cosign public-key` below and
+    // `cosign sign-blob` later — inherit it.
+    if args.cosign_key.starts_with("pkcs11:") && std::env::var_os("COSIGN_PKCS11_PIN").is_none() {
+        let pin = rpassword::prompt_password(
+            "Enter PIN for PKCS#11 attestant key (COSIGN_PKCS11_PIN, will not echo): ",
+        )
+        .context("reading the PKCS#11 PIN")?;
+        if pin.is_empty() {
+            bail!(
+                "no PIN entered. Export COSIGN_PKCS11_PIN or enter it at the prompt, then retry."
+            );
+        }
+        // SAFETY: single-threaded at this point; set before any cosign
+        // child process is spawned, so there is no concurrent env access.
+        unsafe { std::env::set_var("COSIGN_PKCS11_PIN", pin) };
     }
 
     let release_version = args
@@ -72,22 +100,64 @@ pub fn run(args: Args) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("tag `{}` must start with `v`", args.tag))?
         .to_string();
     let git_commit = git_rev_parse(&args.workspace_root, &args.tag)?;
-    let previous_release_git_commit = previous_release_commit(&args.workspace_root, &args.tag)?;
+    let prev_tag = previous_release_tag(&args.workspace_root, &args.tag)?;
+    let previous_release_git_commit = git_rev_parse(&args.workspace_root, &prev_tag)?;
+
+    // Print the resolved SHAs in the same format as `release-verify`'s
+    // diff header, before any prompts. The `diff_reviewed` claim later
+    // echoes these same SHAs inside the signed bytes; surfacing them up
+    // front gives the engineer an early visual cross-check against the
+    // verify scrollback so they can spot drift before affirming anything.
+    println!();
+    println!("== commits being attested ==");
+    println!("  previous: {prev_tag}  →  {previous_release_git_commit}");
+    println!("  this:     {tag}  →  {git_commit}", tag = args.tag);
+    println!();
+    println!(
+        "Confirm these SHAs match what `release-verify` showed. They will be\n\
+         recorded verbatim in the signed attestation."
+    );
 
     let manifest_path = args.workspace_root.join("artifact-manifest.json");
     let artifact_manifest_sha256 = sha256_hex(&fs::read(&manifest_path)?);
 
-    let privacy_doc_path = args.workspace_root.join("PRIVACY-GUARANTEES.md");
+    let privacy_doc_path = args.workspace_root.join("docs/privacy-guarantees.md");
     let privacy_guarantees_doc_sha256 = match fs::read(&privacy_doc_path) {
         Ok(bytes) => sha256_hex(&bytes),
         Err(_) => bail!(
-            "`PRIVACY-GUARANTEES.md` not found at repo root. \
-             The `no_known_privacy_weakening` claim references its sha256; \
+            "`docs/privacy-guarantees.md` not found. \
+             The `privacy_guarantees_not_weakened` claim references its sha256; \
              create the document and commit it before attesting."
         ),
     };
 
-    let key_fingerprint_sha256 = compute_ssh_fingerprint(&args.ssh_pubkey)?;
+    let spki_der = fetch_cosign_pubkey_spki_der(&args.cosign_key)?;
+    let key_fingerprint_sha256 = sha256_hex(&spki_der);
+
+    // Pre-flight: reject keys the updater can't verify (RSA, ECDSA-P521, …)
+    // before we sign and publish. Without this, cosign would happily sign
+    // with, say, a YubiKey RSA-2048 slot or an awskms RSA key — the upload
+    // and `--latest` would succeed, but every client's
+    // `verify_blob_signature_with_spki` rejects anything outside
+    // ECDSA-P256 / ECDSA-P384 / Ed25519, leaving us with a "latest"
+    // release no one can install. Same allowlist, same OID dispatch as the
+    // updater (single source of truth in `eidola_app_core`).
+    let attestant_algorithm =
+        eidola_app_core::updater::human_attestation::classify_attestant_spki_algorithm(&spki_der)
+            .with_context(|| {
+            format!(
+                "the public key for `--cosign-key {}` is not a supported attestant key type. \
+             The eidola updater only accepts ECDSA-P256, ECDSA-P384, or Ed25519; \
+             refusing to sign and publish a release the updater would reject. \
+             Re-issue the cosign / KMS / PKCS#11 key with one of those algorithms and retry.",
+                args.cosign_key
+            )
+        })?;
+    println!();
+    println!(
+        "  attestant key algorithm: {} (sha256 SPKI fingerprint: {key_fingerprint_sha256})",
+        attestant_algorithm.name()
+    );
 
     // Surface a loud warning if the signing key is not yet pinned. Expected
     // for the very first release (the seed); harmful for subsequent ones.
@@ -199,41 +269,11 @@ pub fn run(args: Args) -> Result<()> {
         .with_context(|| format!("writing {}", attestation_path.display()))?;
 
     println!();
-    println!("=== Signing with SSH agent ===");
-    let signature_path = ssh_sign(&attestation_path, &args.ssh_pubkey, SSH_SIG_NAMESPACE)?;
-    println!("  signature → {}", signature_path.display());
-
-    let attestation_hash_hex = sha256_hex(&fs::read(&attestation_path)?);
-    let signature_bytes = fs::read(&signature_path)?;
-    let pubkey_bytes = fs::read(&args.ssh_pubkey)?;
-
-    println!();
-    println!("=== Uploading to Rekor ({REKOR_BASE_URL}) ===");
-    let rekor_entry =
-        rekor_upload_hashedrekord(&attestation_hash_hex, &signature_bytes, &pubkey_bytes)?;
-    println!(
-        "  ✓ log_index={} uuid={}",
-        rekor_entry.log_index, rekor_entry.uuid
-    );
-
-    // Build the bundle file the verifier reads as a **Sigstore Bundle v0.3**
-    // (`application/vnd.dev.sigstore.bundle.v0.3+json`) — the same shape
-    // `cosign sign-blob --bundle` emits, but with a `publicKey.hint` in
-    // place of the Fulcio leaf cert. This lets the verifier share its
-    // structural decode + most field handling across the CI and human
-    // paths. See
-    // `crates/eidola-app-core/src/updater/sigstore_bundle.rs` for the
-    // matching consumer side, and
-    // <https://github.com/sigstore/protobuf-specs/blob/main/protos/sigstore_bundle.proto>
-    // for the upstream spec.
-    let bundle = build_sigstore_bundle_v3(
-        &rekor_entry.raw,
-        &signature_bytes,
-        &attestation_path,
-        &key_fingerprint_sha256,
-    )?;
-    let bundle_serialized = serde_json::to_string_pretty(&bundle)? + "\n";
-    fs::write(&bundle_path, bundle_serialized.as_bytes())?;
+    println!("=== Signing with cosign + uploading to Rekor ===");
+    cosign_sign_blob(&args.cosign_key, &attestation_path, &bundle_path)?;
+    let log_index = read_rekor_log_index(&bundle_path)?;
+    println!("  ✓ rekor log_index = {log_index}");
+    println!("      https://search.sigstore.dev/?logIndex={log_index}");
 
     println!();
     println!("=== Uploading attestation + bundle to release ===");
@@ -252,7 +292,7 @@ pub fn run(args: Args) -> Result<()> {
     // `release.json` is a pure URL index. Policy fields (threshold, allowed
     // identities, allowed schema versions) live in the verifier's embedded
     // trust root so a forged index can't downgrade them — see
-    // `releases/TRUST-ROOT.md`.
+    // `docs/trust-root.md`.
     let release_json = serde_json::json!({
         "schema_version": 1,
         "version": release_version,
@@ -306,15 +346,16 @@ fn require_tool(name: &str) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    // Some tools (e.g. ssh-keygen) exit non-zero on --version; accept either
-    // exit-code success or "the binary at least dispatched."
+    // Accept any tool whose `--version` invocation reached the binary;
+    // we just need to confirm it's resolvable on PATH, not that it
+    // implements a specific exit-code convention.
     if status.is_ok() {
         return Ok(());
     }
     bail!("required tool `{name}` not found on PATH");
 }
 
-fn validate_attestant_id(id: &str) -> Result<()> {
+pub(crate) fn validate_attestant_id(id: &str) -> Result<()> {
     if id.is_empty()
         || !id
             .chars()
@@ -335,322 +376,125 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Compute `sha256(<wire-format pubkey bytes>)` for an OpenSSH `.pub` file.
-/// The wire bytes are the base64-decoded middle field of the `.pub` line
-/// (`ssh-<type> <base64-wire-format> [comment]`).
-fn compute_ssh_fingerprint(pubkey_path: &Path) -> Result<String> {
-    let content = fs::read_to_string(pubkey_path)
-        .with_context(|| format!("reading {}", pubkey_path.display()))?;
-    let line = content
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("ssh pubkey file `{}` is empty", pubkey_path.display()))?;
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 2 {
+/// Extract the public key for `cosign_key` via `cosign public-key
+/// --key <ref>` and return the PKIX SubjectPublicKeyInfo DER bytes.
+/// Callers compute `sha256(spki_der)` to match
+/// `TRUSTED_ATTESTANT_FINGERPRINTS` and pass the same bytes through
+/// [`eidola_app_core::updater::human_attestation::classify_attestant_spki_algorithm`]
+/// to verify the algorithm is on the updater's allowlist before signing.
+fn fetch_cosign_pubkey_spki_der(cosign_key: &str) -> Result<Vec<u8>> {
+    let out = Command::new("cosign")
+        .args(["public-key", "--key", cosign_key])
+        .output()
+        .context("running `cosign public-key --key <ref>`")?;
+    if !out.status.success() {
         bail!(
-            "ssh pubkey file `{}` is malformed (expected `ssh-<type> <base64> [comment]`)",
-            pubkey_path.display()
+            "`cosign public-key --key {}` failed: {}",
+            cosign_key,
+            String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let wire = base64::engine::general_purpose::STANDARD
-        .decode(parts[1].as_bytes())
-        .context("base64-decoding ssh pubkey wire data")?;
-    Ok(sha256_hex(&wire))
+    let pem = String::from_utf8(out.stdout).context("cosign public-key output is not UTF-8")?;
+    pem_public_key_to_spki_der(&pem)
 }
 
-/// Sign `file_to_sign` via `ssh-keygen -Y sign`, returning the path of the
-/// `.sig` file the tool writes alongside the input.
-fn ssh_sign(file_to_sign: &Path, pubkey: &Path, namespace: &str) -> Result<PathBuf> {
-    let status = Command::new("ssh-keygen")
+/// Decode a single `-----BEGIN PUBLIC KEY-----` PEM block to its inner
+/// PKIX SubjectPublicKeyInfo DER bytes. Mirror of the verifier-side
+/// helper in `eidola_app_core::updater::human_attestation`.
+fn pem_public_key_to_spki_der(pem: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let trimmed = pem.trim();
+    let body = trimmed
+        .strip_prefix("-----BEGIN PUBLIC KEY-----")
+        .and_then(|s| s.strip_suffix("-----END PUBLIC KEY-----"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cosign public-key output missing `-----BEGIN/END PUBLIC KEY-----` markers"
+            )
+        })?
+        .trim();
+    let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(stripped.as_bytes())
+        .context("base64-decoding cosign public-key PEM body")
+}
+
+/// True if `cosign_key` looks like a local file path rather than a
+/// PKCS#11/KMS URI. cosign's URI schemes use `:` as a scheme separator
+/// (`pkcs11:`, `awskms:`, `gcpkms:`, `azurekms:`, `hashivault:`); a
+/// local path doesn't.
+fn is_local_key_path(cosign_key: &str) -> bool {
+    !matches!(
+        cosign_key.split(':').next().unwrap_or(""),
+        "pkcs11" | "awskms" | "gcpkms" | "azurekms" | "hashivault"
+    )
+}
+
+/// Run `cosign sign-blob` against `attestation_path`, writing the
+/// Sigstore Bundle v0.3 to `bundle_path`. cosign handles SHA-256 of the
+/// blob, signature, Rekor upload, and bundle serialization in one
+/// shot. `--yes` skips the confirmation prompt; the engineer has
+/// already affirmed every claim before we get here.
+fn cosign_sign_blob(cosign_key: &str, attestation_path: &Path, bundle_path: &Path) -> Result<()> {
+    let status = Command::new("cosign")
         .args([
-            "-Y",
-            "sign",
-            "-n",
-            namespace,
-            "-f",
-            pubkey.to_str().unwrap(),
+            "sign-blob",
+            "--yes",
+            "--key",
+            cosign_key,
+            "--bundle",
+            bundle_path.to_str().unwrap(),
+            attestation_path.to_str().unwrap(),
         ])
-        .arg(file_to_sign)
         .status()
-        .context("running `ssh-keygen -Y sign`")?;
+        .context("running `cosign sign-blob`")?;
     if !status.success() {
         bail!(
-            "ssh-keygen -Y sign failed; ensure SSH_AUTH_SOCK reaches an agent that holds \
-             the matching private key for `{}`",
-            pubkey.display()
+            "`cosign sign-blob` failed; ensure the cosign key reference `{}` is reachable and \
+             COSIGN_PASSWORD / device PIN is correct",
+            cosign_key
         );
     }
-    let mut sig_path = file_to_sign.as_os_str().to_owned();
-    sig_path.push(".sig");
-    Ok(PathBuf::from(sig_path))
+    Ok(())
 }
 
-/// POST a `hashedrekord` entry to Sigstore Rekor and return the parsed log
-/// entry. Rekor identifies SSH-format keys automatically from the pubkey
-/// content; we don't need to declare the format explicitly.
-fn rekor_upload_hashedrekord(
-    artifact_hash_hex: &str,
-    signature_bytes: &[u8],
-    pubkey_bytes: &[u8],
-) -> Result<RekorLogEntry> {
-    let body = serde_json::json!({
-        "apiVersion": "0.0.1",
-        "kind": "hashedrekord",
-        "spec": {
-            "data": {
-                "hash": {
-                    "algorithm": "sha256",
-                    "value": artifact_hash_hex,
-                }
-            },
-            "signature": {
-                "content": base64::engine::general_purpose::STANDARD.encode(signature_bytes),
-                "publicKey": {
-                    "content": base64::engine::general_purpose::STANDARD.encode(pubkey_bytes),
-                }
-            }
-        }
-    });
-
-    let url = format!("{REKOR_BASE_URL}/api/v1/log/entries");
-    let response = reqwest::blocking::Client::new()
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .json(&body)
-        .send()
-        .context("posting hashedrekord to Rekor")?;
-
-    let status = response.status();
-    let response_text = response.text().context("reading Rekor response body")?;
-    if !status.is_success() {
-        bail!("Rekor POST returned {status}: {response_text}");
-    }
-
-    let parsed: serde_json::Value = serde_json::from_str(&response_text)
-        .with_context(|| format!("parsing Rekor response: {response_text}"))?;
-
-    // Rekor returns `{ "<uuid>": { body, integratedTime, logID, logIndex,
-    // verification: { inclusionProof, signedEntryTimestamp } } }`.
-    let obj = parsed
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("Rekor response is not an object"))?;
-    let (uuid, entry) = obj
-        .iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Rekor response is empty"))?;
-
-    let log_index = entry
-        .get("logIndex")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow::anyhow!("Rekor response missing logIndex"))?;
-
-    Ok(RekorLogEntry {
-        uuid: uuid.clone(),
-        log_index,
-        raw: parsed,
-    })
-}
-
-struct RekorLogEntry {
-    uuid: String,
-    log_index: i64,
-    /// Verbatim Rekor response — used as the source of facts for building
-    /// the Sigstore Bundle v0.3 we hand to the verifier.
-    raw: serde_json::Value,
-}
-
-/// Project the verbatim Rekor REST response into a Sigstore Bundle v0.3
-/// JSON document. Fields are mapped per the spec at
-/// <https://github.com/sigstore/protobuf-specs/blob/main/protos/sigstore_bundle.proto>:
-///
-/// - protobuf int64 → JSON string (`logIndex`, `integratedTime`, `treeSize`)
-/// - hex bytes in the Rekor REST shape → base64 in v0.3 (`logID`,
-///   `rootHash`, inclusion-proof `hashes[]`)
-/// - the SSH-SIG PEM (`-----BEGIN SSH SIGNATURE----- ... -----END...`)
-///   goes into `messageSignature.signature` (base64 of its file bytes).
-///   The rekor body still carries it too, but the spec puts the
-///   authoritative signature on `messageSignature`.
-/// - `verificationMaterial.publicKey.hint` carries the engineer's
-///   SSH-key SHA-256 fingerprint (the same value pinned by
-///   `TRUSTED_ATTESTANT_FINGERPRINTS`); the actual pubkey bytes stay in
-///   the rekor body, since `PublicKeyIdentifier` is a hint, not a key.
-fn build_sigstore_bundle_v3(
-    rekor_response: &serde_json::Value,
-    ssh_sig_pem_bytes: &[u8],
-    attestation_path: &Path,
-    key_fingerprint_sha256: &str,
-) -> Result<serde_json::Value> {
-    // Rekor returns `{ "<uuid>": { body, integratedTime, logID, logIndex,
-    // verification: { inclusionProof, signedEntryTimestamp } } }`. We need
-    // the inner value.
-    let obj = rekor_response
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("Rekor response is not an object"))?;
-    let (_, entry) = obj
-        .iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Rekor response is empty"))?;
-
-    let body_b64 = entry
-        .get("body")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Rekor response missing string `body`"))?
-        .to_string();
-    let log_index = entry
-        .get("logIndex")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow::anyhow!("Rekor response missing integer `logIndex`"))?;
-    let integrated_time = entry
-        .get("integratedTime")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow::anyhow!("Rekor response missing integer `integratedTime`"))?;
-    let log_id_hex = entry
-        .get("logID")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Rekor response missing string `logID`"))?;
-    let log_id_bytes = hex_decode(log_id_hex)
-        .with_context(|| format!("hex-decoding Rekor logID `{log_id_hex}`"))?;
-    let log_id_b64 = base64::engine::general_purpose::STANDARD.encode(&log_id_bytes);
-
-    let verification = entry
-        .get("verification")
-        .ok_or_else(|| anyhow::anyhow!("Rekor response missing `verification` block"))?;
-    let signed_entry_timestamp = verification
-        .get("signedEntryTimestamp")
+/// Extract the Rekor `logIndex` from a Sigstore Bundle v0.3 file. Used
+/// purely for the user-facing "log_index=N" message + Sigstore search
+/// URL; the verifier re-derives this independently.
+fn read_rekor_log_index(bundle_path: &Path) -> Result<u64> {
+    let bytes = fs::read(bundle_path)
+        .with_context(|| format!("reading bundle {}", bundle_path.display()))?;
+    let bundle: serde_json::Value =
+        serde_json::from_slice(&bytes).context("parsing cosign-emitted bundle as JSON")?;
+    let log_index_str = bundle
+        .get("verificationMaterial")
+        .and_then(|v| v.get("tlogEntries"))
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.get("logIndex"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            anyhow::anyhow!("Rekor response missing `verification.signedEntryTimestamp`")
-        })?
-        .to_string();
-    let proof = verification
-        .get("inclusionProof")
-        .ok_or_else(|| anyhow::anyhow!("Rekor response missing `verification.inclusionProof`"))?;
-    let proof_log_index = proof
-        .get("logIndex")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow::anyhow!("inclusionProof missing integer `logIndex`"))?;
-    let proof_tree_size = proof
-        .get("treeSize")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow::anyhow!("inclusionProof missing integer `treeSize`"))?;
-    let proof_root_hash_hex = proof
-        .get("rootHash")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("inclusionProof missing string `rootHash`"))?;
-    let proof_root_hash_b64 = base64::engine::general_purpose::STANDARD
-        .encode(hex_decode(proof_root_hash_hex).context("hex-decoding inclusionProof.rootHash")?);
-    let proof_hashes_hex = proof
-        .get("hashes")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let proof_hashes_b64: Vec<String> = proof_hashes_hex
-        .iter()
-        .enumerate()
-        .map(|(i, h)| {
-            let h = h
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("inclusionProof.hashes[{i}] is not a string"))?;
-            let bytes = hex_decode(h)
-                .with_context(|| format!("hex-decoding inclusionProof.hashes[{i}] `{h}`"))?;
-            Ok::<_, anyhow::Error>(base64::engine::general_purpose::STANDARD.encode(bytes))
-        })
-        .collect::<Result<_>>()?;
-
-    let mut inclusion_proof_obj = serde_json::Map::new();
-    inclusion_proof_obj.insert(
-        "logIndex".to_string(),
-        serde_json::Value::String(proof_log_index.to_string()),
-    );
-    inclusion_proof_obj.insert(
-        "rootHash".to_string(),
-        serde_json::Value::String(proof_root_hash_b64),
-    );
-    inclusion_proof_obj.insert(
-        "treeSize".to_string(),
-        serde_json::Value::String(proof_tree_size.to_string()),
-    );
-    inclusion_proof_obj.insert(
-        "hashes".to_string(),
-        serde_json::Value::Array(
-            proof_hashes_b64
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect(),
-        ),
-    );
-    // The Rekor REST response surfaces `checkpoint` as a single signed-note
-    // string; v0.3 wraps it as `{ "envelope": "<that string>" }`. Pass it
-    // through if present — it's optional in the spec.
-    if let Some(cp) = proof.get("checkpoint").and_then(|v| v.as_str()) {
-        inclusion_proof_obj.insert(
-            "checkpoint".to_string(),
-            serde_json::json!({ "envelope": cp }),
-        );
-    }
-
-    let attestation_bytes = fs::read(attestation_path)
-        .with_context(|| format!("reading {}", attestation_path.display()))?;
-    let attestation_digest = Sha256::digest(&attestation_bytes);
-    let attestation_digest_b64 =
-        base64::engine::general_purpose::STANDARD.encode(attestation_digest);
-    let ssh_sig_b64 = base64::engine::general_purpose::STANDARD.encode(ssh_sig_pem_bytes);
-
-    Ok(serde_json::json!({
-        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
-        "verificationMaterial": {
-            "publicKey": {
-                "hint": key_fingerprint_sha256,
-            },
-            "tlogEntries": [{
-                "logIndex": log_index.to_string(),
-                "logId": { "keyId": log_id_b64 },
-                "kindVersion": { "kind": "hashedrekord", "version": "0.0.1" },
-                "integratedTime": integrated_time.to_string(),
-                "inclusionPromise": { "signedEntryTimestamp": signed_entry_timestamp },
-                "inclusionProof": serde_json::Value::Object(inclusion_proof_obj),
-                "canonicalizedBody": body_b64,
-            }],
-        },
-        "messageSignature": {
-            "messageDigest": {
-                "algorithm": "SHA2_256",
-                "digest": attestation_digest_b64,
-            },
-            "signature": ssh_sig_b64,
-        },
-    }))
-}
-
-fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        bail!("hex string `{s}` has odd length");
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow::anyhow!(e)))
-        .collect()
+            anyhow::anyhow!(
+                "cosign bundle missing `verificationMaterial.tlogEntries[0].logIndex` string"
+            )
+        })?;
+    log_index_str
+        .parse::<u64>()
+        .with_context(|| format!("parsing bundle logIndex `{log_index_str}` as u64"))
 }
 
 fn git_rev_parse(workspace_root: &Path, refname: &str) -> Result<String> {
     let out = Command::new("git")
         .current_dir(workspace_root)
-        .args(["rev-parse", refname])
+        .args(["rev-parse", &format!("{refname}^{{commit}}")])
         .output()
-        .context("running `git rev-parse`")?;
+        .context("running `git rev-parse <ref>^{commit}`")?;
     if !out.status.success() {
         bail!(
-            "`git rev-parse {refname}` failed: {}",
+            "`git rev-parse {refname}^{{commit}}` failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
-}
-
-fn previous_release_commit(workspace_root: &Path, tag: &str) -> Result<String> {
-    let prev = previous_release_tag(workspace_root, tag)?;
-    git_rev_parse(workspace_root, &prev)
 }
 
 fn previous_release_version(workspace_root: &Path, tag: &str) -> Result<String> {
@@ -778,177 +622,39 @@ mod tests {
     }
 
     #[test]
-    fn ssh_fingerprint_matches_known_value() {
-        // Construct a `.pub` file with a known wire-format payload.
-        // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(b"hello");
-        std::fs::write(tmp.path(), format!("ssh-ed25519 {encoded} comment\n")).unwrap();
-        let fp = compute_ssh_fingerprint(tmp.path()).unwrap();
-        assert_eq!(
-            fp,
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
+    fn is_local_key_path_recognizes_kms_uris() {
+        // KMS / hardware URIs — cosign reads these as its own key refs.
+        assert!(!is_local_key_path("pkcs11:slot-id=0;object=eidola"));
+        assert!(!is_local_key_path("awskms:///alias/eidola"));
+        assert!(!is_local_key_path(
+            "gcpkms://projects/x/locations/y/keyRings/z/cryptoKeys/q"
+        ));
+        assert!(!is_local_key_path(
+            "azurekms://vault.vault.azure.net/keys/eidola"
+        ));
+        assert!(!is_local_key_path("hashivault://eidola"));
+        // Local paths.
+        assert!(is_local_key_path("cosign.key"));
+        assert!(is_local_key_path("/home/mike/cosign.key"));
+        assert!(is_local_key_path("./cosign.key"));
     }
 
     #[test]
-    fn ssh_fingerprint_rejects_malformed_pubkey() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "only-one-field\n").unwrap();
-        assert!(compute_ssh_fingerprint(tmp.path()).is_err());
+    fn pem_public_key_to_spki_der_extracts_p256_spki() {
+        // PEM SPKI from a real `cosign generate-key-pair` run. P-256
+        // SPKI DER is 91 bytes — the same value the verifier's parallel
+        // helper produces.
+        let pem = "-----BEGIN PUBLIC KEY-----\n\
+                   MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEJsEXjtQe9u/kRQ006UUEXIt4aY7u\n\
+                   JI4fqwrk1qBM9GyGPqZYJrflz/dWImo3wdF17ZG3kmfSe/rCiQKL3x/unQ==\n\
+                   -----END PUBLIC KEY-----\n";
+        let der = pem_public_key_to_spki_der(pem).unwrap();
+        assert_eq!(der.len(), 91);
     }
 
     #[test]
-    fn sigstore_bundle_v3_maps_rekor_response() {
-        // logID is a real-looking 32-byte hex; rootHash is 32 bytes; one
-        // sibling hash. Verify the v3 projection produces the right
-        // shape — mediaType, publicKey.hint, hex→base64, int→string.
-        let log_id_hex = "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b959181d";
-        // make it 64 chars (32 bytes): pad with leading zero
-        let log_id_hex = format!("0{log_id_hex}");
-        let root_hash_hex = "aa".repeat(32);
-        let sibling_hex = "bb".repeat(32);
-
-        let rekor_response = serde_json::json!({
-            "abc-uuid": {
-                "body": "Ym9keQ==", // base64 "body"
-                "logIndex": 12345,
-                "integratedTime": 1_700_000_000_i64,
-                "logID": log_id_hex,
-                "verification": {
-                    "signedEntryTimestamp": "U0VUYnl0ZXM=", // "SETbytes" b64
-                    "inclusionProof": {
-                        "logIndex": 12345,
-                        "treeSize": 67890,
-                        "rootHash": root_hash_hex,
-                        "hashes": [sibling_hex],
-                        "checkpoint": "rekor.sigstore.dev - 1193050959916656506\n8\nfoo\n",
-                    },
-                },
-            }
-        });
-
-        // Write a dummy attestation file so build_sigstore_bundle_v3 can hash it.
-        let att = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(att.path(), b"hello attestation").unwrap();
-
-        let ssh_sig_pem = b"-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n";
-
-        let bundle = build_sigstore_bundle_v3(
-            &rekor_response,
-            ssh_sig_pem,
-            att.path(),
-            "deadbeefcafebabe0000000000000000000000000000000000000000000000ff",
-        )
-        .unwrap();
-
-        // mediaType + version-3 marker.
-        assert_eq!(
-            bundle["mediaType"].as_str().unwrap(),
-            "application/vnd.dev.sigstore.bundle.v0.3+json"
-        );
-
-        // publicKey.hint pass-through.
-        assert_eq!(
-            bundle["verificationMaterial"]["publicKey"]["hint"]
-                .as_str()
-                .unwrap(),
-            "deadbeefcafebabe0000000000000000000000000000000000000000000000ff"
-        );
-        assert!(bundle["verificationMaterial"]["certificate"].is_null());
-
-        let entry = &bundle["verificationMaterial"]["tlogEntries"][0];
-
-        // int → string.
-        assert_eq!(entry["logIndex"].as_str().unwrap(), "12345");
-        assert_eq!(entry["integratedTime"].as_str().unwrap(), "1700000000");
-
-        // logID hex → base64.
-        let log_id_b64 = entry["logId"]["keyId"].as_str().unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(log_id_b64)
-            .unwrap();
-        assert_eq!(decoded, hex_decode(&log_id_hex).unwrap());
-
-        // Pass-through fields.
-        assert_eq!(entry["canonicalizedBody"].as_str().unwrap(), "Ym9keQ==");
-        assert_eq!(
-            entry["inclusionPromise"]["signedEntryTimestamp"]
-                .as_str()
-                .unwrap(),
-            "U0VUYnl0ZXM="
-        );
-        assert_eq!(
-            entry["kindVersion"]["kind"].as_str().unwrap(),
-            "hashedrekord"
-        );
-        assert_eq!(entry["kindVersion"]["version"].as_str().unwrap(), "0.0.1");
-
-        // inclusionProof: ints→strings; hex→base64.
-        let ip = &entry["inclusionProof"];
-        assert_eq!(ip["logIndex"].as_str().unwrap(), "12345");
-        assert_eq!(ip["treeSize"].as_str().unwrap(), "67890");
-        let root_b64 = ip["rootHash"].as_str().unwrap();
-        let root_bytes = base64::engine::general_purpose::STANDARD
-            .decode(root_b64)
-            .unwrap();
-        assert_eq!(root_bytes, hex_decode(&root_hash_hex).unwrap());
-        let hashes = ip["hashes"].as_array().unwrap();
-        assert_eq!(hashes.len(), 1);
-        let sib_bytes = base64::engine::general_purpose::STANDARD
-            .decode(hashes[0].as_str().unwrap())
-            .unwrap();
-        assert_eq!(sib_bytes, hex_decode(&sibling_hex).unwrap());
-        // checkpoint string → { envelope: <string> }.
-        assert_eq!(
-            ip["checkpoint"]["envelope"].as_str().unwrap(),
-            "rekor.sigstore.dev - 1193050959916656506\n8\nfoo\n"
-        );
-
-        // messageSignature: SHA2_256 + base64(sha256(attestation)).
-        let ms = &bundle["messageSignature"];
-        assert_eq!(
-            ms["messageDigest"]["algorithm"].as_str().unwrap(),
-            "SHA2_256"
-        );
-        let claimed = base64::engine::general_purpose::STANDARD
-            .decode(ms["messageDigest"]["digest"].as_str().unwrap())
-            .unwrap();
-        let expected: [u8; 32] = Sha256::digest(b"hello attestation").into();
-        assert_eq!(claimed, expected);
-        // signature: base64(ssh-sig PEM bytes verbatim).
-        let sig_bytes = base64::engine::general_purpose::STANDARD
-            .decode(ms["signature"].as_str().unwrap())
-            .unwrap();
-        assert_eq!(sig_bytes, ssh_sig_pem);
-    }
-
-    #[test]
-    fn sigstore_bundle_v3_omits_checkpoint_when_absent() {
-        let rekor_response = serde_json::json!({
-            "uuid": {
-                "body": "Ym9keQ==",
-                "logIndex": 1,
-                "integratedTime": 2,
-                "logID": "00".repeat(32),
-                "verification": {
-                    "signedEntryTimestamp": "AAA=",
-                    "inclusionProof": {
-                        "logIndex": 1,
-                        "treeSize": 1,
-                        "rootHash": "11".repeat(32),
-                        "hashes": [],
-                    },
-                },
-            }
-        });
-        let att = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(att.path(), b"x").unwrap();
-        let bundle = build_sigstore_bundle_v3(&rekor_response, b"PEM", att.path(), "ab").unwrap();
-        assert!(
-            bundle["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]["checkpoint"]
-                .is_null(),
-            "checkpoint key must be absent when Rekor omits it"
-        );
+    fn pem_public_key_to_spki_der_rejects_certificate_block() {
+        let pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        assert!(pem_public_key_to_spki_der(pem).is_err());
     }
 }

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "trusted_attestant_fingerprints": [
-    "8a43fac439b3509114063274268dd1b3e4cd9616709c6130ebea71d931bc28e6"
+    "0b3679b9da063e57d6985fdc00695500b995fa1ec2412cef2caef8e033a7678e"
   ],
   "min_human_attestations": 1,
   "expected_ci_identity_pattern": "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v*",
