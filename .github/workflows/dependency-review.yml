@@ -20,6 +20,14 @@ jobs:
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: moderate
+          # `LicenseRef-bad-mitapache-2.0` is the synthetic license the action
+          # emits for crates declaring `MIT/Apache-2.0` (deprecated slash form)
+          # that its SPDX parser can't parse — e.g. async-tar, rangemap,
+          # filetime, ctrlc. The slug is derived from that exact string, so it
+          # only ever matches "MIT OR Apache-2.0" crates; since both MIT and
+          # Apache-2.0 are already allowed below, allowlisting the ref accepts
+          # nothing we wouldn't otherwise. (If a future action bump changes the
+          # slug, the check fails closed rather than silently allowing anything.)
           allow-licenses: >-
             0BSD,
             Apache-2.0,
@@ -32,6 +40,7 @@ jobs:
             CC0-1.0,
             CDLA-Permissive-2.0,
             ISC,
+            LicenseRef-bad-mitapache-2.0,
             MIT,
             MIT-0,
             MPL-2.0,
@@ -39,10 +48,3 @@ jobs:
             Unicode-3.0,
             Unlicense,
             Zlib
-          # async-tar and rangemap declare `MIT/Apache-2.0` (deprecated slash form);
-          # the action's SPDX parser can't parse it and emits a synthetic
-          # `LicenseRef-bad-mitapache-2.0`. Both are really MIT OR Apache-2.0.
-          allow-dependencies-licenses: >-
-            pkg:cargo/async-tar,
-            pkg:cargo/rangemap,
-            pkg:cargo/filetime
