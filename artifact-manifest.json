@@ -1,17 +1,17 @@
 {
   "artifacts": {
     "eidola-cli": {
-      "digest": "sha256:16dc384a3703aca05019749a9cf6d64f23e4e1448f9618dc7545d7370ff2dc5c",
+      "digest": "sha256:caee424856c92f2ce9fbc870ecb284685aafd686933f5b142abd05a7d605cb94",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
-      "narHash": "sha256-ZZEN0xM7iwtG1VYWkAa0hfiSIwBnFgN5/xDwGZup+Vk=",
+      "narHash": "sha256-8Gj0JonMlOMBjrbalWXq4HeXctMAGFQAoLwCE2imnvY=",
       "platform": "darwin/universal",
       "type": "nix"
     },
     "eidola-gui-macos-universal": {
-      "narHash": "sha256-yqSuqnXAUfb/pZVhvxN5hqDlbSj9KL6gHlK76QdpIMQ=",
+      "narHash": "sha256-jDGMyhwf5PFRlQSBxqlkWQXvqzwcuiU+eBzob7L9hjA=",
       "platform": "darwin/universal",
       "type": "nix"
     },
@@ -21,17 +21,17 @@
       "type": "oci"
     },
     "eidola-server": {
-      "digest": "sha256:d04934318d08ce7327d193bf437406009bde87d38f0b13ab20a3a54d20fe7beb",
+      "digest": "sha256:dde0ad891fb712b7861dfaac9d52e8127611339a1b05bb9cfe0cbf8cf16e83c0",
       "platform": "linux/amd64",
       "type": "oci"
     }
   },
   "enclave": {
-    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=d09fa0186656e1bcf986024bd095ee2e7d0cda4712349df38c63f1804a18c4ce",
-    "snp_measurement": "7da41d4962044da68ac6e6c46e82ee1ad9f1722696427f2f274aea90970f48cb939f4cd593300ffb80312f532e8a9cf5",
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=753695f2ada779ad3cc3d88ef75417b3479943b9e1b9e589a578e12ae6c0c2f8",
+    "snp_measurement": "edb3390a5cebb170fe5302ef4e789b2bb503ea508d008d43584c432fdccade5954978b8f80d65e1d31c617e23c506c9d",
     "tdx_measurement": {
       "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-      "rtmr2": "9c837e66ad6f75327e733220dbc29a66e5fbc726ff84231a1298da7d278020e956e686cf5b53ea24b6a0c64fa6378dad"
+      "rtmr2": "1c8765c6a1d2bf3f1b2f63bd09157060dbbe4430ac1d51b680beb460bca859f80069be3b451af1577c63b9b1b68ea5c4"
     }
   },
   "schema_version": 1
