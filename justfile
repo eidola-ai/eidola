@@ -138,6 +138,15 @@ measure:
 update-manifest:
     ./scripts/artifact-manifest.sh update --ensure-builder
 
+# List attestant signing keys on a PKCS#11 token (YubiKey/SmartCard/HSM)
+# and print PIN-free cosign --key URIs (no pin-value, no slot-id). Reads
+# only public objects, so it never prompts for or emits a PIN. Copy the
+# printed uri into EIDOLA_ATTESTANT_COSIGN_KEY. Optional --module-path
+# /path/to/libykcs11.{dylib,so} if auto-detection misses it. Full runbook:
+# docs/contributing/release-attestant-yubikey.md
+release-list-keys *args:
+    cargo run -q -p release-tool -- pkcs11 list {{ args }}
+
 # Verify a tag that CI has already built+signed. Fetches the signed manifest
 # from the GitHub release, verifies the Sigstore bundle against the embedded
 # trust root, compares against the committed manifest, and shows the diff
@@ -152,19 +161,30 @@ release-verify tag:
 # EIDOLA_ATTESTANT_COSIGN_KEY / _ID / _NAME / _JURISDICTION env vars
 # (preferred — set once in your shell profile or .envrc). For local
 # PEM keys, also set COSIGN_PASSWORD (empty string is OK for passphrase-
-# less throwaway keys). Trailing args are forwarded to `release-tool
+# less throwaway keys). For a YubiKey-PIV key, get a PIN-free URI from
+# `just release-list-keys` and set it as EIDOLA_ATTESTANT_COSIGN_KEY; the
+# PIN is prompted for automatically when COSIGN_PKCS11_PIN is unset (never
+# put the PIN in the URI — cosign's own prompt fails against a YubiKey, so
+# release-tool supplies it via the env var for the cosign child processes).
+# Trailing args are forwarded to `release-tool
 # attest`, so per-invocation overrides also work, e.g.
 #   just release-attest v0.0.8 --cosign-key /path/to/cosign.key \
 #       --attestant-id mike-marcacci \
 #       --attestant-name "Michael Marcacci" \
 #       --jurisdiction "the State of California, United States"
 #
-# PKCS#11 note: cosign's PKCS#11 support ships as a separate driver
-# binary (`cosign-pivkey-pkcs11key`) — the default Homebrew and GitHub-
-# release `cosign` binaries do NOT include it. For a YubiKey-PIV key
-# (`pkcs11:slot-id=…`), either install that driver build (e.g.
-# `go install github.com/sigstore/cosign/v2/cmd/cosign-pivkey-pkcs11key@latest`)
-# or use a KMS URI instead. KMS-backed keys (`awskms:`, `gcpkms:`,
-# `azurekms:`, `hashivault:`) work with the stock cosign binary.
+# PKCS#11 note: cosign's PKCS#11 support is a build-time option, not a
+# separate binary — the default Homebrew and GitHub-release `cosign`
+# binaries are built without it and fail any PKCS#11 op with "This cosign
+# was not built with pkcs11-tool support!". For a YubiKey-PIV key
+# (`pkcs11:slot-id=…`), build cosign from source with the pivkey/pkcs11key
+# tags (cgo, so a C toolchain is required):
+#   CGO_ENABLED=1 go install -tags=pivkey,pkcs11key \
+#       github.com/sigstore/cosign/v2/cmd/cosign@latest
+# (this is the `go install` equivalent of cosign's `cosign-pivkey-pkcs11key`
+# Makefile target) and ensure $(go env GOPATH)/bin precedes Homebrew on
+# PATH. Alternatively use a KMS URI instead: KMS-backed keys (`awskms:`,
+# `gcpkms:`, `azurekms:`, `hashivault:`) work with the stock cosign binary.
+# Full provisioning runbook: docs/contributing/release-attestant-yubikey.md
 release-attest tag *args:
     cargo run -q -p release-tool -- attest {{ tag }} {{ args }}

@@ -38,6 +38,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 mod attest;
+mod pkcs11;
 mod trust;
 mod verify;
 
@@ -73,11 +74,12 @@ enum Command {
 
         /// Cosign key reference. One of: a local PEM path
         /// (`/path/to/cosign.key` — passphrase from `COSIGN_PASSWORD`),
-        /// a PKCS#11 URI (`pkcs11:slot-id=0;object=eidola`), or any
-        /// KMS URI cosign supports (`awskms:...`, `gcpkms:...`,
-        /// `azurekms:...`, `hashivault:...`). Passed through to
-        /// `cosign sign-blob --key` verbatim. Read from
-        /// `EIDOLA_ATTESTANT_COSIGN_KEY` if set.
+        /// a PKCS#11 URI (for a YubiKey, get a PIN-free one from
+        /// `release-tool pkcs11 list` and supply the PIN via
+        /// `COSIGN_PKCS11_PIN`), or any KMS URI cosign supports
+        /// (`awskms:...`, `gcpkms:...`, `azurekms:...`,
+        /// `hashivault:...`). Passed through to `cosign sign-blob --key`
+        /// verbatim. Read from `EIDOLA_ATTESTANT_COSIGN_KEY` if set.
         ///
         /// The underlying key must be ECDSA-P256, ECDSA-P384, or
         /// Ed25519 — RSA, ECDSA-P521, and other algorithms are rejected
@@ -106,6 +108,24 @@ enum Command {
         #[arg(long, env = "EIDOLA_ATTESTANT_JURISDICTION")]
         jurisdiction: String,
     },
+
+    /// PKCS#11 helpers for hardware attestant keys (YubiKey / SmartCard /
+    /// HSM).
+    #[command(subcommand)]
+    Pkcs11(Pkcs11Command),
+}
+
+#[derive(Subcommand)]
+enum Pkcs11Command {
+    /// List signing keys on a PKCS#11 token and print PIN-free cosign
+    /// `--key` URIs (no `pin-value`, no `slot-id`). Reads only public
+    /// objects, so it never prompts for or emits a PIN.
+    List {
+        /// Path to the PKCS#11 module (`libykcs11.dylib` / `.so`).
+        /// Defaults to probing the well-known install locations.
+        #[arg(long, env = "EIDOLA_PKCS11_MODULE")]
+        module_path: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -114,30 +134,41 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
 
     let cli = Cli::parse();
-    let workspace_root = workspace_root()?;
-    let repo = resolve_repo(cli.repo.as_deref(), &workspace_root)?;
 
     match cli.command {
-        Command::Verify { tag } => verify::run(verify::Args {
-            workspace_root,
-            repo,
-            tag,
-        }),
+        // PKCS#11 helpers are device-local and need neither a workspace nor
+        // a GitHub repo, so resolve those only for the release subcommands.
+        Command::Pkcs11(Pkcs11Command::List { module_path }) => {
+            pkcs11::run(pkcs11::Args { module_path })
+        }
+        Command::Verify { tag } => {
+            let workspace_root = workspace_root()?;
+            let repo = resolve_repo(cli.repo.as_deref(), &workspace_root)?;
+            verify::run(verify::Args {
+                workspace_root,
+                repo,
+                tag,
+            })
+        }
         Command::Attest {
             tag,
             cosign_key,
             attestant_id,
             attestant_name,
             jurisdiction,
-        } => attest::run(attest::Args {
-            workspace_root,
-            repo,
-            tag,
-            cosign_key,
-            attestant_id,
-            attestant_name,
-            jurisdiction,
-        }),
+        } => {
+            let workspace_root = workspace_root()?;
+            let repo = resolve_repo(cli.repo.as_deref(), &workspace_root)?;
+            attest::run(attest::Args {
+                workspace_root,
+                repo,
+                tag,
+                cosign_key,
+                attestant_id,
+                attestant_name,
+                jurisdiction,
+            })
+        }
     }
 }
 

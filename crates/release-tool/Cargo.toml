@@ -15,12 +15,16 @@ anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+cryptoki = "0.12.0"
+der = { version = "0.7", features = ["alloc"] }
 eidola-app-core = { path = "../eidola-app-core" }
 eidola-attestation = { path = "../eidola-attestation" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "blocking"] }
+rpassword = "7.5.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+spki = { version = "0.7", features = ["alloc"] }
 tempfile = "3"

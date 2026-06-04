@@ -72,6 +72,27 @@ pub fn run(args: Args) -> Result<()> {
              (or empty string for a passphrase-less key) and retry."
         );
     }
+    // For a PKCS#11 key, cosign needs the PIN in COSIGN_PKCS11_PIN — its
+    // own interactive prompt is unreachable against a YubiKey (it dies in
+    // GetTokenInfo before prompting; see
+    // docs/contributing/release-attestant-yubikey.md). If the operator
+    // hasn't exported it, prompt once here (no echo) and set it so the
+    // child cosign processes — `cosign public-key` below and
+    // `cosign sign-blob` later — inherit it.
+    if args.cosign_key.starts_with("pkcs11:") && std::env::var_os("COSIGN_PKCS11_PIN").is_none() {
+        let pin = rpassword::prompt_password(
+            "Enter PIN for PKCS#11 attestant key (COSIGN_PKCS11_PIN, will not echo): ",
+        )
+        .context("reading the PKCS#11 PIN")?;
+        if pin.is_empty() {
+            bail!(
+                "no PIN entered. Export COSIGN_PKCS11_PIN or enter it at the prompt, then retry."
+            );
+        }
+        // SAFETY: single-threaded at this point; set before any cosign
+        // child process is spawned, so there is no concurrent env access.
+        unsafe { std::env::set_var("COSIGN_PKCS11_PIN", pin) };
+    }
 
     let release_version = args
         .tag

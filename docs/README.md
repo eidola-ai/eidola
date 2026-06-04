@@ -25,4 +25,4 @@ These docs describe how Eidola works, what it commits to, and what it doesn't ye
 
 ## For contributors
 
-Contributor-facing READMEs live alongside the code they describe. Start with the top-level [`README.md`](../README.md) for the project landing page and dev setup, [`AGENTS.md`](../AGENTS.md) for the architecture overview, and [`releases/README.md`](../releases/README.md) for release-pipeline operations.
+Contributor-facing READMEs live alongside the code they describe. Start with the top-level [`README.md`](../README.md) for the project landing page and dev setup, [`AGENTS.md`](../AGENTS.md) for the architecture overview, and [`releases/README.md`](../releases/README.md) for release-pipeline operations. Task-oriented runbooks (e.g. provisioning the release signing YubiKey) live in [`contributing/`](contributing/README.md).
