@@ -2448,7 +2448,7 @@ dependencies = [
  "anonymous-credit-tokens",
  "base64 0.22.1",
  "blake3",
- "const-oid 0.9.6",
+ "const-oid 0.10.2",
  "der",
  "dirs",
  "ecdsa",

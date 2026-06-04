@@ -10,7 +10,7 @@ publish.workspace = true
 anonymous-credit-tokens = "0.4"
 base64 = "0.22"
 blake3 = "1"
-const-oid = { version = "0.9", features = ["db"] }
+const-oid = { version = "0.10", features = ["db"] }
 der = { version = "0.7", features = ["pem", "alloc"] }
 dirs = "6"
 ecdsa = { version = "0.16", features = ["der", "verifying"] }
