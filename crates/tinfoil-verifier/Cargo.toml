@@ -51,6 +51,22 @@ der = { version = "0.7", features = ["alloc"] }
 # `sev` crate doesn't handle).
 rsa = "0.9"
 
+# ECDSA verification of the enclave's *document* signature on a fresh
+# nonce-bound attestation (`?nonce=<hex>`). The enclave signs the JSON with
+# its TLS leaf private key; production uses P-384, the local shim mock uses
+# P-256, so we carry both curves. Mirrors the dependency shape already used
+# by `eidola-app-core`'s Rekor verifier. `spki` provides the
+# `DecodePublicKey` trait (`from_public_key_der`); `signature` provides the
+# `hazmat::PrehashVerifier` trait so we can verify the SHA-256 prehash that
+# Tinfoil signs (note: P-384 paired with SHA-256, not SHA-384).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+signature = "2"
+spki = "0.7"
+
+# CSPRNG for the per-handshake attestation nonce.
+getrandom = "0.2"
+
 # HTTP client for fetching attestation bundle
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 

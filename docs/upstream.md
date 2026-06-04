@@ -43,10 +43,11 @@ A new upstream measurement does not silently become trusted: it goes through the
 
 The Eidola server's outbound HTTPS client (constructed by `tinfoil-verifier::attesting_client`) re-verifies the upstream enclave on every new TCP+TLS handshake. The mechanics are the same as for the client→server path, because they use the same crate:
 
-- Inline `GET /.well-known/tinfoil-attestation?v=3` over the same TCP+TLS connection that will carry the application request.
+- Inline `GET /.well-known/tinfoil-attestation?nonce=<hex>` (a fresh random nonce per handshake) over the same TCP+TLS connection that will carry the application request.
+- Freshness check (echoed nonce matches) and document-signature check against the embedded TLS cert.
 - AMD VCEK chain verification, SEV-SNP / TDX report verification, TCB policy enforcement.
 - Measurement check against the pinned allowed set.
-- Binding of `report_data[0..32]` to `sha256(SPKI(peer_cert))`.
+- Binding of the report's `REPORT_DATA` to `sha256(tls_key_fp ‖ hpke_key ‖ nonce ‖ …)`, where `tls_key_fp == sha256(SPKI(peer_cert))`.
 
 A failed attestation rejects the request before any inference data crosses the wire.
 

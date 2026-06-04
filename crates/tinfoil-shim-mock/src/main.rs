@@ -5,7 +5,12 @@
 //!
 //! - **Certificate chain:** ARK → ASK → VCEK, all signed with RSA-PSS SHA-384
 //! - **Report signature:** ECDSA P-384 with SHA-384 (VCEK signs the report)
-//! - **TLS binding:** report_data[0..32] = SHA-256(TLS cert SPKI)
+//! - **Fresh, nonce-bound attestation:** each `?nonce=<hex>` request builds a
+//!   *fresh* report whose `report_data[0..32] = SHA-256(tls_key_fp || hpke_key
+//!   || nonce)` (matching upstream `attestation.ComputeReportData`), then signs
+//!   the whole JSON document with the TLS leaf key (ECDSA P-256 / SHA-256). This
+//!   mirrors the production endpoint so `tinfoil-verifier`'s nonce/signature
+//!   checks exercise the same path locally.
 //!
 //! This exercises the complete verification path in `tinfoil-verifier` with
 //! no escape hatches — the `sev` crate's `Verifiable` trait verifies every
@@ -44,7 +49,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -52,6 +57,7 @@ use base64::Engine;
 use der::{Decode, Encode, asn1::BitString};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use p256::pkcs8::DecodePrivateKey;
 use rcgen::KeyPair;
 use rsa::sha2 as rsa_sha2;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
@@ -125,9 +131,79 @@ fn tls_config() -> rustls::ClientConfig {
 
 #[derive(Clone)]
 struct AppState {
-    attestation_json: String,
+    fresh: Arc<FreshBuilder>,
     upstream_url: String,
     proxy_client: reqwest::Client,
+}
+
+/// Query string for the attestation endpoint: `?nonce=<64 hex chars>`.
+#[derive(serde::Deserialize)]
+struct NonceQuery {
+    nonce: Option<String>,
+}
+
+/// Everything needed to assemble a fresh, nonce-bound attestation document on
+/// each request, mirroring the production endpoint. Built once at boot from the
+/// ephemeral per-boot key material; the only per-request input is the nonce.
+struct FreshBuilder {
+    measurement: Vec<u8>,
+    /// SHA-256 of the TLS leaf SPKI — the document's `tls_key_fp`.
+    tls_key_fp: [u8; 32],
+    /// Mock HPKE key (random per boot); real shims publish a meaningful one.
+    hpke_key: [u8; 32],
+    /// VCEK key that signs the SEV-SNP report.
+    vcek_signing_key: p384::ecdsa::SigningKey,
+    /// VCEK certificate, included in the document so tests need no ATC.
+    vcek_der: Vec<u8>,
+    /// PEM-encoded TLS leaf certificate placed in the document.
+    tls_cert_pem: String,
+    /// TLS leaf private key that signs the document (ECDSA P-256 / SHA-256).
+    tls_signing_key: p256::ecdsa::SigningKey,
+}
+
+impl FreshBuilder {
+    /// Assemble and sign a fresh attestation document for `nonce`.
+    fn build(&self, nonce: &[u8; 32]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        use p256::ecdsa::signature::hazmat::PrehashSigner;
+
+        // report_data[0..32] = SHA-256(tls_key_fp || hpke_key || nonce).
+        let mut h = Sha256::new();
+        h.update(self.tls_key_fp);
+        h.update(self.hpke_key);
+        h.update(nonce);
+        let report_data_prefix: [u8; 32] = h.finalize().into();
+
+        let mut report = build_report(&self.measurement, &report_data_prefix);
+        sign_report(&mut report, &self.vcek_signing_key);
+
+        let b64 = &base64::engine::general_purpose::STANDARD;
+
+        // Build the document with an empty signature, sign those exact bytes,
+        // then splice the signature back in. The verifier reconstructs the
+        // signed form by blanking the signature value, so this round-trips.
+        let mut doc = serde_json::json!({
+            "format": "https://tinfoil.sh/predicate/attestation/v3",
+            "report_data": {
+                "tls_key_fp": hex::encode(self.tls_key_fp),
+                "hpke_key": hex::encode(self.hpke_key),
+                "nonce": hex::encode(nonce),
+            },
+            "cpu": {
+                "platform": "sev-snp",
+                "report": b64.encode(report),
+            },
+            "vcek": b64.encode(&self.vcek_der),
+            "certificate": self.tls_cert_pem,
+            "signature": "",
+        });
+
+        let signed_payload = serde_json::to_vec(&doc)?;
+        let digest = Sha256::digest(&signed_payload);
+        let sig: p256::ecdsa::Signature = self.tls_signing_key.sign_prehash(&digest)?;
+        doc["signature"] = serde_json::Value::String(b64.encode(sig.to_der()));
+
+        Ok(serde_json::to_string(&doc)?)
+    }
 }
 
 // ── Certificate construction ────────────────────────────────────────────
@@ -418,7 +494,11 @@ fn write_tcb(report: &mut [u8], offset: usize, bl: u8, snp: u8, ucode: u8) {
 }
 
 /// Build a mock SEV-SNP attestation report (V2 Genoa layout).
-fn build_report(measurement: &[u8], tls_fingerprint: &[u8; 32]) -> [u8; REPORT_SIZE] {
+///
+/// `report_data_prefix` is written into the first 32 bytes of `REPORT_DATA`
+/// (the remaining 32 stay zero). For the fresh nonce-bound flow this is
+/// `SHA-256(tls_key_fp || hpke_key || nonce)`.
+fn build_report(measurement: &[u8], report_data_prefix: &[u8; 32]) -> [u8; REPORT_SIZE] {
     let mut report = [0u8; REPORT_SIZE];
 
     // Version = 2 (V2 report)
@@ -434,8 +514,8 @@ fn build_report(measurement: &[u8], tls_fingerprint: &[u8; 32]) -> [u8; REPORT_S
     write_tcb(&mut report, OFF_COMMITTED_TCB, bl, snp, ucode);
     write_tcb(&mut report, OFF_LAUNCH_TCB, bl, snp, ucode);
 
-    // report_data[0..32] = TLS fingerprint
-    report[OFF_REPORT_DATA..OFF_REPORT_DATA + 32].copy_from_slice(tls_fingerprint);
+    // report_data[0..32] = SHA-256(tls_key_fp || hpke_key || nonce)
+    report[OFF_REPORT_DATA..OFF_REPORT_DATA + 32].copy_from_slice(report_data_prefix);
 
     // measurement (48 bytes)
     let len = measurement.len().min(48);
@@ -844,7 +924,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let (tls_cert_der, tls_key_der) = build_tls_leaf(&tls_ca, &["localhost", "server", "shim"])?;
     let cert_der = rustls::pki_types::CertificateDer::from(tls_cert_der.clone());
+    // Grab the leaf private key (PKCS#8 DER) before `key_der` is consumed by
+    // rustls below — we also need it to sign the attestation document.
+    let leaf_key_pkcs8 = tls_key_der.secret_der().to_vec();
     let key_der = tls_key_der;
+    let tls_signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(&leaf_key_pkcs8)
+        .map_err(|e| format!("loading P-256 leaf key for document signing: {e}"))?;
 
     // ── 5. Compute TLS fingerprint ──────────────────────────────────────
 
@@ -858,35 +943,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("TLS fingerprint: {}", hex::encode(tls_fingerprint));
     info!("Measurement: {measurement}");
 
-    // ── 8. Build and sign mock attestation report ────────────────────────
+    // ── 8. Assemble the fresh-attestation builder ───────────────────────
+    //
+    // Reports are now built per request (each nonce yields fresh REPORT_DATA),
+    // so we stash the per-boot key material in a `FreshBuilder` rather than
+    // pre-serializing a static document. The mock deliberately does not ship
+    // ARK/ASK in the document — those are anchors of trust configured
+    // out-of-band on the verifier (`trusted_ark_der` / `trusted_ask_der`),
+    // never sourced from the attested endpoint. The VCEK *is* shipped (unlike
+    // the production fresh document) so tests need no ATC fallback.
 
-    let mut report = build_report(&measurement_bytes, &tls_fingerprint);
-    sign_report(&mut report, &vcek_signing_key);
+    let mut hpke_key = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut hpke_key);
 
-    // ── 9. Build attestation JSON ───────────────────────────────────────
-
-    let b64 = &base64::engine::general_purpose::STANDARD;
-
-    // V3 attestation: raw report + VCEK. The mock deliberately does not
-    // ship ARK/ASK in the attestation document — those are anchors of
-    // trust and must be configured out-of-band on the verifier (via
-    // `trusted_ark_der` / `trusted_ask_der`), never sourced from the
-    // attested endpoint itself. The on-disk ark.pem / ask.pem files
-    // generated above are what the developer feeds to their verifier
-    // configuration; this endpoint only emits the dynamic per-boot data.
-    let attestation_json = serde_json::to_string(&serde_json::json!({
-        "format": "https://tinfoil.sh/predicate/attestation/v3",
-        "cpu": {
-            "platform": "sev-snp",
-            "report": b64.encode(report),
-        },
-        "vcek": b64.encode(&vcek_der),
-    }))?;
+    let fresh = Arc::new(FreshBuilder {
+        measurement: measurement_bytes,
+        tls_key_fp: tls_fingerprint,
+        hpke_key,
+        vcek_signing_key,
+        vcek_der,
+        tls_cert_pem: der_to_pem_cert(&tls_cert_der),
+        tls_signing_key,
+    });
 
     // ── 10. Start HTTPS server ──────────────────────────────────────────
 
     let state = AppState {
-        attestation_json,
+        fresh,
         upstream_url: upstream_url.clone(),
         proxy_client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -961,12 +1044,55 @@ impl ResolvesServerCert for DevCertResolver {
 
 // ── HTTP handlers ───────────────────────────────────────────────────────
 
-async fn handle_attestation(State(state): State<AppState>) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        state.attestation_json,
-    )
+async fn handle_attestation(
+    State(state): State<AppState>,
+    Query(query): Query<NonceQuery>,
+) -> Response {
+    // Mirror the production endpoint: a nonce is required to build a fresh,
+    // replay-proof attestation. The verifier always sends one.
+    let Some(nonce_hex) = query.nonce else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "missing nonce: GET /.well-known/tinfoil-attestation?nonce=<64 hex chars>",
+        )
+            .into_response();
+    };
+    let nonce = match hex::decode(&nonce_hex) {
+        Ok(n) if n.len() == 32 => n,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "invalid nonce: must be exactly 32 bytes (64 hex chars)",
+            )
+                .into_response();
+        }
+    };
+    let mut nonce32 = [0u8; 32];
+    nonce32.copy_from_slice(&nonce);
+
+    match state.fresh.build(&nonce32) {
+        Ok(json) => (StatusCode::OK, [("content-type", "application/json")], json).into_response(),
+        Err(e) => {
+            debug!("attestation build failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build attestation",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Encode a DER certificate as a PEM string (`-----BEGIN CERTIFICATE-----`).
+fn der_to_pem_cert(der: &[u8]) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
 }
 
 async fn handle_proxy(

@@ -6,23 +6,40 @@
 //!
 //! All verification happens in the data-plane connector layer (see
 //! [`attesting_client`]). On every new TCP+TLS handshake the connector
-//! issues an inline HTTP/1.1 attestation request over the *same* stream that
-//! will subsequently carry application traffic, then verifies the response
-//! binds to the peer's TLS public key before yielding the connection back to
-//! hyper. There is no fingerprint cache, so policy changes (TCB floor,
-//! allowed measurements) take effect on the next connection without a
-//! process restart, and there is no separate startup bootstrap path — the
-//! first real request through the returned client is also the first
-//! attestation. Callers that want fail-fast-at-startup semantics can issue
-//! a single trivial request through the client themselves.
+//! generates a fresh random nonce and issues an inline HTTP/1.1 attestation
+//! request (`?nonce=<hex>`) over the *same* stream that will subsequently
+//! carry application traffic, then verifies that the enclave's *freshly
+//! collected* hardware report commits to that exact nonce and to the peer's
+//! TLS public key before yielding the connection back to hyper. There is no
+//! fingerprint cache, so policy changes (TCB floor, allowed measurements)
+//! take effect on the next connection without a process restart, and there is
+//! no separate startup bootstrap path — the first real request through the
+//! returned client is also the first attestation. Callers that want
+//! fail-fast-at-startup semantics can issue a single trivial request through
+//! the client themselves.
 //!
-//! The enclave's self-contained
-//! `/.well-known/tinfoil-attestation?v=3` document is the source of truth.
-//! Tinfoil's ATC service is consulted only as a fallback for elements that
-//! a non-self-contained v3 document is missing (today: the VCEK certificate,
-//! until upstream ships fully self-contained reports). The verifier never
-//! talks to AMD KDS for the chain itself — ATC is the single fallback target —
-//! though it does fetch AMD KDS CRLs in production mode for revocation checks.
+//! Because the report's `REPORT_DATA` binds the per-handshake nonce, a stale
+//! or captured attestation document can't be replayed against a fresh nonce:
+//! the verifier knows a live, genuine CC machine produced this report *now*.
+//! This binds the enclave's long-term TLS *key* (the cert SPKI), **not** the
+//! live TLS *session*, so it does not by itself defeat exfiltration of that
+//! key — an attacker holding the stolen key could actively MITM the connection
+//! (and thus read the plaintext) while relaying a fresh nonce-bound report
+//! from the enclave's public attestation endpoint. Closing that gap needs
+//! channel binding (a TLS-session value in `report_data`); today it rests on
+//! the TLS key staying sealed in the enclave.
+//!
+//! The enclave also signs the whole document with its TLS leaf key
+//! (ECDSA — P-384 in production, P-256 for the shim mock); the verifier checks
+//! that signature against the certificate carried in the document, which must
+//! in turn match the peer cert the handshake landed on.
+//!
+//! The fresh `/.well-known/tinfoil-attestation?nonce=<hex>` document is the
+//! source of truth. It is *not* fully self-contained — Tinfoil builds it
+//! without the VCEK certificate — so the verifier consults Tinfoil's ATC
+//! service as a fallback to backfill the VCEK. The verifier never talks to
+//! AMD KDS for the chain itself — ATC is the single fallback target — though
+//! it does fetch AMD KDS CRLs in production mode for revocation checks.
 //!
 //! SEV-SNP verification is delegated to the [`sev`](https://crates.io/crates/sev)
 //! crate. TDX Quote V4 verification is delegated to [`dcap_qvl`].
@@ -184,14 +201,18 @@ pub struct AttestingClientConfig<'a> {
 /// which:
 ///
 /// 1. Completes the TCP+TLS handshake.
-/// 2. Issues an inline HTTP/1.1 `GET /.well-known/tinfoil-attestation?v=3`
-///    over the *same* connection.
-/// 3. Falls back to ATC for any element the v3 document is missing
-///    (currently the VCEK).
-/// 4. Verifies the AMD VCEK chain, the report signature, the TCB floor, the
+/// 2. Generates a fresh random nonce and issues an inline HTTP/1.1
+///    `GET /.well-known/tinfoil-attestation?nonce=<hex>` over the *same*
+///    connection.
+/// 3. Falls back to ATC for the VCEK (the fresh document omits it).
+/// 4. Verifies the echoed nonce matches the one sent, the document's
+///    `tls_key_fp` matches `sha256(SPKI(peer_cert))`, the embedded
+///    certificate matches the peer cert, and the document's ECDSA signature
+///    validates against it.
+/// 5. Verifies the AMD VCEK chain, the report signature, the TCB floor, the
 ///    measurement against `allowed_measurements`, and that the report's
-///    `report_data[0..32]` matches `sha256(SPKI(peer_cert))`.
-/// 5. Yields the connection to hyper for the real request.
+///    `REPORT_DATA` equals `sha256(tls_key_fp || hpke_key || nonce || …)`.
+/// 6. Yields the connection to hyper for the real request.
 ///
 /// Callers that want fail-fast-at-startup semantics should make one trivial
 /// request (e.g. `client.get(format!("{base}/v1/models")).send().await`)
