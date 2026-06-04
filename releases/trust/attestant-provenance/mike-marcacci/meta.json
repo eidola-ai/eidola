@@ -1,0 +1,17 @@
+{
+  "attestant_id": "mike-marcacci",
+  "pinned_fingerprint_sha256": "0b3679b9da063e57d6985fdc00695500b995fa1ec2412cef2caef8e033a7678e",
+  "algorithm": "ECDSA-P256",
+  "evidence": [
+    "key-attestation.pem",
+    "intermediate.pem"
+  ],
+  "manufacturer": "Yubico",
+  "product": "YubiKey 5 (USB-C keychain)",
+  "serial": "37842605",
+  "firmware": "5.7.4",
+  "key_generation": "on-device, non-exportable",
+  "pin_policy": "ALWAYS",
+  "touch_policy": "ALWAYS",
+  "chains_to": "Yubico PIV Root CA Serial 263751"
+}

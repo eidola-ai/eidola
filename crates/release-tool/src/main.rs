@@ -39,6 +39,7 @@ use clap::{Parser, Subcommand};
 
 mod attest;
 mod pkcs11;
+mod provenance;
 mod trust;
 mod verify;
 
@@ -113,6 +114,57 @@ enum Command {
     /// HSM).
     #[command(subcommand)]
     Pkcs11(Pkcs11Command),
+
+    /// Informational hardware-provenance evidence for attestant keys
+    /// (NOT consulted by trust evaluation — see
+    /// releases/trust/attestant-provenance/README.md).
+    #[command(subcommand)]
+    Provenance(ProvenanceCommand),
+}
+
+#[derive(Subcommand)]
+enum ProvenanceCommand {
+    /// Verify each committed provenance bundle's attestation certificate
+    /// matches the fingerprint its meta.json claims, and report which
+    /// fingerprints are currently pinned.
+    Check {
+        /// Provenance directory (default:
+        /// `releases/trust/attestant-provenance`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// Capture a YubiKey-PIV attestation bundle via `ykman` and fill its
+    /// meta.json from the attestation cert. Other key sources fill the same
+    /// bundle shape by hand.
+    Capture {
+        /// Attestant identifier — the bundle subdirectory name.
+        #[arg(long, env = "EIDOLA_ATTESTANT_ID")]
+        attestant_id: String,
+
+        /// PIV slot holding the signing key.
+        #[arg(long, default_value = "9c")]
+        slot: String,
+
+        /// Provenance directory (default:
+        /// `releases/trust/attestant-provenance`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// (Re)derive meta.json fields from a bundle's committed attestation
+    /// certificate — no device or `ykman` needed. Runs offline over one
+    /// bundle (`--attestant-id`) or all of them.
+    Enrich {
+        /// A single bundle to enrich; omit to enrich every bundle.
+        #[arg(long, env = "EIDOLA_ATTESTANT_ID")]
+        attestant_id: Option<String>,
+
+        /// Provenance directory (default:
+        /// `releases/trust/attestant-provenance`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -140,6 +192,34 @@ fn main() -> Result<()> {
         // a GitHub repo, so resolve those only for the release subcommands.
         Command::Pkcs11(Pkcs11Command::List { module_path }) => {
             pkcs11::run(pkcs11::Args { module_path })
+        }
+        Command::Provenance(cmd) => {
+            // Needs the workspace (for trust-constants.json and the default
+            // provenance directory) but not a GitHub repo.
+            let workspace_root = workspace_root()?;
+            match cmd {
+                ProvenanceCommand::Check { dir } => provenance::check(provenance::CheckArgs {
+                    workspace_root,
+                    dir,
+                }),
+                ProvenanceCommand::Capture {
+                    attestant_id,
+                    slot,
+                    dir,
+                } => provenance::capture(provenance::CaptureArgs {
+                    workspace_root,
+                    attestant_id,
+                    slot,
+                    dir,
+                }),
+                ProvenanceCommand::Enrich { attestant_id, dir } => {
+                    provenance::enrich(provenance::EnrichArgs {
+                        workspace_root,
+                        attestant_id,
+                        dir,
+                    })
+                }
+            }
         }
         Command::Verify { tag } => {
             let workspace_root = workspace_root()?;

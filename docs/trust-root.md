@@ -94,7 +94,7 @@ The protection that *doesn't* hold without a signed `release.json` is **first-in
 
 ## Where each piece lives
 
-Everything under `releases/` is a **build input** — pinned data the client and server compile against. `artifact-manifest.json` at the repo root is the **build output** — a record of what was actually produced, signed by CI. They live in different places on purpose: files under `releases/` are bulk-copied/filtered into builds as a unit, while `artifact-manifest.json` is deliberately kept out of every build context to prevent self-reference cycles (it records the eidola-cli OCI digest and macOS narHash that the cli build would otherwise see in its own input).
+Almost everything under `releases/` is a **build input** — pinned data the client and server compile against (the one exception is `trust/attestant-provenance/`, informational auditor-facing evidence that no build or client reads). `artifact-manifest.json` at the repo root is the **build output** — a record of what was actually produced, signed by CI. They live in different places on purpose: files under `releases/` are bulk-copied/filtered into builds as a unit, while `artifact-manifest.json` is deliberately kept out of every build context to prevent self-reference cycles (it records the eidola-cli OCI digest and macOS narHash that the cli build would otherwise see in its own input).
 
 ```text
 releases/
@@ -106,6 +106,7 @@ releases/
     sigstore-trusted-root.json          # upstream Sigstore TrustedRoot snapshot (input)
     server-enclave.json                 # paired-server enclave measurement (input — projection of artifact-manifest.json's enclave block, materialized as its own file so the cli build context can COPY it without dragging the manifest in)
     tinfoil-enclaves.json               # allowed upstream Tinfoil inference-enclave measurements (input — server's build.rs reads this)
+    attestant-provenance/               # informational hardware-attestation evidence for pinned attestant keys (NOT a build input — no build.rs or client reads it; auditor-facing only)
 artifact-manifest.json                  # full deployment record (output, signed by CI)
 crates/eidola-app-core/
   build.rs                              # generator: server-enclave.json + trust-constants.json + … → trust_root.gen.rs

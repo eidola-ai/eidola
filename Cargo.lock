@@ -7646,6 +7646,7 @@ dependencies = [
  "sha2 0.11.0",
  "spki",
  "tempfile",
+ "x509-cert",
 ]
 
 [[package]]

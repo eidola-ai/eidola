@@ -147,6 +147,27 @@ update-manifest:
 release-list-keys *args:
     cargo run -q -p release-tool -- pkcs11 list {{ args }}
 
+# Capture INFORMATIONAL hardware-provenance evidence for an attestant key
+# (YubiKey-PIV): runs ykman to write the slot-9c attestation cert + F9
+# intermediate under releases/trust/attestant-provenance/<id>/ and fills
+# meta.json (serial/firmware/PIN+touch policy parsed from the attestation
+# cert). Not consulted by trust evaluation — see that dir's README.
+# Non-YubiKey attestants populate the bundle by hand.
+release-provenance-capture id *args:
+    cargo run -q -p release-tool -- provenance capture --attestant-id {{ id }} {{ args }}
+
+# (Re)derive meta.json device fields from a bundle's committed attestation
+# cert — offline, no device/ykman. No args enriches every bundle; pass
+# --attestant-id <id> for one.
+release-provenance-enrich *args:
+    cargo run -q -p release-tool -- provenance enrich {{ args }}
+
+# Verify each committed provenance bundle's attestation cert matches the
+# fingerprint its meta.json claims and is still pinned (vendor-neutral;
+# CI-friendly). A bundle for an unpinned fingerprint fails as stale.
+release-provenance-check *args:
+    cargo run -q -p release-tool -- provenance check {{ args }}
+
 # Verify a tag that CI has already built+signed. Fetches the signed manifest
 # from the GitHub release, verifies the Sigstore bundle against the embedded
 # trust root, compares against the committed manifest, and shows the diff

@@ -355,7 +355,7 @@ fn require_tool(name: &str) -> Result<()> {
     bail!("required tool `{name}` not found on PATH");
 }
 
-fn validate_attestant_id(id: &str) -> Result<()> {
+pub(crate) fn validate_attestant_id(id: &str) -> Result<()> {
     if id.is_empty()
         || !id
             .chars()

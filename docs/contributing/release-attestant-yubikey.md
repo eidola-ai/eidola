@@ -97,7 +97,7 @@ just release-list-keys
     uri         : pkcs11:token=YubiKey%20PIV%20%2342342556;id=%02;type=private?module-path=/opt/homebrew/lib/libykcs11.dylib
 ```
 
-You want the **Digital Signature** entry — `id 02`, label `Private key for Digital Signature` — the slot 9c key you just generated. A second entry, `id 19` / `Private key for PIV Attestation`, will also appear: that is PIV slot `F9`, the factory-provisioned attestation key (it chains to a Yubico CA and only vouches that *other* on-device keys were hardware-generated). You cannot sign with it — ignore it here, though it is useful as evidence (see [Capturing on-device proof](#capturing-on-device-proof-optional)). The command flags any key whose algorithm the updater would reject and omits a fingerprint for it.
+You want the **Digital Signature** entry — `id 02`, label `Private key for Digital Signature` — the slot 9c key you just generated. A second entry, `id 19` / `Private key for PIV Attestation`, will also appear: that is PIV slot `F9`, the factory-provisioned attestation key (it chains to a Yubico CA and only vouches that *other* on-device keys were hardware-generated). You cannot sign with it — ignore it here, though it is useful as evidence (see [Capturing on-device proof](#6-capture-on-device-proof)). The command flags any key whose algorithm the updater would reject and omits a fingerprint for it.
 
 The printed `uri` is the value you use as `--cosign-key` / `EIDOLA_ATTESTANT_COSIGN_KEY`; it contains no secret, so it is safe to persist. The printed `fingerprint` is what you pin in the next step.
 
@@ -112,6 +112,21 @@ If you kept `attestant-pub.pem` from step 2, you can confirm you pinned the righ
 ```bash
 openssl pkey -pubin -in attestant-pub.pem -outform DER | shasum -a 256 | awk '{print $1}'
 ```
+
+### 6. Capture on-device proof
+
+The factory attestation key in slot F9 (the second entry from step 4) can produce a Yubico-signed certificate proving that your 9c key was hardware-generated and stating its `pin-policy` / `touch-policy`. Committing this lets a future auditor confirm the attestant key really lived on a YubiKey with PIN-per-signature enforced, rather than taking it on faith. **This evidence is not used as part of verification** — no client or build step consults it (see [`releases/trust/attestant-provenance/README.md`](../../releases/trust/attestant-provenance/README.md)); it exists solely for external audit.
+
+`release-tool` captures the bundle and fills its `meta.json` from the attestation cert (serial, firmware, and PIN/touch policy all come straight from the cert's Yubico extensions — no manual entry):
+
+```bash
+just release-provenance-capture your-name   # writes the bundle + a fully-filled meta.json
+just release-provenance-check               # confirms the cert matches the pinned fingerprint
+```
+
+(Confirm the derived `product` string reads sensibly. `just release-provenance-enrich` re-derives those fields from a committed cert offline — no device needed — if you ever hand-edit or rebuild a bundle.)
+
+`release-provenance-check` recomputes the certificate's public-key fingerprint and asserts it equals the value pinned in `trust-constants.json`, so the evidence can never silently drift from the key it claims to describe. Chain validation to Yubico's root stays a documented `openssl` step (see that README) so the tool never hardcodes a vendor CA.
 
 ## Using the key with the attestation script
 
@@ -151,14 +166,3 @@ just release-attest vX.Y.Z \
 - **Record the device metadata outside the repo:** YubiKey serial (from `ykman piv info`) → pinned fingerprint → role (primary / backup). You will want this when a device's fingerprint eventually rotates out.
 - **This key is for the interactive human attestation step only.** It must never be wired into unattended CI — CI signs `artifact-manifest.json` keylessly via Fulcio/OIDC, a separate mechanism. Do not enable PIN caching or touch caching to "make automation easier."
 - **Firmware is fixed.** A YubiKey's firmware cannot be updated; just note the version. Any YubiKey 5C performs ECCP256.
-
-### Capturing on-device proof (optional)
-
-The factory attestation key in slot F9 (the second object from step 4) can produce a Yubico-signed certificate proving that your 9c key was hardware-generated and stating its `pin-policy` / `touch-policy`. For a trust-root bootstrapping ceremony this is worth archiving alongside the device metadata:
-
-```bash
-ykman piv keys attest 9c slot9c-attestation.pem            # Yubico-signed cert describing the 9c key
-ykman piv certificates export f9 yubico-attestation-ca.pem # the intermediate that signed it
-```
-
-These let a future auditor verify the genesis attestant key really lived on a YubiKey with PIN-per-signature enforced, rather than taking it on faith.

@@ -15,8 +15,9 @@ This file is for contributors who need to *modify* something here.
 | `trust/sigstore-trusted-root.json` | Snapshot of the upstream Sigstore `TrustedRoot` (Fulcio CAs, Rekor public keys, CT log keys, TSAs) | `crates/eidola-app-core/build.rs` |
 | `trust/server-enclave.json` | The paired server enclave measurement (SEV-SNP launch digest, TDX RTMR1/RTMR2, kernel cmdline). Materialized as its own file so the cli build can COPY it without dragging the full manifest into its build context | `crates/eidola-app-core/build.rs` |
 | `trust/tinfoil-enclaves.json` | Allowed upstream Tinfoil inference-enclave measurements (one entry per Tinfoil release, with provenance metadata; the workflow keeps the most recent two for rolling deploys) | `crates/eidola-server/build.rs` |
+| `trust/attestant-provenance/` | **Informational only** — optional hardware-attestation evidence (e.g. YubiKey-PIV certs) that a pinned attestant fingerprint is a real on-device, policy-constrained key. See its [`README.md`](trust/attestant-provenance/README.md) | nothing — auditor-facing |
 
-Every file here is a **build input**. The corresponding **build output** — `artifact-manifest.json` at the repo root — is signed by CI and records the digests of what was actually produced. The two are kept separate to prevent build-context self-reference (see [`docs/trust-root.md`](../docs/trust-root.md#why-the-enclave-block-lives-in-its-own-file)).
+Most files here are **build inputs**. The corresponding **build output** — `artifact-manifest.json` at the repo root — is signed by CI and records the digests of what was actually produced. The two are kept separate to prevent build-context self-reference (see [`docs/trust-root.md`](../docs/trust-root.md#why-the-enclave-block-lives-in-its-own-file)).
 
 ## Rotation procedures
 
@@ -25,7 +26,7 @@ Every rotation below ships as a normal release signed under the **current** trus
 ### Rotating an attestant key
 
 1. Generate a new signing key in your hardware-backed store of choice (YubiKey-PIV via PKCS#11, a cloud KMS supported by cosign, etc.). The key must be ECDSA-P256, ECDSA-P384, or Ed25519 — the updater's `verify_blob_signature_with_spki` rejects anything else.
-2. Export the public SPKI and compute its sha256:
+2. Compute the key's sha256 SPKI fingerprint. For a YubiKey, `cargo run -p release-tool -- pkcs11 list` prints it directly (no PIN). For other key types:
 
    ```bash
    cosign public-key --key <key-ref> > new-attestant.pem
@@ -36,6 +37,7 @@ Every rotation below ships as a normal release signed under the **current** trus
 3. Open a release PR that adds the new fingerprint to `releases/trust/trust-constants.json` (`trusted_attestant_fingerprints`). **Keep the old fingerprint** during the overlap window so prior releases remain verifiable.
 4. Cut a release signed by the **current** attestant key. The new client binary embeds both fingerprints.
 5. After the overlap window has passed, open another release PR removing the old fingerprint. Sign with the new key.
+6. *(Optional, informational.)* Keep [`trust/attestant-provenance/`](trust/attestant-provenance/README.md) in lockstep with the pinned set: commit the new key's hardware-provenance bundle (`release-tool provenance capture` for a YubiKey) in the **same PR that pins its fingerprint** (step 3), and remove the old key's bundle in the **same PR that unpins it** (step 5). The retired key's evidence stays in git history; `release-tool provenance check` fails on a bundle left behind for an unpinned fingerprint.
 
 ### Rotating the CI signing workflow
 
