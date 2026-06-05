@@ -7695,8 +7695,7 @@ dependencies = [
 [[package]]
 name = "reqwest"
 version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+source = "git+https://github.com/eidola-ai/reqwest?rev=7c029cc9b3f4b52134c59304c43c1bb8e7603eb3#7c029cc9b3f4b52134c59304c43c1bb8e7603eb3"
 dependencies = [
  "base64 0.22.1",
  "bytes",

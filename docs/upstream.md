@@ -47,7 +47,7 @@ The Eidola server's outbound HTTPS client (constructed by `tinfoil-verifier::att
 - Freshness check (echoed nonce matches) and document-signature check against the embedded TLS cert.
 - AMD VCEK chain verification, SEV-SNP / TDX report verification, TCB policy enforcement.
 - Measurement check against the pinned allowed set.
-- Binding of the report's `REPORT_DATA` to `sha256(tls_key_fp ‖ hpke_key ‖ nonce ‖ …)`, where `tls_key_fp == sha256(SPKI(peer_cert))`.
+- Binding of the report's `REPORT_DATA` to `sha256(tls_key_fp ‖ hpke_key ‖ nonce ‖ … ‖ tls_exporter)`, where `tls_key_fp == sha256(SPKI(peer_cert))` and `tls_exporter` is the RFC 9266 channel binding of the live TLS session (defeating a man-in-the-middle that holds a stolen TLS key).
 
 A failed attestation rejects the request before any inference data crosses the wire.
 

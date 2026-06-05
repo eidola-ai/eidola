@@ -21,13 +21,23 @@
 //! Because the report's `REPORT_DATA` binds the per-handshake nonce, a stale
 //! or captured attestation document can't be replayed against a fresh nonce:
 //! the verifier knows a live, genuine CC machine produced this report *now*.
-//! This binds the enclave's long-term TLS *key* (the cert SPKI), **not** the
-//! live TLS *session*, so it does not by itself defeat exfiltration of that
-//! key — an attacker holding the stolen key could actively MITM the connection
-//! (and thus read the plaintext) while relaying a fresh nonce-bound report
-//! from the enclave's public attestation endpoint. Closing that gap needs
-//! channel binding (a TLS-session value in `report_data`); today it rests on
-//! the TLS key staying sealed in the enclave.
+//!
+//! The nonce alone binds the enclave's long-term TLS *key* (the cert SPKI),
+//! not the live TLS *session*, which would leave a gap: an attacker holding an
+//! exfiltrated TLS key could actively MITM the connection and relay a fresh
+//! nonce-bound report from the enclave's public endpoint. To close that, the
+//! verifier also binds the **TLS channel**: the enclave folds the RFC 9266
+//! `tls-exporter` of the session it terminates into `REPORT_DATA`, and the
+//! verifier checks it equals *this* session's exporter (obtained from the
+//! reqwest connection). A relaying MITM terminates a different TLS session
+//! than the one it relays to the enclave, so the two exporters differ and the
+//! check fails. This holds even against a stolen TLS key, since producing a
+//! report bound to *our* session's exporter requires the genuine hardware
+//! terminating *our* session. The check is enforced whenever the enclave
+//! provides a binding; [`AttestingClientConfig::require_channel_binding`]
+//! additionally rejects enclaves that provide none (for once the upstream
+//! enclave reliably emits it — current Tinfoil enclaves predate the binding,
+//! so it defaults off and the nonce alone still guarantees freshness).
 //!
 //! The enclave also signs the whole document with its TLS leaf key
 //! (ECDSA — P-384 in production, P-256 for the shim mock); the verifier checks
@@ -191,6 +201,25 @@ pub struct AttestingClientConfig<'a> {
     /// including the raw report bytes, matched measurement, and TLS
     /// binding hash. Same lifecycle and constraints as [`Self::tdx_observer`].
     pub attestation_observer: Option<AttestationObserver>,
+    /// Require the enclave to bind the TLS session via an RFC 9266
+    /// `tls-exporter` channel binding.
+    ///
+    /// When the enclave binds the channel, the verifier *always* checks that
+    /// the bound exporter equals this session's exporter — this is what
+    /// defeats a man-in-the-middle holding an exfiltrated TLS key (their
+    /// client-facing session has a different exporter than the one they relay
+    /// to the genuine enclave). This flag controls only what happens when the
+    /// enclave provides **no** binding:
+    ///
+    /// - `false` (default): accept it. The per-handshake nonce still
+    ///   guarantees freshness. Use during rollout, before the upstream enclave
+    ///   is known to emit the binding.
+    /// - `true`: reject it. Use once the upstream enclave reliably binds the
+    ///   channel, to prevent a downgrade.
+    ///
+    /// Independent of platform; the binding rides in `report_data` and is
+    /// authenticated by the hardware report.
+    pub require_channel_binding: bool,
 }
 
 /// Build a `reqwest::Client` whose connector verifies enclave attestation on
@@ -207,11 +236,13 @@ pub struct AttestingClientConfig<'a> {
 /// 3. Falls back to ATC for the VCEK (the fresh document omits it).
 /// 4. Verifies the echoed nonce matches the one sent, the document's
 ///    `tls_key_fp` matches `sha256(SPKI(peer_cert))`, the embedded
-///    certificate matches the peer cert, and the document's ECDSA signature
-///    validates against it.
+///    certificate matches the peer cert, the document's ECDSA signature
+///    validates against it, and the RFC 9266 `tls-exporter` channel binding
+///    (when the enclave provides one) equals this session's exporter.
 /// 5. Verifies the AMD VCEK chain, the report signature, the TCB floor, the
 ///    measurement against `allowed_measurements`, and that the report's
-///    `REPORT_DATA` equals `sha256(tls_key_fp || hpke_key || nonce || …)`.
+///    `REPORT_DATA` equals
+///    `sha256(tls_key_fp || hpke_key || nonce || … || tls_exporter)`.
 /// 6. Yields the connection to hyper for the real request.
 ///
 /// Callers that want fail-fast-at-startup semantics should make one trivial
@@ -248,6 +279,7 @@ pub async fn attesting_client(config: AttestingClientConfig<'_>) -> Result<reqwe
         snp_observer: config.snp_observer,
         attestation_observer: config.attestation_observer,
         tls_roots,
+        require_channel_binding: config.require_channel_binding,
     })
 }
 

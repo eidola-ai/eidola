@@ -75,6 +75,8 @@ async fn mock_attesting_client_e2e() {
         snp_observer: None,
         attestation_observer: None,
         tls_roots,
+        // The mock binds the TLS session, so exercise the strict path.
+        require_channel_binding: true,
     })
     .await
     .expect("attesting_client failed");
@@ -257,6 +259,8 @@ async fn live_attesting_client() {
         snp_observer: None,
         attestation_observer: None,
         tls_roots: webpki,
+        // Live production enclaves may predate channel binding; don't require.
+        require_channel_binding: false,
     })
     .await
     .expect("attesting_client failed");

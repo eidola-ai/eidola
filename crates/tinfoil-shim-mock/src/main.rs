@@ -7,10 +7,11 @@
 //! - **Report signature:** ECDSA P-384 with SHA-384 (VCEK signs the report)
 //! - **Fresh, nonce-bound attestation:** each `?nonce=<hex>` request builds a
 //!   *fresh* report whose `report_data[0..32] = SHA-256(tls_key_fp || hpke_key
-//!   || nonce)` (matching upstream `attestation.ComputeReportData`), then signs
-//!   the whole JSON document with the TLS leaf key (ECDSA P-256 / SHA-256). This
-//!   mirrors the production endpoint so `tinfoil-verifier`'s nonce/signature
-//!   checks exercise the same path locally.
+//!   || nonce || tls_exporter)` (matching upstream `attestation.ComputeReportData`),
+//!   then signs the whole JSON document with the TLS leaf key (ECDSA P-256 /
+//!   SHA-256). `tls_exporter` is the RFC 9266 `tls-exporter` channel binding for
+//!   the request's TLS session, so `tinfoil-verifier`'s nonce, signature, and
+//!   channel-binding checks all exercise the same path locally.
 //!
 //! This exercises the complete verification path in `tinfoil-verifier` with
 //! no escape hatches — the `sev` crate's `Verifiable` trait verifies every
@@ -47,6 +48,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
+use axum::Extension;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Query, State};
@@ -142,6 +144,12 @@ struct NonceQuery {
     nonce: Option<String>,
 }
 
+/// Per-connection RFC 9266 `tls-exporter` channel binding, injected into each
+/// request's extensions so the attestation handler can bind the TLS session.
+/// `None` if the connection couldn't produce an exporter.
+#[derive(Clone, Copy)]
+struct ChannelBinding(Option<[u8; 32]>);
+
 /// Everything needed to assemble a fresh, nonce-bound attestation document on
 /// each request, mirroring the production endpoint. Built once at boot from the
 /// ephemeral per-boot key material; the only per-request input is the nonce.
@@ -162,15 +170,26 @@ struct FreshBuilder {
 }
 
 impl FreshBuilder {
-    /// Assemble and sign a fresh attestation document for `nonce`.
-    fn build(&self, nonce: &[u8; 32]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    /// Assemble and sign a fresh attestation document for `nonce`, binding the
+    /// TLS session's RFC 9266 `tls-exporter` when one is available.
+    fn build(
+        &self,
+        nonce: &[u8; 32],
+        tls_exporter: Option<&[u8]>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         use p256::ecdsa::signature::hazmat::PrehashSigner;
 
-        // report_data[0..32] = SHA-256(tls_key_fp || hpke_key || nonce).
+        // report_data[0..32] =
+        //   SHA-256(tls_key_fp || hpke_key || nonce || tls_exporter).
+        // (GPU/NVSwitch hashes are absent for this CPU-only mock; `tls_exporter`
+        // is appended last, matching upstream `ComputeReportData`.)
         let mut h = Sha256::new();
         h.update(self.tls_key_fp);
         h.update(self.hpke_key);
         h.update(nonce);
+        if let Some(exporter) = tls_exporter {
+            h.update(exporter);
+        }
         let report_data_prefix: [u8; 32] = h.finalize().into();
 
         let mut report = build_report(&self.measurement, &report_data_prefix);
@@ -178,16 +197,21 @@ impl FreshBuilder {
 
         let b64 = &base64::engine::general_purpose::STANDARD;
 
+        let mut report_data = serde_json::json!({
+            "tls_key_fp": hex::encode(self.tls_key_fp),
+            "hpke_key": hex::encode(self.hpke_key),
+            "nonce": hex::encode(nonce),
+        });
+        if let Some(exporter) = tls_exporter {
+            report_data["tls_exporter"] = serde_json::Value::String(hex::encode(exporter));
+        }
+
         // Build the document with an empty signature, sign those exact bytes,
         // then splice the signature back in. The verifier reconstructs the
         // signed form by blanking the signature value, so this round-trips.
         let mut doc = serde_json::json!({
             "format": "https://tinfoil.sh/predicate/attestation/v3",
-            "report_data": {
-                "tls_key_fp": hex::encode(self.tls_key_fp),
-                "hpke_key": hex::encode(self.hpke_key),
-                "nonce": hex::encode(nonce),
-            },
+            "report_data": report_data,
             "cpu": {
                 "platform": "sev-snp",
                 "report": b64.encode(report),
@@ -1015,9 +1039,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             };
 
+            // RFC 9266 tls-exporter channel binding for this TLS session
+            // (label "EXPORTER-Channel-Binding", empty context, 32 bytes) —
+            // the same derivation the verifier computes on its end. Captured
+            // once per connection and attached to every request below.
+            let channel_binding = ChannelBinding({
+                let (_, conn) = tls_stream.get_ref();
+                conn.export_keying_material([0u8; 32], b"EXPORTER-Channel-Binding", None)
+                    .ok()
+            });
+
             let io = TokioIo::new(tls_stream);
             let service = hyper::service::service_fn(move |req| {
                 let mut app = app.clone();
+                let mut req = req;
+                req.extensions_mut().insert(channel_binding);
                 async move { app.call(req).await }
             });
 
@@ -1046,6 +1082,7 @@ impl ResolvesServerCert for DevCertResolver {
 
 async fn handle_attestation(
     State(state): State<AppState>,
+    Extension(channel_binding): Extension<ChannelBinding>,
     Query(query): Query<NonceQuery>,
 ) -> Response {
     // Mirror the production endpoint: a nonce is required to build a fresh,
@@ -1070,7 +1107,11 @@ async fn handle_attestation(
     let mut nonce32 = [0u8; 32];
     nonce32.copy_from_slice(&nonce);
 
-    match state.fresh.build(&nonce32) {
+    let exporter = channel_binding.0;
+    match state
+        .fresh
+        .build(&nonce32, exporter.as_ref().map(|e| &e[..]))
+    {
         Ok(json) => (StatusCode::OK, [("content-type", "application/json")], json).into_response(),
         Err(e) => {
             debug!("attestation build failed: {e}");

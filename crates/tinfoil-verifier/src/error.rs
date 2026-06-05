@@ -37,6 +37,21 @@ pub enum Error {
     #[error("report_data mismatch: expected {expected}, observed {observed}")]
     ReportDataMismatch { expected: String, observed: String },
 
+    #[error(
+        "channel binding mismatch: attestation bound tls-exporter {attested}, live session is {session} (possible TLS man-in-the-middle)"
+    )]
+    ChannelBindingMismatch { attested: String, session: String },
+
+    #[error(
+        "attestation bound a tls-exporter channel binding but the live TLS session did not expose one, so it cannot be verified"
+    )]
+    ChannelBindingUnavailable,
+
+    #[error(
+        "channel binding required by policy but the enclave attestation did not bind the TLS session"
+    )]
+    ChannelBindingMissing,
+
     #[error("TCB policy violation: {0}")]
     TcbPolicy(String),
 

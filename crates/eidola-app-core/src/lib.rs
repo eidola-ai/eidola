@@ -214,6 +214,10 @@ impl Inner {
             snp_observer: None,
             attestation_observer,
             tls_roots: load_native_root_store(),
+            // Transition default: enforce channel binding when the enclave
+            // provides it, but don't yet hard-require it. Flip to `true` once
+            // the upstream enclave reliably emits the RFC 9266 binding.
+            require_channel_binding: false,
         })
         .await
         .map_err(|e| AppError::Attestation {

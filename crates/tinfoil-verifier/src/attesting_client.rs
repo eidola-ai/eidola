@@ -27,25 +27,29 @@
 //! parse the response ourselves. The wire format is fixed: one
 //! request, one response, `Content-Length` or chunked transfer encoding.
 //!
-//! ## Freshness — and its limits
+//! ## Freshness and channel binding
 //!
 //! Re-attesting on every new TLS handshake means TCB-floor bumps and
 //! `ALLOWED_MEASUREMENTS` changes take effect immediately rather than only at
 //! process restart. The per-handshake nonce adds *freshness*: the enclave
 //! folds our random nonce into the hardware report's `REPORT_DATA`
-//! (`REPORT_DATA == sha256(tls_key_fp || hpke_key || nonce || …)`, where
-//! `tls_key_fp` is the SPKI hash of the cert we handshook with), so a stale or
-//! captured document cannot be replayed against a different nonce.
+//! (`REPORT_DATA == sha256(tls_key_fp || hpke_key || nonce || … || tls_exporter)`,
+//! where `tls_key_fp` is the SPKI hash of the cert we handshook with), so a
+//! stale or captured document cannot be replayed against a different nonce.
 //!
-//! It does **not** close the key-exfiltration gap. The report binds the
-//! long-term TLS *key*, not the live TLS *session*, so an attacker who has
-//! exfiltrated that key can still actively MITM the connection — reading the
-//! plaintext, since holding the signing key lets them drive the ECDHE
-//! regardless of TLS 1.3 forward secrecy — and relay a fresh nonce-bound
-//! report fetched from the enclave's public attestation endpoint (which serves
-//! any nonce). Every check here still passes. Closing this requires channel
-//! binding (committing a TLS-session value into `report_data`); today it rests
-//! on the TLS key staying sealed inside the enclave.
+//! The nonce alone binds the long-term TLS *key*, not the live TLS *session*,
+//! which would leave a key-exfiltration gap: an attacker holding the stolen
+//! key could actively MITM the connection — reading the plaintext, since
+//! holding the signing key lets them drive the ECDHE regardless of TLS 1.3
+//! forward secrecy — and relay a fresh nonce-bound report from the enclave's
+//! public endpoint. The `tls_exporter` term closes it: the enclave binds the
+//! RFC 9266 `tls-exporter` of the session *it* terminates, and we check it
+//! against *our* session's exporter (see [`AttestationCheck::verify_channel_binding`]).
+//! A relaying MITM's two TLS sessions have different exporters, so the check
+//! fails. We enforce it whenever the enclave provides a binding; the
+//! `require_channel_binding` policy additionally rejects enclaves that provide
+//! none (off by default while upstream enclaves still predate the binding —
+//! the nonce alone keeps freshness in the meantime).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -98,6 +102,7 @@ pub(crate) struct BuildParams {
     pub snp_observer: Option<sevsnp::SevSnpObserver>,
     pub attestation_observer: Option<crate::AttestationObserver>,
     pub tls_roots: Arc<rustls::RootCertStore>,
+    pub require_channel_binding: bool,
 }
 
 pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Client, Error> {
@@ -113,6 +118,7 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         snp_observer,
         attestation_observer,
         tls_roots,
+        require_channel_binding,
     } = params;
     let host = crate::enclave_host(&inference_base_url);
 
@@ -143,6 +149,7 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         snp_observer,
         snp_crl_cache: sevsnp_crl::CrlCache::new(tls_roots),
         attestation_observer,
+        require_channel_binding,
     });
 
     reqwest::Client::builder()
@@ -263,6 +270,11 @@ struct AttestationCheck {
     /// Optional consumer-provided observer fired for every successful
     /// attestation. Same lifecycle as the platform-specific observers.
     attestation_observer: Option<crate::AttestationObserver>,
+    /// When `true`, reject any attestation that does not bind the TLS session
+    /// via an RFC 9266 `tls-exporter` channel binding. When `false` (the
+    /// transition default), accept enclaves that predate channel binding but
+    /// still enforce the binding whenever the enclave provides one.
+    require_channel_binding: bool,
 }
 
 impl AttestationCheck {
@@ -287,10 +299,16 @@ impl AttestationCheck {
         })?;
         let peer_spki = sevsnp::sha256_spki_from_der(peer_cert_der)?;
 
+        // RFC 9266 tls-exporter channel binding for *this* TLS session, if the
+        // backend exposes it. When the enclave also binds it into the report we
+        // require the two to match — that's what defeats a man-in-the-middle
+        // who holds an exfiltrated TLS key (their client-facing session has a
+        // different exporter than the one they relay to the real enclave).
+        let session_exporter = tls_info.tls_exporter_channel_binding().map(<[u8]>::to_vec);
+
         // Fresh random nonce per handshake. The enclave binds it into the
         // hardware report's REPORT_DATA, so a captured document cannot be
-        // replayed against a different nonce — this is what makes the
-        // attestation safe even against an exfiltrated long-lived TLS key.
+        // replayed against a different nonce.
         let nonce = bundle::random_nonce()?;
 
         // Wrap the hyper IO in TokioIo so we can use AsyncRead/Write extension
@@ -299,7 +317,8 @@ impl AttestationCheck {
         let mut io = TokioIo::new(conn);
 
         let resolved = self.fetch_well_known(&mut io, &nonce).await?;
-        self.verify(&resolved, &peer_spki, &nonce).await?;
+        self.verify(&resolved, &peer_spki, &nonce, session_exporter.as_deref())
+            .await?;
 
         Ok(io.into_inner())
     }
@@ -343,12 +362,13 @@ impl AttestationCheck {
         resolved: &bundle::ResolvedAttestation,
         peer_spki: &[u8; 32],
         sent_nonce: &[u8; bundle::NONCE_LEN],
+        session_exporter: Option<&[u8]>,
     ) -> Result<(), Error> {
         // Document-level binding checks that don't depend on the hardware
-        // report: freshness (nonce echo), TLS-key binding, and the enclave's
-        // own signature over the document. The platform-specific paths then
-        // verify the hardware report and cross-check its REPORT_DATA.
-        self.verify_document_binding(resolved, peer_spki, sent_nonce)?;
+        // report: freshness (nonce echo), TLS-key binding, channel binding, and
+        // the enclave's own signature over the document. The platform-specific
+        // paths then verify the hardware report and cross-check its REPORT_DATA.
+        self.verify_document_binding(resolved, peer_spki, sent_nonce, session_exporter)?;
 
         match resolved.platform {
             bundle::Platform::SevSnp => self.verify_snp(resolved, peer_spki).await,
@@ -366,11 +386,15 @@ impl AttestationCheck {
     ///    depth: the document describes the connection we're on).
     /// 4. The document's ECDSA signature validates against that certificate,
     ///    proving the enclave's TLS key endorsed this exact fresh document.
+    /// 5. The channel binding (RFC 9266 `tls-exporter`) the enclave bound, if
+    ///    any, equals this session's exporter — defeating a key-holding MITM
+    ///    that terminates and re-originates TLS (see [`verify_channel_binding`]).
     fn verify_document_binding(
         &self,
         resolved: &bundle::ResolvedAttestation,
         peer_spki: &[u8; 32],
         sent_nonce: &[u8; bundle::NONCE_LEN],
+        session_exporter: Option<&[u8]>,
     ) -> Result<(), Error> {
         if resolved.report_data.nonce != sent_nonce {
             return Err(Error::NonceMismatch {
@@ -397,7 +421,36 @@ impl AttestationCheck {
         }
 
         bundle::verify_document_signature(resolved)?;
+        self.verify_channel_binding(resolved, session_exporter)?;
         Ok(())
+    }
+
+    /// Verify the RFC 9266 `tls-exporter` channel binding.
+    ///
+    /// The enclave may bind the exporter of the TLS session it terminates into
+    /// `report_data.tls_exporter` (the value is already authenticated against
+    /// the hardware report via the `REPORT_DATA` hash). Here we additionally
+    /// require it to equal *our* exporter for the live session. Because the
+    /// exporter is unique to a TLS session, a MITM that terminates the client's
+    /// connection with a stolen key and relays a fresh report from the real
+    /// enclave is caught: the report binds the MITM↔enclave exporter, which
+    /// differs from the client↔MITM exporter we compute here.
+    ///
+    /// Compatibility: enclaves that predate channel binding send no exporter
+    /// (`tls_exporter` empty). By default such attestations are accepted (the
+    /// nonce still gives freshness); set
+    /// [`AttestingClientConfig::require_channel_binding`] to reject them once
+    /// the upstream enclave is known to bind the channel.
+    fn verify_channel_binding(
+        &self,
+        resolved: &bundle::ResolvedAttestation,
+        session_exporter: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        check_channel_binding(
+            &resolved.report_data.tls_exporter,
+            session_exporter,
+            self.require_channel_binding,
+        )
     }
 
     /// Cross-check that the hardware report's `REPORT_DATA` equals the SHA-256
@@ -572,6 +625,38 @@ impl AttestationCheck {
     }
 }
 
+/// Enforce the RFC 9266 `tls-exporter` channel-binding policy.
+///
+/// - `attested`: the exporter the enclave bound into `report_data` (empty if it
+///   bound none). Already authenticated against the hardware report.
+/// - `session`: this TLS session's exporter, if the backend exposed one.
+/// - `require`: whether an absent binding is a hard failure.
+///
+/// Pure so the security-critical comparison is unit-tested directly.
+fn check_channel_binding(
+    attested: &[u8],
+    session: Option<&[u8]>,
+    require: bool,
+) -> Result<(), Error> {
+    if attested.is_empty() {
+        // The enclave did not bind the channel.
+        if require {
+            return Err(Error::ChannelBindingMissing);
+        }
+        return Ok(());
+    }
+
+    // The enclave bound the channel; we must be able to check it against ours.
+    let session = session.ok_or(Error::ChannelBindingUnavailable)?;
+    if attested != session {
+        return Err(Error::ChannelBindingMismatch {
+            attested: hex::encode(attested),
+            session: hex::encode(session),
+        });
+    }
+    Ok(())
+}
+
 /// Read a single HTTP/1.1 response from `io` and return its body bytes.
 ///
 /// Supports `Content-Length` and `Transfer-Encoding: chunked`. Bounded so a
@@ -741,5 +826,44 @@ where
         Err(Error::Connector(
             "attestation response missing Content-Length and not chunked".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_channel_binding;
+    use crate::Error;
+
+    const A: &[u8] = &[0x11; 32];
+    const B: &[u8] = &[0x22; 32];
+
+    #[test]
+    fn matching_binding_accepted() {
+        check_channel_binding(A, Some(A), true).expect("matching exporter must pass");
+        check_channel_binding(A, Some(A), false).expect("matching exporter must pass");
+    }
+
+    #[test]
+    fn mismatched_binding_rejected() {
+        // The relay case: enclave bound its session's exporter, ours differs.
+        let err = check_channel_binding(A, Some(B), false).unwrap_err();
+        assert!(matches!(err, Error::ChannelBindingMismatch { .. }));
+    }
+
+    #[test]
+    fn bound_but_no_session_exporter_rejected() {
+        // Enclave bound the channel but our backend couldn't produce one:
+        // fail closed rather than silently skip the check.
+        let err = check_channel_binding(A, None, false).unwrap_err();
+        assert!(matches!(err, Error::ChannelBindingUnavailable));
+    }
+
+    #[test]
+    fn absent_binding_accepted_unless_required() {
+        // Old enclave (no binding): accepted by default, rejected when required.
+        check_channel_binding(&[], Some(A), false).expect("absent binding allowed by default");
+        check_channel_binding(&[], None, false).expect("absent binding allowed by default");
+        let err = check_channel_binding(&[], Some(A), true).unwrap_err();
+        assert!(matches!(err, Error::ChannelBindingMissing));
     }
 }
