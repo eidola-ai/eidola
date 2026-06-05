@@ -2,14 +2,16 @@
 //! connector.
 //!
 //! Every time the underlying connection pool needs a new TCP+TLS connection,
-//! the wrapped connector finishes the TLS handshake and then performs an
-//! inline HTTP/1.1 `GET /.well-known/tinfoil-attestation?v=3` over **the same
+//! the wrapped connector finishes the TLS handshake, generates a fresh random
+//! nonce, and then performs an inline HTTP/1.1
+//! `GET /.well-known/tinfoil-attestation?nonce=<hex>` over **the same
 //! stream**. The response is verified before the connection is yielded back
 //! to hyper for the real request. There is no cache: every new handshake is
-//! re-attested. Subsequent HTTP requests on a pooled keepalive connection do
-//! not re-trigger the connector and therefore do not re-attest, but they are
-//! still bound to the same TLS key that was attested when the connection was
-//! first established.
+//! re-attested with a new nonce. Subsequent HTTP requests on a pooled
+//! keepalive connection do not re-trigger the connector and therefore do not
+//! re-attest, but they are still bound to the same TLS key that was attested
+//! (and the same nonce-bound report) when the connection was first
+//! established.
 //!
 //! ## Why inline HTTP/1.1?
 //!
@@ -25,15 +27,25 @@
 //! parse the response ourselves. The wire format is fixed: one
 //! request, one response, `Content-Length` or chunked transfer encoding.
 //!
-//! ## Important: this fixes freshness for *policy* but not for key compromise
+//! ## Freshness — and its limits
 //!
 //! Re-attesting on every new TLS handshake means TCB-floor bumps and
 //! `ALLOWED_MEASUREMENTS` changes take effect immediately rather than only at
-//! process restart. It does **not** mitigate an attacker who has somehow
-//! exfiltrated the enclave's long-lived TLS private key: the attestation
-//! document is static (no nonce yet) and replayable as long as the attacker
-//! can complete a TLS handshake with the bound key. Closing that gap requires
-//! per-handshake nonces in `report_data`, which Tinfoil is adding upstream.
+//! process restart. The per-handshake nonce adds *freshness*: the enclave
+//! folds our random nonce into the hardware report's `REPORT_DATA`
+//! (`REPORT_DATA == sha256(tls_key_fp || hpke_key || nonce || …)`, where
+//! `tls_key_fp` is the SPKI hash of the cert we handshook with), so a stale or
+//! captured document cannot be replayed against a different nonce.
+//!
+//! It does **not** close the key-exfiltration gap. The report binds the
+//! long-term TLS *key*, not the live TLS *session*, so an attacker who has
+//! exfiltrated that key can still actively MITM the connection — reading the
+//! plaintext, since holding the signing key lets them drive the ECDHE
+//! regardless of TLS 1.3 forward secrecy — and relay a fresh nonce-bound
+//! report fetched from the enclave's public attestation endpoint (which serves
+//! any nonce). Every check here still passes. Closing this requires channel
+//! binding (committing a TLS-session value into `report_data`); today it rests
+//! on the TLS key staying sealed inside the enclave.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -119,7 +131,7 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
 
     let check = Arc::new(AttestationCheck {
         allowed_measurements,
-        attestation_path: "/.well-known/tinfoil-attestation?v=3".to_string(),
+        attestation_path: "/.well-known/tinfoil-attestation".to_string(),
         attestation_host: host,
         trusted_ark_der,
         trusted_ask_der,
@@ -212,6 +224,8 @@ where
 /// Per-client attestation policy and target.
 struct AttestationCheck {
     allowed_measurements: Vec<EnclaveMeasurement>,
+    /// Base well-known path; a fresh `?nonce=<hex>` query is appended per
+    /// handshake.
     attestation_path: String,
     attestation_host: String,
     trusted_ark_der: Option<Vec<u8>>,
@@ -273,34 +287,42 @@ impl AttestationCheck {
         })?;
         let peer_spki = sevsnp::sha256_spki_from_der(peer_cert_der)?;
 
+        // Fresh random nonce per handshake. The enclave binds it into the
+        // hardware report's REPORT_DATA, so a captured document cannot be
+        // replayed against a different nonce — this is what makes the
+        // attestation safe even against an exfiltrated long-lived TLS key.
+        let nonce = bundle::random_nonce()?;
+
         // Wrap the hyper IO in TokioIo so we can use AsyncRead/Write extension
         // methods to drive a single inline HTTP/1.1 request without dropping
         // down past the response framing.
         let mut io = TokioIo::new(conn);
 
-        let resolved = self.fetch_well_known(&mut io).await?;
-        self.verify(&resolved, &peer_spki).await?;
+        let resolved = self.fetch_well_known(&mut io, &nonce).await?;
+        self.verify(&resolved, &peer_spki, &nonce).await?;
 
         Ok(io.into_inner())
     }
 
-    /// Issue an HTTP/1.1 GET against the configured v3 well-known endpoint
-    /// and parse the body into a [`bundle::ResolvedAttestation`].
+    /// Issue an HTTP/1.1 GET for a fresh, nonce-bound attestation document over
+    /// the same connection and parse it into a [`bundle::ResolvedAttestation`].
     async fn fetch_well_known<T>(
         &self,
         io: &mut TokioIo<T>,
+        nonce: &[u8; bundle::NONCE_LEN],
     ) -> Result<bundle::ResolvedAttestation, Error>
     where
         T: hyper::rt::Read + hyper::rt::Write + Unpin,
     {
         let request = format!(
-            "GET {path} HTTP/1.1\r\n\
+            "GET {path}?nonce={nonce} HTTP/1.1\r\n\
              Host: {host}\r\n\
              Connection: keep-alive\r\n\
              Accept: application/json\r\n\
              User-Agent: tinfoil-verifier\r\n\
              \r\n",
             path = self.attestation_path,
+            nonce = hex::encode(nonce),
             host = self.attestation_host,
         );
         io.write_all(request.as_bytes())
@@ -311,22 +333,91 @@ impl AttestationCheck {
             .map_err(|e| Error::Connector(format!("flush attestation request: {e}")))?;
 
         let body = read_http1_response(io).await?;
-        let doc: bundle::AttestationDocumentV3 = serde_json::from_slice(&body)
-            .map_err(|e| Error::Connector(format!("v3 attestation JSON parse: {e}")))?;
-        bundle::resolve_v3(&doc)
+        bundle::parse_document(&body)
     }
 
-    /// Verify a freshly-fetched attestation document against the peer cert
-    /// the TLS handshake landed on.
+    /// Verify a freshly-fetched attestation document against the peer cert the
+    /// TLS handshake landed on and the nonce we just sent.
     async fn verify(
         &self,
         resolved: &bundle::ResolvedAttestation,
         peer_spki: &[u8; 32],
+        sent_nonce: &[u8; bundle::NONCE_LEN],
     ) -> Result<(), Error> {
+        // Document-level binding checks that don't depend on the hardware
+        // report: freshness (nonce echo), TLS-key binding, and the enclave's
+        // own signature over the document. The platform-specific paths then
+        // verify the hardware report and cross-check its REPORT_DATA.
+        self.verify_document_binding(resolved, peer_spki, sent_nonce)?;
+
         match resolved.platform {
             bundle::Platform::SevSnp => self.verify_snp(resolved, peer_spki).await,
             bundle::Platform::Tdx => self.verify_tdx(resolved, peer_spki).await,
         }
+    }
+
+    /// Platform-independent checks binding the fresh document to *this*
+    /// connection and *this* nonce:
+    ///
+    /// 1. The echoed nonce equals the one we sent (freshness / anti-replay).
+    /// 2. The document's `tls_key_fp` equals `sha256(SPKI(peer_cert))`, so the
+    ///    report is bound to the TLS key we actually handshook with.
+    /// 3. The embedded certificate's SPKI matches the peer cert (defense in
+    ///    depth: the document describes the connection we're on).
+    /// 4. The document's ECDSA signature validates against that certificate,
+    ///    proving the enclave's TLS key endorsed this exact fresh document.
+    fn verify_document_binding(
+        &self,
+        resolved: &bundle::ResolvedAttestation,
+        peer_spki: &[u8; 32],
+        sent_nonce: &[u8; bundle::NONCE_LEN],
+    ) -> Result<(), Error> {
+        if resolved.report_data.nonce != sent_nonce {
+            return Err(Error::NonceMismatch {
+                sent: hex::encode(sent_nonce),
+                echoed: hex::encode(&resolved.report_data.nonce),
+            });
+        }
+
+        if &resolved.report_data.tls_key_fp != peer_spki {
+            return Err(Error::FingerprintMismatch {
+                report_data: hex::encode(resolved.report_data.tls_key_fp),
+                enclave_cert: hex::encode(peer_spki),
+            });
+        }
+
+        // The certificate carried in the document must be the very cert we
+        // landed on, so the signature we verify below is the peer's.
+        let doc_cert_spki = sevsnp::sha256_spki_from_der(&resolved.certificate_der)?;
+        if &doc_cert_spki != peer_spki {
+            return Err(Error::FingerprintMismatch {
+                report_data: hex::encode(doc_cert_spki),
+                enclave_cert: hex::encode(peer_spki),
+            });
+        }
+
+        bundle::verify_document_signature(resolved)?;
+        Ok(())
+    }
+
+    /// Cross-check that the hardware report's `REPORT_DATA` equals the SHA-256
+    /// of the document's `report_data` inputs. This is what binds the
+    /// attacker-uncontrollable hardware report to the (nonce, TLS key, HPKE
+    /// key) the document claims — every one of those claimed fields is thereby
+    /// authenticated by the AMD/Intel signature over the report.
+    fn verify_report_data_binding(
+        &self,
+        resolved: &bundle::ResolvedAttestation,
+        report_data: &[u8; 64],
+    ) -> Result<(), Error> {
+        let expected = resolved.report_data.expected_report_data();
+        if &expected != report_data {
+            return Err(Error::ReportDataMismatch {
+                expected: hex::encode(expected),
+                observed: hex::encode(report_data),
+            });
+        }
+        Ok(())
     }
 
     async fn verify_snp(
@@ -336,10 +427,11 @@ impl AttestationCheck {
     ) -> Result<(), Error> {
         let report = sevsnp::parse_report(&resolved.report_bytes)?;
 
-        // VCEK source: prefer the self-contained document; otherwise fall back
-        // to ATC. The connector never talks to AMD KDS — ATC is the single
-        // fallback target. Once Tinfoil ships fully self-contained v3 reports
-        // this fallback path will go cold.
+        // VCEK source: prefer a document that self-carries it (the shim mock);
+        // otherwise fall back to ATC. The production fresh document omits the
+        // VCEK, so this fallback is the normal path there. The connector never
+        // talks to AMD KDS — ATC is the single fallback target. Once Tinfoil
+        // folds the VCEK into the fresh document this path will go cold.
         let vcek_der = match resolved.vcek_der.clone() {
             Some(v) => v,
             None => {
@@ -406,12 +498,11 @@ impl AttestationCheck {
         let measurement_hex = hex::encode(report.measurement);
         let matched = check_snp_measurement(&self.allowed_measurements, &measurement_hex)?;
 
-        if &report.report_data[..32] != peer_spki.as_slice() {
-            return Err(Error::FingerprintMismatch {
-                report_data: hex::encode(&report.report_data[..32]),
-                enclave_cert: hex::encode(peer_spki),
-            });
-        }
+        // Bind the hardware report to the nonce/TLS-key/HPKE-key the document
+        // claimed. `verify_document_binding` already proved `tls_key_fp ==
+        // peer_spki` and the nonce is fresh; this proves the AMD-signed report
+        // actually commits to those same values.
+        self.verify_report_data_binding(resolved, &report.report_data)?;
 
         tracing::info!(
             measurement = %matched,
@@ -456,12 +547,9 @@ impl AttestationCheck {
         let rtmr2_hex = hex::encode(result.rtmr2);
         let matched = check_tdx_measurement(&self.allowed_measurements, &rtmr1_hex, &rtmr2_hex)?;
 
-        if &result.report_data[..32] != peer_spki.as_slice() {
-            return Err(Error::FingerprintMismatch {
-                report_data: hex::encode(&result.report_data[..32]),
-                enclave_cert: hex::encode(peer_spki),
-            });
-        }
+        // Bind the TDX quote to the document's nonce/TLS-key/HPKE-key (see the
+        // SEV-SNP path for the rationale).
+        self.verify_report_data_binding(resolved, &result.report_data)?;
 
         tracing::info!(
             measurement = %matched,

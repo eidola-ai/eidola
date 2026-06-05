@@ -28,6 +28,15 @@ pub enum Error {
     #[error("report signature verification failed: {0}")]
     Signature(String),
 
+    #[error("attestation document signature verification failed: {0}")]
+    DocSignature(String),
+
+    #[error("attestation nonce mismatch: sent {sent}, enclave echoed {echoed}")]
+    NonceMismatch { sent: String, echoed: String },
+
+    #[error("report_data mismatch: expected {expected}, observed {observed}")]
+    ReportDataMismatch { expected: String, observed: String },
+
     #[error("TCB policy violation: {0}")]
     TcbPolicy(String),
 

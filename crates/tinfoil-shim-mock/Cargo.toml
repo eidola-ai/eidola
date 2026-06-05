@@ -34,6 +34,11 @@ sev = { version = "8", default-features = false, features = ["snp", "crypto_noss
 # Mock attestation report (ECDSA P-384)
 p384 = { version = "0.13", features = ["ecdsa", "arithmetic", "pkcs8"] }
 
+# Signing the fresh attestation *document* with the TLS leaf key (P-256, the
+# curve rcgen generates for the mock leaf — production uses P-384). Matches the
+# upstream flow where the enclave signs the document with its TLS private key.
+p256 = { version = "0.13", features = ["ecdsa", "arithmetic", "pkcs8"] }
+
 # Connection handling
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
