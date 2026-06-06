@@ -194,7 +194,7 @@ Behavior tests catch logic regressions (clicking X must call `core.Y(z)`; an emp
 
 ## gpui / gpui-component pinning
 
-`gpui-component` (longbridge, rev `01a116a15e9660963a2aa07d0192e38785d8b9ad`) pulls `gpui` and `gpui_platform` from `zed-industries/zed` without a rev. We mirror that exact spec in `Cargo.toml` so cargo unifies on a single `gpui` copy. `Cargo.lock` is the canonical pin for the resolved zed commit.
+`gpui-component` (longbridge, rev `dadfca97fec7221acf3ce7047bccdc1eac0506b9`) pulls `gpui` and `gpui_platform` from `zed-industries/zed` without a rev. We mirror that exact spec in `Cargo.toml` so cargo unifies on a single `gpui` copy. `Cargo.lock` is the canonical pin for the resolved zed commit. gpui-component and gpui move in lockstep: a given gpui-component rev expects a matching gpui (e.g. the `flex_shrink_1`/`flex_grow_1` helpers it calls landed in gpui `6e9465a`), so bump both together.
 
 ## Non-Rust dependencies
 

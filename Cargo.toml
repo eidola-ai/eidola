@@ -12,18 +12,6 @@ authors = ["Mike Marcacci"]
 repository = "https://github.com/eidola-ai/eidola"
 publish = false
 
-# Redirect all three gpui-component crates to the eidola-ai fork, which
-# carries the `fix/asset-paths-link` branch making the icons accessible
-# inside each crate's package boundary (the upstream layout reaches into
-# sibling crates, which breaks under cargo vendor — and embeds
-# NIX_BUILD_TOP into our release binary as a side effect). Drop this block
-# once the upstream PR at longbridge/gpui-component lands and we bump our
-# pinned rev in crates/eidola-gui/Cargo.toml.
-[patch."https://github.com/longbridge/gpui-component"]
-gpui-component = { git = "https://github.com/eidola-ai/gpui-component", rev = "ad16cd47faf14ce7d57695b84d3c9b0f4cf05a24" }
-gpui-component-assets = { git = "https://github.com/eidola-ai/gpui-component", rev = "ad16cd47faf14ce7d57695b84d3c9b0f4cf05a24" }
-gpui-component-macros = { git = "https://github.com/eidola-ai/gpui-component", rev = "ad16cd47faf14ce7d57695b84d3c9b0f4cf05a24" }
-
 [profile.docker-dev]
 inherits = "dev"
 opt-level = 1
