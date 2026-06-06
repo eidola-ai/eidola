@@ -27,6 +27,12 @@ name: Promote next to main
 #     repo/org secrets, or that protection is moot.)
 #   * The App is the sole bypass actor on `main`'s ruleset (no PATs, no humans),
 #     with minimal permissions: contents:write, pull-requests:write, checks:read.
+#   * Who may trigger `/promote` is decided by the commenter's *repository*
+#     permission (admin/write), queried via the collaborators API in a separate
+#     `authorize` job that runs before the App token is minted — NOT by
+#     `author_association`, which in an org only proves org membership, not write
+#     access on this repo. This gate holds even if the Environment has no
+#     required reviewer configured.
 #   * The push is non-force, so GitHub still rejects a non-fast-forward; the App
 #     can only ever advance `main` to a commit this job has verified.
 on:
@@ -40,13 +46,44 @@ concurrency:
 permissions: {}
 
 jobs:
-  promote:
-    name: Fast-forward main
-    # Only on `/promote` comments, on a PR, from someone with repo write access.
+  # Authoritative authorization gate, independent of the Environment's (optional)
+  # required reviewers: the commenter must hold repository write access. This
+  # runs before the env-gated `promote` job, so an unauthorized commenter never
+  # reaches the Environment or mints the App token.
+  authorize:
+    name: Authorize commenter
+    # The `author_association` clause is only a cheap noise pre-filter (drops
+    # drive-by outsiders). It is NOT the security gate — it would wrongly admit
+    # an org MEMBER without repo write access. The collaborators-permission API
+    # call in the step below is the authoritative check.
     if: >
       github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/promote') &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {} # collaborators/permission needs only the implicit metadata:read
+    steps:
+      - name: Require repository write access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.event.comment.user.login }}
+        run: |
+          set -euo pipefail
+          # Roll-up permission is one of admin|write|read|none. Push-capable
+          # roles (admin, maintain, write, and push-granting custom roles)
+          # resolve to admin/write; triage and read do not.
+          PERM=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq '.permission' 2>/dev/null || echo "none")
+          echo "@$ACTOR repository permission: $PERM"
+          case "$PERM" in
+            admin|write) echo "✅ @$ACTOR may promote" ;;
+            *) echo "::error::@$ACTOR lacks write access (permission: $PERM); only repo writers can /promote"; exit 1 ;;
+          esac
+
+  promote:
+    name: Fast-forward main
+    needs: authorize
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     # Gated by the `promote` Environment: main-only deployment-branch policy +
