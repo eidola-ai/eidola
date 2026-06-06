@@ -50,19 +50,21 @@ jobs:
           echo "::error::PRs into main must be this repo's 'next' -> 'main' (got head '${HEAD_REPO}:${HEAD_REF}'). Retargeting onto next."
           gh pr edit "$PR" --repo "$REPO" --base next \
             && gh pr comment "$PR" --repo "$REPO" --body \
-            "👋 This PR targeted \`main\`, but feature work integrates on \`next\` — \`main\` only advances by fast-forward from \`next\` once the full \`CI\` chain passes. I've retargeted it to \`next\`. See \`AGENTS.md\` (\"Branch flow\") for details." \
+            $'👋 This PR targeted `main`, but feature work integrates on `next`. I\'ve retargeted it to `next`.\n\n**The red `Base must be next` check can be ignored.** It stays red by design on any PR that didn\'t originate from `next`. It is not a required check on `next`, so it does not block this PR.' \
             || echo "::warning::could not retarget automatically — resolve the base manually"
 
-          # Re-read the base after the retarget. If it moved off `main`, the guard
-          # did its job: the PR no longer targets `main`, so leave the check green
-          # rather than stamping a permanent red ✗ on an otherwise-valid `next` PR.
-          # Only stay red while the PR is *still* on `main` (retarget raced, was
-          # reverted, or failed) — that's the case the required check must block.
-          CURRENT_BASE="$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName)"
-          if [ "$CURRENT_BASE" != "main" ]; then
-            echo "✅ Retargeted onto '${CURRENT_BASE}'; no longer targeting main."
-            exit 0
-          fi
-
-          echo "::error::PR is still based on 'main' after retarget — keeping the required check red to block merge."
+          # Fail even though the retarget above (probably) succeeded. Do NOT be
+          # tempted to exit 0 once the base reads as `next`: this job's success
+          # conclusion IS the required check that gates merges into `main`, and
+          # GitHub records it against the PR's *head SHA*, not its base. A green
+          # here would persist on that SHA after we move the base to `next`, and
+          # an attacker could then flip the base back to `main` and merge in the
+          # window before a fresh guard run retargets again — reusing this green
+          # plus the expensive `main` checks that already ran on the same SHA from
+          # the original `opened` event (those don't re-run on a base `edited`
+          # event, and cancel-in-progress concurrency only helps the attacker
+          # cancel the corrective run). So the ONLY path to success is the genuine
+          # `next` -> `main` promotion PR handled at the top; every other head
+          # stays red. The red is cosmetic on `next` (this check is not required
+          # there) but load-bearing on `main`.
           exit 1
