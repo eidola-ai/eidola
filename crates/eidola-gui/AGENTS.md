@@ -194,7 +194,9 @@ Behavior tests catch logic regressions (clicking X must call `core.Y(z)`; an emp
 
 ## gpui / gpui-component pinning
 
-`gpui-component` (longbridge, rev `dadfca97fec7221acf3ce7047bccdc1eac0506b9`) pulls `gpui` and `gpui_platform` from `zed-industries/zed` without a rev. We mirror that exact spec in `Cargo.toml` so cargo unifies on a single `gpui` copy. `Cargo.lock` is the canonical pin for the resolved zed commit. gpui-component and gpui move in lockstep: a given gpui-component rev expects a matching gpui (e.g. the `flex_shrink_1`/`flex_grow_1` helpers it calls landed in gpui `6e9465a`), so bump both together.
+`gpui-component` (longbridge, rev `dadfca97fec7221acf3ce7047bccdc1eac0506b9`) pulls `gpui` and `gpui_platform` from `zed-industries/zed` without a rev. We mirror that exact spec in `Cargo.toml` so cargo unifies on a single `gpui` copy. `Cargo.lock` is the canonical pin for the resolved zed commit. gpui-component and gpui move in lockstep: a given gpui-component rev expects a matching gpui (e.g. the `flex_shrink_1`/`flex_grow_1` helpers it calls landed in gpui commit `8982fb17`), so bump both together.
+
+**The zed pin is held at `969a67fc`, deliberately *behind* `main`.** The next commit, `39f7849a` ("Log worst hanging tasks and actions", zed #57835), added a global action-timing profiler whose process-wide `ACTION_STATISTICS` spinlock isn't isolated per thread. It's harmless in the single-threaded UI at runtime, but libtest runs our `gpui-markdown-editor` behavior tests in parallel — concurrent `dispatch_action` calls clobber the one global `running` slot and `save_action_timing()` panics on `None`. `969a67fc` is the parent of that commit: it has the flex helpers gpui-component needs but predates the profiler. Because the deps are rev-less, the lock is the only thing holding this — **do not `cargo update` zed past `969a67fc` until the upstream profiler race is fixed** (re-test the editor suite under parallelism before advancing the pin).
 
 ## Non-Rust dependencies
 
