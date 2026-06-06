@@ -94,11 +94,15 @@ jobs:
           while IFS= read -r f; do
             [ -n "$f" ] || continue
             case "$f" in
-              # The rust-checks workflow itself gates the cargo run, so changing
-              # it must re-exercise that run. (Handled before the `.github/*`
-              # catch-all below.)
+              # The rust-checks workflow itself gates *both* the cargo run and
+              # the markdown lint (rumdl install + invocation + their `if:`
+              # guards all live in this file), so changing it must re-exercise
+              # both — otherwise a workflow-only edit that breaks the markdown
+              # step would skip it and merge unexercised. (Handled before the
+              # `.github/*` catch-all below.)
               .github/workflows/rust-checks.yml)
-                rust=true ;;
+                rust=true
+                markdown=true ;;
 
               # Markdown content + its lint config. rumdl lints the whole tree,
               # so markdown anywhere (docs, .github templates, crate READMEs) is
