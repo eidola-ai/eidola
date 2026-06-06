@@ -35,11 +35,11 @@ pulldown-cmark = { git = "https://github.com/eidola-ai/pulldown-cmark", rev = "3
 # emit native gpui paint ops (paint_quad / paint_path / shaped text)
 # rather than going through a raster intermediate, so math composes
 # with the editor's text and respects Day/Night themes.
-ratex-types = "0.1.10"
-ratex-parser = "0.1.10"
-ratex-layout = "0.1.10"
-ratex-font = "0.1.10"
-ratex-katex-fonts = "0.1.10"
+ratex-types = "0.1.11"
+ratex-parser = "0.1.11"
+ratex-layout = "0.1.11"
+ratex-font = "0.1.11"
+ratex-katex-fonts = "0.1.11"
 smallvec = "1.15"
 unicode-segmentation = "1"
 
