@@ -15,7 +15,7 @@ path = "src/main.rs"
 sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
 
 # TDX measurement
-tdx-measure = { git = "https://github.com/virtee/tdx-measure", tag = "v0.0.10" }
+tdx-measure = { git = "https://github.com/virtee/tdx-measure", tag = "v0.1.1" }
 
 # Config parsing
 serde = { version = "1", features = ["derive"] }
