@@ -35,7 +35,7 @@ thiserror = "2"
 tinfoil-verifier = { path = "../tinfoil-verifier" }
 tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
 toml = "1"
-turso = { version = "0.7.0-pre.4", default-features = false, features = ["pure-rust-crypto"] }
+turso = { version = "0.7.0-pre.5", default-features = false, features = ["pure-rust-crypto"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 x509-cert = "0.2"
 
