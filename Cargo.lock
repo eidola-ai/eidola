@@ -9312,7 +9312,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 [[package]]
 name = "tdx-measure"
 version = "0.1.0"
-source = "git+https://github.com/virtee/tdx-measure?tag=v0.0.10#a18082d6e62c2fc8ccc10cd7fb8d665f0e365b31"
+source = "git+https://github.com/virtee/tdx-measure?tag=v0.1.1#3d9e1244d87e8958f40bfdd649e059df54b40789"
 dependencies = [
  "anyhow",
  "bon",
@@ -9325,6 +9325,7 @@ dependencies = [
  "serde-human-bytes",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
