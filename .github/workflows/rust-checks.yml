@@ -5,6 +5,16 @@ name: Rust Checks
 # `next` and `main` — that expensive chain (oci/apple/artifact-manifest) stays
 # scoped to `main`. See
 # AGENTS.md "Branch flow".
+#
+# Path scoping: many PRs into `next` (workflow edits, README/docs, scripts,
+# compose, Containerfiles) can't change the outcome of any cargo gate, so the
+# `scope` step diffs the PR and skips the heavy steps when nothing relevant
+# changed. The *job* always runs and always reports — the expensive *steps* are
+# what get gated — so the "Rust checks" required status check never gets stuck
+# pending (a path-filtered *workflow* would). The scoping is deliberately
+# conservative: a full run is forced on every push and on any PR into `main`
+# (so the `next` -> `main` promotion gate is never path-skipped), and any
+# changed file we don't recognize as clearly-irrelevant triggers a full run.
 on:
   push:
     branches:
@@ -38,7 +48,95 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Determine which checks to run
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        # Emits two booleans: `rust` (run fmt/clippy/test/openapi) and `markdown`
+        # (run rumdl). A full run is forced for everything that isn't a PR (push
+        # to next/main, tag releases) and for every PR into `main` — the
+        # `next` -> `main` promotion must always get the real gate. For a PR
+        # into `next`, classify each changed file:
+        #   * `*.md` / `.rumdl.toml`  -> markdown lint (rumdl scans the whole
+        #     repo, so any markdown anywhere is in scope)
+        #   * a curated allowlist of paths that provably can't affect any cargo
+        #     gate (other CI configs, docs, scripts, container/compose/build
+        #     plumbing, repo metadata) -> ignored
+        #   * anything else (all `*.rs`, `Cargo.*`, `rust-toolchain.toml`,
+        #     `.cargo/*`, everything under `crates/` and `releases/` — schema
+        #     SQL, trust/measurement JSON consumed by the build scripts, test
+        #     fixtures, `openapi.json`, etc.) -> full rust run. Unrecognized
+        #     files fall through here on purpose, so novelty errs toward running.
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" != "pull_request" ] || [ "$BASE_REF" = "main" ]; then
+            echo "Full run (event=$EVENT base=${BASE_REF:-n/a})."
+            {
+              echo "rust=true"
+              echo "markdown=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # `diff BASE_SHA HEAD` needs only the two trees, not shared history, so
+          # a single-commit fetch of the PR base is enough on the shallow
+          # checkout. HEAD is the PR's merge commit; BASE_SHA is its base parent.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          changed=$(git diff --name-only "$BASE_SHA" HEAD)
+          echo "Changed files:"
+          echo "$changed" | sed 's/^/  /'
+
+          rust=false
+          markdown=false
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              # The rust-checks workflow itself gates the cargo run, so changing
+              # it must re-exercise that run. (Handled before the `.github/*`
+              # catch-all below.)
+              .github/workflows/rust-checks.yml)
+                rust=true ;;
+
+              # Markdown content + its lint config. rumdl lints the whole tree,
+              # so markdown anywhere (docs, .github templates, crate READMEs) is
+              # in scope for the markdown step only.
+              *.md|.rumdl.toml)
+                markdown=true ;;
+
+              # Paths that cannot change a cargo fmt/clippy/test/openapi outcome:
+              .github/*)              : ;;  # other CI/workflow/config files
+              docs/*)                 : ;;  # docs assets (markdown caught above)
+              scripts/*|*.sh)         : ;;  # shell tooling
+              justfile)               : ;;  # task runner recipes
+              compose*.yaml|compose*.yml) : ;;  # local dev compose
+              Containerfile*|*.hcl|.dockerignore) : ;;  # OCI build plumbing
+              flake.nix|flake.lock|*.swift-format) : ;;  # nix/swift build tooling
+              tinfoil-config.yml|artifact-manifest.json) : ;;  # deploy records
+              .env.example|.env.release) : ;;  # sample env files
+              .envrc|.gitignore|.gitattributes|.editorconfig) : ;;  # repo meta
+              LICENSE*|SECURITY.md|GEMINI.md|CLA-SIGNERS.txt) : ;;  # repo meta
+
+              # Everything else (rust source, manifests, toolchain, and all of
+              # crates/** + releases/** — build-script inputs, fixtures, schema,
+              # openapi.json) forces the full run.
+              *)
+                rust=true ;;
+            esac
+          done <<< "$changed"
+
+          echo "Resolved scope: rust=$rust markdown=$markdown"
+          {
+            echo "rust=$rust"
+            echo "markdown=$markdown"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
+        # Needed for the cargo gates and for building rumdl; skip only when
+        # neither scope is active (e.g. a workflow- or scripts-only PR).
+        if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.markdown == 'true'
         run: rustup show
 
       - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
@@ -48,20 +146,24 @@ jobs:
         # and the promotion PR's base). PRs never save (github.ref is a PR ref),
         # so there's no per-PR thrash. This job only runs tests; no artifact
         # from here is published.
+        if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.markdown == 'true'
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
+        if: steps.scope.outputs.rust == 'true'
         run: cargo fmt --check
 
       - name: Clippy
+        if: steps.scope.outputs.rust == 'true'
         run: |
           echo "::add-matcher::.github/rust-problem-matcher.json"
           cargo clippy --all-targets -- -D warnings
           echo "::remove-matcher owner=rust::"
 
       - name: Markdown lint
+        if: steps.scope.outputs.markdown == 'true'
         # rumdl is pinned by the crates/devtools anchor crate and, locally,
         # is on PATH via direnv (.envrc). CI deliberately doesn't install
         # direnv (no apt in the build chain); instead it emulates .envrc —
@@ -74,9 +176,11 @@ jobs:
           rumdl check .
 
       - name: Run tests
+        if: steps.scope.outputs.rust == 'true'
         run: cargo test
 
       - name: Check OpenAPI spec freshness
+        if: steps.scope.outputs.rust == 'true'
         run: |
           cargo run -q -p generate-openapi > /tmp/openapi-generated.json
           if ! diff /tmp/openapi-generated.json crates/eidola-server/openapi.json; then
