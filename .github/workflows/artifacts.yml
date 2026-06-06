@@ -94,11 +94,12 @@ jobs:
             image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
 
       - name: Log in to GHCR
-        # Push events need write to publish images; same-repo PRs (the promotion
-        # PR) need it to read/write the shared registry build cache. Fork PRs get
-        # a read-only token, so they skip login and build cache-cold — cache-to
-        # is ignore-error and cache-from simply misses (see docker-bake.hcl).
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        # Push events need write to publish images; the promotion PR (this repo's
+        # next -> main) needs it to read/write the shared registry build cache.
+        # Everything else (stray or fork PRs to main) skips login — those runs
+        # also get an empty CACHE_REGISTRY below, so they neither read nor write
+        # the shared cache (a fork's token is read-only regardless).
+        if: github.event_name == 'push' || (github.event.pull_request.head.ref == 'next' && github.event.pull_request.head.repo.full_name == github.repository)
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
@@ -136,21 +137,28 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           GIT_REF: ${{ github.ref }}
           REPO_OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           PUSH_FLAG=""
           if [ "${EVENT_NAME}" = "push" ]; then
             PUSH_FLAG="--push"
           fi
 
-          # Shared registry layer cache (per-image refs defined in
-          # docker-bake.hcl, consumed via the CACHE_REGISTRY bake variable).
-          # Empty on v* release tags so Sigstore-attested artifacts compile
-          # clean; otherwise the promotion PR (dev targets) and the post-merge
-          # push to main (ci-* targets) share one ref per image.
+          # Shared registry layer cache (per-image refs in docker-bake.hcl, via
+          # the CACHE_REGISTRY bake variable). Enabled only for trusted producers
+          # — pushes (main / post-promotion) and the promotion PR itself (this
+          # repo's next -> main) — so a stray or fork PR to main can neither read
+          # nor write the shared cache. Empty on v* release tags so attested
+          # artifacts compile clean. The promotion PR (dev targets) writes the
+          # cache the post-merge push (ci-* targets) then reuses.
           if [[ "${GIT_REF}" == refs/tags/v* ]]; then
             export CACHE_REGISTRY=""
-          else
+          elif [[ "${EVENT_NAME}" == "push" ]] || { [[ "${PR_HEAD_REF}" == "next" ]] && [[ "${PR_HEAD_REPO}" == "${REPO}" ]]; }; then
             export CACHE_REGISTRY="ghcr.io/$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          else
+            export CACHE_REGISTRY=""
           fi
 
           ./scripts/artifact-manifest.sh build \
@@ -196,18 +204,23 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           GIT_REF: ${{ github.ref }}
           REPO_OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           PUSH_FLAG=""
           if [ "${EVENT_NAME}" = "push" ]; then
             PUSH_FLAG="--push"
           fi
 
-          # Same shared registry layer cache as Phase 1 (see there). Empty on
-          # v* release tags for a clean attested build.
+          # Same trusted-producer gating as Phase 1 (see there). Empty on v*
+          # release tags for a clean attested build.
           if [[ "${GIT_REF}" == refs/tags/v* ]]; then
             export CACHE_REGISTRY=""
-          else
+          elif [[ "${EVENT_NAME}" == "push" ]] || { [[ "${PR_HEAD_REF}" == "next" ]] && [[ "${PR_HEAD_REPO}" == "${REPO}" ]]; }; then
             export CACHE_REGISTRY="ghcr.io/$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          else
+            export CACHE_REGISTRY=""
           fi
 
           ./scripts/artifact-manifest.sh build \

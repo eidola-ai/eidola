@@ -13,14 +13,22 @@ name: Promote next to main
 # After the push, the PR head is reachable from `main`, so GitHub marks the PR
 # merged automatically.
 #
-# Requirements:
-#   * Branch protection on `main` must require the `Build & Verify Artifacts` workflow's checks and
-#     restrict direct pushes; add this workflow's PROMOTE_TOKEN identity to the
-#     ruleset's bypass list so it can update the ref.
-#   * `PROMOTE_TOKEN` (repo/org secret) must have `contents: write` +
-#     `pull-requests: write` (a fine-grained PAT or GitHub App installation
-#     token). The default `GITHUB_TOKEN` cannot update a push-restricted branch
-#     unless `github-actions[bot]` is itself a bypass actor.
+# Integrity model (full setup in docs/contributing/promotion-security.md):
+#   * Credentials are a dedicated GitHub App, not a PAT. Its App ID + private
+#     key live as secrets on the `promote` Environment, whose deployment-branch
+#     policy is restricted to `main` and which (recommended) requires a human
+#     reviewer. Because this job declares `environment: promote`, and because an
+#     `issue_comment` run executes the *default-branch* (`main`) copy of this
+#     workflow with `github.ref = refs/heads/main`, only this trusted workflow
+#     running from `main` can mint the token. A workflow on a feature/PR branch
+#     cannot: its ref fails the branch policy, so the Environment secrets are
+#     withheld — closing the "same-repo PR runs its own modified workflow with
+#     secrets" hole. (Store the App secrets ONLY on the Environment, never as
+#     repo/org secrets, or that protection is moot.)
+#   * The App is the sole bypass actor on `main`'s ruleset (no PATs, no humans),
+#     with minimal permissions: contents:write, pull-requests:write, checks:read.
+#   * The push is non-force, so GitHub still rejects a non-fast-forward; the App
+#     can only ever advance `main` to a commit this job has verified.
 on:
   issue_comment:
     types: [created]
@@ -41,13 +49,28 @@ jobs:
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # Gated by the `promote` Environment: main-only deployment-branch policy +
+    # (recommended) required reviewers. This is what restricts the App
+    # credentials to runs of this workflow from `main`.
+    environment: promote
     permissions:
-      contents: write # fast-forward the main ref (effective only if the token is a bypass actor on main's ruleset)
-      pull-requests: write # comment status back on the PR
+      contents: read # all writes use the minted App token below, not GITHUB_TOKEN
     steps:
+      - name: Mint promotion App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PROMOTE_APP_ID }}
+          private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+          # Least-privilege installation token; the App must be granted at least
+          # these permissions on this repo (see the security runbook).
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: read
+
       - name: Validate and fast-forward
         env:
-          GH_TOKEN: ${{ secrets.PROMOTE_TOKEN || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.issue.number }}
           ACTOR: ${{ github.event.comment.user.login }}
