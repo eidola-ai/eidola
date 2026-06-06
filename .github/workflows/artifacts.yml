@@ -64,11 +64,18 @@ jobs:
         run: rustup show
 
       - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
+        # Skipped entirely on v* release tags — no restore, no save — so the
+        # release builds measure-enclave from a clean cargo state, matching the
+        # cache-free StageX/OCI build below. save-if still scopes writes to main
+        # for non-tag runs.
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache CVM artifacts # zizmor: ignore[cache-poisoning]
+        # Not gated on tags: CVM artifacts are content-addressed (kernel/initrd
+        # hash-verified on fetch), so a restored entry cannot alter outputs.
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/eidola/cvm
@@ -87,7 +94,11 @@ jobs:
             image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
 
       - name: Log in to GHCR
-        if: github.event_name == 'push'
+        # Push events need write to publish images; same-repo PRs (the promotion
+        # PR) need it to read/write the shared registry build cache. Fork PRs get
+        # a read-only token, so they skip login and build cache-cold — cache-to
+        # is ignore-error and cache-from simply misses (see docker-bake.hcl).
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
@@ -124,24 +135,27 @@ jobs:
           TAGS: ${{ steps.tags.outputs.tags || 'dev' }}
           EVENT_NAME: ${{ github.event_name }}
           GIT_REF: ${{ github.ref }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
           PUSH_FLAG=""
           if [ "${EVENT_NAME}" = "push" ]; then
             PUSH_FLAG="--push"
           fi
 
-          # Skip the GHA cache for v* release tags so Sigstore-attested
-          # artifacts are built clean and don't depend on cache state
-          # written by other refs.
-          CACHE_ARGS=()
-          if [[ "${GIT_REF}" != refs/tags/v* ]]; then
-            CACHE_ARGS=(--set "*.cache-from=type=gha" --set "*.cache-to=type=gha,mode=max")
+          # Shared registry layer cache (per-image refs defined in
+          # docker-bake.hcl, consumed via the CACHE_REGISTRY bake variable).
+          # Empty on v* release tags so Sigstore-attested artifacts compile
+          # clean; otherwise the promotion PR (dev targets) and the post-merge
+          # push to main (ci-* targets) share one ref per image.
+          if [[ "${GIT_REF}" == refs/tags/v* ]]; then
+            export CACHE_REGISTRY=""
+          else
+            export CACHE_REGISTRY="ghcr.io/$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
           fi
 
           ./scripts/artifact-manifest.sh build \
             ${PUSH_FLAG} --targets server \
-            --metadata-file "${SERVER_BAKE_METADATA_FILE}" \
-            "${CACHE_ARGS[@]}"
+            --metadata-file "${SERVER_BAKE_METADATA_FILE}"
 
       - name: Phase 2 — stamp tinfoil-config.yml with built server digest
         id: stamp
@@ -181,21 +195,24 @@ jobs:
           TAGS: ${{ steps.tags.outputs.tags || 'dev' }}
           EVENT_NAME: ${{ github.event_name }}
           GIT_REF: ${{ github.ref }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
           PUSH_FLAG=""
           if [ "${EVENT_NAME}" = "push" ]; then
             PUSH_FLAG="--push"
           fi
 
-          CACHE_ARGS=()
-          if [[ "${GIT_REF}" != refs/tags/v* ]]; then
-            CACHE_ARGS=(--set "*.cache-from=type=gha" --set "*.cache-to=type=gha,mode=max")
+          # Same shared registry layer cache as Phase 1 (see there). Empty on
+          # v* release tags for a clean attested build.
+          if [[ "${GIT_REF}" == refs/tags/v* ]]; then
+            export CACHE_REGISTRY=""
+          else
+            export CACHE_REGISTRY="ghcr.io/$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
           fi
 
           ./scripts/artifact-manifest.sh build \
             ${PUSH_FLAG} --targets cli \
-            --metadata-file "${CLI_BAKE_METADATA_FILE}" \
-            "${CACHE_ARGS[@]}"
+            --metadata-file "${CLI_BAKE_METADATA_FILE}"
 
       - name: Phase 5 — record combined OCI partial
         id: partial
@@ -336,8 +353,12 @@ jobs:
         run: rustup show
 
       - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
-        # save-if scopes writes to main; this job only verifies the manifest,
-        # it does not produce any published artifact.
+        # Skipped entirely on v* release tags so the release recomputes
+        # measurements from a clean cargo state (no restore, no save) — leaving
+        # no shared-cache common mode with the independent Python sevsnpmeasure
+        # cross-check in tinfoil-build.yml. save-if scopes writes to main
+        # otherwise; this job only verifies the manifest and publishes nothing.
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}

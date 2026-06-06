@@ -8,6 +8,7 @@ name: Rust Checks
 on:
   push:
     branches:
+      - next
       - main
     tags:
       - "v*"
@@ -41,11 +42,15 @@ jobs:
         run: rustup show
 
       - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
-        # save-if scopes writes to main; this job only runs tests, no
-        # artifact from here is published.
+        # Save from pushes to both trunks: `next` (the active integration
+        # branch — this is what warms feature PRs, which restore from their
+        # base) and `main` (the default branch — the universal restore fallback
+        # and the promotion PR's base). PRs never save (github.ref is a PR ref),
+        # so there's no per-PR thrash. This job only runs tests; no artifact
+        # from here is published.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
         run: cargo fmt --check

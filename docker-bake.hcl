@@ -11,6 +11,17 @@ variable "TAGS" {
   default = "dev"
 }
 
+# Registry namespace (e.g. ghcr.io/<owner>) for the shared BuildKit layer cache.
+# Empty (the default, and what local builds use) disables the cache entirely;
+# CI sets it for non-release builds and leaves it empty for v* release tags so
+# the attested artifacts compile clean. The dev and ci-* variant of each image
+# share one ref per image (eidola-buildcache:{server,cli,postgres}), so the
+# promotion PR (which builds the dev targets) warms the post-merge push to main
+# (which builds the ci-* targets). See .github/workflows/artifacts.yml.
+variable "CACHE_REGISTRY" {
+  default = ""
+}
+
 # Cargo profile: "release" for reproducible builds, "docker-dev" for fast iteration
 variable "CARGO_PROFILE" {
   default = "release"
@@ -31,6 +42,28 @@ target "_common" {
   attest = ["type=provenance,disabled=true"]
 }
 
+# ── Per-image cache bases ──────────────────────────────────────────────────────
+# Inherited by both the dev and ci-* variant of each image so they share one
+# registry cache ref. `ignore-error=true` keeps cache export non-fatal when the
+# run lacks registry write creds (e.g. a fork PR's read-only token). When
+# CACHE_REGISTRY is empty (local builds, release tags) both lists are empty —
+# no cache import or export.
+
+target "_cache_server" {
+  cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:server"] : []
+  cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:server,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
+}
+
+target "_cache_cli" {
+  cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:cli"] : []
+  cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:cli,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
+}
+
+target "_cache_postgres" {
+  cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:postgres"] : []
+  cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:postgres,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
+}
+
 # ── Local dev targets (compose.yaml overlay) ──────────────────────────────────
 # context and dockerfile come from compose.yaml; not repeated here.
 # For reproducible builds, use a docker-container builder with OCI output and
@@ -38,19 +71,19 @@ target "_common" {
 # (the default docker driver does not support these options).
 
 target "server" {
-  inherits = ["_common"]
+  inherits = ["_common", "_cache_server"]
   tags     = ["eidola-server:dev"]
 }
 
 target "cli" {
-  inherits   = ["_common"]
+  inherits   = ["_common", "_cache_cli"]
   context    = "."
   dockerfile = "oci/eidola-cli/Containerfile"
   tags       = ["eidola-cli:dev"]
 }
 
 target "postgres" {
-  inherits = ["_common"]
+  inherits = ["_common", "_cache_postgres"]
   tags     = ["eidola-postgres:dev"]
 }
 
@@ -84,21 +117,21 @@ target "_ci" {
 }
 
 target "ci-server" {
-  inherits   = ["_ci"]
+  inherits   = ["_ci", "_cache_server"]
   context    = "."
   dockerfile = "oci/eidola-server/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server:${t}"]
 }
 
 target "ci-cli" {
-  inherits   = ["_ci"]
+  inherits   = ["_ci", "_cache_cli"]
   context    = "."
   dockerfile = "oci/eidola-cli/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-cli:${t}"]
 }
 
 target "ci-postgres" {
-  inherits   = ["_ci"]
+  inherits   = ["_ci", "_cache_postgres"]
   context    = "."
   dockerfile = "oci/postgresql/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-postgres:${t}"]
