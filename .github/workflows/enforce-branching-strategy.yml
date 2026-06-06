@@ -1,12 +1,17 @@
 name: Enforce Branching Strategy
 
-# Enforces that the only PRs allowed into `main` are promotion PRs from this
-# repo's `next` branch. For any other PR opened against `main`, it retargets the
-# base onto `next` (feature work integrates there; `main` only advances by
-# fast-forward from `next` once the full `Build & Verify Artifacts` chain passes — see AGENTS.md
-# "Branch flow") AND fails, so it can be made a *required check* on `main`: a PR
-# that somehow stays on `main` without `next` as its head is blocked from
-# merging.
+# Convenience retargeting: any PR opened against `main` that isn't this repo's
+# `next` -> `main` promotion PR is moved onto `next`, where feature work
+# integrates (`main` only advances by fast-forward from `next` once the full
+# `Build & Verify Artifacts` chain passes — see AGENTS.md "Branch flow").
+#
+# This workflow is NOT the merge gate. Blocking a non-`next` source from merging
+# into `main` is enforced by the `Guard` job in `artifacts.yml` (Build & Verify
+# Artifacts), the required check on `main`: it fails fast (red) for any non-`next`
+# head and is never green for an invalid head, so there is no success status to
+# reuse (the concern that previously forced this job to stay red — see PR #151).
+# Because the gate lives there, this job simply ensures the base is `next` and
+# returns success; it fails only if it cannot retarget.
 #
 # Uses `pull_request_target` so the token can edit the base branch even for PRs
 # from forks. Safe here because the job never checks out or executes any
@@ -23,14 +28,14 @@ concurrency:
 permissions: {}
 
 jobs:
-  base-guard:
-    name: Base must be next
+  retarget:
+    name: Retarget onto next
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       pull-requests: write # edit the PR base branch and post an explanatory comment
     steps:
-      - name: Require this repo's next as the only source for main
+      - name: Ensure base is this repo's next
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -40,31 +45,32 @@ jobs:
         run: |
           set -euo pipefail
 
-          # A valid promotion PR is this repo's `next` -> `main` (same-repo, so a
-          # fork branch coincidentally named `next` does not qualify).
+          # The genuine promotion PR is this repo's `next` -> `main` (same-repo, so
+          # a fork branch coincidentally named `next` does not qualify). Leave its
+          # base on `main`.
           if [ "$HEAD_REF" = "next" ] && [ "$HEAD_REPO" = "$REPO" ]; then
             echo "✅ Promotion PR: ${REPO}:next -> main."
             exit 0
           fi
 
-          echo "::error::PRs into main must be this repo's 'next' -> 'main' (got head '${HEAD_REPO}:${HEAD_REF}'). Retargeting onto next."
-          gh pr edit "$PR" --repo "$REPO" --base next \
-            && gh pr comment "$PR" --repo "$REPO" --body \
-            $'👋 This PR targeted `main`, but feature work integrates on `next`. I\'ve retargeted it to `next`.\n\n**The red `Base must be next` check can be ignored.** It stays red by design on any PR that didn\'t originate from `next`. It is not a required check on `next`, so it does not block this PR.' \
-            || echo "::warning::could not retarget automatically — resolve the base manually"
+          # Any other PR: retarget onto `next`. The merge gate for `main` is the
+          # `Guard` job in artifacts.yml — never green for a non-`next` head — so
+          # this is a convenience, not a block. Return success once the base is
+          # `next`; fail only if the base could not be moved.
+          echo "PR head '${HEAD_REPO}:${HEAD_REF}' is not this repo's next; retargeting onto next."
+          if ! gh pr edit "$PR" --repo "$REPO" --base next; then
+            echo "::error::Could not retarget PR #${PR} onto next. Resolve the base manually."
+            exit 1
+          fi
 
-          # Fail even though the retarget above (probably) succeeded. Do NOT be
-          # tempted to exit 0 once the base reads as `next`: this job's success
-          # conclusion IS the required check that gates merges into `main`, and
-          # GitHub records it against the PR's *head SHA*, not its base. A green
-          # here would persist on that SHA after we move the base to `next`, and
-          # an attacker could then flip the base back to `main` and merge in the
-          # window before a fresh guard run retargets again — reusing this green
-          # plus the expensive `main` checks that already ran on the same SHA from
-          # the original `opened` event (those don't re-run on a base `edited`
-          # event, and cancel-in-progress concurrency only helps the attacker
-          # cancel the corrective run). So the ONLY path to success is the genuine
-          # `next` -> `main` promotion PR handled at the top; every other head
-          # stays red. The red is cosmetic on `next` (this check is not required
-          # there) but load-bearing on `main`.
-          exit 1
+          gh pr comment "$PR" --repo "$REPO" --body \
+            $'👋 This PR targeted `main`, but feature work integrates on `next`, so I\'ve retargeted it. `main` only advances by fast-forward from `next` once the full `Build & Verify Artifacts` chain passes (see AGENTS.md "Branch flow").' \
+            || echo "::warning::could not post retarget comment"
+
+          # Confirm the base actually moved before reporting success.
+          BASE_REF=$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName)
+          if [ "$BASE_REF" != "next" ]; then
+            echo "::error::Expected base 'next' after retarget but got '${BASE_REF}'. Resolve the base manually."
+            exit 1
+          fi
+          echo "✅ Base is now 'next'."
