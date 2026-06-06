@@ -19,8 +19,8 @@ path = "src/bin/demo.rs"
 # workspace.
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "01a116a15e9660963a2aa07d0192e38785d8b9ad" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "dadfca97fec7221acf3ce7047bccdc1eac0506b9" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "dadfca97fec7221acf3ce7047bccdc1eac0506b9" }
 
 # Local fork that exposes `Options::ENABLE_EMPTY_NESTED_LISTS`. We need
 # pulldown to parse `  - \n` (and similar empty-nested-item shapes) as
