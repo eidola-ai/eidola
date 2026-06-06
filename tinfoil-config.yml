@@ -18,7 +18,7 @@ memory: 8192
 
 containers:
   - name: "eidola-server"
-    image: "ghcr.io/eidola-ai/eidola-server@sha256:75002930562d153db63402db01e539d694510031389f9e5b4656a05b321cb19d"
+    image: "ghcr.io/eidola-ai/eidola-server@sha256:1eda0d411140f4ffda28db75adcd6a91928976928b5e8a24a4411f92f7537656"
     devices:
       - /dev/sev-guest
     secrets:
