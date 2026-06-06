@@ -24,6 +24,13 @@ gpui-component = { git = "https://github.com/eidola-ai/gpui-component", rev = "a
 gpui-component-assets = { git = "https://github.com/eidola-ai/gpui-component", rev = "ad16cd47faf14ce7d57695b84d3c9b0f4cf05a24" }
 gpui-component-macros = { git = "https://github.com/eidola-ai/gpui-component", rev = "ad16cd47faf14ce7d57695b84d3c9b0f4cf05a24" }
 
+# reqwest fork adding `TlsInfo::tls_exporter_channel_binding()` (RFC 9266
+# tls-exporter channel binding), used by `tinfoil-verifier` to bind attestation
+# to the TLS session. Tracks the upstream PR; drop this patch once it merges and
+# a release ships the accessor.
+[patch.crates-io]
+reqwest = { git = "https://github.com/eidola-ai/reqwest", rev = "7c029cc9b3f4b52134c59304c43c1bb8e7603eb3" }
+
 [profile.docker-dev]
 inherits = "dev"
 opt-level = 1

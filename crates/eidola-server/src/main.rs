@@ -263,6 +263,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             snp_observer: Some(snp_observer),
             attestation_observer: None,
             tls_roots,
+            // Transition default: enforce channel binding when the upstream
+            // enclave provides it, but don't yet hard-require it (current
+            // Tinfoil enclaves predate the binding). Flip to `true` once the
+            // upstream reliably emits the RFC 9266 tls-exporter binding.
+            require_channel_binding: false,
         })
         .await
         .map_err(|e| {

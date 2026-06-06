@@ -15,10 +15,11 @@ SEV-SNP verification is delegated to the [`sev`](https://crates.io/crates/sev) c
 1. **Fetch** the fresh nonce-bound document inline over the attested connection (backfilling the VCEK from Tinfoil's ATC service, which the document omits)
 2. **Check freshness** — the echoed nonce equals the one sent
 3. **Check the document signature** — ECDSA (P-384 prod / P-256 mock, SHA-256) by the embedded TLS leaf cert, which must match the peer cert
-4. **Verify the VCEK certificate chain** (AMD Genoa ARK → ASK → VCEK) via RSA-PSS(SHA-384) and the report signature (ECDSA-P384) against the VCEK
-5. **Validate TCB policy** — minimum firmware versions (`bl >= 0x07`, `snp >= 0x0e`, `ucode >= 0x48`)
-6. **Check the code measurement** (48-byte launch digest) against the allowlist
-7. **Cross-check `REPORT_DATA`** — equals `SHA-256(tls_key_fp ‖ hpke_key ‖ nonce ‖ …)`, where `tls_key_fp == sha256(SPKI(peer_cert))`. This binds the nonce, TLS key, and HPKE key to the AMD-signed report.
+4. **Check channel binding** — the RFC 9266 `tls-exporter` the enclave bound (when present) equals this session's exporter, defeating a MITM that holds a stolen TLS key (requires the forked reqwest exposing `TlsInfo::tls_exporter()`)
+5. **Verify the VCEK certificate chain** (AMD Genoa ARK → ASK → VCEK) via RSA-PSS(SHA-384) and the report signature (ECDSA-P384) against the VCEK
+6. **Validate TCB policy** — minimum firmware versions (`bl >= 0x07`, `snp >= 0x0e`, `ucode >= 0x48`)
+7. **Check the code measurement** (48-byte launch digest) against the allowlist
+8. **Cross-check `REPORT_DATA`** — equals `SHA-256(tls_key_fp ‖ hpke_key ‖ nonce ‖ … ‖ tls_exporter)`, where `tls_key_fp == sha256(SPKI(peer_cert))`. This binds the nonce, TLS key, HPKE key, and channel binding to the AMD-signed report.
 
 ### Intel TDX
 

@@ -93,6 +93,10 @@ pub struct ReportDataFields {
     pub gpu_evidence_hash: Option<String>,
     #[serde(default)]
     pub nvswitch_evidence_hash: Option<String>,
+    /// RFC 9266 `tls-exporter` channel binding the enclave bound into this
+    /// report. Absent on enclaves that predate channel binding.
+    #[serde(default)]
+    pub tls_exporter: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,17 +124,22 @@ pub struct ReportData {
     pub gpu_evidence_hash: Vec<u8>,
     /// Empty when the enclave reports no NVSwitch evidence.
     pub nvswitch_evidence_hash: Vec<u8>,
+    /// RFC 9266 `tls-exporter` channel binding (32 bytes), or empty when the
+    /// enclave did not bind the TLS session (predates channel binding).
+    pub tls_exporter: Vec<u8>,
 }
 
 impl ReportData {
     /// Recompute the 64-byte `REPORT_DATA` value the hardware should carry:
     ///
     /// ```text
-    /// SHA-256(tls_key_fp || hpke_key || nonce || gpu_hash || nvswitch_hash)
+    /// SHA-256(tls_key_fp || hpke_key || nonce || gpu_hash || nvswitch_hash || tls_exporter)
     /// ```
     ///
     /// padded to 64 bytes with trailing zeros. Matches upstream
-    /// `attestation.ComputeReportData`.
+    /// `attestation.ComputeReportData`. `tls_exporter` is empty (contributes
+    /// nothing) on enclaves that predate channel binding, so the value is
+    /// backward compatible.
     pub fn expected_report_data(&self) -> [u8; 64] {
         let mut h = Sha256::new();
         h.update(self.tls_key_fp);
@@ -138,6 +147,7 @@ impl ReportData {
         h.update(&self.nonce);
         h.update(&self.gpu_evidence_hash);
         h.update(&self.nvswitch_evidence_hash);
+        h.update(&self.tls_exporter);
         let digest = h.finalize();
         let mut out = [0u8; 64];
         out[..32].copy_from_slice(&digest);
@@ -327,6 +337,10 @@ pub fn parse_document(raw: &[u8]) -> Result<ResolvedAttestation, Error> {
         Some(s) if !s.is_empty() => decode_hex(s, "nvswitch_evidence_hash")?,
         _ => Vec::new(),
     };
+    let tls_exporter = match &doc.report_data.tls_exporter {
+        Some(s) if !s.is_empty() => decode_hex(s, "tls_exporter")?,
+        _ => Vec::new(),
+    };
 
     let certificate_der = pem_to_der(&doc.certificate)?;
     let signature_der = base64::Engine::decode(
@@ -349,6 +363,7 @@ pub fn parse_document(raw: &[u8]) -> Result<ResolvedAttestation, Error> {
             nonce,
             gpu_evidence_hash,
             nvswitch_evidence_hash,
+            tls_exporter,
         },
         certificate_der,
         signed_payload,
