@@ -1,12 +1,12 @@
 name: Nix Hash Suggester
 
-# Triggered by the CI workflow's completion so it can read failure logs and
+# Triggered by the Build & Verify Artifacts workflow's completion so it can read failure logs and
 # post a review back on the originating PR. workflow_run is the only event
 # that grants both. See zizmor ignore on the trigger below.
 on:
   workflow_run:
-    # This workflow runs when the workflow with the name "CI" completes.
-    workflows: ["CI"] # zizmor: ignore[dangerous-triggers]
+    # This workflow runs when the workflow with the name "Build & Verify Artifacts" completes.
+    workflows: ["Build & Verify Artifacts"] # zizmor: ignore[dangerous-triggers]
     types:
       - completed
 

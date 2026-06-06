@@ -1,0 +1,80 @@
+name: Promote next to main
+
+# Fast-forward `main` to the head of an approved, green `next` -> `main` pull
+# request when a maintainer comments `/promote` on it.
+#
+# The promotion is a plain (non-force) ref update via the Git refs API, so
+# GitHub itself rejects anything that isn't a fast-forward (HTTP 422). That
+# guarantees:
+#   * `main` only ever advances to a commit that already has `main` as an
+#     ancestor — the `main ⊆ next` invariant is preserved by construction; and
+#   * `main` lands on the *exact* `next` commit the `Build & Verify Artifacts` chain validated on this
+#     PR (the PR head SHA), not a rewritten squash/rebase commit.
+# After the push, the PR head is reachable from `main`, so GitHub marks the PR
+# merged automatically.
+#
+# Requirements:
+#   * Branch protection on `main` must require the `Build & Verify Artifacts` workflow's checks and
+#     restrict direct pushes; add this workflow's PROMOTE_TOKEN identity to the
+#     ruleset's bypass list so it can update the ref.
+#   * `PROMOTE_TOKEN` (repo/org secret) must have `contents: write` +
+#     `pull-requests: write` (a fine-grained PAT or GitHub App installation
+#     token). The default `GITHUB_TOKEN` cannot update a push-restricted branch
+#     unless `github-actions[bot]` is itself a bypass actor.
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: promote-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  promote:
+    name: Fast-forward main
+    # Only on `/promote` comments, on a PR, from someone with repo write access.
+    if: >
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/promote') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # fast-forward the main ref (effective only if the token is a bypass actor on main's ruleset)
+      pull-requests: write # comment status back on the PR
+    steps:
+      - name: Validate and fast-forward
+        env:
+          GH_TOKEN: ${{ secrets.PROMOTE_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number }}
+          ACTOR: ${{ github.event.comment.user.login }}
+        run: |
+          set -euo pipefail
+
+          # Resolve PR state. headRefOid is the exact commit CI validated.
+          eval "$(gh pr view "$PR" --repo "$REPO" \
+            --json baseRefName,headRefName,headRefOid,state,reviewDecision,isCrossRepository \
+            --jq '@sh "BASE=\(.baseRefName) HEAD=\(.headRefName) SHA=\(.headRefOid) STATE=\(.state) REVIEW=\(.reviewDecision) CROSS=\(.isCrossRepository)"')"
+
+          echo "PR #$PR: $HEAD -> $BASE @ $SHA (state=$STATE review=$REVIEW cross=$CROSS), requested by @$ACTOR"
+
+          [ "$STATE" = "OPEN" ]   || { echo "::error::PR is $STATE, not OPEN"; exit 1; }
+          [ "$BASE" = "main" ]    || { echo "::error::base is '$BASE', expected 'main'"; exit 1; }
+          [ "$HEAD" = "next" ]    || { echo "::error::head is '$HEAD', expected 'next'"; exit 1; }
+          [ "$CROSS" = "false" ]  || { echo "::error::head is a fork branch, not this repo's 'next'"; exit 1; }
+          [ "$REVIEW" = "APPROVED" ] || { echo "::error::review decision is '$REVIEW', expected APPROVED"; exit 1; }
+
+          # All required checks (i.e. the CI chain) must be green. `gh pr checks`
+          # exits 0 only when every required check has passed.
+          gh pr checks "$PR" --repo "$REPO" --required \
+            || { echo "::error::required checks are not all green"; exit 1; }
+
+          # Fast-forward main. force=false => the API refuses a non-fast-forward.
+          gh api -X PATCH "repos/$REPO/git/refs/heads/main" \
+            -f sha="$SHA" -F force=false
+
+          gh pr comment "$PR" --repo "$REPO" --body \
+            "🚀 Fast-forwarded \`main\` to \`$SHA\` (validated on this PR) at @$ACTOR's request. \`main\` remains an ancestor of \`next\`."

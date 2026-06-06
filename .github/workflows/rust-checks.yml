@@ -1,0 +1,82 @@
+name: Rust Checks
+
+# Cheap cargo gates (fmt, clippy, test, markdown lint, OpenAPI freshness). Split
+# out of the `Build & Verify Artifacts` workflow so it runs on PRs to *both*
+# `next` and `main` — that expensive chain (oci/apple/artifact-manifest) stays
+# scoped to `main`. See
+# AGENTS.md "Branch flow".
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - next
+
+# Cancel superseded PR runs; let pushes to main and tag releases finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  rust-checks:
+    name: Rust checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
+        # save-if scopes writes to main; this job only runs tests, no
+        # artifact from here is published.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: |
+          echo "::add-matcher::.github/rust-problem-matcher.json"
+          cargo clippy --all-targets -- -D warnings
+          echo "::remove-matcher owner=rust::"
+
+      - name: Markdown lint
+        # rumdl is pinned by the crates/devtools anchor crate and, locally,
+        # is on PATH via direnv (.envrc). CI deliberately doesn't install
+        # direnv (no apt in the build chain); instead it emulates .envrc —
+        # build the one tool it needs and prepend target/debug to PATH — so
+        # the `rumdl` invocation matches the local one without compiling the
+        # rest of the pinned toolset (e.g. just).
+        run: |
+          cargo build --quiet -p rumdl
+          export PATH="$PWD/target/debug:$PATH"
+          rumdl check .
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Check OpenAPI spec freshness
+        run: |
+          cargo run -q -p generate-openapi > /tmp/openapi-generated.json
+          if ! diff /tmp/openapi-generated.json crates/eidola-server/openapi.json; then
+            echo ""
+            echo "ERROR: Committed OpenAPI spec doesn't match generated one!"
+            echo "Run: just update-openapi"
+            exit 1
+          fi

@@ -1,0 +1,49 @@
+name: Branch invariant guard
+
+# Asserts the load-bearing invariant: `main` is always an ancestor of `next`
+# (`main ⊆ next`). This holds by construction — `main` only advances by
+# fast-forward to a `next` commit (see promote.yml), and `next` is force-push
+# protected — so a failure here means the discipline was broken out-of-band
+# (e.g. a direct push to `main`, or a ruleset got loosened). Investigate and
+# reconcile before promoting again.
+on:
+  push:
+    branches: [main, next]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  guard:
+    name: main is an ancestor of next
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Compare main and next
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # compare base...head: status is ahead | behind | identical | diverged.
+          # With base=main, head=next, `main ⊆ next` holds iff next is "ahead"
+          # of (or "identical" to) main.
+          STATUS=$(gh api "repos/$REPO/compare/main...next" --jq '.status')
+          AHEAD=$(gh api "repos/$REPO/compare/main...next" --jq '.ahead_by')
+          BEHIND=$(gh api "repos/$REPO/compare/main...next" --jq '.behind_by')
+          echo "main...next: status=$STATUS ahead_by=$AHEAD behind_by=$BEHIND"
+          case "$STATUS" in
+            ahead|identical)
+              echo "✅ main ⊆ next ($STATUS; next is $AHEAD commit(s) ahead)";;
+            *)
+              echo "::error::main is NOT an ancestor of next (status=$STATUS, behind_by=$BEHIND) — divergence!"
+              exit 1;;
+          esac

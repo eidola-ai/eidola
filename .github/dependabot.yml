@@ -1,8 +1,15 @@
 version: 2
 updates:
+  # All updates target `next`, not the default branch (`main`). Every change
+  # must funnel through `next` — `main` only ever advances by fast-forward to a
+  # verified `next` commit (see AGENTS.md "Branch flow"). A dependency bump
+  # merged straight to `main` would put `main` ahead of `next` and break the
+  # `main ⊆ next` invariant.
+
   # Maintain dependencies for GitHub Actions.
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: "next"
     schedule:
       interval: "weekly"
     cooldown:
@@ -16,6 +23,7 @@ updates:
   # Maintain dependencies for Rust/Cargo.
   - package-ecosystem: "cargo"
     directory: "/"
+    target-branch: "next"
     schedule:
       interval: "weekly"
     cooldown:
@@ -29,6 +37,7 @@ updates:
   # Maintain dependencies for Rust/Toolchain.
   - package-ecosystem: "rust-toolchain"
     directory: "/"
+    target-branch: "next"
     schedule:
       interval: "weekly"
     cooldown:
@@ -37,6 +46,7 @@ updates:
   # Maintain dependencies for Docker (Containerfiles).
   - package-ecosystem: "docker"
     directory: "/oci/eidola-server"
+    target-branch: "next"
     schedule:
       interval: "weekly"
     cooldown:
@@ -44,6 +54,7 @@ updates:
 
   - package-ecosystem: "docker"
     directory: "/oci/postgresql"
+    target-branch: "next"
     schedule:
       interval: "weekly"
     cooldown:
@@ -51,6 +62,7 @@ updates:
 
   - package-ecosystem: "docker"
     directory: "/oci/tinfoil-shim-mock"
+    target-branch: "next"
     schedule:
       interval: "weekly"
     cooldown:
@@ -58,6 +70,7 @@ updates:
 
   - package-ecosystem: "docker"
     directory: "/oci/stripe-cli"
+    target-branch: "next"
     schedule:
       interval: "weekly"
     cooldown:

@@ -1,0 +1,58 @@
+name: Enforce Branching Strategy
+
+# Enforces that the only PRs allowed into `main` are promotion PRs from this
+# repo's `next` branch. For any other PR opened against `main`, it retargets the
+# base onto `next` (feature work integrates there; `main` only advances by
+# fast-forward from `next` once the full `Build & Verify Artifacts` chain passes — see AGENTS.md
+# "Branch flow") AND fails, so it can be made a *required check* on `main`: a PR
+# that somehow stays on `main` without `next` as its head is blocked from
+# merging.
+#
+# Uses `pull_request_target` so the token can edit the base branch even for PRs
+# from forks. Safe here because the job never checks out or executes any
+# PR-controlled code — it only calls the GitHub API to move the base and comment.
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] -- no checkout/exec of PR code; only edits the PR base + comments via API
+    types: [opened, reopened, synchronize, edited]
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  base-guard:
+    name: Base must be next
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write # edit the PR base branch and post an explanatory comment
+    steps:
+      - name: Require this repo's next as the only source for main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+
+          # A valid promotion PR is this repo's `next` -> `main` (same-repo, so a
+          # fork branch coincidentally named `next` does not qualify).
+          if [ "$HEAD_REF" = "next" ] && [ "$HEAD_REPO" = "$REPO" ]; then
+            echo "✅ Promotion PR: ${REPO}:next -> main."
+            exit 0
+          fi
+
+          echo "::error::PRs into main must be this repo's 'next' -> 'main' (got head '${HEAD_REPO}:${HEAD_REF}'). Retargeting onto next."
+          gh pr edit "$PR" --repo "$REPO" --base next \
+            && gh pr comment "$PR" --repo "$REPO" --body \
+            "👋 This PR targeted \`main\`, but feature work integrates on \`next\` — \`main\` only advances by fast-forward from \`next\` once the full \`CI\` chain passes. I've retargeted it to \`next\`. See \`AGENTS.md\` (\"Branch flow\") for details." \
+            || echo "::warning::could not retarget automatically — resolve the base manually"
+
+          # Fail regardless: if this PR is still on `main` (retarget raced or was
+          # reverted), the required check stays red and merging is blocked.
+          exit 1
