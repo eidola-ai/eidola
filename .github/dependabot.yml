@@ -42,36 +42,3 @@ updates:
       interval: "weekly"
     cooldown:
       default-days: 7
-
-  # Maintain dependencies for Docker (Containerfiles).
-  - package-ecosystem: "docker"
-    directory: "/oci/eidola-server"
-    target-branch: "next"
-    schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
-
-  - package-ecosystem: "docker"
-    directory: "/oci/postgresql"
-    target-branch: "next"
-    schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
-
-  - package-ecosystem: "docker"
-    directory: "/oci/tinfoil-shim-mock"
-    target-branch: "next"
-    schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
-
-  - package-ecosystem: "docker"
-    directory: "/oci/stripe-cli"
-    target-branch: "next"
-    schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
