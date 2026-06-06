@@ -65,7 +65,7 @@ signature = "2"
 spki = "0.7"
 
 # CSPRNG for the per-handshake attestation nonce.
-getrandom = "0.2"
+getrandom = "0.4"
 
 # HTTP client for fetching attestation bundle
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }

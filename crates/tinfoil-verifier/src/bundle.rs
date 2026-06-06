@@ -177,7 +177,7 @@ pub(crate) const NONCE_LEN: usize = 32;
 /// Generate a fresh 32-byte attestation nonce from the OS CSPRNG.
 pub(crate) fn random_nonce() -> Result<[u8; NONCE_LEN], Error> {
     let mut nonce = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce)
+    getrandom::fill(&mut nonce)
         .map_err(|e| Error::Connector(format!("failed to generate attestation nonce: {e}")))?;
     Ok(nonce)
 }
