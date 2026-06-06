@@ -18,6 +18,47 @@ concurrency:
 permissions: {}
 
 jobs:
+  # ── Guard: gate the expensive chain (cheap ubuntu runner) ───────────────────
+  # `pull_request: [main]` would otherwise fire the full Build & Verify chain
+  # (OCI builds + a self-hosted macOS Nix build) on *every* PR opened against
+  # `main`, including stray or fork PRs that enforce-branching-strategy.yml will
+  # immediately retarget onto `next`. This cheap gate fails fast for any PR whose
+  # head is not this repo's `next`; the downstream jobs all chain off `oci` via
+  # `needs`, so they are skipped instead of burning a macOS runner. Pushes to
+  # `main` and `v*` tags always proceed. The fail (rather than skip) keeps this
+  # workflow red on non-promotion PRs, consistent with base-guard.
+  guard:
+    name: Guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require this repo's next head for PRs into main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Pushes to main and v* tags always run the full chain.
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "✅ ${EVENT_NAME} event — running full Build & Verify."
+            exit 0
+          fi
+
+          # PRs into main run the expensive chain only for this repo's genuine
+          # next -> main promotion PR (same-repo, so a fork branch coincidentally
+          # named `next` does not qualify — mirrors base-guard).
+          if [ "$HEAD_REF" = "next" ] && [ "$HEAD_REPO" = "$REPO" ]; then
+            echo "✅ Promotion PR: ${REPO}:next -> main — running full Build & Verify."
+            exit 0
+          fi
+
+          echo "::error::Build & Verify Artifacts runs only for this repo's 'next' -> 'main' promotion PR (got head '${HEAD_REPO}:${HEAD_REF}'). Failing fast to avoid the expensive OCI + macOS build; Enforce Branching Strategy will retarget this PR onto next."
+          exit 1
+
   # ── OCI images + enclave recompute (cheap ubuntu runner) ────────────────────
   # Mirrors the local `just update-manifest` two-phase flow so every
   # downstream consumer (cli OCI build, apple Nix build, artifact-manifest
@@ -39,6 +80,7 @@ jobs:
   # always internally consistent — so the PR-comment suggestion is too.
   oci:
     name: Build OCI images + recompute enclave
+    needs: guard
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
