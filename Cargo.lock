@@ -2253,7 +2253,7 @@ dependencies = [
  "serde-human-bytes",
  "serde_json",
  "sha2 0.10.9",
- "signature",
+ "signature 2.2.0",
  "urlencoding",
  "wasm-bindgen-futures",
  "x509-cert",
@@ -2273,7 +2273,7 @@ dependencies = [
  "rsa",
  "rustls-pki-types",
  "sha2 0.10.9",
- "signature",
+ "signature 2.2.0",
  "untrusted",
 ]
 
@@ -2550,7 +2550,7 @@ dependencies = [
  "digest 0.10.7",
  "elliptic-curve",
  "rfc6979",
- "signature",
+ "signature 2.2.0",
  "spki",
 ]
 
@@ -2561,7 +2561,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
  "pkcs8",
- "signature",
+ "signature 2.2.0",
 ]
 
 [[package]]
@@ -2604,7 +2604,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "signature",
+ "signature 3.0.0",
  "spki",
  "tempfile",
  "thiserror 2.0.18",
@@ -7840,7 +7840,7 @@ dependencies = [
  "pkcs8",
  "rand_core 0.6.4",
  "sha2 0.10.9",
- "signature",
+ "signature 2.2.0",
  "spki",
  "subtle",
  "zeroize",
@@ -8156,7 +8156,7 @@ dependencies = [
  "rustls-webpki 0.102.8",
  "sec1",
  "sha2 0.10.9",
- "signature",
+ "signature 2.2.0",
  "x25519-dalek",
 ]
 
@@ -8698,6 +8698,12 @@ dependencies = [
  "digest 0.10.7",
  "rand_core 0.6.4",
 ]
+
+[[package]]
+name = "signature"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 
 [[package]]
 name = "simd-adler32"
@@ -9543,7 +9549,7 @@ dependencies = [
  "serde_json",
  "sev",
  "sha2 0.10.9",
- "signature",
+ "signature 3.0.0",
  "spki",
  "thiserror 2.0.18",
  "tokio",
