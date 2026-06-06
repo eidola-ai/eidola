@@ -150,6 +150,10 @@ fn compute_tdx(kernel: &Path, initrd: &Path, cmdline: &str) -> Result<TdxMeasure
         mok_list_x: None,
         sbat_level: None,
         direct_boot: true,
+        metadata_path: Path::new(""),
+        create_acpi_table: false,
+        distribution: "",
+        qemu_version: None,
     };
 
     machine.measure_runtime().context("TDX measurement failed")
