@@ -53,6 +53,16 @@ jobs:
             "👋 This PR targeted \`main\`, but feature work integrates on \`next\` — \`main\` only advances by fast-forward from \`next\` once the full \`CI\` chain passes. I've retargeted it to \`next\`. See \`AGENTS.md\` (\"Branch flow\") for details." \
             || echo "::warning::could not retarget automatically — resolve the base manually"
 
-          # Fail regardless: if this PR is still on `main` (retarget raced or was
-          # reverted), the required check stays red and merging is blocked.
+          # Re-read the base after the retarget. If it moved off `main`, the guard
+          # did its job: the PR no longer targets `main`, so leave the check green
+          # rather than stamping a permanent red ✗ on an otherwise-valid `next` PR.
+          # Only stay red while the PR is *still* on `main` (retarget raced, was
+          # reverted, or failed) — that's the case the required check must block.
+          CURRENT_BASE="$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName)"
+          if [ "$CURRENT_BASE" != "main" ]; then
+            echo "✅ Retargeted onto '${CURRENT_BASE}'; no longer targeting main."
+            exit 0
+          fi
+
+          echo "::error::PR is still based on 'main' after retarget — keeping the required check red to block merge."
           exit 1
