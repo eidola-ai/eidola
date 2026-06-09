@@ -24,6 +24,20 @@ pub enum AppError {
     #[error("credential error: {message}")]
     Credential { message: String },
 
+    /// A chat was attempted with no usable credential and no account
+    /// configured — onboarding has not begun (or the account was reset).
+    /// Distinct from [`AppError::NotConfigured`] so UIs can route to the
+    /// account-creation step instead of a generic config error.
+    #[error("no account configured — create an account to begin")]
+    NoAccount,
+
+    /// The account exists but its available balance cannot cover the
+    /// credits required for the attempted operation. Carries both sides
+    /// of the comparison so UIs can show honest numbers and route to the
+    /// purchase step.
+    #[error("insufficient balance: {required} credits required, {available} available")]
+    InsufficientBalance { available: i64, required: i64 },
+
     /// A local database operation failed.
     #[error("database error: {message}")]
     Database { message: String },

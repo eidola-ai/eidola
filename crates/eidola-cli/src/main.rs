@@ -169,6 +169,21 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("error: {e}");
+        // The typed onboarding errors get actionable hints. (Chat
+        // auto-provisions credentials from the account balance, so these
+        // only fire when the account itself is missing or unfunded.)
+        match &e {
+            AppError::NoAccount => {
+                eprintln!("hint: run `eidola account create` to create an anonymous account");
+            }
+            AppError::InsufficientBalance { .. } => {
+                eprintln!(
+                    "hint: run `eidola account prices`, then \
+                     `eidola account checkout <price_id>` to add credit"
+                );
+            }
+            _ => {}
+        }
         std::process::exit(1);
     }
 }
