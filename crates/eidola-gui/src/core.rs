@@ -326,11 +326,17 @@ impl Core {
     }
 
     /// Refresh the cached space listing (archived spaces excluded).
+    ///
+    /// Uses `spawn_unguarded` rather than `spawn`: the shared `busy` flag
+    /// exists so settings/account views can disable their buttons during
+    /// an operation, but the Library must be able to refresh even while
+    /// some other core call (e.g. a new chat window's model fetch) is in
+    /// flight — `spawn`'s busy gate would silently drop the refresh.
     pub fn fetch_spaces(&mut self, cx: &mut Context<Self>) {
         let Some(core) = self.inner.clone() else {
             return;
         };
-        self.spawn(
+        self.spawn_unguarded(
             cx,
             move || async move { core.list_spaces(false).await },
             |this, result, cx| match result {
@@ -375,7 +381,9 @@ impl Core {
     /// Archive a space. The cached row is removed immediately (so the
     /// Library updates without waiting on the backend — and so stub-core
     /// tests can exercise the local path); the backend archive then runs
-    /// and the listing is re-fetched to reconcile.
+    /// and the listing is re-fetched to reconcile. Unguarded for the same
+    /// reason as `fetch_spaces`, but more so: a busy-gated drop here would
+    /// leave the row removed locally while the space was never archived.
     pub fn archive_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.spaces.retain(|s| s.id != space_id);
         cx.notify();
@@ -383,7 +391,7 @@ impl Core {
         let Some(core) = self.inner.clone() else {
             return;
         };
-        self.spawn(
+        self.spawn_unguarded(
             cx,
             move || async move {
                 core.archive_space(space_id).await?;
@@ -468,13 +476,41 @@ impl Core {
         if self.busy {
             return false;
         }
+        if self.inner.is_none() {
+            // Stub core (snapshot tests) — no backend to drive. Bail before
+            // touching `busy` so it never sticks on.
+            return false;
+        }
+        self.busy = true;
+        self.error_message = None;
+        cx.notify();
+
+        self.spawn_unguarded(cx, make_fut, |this, result, cx| {
+            this.busy = false;
+            on_done(this, result, cx);
+        });
+        true
+    }
+
+    /// Like `spawn`, but neither checks nor sets the shared `busy` flag.
+    /// For operations that must not be silently dropped when something
+    /// else is in flight (space listing refresh, archive).
+    fn spawn_unguarded<MakeFut, Fut, T, OnDone>(
+        &mut self,
+        cx: &mut Context<Self>,
+        make_fut: MakeFut,
+        on_done: OnDone,
+    ) -> bool
+    where
+        MakeFut: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, AppError>> + Send + 'static,
+        T: Send + 'static,
+        OnDone: FnOnce(&mut Core, Result<T, AppError>, &mut Context<Core>) + 'static,
+    {
         let Some(inner) = self.inner.as_ref() else {
             // Stub core (snapshot tests) — no backend to drive.
             return false;
         };
-        self.busy = true;
-        self.error_message = None;
-        cx.notify();
 
         let handle = inner.runtime().handle().clone();
         let (tx, rx) = oneshot::channel();
@@ -490,7 +526,6 @@ impl Core {
                 })
             });
             let _ = this.update(cx, |this, cx| {
-                this.busy = false;
                 on_done(this, result, cx);
                 cx.notify();
             });
