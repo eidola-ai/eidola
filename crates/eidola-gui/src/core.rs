@@ -81,7 +81,11 @@ impl Core {
         self.inner.clone()
     }
 
-    fn refresh_config(&mut self, cx: &mut Context<Self>) {
+    /// Re-read the config snapshot from the backend. Public so views that
+    /// drive config-mutating operations directly on `AppCore` (e.g. the
+    /// chat onboarding flow's account creation) can refresh the shared
+    /// snapshot afterwards.
+    pub fn refresh_config(&mut self, cx: &mut Context<Self>) {
         if let Some(inner) = self.inner.as_ref() {
             self.config_state = Some(inner.config_state());
             cx.notify();
@@ -273,6 +277,74 @@ impl Core {
         );
     }
 
+    /// One-shot startup fetch for a chat window: the model list, plus —
+    /// when an account is configured — balances and wallet credentials
+    /// (the inputs the onboarding state machine needs to decide between
+    /// the plans page and the normal blank page).
+    ///
+    /// Combined into a single `spawn` because `Core::spawn` debounces on
+    /// `busy`: separate sequential calls would silently drop all but the
+    /// first.
+    pub fn fetch_chat_startup(&mut self, cx: &mut Context<Self>) {
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
+        let has_account = self
+            .config_state
+            .as_ref()
+            .is_some_and(|s| s.has_account && s.has_account_secret);
+        self.spawn(
+            cx,
+            move || async move {
+                let models = core.available_models().await?;
+                let account = if has_account {
+                    let balances = core.account_balances().await?;
+                    let credentials = core.wallet_credentials().await?;
+                    Some((balances, credentials))
+                } else {
+                    None
+                };
+                Ok((models, account))
+            },
+            |this, result, cx| match result {
+                Ok((models, account)) => {
+                    this.models = models;
+                    if let Some((balances, credentials)) = account {
+                        this.balances = Some(balances);
+                        this.credentials = credentials;
+                    }
+                    cx.notify();
+                }
+                Err(e) => this.set_error(e, cx),
+            },
+        );
+    }
+
+    /// Fetch the data the onboarding plans page needs — prices and a fresh
+    /// balance snapshot — in a single `spawn` (see `fetch_chat_startup` for
+    /// why they're combined).
+    pub fn fetch_plans_data(&mut self, cx: &mut Context<Self>) {
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
+        self.spawn(
+            cx,
+            move || async move {
+                let prices = core.account_prices().await?;
+                let balances = core.account_balances().await?;
+                Ok((prices, balances))
+            },
+            |this, result, cx| match result {
+                Ok((prices, balances)) => {
+                    this.prices = prices;
+                    this.balances = Some(balances);
+                    cx.notify();
+                }
+                Err(e) => this.set_error(e, cx),
+            },
+        );
+    }
+
     pub fn allocate_credits(&mut self, credits: i64, cx: &mut Context<Self>) {
         let Some(core) = self.inner.clone() else {
             return;
@@ -378,6 +450,48 @@ impl Core {
         let (tx, rx) = oneshot::channel();
         core.runtime().handle().clone().spawn(async move {
             let res = core.chat(prompt, model, space_id).await;
+            let _ = tx.send(res);
+        });
+        rx
+    }
+
+    /// Create an anonymous account on the server. Used by the chat
+    /// window's onboarding welcome page; unlike the `create_account`
+    /// entity method, this returns the typed result so the caller owns
+    /// its own in-flight/error state and is not subject to the `busy`
+    /// debounce.
+    pub fn account_create(
+        core: Arc<AppCore>,
+    ) -> oneshot::Receiver<Result<AccountCreateResult, AppError>> {
+        let (tx, rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let res = core.account_create().await;
+            let _ = tx.send(res);
+        });
+        rx
+    }
+
+    /// Create a checkout session for `price_id` and return the URL to open
+    /// in the browser.
+    pub fn account_checkout(
+        core: Arc<AppCore>,
+        price_id: String,
+    ) -> oneshot::Receiver<Result<String, AppError>> {
+        let (tx, rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let res = core.account_checkout(price_id).await;
+            let _ = tx.send(res);
+        });
+        rx
+    }
+
+    /// Fetch the current balances. Used by the onboarding checkout poll.
+    pub fn account_balances(
+        core: Arc<AppCore>,
+    ) -> oneshot::Receiver<Result<BalancesResult, AppError>> {
+        let (tx, rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let res = core.account_balances().await;
             let _ = tx.send(res);
         });
         rx

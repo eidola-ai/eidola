@@ -20,10 +20,133 @@ use super::harness::Snapshots;
 
 pub fn register(s: &mut Snapshots) {
     register_chat(s);
+    register_onboarding(s);
     register_account(s);
     register_wallet(s);
     register_general(s);
     register_settings(s);
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding (chat window empty states)
+// ---------------------------------------------------------------------------
+
+fn register_onboarding(s: &mut Snapshots) {
+    // No account → the empty page is the welcome page.
+    s.add(
+        "onboarding_welcome",
+        size(px(705.), px(705.)),
+        |window, cx| {
+            let core = cx.new(|_| {
+                let mut c = Core::stub();
+                c.config_state = Some(stub_config_state(false));
+                c
+            });
+            cx.new(|cx| ChatView::new(core, window, cx))
+        },
+    );
+
+    // Account just created, balance known-zero → the plans page.
+    s.add(
+        "onboarding_plans",
+        size(px(705.), px(705.)),
+        |window, cx| {
+            let core = cx.new(|_| {
+                let mut c = Core::stub();
+                c.config_state = Some(stub_config_state(true));
+                c.balances = Some(BalancesResult {
+                    available: 0,
+                    pools: Vec::new(),
+                });
+                c.prices = stub_prices();
+                c
+            });
+            cx.new(|cx| ChatView::new(core, window, cx))
+        },
+    );
+
+    // Checkout URL opened — the balance poll is running.
+    s.add(
+        "onboarding_plans_waiting",
+        size(px(705.), px(705.)),
+        |window, cx| {
+            let core = cx.new(|_| {
+                let mut c = Core::stub();
+                c.config_state = Some(stub_config_state(true));
+                c.balances = Some(BalancesResult {
+                    available: 0,
+                    pools: Vec::new(),
+                });
+                c.prices = stub_prices();
+                c
+            });
+            cx.new(|cx| {
+                let mut view = ChatView::new(core, window, cx);
+                view.onboarding_mut_for_test().awaiting_checkout = true;
+                view
+            })
+        },
+    );
+
+    // A later submit failed with InsufficientBalance: the plans surface
+    // below the transcript via the error band — not a modal.
+    s.add(
+        "chat_insufficient_balance_plans",
+        size(px(705.), px(705.)),
+        |window, cx| {
+            let core = cx.new(|_| {
+                let mut c = Core::stub();
+                c.config_state = Some(stub_config_state(true));
+                c.balances = Some(BalancesResult {
+                    available: 100,
+                    pools: Vec::new(),
+                });
+                c.prices = stub_prices();
+                c
+            });
+            cx.new(|cx| {
+                let mut view = ChatView::new(core, window, cx);
+                view.set_messages_for_test(vec![SpaceMessage {
+                    role: "user".into(),
+                    content: "Can you summarize the attached design doc?".into(),
+                }]);
+                view.set_error_for_test(Some(
+                    "insufficient balance: 6200 credits required, 100 available".into(),
+                ));
+                view.show_plans_after_error = true;
+                view
+            })
+        },
+    );
+}
+
+fn stub_prices() -> Vec<PriceInfo> {
+    vec![
+        PriceInfo {
+            id: "price_starter".into(),
+            product_name: "Starter".into(),
+            product_description: Some("A month of casual questions".into()),
+            amount_display: "5.00 USD".into(),
+            recurrence: "/month".into(),
+            credits: 5_000_000,
+        },
+        PriceInfo {
+            id: "price_standard".into(),
+            product_name: "Standard".into(),
+            product_description: Some("Daily thinking, long documents".into()),
+            amount_display: "20.00 USD".into(),
+            recurrence: "/month".into(),
+            credits: 20_000_000,
+        },
+        PriceInfo {
+            id: "price_topup".into(),
+            product_name: "Top-up".into(),
+            product_description: None,
+            amount_display: "10.00 USD".into(),
+            recurrence: "".into(),
+            credits: 10_000_000,
+        },
+    ]
 }
 
 // ---------------------------------------------------------------------------

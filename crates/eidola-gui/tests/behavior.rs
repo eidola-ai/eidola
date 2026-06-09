@@ -10,8 +10,9 @@
 //!    keystrokes take in production.
 //! 4. Assert against the view/core's public state with `read_with`.
 
-use eidola_app_core::{BalancesResult, ConfigState, CredentialInfo, SpaceMessage};
-use eidola_gui::chat::{ChatView, Send};
+use eidola_app_core::error::AppError;
+use eidola_app_core::{BalancesResult, ConfigState, CredentialInfo, PriceInfo, SpaceMessage};
+use eidola_gui::chat::{ChatView, OnboardingStage, Send};
 use eidola_gui::core::Core;
 use eidola_gui::wallet::WalletView;
 use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
@@ -238,29 +239,314 @@ fn chat_renders_markdown_messages_without_panicking(cx: &mut TestAppContext) {
 }
 
 // ---------------------------------------------------------------------------
+// Onboarding state machine
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn chat_without_account_is_welcome_stage(cx: &mut TestAppContext) {
+    let core = stub_core(cx, |c| {
+        c.config_state = Some(config_state(false));
+    });
+    let (_window, view) = open_chat(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.onboarding_stage(core.read(cx), true),
+            OnboardingStage::Welcome,
+            "no account → the empty page is the welcome page"
+        );
+    });
+}
+
+#[gpui::test]
+fn welcome_begin_enters_account_creation(cx: &mut TestAppContext) {
+    let core = stub_core(cx, |c| {
+        c.config_state = Some(config_state(false));
+    });
+    let (_window, view) = open_chat(cx, &core);
+
+    // Click "Begin" (the button's on_click calls this handler). With a
+    // stub core the request can't actually start, so the observable state
+    // machine transition — `creating_account` — is the assertion target,
+    // mirroring how `chat_submit_with_prompt_appends_user_message` tests
+    // submit up to the backend guard.
+    view.update(cx, |v, cx| v.begin_onboarding(cx));
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.onboarding().creating_account,
+            "Begin must enter the in-flight account-creation state"
+        );
+        assert!(v.onboarding().create_error.is_none());
+    });
+
+    // A second click while in flight is a no-op (idempotent guard).
+    view.update(cx, |v, cx| v.begin_onboarding(cx));
+    view.read_with(cx, |v, _| assert!(v.onboarding().creating_account));
+}
+
+#[gpui::test]
+fn account_with_zero_balance_is_plans_stage(cx: &mut TestAppContext) {
+    let core = stub_core(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.balances = Some(BalancesResult {
+            available: 0,
+            pools: Vec::new(),
+        });
+    });
+    let (_window, view) = open_chat(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.onboarding_stage(core.read(cx), true),
+            OnboardingStage::Plans,
+            "account + known-zero balance + empty wallet → plans page"
+        );
+    });
+}
+
+#[gpui::test]
+fn unknown_balance_is_ready_stage(cx: &mut TestAppContext) {
+    // Balances not yet fetched (None) must NOT claim the user is unfunded —
+    // the page stays the normal blank page until the snapshot is known.
+    let core = stub_core(cx, |c| {
+        c.config_state = Some(config_state(true));
+    });
+    let (_window, view) = open_chat(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.onboarding_stage(core.read(cx), true),
+            OnboardingStage::Ready
+        );
+    });
+}
+
+#[gpui::test]
+fn wallet_credentials_bypass_plans_stage(cx: &mut TestAppContext) {
+    // Zero account balance but a spendable wallet credential → chat works,
+    // so the plans page must not appear.
+    let core = stub_core(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.balances = Some(BalancesResult {
+            available: 0,
+            pools: Vec::new(),
+        });
+        c.credentials = vec![CredentialInfo {
+            nonce: "abc".into(),
+            credits: 50_000,
+            generation: 0,
+        }];
+    });
+    let (_window, view) = open_chat(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.onboarding_stage(core.read(cx), true),
+            OnboardingStage::Ready
+        );
+    });
+}
+
+#[gpui::test]
+fn positive_balance_is_ready_stage(cx: &mut TestAppContext) {
+    let core = stub_core(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.balances = Some(BalancesResult {
+            available: 5_000_000,
+            pools: Vec::new(),
+        });
+    });
+    let (_window, view) = open_chat(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.onboarding_stage(core.read(cx), true),
+            OnboardingStage::Ready
+        );
+    });
+}
+
+#[gpui::test]
+fn composer_text_overrides_plans_stage(cx: &mut TestAppContext) {
+    // If the user has started typing, the onboarding pages must not
+    // replace the page out from under them.
+    let core = stub_core(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.balances = Some(BalancesResult {
+            available: 0,
+            pools: Vec::new(),
+        });
+    });
+    let (_window, view) = open_chat(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.onboarding_stage(core.read(cx), false),
+            OnboardingStage::Ready
+        );
+    });
+}
+
+#[gpui::test]
+fn plan_click_enters_checkout_pending(cx: &mut TestAppContext) {
+    let core = stub_core(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.balances = Some(BalancesResult {
+            available: 0,
+            pools: Vec::new(),
+        });
+        c.prices = vec![PriceInfo {
+            id: "price_basic".into(),
+            product_name: "Basic".into(),
+            product_description: None,
+            amount_display: "10.00 USD".into(),
+            recurrence: "/month".into(),
+            credits: 10_000_000,
+        }];
+    });
+    let (_window, view) = open_chat(cx, &core);
+
+    view.update(cx, |v, cx| v.begin_checkout("price_basic".into(), cx));
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.onboarding().checkout_pending.as_deref(),
+            Some("price_basic"),
+            "clicking a plan must enter the in-flight checkout state"
+        );
+    });
+}
+
+#[gpui::test]
+fn dismiss_returns_to_blank_page(cx: &mut TestAppContext) {
+    let core = stub_core(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.balances = Some(BalancesResult {
+            available: 0,
+            pools: Vec::new(),
+        });
+    });
+    let (_window, view) = open_chat(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.onboarding_stage(core.read(cx), true),
+            OnboardingStage::Plans
+        );
+    });
+
+    view.update(cx, |v, cx| v.dismiss_onboarding(cx));
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.onboarding_stage(core.read(cx), true),
+            OnboardingStage::Ready,
+            "\"I'll do this later\" must fall through to the normal blank page"
+        );
+        assert!(!v.onboarding().awaiting_checkout);
+    });
+}
+
+#[gpui::test]
+fn insufficient_balance_failure_surfaces_plans_below_transcript(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (_window, view) = open_chat(cx, &core);
+
+    view.update(cx, |v, cx| {
+        v.set_messages_for_test(vec![SpaceMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }]);
+        v.apply_chat_failure(
+            AppError::InsufficientBalance {
+                available: 100,
+                required: 6_200,
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.show_plans_after_error,
+            "InsufficientBalance must surface the plans below the transcript"
+        );
+        assert!(v.streaming.is_none());
+        // Typed routing: the transcript stays (Ready stage), no page swap.
+        assert_eq!(
+            v.onboarding_stage(core.read(cx), true),
+            OnboardingStage::Ready
+        );
+    });
+}
+
+#[gpui::test]
+fn non_balance_failure_does_not_surface_plans(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (_window, view) = open_chat(cx, &core);
+
+    view.update(cx, |v, cx| {
+        v.apply_chat_failure(
+            AppError::Network {
+                message: "request failed: connection refused".into(),
+            },
+            cx,
+        );
+    });
+
+    view.read_with(cx, |v, _| {
+        assert!(!v.show_plans_after_error);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn stub_core_with_config(cx: &mut TestAppContext) -> Entity<Core> {
+fn config_state(has_account: bool) -> ConfigState {
+    ConfigState {
+        base_url: "https://eidola.example/v1".into(),
+        has_account,
+        has_account_secret: has_account,
+        domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
+        trusted_measurements: Vec::new(),
+        has_hardware_root_ca: false,
+        has_hardware_intermediate_ca: false,
+        attestation_url: None,
+    }
+}
+
+fn stub_core(cx: &mut TestAppContext, setup: impl FnOnce(&mut Core)) -> Entity<Core> {
     cx.update(|cx| {
         cx.new(|_| {
             let mut c = Core::stub();
-            c.config_state = Some(ConfigState {
-                base_url: "https://eidola.example/v1".into(),
-                has_account: true,
-                has_account_secret: true,
-                domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
-                trusted_measurements: Vec::new(),
-                has_hardware_root_ca: false,
-                has_hardware_intermediate_ca: false,
-                attestation_url: None,
-            });
-            c.balances = Some(BalancesResult {
-                available: 0,
-                pools: Vec::new(),
-            });
+            setup(&mut c);
             c
         })
+    })
+}
+
+/// A stub core representing a funded, ready account — the fixture the
+/// plain chat tests use.
+fn stub_core_with_config(cx: &mut TestAppContext) -> Entity<Core> {
+    stub_core(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.balances = Some(BalancesResult {
+            available: 5_000_000,
+            pools: Vec::new(),
+        });
+    })
+}
+
+fn open_chat(cx: &mut TestAppContext, core: &Entity<Core>) -> (AnyWindowHandle, Entity<ChatView>) {
+    let core = core.clone();
+    open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(core.clone(), window, cx))
     })
 }
 
