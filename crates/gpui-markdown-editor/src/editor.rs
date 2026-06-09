@@ -850,6 +850,13 @@ impl Render for MarkdownEditor {
         self.style.background = theme.background;
         self.style.caret_color = theme.caret;
         self.style.selection_color = theme.selection;
+        self.style.link_color = theme.link;
+        self.style.blockquote_border_color = theme.border;
+        self.style.thematic_break_color = theme.border;
+        self.style.inline_code_background = theme.accent;
+        self.style.code_block_background = theme.muted;
+        self.style.code_block_content_background =
+            crate::style::shift_lightness(theme.muted, -0.04);
 
         // Reset per-frame state. Block elements re-populate `last_blocks`
         // during paint.
