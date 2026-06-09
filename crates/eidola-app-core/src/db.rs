@@ -818,25 +818,82 @@ pub struct SpaceRow {
     pub created_at: i64,
 }
 
-pub async fn list_spaces(conn: &Connection) -> Result<Vec<SpaceRow>, AppError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, title, created_at FROM space \
-             WHERE archived_at IS NULL \
-             ORDER BY created_at DESC",
-        )
-        .await
-        .map_err(AppError::db)?;
+/// One row of the space listing, with the cheap activity signals the UI
+/// needs to render a meaningful entry. `last_activity_at` is the max
+/// `action.created_at` in the space (falling back to the space's own
+/// `created_at` for empty spaces); `message_count` counts terminal
+/// (`complete`/`cancelled`) actions.
+pub struct SpaceListRow {
+    pub id: String,
+    pub title: Option<String>,
+    pub created_at: i64,
+    pub archived_at: Option<i64>,
+    pub last_activity_at: i64,
+    pub message_count: i64,
+}
+
+pub async fn list_spaces(
+    conn: &Connection,
+    include_archived: bool,
+) -> Result<Vec<SpaceListRow>, AppError> {
+    let filter = if include_archived {
+        ""
+    } else {
+        "WHERE s.archived_at IS NULL "
+    };
+    let sql = format!(
+        "SELECT s.id, s.title, s.created_at, s.archived_at, \
+                COALESCE(MAX(a.created_at), s.created_at) AS last_activity_at, \
+                COUNT(a.id) AS message_count \
+         FROM space s \
+         LEFT JOIN action a ON a.space_id = s.id \
+              AND a.status IN ('complete', 'cancelled') \
+         {filter}\
+         GROUP BY s.id, s.title, s.created_at, s.archived_at \
+         ORDER BY last_activity_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt.query(()).await.map_err(AppError::db)?;
     let mut results = Vec::new();
     while let Some(row) = rows.next().await.map_err(AppError::db)? {
-        results.push(SpaceRow {
+        results.push(SpaceListRow {
             id: row.get::<String>(0).map_err(AppError::db)?,
             title: row.get::<Option<String>>(1).map_err(AppError::db)?,
             created_at: row.get::<i64>(2).map_err(AppError::db)?,
+            archived_at: row.get::<Option<i64>>(3).map_err(AppError::db)?,
+            last_activity_at: row.get::<i64>(4).map_err(AppError::db)?,
+            message_count: row.get::<i64>(5).map_err(AppError::db)?,
         });
     }
     Ok(results)
+}
+
+/// First text content block of the first user_input action in a space —
+/// the raw source for the listing snippet shown for untitled spaces.
+pub async fn first_user_text(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT cb.text_content \
+             FROM action a \
+             JOIN content_block cb ON cb.action_id = a.id \
+             WHERE a.space_id = ?1 AND a.action_type = 'user_input' \
+               AND cb.block_type = 'text' \
+             ORDER BY a.created_at ASC, cb.ordinal ASC \
+             LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(row.get::<Option<String>>(0).map_err(AppError::db)?),
+    }
 }
 
 pub async fn get_space(conn: &Connection, space_id: &str) -> Result<Option<SpaceRow>, AppError> {
@@ -1118,6 +1175,116 @@ mod tests {
         let conn = db.connect().unwrap();
         initialize(&conn).await.unwrap();
         assert_eq!(get_user_version(&conn).await.unwrap(), LATEST_VERSION);
+    }
+
+    async fn add_user_action(
+        conn: &Connection,
+        space_id: &str,
+        participant_id: &str,
+        text: &str,
+        created_at: i64,
+    ) {
+        let action_id = uuid::Uuid::now_v7().to_string();
+        insert_action(
+            conn,
+            &ActionEntry {
+                id: action_id.clone(),
+                space_id: space_id.to_string(),
+                participant_id: participant_id.to_string(),
+                action_type: "user_input".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at,
+            },
+        )
+        .await
+        .unwrap();
+        insert_text_content_block(
+            conn,
+            &uuid::Uuid::now_v7().to_string(),
+            &action_id,
+            0,
+            "text",
+            text,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_spaces_reports_activity_and_excludes_archived() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+
+        // Space A: titled, two actions (latest at t=3000).
+        insert_space(&conn, "space-a", Some("Alpha"), "unlinked", 1_000)
+            .await
+            .unwrap();
+        add_user_action(&conn, "space-a", &user, "first question", 2_000).await;
+        add_user_action(&conn, "space-a", &user, "follow-up", 3_000).await;
+
+        // Space B: untitled, one action, more recent activity.
+        insert_space(&conn, "space-b", None, "unlinked", 1_500)
+            .await
+            .unwrap();
+        add_user_action(&conn, "space-b", &user, "what is a monad?", 4_000).await;
+
+        // Space C: empty (no actions yet).
+        insert_space(&conn, "space-c", None, "unlinked", 5_000)
+            .await
+            .unwrap();
+
+        // Space D: archived.
+        insert_space(&conn, "space-d", Some("Old"), "unlinked", 500)
+            .await
+            .unwrap();
+        assert!(archive_space(&conn, "space-d", 6_000).await.unwrap());
+
+        let rows = list_spaces(&conn, false).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        // Ordered by last activity, most recent first; archived excluded.
+        assert_eq!(ids, vec!["space-c", "space-b", "space-a"]);
+
+        let a = rows.iter().find(|r| r.id == "space-a").unwrap();
+        assert_eq!(a.title.as_deref(), Some("Alpha"));
+        assert_eq!(a.last_activity_at, 3_000);
+        assert_eq!(a.message_count, 2);
+        assert!(a.archived_at.is_none());
+
+        let b = rows.iter().find(|r| r.id == "space-b").unwrap();
+        assert!(b.title.is_none());
+        assert_eq!(b.last_activity_at, 4_000);
+        assert_eq!(b.message_count, 1);
+
+        // Empty space falls back to its own created_at.
+        let c = rows.iter().find(|r| r.id == "space-c").unwrap();
+        assert_eq!(c.last_activity_at, 5_000);
+        assert_eq!(c.message_count, 0);
+
+        // include_archived = true brings the archived space back.
+        let all = list_spaces(&conn, true).await.unwrap();
+        assert_eq!(all.len(), 4);
+        let d = all.iter().find(|r| r.id == "space-d").unwrap();
+        assert_eq!(d.archived_at, Some(6_000));
+
+        // Snippet source: first user text in the space.
+        assert_eq!(
+            first_user_text(&conn, "space-a").await.unwrap().as_deref(),
+            Some("first question")
+        );
+        assert_eq!(
+            first_user_text(&conn, "space-b").await.unwrap().as_deref(),
+            Some("what is a monad?")
+        );
+        assert_eq!(first_user_text(&conn, "space-c").await.unwrap(), None);
     }
 
     #[tokio::test]

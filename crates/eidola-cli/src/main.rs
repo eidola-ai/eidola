@@ -139,11 +139,22 @@ enum CredentialsCommand {
 #[derive(Subcommand)]
 enum SpacesCommand {
     /// List active conversation spaces
-    List,
+    List {
+        /// Include archived spaces
+        #[arg(long)]
+        archived: bool,
+    },
     /// Archive a conversation space
     Archive {
         /// Space ID to archive
         id: String,
+    },
+    /// Rename a conversation space
+    Rename {
+        /// Space ID to rename
+        id: String,
+        /// New title
+        title: String,
     },
 }
 
@@ -498,15 +509,24 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             Ok(())
         }
         Some(Command::Spaces { command }) => match command {
-            SpacesCommand::List => {
-                let spaces = core.list_spaces().await?;
+            SpacesCommand::List { archived } => {
+                let spaces = core.list_spaces(archived).await?;
                 if spaces.is_empty() {
                     println!("no active spaces");
                     return Ok(());
                 }
                 for s in &spaces {
-                    let title = s.title.as_deref().unwrap_or("<untitled>");
-                    println!("{}: {}", s.id, title);
+                    let title = s
+                        .title
+                        .as_deref()
+                        .or(s.snippet.as_deref())
+                        .unwrap_or("<untitled>");
+                    let marker = if s.archived_at.is_some() {
+                        " [archived]"
+                    } else {
+                        ""
+                    };
+                    println!("{}: {}{}", s.id, title, marker);
                 }
                 Ok(())
             }
@@ -517,6 +537,11 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 } else {
                     println!("space not found or already archived: {id}");
                 }
+                Ok(())
+            }
+            SpacesCommand::Rename { id, title } => {
+                core.rename_space(id.clone(), title).await?;
+                println!("renamed space {id}");
                 Ok(())
             }
         },

@@ -123,7 +123,18 @@ pub struct ChatResult {
 pub struct SpaceInfo {
     pub id: String,
     pub title: Option<String>,
+    /// First ~120 chars of the first user message in the space — the UI's
+    /// fallback line for untitled spaces. `None` for empty spaces.
+    pub snippet: Option<String>,
     pub created_at: i64,
+    /// Max `action.created_at` in the space; equals `created_at` for spaces
+    /// with no actions yet.
+    pub last_activity_at: i64,
+    /// Count of terminal (complete/cancelled) actions in the space.
+    pub message_count: i64,
+    /// When the space was archived, if it has been. Always `None` unless
+    /// listing was asked to include archived spaces.
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -714,17 +725,26 @@ impl Inner {
             .collect())
     }
 
-    async fn list_spaces(&self) -> Result<Vec<SpaceInfo>, AppError> {
+    async fn list_spaces(&self, include_archived: bool) -> Result<Vec<SpaceInfo>, AppError> {
         let db_conn = self.db_conn().await?;
-        let rows = db::list_spaces(&db_conn).await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| SpaceInfo {
+        let rows = db::list_spaces(&db_conn, include_archived).await?;
+        let mut spaces = Vec::with_capacity(rows.len());
+        for r in rows {
+            let snippet = db::first_user_text(&db_conn, &r.id)
+                .await?
+                .as_deref()
+                .and_then(snippet_of);
+            spaces.push(SpaceInfo {
                 id: r.id,
                 title: r.title,
+                snippet,
                 created_at: r.created_at,
-            })
-            .collect())
+                last_activity_at: r.last_activity_at,
+                message_count: r.message_count,
+                archived_at: r.archived_at,
+            });
+        }
+        Ok(spaces)
     }
 
     async fn get_space_messages(&self, space_id: &str) -> Result<Vec<SpaceMessage>, AppError> {
@@ -752,7 +772,11 @@ impl Inner {
         Ok(SpaceInfo {
             id: space_id,
             title: title.map(String::from),
+            snippet: None,
             created_at: now,
+            last_activity_at: now,
+            message_count: 0,
+            archived_at: None,
         })
     }
 
@@ -802,6 +826,16 @@ impl Inner {
             })
     }
 
+    async fn rename_space(&self, space_id: &str, title: &str) -> Result<(), AppError> {
+        let db_conn = self.db_conn().await?;
+        db::get_space(&db_conn, space_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            })?;
+        db::update_space_title(&db_conn, space_id, title).await
+    }
+
     async fn chat(
         &self,
         prompt: &str,
@@ -847,17 +881,18 @@ impl Inner {
             db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
 
         // Reuse existing space or create a new one
-        let space_id = if let Some(sid) = space_id {
-            db::get_space(&db_conn, sid)
-                .await?
-                .ok_or_else(|| AppError::NotConfigured {
-                    message: format!("space not found: {sid}"),
-                })?;
+        let (space_id, space_title) = if let Some(sid) = space_id {
+            let row =
+                db::get_space(&db_conn, sid)
+                    .await?
+                    .ok_or_else(|| AppError::NotConfigured {
+                        message: format!("space not found: {sid}"),
+                    })?;
             // Ensure model participant is in the space (may be new model for this space)
             let _ =
                 db::insert_space_participant(&db_conn, sid, &model_participant_id, "member", now)
                     .await; // ignore duplicate
-            sid.to_string()
+            (sid.to_string(), row.title)
         } else {
             let sid = Uuid::now_v7().to_string();
             db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
@@ -865,7 +900,7 @@ impl Inner {
                 .await?;
             db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
                 .await?;
-            sid
+            (sid, None)
         };
 
         // Load prior actions to build multi-turn context — needed both for
@@ -980,6 +1015,15 @@ impl Inner {
             prompt,
         )
         .await?;
+
+        // Auto-title: the first exchange in an untitled space names the
+        // space after the user's prompt. Purely local — no model call.
+        if space_title.is_none()
+            && prior_messages.is_empty()
+            && let Some(title) = derive_space_title(prompt)
+        {
+            db::update_space_title(&db_conn, &space_id, &title).await?;
+        }
 
         // Link to previous action as antecedent
         if let Some(ref ante_id) = last_action_id {
@@ -1271,16 +1315,17 @@ impl Inner {
         let model_participant_id =
             db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
 
-        let space_id = if let Some(sid) = space_id {
-            db::get_space(&db_conn, sid)
-                .await?
-                .ok_or_else(|| AppError::NotConfigured {
-                    message: format!("space not found: {sid}"),
-                })?;
+        let (space_id, space_title) = if let Some(sid) = space_id {
+            let row =
+                db::get_space(&db_conn, sid)
+                    .await?
+                    .ok_or_else(|| AppError::NotConfigured {
+                        message: format!("space not found: {sid}"),
+                    })?;
             let _ =
                 db::insert_space_participant(&db_conn, sid, &model_participant_id, "member", now)
                     .await;
-            sid.to_string()
+            (sid.to_string(), row.title)
         } else {
             let sid = Uuid::now_v7().to_string();
             db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
@@ -1288,7 +1333,7 @@ impl Inner {
                 .await?;
             db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
                 .await?;
-            sid
+            (sid, None)
         };
 
         let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
@@ -1398,6 +1443,15 @@ impl Inner {
             prompt,
         )
         .await?;
+
+        // Auto-title: the first exchange in an untitled space names the
+        // space after the user's prompt. Purely local — no model call.
+        if space_title.is_none()
+            && prior_messages.is_empty()
+            && let Some(title) = derive_space_title(prompt)
+        {
+            db::update_space_title(&db_conn, &space_id, &title).await?;
+        }
 
         if let Some(ref ante_id) = last_action_id {
             db::insert_action_antecedent(&db_conn, &user_action_id, ante_id, 0).await?;
@@ -1978,10 +2032,12 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    pub async fn list_spaces(&self) -> Result<Vec<SpaceInfo>, AppError> {
+    /// List spaces, most recently active first. Archived spaces are
+    /// excluded unless `include_archived` is set.
+    pub async fn list_spaces(&self, include_archived: bool) -> Result<Vec<SpaceInfo>, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.list_spaces().await })
+            .spawn(async move { inner.list_spaces(include_archived).await })
             .await
             .map_err(join_err)?
     }
@@ -2009,6 +2065,14 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.archive_space(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn rename_space(&self, space_id: String, title: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.rename_space(&space_id, &title).await })
             .await
             .map_err(join_err)?
     }
@@ -2288,6 +2352,96 @@ fn actions_to_messages(action_rows: &[db::SpaceActionRow]) -> Vec<SpaceMessage> 
     }
 
     messages
+}
+
+/// Maximum length of an auto-derived space title, in characters.
+const TITLE_MAX_CHARS: usize = 64;
+
+/// Maximum length of a listing snippet, in characters.
+const SNIPPET_MAX_CHARS: usize = 120;
+
+/// Derive a space title from the user's first prompt: take the first
+/// non-empty line, strip leading markdown block markers (headings, list
+/// bullets, blockquotes, numbered lists) and surrounding emphasis
+/// characters, then truncate to ~64 chars on a word boundary (appending an
+/// ellipsis when truncated). Returns `None` if nothing presentable is left.
+fn derive_space_title(prompt: &str) -> Option<String> {
+    let line = prompt.lines().map(str::trim).find(|l| !l.is_empty())?;
+
+    // Strip leading block markers, repeatedly — "> # Heading" etc.
+    let mut s = line;
+    loop {
+        let mut t = s.trim_start_matches(['#', '>']).trim_start();
+        // Unordered list bullets.
+        for marker in ["- ", "* ", "+ "] {
+            if let Some(rest) = t.strip_prefix(marker) {
+                t = rest.trim_start();
+            }
+        }
+        // Ordered list markers like "1. " / "12) ".
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0 {
+            let after = &t[digits..];
+            if let Some(rest) = after
+                .strip_prefix(". ")
+                .or_else(|| after.strip_prefix(") "))
+            {
+                t = rest.trim_start();
+            }
+        }
+        if t == s {
+            break;
+        }
+        s = t;
+    }
+
+    // Strip emphasis/code markers from the edges ("**Bold ask**", "`code`").
+    let s = s.trim_matches(['*', '_', '`']).trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    Some(truncate_on_word_boundary(s, TITLE_MAX_CHARS))
+}
+
+/// Snippet for the space listing: first line-collapsed ~120 chars of the
+/// given text, truncated on a word boundary. Returns `None` for
+/// whitespace-only input.
+fn snippet_of(text: &str) -> Option<String> {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(truncate_on_word_boundary(&collapsed, SNIPPET_MAX_CHARS))
+}
+
+/// Truncate `s` to at most `max_chars` characters, breaking on a word
+/// boundary where possible and appending `…` when anything was cut. The
+/// ellipsis is not counted against the budget; `max_chars` must be ≥ 1.
+fn truncate_on_word_boundary(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut count = 0usize;
+    for word in s.split_whitespace() {
+        let word_chars = word.chars().count();
+        let sep = usize::from(!out.is_empty());
+        if count + sep + word_chars > max_chars {
+            break;
+        }
+        if sep == 1 {
+            out.push(' ');
+        }
+        out.push_str(word);
+        count += sep + word_chars;
+    }
+    if out.is_empty() {
+        // Single word longer than the budget — hard-cut it.
+        out = s.chars().take(max_chars).collect();
+    }
+    out.push('…');
+    out
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -2615,5 +2769,94 @@ mod tests {
                 required: 1
             })
         ));
+    }
+
+    #[test]
+    fn derive_title_takes_first_line() {
+        assert_eq!(
+            derive_space_title("How do tides work?\n\nAnd a second question."),
+            Some("How do tides work?".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_title_skips_leading_blank_lines() {
+        assert_eq!(
+            derive_space_title("\n\n  \nActual question"),
+            Some("Actual question".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_title_strips_markdown_markers() {
+        assert_eq!(
+            derive_space_title("## A heading prompt"),
+            Some("A heading prompt".to_string())
+        );
+        assert_eq!(
+            derive_space_title("- a list item"),
+            Some("a list item".to_string())
+        );
+        assert_eq!(
+            derive_space_title("> # quoted heading"),
+            Some("quoted heading".to_string())
+        );
+        assert_eq!(
+            derive_space_title("1. first thing"),
+            Some("first thing".to_string())
+        );
+        assert_eq!(
+            derive_space_title("**Bold ask**"),
+            Some("Bold ask".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_title_truncates_on_word_boundary() {
+        let long = "Please explain in detail how the borrow checker reasons about \
+                    lifetimes when closures capture references";
+        let title = derive_space_title(long).unwrap();
+        assert!(title.ends_with('…'));
+        assert!(title.trim_end_matches('…').chars().count() <= 64);
+        // Word-boundary: must not end mid-word.
+        assert!(long.starts_with(title.trim_end_matches('…')));
+        assert!(
+            title
+                .trim_end_matches('…')
+                .ends_with(|c: char| !c.is_whitespace())
+        );
+        let kept = title.trim_end_matches('…');
+        assert!(
+            long[kept.len()..].starts_with(' '),
+            "cut mid-word: {title:?}"
+        );
+    }
+
+    #[test]
+    fn derive_title_rejects_empty_and_marker_only() {
+        assert_eq!(derive_space_title(""), None);
+        assert_eq!(derive_space_title("   \n  "), None);
+        assert_eq!(derive_space_title("###"), None);
+    }
+
+    #[test]
+    fn derive_title_hard_cuts_single_long_word() {
+        let word = "a".repeat(100);
+        let title = derive_space_title(&word).unwrap();
+        assert_eq!(title.chars().count(), 65); // 64 + ellipsis
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn snippet_collapses_whitespace_and_truncates() {
+        assert_eq!(
+            snippet_of("first line\nsecond   line"),
+            Some("first line second line".to_string())
+        );
+        assert_eq!(snippet_of("  \n \t "), None);
+        let long = "word ".repeat(60);
+        let snippet = snippet_of(&long).unwrap();
+        assert!(snippet.ends_with('…'));
+        assert!(snippet.trim_end_matches('…').chars().count() <= 120);
     }
 }
