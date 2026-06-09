@@ -19,6 +19,7 @@ A native Rust client for Eidola, built on [gpui](https://github.com/zed-industri
 | File | Window root | Purpose |
 |---|---|---|
 | `chat.rs` | `ChatView` | Main chat window — message list + input + Send action, plus the onboarding empty states (see [Onboarding](#onboarding--the-chat-windows-empty-states)) |
+| `library.rs` | `LibraryView` | Library window — table of contents of past spaces; reopen / archive |
 | `settings.rs` | `SettingsView` | Settings window — custom three-button tab strip switching between... |
 | `general.rs` | `GeneralView` | ...base URL + attestation state (read-mostly) |
 | `account.rs` | `AccountView` | ...account/balance/allocate/prices |
@@ -115,9 +116,15 @@ User-initiated submit is a special case: `submit` always sets `pending_tail = tr
 
 ## Window model
 
-**Chat windows are non-singleton.** Every `NewSpace` invocation opens a fresh `ChatView`, each owning its own `space_id` so they're independent conversations sharing the same `Core`. `open_main_window` calls `cx.activate(true)` after `cx.open_window` so a window opened from another app's context (dock right-click while a different app is foreground) brings Eidola to the front rather than opening behind.
+**Chat windows are non-singleton.** Every `NewSpace` invocation opens a fresh `ChatView` via `open_main_window` → `open_chat_window(cx, core, None)`; with `space_id: None` the view is a blank page whose space is created lazily by the first exchange (protecting the instant-⌘N pillar). The Library reopens an existing space via `open_space_window(cx, core, space_id)` (same chat window chrome, `Some(id)`): `ChatView::new` stores the id and asynchronously loads the space's persisted messages through the `Core::get_space_messages` bridge on construction, and the next submit continues that space. Opening the same space twice yields two independent windows — no dedup yet, acceptable v1. `open_chat_window` calls `cx.activate(true)` after `cx.open_window` so a window opened from another app's context (dock right-click while a different app is foreground) brings Eidola to the front rather than opening behind.
 
-**Settings is a singleton.** `AppGlobal.settings_window: Option<WindowHandle<Root>>` caches the handle, and `OpenSettings` raises the existing window via `window.activate_window()` if it's still open. Both open paths are **synchronous** (via `App::open_window`) so the cache is populated before the handler returns. Liveness is checked by matching the cached `WindowId` against `cx.windows()` (the authoritative live list) — borrowing Zed's pattern, except Zed can use `AnyWindowHandle::downcast::<SettingsWindow>` directly because their settings root is uniquely typed; ours is `gpui_component::Root` (shared with chat windows), so we match by id instead. A stale id self-heals on the next invocation — no `on_release` bookkeeping needed.
+**Settings and Library are singletons.** `AppGlobal.settings_window` / `AppGlobal.library_window` (`Option<WindowHandle<Root>>`) cache the handles, and `OpenSettings` / `OpenLibrary` raise the existing window via `window.activate_window()` if it's still open (shared helper `try_focus_existing_singleton`, parameterized over the `AppGlobal` slot). Both open paths are **synchronous** (via `App::open_window`) so the cache is populated before the handler returns. Liveness is checked by matching the cached `WindowId` against `cx.windows()` (the authoritative live list) — borrowing Zed's pattern, except Zed can use `AnyWindowHandle::downcast::<SettingsWindow>` directly because their settings root is uniquely typed; ours is `gpui_component::Root` (shared with chat windows), so we match by id instead. A stale id self-heals on the next invocation — no `on_release` bookkeeping needed. `OpenLibrary` additionally calls `core.fetch_spaces` on every invocation (not just first open) so a long-lived Library window doesn't show a stale listing.
+
+## Library — table of contents, not a sidebar
+
+`library.rs` renders the space listing as a book's table of contents (520×620 default): one column, hairline `theme.border` rules *between* entries (border-top on `idx > 0`, no boxes/cards/avatars), each row a title — or, for untitled spaces, the first-message snippet in `theme.muted_foreground` — with a right-aligned relative date ("today" / "3d ago" / "2w ago"; see `relative_date`) in `text_sm` muted. A chapter-delim-style heading ("Library", italic, between hairline rules) echoes the chat's chapter delimiters so the window reads as another page of the same book. Empty state is a single centered muted line. The data comes from `Core.spaces` (cached `SpaceInfo` list, archived excluded), refreshed via `Core::fetch_spaces`.
+
+Interactions: clicking a row opens the space (`open_space` defers `open_space_window` via `cx.defer` so the new window opens after the current update cycle); hovering a row (`hovered: Option<usize>` tracked via `on_hover`) reveals a ghost × button in a fixed-width slot (so its appearance doesn't shift the date column) that archives via `Core::archive_space` — which removes the cached row *immediately* (so the UI responds without a backend round-trip, and so stub-core tests exercise the local path) and then runs the real archive + re-fetch. The archive click calls `cx.stop_propagation()` so it doesn't also open the row. `archive` / `open_space` are public methods so behavior tests drive them directly instead of synthesizing mouse events; `set_hovered_for_test` exists for the hover snapshot.
 
 ## Edge-to-edge titlebar
 
@@ -133,17 +140,17 @@ All wired in `src/lib.rs::install_menus`, `install_keybindings`, `install_action
 ### Menus (`cx.set_menus`)
 
 - **Eidola**: About / Settings… / Hide / Hide Others / Show All / Quit
-- **File**: New Space / Close Window
+- **File**: New Space / Library… / Close Window
 - **Edit**: Undo / Redo / Cut / Copy / Paste / Select All — Cut/Copy/Paste/Select All declared via `MenuItem::os_action(_, _, OsAction::*)` so they bind to the standard macOS selectors `cut:` / `copy:` / `paste:` / `selectAll:` and route through the responder chain to whatever has focus
 - **Window**: Minimize / Zoom
 
-`cx.set_dock_menu` adds "New Space" for the dock right-click menu.
+`cx.set_dock_menu` adds "New Space" and "Library…" for the dock right-click menu.
 
 **The "Window" menu name is special.** gpui_macos detects a menu literally named `"Window"` and calls `app.setWindowsMenu_(menu)` — which is how AppKit recognizes the app as a fully-wired macOS app and reliably dispatches menu key-equivalents in edge cases (no key window after ⌘Tab back, all windows closed). The Hide / Hide Others / Show All trio play the same "I'm a real app" signaling role.
 
 ### Keybindings (`cx.bind_keys`)
 
-⌘, (Settings), ⌘N (NewSpace), ⌘W (CloseWindow), ⌘Q (Quit), ⌘H (Hide), ⌥⌘H (HideOthers), ⌘M (Minimize), and ⌘↩ for `Send` in the `ChatView` key-context.
+⌘, (Settings), ⌘N (NewSpace), ⌘L (OpenLibrary), ⌘W (CloseWindow), ⌘Q (Quit), ⌘H (Hide), ⌥⌘H (HideOthers), ⌘M (Minimize), and ⌘↩ for `Send` in the `ChatView` key-context.
 
 ### Ordering invariant
 
