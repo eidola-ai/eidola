@@ -3,7 +3,8 @@ use std::sync::Arc;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
     AccountCreateResult, AllocateResult, AppCore, BalancesResult, ChatResult, ChatStreamEvent,
-    ConfigState, CredentialInfo, InFlightCredentialInfo, ModelInfo, PriceInfo, SpaceMessage,
+    ConfigState, CredentialInfo, InFlightCredentialInfo, ModelInfo, PriceInfo, SpaceInfo,
+    SpaceMessage,
 };
 use gpui::{App, AppContext, AsyncApp, Context, Entity, Task, WeakEntity};
 use tokio::sync::{mpsc, oneshot};
@@ -26,6 +27,8 @@ pub struct Core {
     pub credentials: Vec<CredentialInfo>,
     pub spending_credentials: Vec<InFlightCredentialInfo>,
     pub models: Vec<ModelInfo>,
+    /// Cached space listing for the Library window (archived excluded).
+    pub spaces: Vec<SpaceInfo>,
 
     pub error_message: Option<String>,
     pub busy: bool,
@@ -50,6 +53,7 @@ impl Core {
             credentials: Vec::new(),
             spending_credentials: Vec::new(),
             models: Vec::new(),
+            spaces: Vec::new(),
             error_message: None,
             busy: false,
         })
@@ -67,6 +71,7 @@ impl Core {
             credentials: Vec::new(),
             spending_credentials: Vec::new(),
             models: Vec::new(),
+            spaces: Vec::new(),
             error_message: None,
             busy: false,
         }
@@ -320,6 +325,24 @@ impl Core {
         );
     }
 
+    /// Refresh the cached space listing (archived spaces excluded).
+    pub fn fetch_spaces(&mut self, cx: &mut Context<Self>) {
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
+        self.spawn(
+            cx,
+            move || async move { core.list_spaces(false).await },
+            |this, result, cx| match result {
+                Ok(s) => {
+                    this.spaces = s;
+                    cx.notify();
+                }
+                Err(e) => this.set_error(e, cx),
+            },
+        );
+    }
+
     /// Fetch the data the onboarding plans page needs — prices and a fresh
     /// balance snapshot — in a single `spawn` (see `fetch_chat_startup` for
     /// why they're combined).
@@ -347,6 +370,33 @@ impl Core {
                 Err(e) => this.set_error(e, cx),
             },
         )
+    }
+
+    /// Archive a space. The cached row is removed immediately (so the
+    /// Library updates without waiting on the backend — and so stub-core
+    /// tests can exercise the local path); the backend archive then runs
+    /// and the listing is re-fetched to reconcile.
+    pub fn archive_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.spaces.retain(|s| s.id != space_id);
+        cx.notify();
+
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
+        self.spawn(
+            cx,
+            move || async move {
+                core.archive_space(space_id).await?;
+                core.list_spaces(false).await
+            },
+            |this, result, cx| match result {
+                Ok(s) => {
+                    this.spaces = s;
+                    cx.notify();
+                }
+                Err(e) => this.set_error(e, cx),
+            },
+        );
     }
 
     pub fn allocate_credits(&mut self, credits: i64, cx: &mut Context<Self>) {

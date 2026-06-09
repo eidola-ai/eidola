@@ -6,12 +6,13 @@
 
 use eidola_app_core::{
     BalancePoolInfo, BalancesResult, ConfigState, CredentialInfo, InFlightCredentialInfo,
-    MeasurementInfo, PriceInfo, SpaceMessage,
+    MeasurementInfo, PriceInfo, SpaceInfo, SpaceMessage,
 };
 use eidola_gui::account::AccountView;
 use eidola_gui::chat::{ChatView, StreamingResponse};
 use eidola_gui::core::Core;
 use eidola_gui::general::GeneralView;
+use eidola_gui::library::LibraryView;
 use eidola_gui::settings::SettingsView;
 use eidola_gui::wallet::WalletView;
 use gpui::{App, AppContext, Entity, px, size};
@@ -21,6 +22,7 @@ use super::harness::Snapshots;
 pub fn register(s: &mut Snapshots) {
     register_chat(s);
     register_onboarding(s);
+    register_library(s);
     register_account(s);
     register_wallet(s);
     register_general(s);
@@ -42,7 +44,7 @@ fn register_onboarding(s: &mut Snapshots) {
                 c.config_state = Some(stub_config_state(false));
                 c
             });
-            cx.new(|cx| ChatView::new(core, window, cx))
+            cx.new(|cx| ChatView::new(core, None, window, cx))
         },
     );
 
@@ -61,7 +63,7 @@ fn register_onboarding(s: &mut Snapshots) {
                 c.prices = stub_prices();
                 c
             });
-            cx.new(|cx| ChatView::new(core, window, cx))
+            cx.new(|cx| ChatView::new(core, None, window, cx))
         },
     );
 
@@ -81,7 +83,7 @@ fn register_onboarding(s: &mut Snapshots) {
                 c
             });
             cx.new(|cx| {
-                let mut view = ChatView::new(core, window, cx);
+                let mut view = ChatView::new(core, None, window, cx);
                 view.onboarding_mut_for_test().awaiting_checkout = true;
                 view
             })
@@ -105,7 +107,7 @@ fn register_onboarding(s: &mut Snapshots) {
                 c
             });
             cx.new(|cx| {
-                let mut view = ChatView::new(core, window, cx);
+                let mut view = ChatView::new(core, None, window, cx);
                 view.set_messages_for_test(vec![SpaceMessage {
                     role: "user".into(),
                     content: "Can you summarize the attached design doc?".into(),
@@ -156,7 +158,7 @@ fn stub_prices() -> Vec<PriceInfo> {
 fn register_chat(s: &mut Snapshots) {
     s.add("chat_empty", size(px(900.), px(640.)), |window, cx| {
         let core = stub_core_with_config(cx);
-        cx.new(|cx| ChatView::new(core, window, cx))
+        cx.new(|cx| ChatView::new(core, None, window, cx))
     });
 
     // Narrow window — guards that the chapter delimiter tracks the prose
@@ -170,7 +172,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_core_with_config(cx);
             cx.new(|cx| {
-                let view = ChatView::new(core, window, cx);
+                let view = ChatView::new(core, None, window, cx);
                 view_with_messages(
                     view,
                     vec![
@@ -207,7 +209,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_core_with_config(cx);
             cx.new(|cx| {
-                let view = ChatView::new(core, window, cx);
+                let view = ChatView::new(core, None, window, cx);
                 view_with_messages(
                     view,
                     vec![
@@ -238,7 +240,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_core_with_config(cx);
             cx.new(|cx| {
-                let view = ChatView::new(core, window, cx);
+                let view = ChatView::new(core, None, window, cx);
                 view_with_messages(
                     view,
                     vec![
@@ -265,7 +267,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_core_with_config(cx);
             cx.new(|cx| {
-                let view = ChatView::new(core, window, cx);
+                let view = ChatView::new(core, None, window, cx);
                 view_with_messages(
                     view,
                     vec![
@@ -296,7 +298,7 @@ fn register_chat(s: &mut Snapshots) {
                 c
             });
             cx.new(|cx| {
-                let view = ChatView::new(core, window, cx);
+                let view = ChatView::new(core, None, window, cx);
                 // Push a few messages directly into the view's state so we can
                 // render the populated chat without driving any async work.
                 view_with_messages(
@@ -332,7 +334,7 @@ fn register_chat(s: &mut Snapshots) {
                 c
             });
             cx.new(|cx| {
-                let view = ChatView::new(core, window, cx);
+                let view = ChatView::new(core, None, window, cx);
                 view_with_messages(
                     view,
                     vec![
@@ -365,7 +367,7 @@ fn register_chat(s: &mut Snapshots) {
     s.add("chat_thinking", size(px(900.), px(640.)), |window, cx| {
         let core = stub_core_with_config(cx);
         cx.new(|cx| {
-            let view = ChatView::new(core, window, cx);
+            let view = ChatView::new(core, None, window, cx);
             // Empty streaming response — renders the collapsed "Thinking…"
             // header with no body yet, the moment after the user submits.
             view_streaming(view, StreamingResponse::default())
@@ -383,7 +385,7 @@ fn register_chat(s: &mut Snapshots) {
             // visible alongside the answer.
             let core = stub_core_with_config(cx);
             cx.new(|cx| {
-                let mut view = ChatView::new(core, window, cx);
+                let mut view = ChatView::new(core, None, window, cx);
                 view.set_messages_for_test(vec![
                     SpaceMessage {
                         role: "user".into(),
@@ -420,7 +422,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_core_with_config(cx);
             cx.new(|cx| {
-                let view = ChatView::new(core, window, cx);
+                let view = ChatView::new(core, None, window, cx);
                 let view = view_with_messages(
                     view,
                     vec![SpaceMessage {
@@ -450,6 +452,85 @@ fn register_chat(s: &mut Snapshots) {
             })
         },
     );
+}
+
+// ---------------------------------------------------------------------------
+// Library
+// ---------------------------------------------------------------------------
+
+fn library_space(id: &str, title: Option<&str>, snippet: Option<&str>, days_ago: i64) -> SpaceInfo {
+    let ts = eidola_app_core::now_ms() - days_ago * 24 * 60 * 60 * 1000;
+    SpaceInfo {
+        id: id.into(),
+        title: title.map(String::from),
+        snippet: snippet.map(String::from),
+        created_at: ts,
+        last_activity_at: ts,
+        message_count: 4,
+        archived_at: None,
+    }
+}
+
+fn library_core(cx: &mut App) -> Entity<Core> {
+    cx.new(|_| {
+        let mut c = Core::stub();
+        c.spaces = vec![
+            library_space("s1", Some("Tides and the moon"), None, 0),
+            library_space(
+                "s2",
+                Some("Borrow checker, closures, and lifetimes"),
+                None,
+                1,
+            ),
+            library_space(
+                "s3",
+                None,
+                Some(
+                    "what is a monad, really? I keep reading the burrito \
+                     explanations and they don't land for me",
+                ),
+                3,
+            ),
+            library_space("s4", Some("Reading list for distributed systems"), None, 12),
+            library_space(
+                "s5",
+                Some(
+                    "A very long space title that should truncate with an ellipsis \
+                      rather than wrap onto a second line",
+                ),
+                None,
+                45,
+            ),
+            library_space("s6", None, None, 400),
+        ];
+        c
+    })
+}
+
+fn register_library(s: &mut Snapshots) {
+    s.add("library_empty", size(px(520.), px(620.)), |window, cx| {
+        let core = cx.new(|_| Core::stub());
+        cx.new(|cx| LibraryView::new(core, window, cx))
+    });
+
+    s.add(
+        "library_with_spaces",
+        size(px(520.), px(620.)),
+        |window, cx| {
+            let core = library_core(cx);
+            cx.new(|cx| LibraryView::new(core, window, cx))
+        },
+    );
+
+    // Hover state: the archive × is revealed on the hovered row.
+    s.add("library_hovered", size(px(520.), px(620.)), |window, cx| {
+        let core = library_core(cx);
+        cx.new(|cx| {
+            let mut view = LibraryView::new(core, window, cx);
+            view.set_hovered_for_test(Some(1));
+            view
+        })
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -211,10 +211,27 @@ impl ChatView {
     pub fn set_error_for_test(&mut self, error: Option<String>) {
         self.error = error;
     }
+
+    /// The space this window is writing into, if one has been assigned —
+    /// either passed at construction (opened from the Library) or set when
+    /// the first exchange creates a space.
+    pub fn space_id(&self) -> Option<&str> {
+        self.space_id.as_deref()
+    }
 }
 
 impl ChatView {
-    pub fn new(core: Entity<Core>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Construct a chat view. `space_id: None` is the blank page (⌘N): a
+    /// fresh space is created lazily by the first exchange. `Some(id)`
+    /// reopens an existing space (the Library's path): its messages are
+    /// loaded asynchronously on construction and the next exchange
+    /// continues that space.
+    pub fn new(
+        core: Entity<Core>,
+        space_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // The composer is a WYSIWYG markdown editor configured to match
         // the chat transcript's prose typography (Newsreader 17px / 1.65×
         // / gentle heading scale / 1.5 rem paragraph gap), so what the
@@ -255,10 +272,35 @@ impl ChatView {
             cx.notify();
         })];
 
+        // Reopening an existing space: load its persisted messages in the
+        // background, same bridge `spawn_stream` uses for its post-stream
+        // re-fetch. Stub cores (tests) skip the load — tests preload via
+        // `set_messages_for_test`.
+        if let Some(sid) = space_id.clone()
+            && let Some(app_core) = core.read(cx).app_core()
+        {
+            let msgs_rx = Core::get_space_messages(app_core, sid);
+            cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+                let msgs = msgs_rx.await.unwrap_or_else(|_| {
+                    Err(eidola_app_core::error::AppError::Internal {
+                        message: "fetch messages task cancelled".into(),
+                    })
+                });
+                let _ = this.update(cx, |this, cx| {
+                    match msgs {
+                        Ok(messages) => this.merge_messages_from_db(messages, None),
+                        Err(e) => this.error = Some(e.to_string()),
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
         Self {
             core,
             prompt_editor,
-            space_id: None,
+            space_id,
             messages: Vec::new(),
             streaming: None,
             error: None,

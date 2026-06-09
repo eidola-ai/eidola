@@ -6,6 +6,7 @@ pub mod actions;
 pub mod chat;
 pub mod core;
 pub mod general;
+pub mod library;
 pub mod settings;
 pub mod theme;
 pub mod wallet;
@@ -18,11 +19,12 @@ use gpui_component::Root;
 use gpui_component_assets::Assets;
 
 use crate::actions::{
-    About, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenSettings, Quit, ShowAll,
-    ToggleInspector, Zoom,
+    About, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenLibrary, OpenSettings, Quit,
+    ShowAll, ToggleInspector, Zoom,
 };
 use crate::chat::ChatView;
 use crate::core::Core;
+use crate::library::LibraryView;
 use crate::settings::SettingsView;
 
 /// Application-scoped state. Stored as a gpui global so action handlers
@@ -32,9 +34,12 @@ struct AppGlobal {
     /// The single Settings window, if it's currently open. Used to enforce
     /// the macOS-typical singleton: re-invoking `OpenSettings` raises the
     /// existing window instead of opening another. We don't actively clear
-    /// this on close — `try_focus_existing_settings` checks the cached id
+    /// this on close — `try_focus_existing_singleton` checks the cached id
     /// against `cx.windows()` each time and self-heals a stale handle.
     settings_window: Option<WindowHandle<Root>>,
+    /// The single Library window, if open. Same singleton discipline as
+    /// `settings_window`.
+    library_window: Option<WindowHandle<Root>>,
 }
 
 impl gpui::Global for AppGlobal {}
@@ -72,6 +77,7 @@ pub fn run() {
         cx.set_global(AppGlobal {
             core,
             settings_window: None,
+            library_window: None,
         });
 
         // Order matters: `cx.set_menus` snapshots the keymap when it builds
@@ -119,6 +125,7 @@ fn install_menus(cx: &mut App) {
             name: "File".into(),
             items: vec![
                 MenuItem::action("New Space", NewSpace),
+                MenuItem::action("Library…", OpenLibrary),
                 MenuItem::Separator,
                 MenuItem::action("Close Window", CloseWindow),
             ],
@@ -164,14 +171,19 @@ fn install_menus(cx: &mut App) {
         },
     ]);
 
-    // Standard macOS dock menu: right-click the dock icon → "New Space".
-    cx.set_dock_menu(vec![MenuItem::action("New Space", NewSpace)]);
+    // Standard macOS dock menu: right-click the dock icon → "New Space" /
+    // "Library…".
+    cx.set_dock_menu(vec![
+        MenuItem::action("New Space", NewSpace),
+        MenuItem::action("Library…", OpenLibrary),
+    ]);
 }
 
 fn install_keybindings(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-n", NewSpace, None),
+        KeyBinding::new("cmd-l", OpenLibrary, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-h", Hide, None),
@@ -287,6 +299,20 @@ fn install_action_handlers(cx: &mut App) {
         open_main_window(cx);
     });
 
+    cx.on_action(|_: &OpenLibrary, cx: &mut App| {
+        // The listing may be stale (exchanges happen while the singleton
+        // stays open), so refresh it on every invocation — whether we're
+        // raising the existing window or opening a fresh one (which also
+        // fetches on construction; the refresh is idempotent).
+        let core = cx.global::<AppGlobal>().core.clone();
+        core.update(cx, |c, cx| c.fetch_spaces(cx));
+
+        if try_focus_existing_library(cx) {
+            return;
+        }
+        open_library_window(cx);
+    });
+
     // macOS standard App-menu actions. Without these registered, AppKit
     // may treat the app menu as incomplete in the no-window-focused state
     // and skip menu-equivalent dispatch.
@@ -345,19 +371,22 @@ fn install_action_handlers(cx: &mut App) {
     // the menu when no window is open, which is the correct behavior.
 }
 
-/// Try to bring the existing Settings window forward. Returns `true` if a
-/// live Settings window was raised, `false` otherwise.
+/// Try to bring an existing singleton window (Settings, Library) forward.
+/// Returns `true` if a live window was raised, `false` otherwise.
 ///
 /// The liveness check matches the cached id against `cx.windows()` — the
 /// authoritative list of live windows. (We can't use the cleaner Zed-style
-/// `cx.windows().find_map(downcast::<SettingsView>)` because both our
-/// chat and settings windows wrap their views in `gpui_component::Root`,
-/// which is required by `Root::read` calls inside the `Input` widget — so
-/// they're not distinguishable by root view type.) A stale id self-heals
-/// here: if the cached window was closed, the containment check fails and
-/// we clear the cache.
-fn try_focus_existing_settings(cx: &mut App) -> bool {
-    let Some(handle) = cx.global::<AppGlobal>().settings_window else {
+/// `cx.windows().find_map(downcast::<SettingsView>)` because all of our
+/// windows wrap their views in `gpui_component::Root`, which is required by
+/// `Root::read` calls inside the `Input` widget — so they're not
+/// distinguishable by root view type.) A stale id self-heals here: if the
+/// cached window was closed, the containment check fails and we clear the
+/// cache.
+fn try_focus_existing_singleton(
+    cx: &mut App,
+    slot: impl Fn(&mut AppGlobal) -> &mut Option<WindowHandle<Root>>,
+) -> bool {
+    let Some(handle) = *slot(cx.global_mut::<AppGlobal>()) else {
         return false;
     };
     let alive = cx
@@ -365,13 +394,21 @@ fn try_focus_existing_settings(cx: &mut App) -> bool {
         .iter()
         .any(|w| w.window_id() == handle.window_id());
     if !alive {
-        cx.global_mut::<AppGlobal>().settings_window = None;
+        *slot(cx.global_mut::<AppGlobal>()) = None;
         return false;
     }
     handle
         .update(cx, |_, window, _| window.activate_window())
         .ok();
     true
+}
+
+fn try_focus_existing_settings(cx: &mut App) -> bool {
+    try_focus_existing_singleton(cx, |g| &mut g.settings_window)
+}
+
+fn try_focus_existing_library(cx: &mut App) -> bool {
+    try_focus_existing_singleton(cx, |g| &mut g.library_window)
 }
 
 /// Edge-to-edge titlebar: macOS extends the content view under the
@@ -401,7 +438,18 @@ fn centered_window_bounds(cx: &mut App, w: f32, h: f32) -> Option<WindowBounds> 
 
 fn open_main_window(cx: &mut App) {
     let core = cx.global::<AppGlobal>().core.clone();
+    open_chat_window(cx, core, None);
+}
 
+/// Open a chat window onto an existing space. Public-to-the-crate entry
+/// used by the Library; takes the core explicitly (instead of reading
+/// `AppGlobal`) so view code and tests can call it without the global
+/// installed.
+pub fn open_space_window(cx: &mut App, core: Entity<Core>, space_id: String) {
+    open_chat_window(cx, core, Some(space_id));
+}
+
+fn open_chat_window(cx: &mut App, core: Entity<Core>, space_id: Option<String>) {
     // Square chat window. Side = 90% of the smaller display dimension,
     // capped at 800px. A square frames the chat as a writing surface —
     // a sheet of paper, not a wide chat pane — and the cap keeps the
@@ -428,7 +476,7 @@ fn open_main_window(cx: &mut App) {
 
     let _ = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        let view = cx.new(|cx| ChatView::new(core.clone(), window, cx));
+        let view = cx.new(|cx| ChatView::new(core.clone(), space_id.clone(), window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
 
@@ -437,6 +485,32 @@ fn open_main_window(cx: &mut App) {
     // right-click menu while a different app is foreground). `focus: true`
     // in WindowOptions makes the window key within our app, but doesn't
     // by itself activate the app vs other apps.
+    cx.activate(true);
+}
+
+/// Open the Library window — a singleton like Settings. Sized as a tall,
+/// narrow page: a table of contents, not a browser.
+fn open_library_window(cx: &mut App) {
+    let core = cx.global::<AppGlobal>().core.clone();
+    let bounds = centered_window_bounds(cx, 520., 620.);
+
+    let opts = WindowOptions {
+        window_bounds: bounds,
+        titlebar: Some(transparent_titlebar()),
+        kind: WindowKind::Normal,
+        window_min_size: Some(size(px(380.), px(320.))),
+        ..Default::default()
+    };
+
+    let handle = cx.open_window(opts, |window, cx| {
+        theme::observe_window_appearance(window);
+        let view = cx.new(|cx| LibraryView::new(core.clone(), window, cx));
+        cx.new(|cx| Root::new(view, window, cx))
+    });
+
+    if let Ok(handle) = handle {
+        cx.global_mut::<AppGlobal>().library_window = Some(handle);
+    }
     cx.activate(true);
 }
 

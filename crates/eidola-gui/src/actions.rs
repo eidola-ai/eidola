@@ -13,6 +13,10 @@ actions!(
         /// are independent conversations sharing the same `Core`. Bound to
         /// ⌘N on macOS.
         NewSpace,
+        /// Show the Library window — the table of contents of past spaces.
+        /// Bound to ⌘L on macOS. Singleton, like Settings: re-invoking
+        /// raises the existing window.
+        OpenLibrary,
         /// Close the focused window (chat or settings). Bound to ⌘W on
         /// macOS. Closing the last chat window does not quit the app —
         /// that's ⌘Q.
