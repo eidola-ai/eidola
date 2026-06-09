@@ -77,6 +77,10 @@ for i in $(seq 1 30); do
 done
 
 echo "==> Applying schema (if not already present)..."
+docker compose exec -T postgres psql -U eidola -d eidola \
+    -v ON_ERROR_STOP=1 \
+    -c "ALTER ROLE eidola IN DATABASE eidola SET search_path = public" -q
+
 SCHEMA_PRESENT=$(
     docker compose exec -T postgres psql -U eidola -d eidola -tAc \
         "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='account'" \
@@ -84,7 +88,9 @@ SCHEMA_PRESENT=$(
 )
 if [ -z "$SCHEMA_PRESENT" ]; then
     docker compose exec -T postgres psql -U eidola -d eidola \
-        -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/schema.sql -q
+        -v ON_ERROR_STOP=1 \
+        -c "SET search_path TO public" \
+        -f /docker-entrypoint-initdb.d/schema.sql -q
 else
     echo "    schema already applied; skipping (run \`just db-reset\` to recreate)"
 fi

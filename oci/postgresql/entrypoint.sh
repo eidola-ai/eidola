@@ -25,12 +25,15 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
     createdb -U "$POSTGRES_USER" "$POSTGRES_DB"
   fi
 
-  # Create the eidola schema and run init scripts within it
-  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE SCHEMA IF NOT EXISTS eidola;"
+  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -c "ALTER ROLE \"$POSTGRES_USER\" IN DATABASE \"$POSTGRES_DB\" SET search_path = public;"
+
+  # Run init scripts in Postgres' default public schema.
   for f in /docker-entrypoint-initdb.d/*.sql; do
     if [ -f "$f" ]; then
       echo "Running init script: $f"
-      PGOPTIONS="-c search_path=eidola" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f "$f"
+      psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+        -c "SET search_path TO public" -f "$f"
     fi
   done
 
