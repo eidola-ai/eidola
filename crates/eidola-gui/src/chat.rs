@@ -1500,6 +1500,15 @@ fn composer_markdown_style(cx: &gpui::App) -> MarkdownStyle {
             3 => base * 1.125,
             _ => base,
         })
+        // Inline code shares its shaped line with Newsreader body text, and
+        // gpui can't size a single run independently (`TextRun` has no font
+        // size), so the ~0.9× inline-code size good typography wants is
+        // approximated by *family* instead: Courier New's x-height (0.423 em)
+        // matches Newsreader's (0.426 em) almost exactly, where the theme's
+        // Menlo (0.547 em) reads ~28% larger than the surrounding words.
+        // Fenced code blocks keep Menlo — they're whole lines of mono with no
+        // serif neighbors, so density and clarity win there.
+        .inline_code_font_family("Courier New")
 }
 
 /// `TextViewStyle` for chat message bodies. Settings:
