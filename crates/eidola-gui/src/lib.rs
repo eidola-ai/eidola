@@ -3,20 +3,22 @@
 
 pub mod account;
 pub mod actions;
+pub mod bridge;
 pub mod chat;
-pub mod core;
 pub mod general;
 pub mod library;
+pub mod loadable;
 mod plans;
 pub mod record;
 pub mod settings;
+pub mod stores;
 pub mod theme;
 pub mod updates;
 pub mod wallet;
 
 use gpui::{
-    App, AppContext, Bounds, Entity, KeyBinding, Menu, MenuItem, OsAction, TitlebarOptions,
-    WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px, size,
+    App, AppContext, Bounds, KeyBinding, Menu, MenuItem, OsAction, TitlebarOptions, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions, point, px, size,
 };
 use gpui_component::Root;
 use gpui_component_assets::Assets;
@@ -26,16 +28,16 @@ use crate::actions::{
     OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
 };
 use crate::chat::ChatView;
-use crate::core::Core;
 use crate::library::LibraryView;
 use crate::record::RecordView;
 use crate::settings::SettingsView;
+use crate::stores::Stores;
 use crate::updates::UpdatesView;
 
 /// Application-scoped state. Stored as a gpui global so action handlers
 /// (which only get `&mut App`) can reach it.
 struct AppGlobal {
-    core: Entity<Core>,
+    stores: Stores,
     /// The single Settings window, if it's currently open. Used to enforce
     /// the macOS-typical singleton: re-invoking `OpenSettings` raises the
     /// existing window instead of opening another. We don't actively clear
@@ -76,17 +78,32 @@ pub fn run() {
         gpui_component::init(cx);
         theme::install(cx);
 
-        let core = Core::new(cx);
+        let stores = Stores::new(cx);
+
+        // The single app-lifetime bus bridge: forwards every app-core
+        // `Change` into a gpui main-thread loop that dispatches to the
+        // stores (the only place tokio receivers touch gpui). Install it
+        // before the startup refreshes so nothing committed during them is
+        // missed.
+        stores::install_bus_bridge(&stores, cx);
+
+        // Startup refreshes — each in its own store task slot, no shared
+        // busy flag, so none can starve another (the wave-2 launch-order
+        // bug is fixed structurally: the model list refresh cannot be
+        // dropped by an in-flight wallet recovery).
+        stores.models.update(cx, |s, cx| s.refresh(cx));
+        stores.spaces.update(cx, |s, cx| s.refresh(cx));
 
         // Best-effort recovery of any in-flight credentials left over from a
-        // previous run that crashed mid-spend. Fires-and-forgets — the result
-        // surfaces on the wallet view next time the user opens it.
-        core.update(cx, |c, cx| {
-            c.recover_spending_credentials(cx, |_, _, _| {});
+        // previous run that crashed mid-spend. Owned by the WalletStore; the
+        // result surfaces on the wallet view next time the user opens it.
+        stores.wallet.update(cx, |s, cx| {
+            s.refresh(cx);
+            s.recover(cx, |_, _, _| {});
         });
 
         cx.set_global(AppGlobal {
-            core: core.clone(),
+            stores: stores.clone(),
             settings_window: None,
             library_window: None,
             updates_window: None,
@@ -97,7 +114,7 @@ pub fn run() {
         // every ~6h while running (tokio task on the core's runtime). A
         // result that lands while no Updates window is open is reflected
         // the next time one opens — no banners in chat windows.
-        core.read(cx).start_update_polling();
+        stores.update.read(cx).start_polling();
 
         // Order matters: `cx.set_menus` snapshots the keymap when it builds
         // NSMenuItems and attaches each item's `keyEquivalent` from
@@ -330,8 +347,8 @@ fn install_action_handlers(cx: &mut App) {
         // construction, and raising an existing window re-checks here so
         // the user always gets a live answer.
         if try_focus_existing_updates(cx) {
-            let core = cx.global::<AppGlobal>().core.clone();
-            core.update(cx, |c, cx| c.check_for_updates(cx));
+            let update = cx.global::<AppGlobal>().stores.update.clone();
+            update.update(cx, |s, cx| s.check_now(cx));
             return;
         }
         open_updates_window(cx);
@@ -346,8 +363,8 @@ fn install_action_handlers(cx: &mut App) {
         // stays open), so refresh it on every invocation — whether we're
         // raising the existing window or opening a fresh one (which also
         // fetches on construction; the refresh is idempotent).
-        let core = cx.global::<AppGlobal>().core.clone();
-        core.update(cx, |c, cx| c.fetch_spaces(cx));
+        let spaces = cx.global::<AppGlobal>().stores.spaces.clone();
+        spaces.update(cx, |s, cx| s.refresh(cx));
 
         if try_focus_existing_library(cx) {
             return;
@@ -498,19 +515,19 @@ fn centered_window_bounds(cx: &mut App, w: f32, h: f32) -> Option<WindowBounds> 
 }
 
 fn open_main_window(cx: &mut App) {
-    let core = cx.global::<AppGlobal>().core.clone();
-    open_chat_window(cx, core, None);
+    let stores = cx.global::<AppGlobal>().stores.clone();
+    open_chat_window(cx, stores, None);
 }
 
 /// Open a chat window onto an existing space. Public-to-the-crate entry
-/// used by the Library; takes the core explicitly (instead of reading
+/// used by the Library; takes the stores explicitly (instead of reading
 /// `AppGlobal`) so view code and tests can call it without the global
 /// installed.
-pub fn open_space_window(cx: &mut App, core: Entity<Core>, space_id: String) {
-    open_chat_window(cx, core, Some(space_id));
+pub fn open_space_window(cx: &mut App, stores: Stores, space_id: String) {
+    open_chat_window(cx, stores, Some(space_id));
 }
 
-fn open_chat_window(cx: &mut App, core: Entity<Core>, space_id: Option<String>) {
+fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
     // Square chat window. Side = 90% of the smaller display dimension,
     // capped at 800px. A square frames the chat as a writing surface —
     // a sheet of paper, not a wide chat pane — and the cap keeps the
@@ -537,7 +554,7 @@ fn open_chat_window(cx: &mut App, core: Entity<Core>, space_id: Option<String>) 
 
     let _ = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        let view = cx.new(|cx| ChatView::new(core.clone(), space_id.clone(), window, cx));
+        let view = cx.new(|cx| ChatView::new(stores.clone(), space_id.clone(), window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
 
@@ -552,7 +569,7 @@ fn open_chat_window(cx: &mut App, core: Entity<Core>, space_id: Option<String>) 
 /// Open the Library window — a singleton like Settings. Sized as a tall,
 /// narrow page: a table of contents, not a browser.
 fn open_library_window(cx: &mut App) {
-    let core = cx.global::<AppGlobal>().core.clone();
+    let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 520., 620.);
 
     let opts = WindowOptions {
@@ -565,7 +582,7 @@ fn open_library_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        let view = cx.new(|cx| LibraryView::new(core.clone(), window, cx));
+        let view = cx.new(|cx| LibraryView::new(stores.clone(), window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
 
@@ -578,7 +595,7 @@ fn open_library_window(cx: &mut App) {
 /// Open the Updates window — a small singleton (Eidola menu → "Check for
 /// Updates…", standard macOS placement under "About Eidola").
 fn open_updates_window(cx: &mut App) {
-    let core = cx.global::<AppGlobal>().core.clone();
+    let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 480., 360.);
 
     let opts = WindowOptions {
@@ -591,7 +608,7 @@ fn open_updates_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        let view = cx.new(|cx| UpdatesView::new(core.clone(), window, cx));
+        let view = cx.new(|cx| UpdatesView::new(stores.clone(), window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
 
@@ -605,7 +622,7 @@ fn open_updates_window(cx: &mut App) {
 /// requests, spending). Singleton like Settings/Library; sized wide because
 /// its rows are mono request lines, not prose.
 fn open_record_window(cx: &mut App) {
-    let core = cx.global::<AppGlobal>().core.clone();
+    let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 860., 640.);
 
     let opts = WindowOptions {
@@ -618,7 +635,7 @@ fn open_record_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        let view = cx.new(|cx| RecordView::new(core.clone(), window, cx));
+        let view = cx.new(|cx| RecordView::new(stores.clone(), window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
 
@@ -629,7 +646,7 @@ fn open_record_window(cx: &mut App) {
 }
 
 fn open_settings_window(cx: &mut App) {
-    let core = cx.global::<AppGlobal>().core.clone();
+    let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 620., 520.);
 
     let opts = WindowOptions {
@@ -642,7 +659,7 @@ fn open_settings_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        let view = cx.new(|cx| SettingsView::new(core.clone(), window, cx));
+        let view = cx.new(|cx| SettingsView::new(stores.clone(), window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
 

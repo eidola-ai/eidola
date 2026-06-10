@@ -25,7 +25,7 @@ use gpui_component::{
 };
 
 use crate::actions::CloseWindow;
-use crate::core::Core;
+use crate::stores::{Stores, UpdateStore};
 
 /// Vertical reserve under the transparent titlebar so the traffic lights
 /// don't land on content (same rationale as `chat::TITLE_BAR_RESERVE`).
@@ -66,39 +66,40 @@ pub enum UpdatesDisplay {
 }
 
 pub struct UpdatesView {
-    core: Entity<Core>,
+    update: Entity<UpdateStore>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
 impl UpdatesView {
-    pub fn new(core: Entity<Core>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let update = stores.update.clone();
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
-        let _subscriptions = vec![cx.observe(&core, |_, _, cx| cx.notify())];
+        let _subscriptions = vec![cx.observe(&update, |_, _, cx| cx.notify())];
 
         // Reflect any background-poll result that landed while no window
         // was open, then run a fresh check — opening this window *is* the
-        // manual check gesture. Both are no-ops on stub cores.
-        core.update(cx, |c, cx| {
-            c.load_last_update_check(cx);
-            c.check_for_updates(cx);
+        // manual check gesture. Both are no-ops on stub stores.
+        update.update(cx, |s, cx| {
+            s.load_last(cx);
+            s.check_now(cx);
         });
 
         Self {
-            core,
+            update,
             focus_handle,
             _subscriptions,
         }
     }
 
-    /// Derive the display state from the core's cached update state. An
+    /// Derive the display state from the store's cached update state. An
     /// in-flight check only masks the page when there is nothing else to
     /// show; otherwise the last result stays up with a "Checking…" hint.
-    pub fn derive_display(core: &Core) -> UpdatesDisplay {
-        let Some(snapshot) = core.update_check.as_ref() else {
-            return if core.update_checking {
+    pub fn derive_display(store: &UpdateStore) -> UpdatesDisplay {
+        let Some(snapshot) = store.snapshot() else {
+            return if store.checking() {
                 UpdatesDisplay::Checking
             } else {
                 UpdatesDisplay::NoneYet
@@ -137,12 +138,12 @@ impl UpdatesView {
 
     /// Current display state — what behavior tests assert against.
     pub fn display(&self, cx: &gpui::App) -> UpdatesDisplay {
-        Self::derive_display(self.core.read(cx))
+        Self::derive_display(self.update.read(cx))
     }
 
     /// Run a manual check now. Public so tests drive it directly.
     pub fn check_now(&mut self, cx: &mut Context<Self>) {
-        self.core.update(cx, |c, cx| c.check_for_updates(cx));
+        self.update.update(cx, |s, cx| s.check_now(cx));
     }
 
     /// The explicit "treat as update" action for a claims-changed release:
@@ -152,8 +153,8 @@ impl UpdatesView {
         let UpdatesDisplay::ClaimsChanged { release, .. } = self.display(cx) else {
             return;
         };
-        self.core.update(cx, |c, cx| {
-            c.accept_changed_claims(release.version.clone(), release.manifest_sha256.clone(), cx)
+        self.update.update(cx, |s, cx| {
+            s.accept_changed_claims(release.version.clone(), release.manifest_sha256.clone(), cx)
         });
     }
 
@@ -181,7 +182,7 @@ impl Render for UpdatesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let display = self.display(cx);
-        let checking = self.core.read(cx).update_checking;
+        let checking = self.update.read(cx).checking();
 
         let body: gpui::AnyElement = match &display {
             UpdatesDisplay::Checking => render_checking(cx).into_any_element(),

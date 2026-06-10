@@ -22,28 +22,33 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::core::Core;
 use crate::plans::format_credits;
+use crate::stores::WalletStore;
 
 pub struct WalletView {
-    core: Entity<Core>,
+    wallet: Entity<WalletStore>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl WalletView {
-    pub fn new(core: Entity<Core>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let _subscriptions = vec![cx.observe(&core, |_, _, cx| cx.notify())];
-        core.update(cx, |c, cx| c.fetch_wallet(cx));
+    pub fn new(
+        stores: crate::stores::Stores,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let wallet = stores.wallet.clone();
+        let _subscriptions = vec![cx.observe(&wallet, |_, _, cx| cx.notify())];
+        wallet.update(cx, |s, cx| s.refresh(cx));
         Self {
-            core,
+            wallet,
             _subscriptions,
         }
     }
 
     fn recover_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let weak_window = window.window_handle();
-        self.core.update(cx, |c, cx| {
-            c.recover_spending_credentials(cx, move |_, recovered, cx| {
+        self.wallet.update(cx, |s, cx| {
+            s.recover(cx, move |_, recovered, cx| {
                 let message = if recovered.is_empty() {
                     "No credentials could be recovered.".to_string()
                 } else {
@@ -126,9 +131,10 @@ impl WalletView {
 impl Render for WalletView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let core_ref = self.core.read(cx);
-        let busy = core_ref.busy;
-        let rows = core_ref.credential_lifecycle.clone();
+        let store = self.wallet.read(cx);
+        let busy = store.is_loading();
+        let error = store.lifecycle().error().map(|e| e.to_string());
+        let rows = store.lifecycle_rows().to_vec();
         let any_spending = rows.iter().any(|r| r.state == "spending");
 
         let mut col = v_flex().px_6().py_5().gap_3().w_full();
@@ -158,7 +164,7 @@ impl Render for WalletView {
                 .small()
                 .label("Refresh")
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.core.update(cx, |c, cx| c.fetch_wallet(cx));
+                    this.wallet.update(cx, |s, cx| s.refresh(cx));
                 })),
         );
         header = header.child(actions);
@@ -185,12 +191,12 @@ impl Render for WalletView {
             col = col.child(list);
         }
 
-        if let Some(err) = core_ref.error_message.as_deref() {
+        if let Some(err) = error {
             col = col.child(
                 div()
                     .text_sm()
                     .text_color(theme.danger)
-                    .child(SharedString::from(err.to_string())),
+                    .child(SharedString::from(err)),
             );
         }
 

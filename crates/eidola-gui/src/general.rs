@@ -24,10 +24,10 @@ use gpui_component::{
 };
 
 use crate::actions::OpenRecord;
-use crate::core::Core;
+use crate::stores::ConfigStore;
 
 pub struct GeneralView {
-    core: Entity<Core>,
+    config: Entity<ConfigStore>,
     base_url_state: Entity<InputState>,
     /// Whether the Base URL row is in its edit state (input + save/cancel).
     editing_base_url: bool,
@@ -38,11 +38,10 @@ pub struct GeneralView {
 }
 
 impl GeneralView {
-    pub fn new(core: Entity<Core>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let initial = core
+    pub fn new(config: Entity<ConfigStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let initial = config
             .read(cx)
-            .config_state
-            .as_ref()
+            .state()
             .map(|s| s.base_url.clone())
             .unwrap_or_default();
 
@@ -52,10 +51,10 @@ impl GeneralView {
                 .default_value(&initial)
         });
 
-        let _subscriptions = vec![cx.observe(&core, |_, _, cx| cx.notify())];
+        let _subscriptions = vec![cx.observe(&config, |_, _, cx| cx.notify())];
 
         Self {
-            core,
+            config,
             base_url_state,
             editing_base_url: false,
             advanced: false,
@@ -84,10 +83,9 @@ impl GeneralView {
     /// resolved value.
     pub fn begin_edit_base_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self
-            .core
+            .config
             .read(cx)
-            .config_state
-            .as_ref()
+            .state()
             .map(|s| s.base_url.clone())
             .unwrap_or_default();
         self.base_url_state.update(cx, |s, cx| {
@@ -109,17 +107,12 @@ impl GeneralView {
         if value.is_empty() {
             return;
         }
-        let pin = self
-            .core
-            .read(cx)
-            .config_state
-            .as_ref()
-            .map(|s| s.base_url_pin.clone());
-        self.core.update(cx, |core, cx| {
+        let pin = self.config.read(cx).state().map(|s| s.base_url_pin.clone());
+        self.config.update(cx, |c, cx| {
             if pin.as_deref() == Some(value.as_str()) {
-                core.clear_base_url_override(cx);
+                c.clear_base_url_override(cx);
             } else {
-                core.set_base_url(value, cx);
+                c.set_base_url(value, cx);
             }
         });
         self.editing_base_url = false;
@@ -128,8 +121,8 @@ impl GeneralView {
 
     /// One-click revert from an override back to the built-in pin.
     pub fn revert_base_url(&mut self, cx: &mut Context<Self>) {
-        self.core
-            .update(cx, |core, cx| core.clear_base_url_override(cx));
+        self.config
+            .update(cx, |c, cx| c.clear_base_url_override(cx));
         self.editing_base_url = false;
         cx.notify();
     }
@@ -138,9 +131,9 @@ impl GeneralView {
 impl Render for GeneralView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let core = self.core.read(cx);
-        let state = core.config_state.clone();
-        let error = core.error_message.clone();
+        let store = self.config.read(cx);
+        let state = store.state().cloned();
+        let error = store.error().map(|e| e.to_string());
 
         let mut col = v_flex()
             .id("general-pane")

@@ -20,7 +20,7 @@ use gpui_component::{
 };
 
 use crate::actions::CloseWindow;
-use crate::core::Core;
+use crate::stores::{SpacesStore, Stores};
 
 /// Vertical reserve under the macOS traffic lights — same pattern as
 /// `chat::TITLE_BAR_RESERVE` (the window uses the shared transparent
@@ -31,7 +31,8 @@ const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 
 pub struct LibraryView {
-    core: Entity<Core>,
+    stores: Stores,
+    spaces: Entity<SpacesStore>,
     /// Index of the row currently under the pointer, for the hover-revealed
     /// archive affordance.
     hovered: Option<usize>,
@@ -42,15 +43,17 @@ pub struct LibraryView {
 }
 
 impl LibraryView {
-    pub fn new(core: Entity<Core>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let _subscriptions = vec![cx.observe(&core, |_, _, cx| cx.notify())];
-        core.update(cx, |c, cx| c.fetch_spaces(cx));
+    pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let spaces = stores.spaces.clone();
+        let _subscriptions = vec![cx.observe(&spaces, |_, _, cx| cx.notify())];
+        spaces.update(cx, |s, cx| s.refresh(cx));
 
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
         Self {
-            core,
+            stores,
+            spaces,
             hovered: None,
             focus_handle,
             _subscriptions,
@@ -74,15 +77,15 @@ impl LibraryView {
     /// behavior tests can exercise the same path without synthesizing mouse
     /// events.
     pub fn archive(&mut self, space_id: String, cx: &mut Context<Self>) {
-        self.core.update(cx, |c, cx| c.archive_space(space_id, cx));
+        self.spaces.update(cx, |s, cx| s.archive(space_id, cx));
     }
 
     /// Open the given space in a new chat window. Deferred so the window
     /// opens after the current update cycle completes.
     pub fn open_space(&mut self, space_id: String, cx: &mut Context<Self>) {
-        let core = self.core.clone();
+        let stores = self.stores.clone();
         cx.defer(move |cx: &mut App| {
-            crate::open_space_window(cx, core, space_id);
+            crate::open_space_window(cx, stores, space_id);
         });
     }
 
@@ -166,7 +169,7 @@ impl LibraryView {
 impl Render for LibraryView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let spaces = self.core.read(cx).spaces.clone();
+        let spaces = self.spaces.read(cx).list().to_vec();
 
         let mut root = v_flex()
             .track_focus(&self.focus_handle)

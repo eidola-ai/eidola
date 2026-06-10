@@ -19,45 +19,59 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::core::Core;
 use crate::plans::{self, format_credits};
+use crate::stores::{AccountStore, ConfigStore};
 
 pub struct AccountView {
-    core: Entity<Core>,
+    config: Entity<ConfigStore>,
+    account: Entity<AccountStore>,
     /// Two-step reset: the first click arms this; the second actually
     /// resets. Any other interaction (cancel) disarms.
     confirm_reset: bool,
     /// Price id of an in-flight checkout-session request, if any.
     checkout_pending: Option<String>,
     checkout_error: Option<String>,
+    /// View-owned checkout task (the awaitable `request_checkout` is awaited
+    /// here, in the view's own slot — it dies with the window).
+    checkout_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl AccountView {
-    pub fn new(core: Entity<Core>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let _subscriptions = vec![cx.observe(&core, |_, _, cx| cx.notify())];
+    pub fn new(
+        stores: crate::stores::Stores,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let config = stores.config.clone();
+        let account = stores.account.clone();
+        let _subscriptions = vec![
+            cx.observe(&config, |_, _, cx| cx.notify()),
+            cx.observe(&account, |_, _, cx| cx.notify()),
+        ];
 
         // Initial data: prices always; balances only when an account exists.
-        // Combined into one spawn where possible because `Core::spawn`
-        // debounces on `busy` (sequential calls drop all but the first).
-        core.update(cx, |c, cx| {
-            let has_account = c
-                .config_state
-                .as_ref()
-                .map(|s| s.has_account)
-                .unwrap_or(false);
+        // Each refresh owns its own task slot, so there is no debounce to
+        // dodge.
+        let has_account = config
+            .read(cx)
+            .state()
+            .map(|s| s.has_account)
+            .unwrap_or(false);
+        account.update(cx, |s, cx| {
+            s.refresh_prices(cx);
             if has_account {
-                c.fetch_plans_data(cx);
-            } else {
-                c.fetch_prices(cx);
+                s.refresh_balances(cx);
             }
         });
 
         Self {
-            core,
+            config,
+            account,
             confirm_reset: false,
             checkout_pending: None,
             checkout_error: None,
+            checkout_task: None,
             _subscriptions,
         }
     }
@@ -83,7 +97,7 @@ impl AccountView {
             return;
         }
         self.confirm_reset = false;
-        self.core.update(cx, |c, cx| c.reset_account(cx));
+        self.account.update(cx, |s, cx| s.reset_account(cx));
         cx.notify();
     }
 
@@ -101,42 +115,51 @@ impl AccountView {
         self.checkout_error = None;
         cx.notify();
 
-        let Some(app_core) = self.core.read(cx).app_core() else {
+        let Some(rx) = self.account.read(cx).request_checkout(price_id) else {
+            // Stub core: the in-flight marker above is the observable state.
             return;
         };
-        let rx = Core::account_checkout(app_core, price_id);
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let res = rx.await.unwrap_or_else(|_| {
-                Err(AppError::Internal {
-                    message: "checkout task cancelled".into(),
-                })
-            });
-            let _ = this.update(cx, |this, cx| {
-                this.checkout_pending = None;
-                match res {
-                    Ok(url) => cx.open_url(&url),
-                    Err(e) => this.checkout_error = Some(e.to_string()),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        // Own the await in the view's own slot — the checkout request dies
+        // with this window (per the doctrine's `request_*` shape).
+        self.checkout_task = Some(cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let res = rx.await.unwrap_or_else(|_| {
+                    Err(AppError::Internal {
+                        message: "checkout task cancelled".into(),
+                    })
+                });
+                let _ = this.update(cx, |this, cx| {
+                    this.checkout_pending = None;
+                    this.checkout_task = None;
+                    match res {
+                        Ok(url) => cx.open_url(&url),
+                        Err(e) => this.checkout_error = Some(e.to_string()),
+                    }
+                    cx.notify();
+                });
+            },
+        ));
     }
 }
 
 impl Render for AccountView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let core_ref = self.core.read(cx);
-        let has_account = core_ref
-            .config_state
-            .as_ref()
+        let has_account = self
+            .config
+            .read(cx)
+            .state()
             .map(|s| s.has_account)
             .unwrap_or(false);
-        let balances = core_ref.balances.clone();
-        let prices = core_ref.prices.clone();
-        let busy = core_ref.busy;
-        let core_error = core_ref.error_message.clone();
+        let account = self.account.read(cx);
+        let balances = account.balances().value().cloned();
+        let prices = account.prices().value().cloned().unwrap_or_default();
+        let busy = account.is_loading();
+        let core_error = account
+            .balances()
+            .error()
+            .or_else(|| account.prices().error())
+            .map(|e| e.to_string());
 
         let mut col = v_flex().px_6().py_5().gap_4().w_full();
 
@@ -209,7 +232,7 @@ impl Render for AccountView {
                             .small()
                             .label("Create account")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.core.update(cx, |c, cx| c.create_account(cx));
+                                this.account.update(cx, |s, cx| s.create_account(cx));
                             })),
                     ),
                 );
@@ -268,7 +291,7 @@ impl Render for AccountView {
                         .hover(|s| s.text_color(theme.foreground))
                         .child("Refresh")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.core.update(cx, |c, cx| c.fetch_balances(cx));
+                            this.account.update(cx, |s, cx| s.refresh_balances(cx));
                         })),
                 ),
             );

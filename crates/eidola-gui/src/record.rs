@@ -23,7 +23,7 @@ use eidola_app_core::{
     AttestationDetail, AttestationInfo, RequestDetail, RequestInfo, SpendTrailEntry,
 };
 use gpui::{
-    AsyncApp, ClipboardItem, Context, Div, Entity, FocusHandle, InteractiveElement, IntoElement,
+    AsyncApp, ClipboardItem, Context, Div, FocusHandle, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
     div, px,
 };
@@ -35,7 +35,8 @@ use gpui_component::{
 };
 
 use crate::actions::CloseWindow;
-use crate::core::Core;
+use crate::bridge;
+use crate::stores::Stores;
 
 /// Horizontal clearance for the macOS traffic lights — the section strip
 /// doubles as the title bar, same pattern as the old settings tab strip
@@ -97,7 +98,7 @@ impl<T> Default for Listing<T> {
 }
 
 pub struct RecordView {
-    core: Entity<Core>,
+    stores: Stores,
     section: RecordSection,
     attestations: Listing<AttestationInfo>,
     requests: Listing<RequestInfo>,
@@ -110,12 +111,12 @@ pub struct RecordView {
 }
 
 impl RecordView {
-    pub fn new(core: Entity<Core>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
         let mut this = Self {
-            core,
+            stores,
             section: RecordSection::Attestations,
             attestations: Listing::default(),
             requests: Listing::default(),
@@ -183,8 +184,8 @@ impl RecordView {
     }
 
     fn fetch_page(&mut self, section: RecordSection, cx: &mut Context<Self>) {
-        let Some(app_core) = self.core.read(cx).app_core() else {
-            // Stub core (tests): rows are installed via the test setters.
+        let Some(app_core) = self.stores.app_core() else {
+            // Stub stores (tests): rows are installed via the test setters.
             return;
         };
         macro_rules! fetch {
@@ -194,7 +195,7 @@ impl RecordView {
                 }
                 self.$listing.loading = true;
                 let offset = self.$listing.rows.len() as i64;
-                let rx = Core::$helper(app_core, PAGE + 1, offset);
+                let rx = bridge::$helper(app_core, PAGE + 1, offset);
                 cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                     let res = rx.await.unwrap_or_else(|_| {
                         Err(AppError::Internal {
@@ -231,10 +232,10 @@ impl RecordView {
         self.detail_pending = Some(hash.clone());
         self.error = None;
         cx.notify();
-        let Some(app_core) = self.core.read(cx).app_core() else {
+        let Some(app_core) = self.stores.app_core() else {
             return;
         };
-        let rx = Core::attestation_detail(app_core, hash.clone());
+        let rx = bridge::attestation_detail(app_core, hash.clone());
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let res = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
@@ -263,10 +264,10 @@ impl RecordView {
         self.detail_pending = Some(id.clone());
         self.error = None;
         cx.notify();
-        let Some(app_core) = self.core.read(cx).app_core() else {
+        let Some(app_core) = self.stores.app_core() else {
             return;
         };
-        let rx = Core::request_detail(app_core, id.clone());
+        let rx = bridge::request_detail(app_core, id.clone());
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let res = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {

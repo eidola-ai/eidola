@@ -21,7 +21,9 @@ use gpui_component::{
 use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownStyle};
 
 use crate::actions::CloseWindow;
-use crate::core::Core;
+use crate::bridge;
+use crate::plans::format_credits;
+use crate::stores::{AccountStore, ConfigStore, ModelsStore, Stores, WalletStore};
 
 /// Vertical space reserved at the top of the window for the macOS traffic
 /// lights. The window has a transparent titlebar (see
@@ -130,18 +132,24 @@ pub struct OnboardingFlow {
     /// flow on the plans page while the first prices/balances fetch is in
     /// flight, instead of flashing the blank page between the two states.
     pub entered_plans: bool,
-    /// A plans-data fetch has actually started (or the prices were already
-    /// cached) for the current visit to the plans stage. Guards the
-    /// observe-driven auto-fetch from looping. Deliberately *not* set when
-    /// `Core::spawn`'s busy-debounce drops the call — the busy op's
-    /// completion notify is the retry trigger.
+    /// A plans-data fetch has started (or the prices were already cached) for
+    /// the current visit to the plans stage. Guards the observe-driven
+    /// auto-fetch from looping. Each store refresh owns its own task slot, so
+    /// the fetch always starts — the latch is purely re-entry protection.
     plans_fetch_attempted: bool,
     /// The 3s balance-poll loop is already running.
     poll_running: bool,
 }
 
 pub struct ChatView {
-    core: Entity<Core>,
+    /// The store bundle — held whole because the chat surface reads several
+    /// domains (config, models, account, wallet) and owns chat streaming via
+    /// the `bridge` free functions (which take the bundle's `Arc<AppCore>`).
+    stores: Stores,
+    config: Entity<ConfigStore>,
+    models: Entity<ModelsStore>,
+    account: Entity<AccountStore>,
+    wallet: Entity<WalletStore>,
     /// WYSIWYG markdown composer (`gpui-markdown-editor`). The user types
     /// here in styled-markdown view; on submit we read `state.markdown` and
     /// send the raw source upstream.
@@ -270,10 +278,9 @@ impl ChatView {
         if let Some(model) = self.selected_model.as_ref() {
             return model.clone();
         }
-        self.core
+        self.config
             .read(cx)
-            .config_state
-            .as_ref()
+            .state()
             .map(|s| s.default_model.clone())
             .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string())
     }
@@ -334,8 +341,8 @@ impl ChatView {
     /// the visible confirmation.
     pub fn set_current_model_as_default(&mut self, cx: &mut Context<Self>) {
         let model = self.current_model(cx);
-        self.core
-            .update(cx, |core, cx| core.set_default_model(model, cx));
+        self.config
+            .update(cx, |c, cx| c.set_default_model(model, cx));
         cx.notify();
     }
 
@@ -360,7 +367,7 @@ impl ChatView {
     /// loaded asynchronously on construction and the next exchange
     /// continues that space.
     pub fn new(
-        core: Entity<Core>,
+        stores: Stores,
         space_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -393,27 +400,55 @@ impl ChatView {
         // (no modifier) is bound in the editor's context and inserts
         // a newline as normal.
 
-        // One combined startup fetch: models, plus balances + wallet
-        // credentials when an account exists (the onboarding inputs).
-        core.update(cx, |core, cx| core.fetch_chat_startup(cx));
+        let config = stores.config.clone();
+        let models = stores.models.clone();
+        let account = stores.account.clone();
+        let wallet = stores.wallet.clone();
 
-        // Re-render when the shared core snapshots change (config,
-        // balances, prices, credentials), and lazily fetch the plans data
-        // the first time the derived stage lands on `Plans`.
-        let _subscriptions = vec![cx.observe(&core, |this: &mut Self, _, cx| {
-            this.maybe_fetch_plans_data(cx);
-            cx.notify();
-        })];
+        // Onboarding inputs: when an account exists, the stage machine needs
+        // a balance snapshot and the active-credential list. The model list
+        // is refreshed app-globally at launch (and on `Change::Config`) by
+        // `ModelsStore` — the first window reads it from there rather than
+        // kicking its own fetch, which is the structural fix for wave-2's
+        // starved model list. Each refresh owns its own store task slot, so
+        // there is no shared busy gate to dodge.
+        let has_account = config
+            .read(cx)
+            .state()
+            .is_some_and(|s| s.has_account && s.has_account_secret);
+        if has_account {
+            account.update(cx, |s, cx| s.refresh_balances(cx));
+            wallet.update(cx, |s, cx| s.refresh(cx));
+        }
+
+        // Re-render when the stores the onboarding stage depends on change,
+        // and lazily fetch the plans data the first time the derived stage
+        // lands on `Plans`.
+        let _subscriptions = vec![
+            cx.observe(&config, |this: &mut Self, _, cx| {
+                this.maybe_fetch_plans_data(cx);
+                cx.notify();
+            }),
+            cx.observe(&models, |_, _, cx| cx.notify()),
+            cx.observe(&account, |this: &mut Self, _, cx| {
+                this.maybe_fetch_plans_data(cx);
+                cx.notify();
+            }),
+            cx.observe(&wallet, |this: &mut Self, _, cx| {
+                this.maybe_fetch_plans_data(cx);
+                cx.notify();
+            }),
+        ];
 
         // Reopening an existing space: load its persisted messages in the
         // background, same bridge `spawn_stream` uses for its post-stream
-        // re-fetch. Stub cores (tests) skip the load — tests preload via
+        // re-fetch. Stub stores (tests) skip the load — tests preload via
         // `set_messages_for_test`.
         if let Some(sid) = space_id.clone()
-            && let Some(app_core) = core.read(cx).app_core()
+            && let Some(app_core) = stores.app_core()
         {
             let load_generation = 0;
-            let msgs_rx = Core::get_space_messages(app_core, sid);
+            let msgs_rx = bridge::get_space_messages(app_core, sid);
             cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
                 let msgs = msgs_rx.await.unwrap_or_else(|_| {
                     Err(eidola_app_core::error::AppError::Internal {
@@ -438,7 +473,11 @@ impl ChatView {
         }
 
         Self {
-            core,
+            stores,
+            config,
+            models,
+            account,
+            wallet,
             prompt_editor,
             space_id,
             messages: Vec::new(),
@@ -470,7 +509,7 @@ impl ChatView {
     /// balances fetch after account creation is still in flight,
     /// `entered_plans` holds the flow on the plans page so it doesn't flash
     /// through the blank page.
-    pub fn onboarding_stage(&self, core: &Core, composer_empty: bool) -> OnboardingStage {
+    pub fn onboarding_stage(&self, cx: &gpui::App, composer_empty: bool) -> OnboardingStage {
         if !self.messages.is_empty()
             || self.streaming.is_some()
             || self.error.is_some()
@@ -478,7 +517,8 @@ impl ChatView {
         {
             return OnboardingStage::Ready;
         }
-        let Some(state) = core.config_state.as_ref() else {
+        let config = self.config.read(cx);
+        let Some(state) = config.state() else {
             return OnboardingStage::Ready;
         };
         if !state.has_account || !state.has_account_secret {
@@ -487,11 +527,13 @@ impl ChatView {
         if self.onboarding.dismissed {
             return OnboardingStage::Ready;
         }
-        let balance_known_zero = core.balances.as_ref().is_some_and(|b| b.available <= 0);
-        if balance_known_zero && core.credentials.is_empty() {
+        let balances = self.account.read(cx).balances();
+        let credentials_empty = self.wallet.read(cx).credentials().is_empty();
+        let balance_known_zero = balances.value().is_some_and(|b| b.available <= 0);
+        if balance_known_zero && credentials_empty {
             return OnboardingStage::Plans;
         }
-        if self.onboarding.entered_plans && core.balances.is_none() {
+        if self.onboarding.entered_plans && balances.value().is_none() {
             return OnboardingStage::Plans;
         }
         OnboardingStage::Ready
@@ -499,7 +541,7 @@ impl ChatView {
 
     fn current_stage(&self, cx: &Context<Self>) -> OnboardingStage {
         let composer_empty = self.prompt_editor.read(cx).state.markdown.trim().is_empty();
-        self.onboarding_stage(self.core.read(cx), composer_empty)
+        self.onboarding_stage(cx, composer_empty)
     }
 
     /// Kick off a prices+balances fetch the first time the derived stage
@@ -512,16 +554,18 @@ impl ChatView {
         if self.current_stage(cx) != OnboardingStage::Plans {
             return;
         }
-        if !self.core.read(cx).prices.is_empty() {
+        if self.account.read(cx).prices().has_value() {
             self.onboarding.plans_fetch_attempted = true;
             return;
         }
-        // Latch only if the fetch actually started: `Core::spawn` silently
-        // drops the call while another core op is in flight (e.g. the
-        // startup fetch), and that op's completion notify is what re-runs
-        // us for the retry.
-        self.onboarding.plans_fetch_attempted =
-            self.core.update(cx, |core, cx| core.fetch_plans_data(cx));
+        // Latch unconditionally now: each store refresh owns its own task
+        // slot (no shared busy gate), so a `Plans`-stage prices fetch always
+        // starts. We still guard against re-entry via the latch.
+        self.account.update(cx, |s, cx| {
+            s.refresh_prices(cx);
+            s.refresh_balances(cx);
+        });
+        self.onboarding.plans_fetch_attempted = true;
     }
 
     /// "Begin" on the welcome page: create the anonymous account. There is
@@ -534,12 +578,13 @@ impl ChatView {
         self.onboarding.create_error = None;
         cx.notify();
 
-        let Some(app_core) = self.core.read(cx).app_core() else {
-            // Stub core (behavior tests): the in-flight flag above is the
-            // observable state machine transition.
+        // Awaitable account-create: the onboarding flow owns the await in its
+        // own (detached, view-scoped) task and refreshes config/account on
+        // success. `None` on stub stores (behavior tests): the in-flight flag
+        // above is the observable state-machine transition.
+        let Some(rx) = self.account.read(cx).request_account_create() else {
             return;
         };
-        let rx = Core::account_create(app_core);
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let res = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
@@ -550,18 +595,17 @@ impl ChatView {
                 this.onboarding.creating_account = false;
                 match res {
                     Ok(_) => {
-                        // Move straight to the plans step: refresh the
-                        // config snapshot (has_account flips true) and
-                        // fetch prices + the initial (zero) balance. The
-                        // latch tracks whether the fetch actually started —
-                        // if the startup fetch is still busy the call is
-                        // dropped, and `maybe_fetch_plans_data` retries on
-                        // that op's completion notify.
+                        // Move straight to the plans step: refresh the config
+                        // snapshot (has_account flips true) and fetch prices +
+                        // the initial (zero) balance. Each refresh owns its own
+                        // store task slot, so the calls always start.
                         this.onboarding.entered_plans = true;
-                        this.onboarding.plans_fetch_attempted = this.core.update(cx, |core, cx| {
-                            core.refresh_config(cx);
-                            core.fetch_plans_data(cx)
+                        this.config.update(cx, |c, cx| c.refresh(cx));
+                        this.account.update(cx, |s, cx| {
+                            s.refresh_prices(cx);
+                            s.refresh_balances(cx);
                         });
+                        this.onboarding.plans_fetch_attempted = true;
                     }
                     Err(e) => this.onboarding.create_error = Some(e.to_string()),
                 }
@@ -581,10 +625,9 @@ impl ChatView {
         self.onboarding.plans_error = None;
         cx.notify();
 
-        let Some(app_core) = self.core.read(cx).app_core() else {
+        let Some(rx) = self.account.read(cx).request_checkout(price_id) else {
             return;
         };
-        let rx = Core::account_checkout(app_core, price_id);
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let res = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
@@ -623,9 +666,10 @@ impl ChatView {
         if self.onboarding.poll_running {
             return;
         }
-        let Some(app_core) = self.core.read(cx).app_core() else {
+        // Stub stores have no backend to poll.
+        if self.stores.app_core().is_none() {
             return;
-        };
+        }
         self.onboarding.poll_running = true;
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
@@ -636,9 +680,20 @@ impl ChatView {
                 if !keep_going {
                     break;
                 }
-                let res = match Core::account_balances(app_core.clone()).await {
+                // Ask the AccountStore for a fresh balances fetch via its
+                // awaitable `request_balances` — the poll (the initiator)
+                // owns the await here and writes the result back into the
+                // store, since the poll itself is the source of this change.
+                let Some(rx) = this
+                    .read_with(cx, |this, cx| this.account.read(cx).request_balances())
+                    .ok()
+                    .flatten()
+                else {
+                    break;
+                };
+                let res = match rx.await {
                     Ok(res) => res,
-                    Err(_) => break, // core dropped
+                    Err(_) => break, // task cancelled
                 };
                 let stop = this
                     .update(cx, |this, cx| {
@@ -648,10 +703,8 @@ impl ChatView {
                                 if balances.available > 0 {
                                     this.onboarding.awaiting_checkout = false;
                                 }
-                                this.core.update(cx, |core, cx| {
-                                    core.balances = Some(balances);
-                                    cx.notify();
-                                });
+                                this.account
+                                    .update(cx, |s, cx| s.set_balances(balances, cx));
                             }
                             Err(e) => {
                                 this.onboarding.plans_error =
@@ -680,8 +733,11 @@ impl ChatView {
         self.streaming = None;
         if matches!(e, AppError::InsufficientBalance { .. }) {
             self.show_plans_after_error = true;
-            if self.core.read(cx).prices.is_empty() {
-                self.core.update(cx, |core, cx| core.fetch_plans_data(cx));
+            if !self.account.read(cx).prices().has_value() {
+                self.account.update(cx, |s, cx| {
+                    s.refresh_prices(cx);
+                    s.refresh_balances(cx);
+                });
             }
         }
         self.error = Some(e.to_string());
@@ -788,8 +844,8 @@ impl ChatView {
         self.show_plans_after_error = false;
         cx.notify();
 
-        let Some(app_core) = self.core.read(cx).app_core() else {
-            // Stub core (behavior tests): the local state update above has
+        let Some(app_core) = self.stores.app_core() else {
+            // Stub stores (behavior tests): the local state update above has
             // already happened; without a real backend there is nothing more
             // to do.
             return;
@@ -809,7 +865,8 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (mut event_rx, done_rx) = Core::chat_stream(app_core.clone(), prompt, model, space_id);
+        let (mut event_rx, done_rx) =
+            bridge::chat_stream(app_core.clone(), prompt, model, space_id);
 
         cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
             while let Some(event) = event_rx.recv().await {
@@ -832,7 +889,7 @@ impl ChatView {
 
             match outcome {
                 Ok(result) => {
-                    let msgs_rx = Core::get_space_messages(app_core, result.space_id.clone());
+                    let msgs_rx = bridge::get_space_messages(app_core, result.space_id.clone());
                     let msgs = msgs_rx.await.unwrap_or_else(|_| {
                         Err(eidola_app_core::error::AppError::Internal {
                             message: "fetch messages task cancelled".into(),
@@ -1339,27 +1396,31 @@ impl ChatView {
     /// clicking it opens checkout.
     fn render_plans_list(&self, cx: &Context<Self>) -> Div {
         let theme = cx.theme();
-        let core = self.core.read(cx);
+        let account = self.account.read(cx);
+        let prices_cell = account.prices();
+        let prices = prices_cell.value().cloned().unwrap_or_default();
+        let prices_loading = prices_cell.is_loading() || prices_cell.is_stale();
+        let prices_error = prices_cell.error().map(|e| e.to_string());
         let ob = &self.onboarding;
 
         let mut list = v_flex().w_full();
 
-        if core.prices.is_empty() {
-            if core.busy {
-                // `fetch_plans_data` is in flight.
+        if prices.is_empty() {
+            if prices_loading {
+                // A prices refresh is in flight.
                 list = list.child(
                     div()
                         .italic()
                         .text_color(theme.muted_foreground)
                         .child("Loading plans…"),
                 );
-            } else if let Some(err) = core.error_message.as_deref() {
+            } else if let Some(err) = prices_error {
                 list = list
                     .child(
                         div()
                             .text_sm()
                             .text_color(theme.danger)
-                            .child(SharedString::from(err.to_string())),
+                            .child(SharedString::from(err)),
                     )
                     .child(
                         div()
@@ -1370,11 +1431,11 @@ impl ChatView {
                             .hover(|s| s.text_color(theme.foreground))
                             .child("Try again")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.onboarding.plans_fetch_attempted =
-                                    this.core.update(cx, |core, cx| {
-                                        core.clear_error(cx);
-                                        core.fetch_plans_data(cx)
-                                    });
+                                this.account.update(cx, |s, cx| {
+                                    s.refresh_prices(cx);
+                                    s.refresh_balances(cx);
+                                });
+                                this.onboarding.plans_fetch_attempted = true;
                             })),
                     );
             } else {
@@ -1397,7 +1458,7 @@ impl ChatView {
                 let _ = weak.update(app, |this, cx| this.begin_checkout(price_id, cx));
             });
         list = list.child(crate::plans::plan_rows(
-            &core.prices,
+            &prices,
             ob.checkout_pending.as_deref(),
             on_select,
             cx,
@@ -1722,14 +1783,14 @@ impl ChatView {
     /// consistent with gpui-component overlays under the Circadian theme.
     fn render_model_picker(&self, cx: &Context<Self>) -> gpui::Stateful<Div> {
         let theme = cx.theme();
-        let core = self.core.read(cx);
         let current = self.current_model(cx);
-        let default_model = core
-            .config_state
-            .as_ref()
+        let default_model = self
+            .config
+            .read(cx)
+            .state()
             .map(|s| s.default_model.clone())
             .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string());
-        let models = core.models.clone();
+        let models = self.models.read(cx).list().to_vec();
 
         let mut panel = v_flex()
             .id("model-picker")

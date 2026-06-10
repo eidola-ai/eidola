@@ -15,8 +15,8 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 use crate::account::AccountView;
 use crate::actions::CloseWindow;
-use crate::core::Core;
 use crate::general::GeneralView;
+use crate::stores::Stores;
 use crate::wallet::WalletView;
 
 /// Vertical reserve at the top of the nav band so the macOS traffic lights
@@ -60,10 +60,10 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(core: Entity<Core>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let general = cx.new(|cx| GeneralView::new(core.clone(), window, cx));
-        let account = cx.new(|cx| AccountView::new(core.clone(), window, cx));
-        let wallet = cx.new(|cx| WalletView::new(core, window, cx));
+    pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let general = cx.new(|cx| GeneralView::new(stores.config.clone(), window, cx));
+        let account = cx.new(|cx| AccountView::new(stores.clone(), window, cx));
+        let wallet = cx.new(|cx| WalletView::new(stores, window, cx));
 
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
