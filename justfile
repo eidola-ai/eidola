@@ -22,7 +22,7 @@ down:
 db-reset:
     docker compose exec postgres dropdb -U eidola --if-exists eidola
     docker compose exec postgres createdb -U eidola eidola
-    docker compose exec postgres psql -U eidola -d eidola -f /docker-entrypoint-initdb.d/schema.sql
+    docker compose exec postgres psql -U eidola -d eidola -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/schema.sql
 
 # --- Build (local toolchain, fast iteration) ---
 

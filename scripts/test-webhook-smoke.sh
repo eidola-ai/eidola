@@ -51,8 +51,18 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-echo "==> Applying schema..."
-docker compose exec postgres psql -U eidola -d eidola -f /docker-entrypoint-initdb.d/schema.sql -q
+echo "==> Applying schema (if not already present)..."
+SCHEMA_PRESENT=$(
+    docker compose exec -T postgres psql -U eidola -d eidola -tAc \
+        "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='account'" \
+        2>/dev/null || true
+)
+if [ -z "$SCHEMA_PRESENT" ]; then
+    docker compose exec -T postgres psql -U eidola -d eidola \
+        -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/schema.sql -q
+else
+    echo "    schema already applied; skipping"
+fi
 
 # ── Capture webhook secret ───────────────────────────────────────────────────
 
