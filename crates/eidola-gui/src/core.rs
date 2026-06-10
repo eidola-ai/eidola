@@ -3,9 +3,10 @@ use std::sync::Arc;
 use eidola_app_core::error::AppError;
 use eidola_app_core::updates::UpdateCheckSnapshot;
 use eidola_app_core::{
-    AccountCreateResult, AllocateResult, AppCore, BalancesResult, ChatResult, ChatStreamEvent,
-    ConfigState, CredentialInfo, InFlightCredentialInfo, ModelInfo, PriceInfo, SpaceInfo,
-    SpaceMessage,
+    AccountCreateResult, AllocateResult, AppCore, AttestationDetail, AttestationInfo,
+    BalancesResult, ChatResult, ChatStreamEvent, ConfigState, CredentialInfo,
+    CredentialLifecycleInfo, InFlightCredentialInfo, ModelInfo, PriceInfo, RequestDetail,
+    RequestInfo, SpaceInfo, SpaceMessage, SpendTrailEntry,
 };
 use gpui::{App, AppContext, AsyncApp, Context, Entity, Task, WeakEntity};
 use tokio::sync::{mpsc, oneshot};
@@ -27,6 +28,9 @@ pub struct Core {
     pub prices: Vec<PriceInfo>,
     pub credentials: Vec<CredentialInfo>,
     pub spending_credentials: Vec<InFlightCredentialInfo>,
+    /// Every wallet credential with its lifecycle state (active / spending /
+    /// spent / expired), newest first — the wallet pane's listing.
+    pub credential_lifecycle: Vec<CredentialLifecycleInfo>,
     pub models: Vec<ModelInfo>,
     /// Cached space listing for the Library window (archived excluded).
     pub spaces: Vec<SpaceInfo>,
@@ -58,6 +62,7 @@ impl Core {
             prices: Vec::new(),
             credentials: Vec::new(),
             spending_credentials: Vec::new(),
+            credential_lifecycle: Vec::new(),
             models: Vec::new(),
             spaces: Vec::new(),
             update_check: None,
@@ -78,6 +83,7 @@ impl Core {
             prices: Vec::new(),
             credentials: Vec::new(),
             spending_credentials: Vec::new(),
+            credential_lifecycle: Vec::new(),
             models: Vec::new(),
             spaces: Vec::new(),
             update_check: None,
@@ -143,6 +149,17 @@ impl Core {
             return;
         };
         match inner.set_default_model(model) {
+            Ok(()) => self.refresh_config(cx),
+            Err(e) => self.set_error(e, cx),
+        }
+    }
+
+    /// Remove the base-URL override and fall back to the trust-root pin.
+    pub fn clear_base_url_override(&mut self, cx: &mut Context<Self>) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        match inner.clear_base_url_override() {
             Ok(()) => self.refresh_config(cx),
             Err(e) => self.set_error(e, cx),
         }
@@ -254,6 +271,25 @@ impl Core {
         );
     }
 
+    /// Fetch the wallet pane's lifecycle listing (every credential with its
+    /// computed active / spending / spent / expired state).
+    pub fn fetch_wallet(&mut self, cx: &mut Context<Self>) {
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
+        self.spawn(
+            cx,
+            move || async move { core.wallet_lifecycle().await },
+            |this, result, cx| match result {
+                Ok(rows) => {
+                    this.credential_lifecycle = rows;
+                    cx.notify();
+                }
+                Err(e) => this.set_error(e, cx),
+            },
+        );
+    }
+
     /// Attempt recovery of any in-flight credentials. After the call
     /// returns, refreshes both active and spending credentials caches and
     /// stashes the recovered nonces into `last_recovered` so the UI can
@@ -275,13 +311,15 @@ impl Core {
                     let recovered = core1.recover_spending_credentials().await?;
                     let active = core1.wallet_credentials().await?;
                     let spending = core1.wallet_spending_credentials().await?;
-                    Ok((recovered, active, spending))
+                    let lifecycle = core1.wallet_lifecycle().await?;
+                    Ok((recovered, active, spending, lifecycle))
                 }
             },
             move |this, result, cx| match result {
-                Ok((recovered, active, spending)) => {
+                Ok((recovered, active, spending, lifecycle)) => {
                     this.credentials = active;
                     this.spending_credentials = spending;
+                    this.credential_lifecycle = lifecycle;
                     cx.notify();
                     on_done(this, recovered, cx);
                 }
@@ -683,6 +721,75 @@ impl Core {
         let (tx, rx) = oneshot::channel();
         core.runtime().handle().clone().spawn(async move {
             let res = core.account_balances().await;
+            let _ = tx.send(res);
+        });
+        rx
+    }
+
+    // ------------------------------------------------------------------
+    // The Record — windowed read-only queries over the local trail. Static
+    // oneshot helpers (same shape as `Core::chat`) so the Record window
+    // owns its own typed loading state and is never debounced by `busy`.
+    // ------------------------------------------------------------------
+
+    pub fn list_attestations(
+        core: Arc<AppCore>,
+        limit: i64,
+        offset: i64,
+    ) -> oneshot::Receiver<Result<Vec<AttestationInfo>, AppError>> {
+        let (tx, rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let res = core.list_attestations(limit, offset).await;
+            let _ = tx.send(res);
+        });
+        rx
+    }
+
+    pub fn attestation_detail(
+        core: Arc<AppCore>,
+        hash: String,
+    ) -> oneshot::Receiver<Result<Option<AttestationDetail>, AppError>> {
+        let (tx, rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let res = core.attestation_detail(hash).await;
+            let _ = tx.send(res);
+        });
+        rx
+    }
+
+    pub fn list_requests(
+        core: Arc<AppCore>,
+        limit: i64,
+        offset: i64,
+    ) -> oneshot::Receiver<Result<Vec<RequestInfo>, AppError>> {
+        let (tx, rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let res = core.list_requests(limit, offset).await;
+            let _ = tx.send(res);
+        });
+        rx
+    }
+
+    pub fn request_detail(
+        core: Arc<AppCore>,
+        id: String,
+    ) -> oneshot::Receiver<Result<Option<RequestDetail>, AppError>> {
+        let (tx, rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let res = core.request_detail(id).await;
+            let _ = tx.send(res);
+        });
+        rx
+    }
+
+    pub fn spend_trail(
+        core: Arc<AppCore>,
+        limit: i64,
+        offset: i64,
+    ) -> oneshot::Receiver<Result<Vec<SpendTrailEntry>, AppError>> {
+        let (tx, rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let res = core.spend_trail(limit, offset).await;
             let _ = tx.send(res);
         });
         rx

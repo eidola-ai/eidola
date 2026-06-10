@@ -1,13 +1,29 @@
+//! Wallet settings pane — the anonymous spend credentials, with their honest
+//! lifecycle states.
+//!
+//! The listing comes from the local `credential_lifecycle` view (via
+//! `Core::fetch_wallet` → `AppCore::wallet_lifecycle`), so every credential
+//! the wallet has ever held is shown with the state the database actually
+//! computes: **active** (spendable), **in flight** (a spend is unsettled —
+//! recoverable), **spent** (settled into a successor), **expired** (issuer
+//! key lapsed). No active/in-flight split into separate lists; one history,
+//! newest first, hairline rules between rows.
+
+use eidola_app_core::CredentialLifecycleInfo;
 use gpui::{
     Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Subscription,
     Window, div,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, WindowExt, button::Button, h_flex, label::Label,
-    notification::Notification, v_flex,
+    ActiveTheme, Disableable, Sizable, StyledExt, WindowExt,
+    button::{Button, ButtonVariants},
+    h_flex,
+    notification::Notification,
+    v_flex,
 };
 
 use crate::core::Core;
+use crate::plans::format_credits;
 
 pub struct WalletView {
     core: Entity<Core>,
@@ -17,7 +33,7 @@ pub struct WalletView {
 impl WalletView {
     pub fn new(core: Entity<Core>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let _subscriptions = vec![cx.observe(&core, |_, _, cx| cx.notify())];
-        core.update(cx, |c, cx| c.fetch_credentials(cx));
+        core.update(cx, |c, cx| c.fetch_wallet(cx));
         Self {
             core,
             _subscriptions,
@@ -39,6 +55,72 @@ impl WalletView {
             });
         });
     }
+
+    fn render_row(
+        &self,
+        idx: usize,
+        cred: &CredentialLifecycleInfo,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let settled = matches!(cred.state.as_str(), "spent" | "expired");
+        let nonce_short: String = cred.nonce.chars().take(16).collect();
+
+        let (state_line, state_color) = match cred.state.as_str() {
+            "active" => (
+                format!("active · generation {}", cred.generation),
+                theme.muted_foreground,
+            ),
+            "spending" => (
+                format!(
+                    "in flight — {} credits held",
+                    format_credits(cred.spend_amount.unwrap_or(0))
+                ),
+                theme.warning,
+            ),
+            "spent" => (
+                format!(
+                    "spent — {} credits charged",
+                    format_credits(cred.spend_amount.unwrap_or(0))
+                ),
+                theme.muted_foreground,
+            ),
+            "expired" => ("expired".to_string(), theme.muted_foreground),
+            other => (other.to_string(), theme.muted_foreground),
+        };
+
+        let mut nonce_el = div()
+            .text_sm()
+            .font_family("Menlo")
+            .child(SharedString::from(format!("{nonce_short}…")));
+        let mut credits_el = div().child(SharedString::from(format!(
+            "{} credits",
+            format_credits(cred.credits)
+        )));
+        if settled {
+            nonce_el = nonce_el.text_color(theme.muted_foreground);
+            credits_el = credits_el.text_color(theme.muted_foreground);
+        }
+
+        let mut row = h_flex()
+            .w_full()
+            .py_2()
+            .gap_3()
+            .items_center()
+            .child(
+                v_flex().flex_1().gap_0p5().child(nonce_el).child(
+                    div()
+                        .text_xs()
+                        .text_color(state_color)
+                        .child(SharedString::from(state_line)),
+                ),
+            )
+            .child(credits_el);
+        if idx > 0 {
+            row = row.border_t_1().border_color(theme.border);
+        }
+        row
+    }
 }
 
 impl Render for WalletView {
@@ -46,112 +128,70 @@ impl Render for WalletView {
         let theme = cx.theme();
         let core_ref = self.core.read(cx);
         let busy = core_ref.busy;
+        let rows = core_ref.credential_lifecycle.clone();
+        let any_spending = rows.iter().any(|r| r.state == "spending");
 
-        let mut col = v_flex().p_4().gap_3().w_full();
+        let mut col = v_flex().px_6().py_5().gap_3().w_full();
 
-        if !core_ref.spending_credentials.is_empty() {
-            col = col.child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(Label::new("In Flight").text_color(theme.muted_foreground))
-                    .child(
-                        Button::new("recover-all")
-                            .label("Recover All")
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.recover_all(window, cx);
-                            })),
-                    ),
+        let mut header = h_flex().w_full().justify_between().items_center().child(
+            div()
+                .text_sm()
+                .font_medium()
+                .text_color(theme.muted_foreground)
+                .child("Credentials"),
+        );
+        let mut actions = h_flex().gap_2();
+        if any_spending {
+            actions = actions.child(
+                Button::new("recover-all")
+                    .small()
+                    .label("Recover in-flight")
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.recover_all(window, cx);
+                    })),
             );
+        }
+        actions = actions.child(
+            Button::new("refresh-credentials")
+                .ghost()
+                .small()
+                .label("Refresh")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.core.update(cx, |c, cx| c.fetch_wallet(cx));
+                })),
+        );
+        header = header.child(actions);
+        col = col.child(header);
 
-            for cred in &core_ref.spending_credentials {
-                let nonce_short: String = cred.nonce.chars().take(16).collect();
-                col = col.child(
-                    h_flex()
-                        .w_full()
-                        .py_2()
-                        .gap_3()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .gap_1()
-                                .child(div().child(SharedString::from(format!("{nonce_short}…"))))
-                                .child(
-                                    Label::new(SharedString::from(format!(
-                                        "Stuck — {} credits charged",
-                                        cred.spend_amount
-                                    )))
-                                    .text_color(theme.warning),
-                                ),
-                        )
-                        .child(Label::new(SharedString::from(format!(
-                            "{} credits",
-                            cred.credits
-                        )))),
-                );
+        col = col.child(div().text_xs().text_color(theme.muted_foreground).child(
+            "Anonymous spend credentials provision themselves from your balance — \
+                     the server cannot link them back to your account.",
+        ));
+
+        if rows.is_empty() {
+            col = col.child(
+                div()
+                    .py_8()
+                    .w_full()
+                    .text_color(theme.muted_foreground)
+                    .child("No credentials yet — they appear when you start chatting."),
+            );
+        } else {
+            let mut list = v_flex().w_full().pt_1();
+            for (idx, cred) in rows.iter().enumerate() {
+                list = list.child(self.render_row(idx, cred, cx));
             }
+            col = col.child(list);
         }
 
-        col = col.child(
-            h_flex()
-                .justify_between()
-                .child(Label::new("Active Credentials").text_color(theme.muted_foreground))
-                .child(
-                    Button::new("refresh-credentials")
-                        .label("Refresh")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.core.update(cx, |c, cx| c.fetch_credentials(cx));
-                        })),
-                ),
-        );
-
-        if core_ref.credentials.is_empty() && core_ref.spending_credentials.is_empty() {
+        if let Some(err) = core_ref.error_message.as_deref() {
             col = col.child(
-                v_flex()
-                    .gap_1()
-                    .py_8()
-                    .items_center()
-                    .child(Label::new("No Credentials").text_color(theme.muted_foreground))
-                    .child(
-                        Label::new("Allocate credits from Account to get started.")
-                            .text_color(theme.muted_foreground),
-                    ),
+                div()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(SharedString::from(err.to_string())),
             );
-        } else if core_ref.credentials.is_empty() {
-            col =
-                col.child(Label::new("No active credentials.").text_color(theme.muted_foreground));
-        } else {
-            for cred in &core_ref.credentials {
-                let nonce_short: String = cred.nonce.chars().take(16).collect();
-                col = col.child(
-                    h_flex()
-                        .w_full()
-                        .py_2()
-                        .gap_3()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .gap_1()
-                                .child(div().child(SharedString::from(format!("{nonce_short}…"))))
-                                .child(
-                                    Label::new(SharedString::from(format!(
-                                        "Generation {}",
-                                        cred.generation
-                                    )))
-                                    .text_color(theme.muted_foreground),
-                                ),
-                        )
-                        .child(Label::new(SharedString::from(format!(
-                            "{} credits",
-                            cred.credits
-                        )))),
-                );
-            }
         }
 
         col

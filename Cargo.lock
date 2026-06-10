@@ -2666,6 +2666,7 @@ dependencies = [
  "gpui-markdown-editor",
  "gpui_platform",
  "image",
+ "serde_json",
  "tokio",
 ]
 

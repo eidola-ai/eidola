@@ -17,6 +17,10 @@ actions!(
         /// Bound to ⌘L on macOS. Singleton, like Settings: re-invoking
         /// raises the existing window.
         OpenLibrary,
+        /// Show the Record window — the raw local trail of attestations,
+        /// requests, and spending. Bound to ⇧⌘L on macOS (sibling of the
+        /// Library's ⌘L). Singleton, like Settings and Library.
+        OpenRecord,
         /// Close the focused window (chat or settings). Bound to ⌘W on
         /// macOS. Closing the last chat window does not quit the app —
         /// that's ⌘Q.

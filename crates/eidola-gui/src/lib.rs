@@ -7,6 +7,8 @@ pub mod chat;
 pub mod core;
 pub mod general;
 pub mod library;
+mod plans;
+pub mod record;
 pub mod settings;
 pub mod theme;
 pub mod updates;
@@ -21,11 +23,12 @@ use gpui_component_assets::Assets;
 
 use crate::actions::{
     About, CheckForUpdates, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenLibrary,
-    OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
+    OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
 };
 use crate::chat::ChatView;
 use crate::core::Core;
 use crate::library::LibraryView;
+use crate::record::RecordView;
 use crate::settings::SettingsView;
 use crate::updates::UpdatesView;
 
@@ -45,6 +48,9 @@ struct AppGlobal {
     /// The single Updates window, if open. Same singleton discipline as
     /// `settings_window`.
     updates_window: Option<WindowHandle<Root>>,
+    /// The single Record window, if open. Same singleton discipline as
+    /// `settings_window`.
+    record_window: Option<WindowHandle<Root>>,
 }
 
 impl gpui::Global for AppGlobal {}
@@ -84,6 +90,7 @@ pub fn run() {
             settings_window: None,
             library_window: None,
             updates_window: None,
+            record_window: None,
         });
 
         // Verified update-notification polling: one check at launch, then
@@ -139,6 +146,7 @@ fn install_menus(cx: &mut App) {
             items: vec![
                 MenuItem::action("New Space", NewSpace),
                 MenuItem::action("Library…", OpenLibrary),
+                MenuItem::action("Record…", OpenRecord),
                 MenuItem::Separator,
                 MenuItem::action("Close Window", CloseWindow),
             ],
@@ -197,6 +205,7 @@ fn install_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-n", NewSpace, None),
         KeyBinding::new("cmd-l", OpenLibrary, None),
+        KeyBinding::new("cmd-shift-l", OpenRecord, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-h", Hide, None),
@@ -346,6 +355,16 @@ fn install_action_handlers(cx: &mut App) {
         open_library_window(cx);
     });
 
+    cx.on_action(|_: &OpenRecord, cx: &mut App| {
+        // Singleton like Settings/Library. The view re-queries the local
+        // database on construction and exposes its own Refresh affordance,
+        // so raising the existing window needs no extra fetch here.
+        if try_focus_existing_record(cx) {
+            return;
+        }
+        open_record_window(cx);
+    });
+
     // macOS standard App-menu actions. Without these registered, AppKit
     // may treat the app menu as incomplete in the no-window-focused state
     // and skip menu-equivalent dispatch.
@@ -448,12 +467,17 @@ fn try_focus_existing_updates(cx: &mut App) -> bool {
     try_focus_existing_singleton(cx, |g| &mut g.updates_window)
 }
 
+fn try_focus_existing_record(cx: &mut App) -> bool {
+    try_focus_existing_singleton(cx, |g| &mut g.record_window)
+}
+
 /// Edge-to-edge titlebar: macOS extends the content view under the
 /// traffic-light buttons and stops painting a separate titlebar background.
 /// Each view is responsible for leaving room at the top so the lights don't
 /// land on real UI — see `chat::TITLE_BAR_RESERVE` (vertical reserve + fade
-/// gradient) and `settings::TAB_STRIP_LEFT_PAD` (horizontal pad — the tab
-/// row doubles as the title bar).
+/// gradient), `settings::NAV_TOP_RESERVE` (the lights sit over the nav
+/// band), and `record::STRIP_LEFT_PAD` (the section strip doubles as the
+/// title bar).
 fn transparent_titlebar() -> TitlebarOptions {
     TitlebarOptions {
         title: None,
@@ -577,9 +601,36 @@ fn open_updates_window(cx: &mut App) {
     cx.activate(true);
 }
 
+/// Open the Record window — the trust door's raw local trail (attestations,
+/// requests, spending). Singleton like Settings/Library; sized wide because
+/// its rows are mono request lines, not prose.
+fn open_record_window(cx: &mut App) {
+    let core = cx.global::<AppGlobal>().core.clone();
+    let bounds = centered_window_bounds(cx, 860., 640.);
+
+    let opts = WindowOptions {
+        window_bounds: bounds,
+        titlebar: Some(transparent_titlebar()),
+        kind: WindowKind::Normal,
+        window_min_size: Some(size(px(560.), px(400.))),
+        ..Default::default()
+    };
+
+    let handle = cx.open_window(opts, |window, cx| {
+        theme::observe_window_appearance(window);
+        let view = cx.new(|cx| RecordView::new(core.clone(), window, cx));
+        cx.new(|cx| Root::new(view, window, cx))
+    });
+
+    if let Ok(handle) = handle {
+        cx.global_mut::<AppGlobal>().record_window = Some(handle);
+    }
+    cx.activate(true);
+}
+
 fn open_settings_window(cx: &mut App) {
     let core = cx.global::<AppGlobal>().core.clone();
-    let bounds = centered_window_bounds(cx, 560., 480.);
+    let bounds = centered_window_bounds(cx, 620., 520.);
 
     let opts = WindowOptions {
         window_bounds: bounds,

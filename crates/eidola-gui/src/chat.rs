@@ -1387,55 +1387,21 @@ impl ChatView {
             return list;
         }
 
-        for (idx, price) in core.prices.iter().enumerate() {
-            let price_line = if ob.checkout_pending.as_deref() == Some(price.id.as_str()) {
-                // Real in-flight request — see `begin_checkout`.
-                "Opening checkout…".to_string()
-            } else {
-                format!("{}{}", price.amount_display, price.recurrence)
-            };
-            let mut subline = format!("{} credits", format_credits(price.credits));
-            if let Some(desc) = price.product_description.as_deref() {
-                subline = format!("{subline} — {desc}");
-            }
-            let price_id = price.id.clone();
-
-            list =
-                list.child(
-                    v_flex()
-                        .id(("plan", idx))
-                        .w_full()
-                        .py_3()
-                        .gap_1()
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.muted.opacity(0.35)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.begin_checkout(price_id.clone(), cx)
-                        }))
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .justify_between()
-                                .items_baseline()
-                                .child(div().child(SharedString::from(price.product_name.clone())))
-                                .child(
-                                    div()
-                                        .text_color(theme.muted_foreground)
-                                        .child(SharedString::from(price_line)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child(SharedString::from(subline)),
-                        ),
-                );
-        }
-        // Closing hairline under the last row.
-        list = list.child(div().w_full().h(px(1.)).bg(theme.border));
+        // The rows themselves are shared with the Settings Account pane —
+        // see `crate::plans::plan_rows`. The click handler routes back into
+        // this view through a weak entity handle (`plan_rows` is a free
+        // function, so it can't take `cx.listener` directly).
+        let weak = cx.entity().downgrade();
+        let on_select: crate::plans::PlanSelectHandler =
+            std::rc::Rc::new(move |price_id, _window, app| {
+                let _ = weak.update(app, |this, cx| this.begin_checkout(price_id, cx));
+            });
+        list = list.child(crate::plans::plan_rows(
+            &core.prices,
+            ob.checkout_pending.as_deref(),
+            on_select,
+            cx,
+        ));
 
         if ob.awaiting_checkout {
             // The balance poll is live — one real request every ~3s.
@@ -1515,24 +1481,6 @@ fn prose_col() -> Div {
         .max_w(rems(PROSE_MAX_WIDTH_REM))
         .text_size(PROSE_FONT_SIZE)
         .line_height(relative(PROSE_LINE_HEIGHT))
-}
-
-/// Format a credit amount with thousands separators (credits are micro-USD
-/// denominated, so the magnitudes are large).
-fn format_credits(credits: i64) -> String {
-    let raw = credits.abs().to_string();
-    let mut out = String::with_capacity(raw.len() + raw.len() / 3 + 1);
-    if credits < 0 {
-        out.push('-');
-    }
-    let offset = raw.len() % 3;
-    for (i, ch) in raw.chars().enumerate() {
-        if i > 0 && (i + 3 - offset).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 /// Friendly label for a chat role, used as the participant name in the
