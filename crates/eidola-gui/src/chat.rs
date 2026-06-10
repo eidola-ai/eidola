@@ -142,6 +142,10 @@ pub struct ChatView {
     /// Conversation history shown in the scroll view. `pub` so snapshot tests
     /// can render the view in a populated state without driving async chat.
     pub messages: Vec<ChatMessageView>,
+    /// Bumped whenever local chat state moves ahead of an initial reload.
+    /// Reopened-space loads capture this value and only apply if it still
+    /// matches, so a slow initial load cannot hide a newly submitted exchange.
+    transcript_generation: u64,
     /// In-flight streaming assistant response, or `None` when idle.
     pub streaming: Option<StreamingResponse>,
     error: Option<String>,
@@ -212,6 +216,16 @@ impl ChatView {
         self.error = error;
     }
 
+    /// Test-only: simulate completion of the initial reopened-space load.
+    #[doc(hidden)]
+    pub fn merge_initial_messages_for_test(
+        &mut self,
+        load_generation: u64,
+        messages: Vec<SpaceMessage>,
+    ) -> bool {
+        self.merge_initial_messages_from_db(load_generation, messages)
+    }
+
     /// The space this window is writing into, if one has been assigned —
     /// either passed at construction (opened from the Library) or set when
     /// the first exchange creates a space.
@@ -279,6 +293,7 @@ impl ChatView {
         if let Some(sid) = space_id.clone()
             && let Some(app_core) = core.read(cx).app_core()
         {
+            let load_generation = 0;
             let msgs_rx = Core::get_space_messages(app_core, sid);
             cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
                 let msgs = msgs_rx.await.unwrap_or_else(|_| {
@@ -288,8 +303,14 @@ impl ChatView {
                 });
                 let _ = this.update(cx, |this, cx| {
                     match msgs {
-                        Ok(messages) => this.merge_messages_from_db(messages, None),
-                        Err(e) => this.error = Some(e.to_string()),
+                        Ok(messages) => {
+                            this.merge_initial_messages_from_db(load_generation, messages);
+                        }
+                        Err(e) => {
+                            if this.transcript_generation == load_generation {
+                                this.error = Some(e.to_string());
+                            }
+                        }
                     }
                     cx.notify();
                 });
@@ -302,6 +323,7 @@ impl ChatView {
             prompt_editor,
             space_id,
             messages: Vec::new(),
+            transcript_generation: 0,
             streaming: None,
             error: None,
             onboarding: OnboardingFlow::default(),
@@ -548,6 +570,18 @@ impl ChatView {
     /// this view, so positions are stable) and attaching the just-
     /// captured streaming reasoning to the new last assistant entry if
     /// non-empty.
+    fn merge_initial_messages_from_db(
+        &mut self,
+        load_generation: u64,
+        messages: Vec<SpaceMessage>,
+    ) -> bool {
+        if self.transcript_generation != load_generation {
+            return false;
+        }
+        self.merge_messages_from_db(messages, None);
+        true
+    }
+
     fn merge_messages_from_db(
         &mut self,
         new_messages: Vec<SpaceMessage>,
@@ -613,6 +647,7 @@ impl ChatView {
             editor.state = EditorState::default();
             cx.notify();
         });
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.messages.push(ChatMessageView::new(SpaceMessage {
             role: "user".to_string(),
             content: prompt.clone(),

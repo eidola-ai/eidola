@@ -261,6 +261,42 @@ fn chat_view_records_existing_space_id(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn stale_initial_space_load_does_not_replace_submitted_prompt(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(core.clone(), Some("space-123".into()), window, cx))
+    });
+
+    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    cx.update_window(window, |_, _, cx| {
+        prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::with_markdown("new prompt");
+            cx.notify();
+        });
+    })
+    .unwrap();
+    dispatch_send(&view, window, cx);
+
+    view.update(cx, |v, _| {
+        let applied = v.merge_initial_messages_for_test(
+            0,
+            vec![SpaceMessage {
+                role: "user".into(),
+                content: "old prompt".into(),
+            }],
+        );
+        assert!(!applied, "stale initial load should be ignored");
+    });
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.messages.len(), 1);
+        assert_eq!(v.messages[0].message.role, "user");
+        assert_eq!(v.messages[0].message.content, "new prompt");
+        assert!(v.streaming.is_some());
+    });
+}
+
+#[gpui::test]
 fn chat_view_renders_preloaded_messages(cx: &mut TestAppContext) {
     // A reopened space renders its persisted history. The stub core can't
     // drive the async load, so this exercises the same state the loader
