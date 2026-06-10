@@ -11,9 +11,12 @@
 //! 4. Assert against the view/core's public state with `read_with`.
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{BalancesResult, ConfigState, CredentialInfo, PriceInfo, SpaceMessage};
+use eidola_app_core::{
+    BalancesResult, ConfigState, CredentialInfo, PriceInfo, SpaceInfo, SpaceMessage,
+};
 use eidola_gui::chat::{ChatView, OnboardingStage, Send};
 use eidola_gui::core::Core;
+use eidola_gui::library::LibraryView;
 use eidola_gui::wallet::WalletView;
 use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
 use gpui_component::{Root, Theme};
@@ -133,7 +136,7 @@ fn wallet_view_constructs_against_stub_core(cx: &mut TestAppContext) {
 fn chat_submit_with_empty_prompt_is_noop(cx: &mut TestAppContext) {
     let core = stub_core_with_config(cx);
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(core.clone(), window, cx))
+        cx.new(|cx| ChatView::new(core.clone(), None, window, cx))
     });
 
     view.read_with(cx, |v, _| {
@@ -159,7 +162,7 @@ fn chat_submit_with_empty_prompt_is_noop(cx: &mut TestAppContext) {
 fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
     let core = stub_core_with_config(cx);
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(core.clone(), window, cx))
+        cx.new(|cx| ChatView::new(core.clone(), None, window, cx))
     });
 
     // Populate the prompt editor the same way a user would, then dispatch
@@ -211,7 +214,7 @@ fn chat_renders_markdown_messages_without_panicking(cx: &mut TestAppContext) {
     // of how many block elements its content parses into.
     let core = stub_core_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(core.clone(), window, cx))
+        cx.new(|cx| ChatView::new(core.clone(), None, window, cx))
     });
 
     view.update(cx, |v, _cx| {
@@ -235,6 +238,167 @@ fn chat_renders_markdown_messages_without_panicking(cx: &mut TestAppContext) {
             "markdown content must not multiply messages"
         );
         assert_eq!(v.messages[1].message.role, "assistant");
+    });
+}
+
+#[gpui::test]
+fn chat_view_records_existing_space_id(cx: &mut TestAppContext) {
+    // Opening a space from the Library constructs the ChatView with the
+    // existing space_id. With a stub core there's no backend to load
+    // messages from, so the transcript starts empty (tests preload via
+    // `set_messages_for_test`) — but the space binding must be in place so
+    // the next submit continues the space instead of creating a new one.
+    let core = stub_core_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(core.clone(), Some("space-123".into()), window, cx))
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.space_id(), Some("space-123"));
+        assert!(v.messages.is_empty());
+    });
+}
+
+#[gpui::test]
+fn stale_initial_space_load_does_not_replace_submitted_prompt(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(core.clone(), Some("space-123".into()), window, cx))
+    });
+
+    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    cx.update_window(window, |_, _, cx| {
+        prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::with_markdown("new prompt");
+            cx.notify();
+        });
+    })
+    .unwrap();
+    dispatch_send(&view, window, cx);
+
+    view.update(cx, |v, _| {
+        let applied = v.merge_initial_messages_for_test(
+            0,
+            vec![SpaceMessage {
+                role: "user".into(),
+                content: "old prompt".into(),
+            }],
+        );
+        assert!(!applied, "stale initial load should be ignored");
+    });
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.messages.len(), 1);
+        assert_eq!(v.messages[0].message.role, "user");
+        assert_eq!(v.messages[0].message.content, "new prompt");
+        assert!(v.streaming.is_some());
+    });
+}
+
+#[gpui::test]
+fn chat_view_renders_preloaded_messages(cx: &mut TestAppContext) {
+    // A reopened space renders its persisted history. The stub core can't
+    // drive the async load, so this exercises the same state the loader
+    // produces: messages installed after construction.
+    let core = stub_core_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(core.clone(), Some("space-123".into()), window, cx))
+    });
+
+    view.update(cx, |v, _| {
+        v.set_messages_for_test(vec![
+            SpaceMessage {
+                role: "user".into(),
+                content: "Earlier question".into(),
+            },
+            SpaceMessage {
+                role: "assistant".into(),
+                content: "Earlier answer".into(),
+            },
+        ]);
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.messages.len(), 2);
+        assert_eq!(v.messages[0].message.role, "user");
+        assert_eq!(v.messages[1].message.role, "assistant");
+        assert_eq!(v.space_id(), Some("space-123"));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Library view
+// ---------------------------------------------------------------------------
+
+fn stub_space(id: &str, title: Option<&str>, snippet: Option<&str>, ts: i64) -> SpaceInfo {
+    SpaceInfo {
+        id: id.into(),
+        title: title.map(String::from),
+        snippet: snippet.map(String::from),
+        created_at: ts,
+        last_activity_at: ts,
+        message_count: 2,
+        archived_at: None,
+    }
+}
+
+#[gpui::test]
+fn library_view_renders_stubbed_spaces(cx: &mut TestAppContext) {
+    let core = cx.update(|cx| {
+        cx.new(|_| {
+            let mut c = Core::stub();
+            c.spaces = vec![
+                stub_space("s1", Some("Tides and the moon"), None, 1_000),
+                stub_space("s2", None, Some("what is a monad?"), 2_000),
+            ];
+            c
+        })
+    });
+
+    let (_window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(core.clone(), window, cx))
+    });
+    cx.run_until_parked();
+
+    // Construction calls `core.fetch_spaces(cx)` — a no-op on a stub — so
+    // the stubbed listing must survive render.
+    core.read_with(cx, |c, _| {
+        assert_eq!(c.spaces.len(), 2);
+        assert!(!c.busy);
+    });
+}
+
+#[gpui::test]
+fn library_archive_removes_row(cx: &mut TestAppContext) {
+    let core = cx.update(|cx| {
+        cx.new(|_| {
+            let mut c = Core::stub();
+            c.spaces = vec![
+                stub_space("s1", Some("Keep me"), None, 1_000),
+                stub_space("s2", Some("Archive me"), None, 2_000),
+            ];
+            c
+        })
+    });
+
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(core.clone(), window, cx))
+    });
+
+    // The hover-revealed × calls `LibraryView::archive` with the row's
+    // space id; drive the same method directly (behavior tests don't
+    // synthesize mouse events).
+    view.update(cx, |v, cx| v.archive("s2".into(), cx));
+    cx.run_until_parked();
+
+    core.read_with(cx, |c, _| {
+        assert_eq!(
+            c.spaces.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["s1"],
+            "archiving must remove the row from the cached listing"
+        );
     });
 }
 
@@ -546,7 +710,7 @@ fn stub_core_with_config(cx: &mut TestAppContext) -> Entity<Core> {
 fn open_chat(cx: &mut TestAppContext, core: &Entity<Core>) -> (AnyWindowHandle, Entity<ChatView>) {
     let core = core.clone();
     open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(core.clone(), window, cx))
+        cx.new(|cx| ChatView::new(core.clone(), None, window, cx))
     })
 }
 

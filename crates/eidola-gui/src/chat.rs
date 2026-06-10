@@ -142,6 +142,10 @@ pub struct ChatView {
     /// Conversation history shown in the scroll view. `pub` so snapshot tests
     /// can render the view in a populated state without driving async chat.
     pub messages: Vec<ChatMessageView>,
+    /// Bumped whenever local chat state moves ahead of an initial reload.
+    /// Reopened-space loads capture this value and only apply if it still
+    /// matches, so a slow initial load cannot hide a newly submitted exchange.
+    transcript_generation: u64,
     /// In-flight streaming assistant response, or `None` when idle.
     pub streaming: Option<StreamingResponse>,
     error: Option<String>,
@@ -211,10 +215,37 @@ impl ChatView {
     pub fn set_error_for_test(&mut self, error: Option<String>) {
         self.error = error;
     }
+
+    /// Test-only: simulate completion of the initial reopened-space load.
+    #[doc(hidden)]
+    pub fn merge_initial_messages_for_test(
+        &mut self,
+        load_generation: u64,
+        messages: Vec<SpaceMessage>,
+    ) -> bool {
+        self.merge_initial_messages_from_db(load_generation, messages)
+    }
+
+    /// The space this window is writing into, if one has been assigned —
+    /// either passed at construction (opened from the Library) or set when
+    /// the first exchange creates a space.
+    pub fn space_id(&self) -> Option<&str> {
+        self.space_id.as_deref()
+    }
 }
 
 impl ChatView {
-    pub fn new(core: Entity<Core>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Construct a chat view. `space_id: None` is the blank page (⌘N): a
+    /// fresh space is created lazily by the first exchange. `Some(id)`
+    /// reopens an existing space (the Library's path): its messages are
+    /// loaded asynchronously on construction and the next exchange
+    /// continues that space.
+    pub fn new(
+        core: Entity<Core>,
+        space_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // The composer is a WYSIWYG markdown editor configured to match
         // the chat transcript's prose typography (Newsreader 17px / 1.65×
         // / gentle heading scale / 1.5 rem paragraph gap), so what the
@@ -255,11 +286,44 @@ impl ChatView {
             cx.notify();
         })];
 
+        // Reopening an existing space: load its persisted messages in the
+        // background, same bridge `spawn_stream` uses for its post-stream
+        // re-fetch. Stub cores (tests) skip the load — tests preload via
+        // `set_messages_for_test`.
+        if let Some(sid) = space_id.clone()
+            && let Some(app_core) = core.read(cx).app_core()
+        {
+            let load_generation = 0;
+            let msgs_rx = Core::get_space_messages(app_core, sid);
+            cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+                let msgs = msgs_rx.await.unwrap_or_else(|_| {
+                    Err(eidola_app_core::error::AppError::Internal {
+                        message: "fetch messages task cancelled".into(),
+                    })
+                });
+                let _ = this.update(cx, |this, cx| {
+                    match msgs {
+                        Ok(messages) => {
+                            this.merge_initial_messages_from_db(load_generation, messages);
+                        }
+                        Err(e) => {
+                            if this.transcript_generation == load_generation {
+                                this.error = Some(e.to_string());
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
         Self {
             core,
             prompt_editor,
-            space_id: None,
+            space_id,
             messages: Vec::new(),
+            transcript_generation: 0,
             streaming: None,
             error: None,
             onboarding: OnboardingFlow::default(),
@@ -506,6 +570,18 @@ impl ChatView {
     /// this view, so positions are stable) and attaching the just-
     /// captured streaming reasoning to the new last assistant entry if
     /// non-empty.
+    fn merge_initial_messages_from_db(
+        &mut self,
+        load_generation: u64,
+        messages: Vec<SpaceMessage>,
+    ) -> bool {
+        if self.transcript_generation != load_generation {
+            return false;
+        }
+        self.merge_messages_from_db(messages, None);
+        true
+    }
+
     fn merge_messages_from_db(
         &mut self,
         new_messages: Vec<SpaceMessage>,
@@ -571,6 +647,7 @@ impl ChatView {
             editor.state = EditorState::default();
             cx.notify();
         });
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.messages.push(ChatMessageView::new(SpaceMessage {
             role: "user".to_string(),
             content: prompt.clone(),

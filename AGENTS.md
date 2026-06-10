@@ -105,7 +105,7 @@ The GUI app and CLI share a common Rust core (`crates/eidola-app-core/`) consume
 
 **Core crate modules:**
 
-- `lib.rs` — `AppCore` struct, all high-level operations (account create/show/allocate, chat, wallet), DTO record types (`ConfigState`, `ChatResult`, `PriceInfo`, etc.), internal helpers (ACT token serialization, attestation flushing, HTTP response handling)
+- `lib.rs` — `AppCore` struct, all high-level operations (account create/show/allocate, chat, wallet, spaces: list/archive/rename), DTO record types (`ConfigState`, `ChatResult`, `PriceInfo`, `SpaceInfo`, etc.), internal helpers (ACT token serialization, attestation flushing, HTTP response handling). `list_spaces(include_archived)` returns title + first-message snippet + last-activity + message-count signals for the GUI's Library; `chat`/`chat_stream` auto-title an untitled space on its first exchange from the first line of the user's prompt (local heuristic — markdown markers stripped, ~64-char word-boundary truncation; no model call)
 - `config.rs` — `Config` struct (TOML serde) with `*_override` fields and resolver methods that fall back to the embedded trust-root pin, load/save with explicit paths, measurement parsing, certificate parsing
 - `trust_root.rs` — re-exports the build-time-generated `trust_root.gen.rs` constants (server URL, server enclave measurement, attestant fingerprints, CI identity, schema versions, embedded JSON for attestation templates + Sigstore trusted root). Source files live under `releases/`; see `docs/trust-root.md` for what's pinned and `releases/README.md` for how it rotates.
 - `db.rs` — Turso (libSQL) database layer with 3-layer schema (wallet, transport, semantic), migrations, all CRUD operations
