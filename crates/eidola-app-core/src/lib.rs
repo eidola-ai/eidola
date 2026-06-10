@@ -1,3 +1,4 @@
+pub mod changes;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -20,6 +21,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
 use error::AppError;
 
@@ -340,6 +342,8 @@ struct Inner {
     update_state: Mutex<Option<updates::UpdateState>>,
     /// Latch so `start_update_polling` spawns at most one poll loop.
     update_polling: std::sync::atomic::AtomicBool,
+    /// Invalidation bus — emits a [`Change`] after every durable commit.
+    bus: BroadcastSource,
 }
 
 // --- Config helpers (sync) ---------------------------------------------------
@@ -372,12 +376,13 @@ impl Inner {
 
     /// Replace the cached state and persist it. A disk write failure is
     /// logged, not fatal — the in-memory state stays authoritative for the
-    /// rest of the run.
+    /// rest of the run.  Emits [`Change::UpdateState`] after the write.
     fn store_update_state(&self, state: updates::UpdateState) {
         if let Err(e) = updates::save_state(&self.data_dir, &state) {
             eprintln!("warning: failed to persist update-check state: {e}");
         }
         *self.update_state.lock().expect("update_state lock") = Some(state);
+        self.bus.emit(Change::UpdateState);
     }
 
     /// Run one check and fold it into the persisted state (a `CheckFailed`
@@ -544,6 +549,7 @@ impl Inner {
         cfg.account_id = Some(created.account_id.to_string());
         cfg.account_secret = Some(created.secret);
         cfg.save_to(&self.config_path)?;
+        self.bus.emit(Change::Config);
 
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
@@ -824,6 +830,11 @@ impl Inner {
         )
         .await?;
 
+        // Allocation moves credits from the account balance into a credential:
+        // both the wallet and account domains changed.
+        self.bus.emit(Change::Wallet);
+        self.bus.emit(Change::Account);
+
         Ok(AllocateResult {
             nonce: nonce_hex,
             credits: issued.credits,
@@ -1042,6 +1053,10 @@ impl Inner {
             }
         }
 
+        if !recovered.is_empty() {
+            self.bus.emit(Change::Wallet);
+        }
+
         Ok(recovered)
     }
 
@@ -1112,6 +1127,8 @@ impl Inner {
         db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
             .await?;
 
+        self.bus.emit(Change::SpaceIndex);
+
         Ok(SpaceInfo {
             id: space_id,
             title: title.map(String::from),
@@ -1125,7 +1142,11 @@ impl Inner {
 
     async fn archive_space(&self, space_id: &str) -> Result<bool, AppError> {
         let db_conn = self.db_conn().await?;
-        db::archive_space(&db_conn, space_id, now_ms()).await
+        let archived = db::archive_space(&db_conn, space_id, now_ms()).await?;
+        if archived {
+            self.bus.emit(Change::SpaceIndex);
+        }
+        Ok(archived)
     }
 
     /// Find a credential that can cover `charge_credits`, auto-provisioning
@@ -1176,7 +1197,9 @@ impl Inner {
             .ok_or_else(|| AppError::NotConfigured {
                 message: format!("space not found: {space_id}"),
             })?;
-        db::update_space_title(&db_conn, space_id, title).await
+        db::update_space_title(&db_conn, space_id, title).await?;
+        self.bus.emit(Change::SpaceIndex);
+        Ok(())
     }
 
     async fn chat(
@@ -1188,6 +1211,9 @@ impl Inner {
         let cfg = self.load_config();
         let base_url = cfg.base_url();
         let now = now_ms();
+        // Track whether this chat implicitly creates a new space or auto-titles
+        // an existing untitled one — both touch the space index.
+        let is_new_space = space_id.is_none();
 
         let db_conn = self.db_conn().await?;
         let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
@@ -1361,11 +1387,13 @@ impl Inner {
 
         // Auto-title: the first exchange in an untitled space names the
         // space after the user's prompt. Purely local — no model call.
+        let mut auto_titled = false;
         if space_title.is_none()
             && prior_messages.is_empty()
             && let Some(title) = derive_space_title(prompt)
         {
             db::update_space_title(&db_conn, &space_id, &title).await?;
+            auto_titled = true;
         }
 
         // Link to previous action as antecedent
@@ -1582,6 +1610,16 @@ impl Inner {
             });
         }
 
+        // All durable writes succeeded — emit one message per affected domain.
+        // SpaceIndex: a new space was implicitly created, or the space was
+        // auto-titled on its first exchange.
+        if is_new_space || auto_titled {
+            self.bus.emit(Change::SpaceIndex);
+        }
+        self.bus.emit(Change::Space(space_id.clone()));
+        self.bus.emit(Change::Wallet);
+        self.bus.emit(Change::Record);
+
         Ok(ChatResult {
             space_id,
             content: response_content,
@@ -1623,6 +1661,7 @@ impl Inner {
         let cfg = self.load_config();
         let base_url = cfg.base_url();
         let now = now_ms();
+        let is_new_space = space_id.is_none();
 
         let db_conn = self.db_conn().await?;
         let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
@@ -1789,11 +1828,13 @@ impl Inner {
 
         // Auto-title: the first exchange in an untitled space names the
         // space after the user's prompt. Purely local — no model call.
+        let mut auto_titled = false;
         if space_title.is_none()
             && prior_messages.is_empty()
             && let Some(title) = derive_space_title(prompt)
         {
             db::update_space_title(&db_conn, &space_id, &title).await?;
+            auto_titled = true;
         }
 
         if let Some(ref ante_id) = last_action_id {
@@ -2090,6 +2131,14 @@ impl Inner {
         )
         .await?;
 
+        // All durable writes succeeded — emit one message per affected domain.
+        if is_new_space || auto_titled {
+            self.bus.emit(Change::SpaceIndex);
+        }
+        self.bus.emit(Change::Space(space_id.clone()));
+        self.bus.emit(Change::Wallet);
+        self.bus.emit(Change::Record);
+
         Ok(ChatResult {
             space_id,
             content: full_content,
@@ -2125,6 +2174,9 @@ fn find_event_boundary(buf: &[u8]) -> Option<usize> {
 pub struct AppCore {
     runtime: tokio::runtime::Runtime,
     inner: Arc<Inner>,
+    /// The invalidation bus, shared with `Inner` so callers can subscribe
+    /// while `Inner` emits on the tokio runtime.
+    bus: BroadcastSource,
 }
 
 impl AppCore {
@@ -2174,16 +2226,36 @@ impl AppCore {
             .thread_stack_size(8 * 1024 * 1024) // 8 MB — matches default main-thread size
             .build()
             .expect("failed to create tokio runtime");
+        let bus = BroadcastSource::new();
         Self {
             runtime,
+            bus: bus.clone(),
             inner: Arc::new(Inner {
                 config_path: config_dir.join("config.toml"),
                 data_dir,
                 db: tokio::sync::OnceCell::new(),
                 update_state: Mutex::new(None),
                 update_polling: std::sync::atomic::AtomicBool::new(false),
+                bus,
             }),
         }
+    }
+
+    /// Subscribe to the invalidation bus.
+    ///
+    /// Returns a [`tokio::sync::broadcast::Receiver`] that receives a
+    /// [`changes::Change`] after every successful durable write in this
+    /// `AppCore` instance.  The receiver is independent — dropping it does
+    /// not affect the bus or other subscribers.
+    ///
+    /// ## Lagged receivers
+    ///
+    /// If a receiver falls more than [`changes::BUS_CAPACITY`] messages behind
+    /// it will receive [`tokio::sync::broadcast::error::RecvError::Lagged`].
+    /// Treat that as "refresh everything you care about" — at least that many
+    /// changes were missed.
+    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<changes::Change> {
+        self.bus.subscribe()
     }
 
     // -----------------------------------------------------------------------
@@ -2216,7 +2288,9 @@ impl AppCore {
     pub fn set_base_url(&self, url: String) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.base_url_override = Some(url);
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     /// Persist the user's default inference model (the `default_model`
@@ -2231,7 +2305,9 @@ impl AppCore {
         }
         let mut cfg = self.inner.load_config();
         cfg.default_model_override = Some(model);
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     /// Remove the user's base-URL override, reverting to the trust-root pin
@@ -2239,27 +2315,35 @@ impl AppCore {
     pub fn clear_base_url_override(&self) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.base_url_override = None;
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     pub fn set_attestation_url(&self, url: String) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.attestation_url = Some(url);
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     pub fn set_hardware_root_ca(&self, pem: String) -> Result<(), AppError> {
         config::parse_cert_config(Some(&pem), "hardware_root_ca")?;
         let mut cfg = self.inner.load_config();
         cfg.hardware_root_ca = Some(pem.trim().to_string());
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     pub fn set_hardware_intermediate_ca(&self, pem: String) -> Result<(), AppError> {
         config::parse_cert_config(Some(&pem), "hardware_intermediate_ca")?;
         let mut cfg = self.inner.load_config();
         cfg.hardware_intermediate_ca = Some(pem.trim().to_string());
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     pub fn trust_measurement(
@@ -2279,6 +2363,7 @@ impl AppCore {
         }
         cfg.trusted_measurements_override.push(entry);
         cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
         Ok(true)
     }
 
@@ -2292,6 +2377,7 @@ impl AppCore {
         {
             cfg.trusted_measurements_override.remove(pos);
             cfg.save_to(&self.inner.config_path)?;
+            self.bus.emit(Change::Config);
             Ok(true)
         } else {
             Ok(false)
@@ -2308,14 +2394,18 @@ impl AppCore {
         let mut cfg = cfg;
         cfg.account_id = Some(id);
         cfg.account_secret = Some(secret);
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     pub fn reset_account(&self) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.account_id = None;
         cfg.account_secret = None;
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
