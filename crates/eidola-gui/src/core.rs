@@ -123,6 +123,21 @@ impl Core {
         }
     }
 
+    /// Persist the user's default model (`default_model` config override)
+    /// and refresh the shared config snapshot so every window's resolved
+    /// default tracks the new value. No-op on stub cores: behavior tests
+    /// assert per-window selection state instead, and the config round-trip
+    /// is covered at the app-core layer.
+    pub fn set_default_model(&mut self, model: String, cx: &mut Context<Self>) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        match inner.set_default_model(model) {
+            Ok(()) => self.refresh_config(cx),
+            Err(e) => self.set_error(e, cx),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn set_attestation_url(&mut self, url: String, cx: &mut Context<Self>) {
         let Some(inner) = self.inner.as_ref() else {

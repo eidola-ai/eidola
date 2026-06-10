@@ -97,6 +97,17 @@ There is no Send button. ⌘↩ is the sole submit path.
 
 **Test wrapping invariant.** Behavior tests still wrap the view in `gpui_component::Root` (see `tests/behavior.rs::open_view`) even though the chat composer no longer uses `gpui_component::Input` — keeping Root mirrors production (`lib.rs::open_main_window`) and is required for any test that exercises SettingsView. The chat tests no longer *require* Root strictly, but the helper is shared across views so removing the wrap would split the harness.
 
+## Model picker — Option-revealed
+
+The first real exercise of the "Option key reveals power" pillar; the interaction pattern here is the template for future ⌥-affordances. At rest the page shows **no model chrome at all** — the blank page stays sacred.
+
+- **Reveal.** `ChatView` tracks ⌥ via `on_modifiers_changed` on the root v_flex (`cx.listener` → `handle_modifiers_changed` → `alt_held`). gpui dispatches `ModifiersChangedEvent` along the focused element's dispatch path, and the root is an ancestor of the always-focused composer, so the listener fires for every modifier transition while the window is key. While ⌥ is held (or the picker is open — the open panel keeps its anchor), the current model id appears right-aligned **in the title-bar band** (`render_title_bar`), `text_sm` muted italic — the same voice as the chapter-delim labels. The band is absolutely-positioned chrome painted last, so the reveal cannot shift page layout. Model chrome renders only on the `Ready` onboarding stage; the welcome/plans pages have no sends for it to describe.
+- **Picker.** Clicking the revealed label or pressing **⌥⌘M** (`chat::ToggleModelPicker`, bound in the `ChatView` key context) toggles a quiet panel anchored under the band's right edge, listing `Core.models` with honest per-model info straight from the `/models` payload: context length plus the credit rates actually charged (`ModelInfo::{prompt,completion}_credits_per_token`, or the flat `request_credits` for per-request models; if pricing is absent we show context length only — no invented numbers). The current selection and the config default are marked; rows are hairline-separated; `popover_style` keeps the surface consistent with gpui-component overlays. Click-out dismisses (`on_mouse_down_out`), ⌥⌘M toggles closed. Hand-rolled rather than `gpui_component::Popover` because the open state must live on the view (⌥⌘M and behavior tests drive it without a pointer), the anchor is the absolute band rather than an in-flow `Selectable` trigger, and the band already paints above the scroll content, so plain absolute positioning does everything `deferred(anchored(…))` would.
+- **Scope of the choice.** `selected_model: Option<String>` is per-window; `None` means "follow the config default". `current_model()` resolves selection → `ConfigState::default_model` → embedded fallback (`eidola_app_core::config::DEFAULT_MODEL`, for stub cores). The default lives in config as the `default_model` override (`Config::default_model()` resolver, `AppCore::set_default_model`, surfaced through `ConfigState`); the picker's footer shows a small secondary "Set … as default" affordance only when it would change anything. Switching mid-stream applies to the *next* send — the in-flight request is never hot-swapped.
+- **Honesty plumbing.** `submit` resolves the model once, records it in `last_submitted_model` *before* the stub-core guard (so behavior tests assert exactly what a real send would use), and passes it through `chat_stream` — which is also what app-core persists on the action row in the local DB.
+- **Tests.** Behavior: `alt_reveals_model_label` (drives the real modifiers dispatch via `VisualTestContext::simulate_modifiers_change`), picker toggle round-trip, default-vs-selection submit resolution, mid-stream selection. Config persistence round-trips are covered in app-core (`set_default_model_round_trips_through_config_state` + `config.rs` TOML tests). Snapshots: `chat_model_reveal`, `chat_model_picker`.
+- **Deferred:** opacity fade-in on reveal (instant today; an animation would also make snapshots nondeterministic), Escape-to-dismiss (⌥⌘M toggles closed), keyboard navigation inside the picker.
+
 ## Streaming chat
 
 `ChatView` drives chat via `Core::chat_stream` (which wraps `AppCore::chat_stream` from `crates/eidola-app-core/`). The core's streaming method posts `stream: true` to the OpenAI-compatible upstream and forwards each SSE chunk's `delta.content` as `ChatStreamEvent::ContentDelta` and `delta.reasoning_content` / `delta.reasoning` (vLLM-style) as `ChatStreamEvent::ReasoningDelta`. The terminal `ChatResult` is the function's return value, not an event — the channel just closes.
@@ -131,7 +142,7 @@ Interactions: clicking a row opens the space (`open_space` defers `open_space_wi
 
 `transparent_titlebar()` returns `TitlebarOptions { appears_transparent: true, title: None, traffic_light_position: Some(point(14, 11)) }`. macOS extends the content view under the traffic-light buttons and stops painting a separate titlebar background. Each view leaves room at the top so the lights don't land on real UI:
 
-- **`chat::TITLE_BAR_RESERVE`** (36px on macOS): vertical reserve, plus a `theme.background → transparent` linear-gradient overlay (`title_bar_overlay`) painted absolutely over the scroll area. Messages scrolling up under the band fade smoothly into the chrome instead of clipping at a hard edge.
+- **`chat::TITLE_BAR_RESERVE`** (36px on macOS): vertical reserve, plus a `theme.background → transparent` linear-gradient overlay (`ChatView::render_title_bar`) painted absolutely over the scroll area. Messages scrolling up under the band fade smoothly into the chrome instead of clipping at a hard edge. The band also hosts the ⌥-revealed model label and the anchored picker panel (see [Model picker](#model-picker--option-revealed)).
 - **`settings::TAB_STRIP_LEFT_PAD`** (80px on macOS): horizontal pad on the tab strip. The tab row doubles as the title bar — the lights live to its left on a shared `theme.background` band. 80px matches gpui-component's own `TITLE_BAR_LEFT_PADDING`.
 
 ## macOS UX — menus, keybindings, action dispatch
@@ -151,7 +162,7 @@ All wired in `src/lib.rs::install_menus`, `install_keybindings`, `install_action
 
 ### Keybindings (`cx.bind_keys`)
 
-⌘, (Settings), ⌘N (NewSpace), ⌘L (OpenLibrary), ⌘W (CloseWindow), ⌘Q (Quit), ⌘H (Hide), ⌥⌘H (HideOthers), ⌘M (Minimize), and ⌘↩ for `Send` in the `ChatView` key-context.
+⌘, (Settings), ⌘N (NewSpace), ⌘L (OpenLibrary), ⌘W (CloseWindow), ⌘Q (Quit), ⌘H (Hide), ⌥⌘H (HideOthers), ⌘M (Minimize), plus two `ChatView`-context bindings: ⌘↩ (`Send`) and ⌥⌘M (`ToggleModelPicker` — distinct keystroke from the global ⌘M, so no conflict).
 
 ### Ordering invariant
 

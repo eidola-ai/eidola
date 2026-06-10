@@ -12,13 +12,16 @@
 
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    BalancesResult, ConfigState, CredentialInfo, PriceInfo, SpaceInfo, SpaceMessage,
+    BalancesResult, ConfigState, CredentialInfo, ModelInfo, PriceInfo, SpaceInfo, SpaceMessage,
 };
-use eidola_gui::chat::{ChatView, OnboardingStage, Send};
+use eidola_gui::chat::{ChatView, OnboardingStage, Send, ToggleModelPicker};
 use eidola_gui::core::Core;
 use eidola_gui::library::LibraryView;
 use eidola_gui::wallet::WalletView;
-use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
+use gpui::{
+    AnyWindowHandle, AppContext, Entity, Modifiers, TestAppContext, VisualTestContext,
+    WindowOptions,
+};
 use gpui_component::{Root, Theme};
 use gpui_markdown_editor::EditorState;
 
@@ -326,6 +329,221 @@ fn chat_view_renders_preloaded_messages(cx: &mut TestAppContext) {
         assert_eq!(v.messages[1].message.role, "assistant");
         assert_eq!(v.space_id(), Some("space-123"));
     });
+}
+
+// ---------------------------------------------------------------------------
+// Chat view — model picker
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn alt_reveals_model_label(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (window, view) = open_chat(cx, &core);
+
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.model_revealed(),
+            "resting state is invisible — no model chrome until ⌥"
+        );
+    });
+
+    // Drive the real modifiers-changed dispatch path (platform event →
+    // window → focus dispatch chain → the root element's
+    // `on_modifiers_changed` listener).
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_modifiers_change(Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(v.model_revealed(), "holding ⌥ must reveal the model label");
+    });
+
+    vcx.simulate_modifiers_change(Modifiers::default());
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.model_revealed(),
+            "releasing ⌥ must return the page to its resting state"
+        );
+    });
+}
+
+#[gpui::test]
+fn picker_stays_open_after_alt_release(cx: &mut TestAppContext) {
+    // ⌥⌘M opens the picker; releasing ⌥ afterwards must not yank the
+    // panel (or its anchor label) away mid-interaction.
+    let core = stub_core_with_config(cx);
+    let (window, view) = open_chat(cx, &core);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_modifiers_change(Modifiers::default());
+    view.read_with(&vcx, |v, _| {
+        assert!(v.model_picker_open());
+        assert!(
+            v.model_revealed(),
+            "the open picker keeps its anchor label revealed"
+        );
+    });
+}
+
+#[gpui::test]
+fn toggle_model_picker_action_round_trips(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (window, view) = open_chat(cx, &core);
+
+    view.read_with(cx, |v, _| assert!(!v.model_picker_open()));
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(v.model_picker_open(), "⌥⌘M must open the picker")
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(!v.model_picker_open(), "⌥⌘M again must close the picker")
+    });
+}
+
+#[gpui::test]
+fn submit_uses_config_default_model_when_nothing_selected(cx: &mut TestAppContext) {
+    // New windows start from the user's default: with no per-window
+    // selection, a send resolves the model from `ConfigState::default_model`.
+    let core = stub_core(cx, |c| {
+        let mut state = config_state(true);
+        state.default_model = "custom-default".into();
+        c.config_state = Some(state);
+        c.balances = Some(BalancesResult {
+            available: 5_000_000,
+            pools: Vec::new(),
+        });
+    });
+    let (window, view) = open_chat(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.current_model(cx), "custom-default");
+        assert_eq!(v.selected_model(), None);
+    });
+
+    set_composer_text(&view, window, cx, "hello");
+    dispatch_send(&view, window, cx);
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.last_submitted_model(),
+            Some("custom-default"),
+            "an unselected window must send with the config default"
+        );
+    });
+}
+
+#[gpui::test]
+fn selecting_a_model_changes_what_submit_sends(cx: &mut TestAppContext) {
+    let core = stub_core(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.balances = Some(BalancesResult {
+            available: 5_000_000,
+            pools: Vec::new(),
+        });
+        c.models = stub_models();
+    });
+    let (window, view) = open_chat(cx, &core);
+
+    // Selecting from the picker closes it and pins this window's model.
+    view.update(cx, |v, cx| {
+        v.set_model_picker_open_for_test(true);
+        v.select_model("kimi-k2-6".into(), cx);
+    });
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.selected_model(), Some("kimi-k2-6"));
+        assert_eq!(v.current_model(cx), "kimi-k2-6");
+        assert!(!v.model_picker_open(), "selection must close the picker");
+    });
+
+    set_composer_text(&view, window, cx, "hi");
+    dispatch_send(&view, window, cx);
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.last_submitted_model(),
+            Some("kimi-k2-6"),
+            "submit must use the window's selected model"
+        );
+    });
+}
+
+#[gpui::test]
+fn selection_during_streaming_applies_to_next_send(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (window, view) = open_chat(cx, &core);
+
+    // First send (stub core: streaming state sticks).
+    set_composer_text(&view, window, cx, "first");
+    dispatch_send(&view, window, cx);
+    view.read_with(cx, |v, _| {
+        assert!(v.streaming.is_some());
+        assert_eq!(v.last_submitted_model(), Some("gemma4-31b"));
+    });
+
+    // Switching mid-stream must not touch the in-flight request — only
+    // the window's selection for the *next* send.
+    view.update(cx, |v, cx| v.select_model("kimi-k2-6".into(), cx));
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.last_submitted_model(),
+            Some("gemma4-31b"),
+            "an in-flight stream is never hot-swapped"
+        );
+        assert_eq!(v.selected_model(), Some("kimi-k2-6"));
+    });
+}
+
+fn stub_models() -> Vec<ModelInfo> {
+    vec![
+        ModelInfo {
+            id: "gemma4-31b".into(),
+            context_length: 131_072,
+            prompt_credits_per_token: 0.53,
+            completion_credits_per_token: 1.5,
+            request_credits: None,
+        },
+        ModelInfo {
+            id: "kimi-k2-6".into(),
+            context_length: 262_144,
+            prompt_credits_per_token: 3.0,
+            completion_credits_per_token: 9.0,
+            request_credits: None,
+        },
+    ]
+}
+
+fn set_composer_text(
+    view: &Entity<ChatView>,
+    window: AnyWindowHandle,
+    cx: &mut TestAppContext,
+    text: &str,
+) {
+    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    let text = text.to_string();
+    cx.update_window(window, |_, _, cx| {
+        prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::with_markdown(text.as_str());
+            cx.notify();
+        });
+    })
+    .unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +893,7 @@ fn non_balance_failure_does_not_surface_plans(cx: &mut TestAppContext) {
 fn config_state(has_account: bool) -> ConfigState {
     ConfigState {
         base_url: "https://eidola.example/v1".into(),
+        default_model: "gemma4-31b".into(),
         has_account,
         has_account_secret: has_account,
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),

@@ -6,7 +6,7 @@
 
 use eidola_app_core::{
     BalancePoolInfo, BalancesResult, ConfigState, CredentialInfo, InFlightCredentialInfo,
-    MeasurementInfo, PriceInfo, SpaceInfo, SpaceMessage,
+    MeasurementInfo, ModelInfo, PriceInfo, SpaceInfo, SpaceMessage,
 };
 use eidola_gui::account::AccountView;
 use eidola_gui::chat::{ChatView, StreamingResponse};
@@ -413,6 +413,58 @@ fn register_chat(s: &mut Snapshots) {
         },
     );
 
+    // ⌥ held — the model label reveals right-aligned in the title-bar band,
+    // text_sm muted italic, matching the chapter-delim voice. The page
+    // content underneath must be identical to the resting state (the band
+    // is absolute chrome; the reveal cannot shift layout).
+    s.add(
+        "chat_model_reveal",
+        size(px(705.), px(705.)),
+        |window, cx| {
+            let core = model_core(cx);
+            cx.new(|cx| {
+                let mut view = ChatView::new(core, None, window, cx);
+                view.set_messages_for_test(vec![
+                    SpaceMessage {
+                        role: "user".into(),
+                        content: "What's the tide schedule for tomorrow?".into(),
+                    },
+                    SpaceMessage {
+                        role: "assistant".into(),
+                        content: "High tide lands at 06:41 and 19:12; lows at 00:55 and 13:03. \
+                        The morning high is the stronger of the two."
+                            .into(),
+                    },
+                ]);
+                view.set_alt_held_for_test(true);
+                view
+            })
+        },
+    );
+
+    // Picker open (⌥⌘M or clicking the revealed label) — a quiet panel
+    // under the band's right edge listing Core.models with honest
+    // per-model info; current selection and config default marked, and
+    // the secondary "set as default" affordance in the footer.
+    s.add(
+        "chat_model_picker",
+        size(px(705.), px(705.)),
+        |window, cx| {
+            let core = model_core(cx);
+            cx.new(|cx| {
+                let mut view = ChatView::new(core, None, window, cx);
+                view.set_messages_for_test(vec![SpaceMessage {
+                    role: "user".into(),
+                    content: "Comparing models for a long document review.".into(),
+                }]);
+                view.select_model("kimi-k2-6".into(), cx);
+                view.set_model_picker_open_for_test(true);
+                view.set_alt_held_for_test(true);
+                view
+            })
+        },
+    );
+
     s.add("chat_thinking", size(px(900.), px(640.)), |window, cx| {
         let core = stub_core_with_config(cx);
         cx.new(|cx| {
@@ -767,9 +819,51 @@ fn stub_core_with_config(cx: &mut App) -> Entity<Core> {
     })
 }
 
+/// A stub core with a model catalog, for the model-picker cases. Rates are
+/// representative of the real catalog (credits are micro-USD-denominated,
+/// so credits/token reads as $/M tokens).
+fn model_core(cx: &mut App) -> Entity<Core> {
+    cx.new(|_| {
+        let mut c = Core::stub();
+        c.config_state = Some(stub_config_state(true));
+        c.models = vec![
+            ModelInfo {
+                id: "gemma4-31b".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 0.53,
+                completion_credits_per_token: 1.5,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "kimi-k2-6".into(),
+                context_length: 262_144,
+                prompt_credits_per_token: 3.0,
+                completion_credits_per_token: 9.0,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "qwen3-coder-watt".into(),
+                context_length: 131_072,
+                prompt_credits_per_token: 1.05,
+                completion_credits_per_token: 5.25,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "whisper-large-v3".into(),
+                context_length: 0,
+                prompt_credits_per_token: 0.0,
+                completion_credits_per_token: 0.0,
+                request_credits: Some(9_000.0),
+            },
+        ];
+        c
+    })
+}
+
 fn stub_config_state(has_account: bool) -> ConfigState {
     ConfigState {
         base_url: "https://eidola.example/v1".into(),
+        default_model: "gemma4-31b".into(),
         has_account,
         has_account_secret: has_account,
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),

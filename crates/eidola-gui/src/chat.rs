@@ -2,15 +2,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{ChatStreamEvent, SpaceMessage};
+use eidola_app_core::{ChatStreamEvent, ModelInfo, SpaceMessage};
 use gpui::{
     AppContext, AsyncApp, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    InteractiveElement, IntoElement, ModifiersChangedEvent, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, actions, div,
-    linear_color_stop, linear_gradient, px, relative, rems,
+    linear_color_stop, linear_gradient, prelude::FluentBuilder, px, relative, rems,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, IconName,
+    ActiveTheme, Disableable, IconName, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     highlighter::HighlightTheme,
@@ -22,9 +22,6 @@ use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownStyle};
 
 use crate::actions::CloseWindow;
 use crate::core::Core;
-
-/// Default model to send to the inference endpoint.
-const DEFAULT_MODEL: &str = "gemma4-31b";
 
 /// Vertical space reserved at the top of the window for the macOS traffic
 /// lights. The window has a transparent titlebar (see
@@ -42,7 +39,18 @@ const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
 #[cfg(not(target_os = "macos"))]
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 
-actions!(chat, [Send]);
+actions!(
+    chat,
+    [
+        /// Submit the composer's markdown to the model. Bound to ⌘↩ in the
+        /// `ChatView` key context.
+        Send,
+        /// Toggle the quiet model picker anchored to the title-bar band.
+        /// Bound to ⌥⌘M in the `ChatView` key context; clicking the
+        /// ⌥-revealed model label is the pointer path to the same state.
+        ToggleModelPicker
+    ]
+);
 
 /// In-flight assistant response. While this is `Some(...)`, the chat is
 /// streaming — `reasoning` and `content` grow as deltas arrive. On
@@ -155,6 +163,25 @@ pub struct ChatView {
     /// list below the transcript's error band (not a modal).
     pub show_plans_after_error: bool,
 
+    /// Whether ⌥ is currently held (tracked via the root element's
+    /// `on_modifiers_changed`). While true, the model label reveals in the
+    /// title-bar band; at rest the page shows no model chrome at all.
+    alt_held: bool,
+    /// Whether the model picker panel is open (⌥⌘M or clicking the
+    /// revealed label). The label stays revealed while the picker is open
+    /// so the picker keeps its visual anchor after ⌥ is released.
+    model_picker_open: bool,
+    /// This window's explicit model choice. `None` means "follow the
+    /// config default" (`ConfigState::default_model`); new windows start
+    /// here. Selection applies to subsequent sends only — a switch during
+    /// streaming never hot-swaps the in-flight request.
+    selected_model: Option<String>,
+    /// The model id actually handed to the last `chat_stream` call (set on
+    /// every submit, including stub-core submits, *before* the backend
+    /// guard). Behavior tests assert against this to prove the picker's
+    /// selection is what a send really uses.
+    last_submitted_model: Option<String>,
+
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -231,6 +258,98 @@ impl ChatView {
     /// the first exchange creates a space.
     pub fn space_id(&self) -> Option<&str> {
         self.space_id.as_deref()
+    }
+
+    // -- Model picker state -------------------------------------------------
+
+    /// The model the next send will use: this window's explicit selection
+    /// if the user picked one, otherwise the config default
+    /// (`ConfigState::default_model`), otherwise the embedded fallback
+    /// (stub cores in tests have no config snapshot).
+    pub fn current_model(&self, cx: &gpui::App) -> String {
+        if let Some(model) = self.selected_model.as_ref() {
+            return model.clone();
+        }
+        self.core
+            .read(cx)
+            .config_state
+            .as_ref()
+            .map(|s| s.default_model.clone())
+            .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string())
+    }
+
+    /// Whether the model label is currently revealed in the title-bar band:
+    /// while ⌥ is held, or while the picker it anchors is open.
+    pub fn model_revealed(&self) -> bool {
+        self.alt_held || self.model_picker_open
+    }
+
+    /// Whether the model picker panel is open.
+    pub fn model_picker_open(&self) -> bool {
+        self.model_picker_open
+    }
+
+    /// This window's explicit model selection, if any.
+    pub fn selected_model(&self) -> Option<&str> {
+        self.selected_model.as_deref()
+    }
+
+    /// The model id handed to the most recent submit (see field docs).
+    pub fn last_submitted_model(&self) -> Option<&str> {
+        self.last_submitted_model.as_deref()
+    }
+
+    /// Track ⌥ for the title-bar reveal. Registered on the root element via
+    /// `on_modifiers_changed`, so it fires for every modifier transition
+    /// while this window's focus chain is active.
+    pub fn handle_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.alt_held != event.modifiers.alt {
+            self.alt_held = event.modifiers.alt;
+            cx.notify();
+        }
+    }
+
+    /// Toggle the model picker (⌥⌘M, or clicking the revealed label).
+    pub fn toggle_model_picker(&mut self, cx: &mut Context<Self>) {
+        self.model_picker_open = !self.model_picker_open;
+        cx.notify();
+    }
+
+    /// Choose the model for this window's subsequent sends and close the
+    /// picker. A switch while a response is streaming applies to the *next*
+    /// send — the in-flight request is never hot-swapped.
+    pub fn select_model(&mut self, id: String, cx: &mut Context<Self>) {
+        self.selected_model = Some(id);
+        self.model_picker_open = false;
+        cx.notify();
+    }
+
+    /// Persist this window's current model as the config default
+    /// (`default_model` override) — the picker's quiet "set as default"
+    /// affordance. The picker stays open so the moved "default" marker is
+    /// the visible confirmation.
+    pub fn set_current_model_as_default(&mut self, cx: &mut Context<Self>) {
+        let model = self.current_model(cx);
+        self.core
+            .update(cx, |core, cx| core.set_default_model(model, cx));
+        cx.notify();
+    }
+
+    /// Test-only setter for the ⌥-reveal state, so snapshot tests can render
+    /// the revealed label without synthesizing platform modifier events.
+    #[doc(hidden)]
+    pub fn set_alt_held_for_test(&mut self, alt: bool) {
+        self.alt_held = alt;
+    }
+
+    /// Test-only setter for the picker's open state.
+    #[doc(hidden)]
+    pub fn set_model_picker_open_for_test(&mut self, open: bool) {
+        self.model_picker_open = open;
     }
 }
 
@@ -328,6 +447,10 @@ impl ChatView {
             error: None,
             onboarding: OnboardingFlow::default(),
             show_plans_after_error: false,
+            alt_held: false,
+            model_picker_open: false,
+            selected_model: None,
+            last_submitted_model: None,
             focus_handle,
             _subscriptions,
         }
@@ -643,6 +766,14 @@ impl ChatView {
             return;
         }
 
+        // Resolve the model at submit time (window selection → config
+        // default → embedded fallback) and record it before the backend
+        // guard so stub-core tests observe exactly what a real send would
+        // use. This is also the value persisted on the action row in the
+        // local DB — the transcript records what actually ran.
+        let model = self.current_model(cx);
+        self.last_submitted_model = Some(model.clone());
+
         self.prompt_editor.update(cx, |editor, cx| {
             editor.state = EditorState::default();
             cx.notify();
@@ -665,7 +796,7 @@ impl ChatView {
         };
         let space_id = self.space_id.clone();
 
-        self.spawn_stream(app_core, prompt, space_id, window, cx);
+        self.spawn_stream(app_core, prompt, model, space_id, window, cx);
     }
 
     /// Drive a streaming chat request from gpui's main thread.
@@ -673,12 +804,12 @@ impl ChatView {
         &mut self,
         app_core: Arc<eidola_app_core::AppCore>,
         prompt: String,
+        model: String,
         space_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (mut event_rx, done_rx) =
-            Core::chat_stream(app_core.clone(), prompt, DEFAULT_MODEL.into(), space_id);
+        let (mut event_rx, done_rx) = Core::chat_stream(app_core.clone(), prompt, model, space_id);
 
         cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
             while let Some(event) = event_rx.recv().await {
@@ -752,15 +883,21 @@ impl Render for ChatView {
             .key_context("ChatView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::submit))
+            .on_action(
+                cx.listener(|this, _: &ToggleModelPicker, _, cx| this.toggle_model_picker(cx)),
+            )
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
+            }))
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
+                this.handle_modifiers_changed(event, cx)
             }))
             .relative()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(content)
-            .child(title_bar_overlay(cx))
+            .child(self.render_title_bar(stage, cx))
     }
 }
 
@@ -1550,40 +1687,257 @@ fn markdown_style(is_dark: bool) -> TextViewStyle {
     })
 }
 
-/// Title-bar overlay: a gradient that fades from full `theme.background` at
-/// the top to fully transparent at the bottom of the reserve. Painted over
-/// the scroll area (positioned absolutely, last child wins z-order in gpui),
-/// so messages scrolling up under it dissolve smoothly instead of clipping.
-///
-/// Two non-aesthetic modifiers tame the title-bar band:
-///
-/// - `.cursor_default()` sets the platform cursor to `Arrow` over the band
-///   *and* causes gpui to register a hitbox here
-///   (`Interactivity::should_insert_hitbox` includes
-///   `style.mouse_cursor.is_some()`). Without it, the text below keeps
-///   winning the cursor-style lookup and the I-beam shows over the band.
-/// - `.block_mouse_except_scroll()` upgrades that hitbox to swallow click
-///   and drag events so a double-click-drag in the band doesn't fall
-///   through to `TextView`'s selectable handler and start a text
-///   selection underneath. Scroll passes through, so wheel-scrolling
-///   while the cursor is in the band still scrolls the chat.
-///
-/// macOS native titlebar behavior (drag, double-click-to-zoom) is handled
-/// by AppKit at the NSWindow layer before the gpui content view is asked,
-/// so blocking mouse on the gpui side doesn't disturb it.
-fn title_bar_overlay(cx: &gpui::App) -> impl IntoElement {
-    let bg = cx.theme().background;
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
-        .h(TITLE_BAR_RESERVE)
-        .cursor_default()
-        .block_mouse_except_scroll()
-        .bg(linear_gradient(
-            180.,
-            linear_color_stop(bg, 0.0),
-            linear_color_stop(bg.opacity(0.0), 1.0),
+impl ChatView {
+    /// Title-bar band: a gradient that fades from full `theme.background` at
+    /// the top to fully transparent at the bottom of the reserve. Painted
+    /// over the scroll area (positioned absolutely, last child wins z-order
+    /// in gpui), so messages scrolling up under it dissolve smoothly instead
+    /// of clipping.
+    ///
+    /// Two non-aesthetic modifiers tame the title-bar band:
+    ///
+    /// - `.cursor_default()` sets the platform cursor to `Arrow` over the
+    ///   band *and* causes gpui to register a hitbox here
+    ///   (`Interactivity::should_insert_hitbox` includes
+    ///   `style.mouse_cursor.is_some()`). Without it, the text below keeps
+    ///   winning the cursor-style lookup and the I-beam shows over the band.
+    /// - `.block_mouse_except_scroll()` upgrades that hitbox to swallow
+    ///   click and drag events so a double-click-drag in the band doesn't
+    ///   fall through to `TextView`'s selectable handler and start a text
+    ///   selection underneath. Scroll passes through, so wheel-scrolling
+    ///   while the cursor is in the band still scrolls the chat.
+    ///
+    /// macOS native titlebar behavior (drag, double-click-to-zoom) is
+    /// handled by AppKit at the NSWindow layer before the gpui content view
+    /// is asked, so blocking mouse on the gpui side doesn't disturb it.
+    ///
+    /// The band is also the home of the ⌥-revealed model label: at rest the
+    /// band is pure gradient (the page stays sacred), and while ⌥ is held —
+    /// or the picker it anchors is open — the current model id appears
+    /// right-aligned in `text_sm` muted italic, the same voice as the
+    /// chapter-delim labels. Children of the band are absolutely positioned
+    /// chrome, so the reveal cannot shift the page layout. The model chrome
+    /// only renders on the `Ready` stage — the onboarding pages have no
+    /// sends for it to describe.
+    fn render_title_bar(&self, stage: OnboardingStage, cx: &Context<Self>) -> Div {
+        let theme = cx.theme();
+        let bg = theme.background;
+        let mut band = h_flex()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(TITLE_BAR_RESERVE)
+            .justify_end()
+            .items_center()
+            .cursor_default()
+            .block_mouse_except_scroll()
+            .bg(linear_gradient(
+                180.,
+                linear_color_stop(bg, 0.0),
+                linear_color_stop(bg.opacity(0.0), 1.0),
+            ));
+
+        if stage == OnboardingStage::Ready && self.model_revealed() {
+            band = band.child(
+                div()
+                    .id("model-label")
+                    .px_5()
+                    .text_sm()
+                    .italic()
+                    .text_color(theme.muted_foreground)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.foreground))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_model_picker(cx)))
+                    .child(SharedString::from(self.current_model(cx))),
+            );
+        }
+        if stage == OnboardingStage::Ready && self.model_picker_open {
+            band = band.child(self.render_model_picker(cx));
+        }
+        band
+    }
+
+    /// The model picker: a quiet panel anchored under the title-bar band's
+    /// right edge, listing `Core.models` with honest per-model info
+    /// (context length, credits per token — straight from the `/models`
+    /// payload). The current selection and the config default are marked;
+    /// a small footer affordance persists the current selection as the
+    /// default. Clicking outside dismisses; ⌥⌘M toggles.
+    ///
+    /// Hand-rolled rather than `gpui_component::Popover`: the open state
+    /// must live on the view (⌥⌘M and behavior tests drive it without a
+    /// pointer), the anchor is an absolutely-positioned band rather than an
+    /// in-flow trigger, and the band already paints above the scroll
+    /// content, so plain absolute positioning does everything `deferred(
+    /// anchored(…))` would. `popover_style` keeps the surface itself
+    /// consistent with gpui-component overlays under the Circadian theme.
+    fn render_model_picker(&self, cx: &Context<Self>) -> gpui::Stateful<Div> {
+        let theme = cx.theme();
+        let core = self.core.read(cx);
+        let current = self.current_model(cx);
+        let default_model = core
+            .config_state
+            .as_ref()
+            .map(|s| s.default_model.clone())
+            .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string());
+        let models = core.models.clone();
+
+        let mut panel = v_flex()
+            .id("model-picker")
+            .occlude()
+            .absolute()
+            .top(TITLE_BAR_RESERVE)
+            .right(px(12.))
+            .w(px(340.))
+            .max_h(px(420.))
+            .overflow_y_scroll()
+            .popover_style(cx)
+            .py_1()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.model_picker_open = false;
+                cx.notify();
+            }));
+
+        if models.is_empty() {
+            // Honest empty state: the model list hasn't loaded (or the
+            // fetch failed) — say what a send will actually use.
+            return panel.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(format!(
+                        "Model list unavailable — sends use {current}."
+                    ))),
+            );
+        }
+
+        for (idx, model) in models.iter().enumerate() {
+            let is_current = model.id == current;
+            let is_default = model.id == default_model;
+
+            let mut markers: Vec<&str> = Vec::new();
+            if is_current {
+                markers.push("current");
+            }
+            if is_default {
+                markers.push("default");
+            }
+
+            let mut name = div().text_sm().child(SharedString::from(model.id.clone()));
+            if is_current {
+                name = name.font_weight(gpui::FontWeight::SEMIBOLD);
+            }
+            let mut name_row = h_flex()
+                .w_full()
+                .justify_between()
+                .items_baseline()
+                .child(name);
+            if !markers.is_empty() {
+                name_row = name_row.child(
+                    div()
+                        .text_xs()
+                        .italic()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(markers.join(" · "))),
+                );
+            }
+
+            let id = model.id.clone();
+            panel = panel.child(
+                v_flex()
+                    .id(("model-row", idx))
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_0p5()
+                    .when(idx > 0, |d| d.border_t_1().border_color(theme.border))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.muted.opacity(0.5)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_model(id.clone(), cx)))
+                    .child(name_row)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(model_info_line(model))),
+                    ),
+            );
+        }
+
+        if current != default_model {
+            // Quiet, secondary: persist this window's model as the config
+            // default. Only offered when it would change anything.
+            let label = format!("Set {current} as default");
+            panel = panel.child(
+                div()
+                    .id("set-default-model")
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .italic()
+                    .text_color(theme.muted_foreground)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.foreground))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_current_model_as_default(cx)))
+                    .child(SharedString::from(label)),
+            );
+        }
+
+        panel
+    }
+}
+
+/// One honest line of per-model info for the picker, from the `/models`
+/// payload: context length plus the credit rates that will actually be
+/// charged. Per-request models show their flat rate; if the payload carried
+/// no pricing at all, only the context length is shown — we don't invent
+/// numbers.
+fn model_info_line(model: &ModelInfo) -> String {
+    // Per-request models (e.g. transcription) report no meaningful context
+    // length; showing "0-token context" would be noise, not honesty.
+    let ctx = (model.context_length > 0).then(|| {
+        format!(
+            "{}-token context",
+            format_credits(model.context_length as i64)
+        )
+    });
+    let price = if let Some(request) = model.request_credits {
+        Some(format!("{} credits per request", format_rate(request)))
+    } else if model.prompt_credits_per_token > 0.0 || model.completion_credits_per_token > 0.0 {
+        Some(format!(
+            "{} in / {} out credits per token",
+            format_rate(model.prompt_credits_per_token),
+            format_rate(model.completion_credits_per_token)
         ))
+    } else {
+        None
+    };
+    match (ctx, price) {
+        (Some(ctx), Some(price)) => format!("{ctx} · {price}"),
+        (Some(ctx), None) => ctx,
+        (None, Some(price)) => price,
+        (None, None) => "no published details".to_string(),
+    }
+}
+
+/// Format a credit rate: whole thousands get separators ("9,000"),
+/// everything else shows up to three decimals with trailing zeros trimmed
+/// ("1.500" → "1.5", "0.530" → "0.53", "3.000" → "3").
+fn format_rate(rate: f64) -> String {
+    if rate >= 1000.0 && rate.fract() == 0.0 {
+        return format_credits(rate as i64);
+    }
+    let s = format!("{rate:.3}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }

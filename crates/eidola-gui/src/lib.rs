@@ -191,6 +191,13 @@ fn install_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-alt-i", ToggleInspector, None),
         KeyBinding::new("cmd-enter", crate::chat::Send, Some("ChatView")),
+        // ⌥⌘M — toggle the quiet model picker. Scoped to ChatView so the
+        // distinct keystroke never competes with the global ⌘M (Minimize).
+        KeyBinding::new(
+            "cmd-alt-m",
+            crate::chat::ToggleModelPicker,
+            Some("ChatView"),
+        ),
     ]);
 
     install_markdown_editor_keybindings(cx);
