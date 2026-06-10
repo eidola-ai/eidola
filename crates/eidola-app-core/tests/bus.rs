@@ -10,6 +10,25 @@
 //! full-HTTP paths are covered by other test suites (updates_check.rs uses
 //! wiremock). The bus itself doesn't care about the write mechanism — only
 //! that the emit calls are placed correctly, which is what these tests assert.
+//!
+//! ## Error-path emission coverage
+//!
+//! The partial-failure emissions added to `chat` and `chat_stream` require an
+//! HTTP server fixture to exercise end-to-end. The three error paths and their
+//! test status:
+//!
+//! | Exit point | Writes committed | Emissions | Tested here |
+//! |---|---|---|---|
+//! | `chat`/`chat_stream` — `insert_pre_credential_refund` succeeds, any later step fails | Credential in `spending` state | `Wallet` | No — needs HTTP to reach that write |
+//! | `chat`/`chat_stream` — network-error arm, `process_refund` returns `Ok` | Successor credential written | `Wallet` | No — needs HTTP + network-failure injection |
+//! | `chat` — non-2xx response, after `insert_request` | Space, user-message, request rows | `Space(id)`, optionally `SpaceIndex`, `Record` | No — needs HTTP returning non-2xx |
+//! | `chat_stream` — non-2xx response, after `insert_request` inside that branch | Space, user-message, request rows | `Space(id)`, optionally `SpaceIndex`, `Record`; `Wallet` if refund recovered | No — needs HTTP returning non-2xx |
+//!
+//! These are asserted-by-inspection of the emit placement in `lib.rs`. The
+//! happy-path tests below confirm that the success-path emissions remain intact
+//! and that the shared infrastructure (bus capacity, multi-subscriber delivery)
+//! works. An integration test suite with a wiremock server would be the right
+//! place to add the error-path assertions.
 
 use eidola_app_core::{AppCore, changes::Change};
 

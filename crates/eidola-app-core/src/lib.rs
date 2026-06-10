@@ -1340,6 +1340,9 @@ impl Inner {
             now,
         )
         .await?;
+        // Credential flipped to "spending" — wallet state changed regardless of
+        // whether the rest of the operation succeeds.
+        self.bus.emit(Change::Wallet);
 
         let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
         let challenge_digest = compute_challenge_digest();
@@ -1448,8 +1451,8 @@ impl Inner {
                 // Network error — the server may or may not have received the
                 // request. Try to recover the refund token.
                 let original_err = AppError::from_request(e);
-                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
-                    let _ = process_refund(
+                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
+                    && process_refund(
                         &refund_obj,
                         &params,
                         &spend_proof,
@@ -1460,7 +1463,11 @@ impl Inner {
                         cred.generation + 1,
                         now,
                     )
-                    .await;
+                    .await
+                    .is_ok()
+                {
+                    // Successor credential written — wallet state updated.
+                    self.bus.emit(Change::Wallet);
                 }
                 return Err(original_err);
             }
@@ -1604,6 +1611,13 @@ impl Inner {
         .await?;
 
         if !status.is_success() {
+            // Space, user-message, and request rows are already committed.
+            // Wallet was emitted after insert_pre_credential_refund above.
+            if is_new_space || auto_titled {
+                self.bus.emit(Change::SpaceIndex);
+            }
+            self.bus.emit(Change::Space(space_id.clone()));
+            self.bus.emit(Change::Record);
             return Err(AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
@@ -1783,6 +1797,9 @@ impl Inner {
             now,
         )
         .await?;
+        // Credential flipped to "spending" — wallet state changed regardless of
+        // whether the rest of the operation succeeds.
+        self.bus.emit(Change::Wallet);
 
         let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
         let challenge_digest = compute_challenge_digest();
@@ -1881,8 +1898,8 @@ impl Inner {
             }
             Err(e) => {
                 let original_err = AppError::from_request(e);
-                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
-                    let _ = process_refund(
+                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
+                    && process_refund(
                         &refund_obj,
                         &params,
                         &spend_proof,
@@ -1893,7 +1910,11 @@ impl Inner {
                         cred.generation + 1,
                         now,
                     )
-                    .await;
+                    .await
+                    .is_ok()
+                {
+                    // Successor credential written — wallet state updated.
+                    self.bus.emit(Change::Wallet);
                 }
                 return Err(original_err);
             }
@@ -1905,8 +1926,8 @@ impl Inner {
         // Read it normally so we can surface a useful message.
         if !status.is_success() {
             let response_text = resp.text().await.unwrap_or_default();
-            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
-                let _ = process_refund(
+            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
+                && process_refund(
                     &refund_obj,
                     &params,
                     &spend_proof,
@@ -1917,7 +1938,11 @@ impl Inner {
                     cred.generation + 1,
                     now,
                 )
-                .await;
+                .await
+                .is_ok()
+            {
+                // Successor credential written — wallet state updated.
+                self.bus.emit(Change::Wallet);
             }
             db::insert_request(
                 &db_conn,
@@ -1941,6 +1966,14 @@ impl Inner {
                 },
             )
             .await?;
+            // Space, user-message, and request rows are already committed.
+            // Wallet was emitted after insert_pre_credential_refund above
+            // (and again above if the refund recovery succeeded).
+            if is_new_space || auto_titled {
+                self.bus.emit(Change::SpaceIndex);
+            }
+            self.bus.emit(Change::Space(space_id.clone()));
+            self.bus.emit(Change::Record);
             return Err(AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
