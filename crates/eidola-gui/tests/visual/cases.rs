@@ -227,10 +227,13 @@ fn register_onboarding(s: &mut Snapshots) {
             });
             cx.new(|cx| {
                 let mut view = ChatView::new(stores, None, window, cx);
-                view.set_messages_for_test(vec![SpaceMessage {
-                    role: "user".into(),
-                    content: "Can you summarize the attached design doc?".into(),
-                }]);
+                view.set_messages_for_test(
+                    vec![SpaceMessage {
+                        role: "user".into(),
+                        content: "Can you summarize the attached design doc?".into(),
+                    }],
+                    cx,
+                );
                 view.set_error_for_test(Some(
                     "insufficient balance: 6200 credits required, 100 available".into(),
                 ));
@@ -304,6 +307,7 @@ fn register_chat(s: &mut Snapshots) {
                             content: "Yes — everything looks fine on the latest deploy.".into(),
                         },
                     ],
+                    cx,
                 )
             })
         },
@@ -343,6 +347,7 @@ fn register_chat(s: &mut Snapshots) {
                                 .into(),
                         },
                     ],
+                    cx,
                 )
             })
         },
@@ -375,6 +380,7 @@ fn register_chat(s: &mut Snapshots) {
                                 .into(),
                         },
                     ],
+                    cx,
                 )
             })
         },
@@ -402,6 +408,7 @@ fn register_chat(s: &mut Snapshots) {
                                     .into(),
                         },
                     ],
+                    cx,
                 )
             })
         },
@@ -436,6 +443,7 @@ fn register_chat(s: &mut Snapshots) {
                             content: "Any pending work?".into(),
                         },
                     ],
+                    cx,
                 )
             })
         },
@@ -474,6 +482,7 @@ fn register_chat(s: &mut Snapshots) {
                                 .into(),
                         },
                     ],
+                    cx,
                 )
             })
         },
@@ -501,6 +510,7 @@ fn register_chat(s: &mut Snapshots) {
                             for comparison."
                             .into(),
                     }],
+                    cx,
                 )
             });
             let editor = view.read(cx).prompt_editor_for_test();
@@ -538,18 +548,22 @@ fn register_chat(s: &mut Snapshots) {
             let core = model_stores(cx);
             cx.new(|cx| {
                 let mut view = ChatView::new(core, None, window, cx);
-                view.set_messages_for_test(vec![
-                    SpaceMessage {
-                        role: "user".into(),
-                        content: "What's the tide schedule for tomorrow?".into(),
-                    },
-                    SpaceMessage {
-                        role: "assistant".into(),
-                        content: "High tide lands at 06:41 and 19:12; lows at 00:55 and 13:03. \
+                view.set_messages_for_test(
+                    vec![
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "What's the tide schedule for tomorrow?".into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content:
+                                "High tide lands at 06:41 and 19:12; lows at 00:55 and 13:03. \
                         The morning high is the stronger of the two."
-                            .into(),
-                    },
-                ]);
+                                    .into(),
+                        },
+                    ],
+                    cx,
+                );
                 view.set_alt_held_for_test(true);
                 view
             })
@@ -567,10 +581,13 @@ fn register_chat(s: &mut Snapshots) {
             let core = model_stores(cx);
             cx.new(|cx| {
                 let mut view = ChatView::new(core, None, window, cx);
-                view.set_messages_for_test(vec![SpaceMessage {
-                    role: "user".into(),
-                    content: "Comparing models for a long document review.".into(),
-                }]);
+                view.set_messages_for_test(
+                    vec![SpaceMessage {
+                        role: "user".into(),
+                        content: "Comparing models for a long document review.".into(),
+                    }],
+                    cx,
+                );
                 view.select_model("kimi-k2-6".into(), cx);
                 view.set_model_picker_open_for_test(true);
                 view.set_alt_held_for_test(true);
@@ -585,7 +602,7 @@ fn register_chat(s: &mut Snapshots) {
             let view = ChatView::new(core, None, window, cx);
             // Empty streaming response — renders the collapsed "Thinking…"
             // header with no body yet, the moment after the user submits.
-            view_streaming(view, StreamingResponse::default())
+            view_streaming(view, StreamingResponse::default(), cx)
         })
     });
 
@@ -601,22 +618,25 @@ fn register_chat(s: &mut Snapshots) {
             let core = stub_stores_with_config(cx);
             cx.new(|cx| {
                 let mut view = ChatView::new(core, None, window, cx);
-                view.set_messages_for_test(vec![
-                    SpaceMessage {
-                        role: "user".into(),
-                        content: "What's a Hilbert space, in one paragraph?".into(),
-                    },
-                    SpaceMessage {
-                        role: "assistant".into(),
-                        content: "A **Hilbert space** is a complete inner-product space — a \
+                view.set_messages_for_test(
+                    vec![
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "What's a Hilbert space, in one paragraph?".into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content: "A **Hilbert space** is a complete inner-product space — a \
                             vector space equipped with an inner product whose induced norm \
                             makes it a Banach space. The completeness lets you reason about \
                             limits of Cauchy sequences (essential for things like Fourier \
                             analysis), and the inner product gives you geometry: angles, \
                             orthogonality, projections."
-                            .into(),
-                    },
-                ]);
+                                .into(),
+                        },
+                    ],
+                    cx,
+                );
                 view.set_reasoning_for_test(
                     1,
                     "The user wants a one-paragraph definition. I should hit: vector space \
@@ -625,6 +645,7 @@ fn register_chat(s: &mut Snapshots) {
                         what 'in one paragraph' is asking for."
                         .into(),
                     true,
+                    cx,
                 );
                 view
             })
@@ -644,6 +665,7 @@ fn register_chat(s: &mut Snapshots) {
                         role: "user".into(),
                         content: "Why is the sky blue?".into(),
                     }],
+                    cx,
                 );
                 view_streaming(
                     view,
@@ -663,6 +685,7 @@ fn register_chat(s: &mut Snapshots) {
                         expanded: true,
                         error: None,
                     },
+                    cx,
                 )
             })
         },
@@ -1225,14 +1248,20 @@ fn stub_config_state(has_account: bool) -> ConfigState {
     }
 }
 
-fn view_with_messages(view: ChatView, messages: Vec<SpaceMessage>) -> ChatView {
-    let mut view = view;
-    view.set_messages_for_test(messages);
+fn view_with_messages(
+    mut view: ChatView,
+    messages: Vec<SpaceMessage>,
+    cx: &mut gpui::Context<ChatView>,
+) -> ChatView {
+    view.set_messages_for_test(messages, cx);
     view
 }
 
-fn view_streaming(view: ChatView, streaming: StreamingResponse) -> ChatView {
-    let mut view = view;
-    view.set_streaming_for_test(Some(streaming));
+fn view_streaming(
+    mut view: ChatView,
+    streaming: StreamingResponse,
+    cx: &mut gpui::Context<ChatView>,
+) -> ChatView {
+    view.set_streaming_for_test(Some(streaming), cx);
     view
 }

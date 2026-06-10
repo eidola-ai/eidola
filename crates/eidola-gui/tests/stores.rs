@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use eidola_app_core::AppCore;
 use eidola_app_core::changes::Change;
-use gpui::TestAppContext;
+use gpui::{AppContext, TestAppContext};
 
-use eidola_gui::stores::{self, Stores};
+use eidola_gui::stores::{self, SpacesStore, Stores};
 
 /// A real `AppCore` over tempdirs with an unreachable base URL. Its async
 /// methods would fail fast if driven, but these tests never park the
@@ -118,6 +118,45 @@ fn bus_bridge_dispatches_wallet_change(cx: &mut TestAppContext) {
     stores
         .models
         .read_with(cx, |m, _| assert!(m.models().is_loading()));
+}
+
+/// The space-entity registry's join-existing semantics: two `open` calls for
+/// the same id return the *same* `Space` entity (so two windows on one space
+/// share one transcript + streaming buffer — wave-2 bug 4), while a different
+/// id and each `blank()` yield distinct entities.
+#[gpui::test]
+fn spaces_registry_joins_existing_and_blanks_are_distinct(cx: &mut TestAppContext) {
+    let store = cx.update(|cx| cx.new(|_| SpacesStore::stub(Vec::new())));
+
+    let (a1, a2, b, blank1, blank2) = store.update(cx, |s, cx| {
+        (
+            s.open("space-a".into(), cx),
+            s.open("space-a".into(), cx),
+            s.open("space-b".into(), cx),
+            s.blank(cx),
+            s.blank(cx),
+        )
+    });
+
+    assert_eq!(
+        a1.entity_id(),
+        a2.entity_id(),
+        "two opens of one id must join the same Space entity"
+    );
+    assert_ne!(
+        a1.entity_id(),
+        b.entity_id(),
+        "distinct ids get distinct entities"
+    );
+    assert_ne!(
+        blank1.entity_id(),
+        blank2.entity_id(),
+        "each blank (⌘N) is its own id-less space until adopted"
+    );
+    assert!(
+        blank1.read_with(cx, |sp, _| sp.id().is_none()),
+        "a blank space starts id-less"
+    );
 }
 
 /// Supersede semantics: two back-to-back refreshes on the same slot. Replacing

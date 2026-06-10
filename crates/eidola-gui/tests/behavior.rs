@@ -151,20 +151,20 @@ fn chat_submit_with_empty_prompt_is_noop(cx: &mut TestAppContext) {
         cx.new(|cx| ChatView::new(stores.clone(), None, window, cx))
     });
 
-    view.read_with(cx, |v, _| {
-        assert!(v.messages.is_empty());
-        assert!(v.streaming.is_none());
+    view.read_with(cx, |v, cx| {
+        assert!(v.messages(cx).is_empty());
+        assert!(v.streaming(cx).is_none());
     });
 
     dispatch_send(&view, window, cx);
 
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, cx| {
         assert!(
-            v.messages.is_empty(),
+            v.messages(cx).is_empty(),
             "submit with empty prompt must not append a message"
         );
         assert!(
-            v.streaming.is_none(),
+            v.streaming(cx).is_none(),
             "submit with empty prompt must not start a streaming response"
         );
     });
@@ -202,15 +202,17 @@ fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
     .unwrap();
     cx.run_until_parked();
 
-    view.read_with(cx, |v, _| {
-        assert_eq!(v.messages.len(), 1, "submit should append the user message");
-        assert_eq!(v.messages[0].message.role, "user");
-        assert_eq!(v.messages[0].message.content, "hi there");
+    view.read_with(cx, |v, cx| {
+        let messages = v.messages(cx);
+        assert_eq!(messages.len(), 1, "submit should append the user message");
+        assert_eq!(messages[0].message.role, "user");
+        assert_eq!(messages[0].message.content, "hi there");
+        let streaming = v.streaming(cx);
         assert!(
-            v.streaming.is_some(),
+            streaming.is_some(),
             "submit should enter streaming state with an empty StreamingResponse"
         );
-        let s = v.streaming.as_ref().unwrap();
+        let s = streaming.as_ref().unwrap();
         assert!(s.reasoning.is_empty());
         assert!(s.content.is_empty());
         assert!(!s.expanded);
@@ -229,27 +231,31 @@ fn chat_renders_markdown_messages_without_panicking(cx: &mut TestAppContext) {
         cx.new(|cx| ChatView::new(stores.clone(), None, window, cx))
     });
 
-    view.update(cx, |v, _cx| {
-        v.set_messages_for_test(vec![
-            SpaceMessage {
-                role: "user".into(),
-                content: "What does this code do?".into(),
-            },
-            SpaceMessage {
-                role: "assistant".into(),
-                content: "# Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
-            },
-        ]);
+    view.update(cx, |v, cx| {
+        v.set_messages_for_test(
+            vec![
+                SpaceMessage {
+                    role: "user".into(),
+                    content: "What does this code do?".into(),
+                },
+                SpaceMessage {
+                    role: "assistant".into(),
+                    content: "# Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
+                },
+            ],
+            cx,
+        );
     });
     cx.run_until_parked();
 
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, cx| {
+        let messages = v.messages(cx);
         assert_eq!(
-            v.messages.len(),
+            messages.len(),
             2,
             "markdown content must not multiply messages"
         );
-        assert_eq!(v.messages[1].message.role, "assistant");
+        assert_eq!(messages[1].message.role, "assistant");
     });
 }
 
@@ -266,9 +272,9 @@ fn chat_view_records_existing_space_id(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    view.read_with(cx, |v, _| {
-        assert_eq!(v.space_id(), Some("space-123"));
-        assert!(v.messages.is_empty());
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.space_id(cx).as_deref(), Some("space-123"));
+        assert!(v.messages(cx).is_empty());
     });
 }
 
@@ -289,22 +295,32 @@ fn stale_initial_space_load_does_not_replace_submitted_prompt(cx: &mut TestAppCo
     .unwrap();
     dispatch_send(&view, window, cx);
 
-    view.update(cx, |v, _| {
-        let applied = v.merge_initial_messages_for_test(
-            0,
+    // Simulate the reopened-space initial load completing *after* the local
+    // submit. The race is serialized inside the `Space` entity (which owns
+    // both the load and the submit): a stale load that finishes once
+    // streaming has begun is dropped, so it cannot clobber the just-submitted
+    // prompt. This replaces the old `transcript_generation` counter.
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    space.update(cx, |s, cx| {
+        let applied = s.apply_loaded_transcript_for_test(
             vec![SpaceMessage {
                 role: "user".into(),
                 content: "old prompt".into(),
             }],
+            cx,
         );
-        assert!(!applied, "stale initial load should be ignored");
+        assert!(
+            !applied,
+            "a stale initial load racing a submit must be dropped"
+        );
     });
 
-    view.read_with(cx, |v, _| {
-        assert_eq!(v.messages.len(), 1);
-        assert_eq!(v.messages[0].message.role, "user");
-        assert_eq!(v.messages[0].message.content, "new prompt");
-        assert!(v.streaming.is_some());
+    view.read_with(cx, |v, cx| {
+        let messages = v.messages(cx);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message.role, "user");
+        assert_eq!(messages[0].message.content, "new prompt");
+        assert!(v.streaming(cx).is_some());
     });
 }
 
@@ -318,26 +334,108 @@ fn chat_view_renders_preloaded_messages(cx: &mut TestAppContext) {
         cx.new(|cx| ChatView::new(stores.clone(), Some("space-123".into()), window, cx))
     });
 
-    view.update(cx, |v, _| {
-        v.set_messages_for_test(vec![
-            SpaceMessage {
-                role: "user".into(),
-                content: "Earlier question".into(),
-            },
-            SpaceMessage {
-                role: "assistant".into(),
-                content: "Earlier answer".into(),
-            },
-        ]);
+    view.update(cx, |v, cx| {
+        v.set_messages_for_test(
+            vec![
+                SpaceMessage {
+                    role: "user".into(),
+                    content: "Earlier question".into(),
+                },
+                SpaceMessage {
+                    role: "assistant".into(),
+                    content: "Earlier answer".into(),
+                },
+            ],
+            cx,
+        );
     });
     cx.run_until_parked();
 
-    view.read_with(cx, |v, _| {
-        assert_eq!(v.messages.len(), 2);
-        assert_eq!(v.messages[0].message.role, "user");
-        assert_eq!(v.messages[1].message.role, "assistant");
-        assert_eq!(v.space_id(), Some("space-123"));
+    view.read_with(cx, |v, cx| {
+        let messages = v.messages(cx);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].message.role, "user");
+        assert_eq!(messages[1].message.role, "assistant");
+        assert_eq!(v.space_id(cx).as_deref(), Some("space-123"));
     });
+}
+
+#[gpui::test]
+fn two_windows_on_one_space_share_state(cx: &mut TestAppContext) {
+    // Wave-2 bug 4: two windows opened on the same space hold the *same*
+    // `Space` entity (via the `SpacesStore` registry), so a submit + stream
+    // driven through one window appears in the other live — structurally, not
+    // by any cross-window plumbing. Both `ChatView`s are lenses over one
+    // shared transcript + streaming buffer.
+    let stores = stub_stores_with_config(cx);
+
+    let (window_a, view_a) = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(stores.clone(), Some("space-shared".into()), window, cx))
+    });
+    let (_window_b, view_b) = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(stores.clone(), Some("space-shared".into()), window, cx))
+    });
+    cx.run_until_parked();
+
+    // The registry joined both opens onto one entity.
+    let space_a = view_a.read_with(cx, |v, _| v.space().clone());
+    let space_b = view_b.read_with(cx, |v, _| v.space().clone());
+    assert_eq!(
+        space_a.entity_id(),
+        space_b.entity_id(),
+        "two windows on one space must share one Space entity"
+    );
+
+    // Submit through window A.
+    set_composer_text(&view_a, window_a, cx, "shared question");
+    dispatch_send(&view_a, window_a, cx);
+
+    // Window B sees the appended user turn and the streaming state, because it
+    // renders from the same entity.
+    let agree = |cx: &mut TestAppContext| {
+        let a = view_a.read_with(cx, |v, cx| {
+            (
+                v.messages(cx)
+                    .iter()
+                    .map(|m| (m.message.role.clone(), m.message.content.clone()))
+                    .collect::<Vec<_>>(),
+                v.streaming(cx)
+                    .map(|s| (s.reasoning.clone(), s.content.clone())),
+            )
+        });
+        let b = view_b.read_with(cx, |v, cx| {
+            (
+                v.messages(cx)
+                    .iter()
+                    .map(|m| (m.message.role.clone(), m.message.content.clone()))
+                    .collect::<Vec<_>>(),
+                v.streaming(cx)
+                    .map(|s| (s.reasoning.clone(), s.content.clone())),
+            )
+        });
+        assert_eq!(a, b, "both windows must agree on transcript + streaming");
+        a
+    };
+
+    let after_submit = agree(cx);
+    assert_eq!(
+        after_submit.0,
+        vec![("user".to_string(), "shared question".to_string())],
+    );
+    assert!(after_submit.1.is_some(), "both windows are streaming");
+
+    // Drive a stream delta on the shared space — both lenses observe it.
+    space_a.update(cx, |s, cx| {
+        s.push_content_delta_for_test("partial answer", cx)
+    });
+    cx.run_until_parked();
+
+    let after_delta = agree(cx);
+    assert_eq!(
+        after_delta.1.unwrap().1,
+        "partial answer",
+        "the streamed content appears in both windows"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -443,15 +541,15 @@ fn submit_uses_config_default_model_when_nothing_selected(cx: &mut TestAppContex
 
     view.read_with(cx, |v, cx| {
         assert_eq!(v.current_model(cx), "custom-default");
-        assert_eq!(v.selected_model(), None);
+        assert_eq!(v.selected_model(cx), None);
     });
 
     set_composer_text(&view, window, cx, "hello");
     dispatch_send(&view, window, cx);
 
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, cx| {
         assert_eq!(
-            v.last_submitted_model(),
+            v.last_submitted_model(cx).as_deref(),
             Some("custom-default"),
             "an unselected window must send with the config default"
         );
@@ -476,7 +574,7 @@ fn selecting_a_model_changes_what_submit_sends(cx: &mut TestAppContext) {
         v.select_model("kimi-k2-6".into(), cx);
     });
     view.read_with(cx, |v, cx| {
-        assert_eq!(v.selected_model(), Some("kimi-k2-6"));
+        assert_eq!(v.selected_model(cx).as_deref(), Some("kimi-k2-6"));
         assert_eq!(v.current_model(cx), "kimi-k2-6");
         assert!(!v.model_picker_open(), "selection must close the picker");
     });
@@ -484,9 +582,9 @@ fn selecting_a_model_changes_what_submit_sends(cx: &mut TestAppContext) {
     set_composer_text(&view, window, cx, "hi");
     dispatch_send(&view, window, cx);
 
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, cx| {
         assert_eq!(
-            v.last_submitted_model(),
+            v.last_submitted_model(cx).as_deref(),
             Some("kimi-k2-6"),
             "submit must use the window's selected model"
         );
@@ -501,21 +599,21 @@ fn selection_during_streaming_applies_to_next_send(cx: &mut TestAppContext) {
     // First send (stub core: streaming state sticks).
     set_composer_text(&view, window, cx, "first");
     dispatch_send(&view, window, cx);
-    view.read_with(cx, |v, _| {
-        assert!(v.streaming.is_some());
-        assert_eq!(v.last_submitted_model(), Some("gemma4-31b"));
+    view.read_with(cx, |v, cx| {
+        assert!(v.streaming(cx).is_some());
+        assert_eq!(v.last_submitted_model(cx).as_deref(), Some("gemma4-31b"));
     });
 
     // Switching mid-stream must not touch the in-flight request — only
-    // the window's selection for the *next* send.
+    // the space's selection for the *next* send.
     view.update(cx, |v, cx| v.select_model("kimi-k2-6".into(), cx));
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, cx| {
         assert_eq!(
-            v.last_submitted_model(),
+            v.last_submitted_model(cx).as_deref(),
             Some("gemma4-31b"),
             "an in-flight stream is never hot-swapped"
         );
-        assert_eq!(v.selected_model(), Some("kimi-k2-6"));
+        assert_eq!(v.selected_model(cx).as_deref(), Some("kimi-k2-6"));
     });
 }
 
@@ -824,10 +922,13 @@ fn insufficient_balance_failure_surfaces_plans_below_transcript(cx: &mut TestApp
     let (_window, view) = open_chat(cx, &stores);
 
     view.update(cx, |v, cx| {
-        v.set_messages_for_test(vec![SpaceMessage {
-            role: "user".into(),
-            content: "hello".into(),
-        }]);
+        v.set_messages_for_test(
+            vec![SpaceMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            }],
+            cx,
+        );
         v.apply_chat_failure(
             AppError::InsufficientBalance {
                 available: 100,
@@ -843,7 +944,7 @@ fn insufficient_balance_failure_surfaces_plans_below_transcript(cx: &mut TestApp
             v.show_plans_after_error,
             "InsufficientBalance must surface the plans below the transcript"
         );
-        assert!(v.streaming.is_none());
+        assert!(v.streaming(cx).is_none());
         // Typed routing: the transcript stays (Ready stage), no page swap.
         assert_eq!(v.onboarding_stage(cx, true), OnboardingStage::Ready);
     });
