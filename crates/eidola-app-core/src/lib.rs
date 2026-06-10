@@ -35,6 +35,10 @@ use error::AppError;
 #[derive(Clone, Debug)]
 pub struct ConfigState {
     pub base_url: String,
+    /// The resolved default inference model: the user's `default_model`
+    /// config override if set, otherwise the embedded fallback
+    /// ([`config::DEFAULT_MODEL`]).
+    pub default_model: String,
     pub has_account: bool,
     pub has_account_secret: bool,
     pub domain_separator: String,
@@ -147,6 +151,16 @@ pub struct SpaceMessage {
 pub struct ModelInfo {
     pub id: String,
     pub context_length: u64,
+    /// Credits charged per prompt token. Credits are micro-USD-denominated,
+    /// so this is numerically the same as USD per million prompt tokens.
+    /// Zero for per-request-priced models.
+    pub prompt_credits_per_token: f64,
+    /// Credits charged per completion token (see
+    /// [`prompt_credits_per_token`](Self::prompt_credits_per_token)).
+    pub completion_credits_per_token: f64,
+    /// Flat per-request price for models that charge per request rather
+    /// than per token (e.g. transcription); `None` for token-priced models.
+    pub request_credits: Option<f64>,
 }
 
 /// Default number of credits to allocate into a fresh anonymous credential
@@ -721,6 +735,13 @@ impl Inner {
             .map(|m| ModelInfo {
                 id: m.id,
                 context_length: m.context_length,
+                prompt_credits_per_token: m.pricing.per_prompt_token.credits_per_unit(),
+                completion_credits_per_token: m.pricing.per_completion_token.credits_per_unit(),
+                request_credits: m
+                    .pricing
+                    .per_request
+                    .as_ref()
+                    .map(ScaledPriceInfo::credits_per_unit),
             })
             .collect())
     }
@@ -1854,6 +1875,7 @@ impl AppCore {
         };
         ConfigState {
             base_url: cfg.base_url().to_string(),
+            default_model: cfg.default_model().to_string(),
             has_account: cfg.account_id.is_some(),
             has_account_secret: cfg.account_secret.is_some(),
             domain_separator: cfg.domain_separator().to_string(),
@@ -1867,6 +1889,21 @@ impl AppCore {
     pub fn set_base_url(&self, url: String) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.base_url_override = Some(url);
+        cfg.save_to(&self.inner.config_path)
+    }
+
+    /// Persist the user's default inference model (the `default_model`
+    /// config override). New chat surfaces resolve their starting model
+    /// from this; an existing window's explicit selection is unaffected.
+    pub fn set_default_model(&self, model: String) -> Result<(), AppError> {
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err(AppError::Config {
+                message: "default model must not be empty".into(),
+            });
+        }
+        let mut cfg = self.inner.load_config();
+        cfg.default_model_override = Some(model);
         cfg.save_to(&self.inner.config_path)
     }
 
@@ -2182,12 +2219,28 @@ struct IssueCredentialsResponse {
 struct ModelPricingInfo {
     per_prompt_token: ScaledPriceInfo,
     per_completion_token: ScaledPriceInfo,
+    /// Present only for models priced per request (e.g. transcription).
+    #[serde(default)]
+    per_request: Option<ScaledPriceInfo>,
 }
 
 #[derive(Deserialize)]
 struct ScaledPriceInfo {
     value: u64,
     scale_factor: u64,
+}
+
+impl ScaledPriceInfo {
+    /// Credits per priced unit (token or request) as a float for display.
+    /// Charging math elsewhere stays in integer `value`/`scale_factor`
+    /// space; this is only the honest human-readable rate.
+    fn credits_per_unit(&self) -> f64 {
+        if self.scale_factor == 0 {
+            0.0
+        } else {
+            self.value as f64 / self.scale_factor as f64
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2710,6 +2763,29 @@ mod tests {
     #[test]
     fn params_from_domain_separator_rejects_wrong_format() {
         assert!(params_from_domain_separator("bad").is_err());
+    }
+
+    // --- Default model config ----------------------------------------------
+
+    #[test]
+    fn set_default_model_round_trips_through_config_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().to_path_buf();
+        let data_dir = dir.path().join("data");
+
+        let core = AppCore::new(config_dir.clone(), data_dir.clone());
+        assert_eq!(core.config_state().default_model, config::DEFAULT_MODEL);
+
+        core.set_default_model("kimi-k2-6".into()).unwrap();
+        assert_eq!(core.config_state().default_model, "kimi-k2-6");
+
+        // A fresh core over the same config dir sees the persisted value.
+        let core2 = AppCore::new(config_dir, data_dir);
+        assert_eq!(core2.config_state().default_model, "kimi-k2-6");
+
+        // Whitespace-only is rejected and leaves the config untouched.
+        assert!(core2.set_default_model("   ".into()).is_err());
+        assert_eq!(core2.config_state().default_model, "kimi-k2-6");
     }
 
     // --- Auto-provisioning decision logic ---------------------------------

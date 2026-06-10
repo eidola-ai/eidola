@@ -47,7 +47,7 @@ enum Command {
     Chat {
         /// The prompt to send
         prompt: String,
-        /// Model to use (defaults to first available)
+        /// Model to use (defaults to the configured `default_model`)
         #[arg(long, short)]
         model: Option<String>,
         /// Continue an existing conversation by space ID
@@ -205,6 +205,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             let state = core.config_state();
             println!("config path: {:?}", config::default_config_path());
             println!("base_url: {}", state.base_url);
+            println!("default_model: {}", state.default_model);
             println!(
                 "account_id: {}",
                 if state.has_account {
@@ -448,7 +449,10 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             model,
             space,
         }) => {
-            let model = model.unwrap_or_else(|| "gemma4-31b".to_string());
+            // No --model flag → the user's configured default (the
+            // `default_model` override, falling back to the embedded
+            // default).
+            let model = model.unwrap_or_else(|| core.config_state().default_model);
 
             // Stream chunks straight to stdout. Reasoning goes to stderr
             // (dim, prefixed with "thinking: ") so a piped stdout still

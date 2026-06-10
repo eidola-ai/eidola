@@ -17,6 +17,10 @@ pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidola:inference:production:2
 /// against via the Tinfoil ATC `POST /attestation` endpoint.
 pub const DEFAULT_ATTESTATION_REPO: &str = "eidola-ai/eidola";
 
+/// Embedded fallback for the inference model used when neither the user's
+/// config (`default_model`) nor the caller specifies one.
+pub const DEFAULT_MODEL: &str = "gemma4-31b";
+
 /// Returns the default config file path: `<config_dir>/eidola/config.toml`.
 pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("eidola").join("config.toml"))
@@ -35,6 +39,12 @@ pub fn default_data_dir() -> Option<PathBuf> {
 pub struct Config {
     #[serde(rename = "base_url", default, skip_serializing_if = "Option::is_none")]
     pub base_url_override: Option<String>,
+    #[serde(
+        rename = "default_model",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_model_override: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +81,15 @@ impl Config {
         self.attestation_repo
             .as_deref()
             .unwrap_or(DEFAULT_ATTESTATION_REPO)
+    }
+
+    /// The inference model to use when the caller doesn't specify one: the
+    /// user's `default_model` override if set, otherwise the embedded
+    /// fallback ([`DEFAULT_MODEL`]).
+    pub fn default_model(&self) -> &str {
+        self.default_model_override
+            .as_deref()
+            .unwrap_or(DEFAULT_MODEL)
     }
 
     /// The server URL to talk to: the user's `base_url` override if set,
@@ -295,6 +314,32 @@ tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
         assert_eq!(parse_untrust_key(&snp).unwrap(), snp);
         let triple = format!("{}:{}:{}", snp, "b".repeat(96), "c".repeat(96));
         assert_eq!(parse_untrust_key(&triple).unwrap(), snp);
+    }
+
+    #[test]
+    fn default_model_falls_back_to_embedded_value() {
+        let cfg = Config::default();
+        assert_eq!(cfg.default_model(), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn default_model_round_trips_via_toml() {
+        let original = Config {
+            default_model_override: Some("kimi-k2-6".into()),
+            ..Config::default()
+        };
+        let toml_text = toml::to_string_pretty(&original).expect("serialize");
+        assert!(
+            toml_text.contains("default_model = \"kimi-k2-6\""),
+            "override must serialize under the public `default_model` key: {toml_text}"
+        );
+        let parsed: Config = toml::from_str(&toml_text).expect("deserialize");
+        assert_eq!(parsed.default_model(), "kimi-k2-6");
+
+        // Absent key → override stays None and the resolver falls back.
+        let parsed: Config = toml::from_str("").expect("deserialize empty");
+        assert!(parsed.default_model_override.is_none());
+        assert_eq!(parsed.default_model(), DEFAULT_MODEL);
     }
 
     #[test]
