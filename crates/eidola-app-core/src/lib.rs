@@ -40,10 +40,20 @@ pub struct ConfigState {
     /// config override if set, otherwise the embedded fallback
     /// ([`config::DEFAULT_MODEL`]).
     pub default_model: String,
+    /// The trust-root pin baked into this binary. Equal to `base_url` unless
+    /// the user has set an override — the UI uses the pair to be honest
+    /// about override-vs-pin instead of presenting one undifferentiated URL.
+    pub base_url_pin: String,
+    /// Whether `base_url` comes from a user override (`true`) or the
+    /// embedded trust-root pin (`false`).
+    pub base_url_is_override: bool,
     pub has_account: bool,
     pub has_account_secret: bool,
     pub domain_separator: String,
     pub trusted_measurements: Vec<MeasurementInfo>,
+    /// Whether `trusted_measurements` is a user override list (`true`) or
+    /// the single pinned build measurement (`false`).
+    pub trusted_measurements_are_override: bool,
     pub has_hardware_root_ca: bool,
     pub has_hardware_intermediate_ca: bool,
     pub attestation_url: Option<String>,
@@ -162,6 +172,108 @@ pub struct ModelInfo {
     /// Flat per-request price for models that charge per request rather
     /// than per token (e.g. transcription); `None` for token-priced models.
     pub request_credits: Option<f64>,
+}
+
+/// One credential row with its lifecycle state, as computed by the local
+/// `credential_lifecycle` view: `active` (spendable), `spending` (a spend
+/// proof is in flight / unsettled), `spent` (settled into a successor), or
+/// `expired` (issuer key past its expiry).
+#[derive(Clone, Debug)]
+pub struct CredentialLifecycleInfo {
+    pub nonce: String,
+    pub credits: i64,
+    pub generation: i64,
+    pub created_at: i64,
+    pub state: String,
+    /// For `spending`/`spent` credentials, the amount charged by the
+    /// in-flight (or settled) spend.
+    pub spend_amount: Option<i64>,
+}
+
+/// One row of the attestation listing in the Record.
+#[derive(Clone, Debug)]
+pub struct AttestationInfo {
+    pub hash: String,
+    pub pcr_digest: Option<String>,
+    pub created_at: i64,
+    /// Size of the stored raw document, in bytes.
+    pub doc_bytes: i64,
+    /// Number of recorded connections that presented this attestation.
+    pub connection_count: i64,
+}
+
+/// The full raw attestation document for the Record's detail view.
+#[derive(Clone, Debug)]
+pub struct AttestationDetail {
+    pub hash: String,
+    pub pcr_digest: Option<String>,
+    pub created_at: i64,
+    pub doc: Vec<u8>,
+}
+
+/// One row of the request listing in the Record — summary only; the raw
+/// header/body payloads come from [`AppCore::request_detail`].
+#[derive(Clone, Debug)]
+pub struct RequestInfo {
+    pub id: String,
+    pub method: String,
+    pub path: String,
+    pub response_status: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub request_at: i64,
+    pub error: Option<String>,
+    pub attempt_number: i64,
+    pub credential_nonce: Option<String>,
+    pub transport: Option<String>,
+    pub base_url: Option<String>,
+    pub attestation_hash: Option<String>,
+}
+
+/// The full recorded request/response pair, raw bodies included. This is
+/// the user's own traffic on their own machine — nothing is redacted.
+#[derive(Clone, Debug)]
+pub struct RequestDetail {
+    pub id: String,
+    pub method: String,
+    pub path: String,
+    pub request_headers: Option<String>,
+    pub request_body: Option<Vec<u8>>,
+    pub response_status: Option<i64>,
+    pub response_headers: Option<String>,
+    pub response_body: Option<Vec<u8>>,
+    pub request_at: i64,
+    pub response_at: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub error: Option<String>,
+    pub retry_of_id: Option<String>,
+    pub attempt_number: i64,
+    pub credential_nonce: Option<String>,
+    pub action_id: Option<String>,
+    pub transport: Option<String>,
+    pub base_url: Option<String>,
+    pub attestation_hash: Option<String>,
+}
+
+/// One row of the `spend_trail` view: credential → request → action → space.
+#[derive(Clone, Debug)]
+pub struct SpendTrailEntry {
+    pub credential_nonce: String,
+    pub spend_amount: Option<i64>,
+    pub credential_state: String,
+    pub request_id: String,
+    pub method: String,
+    pub path: String,
+    pub request_at: i64,
+    pub duration_ms: Option<i64>,
+    pub attempt_number: i64,
+    pub action_id: Option<String>,
+    pub action_type: Option<String>,
+    pub model: Option<String>,
+    pub credits_consumed: Option<i64>,
+    pub intent: Option<String>,
+    pub space_id: Option<String>,
+    pub space_title: Option<String>,
+    pub linkability: Option<String>,
 }
 
 /// Default number of credits to allocate into a fresh anonymous credential
@@ -742,6 +854,129 @@ impl Inner {
                 credits: r.credits,
                 generation: r.generation,
                 spend_amount: r.spend_amount,
+            })
+            .collect())
+    }
+
+    async fn wallet_lifecycle(&self) -> Result<Vec<CredentialLifecycleInfo>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_credential_lifecycle(&db_conn).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| CredentialLifecycleInfo {
+                nonce: r.nonce,
+                credits: r.credits,
+                generation: r.generation,
+                created_at: r.created_at,
+                state: r.state,
+                spend_amount: r.spend_amount,
+            })
+            .collect())
+    }
+
+    // --- The Record: read-only queries over the local trail -----------------
+
+    async fn list_attestations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AttestationInfo>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_attestations(&db_conn, limit, offset).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AttestationInfo {
+                hash: r.hash,
+                pcr_digest: r.pcr_digest,
+                created_at: r.created_at,
+                doc_bytes: r.doc_bytes,
+                connection_count: r.connection_count,
+            })
+            .collect())
+    }
+
+    async fn attestation_detail(&self, hash: &str) -> Result<Option<AttestationDetail>, AppError> {
+        let db_conn = self.db_conn().await?;
+        Ok(db::get_attestation(&db_conn, hash)
+            .await?
+            .map(|r| AttestationDetail {
+                hash: r.hash,
+                pcr_digest: r.pcr_digest,
+                created_at: r.created_at,
+                doc: r.doc,
+            }))
+    }
+
+    async fn list_requests(&self, limit: i64, offset: i64) -> Result<Vec<RequestInfo>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_requests(&db_conn, limit, offset).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| RequestInfo {
+                id: r.id,
+                method: r.method,
+                path: r.path,
+                response_status: r.response_status,
+                duration_ms: r.duration_ms,
+                request_at: r.request_at,
+                error: r.error,
+                attempt_number: r.attempt_number,
+                credential_nonce: r.credential_nonce,
+                transport: r.transport,
+                base_url: r.base_url,
+                attestation_hash: r.attestation_hash,
+            })
+            .collect())
+    }
+
+    async fn request_detail(&self, id: &str) -> Result<Option<RequestDetail>, AppError> {
+        let db_conn = self.db_conn().await?;
+        Ok(db::get_request(&db_conn, id).await?.map(|r| RequestDetail {
+            id: r.id,
+            method: r.method,
+            path: r.path,
+            request_headers: r.request_headers,
+            request_body: r.request_body,
+            response_status: r.response_status,
+            response_headers: r.response_headers,
+            response_body: r.response_body,
+            request_at: r.request_at,
+            response_at: r.response_at,
+            duration_ms: r.duration_ms,
+            error: r.error,
+            retry_of_id: r.retry_of_id,
+            attempt_number: r.attempt_number,
+            credential_nonce: r.credential_nonce,
+            action_id: r.action_id,
+            transport: r.transport,
+            base_url: r.base_url,
+            attestation_hash: r.attestation_hash,
+        }))
+    }
+
+    async fn spend_trail(&self, limit: i64, offset: i64) -> Result<Vec<SpendTrailEntry>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_spend_trail(&db_conn, limit, offset).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SpendTrailEntry {
+                credential_nonce: r.credential_nonce,
+                spend_amount: r.spend_amount,
+                credential_state: r.credential_state,
+                request_id: r.request_id,
+                method: r.method,
+                path: r.path,
+                request_at: r.request_at,
+                duration_ms: r.duration_ms,
+                attempt_number: r.attempt_number,
+                action_id: r.action_id,
+                action_type: r.action_type,
+                model: r.model,
+                credits_consumed: r.credits_consumed,
+                intent: r.intent,
+                space_id: r.space_id,
+                space_title: r.space_title,
+                linkability: r.linkability,
             })
             .collect())
     }
@@ -1965,10 +2200,13 @@ impl AppCore {
         ConfigState {
             base_url: cfg.base_url().to_string(),
             default_model: cfg.default_model().to_string(),
+            base_url_pin: trust_root::SERVER_URL.to_string(),
+            base_url_is_override: cfg.base_url_override.is_some(),
             has_account: cfg.account_id.is_some(),
             has_account_secret: cfg.account_secret.is_some(),
             domain_separator: cfg.domain_separator().to_string(),
             trusted_measurements: cfg.trusted_measurements().iter().map(&to_info).collect(),
+            trusted_measurements_are_override: !cfg.trusted_measurements_override.is_empty(),
             has_hardware_root_ca: cfg.hardware_root_ca.is_some(),
             has_hardware_intermediate_ca: cfg.hardware_intermediate_ca.is_some(),
             attestation_url: cfg.attestation_url.clone(),
@@ -1993,6 +2231,14 @@ impl AppCore {
         }
         let mut cfg = self.inner.load_config();
         cfg.default_model_override = Some(model);
+        cfg.save_to(&self.inner.config_path)
+    }
+
+    /// Remove the user's base-URL override, reverting to the trust-root pin
+    /// baked into this binary.
+    pub fn clear_base_url_override(&self) -> Result<(), AppError> {
+        let mut cfg = self.inner.load_config();
+        cfg.base_url_override = None;
         cfg.save_to(&self.inner.config_path)
     }
 
@@ -2206,10 +2452,83 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Every credential in the local wallet with its lifecycle state
+    /// (`active` / `spending` / `spent` / `expired`), newest first.
+    pub async fn wallet_lifecycle(&self) -> Result<Vec<CredentialLifecycleInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.wallet_lifecycle().await })
+            .await
+            .map_err(join_err)?
+    }
+
     pub async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.recover_spending_credentials().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    // -----------------------------------------------------------------------
+    // The Record — read-only queries over the local trail. Pure SELECTs;
+    // newest first; `limit`/`offset` for windowed fetches.
+    // -----------------------------------------------------------------------
+
+    pub async fn list_attestations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AttestationInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.list_attestations(limit, offset).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The full raw attestation document, or `None` if the hash is unknown.
+    pub async fn attestation_detail(
+        &self,
+        hash: String,
+    ) -> Result<Option<AttestationDetail>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.attestation_detail(&hash).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn list_requests(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<RequestInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.list_requests(limit, offset).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The full recorded request/response pair (raw bodies included), or
+    /// `None` if the id is unknown.
+    pub async fn request_detail(&self, id: String) -> Result<Option<RequestDetail>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.request_detail(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn spend_trail(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SpendTrailEntry>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.spend_trail(limit, offset).await })
             .await
             .map_err(join_err)?
     }
