@@ -8,15 +8,15 @@ use eidola_app_core::updates::{
     Claim, ClaimDelta, ClaimsComparison, UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease,
 };
 use eidola_app_core::{
-    BalancePoolInfo, BalancesResult, ConfigState, CredentialInfo, InFlightCredentialInfo,
-    MeasurementInfo, ModelInfo, PriceInfo, SpaceInfo, SpaceMessage,
+    AttestationDetail, AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState,
+    CredentialInfo, CredentialLifecycleInfo, InFlightCredentialInfo, MeasurementInfo, ModelInfo,
+    PriceInfo, RequestDetail, RequestInfo, SpaceInfo, SpaceMessage, SpendTrailEntry,
 };
-use eidola_gui::account::AccountView;
 use eidola_gui::chat::{ChatView, StreamingResponse};
 use eidola_gui::core::Core;
-use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
-use eidola_gui::settings::SettingsView;
+use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
+use eidola_gui::settings::{SettingsPane, SettingsView};
 use eidola_gui::updates::UpdatesView;
 use eidola_gui::wallet::WalletView;
 use gpui::{App, AppContext, Entity, px, size};
@@ -28,11 +28,9 @@ pub fn register(s: &mut Snapshots) {
     register_chat(s);
     register_onboarding(s);
     register_library(s);
-    register_account(s);
-    register_wallet(s);
-    register_general(s);
     register_settings(s);
     register_updates(s);
+    register_record(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -768,176 +766,414 @@ fn register_library(s: &mut Snapshots) {
 }
 
 // ---------------------------------------------------------------------------
-// Account
+// Settings (two-pane window: nav band + pane)
 // ---------------------------------------------------------------------------
 
-fn register_account(s: &mut Snapshots) {
-    s.add(
-        "account_no_account",
-        size(px(560.), px(720.)),
-        |window, cx| {
-            let core = cx.new(|_| {
-                let mut c = Core::stub();
-                c.config_state = Some(stub_config_state(false));
-                c
-            });
-            cx.new(|cx| AccountView::new(core, window, cx))
-        },
-    );
-
-    s.add(
-        "account_with_balances",
-        size(px(560.), px(720.)),
-        |window, cx| {
-            let core = cx.new(|_| {
-                let mut c = Core::stub();
-                c.config_state = Some(stub_config_state(true));
-                c.balances = Some(BalancesResult {
-                    available: 4_200,
-                    pools: vec![
-                        BalancePoolInfo {
-                            amount: 3_000,
-                            source: "subscription".into(),
-                            expires_at: Some(1_780_000_000_000),
-                        },
-                        BalancePoolInfo {
-                            amount: 1_200,
-                            source: "topup".into(),
-                            expires_at: None,
-                        },
-                    ],
-                });
-                c.prices = vec![
-                    PriceInfo {
-                        id: "price_basic".into(),
-                        product_name: "Basic".into(),
-                        product_description: Some("1,000 credits per month".into()),
-                        amount_display: "10.00 USD".into(),
-                        recurrence: "/month".into(),
-                        credits: 1_000,
-                    },
-                    PriceInfo {
-                        id: "price_pro".into(),
-                        product_name: "Pro".into(),
-                        product_description: Some("5,000 credits per month".into()),
-                        amount_display: "40.00 USD".into(),
-                        recurrence: "/month".into(),
-                        credits: 5_000,
-                    },
-                ];
-                c
-            });
-            cx.new(|cx| AccountView::new(core, window, cx))
-        },
-    );
+/// A funded account fixture with pools and plans, shared by the settings
+/// cases.
+fn settings_core(cx: &mut App) -> Entity<Core> {
+    cx.new(|_| {
+        let mut c = Core::stub();
+        c.config_state = Some(stub_config_state(true));
+        c.balances = Some(BalancesResult {
+            available: 4_200_000,
+            pools: vec![
+                BalancePoolInfo {
+                    amount: 3_000_000,
+                    source: "subscription".into(),
+                    expires_at: Some(eidola_app_core::now_ms() + 23 * 24 * 60 * 60 * 1000),
+                },
+                BalancePoolInfo {
+                    amount: 1_200_000,
+                    source: "topup".into(),
+                    expires_at: None,
+                },
+            ],
+        });
+        c.prices = vec![
+            PriceInfo {
+                id: "price_starter".into(),
+                product_name: "Starter".into(),
+                product_description: Some("A month of casual questions".into()),
+                amount_display: "5.00 USD".into(),
+                recurrence: "/month".into(),
+                credits: 5_000_000,
+            },
+            PriceInfo {
+                id: "price_standard".into(),
+                product_name: "Standard".into(),
+                product_description: Some("Daily thinking, long documents".into()),
+                amount_display: "20.00 USD".into(),
+                recurrence: "/month".into(),
+                credits: 20_000_000,
+            },
+        ];
+        c.credential_lifecycle = vec![
+            CredentialLifecycleInfo {
+                nonce: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into(),
+                credits: 985_400,
+                generation: 0,
+                created_at: 4_000,
+                state: "active".into(),
+                spend_amount: None,
+            },
+            CredentialLifecycleInfo {
+                nonce: "deadbeefcafef00d0123456789abcdef".into(),
+                credits: 812_000,
+                generation: 1,
+                created_at: 3_000,
+                state: "spending".into(),
+                spend_amount: Some(6_200),
+            },
+            CredentialLifecycleInfo {
+                nonce: "ff1122334455667788990011223344aa".into(),
+                credits: 1_000_000,
+                generation: 0,
+                created_at: 2_000,
+                state: "spent".into(),
+                spend_amount: Some(14_600),
+            },
+            CredentialLifecycleInfo {
+                nonce: "0099aabbccddeeff0011223344556677".into(),
+                credits: 52_000,
+                generation: 3,
+                created_at: 1_000,
+                state: "expired".into(),
+                spend_amount: None,
+            },
+        ];
+        c
+    })
 }
-
-// ---------------------------------------------------------------------------
-// Wallet
-// ---------------------------------------------------------------------------
-
-fn register_wallet(s: &mut Snapshots) {
-    s.add("wallet_empty", size(px(560.), px(480.)), |window, cx| {
-        let core = cx.new(|_| Core::stub());
-        cx.new(|cx| WalletView::new(core, window, cx))
-    });
-
-    s.add(
-        "wallet_with_credentials",
-        size(px(560.), px(480.)),
-        |window, cx| {
-            let core = cx.new(|_| {
-                let mut c = Core::stub();
-                c.credentials = vec![
-                    CredentialInfo {
-                        nonce: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into(),
-                        credits: 1_500,
-                        generation: 0,
-                    },
-                    CredentialInfo {
-                        nonce: "ff1122334455667788990011223344aa".into(),
-                        credits: 2_700,
-                        generation: 2,
-                    },
-                ];
-                c
-            });
-            cx.new(|cx| WalletView::new(core, window, cx))
-        },
-    );
-
-    s.add(
-        "wallet_with_in_flight",
-        size(px(560.), px(480.)),
-        |window, cx| {
-            let core = cx.new(|_| {
-                let mut c = Core::stub();
-                c.spending_credentials = vec![InFlightCredentialInfo {
-                    nonce: "deadbeefcafef00d0123456789abcdef".into(),
-                    credits: 800,
-                    generation: 1,
-                    spend_amount: 700,
-                }];
-                c.credentials = vec![CredentialInfo {
-                    nonce: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into(),
-                    credits: 1_500,
-                    generation: 0,
-                }];
-                c
-            });
-            cx.new(|cx| WalletView::new(core, window, cx))
-        },
-    );
-}
-
-// ---------------------------------------------------------------------------
-// General settings
-// ---------------------------------------------------------------------------
-
-fn register_general(s: &mut Snapshots) {
-    s.add("general_default", size(px(560.), px(720.)), |window, cx| {
-        let core = stub_core_with_config(cx);
-        cx.new(|cx| GeneralView::new(core, window, cx))
-    });
-
-    s.add(
-        "general_with_attestation",
-        size(px(560.), px(720.)),
-        |window, cx| {
-            let core = cx.new(|_| {
-                let mut c = Core::stub();
-                let mut state = stub_config_state(true);
-                state.attestation_url = Some("https://atc.tinfoil.sh/v1/attest".into());
-                state.has_hardware_root_ca = true;
-                state.has_hardware_intermediate_ca = true;
-                state.trusted_measurements = vec![MeasurementInfo {
-                    snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
-                    tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                        .into(),
-                    tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-                        .into(),
-                }];
-                c.config_state = Some(state);
-                c
-            });
-            cx.new(|cx| GeneralView::new(core, window, cx))
-        },
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Settings (full window with tab strip)
-// ---------------------------------------------------------------------------
 
 fn register_settings(s: &mut Snapshots) {
+    let settings_size = size(px(620.), px(520.));
+
+    // General at rest: base URL pin, advanced rows hidden behind ⌥.
+    s.add("settings_general", settings_size, |window, cx| {
+        let core = settings_core(cx);
+        cx.new(|cx| SettingsView::new(core, window, cx))
+    });
+
+    // ⌥ held: advanced rows visible, with an overridden base URL and a
+    // user-trusted measurement so the honest "override" annotations show.
+    s.add("settings_general_advanced", settings_size, |window, cx| {
+        let core = cx.new(|_| {
+            let mut c = Core::stub();
+            let mut state = stub_config_state(true);
+            state.base_url = "https://staging.eidola.example/v1".into();
+            state.base_url_is_override = true;
+            state.attestation_url = Some("https://atc.tinfoil.sh/v1/attest".into());
+            state.has_hardware_root_ca = true;
+            state.trusted_measurements = vec![MeasurementInfo {
+                snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+                tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .into(),
+                tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                    .into(),
+            }];
+            state.trusted_measurements_are_override = true;
+            c.config_state = Some(state);
+            c
+        });
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        let general = view.read(cx).general();
+        general.update(cx, |g, cx| g.set_advanced(true, cx));
+        view
+    });
+
+    // Account pane: balance, pools with humanized expiry, plans.
+    s.add("settings_account", settings_size, |window, cx| {
+        let core = settings_core(cx);
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+        view
+    });
+
+    // Account pane with the reset confirm armed (step two of two).
     s.add(
-        "settings_window_general_tab",
-        size(px(560.), px(480.)),
+        "settings_account_reset_confirm",
+        settings_size,
         |window, cx| {
-            let core = stub_core_with_config(cx);
-            cx.new(|cx| SettingsView::new(core, window, cx))
+            let core = settings_core(cx);
+            let view = cx.new(|cx| SettingsView::new(core, window, cx));
+            view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+            let account = view.read(cx).account();
+            account.update(cx, |a, cx| a.request_reset(cx));
+            view
         },
     );
+
+    // Wallet pane: the four lifecycle states in one honest listing.
+    s.add("settings_wallet", settings_size, |window, cx| {
+        let core = settings_core(cx);
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Wallet, cx));
+        view
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The Record
+// ---------------------------------------------------------------------------
+
+fn record_size() -> gpui::Size<gpui::Pixels> {
+    size(px(860.), px(640.))
+}
+
+fn now_minus(mins: i64) -> i64 {
+    1_781_013_753_000 - mins * 60_000 // anchored so timestamps are stable
+}
+
+fn record_attestations() -> Vec<AttestationInfo> {
+    vec![
+        AttestationInfo {
+            hash: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+            pcr_digest: Some(
+                "77aa00cc190c107d4ec428b54df0b242b4e0fc4e8f2f2a35ee98b8ddfb2dca10".into(),
+            ),
+            created_at: now_minus(12),
+            doc_bytes: 5_882,
+            connection_count: 4,
+        },
+        AttestationInfo {
+            hash: "1f00aa45be21b268536059930c717abb7004279e860cbbb8f88be8a48d250d97".into(),
+            pcr_digest: None,
+            created_at: now_minus(60 * 26),
+            doc_bytes: 5_874,
+            connection_count: 1,
+        },
+    ]
+}
+
+fn record_requests() -> Vec<RequestInfo> {
+    vec![
+        RequestInfo {
+            id: "req-1".into(),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            response_status: Some(200),
+            duration_ms: Some(2_741),
+            request_at: now_minus(3),
+            error: None,
+            attempt_number: 1,
+            credential_nonce: Some("a1b2c3d4e5f60718293a4b5c6d7e8f90".into()),
+            transport: Some("clearnet".into()),
+            base_url: Some("https://eidola.example".into()),
+            attestation_hash: Some(
+                "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+            ),
+        },
+        RequestInfo {
+            id: "req-2".into(),
+            method: "POST".into(),
+            path: "/v1/credentials/refund".into(),
+            response_status: Some(200),
+            duration_ms: Some(204),
+            request_at: now_minus(9),
+            error: None,
+            attempt_number: 2,
+            credential_nonce: Some("deadbeefcafef00d0123456789abcdef".into()),
+            transport: Some("clearnet".into()),
+            base_url: Some("https://eidola.example".into()),
+            attestation_hash: Some(
+                "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+            ),
+        },
+        RequestInfo {
+            id: "req-3".into(),
+            method: "GET".into(),
+            path: "/v1/models".into(),
+            response_status: None,
+            duration_ms: None,
+            request_at: now_minus(60 * 5),
+            error: Some("connection refused".into()),
+            attempt_number: 1,
+            credential_nonce: None,
+            transport: None,
+            base_url: None,
+            attestation_hash: None,
+        },
+        RequestInfo {
+            id: "req-4".into(),
+            method: "GET".into(),
+            path: "/v1/account/balances".into(),
+            response_status: Some(401),
+            duration_ms: Some(96),
+            request_at: now_minus(60 * 30),
+            error: None,
+            attempt_number: 1,
+            credential_nonce: None,
+            transport: Some("clearnet".into()),
+            base_url: Some("https://eidola.example".into()),
+            attestation_hash: None,
+        },
+    ]
+}
+
+fn record_spending() -> Vec<SpendTrailEntry> {
+    vec![
+        SpendTrailEntry {
+            credential_nonce: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into(),
+            spend_amount: Some(6_200),
+            credential_state: "spending".into(),
+            request_id: "req-1".into(),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            request_at: now_minus(3),
+            duration_ms: Some(2_741),
+            attempt_number: 1,
+            action_id: Some("act-1".into()),
+            action_type: Some("inference".into()),
+            model: Some("gemma4-31b".into()),
+            credits_consumed: Some(6_200),
+            intent: None,
+            space_id: Some("space-1".into()),
+            space_title: Some("Tides and the moon".into()),
+            linkability: Some("unlinked".into()),
+        },
+        SpendTrailEntry {
+            credential_nonce: "ff1122334455667788990011223344aa".into(),
+            spend_amount: Some(14_600),
+            credential_state: "spent".into(),
+            request_id: "req-5".into(),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            request_at: now_minus(60 * 24),
+            duration_ms: Some(5_120),
+            attempt_number: 1,
+            action_id: Some("act-2".into()),
+            action_type: Some("inference".into()),
+            model: Some("kimi-k2-6".into()),
+            credits_consumed: Some(9_400),
+            intent: None,
+            space_id: Some("space-2".into()),
+            space_title: None,
+            linkability: Some("unlinked".into()),
+        },
+        SpendTrailEntry {
+            credential_nonce: "ff1122334455667788990011223344aa".into(),
+            spend_amount: Some(14_600),
+            credential_state: "spent".into(),
+            request_id: "req-6".into(),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            request_at: now_minus(60 * 25),
+            duration_ms: Some(3_300),
+            attempt_number: 1,
+            action_id: Some("act-3".into()),
+            action_type: Some("inference".into()),
+            model: Some("kimi-k2-6".into()),
+            credits_consumed: Some(5_200),
+            intent: None,
+            space_id: Some("space-1".into()),
+            space_title: Some("Tides and the moon".into()),
+            linkability: Some("unlinked".into()),
+        },
+    ]
+}
+
+fn register_record(s: &mut Snapshots) {
+    s.add("record_attestations", record_size(), |window, cx| {
+        let core = stub_core_with_config(cx);
+        cx.new(|cx| {
+            let mut view = RecordView::new(core, window, cx);
+            view.set_attestations_for_test(record_attestations(), false);
+            view
+        })
+    });
+
+    s.add("record_requests", record_size(), |window, cx| {
+        let core = stub_core_with_config(cx);
+        cx.new(|cx| {
+            let mut view = RecordView::new(core, window, cx);
+            view.set_requests_for_test(record_requests(), true);
+            view.select_section(RecordSection::Requests, cx);
+            view
+        })
+    });
+
+    s.add("record_spending", record_size(), |window, cx| {
+        let core = stub_core_with_config(cx);
+        cx.new(|cx| {
+            let mut view = RecordView::new(core, window, cx);
+            view.set_spending_for_test(record_spending(), false);
+            view.select_section(RecordSection::Spending, cx);
+            view
+        })
+    });
+
+    s.add("record_empty", record_size(), |window, cx| {
+        let core = stub_core_with_config(cx);
+        cx.new(|cx| {
+            let mut view = RecordView::new(core, window, cx);
+            view.set_requests_for_test(Vec::new(), false);
+            view.select_section(RecordSection::Requests, cx);
+            view
+        })
+    });
+
+    s.add("record_request_detail", record_size(), |window, cx| {
+        let core = stub_core_with_config(cx);
+        cx.new(|cx| {
+            let mut view = RecordView::new(core, window, cx);
+            view.set_requests_for_test(record_requests(), false);
+            view.select_section(RecordSection::Requests, cx);
+            view.set_detail_for_test(Some(RecordDetail::Request(Box::new(RequestDetail {
+                id: "req-1".into(),
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                request_headers: Some(
+                    "content-type: application/json\nauthorization: PrivateToken token=\"…\""
+                        .into(),
+                ),
+                request_body: Some(
+                    br#"{"model":"gemma4-31b","stream":true,"messages":[{"role":"user","content":"Why is the sky blue?"}]}"#
+                        .to_vec(),
+                ),
+                response_status: Some(200),
+                response_headers: Some(
+                    "content-type: text/event-stream\nx-credits-charged: 6200".into(),
+                ),
+                response_body: Some(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"Rayleigh\"}}]}\n\ndata: [DONE]"
+                        .to_vec(),
+                ),
+                request_at: now_minus(3),
+                response_at: Some(now_minus(3) + 2_741),
+                duration_ms: Some(2_741),
+                error: None,
+                retry_of_id: None,
+                attempt_number: 1,
+                credential_nonce: Some("a1b2c3d4e5f60718293a4b5c6d7e8f90".into()),
+                action_id: Some("act-1".into()),
+                transport: Some("clearnet".into()),
+                base_url: Some("https://eidola.example".into()),
+                attestation_hash: Some(
+                    "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+                ),
+            }))));
+            view
+        })
+    });
+
+    s.add("record_attestation_detail", record_size(), |window, cx| {
+        let core = stub_core_with_config(cx);
+        cx.new(|cx| {
+            let mut view = RecordView::new(core, window, cx);
+            view.set_attestations_for_test(record_attestations(), false);
+            view.set_detail_for_test(Some(RecordDetail::Attestation(AttestationDetail {
+                hash: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+                pcr_digest: Some(
+                    "77aa00cc190c107d4ec428b54df0b242b4e0fc4e8f2f2a35ee98b8ddfb2dca10".into(),
+                ),
+                created_at: now_minus(12),
+                doc: br#"{"format":"https://tinfoil.sh/predicate/sev-snp-guest/v1","body":"pZWA2x0aGUgcmVwb3J0IGJvZHkgaXMgYSBsb25nIGJhc2U2NCBibG9i","tls_public_key_fp":"8c41af","nonce":"f00d"}"#
+                    .to_vec(),
+            })));
+            view
+        })
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -997,10 +1233,13 @@ fn stub_config_state(has_account: bool) -> ConfigState {
     ConfigState {
         base_url: "https://eidola.example/v1".into(),
         default_model: "gemma4-31b".into(),
+        base_url_pin: "https://eidola.example/v1".into(),
+        base_url_is_override: false,
         has_account,
         has_account_secret: has_account,
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
         trusted_measurements: Vec::new(),
+        trusted_measurements_are_override: false,
         has_hardware_root_ca: false,
         has_hardware_intermediate_ca: false,
         attestation_url: None,

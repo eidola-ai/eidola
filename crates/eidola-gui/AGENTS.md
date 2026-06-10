@@ -21,10 +21,12 @@ A native Rust client for Eidola, built on [gpui](https://github.com/zed-industri
 | `chat.rs` | `ChatView` | Main chat window — message list + input + Send action, plus the onboarding empty states (see [Onboarding](#onboarding--the-chat-windows-empty-states)) |
 | `library.rs` | `LibraryView` | Library window — table of contents of past spaces; reopen / archive |
 | `updates.rs` | `UpdatesView` | Updates window — the verified update-check state machine (see [Updates window](#updates-window)) |
-| `settings.rs` | `SettingsView` | Settings window — custom three-button tab strip switching between... |
-| `general.rs` | `GeneralView` | ...base URL + attestation state (read-mostly) |
-| `account.rs` | `AccountView` | ...account/balance/allocate/prices |
-| `wallet.rs` | `WalletView` | ...credential list |
+| `record.rs` | `RecordView` | The Record window — raw local trail: attestations / requests / spending (see [The Record](#the-record-window--the-trust-doors-engine-room)) |
+| `settings.rs` | `SettingsView` | Settings window — quiet two-pane layout: nav band (General · Account · Wallet) on `theme.sidebar`, selected pane in the content column |
+| `general.rs` | `GeneralView` | ...Base URL (honest about override-vs-pin, one-click revert) + ⌥-revealed advanced rows (attestation URL, domain separator, CAs, measurement summary linking to the Record) |
+| `account.rs` | `AccountView` | ...balance + pools (humanized expiry), plans/checkout (shared `plans.rs` rows), two-step inline reset confirm |
+| `wallet.rs` | `WalletView` | ...credential history with lifecycle states from the local `credential_lifecycle` view (active / in flight / spent / expired) |
+| `plans.rs` (no window) | — | shared plans-row presentation (`plan_rows`) used by both the chat onboarding plans page and the Account pane; takes an `Rc` select-handler so each caller routes clicks back into its own entity |
 
 All view roots are wrapped in `gpui_component::Root` before being handed to `cx.open_window`. **Root is required** — `gpui_component::Input` calls `Root::read(window, cx)` to track the focused input, and panics if the window's root view type isn't `Root`.
 
@@ -131,7 +133,7 @@ User-initiated submit is a special case: `submit` always sets `pending_tail = tr
 
 **Chat windows are non-singleton.** Every `NewSpace` invocation opens a fresh `ChatView` via `open_main_window` → `open_chat_window(cx, core, None)`; with `space_id: None` the view is a blank page whose space is created lazily by the first exchange (protecting the instant-⌘N pillar). The Library reopens an existing space via `open_space_window(cx, core, space_id)` (same chat window chrome, `Some(id)`): `ChatView::new` stores the id and asynchronously loads the space's persisted messages through the `Core::get_space_messages` bridge on construction, and the next submit continues that space. Opening the same space twice yields two independent windows — no dedup yet, acceptable v1. `open_chat_window` calls `cx.activate(true)` after `cx.open_window` so a window opened from another app's context (dock right-click while a different app is foreground) brings Eidola to the front rather than opening behind.
 
-**Settings, Library, and Updates are singletons.** `AppGlobal.settings_window` / `AppGlobal.library_window` (`Option<WindowHandle<Root>>`) cache the handles, and `OpenSettings` / `OpenLibrary` raise the existing window via `window.activate_window()` if it's still open (shared helper `try_focus_existing_singleton`, parameterized over the `AppGlobal` slot). Both open paths are **synchronous** (via `App::open_window`) so the cache is populated before the handler returns. Liveness is checked by matching the cached `WindowId` against `cx.windows()` (the authoritative live list) — borrowing Zed's pattern, except Zed can use `AnyWindowHandle::downcast::<SettingsWindow>` directly because their settings root is uniquely typed; ours is `gpui_component::Root` (shared with chat windows), so we match by id instead. A stale id self-heals on the next invocation — no `on_release` bookkeeping needed. `OpenLibrary` additionally calls `core.fetch_spaces` on every invocation (not just first open) so a long-lived Library window doesn't show a stale listing. `CheckForUpdates` follows the same singleton pattern via `AppGlobal.updates_window`, and re-runs `core.check_for_updates` when raising an existing window so the menu gesture always produces a live check.
+**Settings, Library, Updates, and Record are singletons.** `AppGlobal.settings_window` / `AppGlobal.library_window` / `AppGlobal.updates_window` / `AppGlobal.record_window` (`Option<WindowHandle<Root>>`) cache the handles, and `OpenSettings` / `OpenLibrary` / `CheckForUpdates` / `OpenRecord` raise the existing window via `window.activate_window()` if it's still open (shared helper `try_focus_existing_singleton`, parameterized over the `AppGlobal` slot). Both open paths are **synchronous** (via `App::open_window`) so the cache is populated before the handler returns. Liveness is checked by matching the cached `WindowId` against `cx.windows()` (the authoritative live list) — borrowing Zed's pattern, except Zed can use `AnyWindowHandle::downcast::<SettingsWindow>` directly because their settings root is uniquely typed; ours is `gpui_component::Root` (shared with chat windows), so we match by id instead. A stale id self-heals on the next invocation — no `on_release` bookkeeping needed. `OpenLibrary` additionally calls `core.fetch_spaces` on every invocation (not just first open) so a long-lived Library window doesn't show a stale listing. `CheckForUpdates` follows the same singleton pattern via `AppGlobal.updates_window`, and re-runs `core.check_for_updates` when raising an existing window so the menu gesture always produces a live check.
 
 ## Updates window
 
@@ -148,12 +150,36 @@ User-initiated submit is a special case: `submit` always sets `pending_tail = tr
 
 Interactions: clicking a row opens the space (`open_space` defers `open_space_window` via `cx.defer` so the new window opens after the current update cycle); hovering a row (`hovered: Option<usize>` tracked via `on_hover`) reveals a ghost × button in a fixed-width slot (so its appearance doesn't shift the date column) that archives via `Core::archive_space` — which removes the cached row *immediately* (so the UI responds without a backend round-trip, and so stub-core tests exercise the local path) and then runs the real archive + re-fetch. The archive click calls `cx.stop_propagation()` so it doesn't also open the row. `archive` / `open_space` are public methods so behavior tests drive them directly instead of synthesizing mouse events; `set_hovered_for_test` exists for the hover snapshot.
 
+## Settings — calm two-pane, ⌥-revealed advanced
+
+`SettingsView` (620×520) is an `h_flex`: a narrow nav band (`NAV_WIDTH` 132px) on `theme.sidebar` with quiet text items (active = `sidebar_accent` pill), and the selected pane in the content column. Settings keeps **no raw-data dumps** — summaries link to the Record window.
+
+- **Scroll-width invariant (again).** The content pane's scroll container is a `v_flex().flex_1().h_full().min_w_0()` wrapping `div().id("settings-body").w_full().flex_1().overflow_y_scroll()`. Without the `w_full` on the scroll div, taffy content-sizes the pane: long lines refuse to wrap and rows shrink to content width (same failure mode as the chat transcript invariant).
+- **General**: the Base URL row shows the resolved value plus an honest source line — "Built-in pin" vs "Override — the built-in pin is …" with a one-click "Revert to pin" (`AppCore::clear_base_url_override`; `ConfigState` carries `base_url_pin` / `base_url_is_override`). Saving a value equal to the pin is treated as a revert. The **advanced rows** (attestation URL, domain separator, hardware CAs, trusted-measurements summary + Record link) render only while **⌥ is held**: the pane root registers `.on_modifiers_changed` (gpui registers element modifier listeners window-wide during paint — no focus-path requirement) and mirrors `event.modifiers.alt` into `GeneralView::set_advanced`. A one-line italic hint discloses the affordance at rest. The measurements row never shows hex — it links to the Record via `window.dispatch_action(Box::new(OpenRecord), cx)`.
+- **Account**: balance + pools (humanized future expiries, `humanize_expiry`), plans via the shared `plans::plan_rows` with the same checkout flow as onboarding (`Core::account_checkout` static helper, view-owned pending state), and Reset behind a **two-step inline confirm** (`request_reset` → armed warning + "Reset account" / "Keep account"; no modal). The manual allocate-credits input was removed — app-core auto-provisions credentials from balance, so it no longer justified its row.
+- **Wallet**: one history listing from `Core.credential_lifecycle` (via `Core::fetch_wallet` → `AppCore::wallet_lifecycle`, the local `credential_lifecycle` view): active / in flight (warning color, recoverable) / spent / expired (muted). "Recover in-flight" appears only when something is actually in flight.
+
+## The Record window — the trust door's engine room
+
+`record.rs` (`RecordView`, singleton, ⇧⌘L / File → "Record…", 860×640) exposes the raw local Turso trail. Three sections in a quiet text strip that doubles as the title bar (`STRIP_LEFT_PAD` 80px clears the traffic lights; right side carries a Refresh affordance and an italic "The Record" wordmark):
+
+- **Attestations** — `attestation` rows (middle-truncated hash, pcr digest, connection count, doc size, UTC timestamp). Click → the full raw document: pretty-printed JSON when it parses, UTF-8 text, hex otherwise.
+- **Requests** — `request` ⋈ `connection` rows (mono `METHOD /path`, status colored by outcome, transport/duration/attempt/credential/error subline). Click → full detail: kv rows (the attestation hash links through to its attestation detail) + raw request/response headers and bodies.
+- **Spending** — the `spend_trail` view grouped by credential (consecutive same-nonce rows share a group header with held/charged amounts; rows are time-ordered so the grouping matches reality). Rows click through to the request detail.
+
+Mechanics worth knowing:
+
+- **Windowed fetch.** `Listing<T>` per section; each page asks app-core for `PAGE+1 = 51` rows (`LIMIT/OFFSET`) to learn `has_more` without a COUNT. "Load more…" appends. Data flows through static `Core` oneshot helpers (`Core::list_attestations` / `list_requests` / `spend_trail` / `attestation_detail` / `request_detail`) so the view owns its loading state and is never `busy`-debounced. Stub cores skip the fetch; tests install rows via `set_*_for_test`.
+- **Raw payloads are never redacted** (the user's own traffic on their own machine). Inline rendering is capped at 64 KiB with an honest note; the per-section **Copy** affordance always writes the *full* payload to the clipboard. Raw text renders selectable through `TextView::markdown` inside a code fence whose backtick run is computed to exceed any run in the content (`fenced`); the `TextViewStyle` mirrors `theme.mode.is_dark()` so the block ground tracks Circadian night.
+- **Mono is for data, the UI font is for chrome** — `mono()` (Menlo 12/13px) wraps every hash, nonce, path, and payload; labels, timestamps and empty states stay in Newsreader. Timestamps are UTC and say so (`fmt_utc`, Hinnant `civil_from_days` — no chrono dependency).
+
 ## Edge-to-edge titlebar
 
 `transparent_titlebar()` returns `TitlebarOptions { appears_transparent: true, title: None, traffic_light_position: Some(point(14, 11)) }`. macOS extends the content view under the traffic-light buttons and stops painting a separate titlebar background. Each view leaves room at the top so the lights don't land on real UI:
 
 - **`chat::TITLE_BAR_RESERVE`** (36px on macOS): vertical reserve, plus a `theme.background → transparent` linear-gradient overlay (`ChatView::render_title_bar`) painted absolutely over the scroll area. Messages scrolling up under the band fade smoothly into the chrome instead of clipping at a hard edge. The band also hosts the ⌥-revealed model label and the anchored picker panel (see [Model picker](#model-picker--option-revealed)).
-- **`settings::TAB_STRIP_LEFT_PAD`** (80px on macOS): horizontal pad on the tab strip. The tab row doubles as the title bar — the lights live to its left on a shared `theme.background` band. 80px matches gpui-component's own `TITLE_BAR_LEFT_PADDING`.
+- **`settings::NAV_TOP_RESERVE`** (44px on macOS): the traffic lights sit over the sidebar nav band, so the band's first item starts below them.
+- **`record::STRIP_LEFT_PAD`** (80px on macOS): horizontal pad on the Record's section strip, which doubles as the title bar — the lights live to its left. 80px matches gpui-component's own `TITLE_BAR_LEFT_PADDING`.
 
 ## macOS UX — menus, keybindings, action dispatch
 
@@ -162,7 +188,7 @@ All wired in `src/lib.rs::install_menus`, `install_keybindings`, `install_action
 ### Menus (`cx.set_menus`)
 
 - **Eidola**: About / Check for Updates… / Settings… / Hide / Hide Others / Show All / Quit
-- **File**: New Space / Library… / Close Window
+- **File**: New Space / Library… / Record… / Close Window
 - **Edit**: Undo / Redo / Cut / Copy / Paste / Select All — Cut/Copy/Paste/Select All declared via `MenuItem::os_action(_, _, OsAction::*)` so they bind to the standard macOS selectors `cut:` / `copy:` / `paste:` / `selectAll:` and route through the responder chain to whatever has focus
 - **Window**: Minimize / Zoom
 
@@ -172,7 +198,7 @@ All wired in `src/lib.rs::install_menus`, `install_keybindings`, `install_action
 
 ### Keybindings (`cx.bind_keys`)
 
-⌘, (Settings), ⌘N (NewSpace), ⌘L (OpenLibrary), ⌘W (CloseWindow), ⌘Q (Quit), ⌘H (Hide), ⌥⌘H (HideOthers), ⌘M (Minimize), plus two `ChatView`-context bindings: ⌘↩ (`Send`) and ⌥⌘M (`ToggleModelPicker` — distinct keystroke from the global ⌘M, so no conflict).
+⌘, (Settings), ⌘N (NewSpace), ⌘L (OpenLibrary), ⇧⌘L (OpenRecord), ⌘W (CloseWindow), ⌘Q (Quit), ⌘H (Hide), ⌥⌘H (HideOthers), ⌘M (Minimize), plus two `ChatView`-context bindings: ⌘↩ (`Send`) and ⌥⌘M (`ToggleModelPicker` — distinct keystroke from the global ⌘M, so no conflict).
 
 ### Ordering invariant
 

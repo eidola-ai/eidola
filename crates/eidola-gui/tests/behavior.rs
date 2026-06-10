@@ -15,11 +15,15 @@ use eidola_app_core::updates::{
     Claim, ClaimDelta, ClaimsComparison, UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease,
 };
 use eidola_app_core::{
-    BalancesResult, ConfigState, CredentialInfo, ModelInfo, PriceInfo, SpaceInfo, SpaceMessage,
+    AttestationDetail, AttestationInfo, BalancesResult, ConfigState, CredentialInfo, ModelInfo,
+    PriceInfo, RequestInfo, SpaceInfo, SpaceMessage,
 };
+use eidola_gui::account::AccountView;
 use eidola_gui::chat::{ChatView, OnboardingStage, Send, ToggleModelPicker};
 use eidola_gui::core::Core;
 use eidola_gui::library::LibraryView;
+use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
+use eidola_gui::settings::{SettingsPane, SettingsView};
 use eidola_gui::updates::{UpdatesDisplay, UpdatesView, relative_time};
 use eidola_gui::wallet::WalletView;
 use gpui::{
@@ -1155,6 +1159,211 @@ fn relative_time_buckets(cx: &mut TestAppContext) {
 }
 
 // ---------------------------------------------------------------------------
+// Settings — two-pane nav, option reveal, reset confirm
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn settings_nav_switches_panes(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(core.clone(), window, cx))
+    });
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.selected(),
+            SettingsPane::General,
+            "General is the resting pane"
+        );
+    });
+
+    view.update(cx, |v, cx| v.select(SettingsPane::Wallet, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Wallet));
+
+    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Account));
+}
+
+#[gpui::test]
+fn general_option_reveal_tracks_modifier_state(cx: &mut TestAppContext) {
+    // The advanced rows appear only while ⌥ is held. The pane's root
+    // registers `on_modifiers_changed`, which calls `set_advanced` with the
+    // live alt state — this drives the same method.
+    let core = stub_core_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(core.clone(), window, cx))
+    });
+
+    let general = view.read_with(cx, |v, _| v.general());
+    general.read_with(cx, |g, _| {
+        assert!(!g.advanced(), "advanced section is hidden at rest");
+    });
+
+    general.update(cx, |g, cx| g.set_advanced(true, cx));
+    general.read_with(cx, |g, _| assert!(g.advanced()));
+
+    // Releasing ⌥ hides it again.
+    general.update(cx, |g, cx| g.set_advanced(false, cx));
+    general.read_with(cx, |g, _| assert!(!g.advanced()));
+}
+
+#[gpui::test]
+fn account_reset_requires_two_steps(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(core.clone(), window, cx))
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| assert!(!v.reset_armed()));
+
+    // First click arms; nothing is reset yet.
+    view.update(cx, |v, cx| v.request_reset(cx));
+    view.read_with(cx, |v, _| assert!(v.reset_armed()));
+    core.read_with(cx, |c, _| {
+        assert!(
+            c.config_state.as_ref().unwrap().has_account,
+            "arming must not reset anything"
+        );
+    });
+
+    // Cancel disarms.
+    view.update(cx, |v, cx| v.cancel_reset(cx));
+    view.read_with(cx, |v, _| assert!(!v.reset_armed()));
+
+    // Confirm without arming is a no-op guard; arm + confirm goes through
+    // (stub core: `reset_account` early-returns after the local mutation).
+    view.update(cx, |v, cx| v.confirm_reset(cx));
+    view.read_with(cx, |v, _| assert!(!v.reset_armed()));
+    view.update(cx, |v, cx| {
+        v.request_reset(cx);
+        v.confirm_reset(cx);
+    });
+    view.read_with(cx, |v, _| assert!(!v.reset_armed()));
+}
+
+// ---------------------------------------------------------------------------
+// Record window
+// ---------------------------------------------------------------------------
+
+fn stub_attestation(hash: &str, ts: i64) -> AttestationInfo {
+    AttestationInfo {
+        hash: hash.into(),
+        pcr_digest: Some("pcr-abc".into()),
+        created_at: ts,
+        doc_bytes: 2_048,
+        connection_count: 3,
+    }
+}
+
+fn stub_request(id: &str, ts: i64) -> RequestInfo {
+    RequestInfo {
+        id: id.into(),
+        method: "POST".into(),
+        path: "/v1/chat/completions".into(),
+        response_status: Some(200),
+        duration_ms: Some(742),
+        request_at: ts,
+        error: None,
+        attempt_number: 1,
+        credential_nonce: Some("nonce-1".into()),
+        transport: Some("clearnet".into()),
+        base_url: Some("https://eidola.example".into()),
+        attestation_hash: Some("att-1".into()),
+    }
+}
+
+#[gpui::test]
+fn record_section_switching(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(core.clone(), window, cx))
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.section(),
+            RecordSection::Attestations,
+            "attestations first"
+        );
+        assert!(v.detail().is_none());
+    });
+
+    view.update(cx, |v, cx| v.select_section(RecordSection::Requests, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.section(), RecordSection::Requests));
+
+    view.update(cx, |v, cx| v.select_section(RecordSection::Spending, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.section(), RecordSection::Spending));
+}
+
+#[gpui::test]
+fn record_detail_open_and_close(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(core.clone(), window, cx))
+    });
+
+    view.update(cx, |v, _| {
+        v.set_requests_for_test(vec![stub_request("req-1", 1_000)], false);
+    });
+
+    // Clicking a row starts the detail fetch. With a stub core there is no
+    // backend, so the observable transition is the pending marker — the
+    // same up-to-the-backend-guard pattern the chat submit tests use.
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Requests, cx);
+        v.open_request("req-1".into(), cx);
+    });
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.detail_pending(), Some("req-1"));
+        assert!(v.detail().is_none());
+    });
+
+    // The fetch landing installs the detail (simulated via the test setter).
+    view.update(cx, |v, _| {
+        v.set_detail_for_test(Some(RecordDetail::Attestation(AttestationDetail {
+            hash: "att-1".into(),
+            pcr_digest: None,
+            created_at: 1_000,
+            doc: b"{\"v\":1}".to_vec(),
+        })));
+    });
+    view.read_with(cx, |v, _| {
+        assert!(v.detail().is_some());
+        assert!(v.detail_pending().is_none());
+    });
+
+    // Back returns to the listing; switching sections also closes detail.
+    view.update(cx, |v, cx| v.close_detail(cx));
+    view.read_with(cx, |v, _| assert!(v.detail().is_none()));
+}
+
+#[gpui::test]
+fn record_renders_stubbed_rows_without_backend(cx: &mut TestAppContext) {
+    let core = stub_core_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(core.clone(), window, cx))
+    });
+
+    view.update(cx, |v, cx| {
+        v.set_attestations_for_test(
+            vec![stub_attestation("a1", 2_000), stub_attestation("a2", 1_000)],
+            true,
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Rows installed by the setter must survive render (construction's
+    // fetch is a no-op on a stub core).
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.section(), RecordSection::Attestations);
+        assert!(v.detail().is_none());
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1162,10 +1371,13 @@ fn config_state(has_account: bool) -> ConfigState {
     ConfigState {
         base_url: "https://eidola.example/v1".into(),
         default_model: "gemma4-31b".into(),
+        base_url_pin: "https://eidola.example/v1".into(),
+        base_url_is_override: false,
         has_account,
         has_account_secret: has_account,
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
         trusted_measurements: Vec::new(),
+        trusted_measurements_are_override: false,
         has_hardware_root_ca: false,
         has_hardware_intermediate_ca: false,
         attestation_url: None,
