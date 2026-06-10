@@ -1,8 +1,7 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{ChatStreamEvent, ModelInfo, SpaceMessage};
+use eidola_app_core::{ModelInfo, SpaceMessage};
 use gpui::{
     AppContext, AsyncApp, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, ModifiersChangedEvent, ParentElement, Render, SharedString,
@@ -21,8 +20,11 @@ use gpui_component::{
 use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownStyle};
 
 use crate::actions::CloseWindow;
-use crate::bridge;
 use crate::plans::format_credits;
+// Re-exported for the chat surface's consumers (tests construct
+// `StreamingResponse` / read `ChatMessageView` through `eidola_gui::chat`).
+pub use crate::space::{ChatMessageView, StreamingResponse};
+use crate::space::{Space, SpaceEvent};
 use crate::stores::{AccountStore, ConfigStore, ModelsStore, Stores, WalletStore};
 
 /// Vertical space reserved at the top of the window for the macOS traffic
@@ -53,45 +55,6 @@ actions!(
         ToggleModelPicker
     ]
 );
-
-/// In-flight assistant response. While this is `Some(...)`, the chat is
-/// streaming — `reasoning` and `content` grow as deltas arrive. On
-/// completion the streaming response is dropped; the captured reasoning
-/// is moved onto the just-finalized assistant entry in `messages` so the
-/// disclosure remains available after the stream ends.
-#[derive(Default, Clone)]
-pub struct StreamingResponse {
-    pub reasoning: String,
-    pub content: String,
-    /// Whether the reasoning disclosure is open. Independent of whether
-    /// reasoning has any content yet.
-    pub expanded: bool,
-    /// In-stream error: stream produced something the user should see,
-    /// but the request as a whole has not necessarily failed.
-    pub error: Option<String>,
-}
-
-/// A single rendered chat row: the persisted message plus any reasoning
-/// captured for it during streaming. Reasoning is ephemeral session
-/// state — the local DB stores only the assistant's final content — so
-/// older messages from a re-loaded space carry `reasoning = None`. New
-/// assistant messages adopt whatever reasoning was streaming at finalize.
-#[derive(Clone)]
-pub struct ChatMessageView {
-    pub message: SpaceMessage,
-    pub reasoning: Option<String>,
-    pub reasoning_expanded: bool,
-}
-
-impl ChatMessageView {
-    pub fn new(message: SpaceMessage) -> Self {
-        Self {
-            message,
-            reasoning: None,
-            reasoning_expanded: false,
-        }
-    }
-}
 
 /// The chat window's onboarding stage, derived each render from the shared
 /// `Core` snapshots plus the view's local state. See
@@ -143,27 +106,29 @@ pub struct OnboardingFlow {
 
 pub struct ChatView {
     /// The store bundle — held whole because the chat surface reads several
-    /// domains (config, models, account, wallet) and owns chat streaming via
-    /// the `bridge` free functions (which take the bundle's `Arc<AppCore>`).
+    /// domains (config, models, account, wallet) and opens spaces through the
+    /// `SpacesStore` registry.
     stores: Stores,
     config: Entity<ConfigStore>,
     models: Entity<ModelsStore>,
     account: Entity<AccountStore>,
     wallet: Entity<WalletStore>,
+    /// The shared per-conversation domain entity. Owns the transcript,
+    /// streaming buffers, the submit runner, and the per-space model
+    /// selection — two windows on the same space hold the *same* `Space`, so
+    /// a submit/stream in one appears in the other (wave-2 bug 4). `ChatView`
+    /// is a window-local lens over it.
+    space: Entity<Space>,
     /// WYSIWYG markdown composer (`gpui-markdown-editor`). The user types
     /// here in styled-markdown view; on submit we read `state.markdown` and
-    /// send the raw source upstream.
+    /// send the raw source upstream. The composer draft is **window-local by
+    /// design** — two windows on one space are two cursors with two drafts
+    /// (see `docs/architecture/state.md`).
     prompt_editor: Entity<MarkdownEditor>,
-    space_id: Option<String>,
-    /// Conversation history shown in the scroll view. `pub` so snapshot tests
-    /// can render the view in a populated state without driving async chat.
-    pub messages: Vec<ChatMessageView>,
-    /// Bumped whenever local chat state moves ahead of an initial reload.
-    /// Reopened-space loads capture this value and only apply if it still
-    /// matches, so a slow initial load cannot hide a newly submitted exchange.
-    transcript_generation: u64,
-    /// In-flight streaming assistant response, or `None` when idle.
-    pub streaming: Option<StreamingResponse>,
+    /// The error band shown below the transcript. Window-local: set from the
+    /// space's `SpaceEvent::Failed` (and a transcript-load failure), so each
+    /// window can surface its own last-submit error and its own degraded
+    /// onboarding state.
     error: Option<String>,
     /// Onboarding flow state (welcome → plans → ready).
     onboarding: OnboardingFlow,
@@ -179,16 +144,6 @@ pub struct ChatView {
     /// revealed label). The label stays revealed while the picker is open
     /// so the picker keeps its visual anchor after ⌥ is released.
     model_picker_open: bool,
-    /// This window's explicit model choice. `None` means "follow the
-    /// config default" (`ConfigState::default_model`); new windows start
-    /// here. Selection applies to subsequent sends only — a switch during
-    /// streaming never hot-swaps the in-flight request.
-    selected_model: Option<String>,
-    /// The model id actually handed to the last `chat_stream` call (set on
-    /// every submit, including stub-core submits, *before* the backend
-    /// guard). Behavior tests assert against this to prove the picker's
-    /// selection is what a send really uses.
-    last_submitted_model: Option<String>,
 
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -209,27 +164,54 @@ impl ChatView {
         self.prompt_editor.clone()
     }
 
-    /// Test-only setter for snapshot tests. Wraps each `SpaceMessage`
-    /// into a `ChatMessageView` with `reasoning = None`.
+    /// The shared `Space` entity this window is a lens over.
+    pub fn space(&self) -> &Entity<Space> {
+        &self.space
+    }
+
+    /// The transcript rows, read from the shared `Space`.
+    pub fn messages(&self, cx: &gpui::App) -> Vec<ChatMessageView> {
+        self.space.read(cx).messages().to_vec()
+    }
+
+    /// The current streaming response, read from the shared `Space`.
+    pub fn streaming(&self, cx: &gpui::App) -> Option<StreamingResponse> {
+        self.space.read(cx).streaming().cloned()
+    }
+
+    /// Test-only setter for snapshot tests. Writes the transcript into the
+    /// shared `Space`.
     #[doc(hidden)]
-    pub fn set_messages_for_test(&mut self, messages: Vec<SpaceMessage>) {
-        self.messages = messages.into_iter().map(ChatMessageView::new).collect();
+    pub fn set_messages_for_test(&mut self, messages: Vec<SpaceMessage>, cx: &mut Context<Self>) {
+        self.space
+            .update(cx, |s, cx| s.set_messages_for_test(messages, cx));
     }
 
     /// Test-only: attach reasoning to the message at `idx`, optionally
     /// expanded. Use after `set_messages_for_test`.
     #[doc(hidden)]
-    pub fn set_reasoning_for_test(&mut self, idx: usize, reasoning: String, expanded: bool) {
-        if let Some(entry) = self.messages.get_mut(idx) {
-            entry.reasoning = Some(reasoning);
-            entry.reasoning_expanded = expanded;
-        }
+    pub fn set_reasoning_for_test(
+        &mut self,
+        idx: usize,
+        reasoning: String,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.space.update(cx, |s, cx| {
+            s.set_reasoning_for_test(idx, reasoning, expanded, cx)
+        });
     }
 
-    /// Test-only setter for snapshot tests.
+    /// Test-only setter for snapshot tests. Writes the streaming state into
+    /// the shared `Space`.
     #[doc(hidden)]
-    pub fn set_streaming_for_test(&mut self, streaming: Option<StreamingResponse>) {
-        self.streaming = streaming;
+    pub fn set_streaming_for_test(
+        &mut self,
+        streaming: Option<StreamingResponse>,
+        cx: &mut Context<Self>,
+    ) {
+        self.space
+            .update(cx, |s, cx| s.set_streaming_for_test(streaming, cx));
     }
 
     /// Read access to the onboarding flow state, for behavior tests.
@@ -251,32 +233,22 @@ impl ChatView {
         self.error = error;
     }
 
-    /// Test-only: simulate completion of the initial reopened-space load.
-    #[doc(hidden)]
-    pub fn merge_initial_messages_for_test(
-        &mut self,
-        load_generation: u64,
-        messages: Vec<SpaceMessage>,
-    ) -> bool {
-        self.merge_initial_messages_from_db(load_generation, messages)
-    }
-
     /// The space this window is writing into, if one has been assigned —
     /// either passed at construction (opened from the Library) or set when
-    /// the first exchange creates a space.
-    pub fn space_id(&self) -> Option<&str> {
-        self.space_id.as_deref()
+    /// the first exchange creates a space. Reads through the shared `Space`.
+    pub fn space_id(&self, cx: &gpui::App) -> Option<String> {
+        self.space.read(cx).id().map(str::to_string)
     }
 
     // -- Model picker state -------------------------------------------------
 
-    /// The model the next send will use: this window's explicit selection
-    /// if the user picked one, otherwise the config default
+    /// The model the next send will use: the space's explicit selection if the
+    /// user picked one, otherwise the config default
     /// (`ConfigState::default_model`), otherwise the embedded fallback
     /// (stub cores in tests have no config snapshot).
     pub fn current_model(&self, cx: &gpui::App) -> String {
-        if let Some(model) = self.selected_model.as_ref() {
-            return model.clone();
+        if let Some(model) = self.space.read(cx).selected_model() {
+            return model.to_string();
         }
         self.config
             .read(cx)
@@ -296,14 +268,17 @@ impl ChatView {
         self.model_picker_open
     }
 
-    /// This window's explicit model selection, if any.
-    pub fn selected_model(&self) -> Option<&str> {
-        self.selected_model.as_deref()
+    /// The space's explicit model selection, if any.
+    pub fn selected_model(&self, cx: &gpui::App) -> Option<String> {
+        self.space.read(cx).selected_model().map(str::to_string)
     }
 
-    /// The model id handed to the most recent submit (see field docs).
-    pub fn last_submitted_model(&self) -> Option<&str> {
-        self.last_submitted_model.as_deref()
+    /// The model id handed to the most recent submit (read from the space).
+    pub fn last_submitted_model(&self, cx: &gpui::App) -> Option<String> {
+        self.space
+            .read(cx)
+            .last_submitted_model()
+            .map(str::to_string)
     }
 
     /// Track ⌥ for the title-bar reveal. Registered on the root element via
@@ -326,11 +301,12 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Choose the model for this window's subsequent sends and close the
+    /// Choose the model for this space's subsequent sends and close the
     /// picker. A switch while a response is streaming applies to the *next*
-    /// send — the in-flight request is never hot-swapped.
+    /// send — the in-flight request is never hot-swapped (the selection lives
+    /// on the shared `Space`, so both windows see the change).
     pub fn select_model(&mut self, id: String, cx: &mut Context<Self>) {
-        self.selected_model = Some(id);
+        self.space.update(cx, |s, cx| s.select_model(id, cx));
         self.model_picker_open = false;
         cx.notify();
     }
@@ -404,6 +380,18 @@ impl ChatView {
         let models = stores.models.clone();
         let account = stores.account.clone();
         let wallet = stores.wallet.clone();
+        let spaces = stores.spaces.clone();
+
+        // Get-or-create the shared `Space` entity through the registry.
+        // `Some(id)` joins (or creates) the entity for an existing space — and
+        // kicks off the one transcript load; a second window opening the same
+        // id shares this entity (and its single load), which is the wave-2
+        // bug-4 fix. `None` mints a blank space (⌘N) that stays instant and is
+        // adopted into the registry once its first exchange assigns an id.
+        let space = match space_id {
+            Some(id) => spaces.update(cx, |s, cx| s.open(id, cx)),
+            None => spaces.update(cx, |s, cx| s.blank(cx)),
+        };
 
         // Onboarding inputs: when an account exists, the stage machine needs
         // a balance snapshot and the active-credential list. The model list
@@ -423,7 +411,11 @@ impl ChatView {
 
         // Re-render when the stores the onboarding stage depends on change,
         // and lazily fetch the plans data the first time the derived stage
-        // lands on `Plans`.
+        // lands on `Plans`. The `Space` gets both a plain `observe` (re-render
+        // on any change — transcript reloads, streaming deltas) and a
+        // semantic `subscribe` (`SpaceEvent`): tail-scroll keys off
+        // `StreamDelta`, and a failed submit (`Failed`) routes the degraded
+        // onboarding state, both window-local concerns.
         let _subscriptions = vec![
             cx.observe(&config, |this: &mut Self, _, cx| {
                 this.maybe_fetch_plans_data(cx);
@@ -438,39 +430,9 @@ impl ChatView {
                 this.maybe_fetch_plans_data(cx);
                 cx.notify();
             }),
+            cx.observe(&space, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&space, window, Self::on_space_event),
         ];
-
-        // Reopening an existing space: load its persisted messages in the
-        // background, same bridge `spawn_stream` uses for its post-stream
-        // re-fetch. Stub stores (tests) skip the load — tests preload via
-        // `set_messages_for_test`.
-        if let Some(sid) = space_id.clone()
-            && let Some(app_core) = stores.app_core()
-        {
-            let load_generation = 0;
-            let msgs_rx = bridge::get_space_messages(app_core, sid);
-            cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
-                let msgs = msgs_rx.await.unwrap_or_else(|_| {
-                    Err(eidola_app_core::error::AppError::Internal {
-                        message: "fetch messages task cancelled".into(),
-                    })
-                });
-                let _ = this.update(cx, |this, cx| {
-                    match msgs {
-                        Ok(messages) => {
-                            this.merge_initial_messages_from_db(load_generation, messages);
-                        }
-                        Err(e) => {
-                            if this.transcript_generation == load_generation {
-                                this.error = Some(e.to_string());
-                            }
-                        }
-                    }
-                    cx.notify();
-                });
-            })
-            .detach();
-        }
 
         Self {
             stores,
@@ -478,20 +440,42 @@ impl ChatView {
             models,
             account,
             wallet,
+            space,
             prompt_editor,
-            space_id,
-            messages: Vec::new(),
-            transcript_generation: 0,
-            streaming: None,
             error: None,
             onboarding: OnboardingFlow::default(),
             show_plans_after_error: false,
             alt_held: false,
             model_picker_open: false,
-            selected_model: None,
-            last_submitted_model: None,
             focus_handle,
             _subscriptions,
+        }
+    }
+
+    /// React to a semantic `SpaceEvent` from the shared `Space`. Plain
+    /// re-render is handled by the sibling `observe`; here we handle the
+    /// window-local consequences: tail-scroll on a streaming delta and the
+    /// degraded-onboarding routing on a typed failure.
+    fn on_space_event(
+        &mut self,
+        _space: &Entity<Space>,
+        event: &SpaceEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SpaceEvent::StreamDelta => {
+                // Tail-scroll hook: the chat scroll surface is rebuilt each
+                // render, and there is no persistent scroll handle today, so a
+                // delta just needs a re-render to reflect the growing content.
+                cx.notify();
+            }
+            SpaceEvent::MessagesChanged | SpaceEvent::StreamEnded => {
+                cx.notify();
+            }
+            SpaceEvent::Failed(e) => {
+                self.apply_chat_failure(e.clone(), cx);
+            }
         }
     }
 
@@ -510,8 +494,9 @@ impl ChatView {
     /// `entered_plans` holds the flow on the plans page so it doesn't flash
     /// through the blank page.
     pub fn onboarding_stage(&self, cx: &gpui::App, composer_empty: bool) -> OnboardingStage {
-        if !self.messages.is_empty()
-            || self.streaming.is_some()
+        let space = self.space.read(cx);
+        if !space.messages().is_empty()
+            || space.is_streaming()
             || self.error.is_some()
             || !composer_empty
         {
@@ -726,11 +711,13 @@ impl ChatView {
         .detach();
     }
 
-    /// Route a failed chat submit. `InsufficientBalance` additionally
-    /// surfaces the plans list below the transcript via the error band —
-    /// typed routing, not string matching.
+    /// Route a failed chat submit. Called from the space's `SpaceEvent::Failed`
+    /// handler. `InsufficientBalance` additionally surfaces the plans list
+    /// below the transcript via the error band — typed routing, not string
+    /// matching. The streaming state itself is cleared by the `Space` (it owns
+    /// it); this method only sets the *window-local* error band + degraded
+    /// onboarding presentation.
     pub fn apply_chat_failure(&mut self, e: AppError, cx: &mut Context<Self>) {
-        self.streaming = None;
         if matches!(e, AppError::InsufficientBalance { .. }) {
             self.show_plans_after_error = true;
             if !self.account.read(cx).prices().has_value() {
@@ -744,70 +731,11 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Replace `messages` with a fresh list from the DB, preserving any
-    /// previously-attached reasoning by index (we only ever append in
-    /// this view, so positions are stable) and attaching the just-
-    /// captured streaming reasoning to the new last assistant entry if
-    /// non-empty.
-    fn merge_initial_messages_from_db(
-        &mut self,
-        load_generation: u64,
-        messages: Vec<SpaceMessage>,
-    ) -> bool {
-        if self.transcript_generation != load_generation {
-            return false;
-        }
-        self.merge_messages_from_db(messages, None);
-        true
-    }
-
-    fn merge_messages_from_db(
-        &mut self,
-        new_messages: Vec<SpaceMessage>,
-        new_reasoning: Option<String>,
-    ) {
-        let mut next: Vec<ChatMessageView> = new_messages
-            .into_iter()
-            .enumerate()
-            .map(|(idx, msg)| {
-                let prior = self.messages.get(idx);
-                let same_position = prior.is_some_and(|p| {
-                    p.message.role == msg.role && p.message.content == msg.content
-                });
-                ChatMessageView {
-                    message: msg,
-                    reasoning: if same_position {
-                        prior.and_then(|p| p.reasoning.clone())
-                    } else {
-                        None
-                    },
-                    reasoning_expanded: if same_position {
-                        prior.is_some_and(|p| p.reasoning_expanded)
-                    } else {
-                        false
-                    },
-                }
-            })
-            .collect();
-
-        if let Some(reasoning) = new_reasoning
-            && !reasoning.is_empty()
-        {
-            // Find the last assistant entry and attach the reasoning we
-            // captured during streaming.
-            if let Some(entry) = next
-                .iter_mut()
-                .rev()
-                .find(|e| e.message.role == "assistant")
-            {
-                entry.reasoning = Some(reasoning);
-            }
-        }
-        self.messages = next;
-    }
-
-    fn submit(&mut self, _: &Send, window: &mut Window, cx: &mut Context<Self>) {
-        if self.streaming.is_some() {
+    fn submit(&mut self, _: &Send, _window: &mut Window, cx: &mut Context<Self>) {
+        // Submit-during-streaming is a no-op (the current UX); the `Space`'s
+        // runner slot enforces this structurally, so we read it before
+        // touching the composer.
+        if self.space.read(cx).is_streaming() {
             return;
         }
 
@@ -822,101 +750,24 @@ impl ChatView {
             return;
         }
 
-        // Resolve the model at submit time (window selection → config
-        // default → embedded fallback) and record it before the backend
-        // guard so stub-core tests observe exactly what a real send would
-        // use. This is also the value persisted on the action row in the
-        // local DB — the transcript records what actually ran.
+        // Resolve the model at submit time (space selection → config default →
+        // embedded fallback). The `Space` records it before its own backend
+        // guard, so stub-core tests observe exactly what a real send would use.
         let model = self.current_model(cx);
-        self.last_submitted_model = Some(model.clone());
 
         self.prompt_editor.update(cx, |editor, cx| {
             editor.state = EditorState::default();
             cx.notify();
         });
-        self.transcript_generation = self.transcript_generation.wrapping_add(1);
-        self.messages.push(ChatMessageView::new(SpaceMessage {
-            role: "user".to_string(),
-            content: prompt.clone(),
-        }));
-        self.streaming = Some(StreamingResponse::default());
+        // Clear the window-local error band on a fresh submit. The transcript
+        // append + streaming entry + the streaming runner all live on the
+        // shared `Space`, so a second window on the same space sees them too.
         self.error = None;
         self.show_plans_after_error = false;
+        self.space.update(cx, |s, cx| {
+            s.submit(prompt, model, cx);
+        });
         cx.notify();
-
-        let Some(app_core) = self.stores.app_core() else {
-            // Stub stores (behavior tests): the local state update above has
-            // already happened; without a real backend there is nothing more
-            // to do.
-            return;
-        };
-        let space_id = self.space_id.clone();
-
-        self.spawn_stream(app_core, prompt, model, space_id, window, cx);
-    }
-
-    /// Drive a streaming chat request from gpui's main thread.
-    fn spawn_stream(
-        &mut self,
-        app_core: Arc<eidola_app_core::AppCore>,
-        prompt: String,
-        model: String,
-        space_id: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (mut event_rx, done_rx) =
-            bridge::chat_stream(app_core.clone(), prompt, model, space_id);
-
-        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
-            while let Some(event) = event_rx.recv().await {
-                let _ = this.update(cx, |this, cx| {
-                    if let Some(s) = this.streaming.as_mut() {
-                        match event {
-                            ChatStreamEvent::ReasoningDelta(d) => s.reasoning.push_str(&d),
-                            ChatStreamEvent::ContentDelta(d) => s.content.push_str(&d),
-                        }
-                    }
-                    cx.notify();
-                });
-            }
-
-            let outcome = done_rx.await.unwrap_or_else(|_| {
-                Err(eidola_app_core::error::AppError::Internal {
-                    message: "chat task cancelled".into(),
-                })
-            });
-
-            match outcome {
-                Ok(result) => {
-                    let msgs_rx = bridge::get_space_messages(app_core, result.space_id.clone());
-                    let msgs = msgs_rx.await.unwrap_or_else(|_| {
-                        Err(eidola_app_core::error::AppError::Internal {
-                            message: "fetch messages task cancelled".into(),
-                        })
-                    });
-                    let _ = this.update(cx, |this, cx| {
-                        let captured_reasoning =
-                            this.streaming.as_ref().map(|s| s.reasoning.clone());
-                        this.streaming = None;
-                        this.space_id = Some(result.space_id);
-                        match msgs {
-                            Ok(messages) => {
-                                this.merge_messages_from_db(messages, captured_reasoning)
-                            }
-                            Err(e) => this.error = Some(e.to_string()),
-                        }
-                        cx.notify();
-                    });
-                }
-                Err(e) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.apply_chat_failure(e, cx);
-                    });
-                }
-            }
-        })
-        .detach();
     }
 }
 
@@ -973,11 +824,18 @@ impl ChatView {
         // feel of long-form note tools.
         let composer_pb = window.viewport_size().height * 0.5;
 
+        // The transcript + streaming state live on the shared `Space`; read
+        // them once here. (Two windows on the same space render from the same
+        // entity, so a submit/stream in one appears in both.)
+        let space = self.space.read(cx);
+        let messages = space.messages();
+        let streaming = space.streaming().cloned();
+
         // pt(TITLE_BAR_RESERVE) handles the leading edge under the
         // traffic lights. No trailing pb on the column itself: the
         // composer's own pb (above) carries the bottom breath.
         let mut messages_col = v_flex().w_full().gap_0().pt(TITLE_BAR_RESERVE);
-        for (idx, entry) in self.messages.iter().enumerate() {
+        for (idx, entry) in messages.iter().enumerate() {
             let msg = &entry.message;
 
             // Chapter delimiter — a hairline rule + italic participant
@@ -1040,10 +898,9 @@ impl ChatView {
                                     .icon(chevron)
                                     .label(SharedString::from("Thinking"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(entry) = this.messages.get_mut(idx) {
-                                            entry.reasoning_expanded = !entry.reasoning_expanded;
-                                            cx.notify();
-                                        }
+                                        this.space.update(cx, |s, cx| {
+                                            s.toggle_message_reasoning(idx, cx);
+                                        });
                                     })),
                             ),
                         ),
@@ -1075,7 +932,7 @@ impl ChatView {
             messages_col = messages_col.child(row);
         }
 
-        if let Some(s) = self.streaming.as_ref() {
+        if let Some(s) = streaming.as_ref() {
             let fg = theme.foreground;
             let muted_fg = theme.muted_foreground;
             let danger = theme.danger;
@@ -1113,10 +970,9 @@ impl ChatView {
                                     .icon(chevron)
                                     .label(SharedString::from("Thinking"))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(s) = this.streaming.as_mut() {
-                                            s.expanded = !s.expanded;
-                                            cx.notify();
-                                        }
+                                        this.space.update(cx, |s, cx| {
+                                            s.toggle_streaming_reasoning(cx);
+                                        });
                                     })),
                             ),
                         ),
@@ -1239,8 +1095,7 @@ impl ChatView {
         // height and the user couldn't click back into it after losing
         // focus). The floor matches one body line at the prose line-
         // height ratio so it doesn't visually grow once content arrives.
-        let has_preceding =
-            !self.messages.is_empty() || self.streaming.is_some() || self.error.is_some();
+        let has_preceding = !messages.is_empty() || streaming.is_some() || self.error.is_some();
         if has_preceding {
             messages_col = messages_col.child(chapter_delim(
                 participant_label("user"),

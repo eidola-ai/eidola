@@ -245,9 +245,15 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
         Change::SpaceIndex => {
             stores.spaces.update(cx, |s, cx| s.refresh(cx));
         }
-        // Per-space message changes are handled by the per-`Space` entity in
-        // step 3; the listing-level signal we react to is `SpaceIndex`.
-        Change::Space(_) => {}
+        // A per-space message change (e.g. a CLI write to the same space, in
+        // process) is routed to the live registered `Space` entity, which
+        // refreshes its own transcript. The listing-level signal is
+        // `SpaceIndex` (above).
+        Change::Space(id) => {
+            stores
+                .spaces
+                .update(cx, |s, cx| s.notify_space_changed(&id, cx));
+        }
         // Record listings are window-scoped reader entities (step 3); they
         // subscribe to mark themselves stale. No global store owns them.
         Change::Record => {}
