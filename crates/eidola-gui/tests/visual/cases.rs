@@ -378,7 +378,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_core_with_config(cx);
             let view = cx.new(|cx| {
-                let view = ChatView::new(core, window, cx);
+                let view = ChatView::new(core, None, window, cx);
                 view_with_messages(
                     view,
                     vec![SpaceMessage {

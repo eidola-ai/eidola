@@ -299,7 +299,7 @@ cargo build -p gpui-markdown-editor
 cargo test -p gpui-markdown-editor
 
 # visual snapshots (write goldens on first run, then compare)
-cargo test -p gpui-markdown-editor --test visual
+EIDOLA_RUN_VISUAL_TESTS=1 cargo test -p gpui-markdown-editor --test visual
 UPDATE_SNAPSHOTS=1 cargo test -p gpui-markdown-editor --test visual
 
 # demo binary

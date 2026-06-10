@@ -2,7 +2,8 @@
 //! `fn main()` executes on the macOS main thread (required by AppKit).
 //!
 //! Run:
-//! - `cargo test -p eidola-gui --test visual`        — verify against goldens
+//! - `EIDOLA_RUN_VISUAL_TESTS=1 cargo test -p eidola-gui --test visual`
+//!   — verify against goldens
 //! - `UPDATE_SNAPSHOTS=1 cargo test -p eidola-gui --test visual` — accept new
 //!
 //! Snapshots are written to `crates/eidola-gui/tests/snapshots/`.
@@ -15,9 +16,27 @@ mod visual {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    if !visual_tests_enabled() {
+        println!(
+            "visual snapshots skipped; set EIDOLA_RUN_VISUAL_TESTS=1 to render local snapshots"
+        );
+        return;
+    }
+
     let mut snapshots = visual::harness::Snapshots::new();
     visual::cases::register(&mut snapshots);
     snapshots.run_or_exit();
+}
+
+#[cfg(target_os = "macos")]
+fn visual_tests_enabled() -> bool {
+    matches!(
+        std::env::var("EIDOLA_RUN_VISUAL_TESTS").as_deref(),
+        Ok("1") | Ok("true")
+    ) || matches!(
+        std::env::var("UPDATE_SNAPSHOTS").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 // On non-macOS targets (e.g. CI's Linux clippy/test runner), the visual
