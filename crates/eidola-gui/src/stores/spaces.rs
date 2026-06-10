@@ -1,17 +1,24 @@
-//! `SpacesStore` — the Library index (the list of non-archived spaces).
+//! `SpacesStore` — the Library index (the list of non-archived spaces) **and**
+//! the per-space entity registry.
 //!
-//! Per `docs/architecture/state.md` this store will *also* hold the per-space
-//! entity registry (`HashMap<SpaceId, WeakEntity<Space>>`) once the `Space`
-//! entity lands — that is **step 3**, out of scope here. A placeholder field +
-//! doc comment marks the seam.
+//! Per `docs/architecture/state.md` ("Space entities — shared, registried"),
+//! this store holds `HashMap<SpaceId, WeakEntity<Space>>`. Opening a space goes
+//! through [`SpacesStore::open`], which gets-or-creates: two windows on the
+//! same space share **one** `Space` entity (and one transcript load), which is
+//! the structural fix for wave-2 bug 4 (a submit/stream in window A appears in
+//! window B). [`SpacesStore::blank`] mints an id-less space for ⌘N; the
+//! registry adopts it when its first exchange assigns an id (a subscriber on
+//! the space's `StreamEnded` event reads its now-present id and keys it).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use eidola_app_core::{AppCore, SpaceInfo};
-use gpui::{Context, Task};
+use gpui::{AppContext, Context, Entity, Subscription, Task, WeakEntity};
 
 use crate::bridge::bridge;
 use crate::loadable::Loadable;
+use crate::space::{Space, SpaceEvent};
 
 pub struct SpacesStore {
     app_core: Option<Arc<AppCore>>,
@@ -19,10 +26,14 @@ pub struct SpacesStore {
     index: Loadable<Vec<SpaceInfo>>,
     /// Supersede slot for the index refresh.
     task: Option<Task<()>>,
-    // STEP 3: the per-space entity registry lands here —
-    //   `registry: HashMap<SpaceId, WeakEntity<Space>>`
-    // with `open(space_id)` getting-or-creating, so two windows on one space
-    // share the same `Space` entity (fixes wave-2 bug 4). Not in scope now.
+    /// The per-space entity registry. `WeakEntity` so a dropped window's space
+    /// (with no other holder) is collected — `open` prunes dead weaks on miss.
+    registry: HashMap<String, WeakEntity<Space>>,
+    /// Spaces minted blank (⌘N) that have not yet been adopted into the
+    /// registry. Each is held as a weak handle + the subscription that watches
+    /// for its first id assignment. On `StreamEnded` the space's now-present
+    /// id is read and the entity is moved into `registry`.
+    pending_blanks: Vec<(WeakEntity<Space>, Subscription)>,
 }
 
 impl SpacesStore {
@@ -31,6 +42,8 @@ impl SpacesStore {
             app_core,
             index: Loadable::NotLoaded,
             task: None,
+            registry: HashMap::new(),
+            pending_blanks: Vec::new(),
         }
     }
 
@@ -44,6 +57,8 @@ impl SpacesStore {
                 Loadable::loaded(spaces)
             },
             task: None,
+            registry: HashMap::new(),
+            pending_blanks: Vec::new(),
         }
     }
 
@@ -56,6 +71,76 @@ impl SpacesStore {
     pub fn list(&self) -> &[SpaceInfo] {
         self.index.value().map(|v| v.as_slice()).unwrap_or(&[])
     }
+
+    // -- The space-entity registry ----------------------------------------
+
+    /// Open a space by id, getting-or-creating its shared `Space` entity.
+    ///
+    /// Join-existing: if a live entity is already registered for `id` (another
+    /// window opened it), the *same* `Entity<Space>` is returned — both
+    /// windows then observe one entity and one transcript load, so a
+    /// submit/stream in one appears in the other (wave-2 bug 4). A miss (no
+    /// entry, or a collected weak) creates a fresh `Space::existing`, which
+    /// kicks off the transcript load once; the second concurrent open joins
+    /// that same in-flight load by sharing the entity rather than starting a
+    /// duplicate fetch.
+    pub fn open(&mut self, id: String, cx: &mut Context<Self>) -> Entity<Space> {
+        if let Some(weak) = self.registry.get(&id)
+            && let Some(entity) = weak.upgrade()
+        {
+            return entity;
+        }
+        let app_core = self.app_core.clone();
+        let entity = cx.new(|cx| Space::existing(app_core, id.clone(), cx));
+        self.registry.insert(id, entity.downgrade());
+        entity
+    }
+
+    /// Mint a blank space for ⌘N: id-less, instant, no transcript load. The
+    /// registry adopts it once its first exchange persists and assigns an id
+    /// (watched via the space's `StreamEnded` event).
+    pub fn blank(&mut self, cx: &mut Context<Self>) -> Entity<Space> {
+        let app_core = self.app_core.clone();
+        let entity = cx.new(|_| Space::blank(app_core));
+        let weak = entity.downgrade();
+        // Watch for the first id assignment: `StreamEnded` only fires after a
+        // finalized exchange, at which point `Space::id()` is populated.
+        let sub = cx.subscribe(&entity, |this, space, event, cx| {
+            if let SpaceEvent::StreamEnded = event {
+                this.adopt_blank(&space, cx);
+            }
+        });
+        self.pending_blanks.push((weak, sub));
+        entity
+    }
+
+    /// Adopt a now-id'd blank space into the keyed registry, dropping the
+    /// pending-blank bookkeeping for it. Idempotent: re-adoption of an
+    /// already-registered id (e.g. multiple `StreamEnded`s) just refreshes the
+    /// weak handle.
+    fn adopt_blank(&mut self, space: &Entity<Space>, cx: &mut Context<Self>) {
+        let Some(id) = space.read(cx).id().map(str::to_string) else {
+            return;
+        };
+        self.registry.insert(id, space.downgrade());
+        // Drop the pending-blank entry (and its subscription) for this entity.
+        let target = space.downgrade();
+        self.pending_blanks
+            .retain(|(weak, _)| weak.entity_id() != target.entity_id());
+    }
+
+    /// React to a `Change::Space(id)` from the bus by telling the live
+    /// registered `Space` (if any) to refresh its transcript. Routed here from
+    /// `stores::dispatch_change`.
+    pub fn notify_space_changed(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(weak) = self.registry.get(id)
+            && let Some(entity) = weak.upgrade()
+        {
+            entity.update(cx, |space, cx| space.on_space_changed(id, cx));
+        }
+    }
+
+    // -- The Library index ------------------------------------------------
 
     /// Refresh the Library index. Fire-and-notify supersede slot.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {

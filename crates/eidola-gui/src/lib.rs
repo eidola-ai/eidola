@@ -11,6 +11,7 @@ pub mod loadable;
 mod plans;
 pub mod record;
 pub mod settings;
+pub mod space;
 pub mod stores;
 pub mod theme;
 pub mod updates;
