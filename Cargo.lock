@@ -2666,7 +2666,10 @@ dependencies = [
  "gpui-markdown-editor",
  "gpui_platform",
  "image",
+ "rustls",
+ "rustls-rustcrypto",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

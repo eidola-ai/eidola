@@ -13,13 +13,12 @@ use eidola_app_core::{
     PriceInfo, RequestDetail, RequestInfo, SpaceInfo, SpaceMessage, SpendTrailEntry,
 };
 use eidola_gui::chat::{ChatView, StreamingResponse};
-use eidola_gui::core::Core;
 use eidola_gui::library::LibraryView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
+use eidola_gui::stores::{Stores, StoresStub};
 use eidola_gui::updates::UpdatesView;
-use eidola_gui::wallet::WalletView;
-use gpui::{App, AppContext, Entity, px, size};
+use gpui::{App, AppContext, px, size};
 use gpui_markdown_editor::{EditorState, Selection};
 
 use super::harness::Snapshots;
@@ -38,12 +37,8 @@ pub fn register(s: &mut Snapshots) {
 // ---------------------------------------------------------------------------
 
 fn register_updates(s: &mut Snapshots) {
-    fn updates_core(cx: &mut App, setup: impl FnOnce(&mut Core)) -> Entity<Core> {
-        cx.new(|_| {
-            let mut c = Core::stub();
-            setup(&mut c);
-            c
-        })
+    fn updates_stores(cx: &mut App, setup: impl FnOnce(&mut StoresStub)) -> Stores {
+        stub_stores(cx, setup)
     }
 
     fn snapshot(result: UpdateCheckResult) -> UpdateCheckSnapshot {
@@ -71,12 +66,12 @@ fn register_updates(s: &mut Snapshots) {
     let sz = size(px(480.), px(360.));
 
     s.add("updates_checking", sz, |window, cx| {
-        let core = updates_core(cx, |c| c.update_checking = true);
+        let core = updates_stores(cx, |c| c.update_checking = true);
         cx.new(|cx| UpdatesView::new(core, window, cx))
     });
 
     s.add("updates_up_to_date", sz, move |window, cx| {
-        let core = updates_core(cx, |c| {
+        let core = updates_stores(cx, |c| {
             c.update_check = Some(snapshot(UpdateCheckResult::UpToDate {
                 latest_version: Some("0.1.0".into()),
             }));
@@ -85,7 +80,7 @@ fn register_updates(s: &mut Snapshots) {
     });
 
     s.add("updates_check_failed", sz, move |window, cx| {
-        let core = updates_core(cx, |c| {
+        let core = updates_stores(cx, |c| {
             c.update_check = Some(snapshot(UpdateCheckResult::CheckFailed {
                 message: "GET https://api.github.com/...: connection timed out".into(),
             }));
@@ -94,7 +89,7 @@ fn register_updates(s: &mut Snapshots) {
     });
 
     s.add("updates_available", sz, move |window, cx| {
-        let core = updates_core(cx, |c| {
+        let core = updates_stores(cx, |c| {
             c.update_check = Some(snapshot(UpdateCheckResult::UpdateAvailable {
                 release: release(false),
             }));
@@ -103,7 +98,7 @@ fn register_updates(s: &mut Snapshots) {
     });
 
     s.add("updates_unverifiable", sz, move |window, cx| {
-        let core = updates_core(cx, |c| {
+        let core = updates_stores(cx, |c| {
             c.update_check = Some(snapshot(UpdateCheckResult::Unverifiable {
                 version: "0.2.0".into(),
                 tag: "v0.2.0".into(),
@@ -119,7 +114,7 @@ fn register_updates(s: &mut Snapshots) {
         "updates_claims_changed",
         size(px(480.), px(440.)),
         move |window, cx| {
-            let core = updates_core(cx, |c| {
+            let core = updates_stores(cx, |c| {
                 c.update_check = Some(snapshot(UpdateCheckResult::ClaimsChanged {
                     release: release(false),
                     comparison: ClaimsComparison {
@@ -171,12 +166,10 @@ fn register_onboarding(s: &mut Snapshots) {
         "onboarding_welcome",
         size(px(705.), px(705.)),
         |window, cx| {
-            let core = cx.new(|_| {
-                let mut c = Core::stub();
-                c.config_state = Some(stub_config_state(false));
-                c
+            let stores = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(false));
             });
-            cx.new(|cx| ChatView::new(core, None, window, cx))
+            cx.new(|cx| ChatView::new(stores, None, window, cx))
         },
     );
 
@@ -185,17 +178,15 @@ fn register_onboarding(s: &mut Snapshots) {
         "onboarding_plans",
         size(px(705.), px(705.)),
         |window, cx| {
-            let core = cx.new(|_| {
-                let mut c = Core::stub();
-                c.config_state = Some(stub_config_state(true));
-                c.balances = Some(BalancesResult {
+            let stores = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(true));
+                s.balances = Some(BalancesResult {
                     available: 0,
                     pools: Vec::new(),
                 });
-                c.prices = stub_prices();
-                c
+                s.prices = stub_prices();
             });
-            cx.new(|cx| ChatView::new(core, None, window, cx))
+            cx.new(|cx| ChatView::new(stores, None, window, cx))
         },
     );
 
@@ -204,18 +195,16 @@ fn register_onboarding(s: &mut Snapshots) {
         "onboarding_plans_waiting",
         size(px(705.), px(705.)),
         |window, cx| {
-            let core = cx.new(|_| {
-                let mut c = Core::stub();
-                c.config_state = Some(stub_config_state(true));
-                c.balances = Some(BalancesResult {
+            let stores = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(true));
+                s.balances = Some(BalancesResult {
                     available: 0,
                     pools: Vec::new(),
                 });
-                c.prices = stub_prices();
-                c
+                s.prices = stub_prices();
             });
             cx.new(|cx| {
-                let mut view = ChatView::new(core, None, window, cx);
+                let mut view = ChatView::new(stores, None, window, cx);
                 view.onboarding_mut_for_test().awaiting_checkout = true;
                 view
             })
@@ -228,18 +217,16 @@ fn register_onboarding(s: &mut Snapshots) {
         "chat_insufficient_balance_plans",
         size(px(705.), px(705.)),
         |window, cx| {
-            let core = cx.new(|_| {
-                let mut c = Core::stub();
-                c.config_state = Some(stub_config_state(true));
-                c.balances = Some(BalancesResult {
+            let stores = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(true));
+                s.balances = Some(BalancesResult {
                     available: 100,
                     pools: Vec::new(),
                 });
-                c.prices = stub_prices();
-                c
+                s.prices = stub_prices();
             });
             cx.new(|cx| {
-                let mut view = ChatView::new(core, None, window, cx);
+                let mut view = ChatView::new(stores, None, window, cx);
                 view.set_messages_for_test(vec![SpaceMessage {
                     role: "user".into(),
                     content: "Can you summarize the attached design doc?".into(),
@@ -289,7 +276,7 @@ fn stub_prices() -> Vec<PriceInfo> {
 
 fn register_chat(s: &mut Snapshots) {
     s.add("chat_empty", size(px(900.), px(640.)), |window, cx| {
-        let core = stub_core_with_config(cx);
+        let core = stub_stores_with_config(cx);
         cx.new(|cx| ChatView::new(core, None, window, cx))
     });
 
@@ -302,7 +289,7 @@ fn register_chat(s: &mut Snapshots) {
         "chat_with_messages_narrow",
         size(px(480.), px(520.)),
         |window, cx| {
-            let core = stub_core_with_config(cx);
+            let core = stub_stores_with_config(cx);
             cx.new(|cx| {
                 let view = ChatView::new(core, None, window, cx);
                 view_with_messages(
@@ -339,7 +326,7 @@ fn register_chat(s: &mut Snapshots) {
         "chat_with_messages_breakpoint",
         size(px(680.), px(640.)),
         |window, cx| {
-            let core = stub_core_with_config(cx);
+            let core = stub_stores_with_config(cx);
             cx.new(|cx| {
                 let view = ChatView::new(core, None, window, cx);
                 view_with_messages(
@@ -370,7 +357,7 @@ fn register_chat(s: &mut Snapshots) {
         "chat_with_messages_live",
         size(px(1400.), px(1000.)),
         |window, cx| {
-            let core = stub_core_with_config(cx);
+            let core = stub_stores_with_config(cx);
             cx.new(|cx| {
                 let view = ChatView::new(core, None, window, cx);
                 view_with_messages(
@@ -397,7 +384,7 @@ fn register_chat(s: &mut Snapshots) {
         "chat_with_messages_mid",
         size(px(820.), px(640.)),
         |window, cx| {
-            let core = stub_core_with_config(cx);
+            let core = stub_stores_with_config(cx);
             cx.new(|cx| {
                 let view = ChatView::new(core, None, window, cx);
                 view_with_messages(
@@ -424,10 +411,8 @@ fn register_chat(s: &mut Snapshots) {
         "chat_with_messages",
         size(px(900.), px(640.)),
         |window, cx| {
-            let core = cx.new(|_| {
-                let mut c = Core::stub();
-                c.config_state = Some(stub_config_state(true));
-                c
+            let core = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(true));
             });
             cx.new(|cx| {
                 let view = ChatView::new(core, None, window, cx);
@@ -460,10 +445,8 @@ fn register_chat(s: &mut Snapshots) {
         "chat_with_markdown",
         size(px(900.), px(640.)),
         |window, cx| {
-            let core = cx.new(|_| {
-                let mut c = Core::stub();
-                c.config_state = Some(stub_config_state(true));
-                c
+            let core = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(true));
             });
             cx.new(|cx| {
                 let view = ChatView::new(core, None, window, cx);
@@ -507,7 +490,7 @@ fn register_chat(s: &mut Snapshots) {
         "chat_composer_markdown",
         size(px(900.), px(640.)),
         |window, cx| {
-            let core = stub_core_with_config(cx);
+            let core = stub_stores_with_config(cx);
             let view = cx.new(|cx| {
                 let view = ChatView::new(core, None, window, cx);
                 view_with_messages(
@@ -552,7 +535,7 @@ fn register_chat(s: &mut Snapshots) {
         "chat_model_reveal",
         size(px(705.), px(705.)),
         |window, cx| {
-            let core = model_core(cx);
+            let core = model_stores(cx);
             cx.new(|cx| {
                 let mut view = ChatView::new(core, None, window, cx);
                 view.set_messages_for_test(vec![
@@ -581,7 +564,7 @@ fn register_chat(s: &mut Snapshots) {
         "chat_model_picker",
         size(px(705.), px(705.)),
         |window, cx| {
-            let core = model_core(cx);
+            let core = model_stores(cx);
             cx.new(|cx| {
                 let mut view = ChatView::new(core, None, window, cx);
                 view.set_messages_for_test(vec![SpaceMessage {
@@ -597,7 +580,7 @@ fn register_chat(s: &mut Snapshots) {
     );
 
     s.add("chat_thinking", size(px(900.), px(640.)), |window, cx| {
-        let core = stub_core_with_config(cx);
+        let core = stub_stores_with_config(cx);
         cx.new(|cx| {
             let view = ChatView::new(core, None, window, cx);
             // Empty streaming response — renders the collapsed "Thinking…"
@@ -615,7 +598,7 @@ fn register_chat(s: &mut Snapshots) {
             // the user can re-open. Rendered here in the expanded
             // state to verify the layout when the thinking body is
             // visible alongside the answer.
-            let core = stub_core_with_config(cx);
+            let core = stub_stores_with_config(cx);
             cx.new(|cx| {
                 let mut view = ChatView::new(core, None, window, cx);
                 view.set_messages_for_test(vec![
@@ -652,7 +635,7 @@ fn register_chat(s: &mut Snapshots) {
         "chat_streaming_partial",
         size(px(900.), px(640.)),
         |window, cx| {
-            let core = stub_core_with_config(cx);
+            let core = stub_stores_with_config(cx);
             cx.new(|cx| {
                 let view = ChatView::new(core, None, window, cx);
                 let view = view_with_messages(
@@ -703,10 +686,9 @@ fn library_space(id: &str, title: Option<&str>, snippet: Option<&str>, days_ago:
     }
 }
 
-fn library_core(cx: &mut App) -> Entity<Core> {
-    cx.new(|_| {
-        let mut c = Core::stub();
-        c.spaces = vec![
+fn library_stores(cx: &mut App) -> Stores {
+    stub_stores(cx, |s| {
+        s.spaces = vec![
             library_space("s1", Some("Tides and the moon"), None, 0),
             library_space(
                 "s2",
@@ -735,28 +717,27 @@ fn library_core(cx: &mut App) -> Entity<Core> {
             ),
             library_space("s6", None, None, 400),
         ];
-        c
     })
 }
 
 fn register_library(s: &mut Snapshots) {
     s.add("library_empty", size(px(520.), px(620.)), |window, cx| {
-        let core = cx.new(|_| Core::stub());
-        cx.new(|cx| LibraryView::new(core, window, cx))
+        let stores = stub_stores(cx, |_| {});
+        cx.new(|cx| LibraryView::new(stores, window, cx))
     });
 
     s.add(
         "library_with_spaces",
         size(px(520.), px(620.)),
         |window, cx| {
-            let core = library_core(cx);
+            let core = library_stores(cx);
             cx.new(|cx| LibraryView::new(core, window, cx))
         },
     );
 
     // Hover state: the archive × is revealed on the hovered row.
     s.add("library_hovered", size(px(520.), px(620.)), |window, cx| {
-        let core = library_core(cx);
+        let core = library_stores(cx);
         cx.new(|cx| {
             let mut view = LibraryView::new(core, window, cx);
             view.set_hovered_for_test(Some(1));
@@ -771,11 +752,10 @@ fn register_library(s: &mut Snapshots) {
 
 /// A funded account fixture with pools and plans, shared by the settings
 /// cases.
-fn settings_core(cx: &mut App) -> Entity<Core> {
-    cx.new(|_| {
-        let mut c = Core::stub();
-        c.config_state = Some(stub_config_state(true));
-        c.balances = Some(BalancesResult {
+fn settings_stores(cx: &mut App) -> Stores {
+    stub_stores(cx, |s| {
+        s.config_state = Some(stub_config_state(true));
+        s.balances = Some(BalancesResult {
             available: 4_200_000,
             pools: vec![
                 BalancePoolInfo {
@@ -790,7 +770,7 @@ fn settings_core(cx: &mut App) -> Entity<Core> {
                 },
             ],
         });
-        c.prices = vec![
+        s.prices = vec![
             PriceInfo {
                 id: "price_starter".into(),
                 product_name: "Starter".into(),
@@ -808,7 +788,7 @@ fn settings_core(cx: &mut App) -> Entity<Core> {
                 credits: 20_000_000,
             },
         ];
-        c.credential_lifecycle = vec![
+        s.credential_lifecycle = vec![
             CredentialLifecycleInfo {
                 nonce: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into(),
                 credits: 985_400,
@@ -842,7 +822,6 @@ fn settings_core(cx: &mut App) -> Entity<Core> {
                 spend_amount: None,
             },
         ];
-        c
     })
 }
 
@@ -851,15 +830,14 @@ fn register_settings(s: &mut Snapshots) {
 
     // General at rest: base URL pin, advanced rows hidden behind ⌥.
     s.add("settings_general", settings_size, |window, cx| {
-        let core = settings_core(cx);
+        let core = settings_stores(cx);
         cx.new(|cx| SettingsView::new(core, window, cx))
     });
 
     // ⌥ held: advanced rows visible, with an overridden base URL and a
     // user-trusted measurement so the honest "override" annotations show.
     s.add("settings_general_advanced", settings_size, |window, cx| {
-        let core = cx.new(|_| {
-            let mut c = Core::stub();
+        let core = stub_stores(cx, |s| {
             let mut state = stub_config_state(true);
             state.base_url = "https://staging.eidola.example/v1".into();
             state.base_url_is_override = true;
@@ -873,8 +851,7 @@ fn register_settings(s: &mut Snapshots) {
                     .into(),
             }];
             state.trusted_measurements_are_override = true;
-            c.config_state = Some(state);
-            c
+            s.config_state = Some(state);
         });
         let view = cx.new(|cx| SettingsView::new(core, window, cx));
         let general = view.read(cx).general();
@@ -884,7 +861,7 @@ fn register_settings(s: &mut Snapshots) {
 
     // Account pane: balance, pools with humanized expiry, plans.
     s.add("settings_account", settings_size, |window, cx| {
-        let core = settings_core(cx);
+        let core = settings_stores(cx);
         let view = cx.new(|cx| SettingsView::new(core, window, cx));
         view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
         view
@@ -895,7 +872,7 @@ fn register_settings(s: &mut Snapshots) {
         "settings_account_reset_confirm",
         settings_size,
         |window, cx| {
-            let core = settings_core(cx);
+            let core = settings_stores(cx);
             let view = cx.new(|cx| SettingsView::new(core, window, cx));
             view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
             let account = view.read(cx).account();
@@ -906,7 +883,7 @@ fn register_settings(s: &mut Snapshots) {
 
     // Wallet pane: the four lifecycle states in one honest listing.
     s.add("settings_wallet", settings_size, |window, cx| {
-        let core = settings_core(cx);
+        let core = settings_stores(cx);
         let view = cx.new(|cx| SettingsView::new(core, window, cx));
         view.update(cx, |v, cx| v.select(SettingsPane::Wallet, cx));
         view
@@ -1075,7 +1052,7 @@ fn record_spending() -> Vec<SpendTrailEntry> {
 
 fn register_record(s: &mut Snapshots) {
     s.add("record_attestations", record_size(), |window, cx| {
-        let core = stub_core_with_config(cx);
+        let core = stub_stores_with_config(cx);
         cx.new(|cx| {
             let mut view = RecordView::new(core, window, cx);
             view.set_attestations_for_test(record_attestations(), false);
@@ -1084,7 +1061,7 @@ fn register_record(s: &mut Snapshots) {
     });
 
     s.add("record_requests", record_size(), |window, cx| {
-        let core = stub_core_with_config(cx);
+        let core = stub_stores_with_config(cx);
         cx.new(|cx| {
             let mut view = RecordView::new(core, window, cx);
             view.set_requests_for_test(record_requests(), true);
@@ -1094,7 +1071,7 @@ fn register_record(s: &mut Snapshots) {
     });
 
     s.add("record_spending", record_size(), |window, cx| {
-        let core = stub_core_with_config(cx);
+        let core = stub_stores_with_config(cx);
         cx.new(|cx| {
             let mut view = RecordView::new(core, window, cx);
             view.set_spending_for_test(record_spending(), false);
@@ -1104,7 +1081,7 @@ fn register_record(s: &mut Snapshots) {
     });
 
     s.add("record_empty", record_size(), |window, cx| {
-        let core = stub_core_with_config(cx);
+        let core = stub_stores_with_config(cx);
         cx.new(|cx| {
             let mut view = RecordView::new(core, window, cx);
             view.set_requests_for_test(Vec::new(), false);
@@ -1114,7 +1091,7 @@ fn register_record(s: &mut Snapshots) {
     });
 
     s.add("record_request_detail", record_size(), |window, cx| {
-        let core = stub_core_with_config(cx);
+        let core = stub_stores_with_config(cx);
         cx.new(|cx| {
             let mut view = RecordView::new(core, window, cx);
             view.set_requests_for_test(record_requests(), false);
@@ -1158,7 +1135,7 @@ fn register_record(s: &mut Snapshots) {
     });
 
     s.add("record_attestation_detail", record_size(), |window, cx| {
-        let core = stub_core_with_config(cx);
+        let core = stub_stores_with_config(cx);
         cx.new(|cx| {
             let mut view = RecordView::new(core, window, cx);
             view.set_attestations_for_test(record_attestations(), false);
@@ -1180,22 +1157,25 @@ fn register_record(s: &mut Snapshots) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn stub_core_with_config(cx: &mut App) -> Entity<Core> {
-    cx.new(|_| {
-        let mut c = Core::stub();
-        c.config_state = Some(stub_config_state(true));
-        c
-    })
+/// Build stub stores from a declaratively-described scene — the visual-case
+/// equivalent of the old `Core::stub()` field-poking.
+fn stub_stores(cx: &mut App, setup: impl FnOnce(&mut StoresStub)) -> Stores {
+    let mut fixture = StoresStub::default();
+    setup(&mut fixture);
+    Stores::stub_with(fixture, cx)
 }
 
-/// A stub core with a model catalog, for the model-picker cases. Rates are
+fn stub_stores_with_config(cx: &mut App) -> Stores {
+    stub_stores(cx, |s| s.config_state = Some(stub_config_state(true)))
+}
+
+/// Stub stores with a model catalog, for the model-picker cases. Rates are
 /// representative of the real catalog (credits are micro-USD-denominated,
 /// so credits/token reads as $/M tokens).
-fn model_core(cx: &mut App) -> Entity<Core> {
-    cx.new(|_| {
-        let mut c = Core::stub();
-        c.config_state = Some(stub_config_state(true));
-        c.models = vec![
+fn model_stores(cx: &mut App) -> Stores {
+    stub_stores(cx, |s| {
+        s.config_state = Some(stub_config_state(true));
+        s.models = vec![
             ModelInfo {
                 id: "gemma4-31b".into(),
                 context_length: 131_072,
@@ -1225,7 +1205,6 @@ fn model_core(cx: &mut App) -> Entity<Core> {
                 request_credits: Some(9_000.0),
             },
         ];
-        c
     })
 }
 
