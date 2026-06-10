@@ -138,6 +138,44 @@ pub struct ModelInfo {
     pub context_length: u64,
 }
 
+/// Default number of credits to allocate into a fresh anonymous credential
+/// when a chat needs one and the account has balance available
+/// (auto-provisioning). The actual amount is
+/// `min(available, max(DEFAULT_ALLOCATION_CREDITS, required))` — see
+/// [`auto_allocation_amount`].
+///
+/// Why 1,000,000: credits are micro-USD-denominated (the server's
+/// `PRICING_SCALE_FACTOR` is 1e6 — `usd_per_M_tokens × markup` becomes
+/// credits-per-token directly, e.g. gemma4-31b output $1.00/M × 1.5 markup
+/// = 1.5 credits/token). A single chat turn's worst-case hold is
+/// `prompt_bytes × prompt_rate + 4096 × completion_rate`: ≈6,200 credits
+/// for the default gemma4-31b, ≈32,000 for the most expensive catalog
+/// models (output 7.875 credits/token) — mostly refunded after the actual
+/// usage settles. 1,000,000 credits ($1.00 of balance) therefore covers
+/// ~30 worst-case holds or 100+ typical turns: small enough that only a
+/// sliver of the account balance is parked in one unlinkable credential
+/// at a time, large enough that re-allocation (an account-linked,
+/// timing-correlatable operation) stays infrequent.
+pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
+
+/// Decide how many credits to auto-allocate, given the account's available
+/// balance and the credits required for the operation that triggered
+/// provisioning. Pure function so the decision logic is unit-testable
+/// without HTTP.
+///
+/// Returns [`AppError::InsufficientBalance`] when the balance cannot cover
+/// even the required amount; otherwise the chunk size:
+/// `min(available, max(DEFAULT_ALLOCATION_CREDITS, required))`.
+fn auto_allocation_amount(available: i64, required: i64) -> Result<i64, AppError> {
+    if available < required {
+        return Err(AppError::InsufficientBalance {
+            available,
+            required,
+        });
+    }
+    Ok(available.min(DEFAULT_ALLOCATION_CREDITS.max(required)))
+}
+
 /// Incremental events emitted by `AppCore::chat_stream`. The terminal
 /// outcome is the function's `Result<ChatResult, AppError>` return value;
 /// senders close their channel when the function returns.
@@ -723,6 +761,47 @@ impl Inner {
         db::archive_space(&db_conn, space_id, now_ms()).await
     }
 
+    /// Find a credential that can cover `charge_credits`, auto-provisioning
+    /// one from the account balance when none exists.
+    ///
+    /// Resolution order:
+    /// 1. An active local credential with enough credits → use it.
+    /// 2. No usable credential and no account configured →
+    ///    [`AppError::NoAccount`] (the UI routes to account creation).
+    /// 3. Account exists: fetch balances; if the available balance cannot
+    ///    cover the charge → [`AppError::InsufficientBalance`] (the UI
+    ///    routes to purchase). Otherwise allocate
+    ///    `min(available, max(DEFAULT_ALLOCATION_CREDITS, charge))` and
+    ///    use the freshly issued credential.
+    ///
+    /// This keeps credential provisioning out of the happy path's UI: the
+    /// explicit `account_allocate` flow still works, but a chat never fails
+    /// just because the wallet is empty while the account is funded.
+    async fn ensure_spendable_credential(
+        &self,
+        cfg: &Config,
+        db_conn: &turso::Connection,
+        charge_credits: i64,
+    ) -> Result<db::SpendableCredential, AppError> {
+        if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
+            return Ok(cred);
+        }
+
+        if cfg.account_id.is_none() || cfg.account_secret.is_none() {
+            return Err(AppError::NoAccount);
+        }
+
+        let balances = self.account_balances().await?;
+        let amount = auto_allocation_amount(balances.available, charge_credits)?;
+        self.account_allocate(amount).await?;
+
+        db::find_spendable_credential(db_conn, charge_credits)
+            .await?
+            .ok_or_else(|| AppError::Credential {
+                message: "credential was allocated but is not spendable".into(),
+            })
+    }
+
     async fn chat(
         &self,
         prompt: &str,
@@ -814,11 +893,9 @@ impl Inner {
             });
         }
 
-        let cred = db::find_spendable_credential(&db_conn, charge_credits as i64)
-            .await?
-            .ok_or_else(|| AppError::Credential {
-                message: "no credential with sufficient credits found".into(),
-            })?;
+        let cred = self
+            .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
+            .await?;
 
         let credit_token =
             CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
@@ -1236,11 +1313,9 @@ impl Inner {
             });
         }
 
-        let cred = db::find_spendable_credential(&db_conn, charge_credits as i64)
-            .await?
-            .ok_or_else(|| AppError::Credential {
-                message: "no credential with sufficient credits found".into(),
-            })?;
+        let cred = self
+            .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
+            .await?;
 
         let credit_token =
             CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
@@ -2481,5 +2556,64 @@ mod tests {
     #[test]
     fn params_from_domain_separator_rejects_wrong_format() {
         assert!(params_from_domain_separator("bad").is_err());
+    }
+
+    // --- Auto-provisioning decision logic ---------------------------------
+
+    #[test]
+    fn auto_allocation_uses_default_chunk_when_balance_is_plentiful() {
+        // Plenty of balance, small charge → allocate the default chunk,
+        // leaving the rest of the balance in the account.
+        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, 6_200).unwrap();
+        assert_eq!(amount, DEFAULT_ALLOCATION_CREDITS);
+    }
+
+    #[test]
+    fn auto_allocation_is_capped_by_available_balance() {
+        // Balance covers the charge but is below the default chunk →
+        // allocate everything that's available.
+        let amount = auto_allocation_amount(50_000, 6_200).unwrap();
+        assert_eq!(amount, 50_000);
+    }
+
+    #[test]
+    fn auto_allocation_grows_to_cover_a_large_charge() {
+        // A single charge larger than the default chunk must still fit in
+        // one credential (spends draw from exactly one credential).
+        let required = DEFAULT_ALLOCATION_CREDITS + 500_000;
+        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, required).unwrap();
+        assert_eq!(amount, required);
+    }
+
+    #[test]
+    fn auto_allocation_exact_balance_allocates_it_all() {
+        let amount = auto_allocation_amount(6_200, 6_200).unwrap();
+        assert_eq!(amount, 6_200);
+    }
+
+    #[test]
+    fn auto_allocation_fails_typed_when_balance_cannot_cover_charge() {
+        let err = auto_allocation_amount(1_000, 6_200).unwrap_err();
+        match err {
+            AppError::InsufficientBalance {
+                available,
+                required,
+            } => {
+                assert_eq!(available, 1_000);
+                assert_eq!(required, 6_200);
+            }
+            other => panic!("expected InsufficientBalance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_allocation_fails_typed_on_zero_balance() {
+        assert!(matches!(
+            auto_allocation_amount(0, 1),
+            Err(AppError::InsufficientBalance {
+                available: 0,
+                required: 1
+            })
+        ));
     }
 }

@@ -18,13 +18,28 @@ A native Rust client for Eidola, built on [gpui](https://github.com/zed-industri
 
 | File | Window root | Purpose |
 |---|---|---|
-| `chat.rs` | `ChatView` | Main chat window — message list + input + Send action |
+| `chat.rs` | `ChatView` | Main chat window — message list + input + Send action, plus the onboarding empty states (see [Onboarding](#onboarding--the-chat-windows-empty-states)) |
 | `settings.rs` | `SettingsView` | Settings window — custom three-button tab strip switching between... |
 | `general.rs` | `GeneralView` | ...base URL + attestation state (read-mostly) |
 | `account.rs` | `AccountView` | ...account/balance/allocate/prices |
 | `wallet.rs` | `WalletView` | ...credential list |
 
 All view roots are wrapped in `gpui_component::Root` before being handed to `cx.open_window`. **Root is required** — `gpui_component::Input` calls `Root::read(window, cx)` to track the focused input, and panics if the window's root view type isn't `Root`.
+
+**`Core::spawn` debounces on a single `busy` flag** — sequential entity-method calls (`fetch_models` then `fetch_balances`) silently drop all but the first. Two consequences baked into the API: multi-fetch operations are *combined* into one spawn (`fetch_chat_startup` = models + balances + credentials; `fetch_plans_data` = prices + balances), and flows that must never be dropped (onboarding's account creation / checkout / balance poll) bypass the entity methods entirely via static oneshot helpers (`Core::account_create`, `Core::account_checkout`, `Core::account_balances` — same shape as `Core::chat`) so the calling view owns its own typed in-flight/error state.
+
+## Onboarding — the chat window's empty states
+
+From zero to first answer without leaving the page: onboarding is not a wizard window, it's what the chat window's *empty state* renders until the account is usable. The state machine lives in `ChatView` (`chat.rs`):
+
+- **Stage is derived, not stored.** `ChatView::onboarding_stage(core, composer_empty)` returns `Welcome` (no account in `config_state`), `Plans` (account + *known-zero* balance + empty wallet credentials), or `Ready`. Any page content — messages, an in-flight stream, an error band, or composer text — short-circuits to `Ready` so the onboarding pages only ever replace a genuinely empty page. A `None` balance (not yet fetched) is `Ready`, never `Plans`: we don't claim the user is unfunded on an assumption. The only stored bridge is `OnboardingFlow.entered_plans`, which holds the page on `Plans` between account creation and the first balances fetch so the flow doesn't flash through the blank page.
+- **`OnboardingFlow`** holds the local in-flight bits — `creating_account`, `checkout_pending`, `awaiting_checkout`, errors, `dismissed` — and every flag corresponds to a real request currently running or an explicit user choice (the no-fake-states rule). Async work goes through the static `Core` oneshot helpers, giving the view typed `AppError` results.
+- **Welcome** — wordmark + three sentences + a single "Begin" button → `account_create` (anonymous; nothing to fill in). Success refreshes `config_state`, sets `entered_plans`, and kicks `fetch_plans_data`; failure renders inline with Begin available for retry.
+- **Plans** — `prices` rendered as hairline-rule rows (name · price, credits underneath) in the prose column; clicking a row → `account_checkout` → `cx.open_url` → `awaiting_checkout` + a 3-second balance poll (`start_balance_poll`, each tick a real `GET /v1/account/balances`; poll errors surface inline and polling continues). A positive balance flips the derived stage to `Ready`. A quiet "I'll do this later" link sets `dismissed`.
+- **Degraded honesty** — a later submit failing with `AppError::InsufficientBalance` (typed routing, no string matching — see `apply_chat_failure`) sets `show_plans_after_error`, which renders the same plans list below the transcript's error band. Not a modal.
+- Silent credential provisioning itself is app-core's job (see the workspace `AGENTS.md`): a funded account never sees any of this — `chat()` auto-allocates from balance.
+
+Behavior tests cover the stage derivation and each transition's in-flight state (stub core: handlers early-return after the local mutation, mirroring `submit`); visual snapshots cover `onboarding_welcome`, `onboarding_plans`, `onboarding_plans_waiting`, and `chat_insufficient_balance_plans`.
 
 ## Theme — Circadian (`src/theme.rs`)
 

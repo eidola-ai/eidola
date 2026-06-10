@@ -1,13 +1,16 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use eidola_app_core::error::AppError;
 use eidola_app_core::{ChatStreamEvent, SpaceMessage};
 use gpui::{
-    AppContext, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    WeakEntity, Window, actions, div, linear_color_stop, linear_gradient, px, relative, rems,
+    AppContext, AsyncApp, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, actions, div,
+    linear_color_stop, linear_gradient, px, relative, rems,
 };
 use gpui_component::{
-    ActiveTheme, IconName,
+    ActiveTheme, Disableable, IconName,
     button::{Button, ButtonVariants},
     h_flex,
     highlighter::HighlightTheme,
@@ -80,6 +83,55 @@ impl ChatMessageView {
     }
 }
 
+/// The chat window's onboarding stage, derived each render from the shared
+/// `Core` snapshots plus the view's local state. See
+/// [`ChatView::onboarding_stage`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OnboardingStage {
+    /// No account configured — the empty page is the welcome page.
+    Welcome,
+    /// Account exists, but the balance is known-zero and the wallet has no
+    /// credentials — the empty page lists the plans.
+    Plans,
+    /// The normal page (blank or with transcript). Credential provisioning
+    /// from the account balance is silent (app-core).
+    Ready,
+}
+
+/// Local, per-window state for the onboarding flow. The *stage* is derived
+/// (`ChatView::onboarding_stage`); every in-flight flag here corresponds to
+/// a real request that is currently running or an explicit user choice —
+/// no fake states.
+#[derive(Default)]
+pub struct OnboardingFlow {
+    /// Account-creation request in flight.
+    pub creating_account: bool,
+    /// Error from the last account-creation attempt.
+    pub create_error: Option<String>,
+    /// `price_id` of a checkout-session request in flight.
+    pub checkout_pending: Option<String>,
+    /// A checkout URL has been opened in the browser and the balance poll
+    /// is running.
+    pub awaiting_checkout: bool,
+    /// Error from the last checkout attempt or balance poll.
+    pub plans_error: Option<String>,
+    /// The user chose "I'll do this later" — fall through to the normal
+    /// blank page for this window.
+    pub dismissed: bool,
+    /// Set when the account was just created from this window. Keeps the
+    /// flow on the plans page while the first prices/balances fetch is in
+    /// flight, instead of flashing the blank page between the two states.
+    pub entered_plans: bool,
+    /// A plans-data fetch has actually started (or the prices were already
+    /// cached) for the current visit to the plans stage. Guards the
+    /// observe-driven auto-fetch from looping. Deliberately *not* set when
+    /// `Core::spawn`'s busy-debounce drops the call — the busy op's
+    /// completion notify is the retry trigger.
+    plans_fetch_attempted: bool,
+    /// The 3s balance-poll loop is already running.
+    poll_running: bool,
+}
+
 pub struct ChatView {
     core: Entity<Core>,
     /// WYSIWYG markdown composer (`gpui-markdown-editor`). The user types
@@ -93,8 +145,14 @@ pub struct ChatView {
     /// In-flight streaming assistant response, or `None` when idle.
     pub streaming: Option<StreamingResponse>,
     error: Option<String>,
+    /// Onboarding flow state (welcome → plans → ready).
+    onboarding: OnboardingFlow,
+    /// A chat submit failed with `InsufficientBalance` — surface the plans
+    /// list below the transcript's error band (not a modal).
+    pub show_plans_after_error: bool,
 
     focus_handle: FocusHandle,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ChatView {
@@ -134,6 +192,25 @@ impl ChatView {
     pub fn set_streaming_for_test(&mut self, streaming: Option<StreamingResponse>) {
         self.streaming = streaming;
     }
+
+    /// Read access to the onboarding flow state, for behavior tests.
+    pub fn onboarding(&self) -> &OnboardingFlow {
+        &self.onboarding
+    }
+
+    /// Test-only mutable access to the onboarding flow state, so snapshot
+    /// tests can render in-flight sub-states (waiting for checkout, etc.)
+    /// without driving async work.
+    #[doc(hidden)]
+    pub fn onboarding_mut_for_test(&mut self) -> &mut OnboardingFlow {
+        &mut self.onboarding
+    }
+
+    /// Test-only setter for the transcript error band.
+    #[doc(hidden)]
+    pub fn set_error_for_test(&mut self, error: Option<String>) {
+        self.error = error;
+    }
 }
 
 impl ChatView {
@@ -166,7 +243,17 @@ impl ChatView {
         // (no modifier) is bound in the editor's context and inserts
         // a newline as normal.
 
-        core.update(cx, |core, cx| core.fetch_models(cx));
+        // One combined startup fetch: models, plus balances + wallet
+        // credentials when an account exists (the onboarding inputs).
+        core.update(cx, |core, cx| core.fetch_chat_startup(cx));
+
+        // Re-render when the shared core snapshots change (config,
+        // balances, prices, credentials), and lazily fetch the plans data
+        // the first time the derived stage lands on `Plans`.
+        let _subscriptions = vec![cx.observe(&core, |this: &mut Self, _, cx| {
+            this.maybe_fetch_plans_data(cx);
+            cx.notify();
+        })];
 
         Self {
             core,
@@ -175,8 +262,243 @@ impl ChatView {
             messages: Vec::new(),
             streaming: None,
             error: None,
+            onboarding: OnboardingFlow::default(),
+            show_plans_after_error: false,
             focus_handle,
+            _subscriptions,
         }
+    }
+
+    /// Derive the onboarding stage from the shared core snapshots and the
+    /// view's local state.
+    ///
+    /// The onboarding pages only ever replace the *empty* page: any
+    /// transcript content, in-flight stream, error band, or composer text
+    /// short-circuits to `Ready` (a later funding failure is surfaced below
+    /// the transcript via the error band instead — see
+    /// `apply_chat_failure`).
+    ///
+    /// `Plans` requires the balance to be *known* zero (a fetched snapshot,
+    /// not an assumption) with no wallet credentials. While the very first
+    /// balances fetch after account creation is still in flight,
+    /// `entered_plans` holds the flow on the plans page so it doesn't flash
+    /// through the blank page.
+    pub fn onboarding_stage(&self, core: &Core, composer_empty: bool) -> OnboardingStage {
+        if !self.messages.is_empty()
+            || self.streaming.is_some()
+            || self.error.is_some()
+            || !composer_empty
+        {
+            return OnboardingStage::Ready;
+        }
+        let Some(state) = core.config_state.as_ref() else {
+            return OnboardingStage::Ready;
+        };
+        if !state.has_account || !state.has_account_secret {
+            return OnboardingStage::Welcome;
+        }
+        if self.onboarding.dismissed {
+            return OnboardingStage::Ready;
+        }
+        let balance_known_zero = core.balances.as_ref().is_some_and(|b| b.available <= 0);
+        if balance_known_zero && core.credentials.is_empty() {
+            return OnboardingStage::Plans;
+        }
+        if self.onboarding.entered_plans && core.balances.is_none() {
+            return OnboardingStage::Plans;
+        }
+        OnboardingStage::Ready
+    }
+
+    fn current_stage(&self, cx: &Context<Self>) -> OnboardingStage {
+        let composer_empty = self.prompt_editor.read(cx).state.markdown.trim().is_empty();
+        self.onboarding_stage(self.core.read(cx), composer_empty)
+    }
+
+    /// Kick off a prices+balances fetch the first time the derived stage
+    /// lands on `Plans` and there is nothing cached yet. One attempt per
+    /// visit; the plans page's retry link clears the latch.
+    fn maybe_fetch_plans_data(&mut self, cx: &mut Context<Self>) {
+        if self.onboarding.plans_fetch_attempted {
+            return;
+        }
+        if self.current_stage(cx) != OnboardingStage::Plans {
+            return;
+        }
+        if !self.core.read(cx).prices.is_empty() {
+            self.onboarding.plans_fetch_attempted = true;
+            return;
+        }
+        // Latch only if the fetch actually started: `Core::spawn` silently
+        // drops the call while another core op is in flight (e.g. the
+        // startup fetch), and that op's completion notify is what re-runs
+        // us for the retry.
+        self.onboarding.plans_fetch_attempted =
+            self.core.update(cx, |core, cx| core.fetch_plans_data(cx));
+    }
+
+    /// "Begin" on the welcome page: create the anonymous account. There is
+    /// nothing to fill in — the account is an anonymous identifier.
+    pub fn begin_onboarding(&mut self, cx: &mut Context<Self>) {
+        if self.onboarding.creating_account {
+            return;
+        }
+        self.onboarding.creating_account = true;
+        self.onboarding.create_error = None;
+        cx.notify();
+
+        let Some(app_core) = self.core.read(cx).app_core() else {
+            // Stub core (behavior tests): the in-flight flag above is the
+            // observable state machine transition.
+            return;
+        };
+        let rx = Core::account_create(app_core);
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let res = rx.await.unwrap_or_else(|_| {
+                Err(AppError::Internal {
+                    message: "account creation task cancelled".into(),
+                })
+            });
+            let _ = this.update(cx, |this, cx| {
+                this.onboarding.creating_account = false;
+                match res {
+                    Ok(_) => {
+                        // Move straight to the plans step: refresh the
+                        // config snapshot (has_account flips true) and
+                        // fetch prices + the initial (zero) balance. The
+                        // latch tracks whether the fetch actually started —
+                        // if the startup fetch is still busy the call is
+                        // dropped, and `maybe_fetch_plans_data` retries on
+                        // that op's completion notify.
+                        this.onboarding.entered_plans = true;
+                        this.onboarding.plans_fetch_attempted = this.core.update(cx, |core, cx| {
+                            core.refresh_config(cx);
+                            core.fetch_plans_data(cx)
+                        });
+                    }
+                    Err(e) => this.onboarding.create_error = Some(e.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A plan row was clicked: create a checkout session, open the URL in
+    /// the browser, and start polling balances until the purchase lands.
+    pub fn begin_checkout(&mut self, price_id: String, cx: &mut Context<Self>) {
+        if self.onboarding.checkout_pending.is_some() {
+            return;
+        }
+        self.onboarding.checkout_pending = Some(price_id.clone());
+        self.onboarding.plans_error = None;
+        cx.notify();
+
+        let Some(app_core) = self.core.read(cx).app_core() else {
+            return;
+        };
+        let rx = Core::account_checkout(app_core, price_id);
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let res = rx.await.unwrap_or_else(|_| {
+                Err(AppError::Internal {
+                    message: "checkout task cancelled".into(),
+                })
+            });
+            let _ = this.update(cx, |this, cx| {
+                this.onboarding.checkout_pending = None;
+                match res {
+                    Ok(url) => {
+                        cx.open_url(&url);
+                        this.onboarding.awaiting_checkout = true;
+                        this.start_balance_poll(cx);
+                    }
+                    Err(e) => this.onboarding.plans_error = Some(e.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Quiet exit from the plans page ("I'll do this later"): show the
+    /// normal blank page and stop the checkout poll.
+    pub fn dismiss_onboarding(&mut self, cx: &mut Context<Self>) {
+        self.onboarding.dismissed = true;
+        self.onboarding.awaiting_checkout = false;
+        cx.notify();
+    }
+
+    /// Poll balances every ~3s while `awaiting_checkout`. Each iteration is
+    /// a real `GET /v1/account/balances`; a positive balance ends both the
+    /// poll and (via the derived stage) the plans page. Poll errors are
+    /// surfaced inline and polling continues — checkout may still complete.
+    fn start_balance_poll(&mut self, cx: &mut Context<Self>) {
+        if self.onboarding.poll_running {
+            return;
+        }
+        let Some(app_core) = self.core.read(cx).app_core() else {
+            return;
+        };
+        self.onboarding.poll_running = true;
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                let keep_going = this
+                    .read_with(cx, |this, _| this.onboarding.awaiting_checkout)
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+                let res = match Core::account_balances(app_core.clone()).await {
+                    Ok(res) => res,
+                    Err(_) => break, // core dropped
+                };
+                let stop = this
+                    .update(cx, |this, cx| {
+                        match res {
+                            Ok(balances) => {
+                                this.onboarding.plans_error = None;
+                                if balances.available > 0 {
+                                    this.onboarding.awaiting_checkout = false;
+                                }
+                                this.core.update(cx, |core, cx| {
+                                    core.balances = Some(balances);
+                                    cx.notify();
+                                });
+                            }
+                            Err(e) => {
+                                this.onboarding.plans_error =
+                                    Some(format!("balance check failed: {e}"));
+                            }
+                        }
+                        cx.notify();
+                        !this.onboarding.awaiting_checkout
+                    })
+                    .unwrap_or(true);
+                if stop {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, _| {
+                this.onboarding.poll_running = false;
+            });
+        })
+        .detach();
+    }
+
+    /// Route a failed chat submit. `InsufficientBalance` additionally
+    /// surfaces the plans list below the transcript via the error band —
+    /// typed routing, not string matching.
+    pub fn apply_chat_failure(&mut self, e: AppError, cx: &mut Context<Self>) {
+        self.streaming = None;
+        if matches!(e, AppError::InsufficientBalance { .. }) {
+            self.show_plans_after_error = true;
+            if self.core.read(cx).prices.is_empty() {
+                self.core.update(cx, |core, cx| core.fetch_plans_data(cx));
+            }
+        }
+        self.error = Some(e.to_string());
+        cx.notify();
     }
 
     /// Replace `messages` with a fresh list from the DB, preserving any
@@ -255,6 +577,7 @@ impl ChatView {
         }));
         self.streaming = Some(StreamingResponse::default());
         self.error = None;
+        self.show_plans_after_error = false;
         cx.notify();
 
         let Some(app_core) = self.core.read(cx).app_core() else {
@@ -323,9 +646,7 @@ impl ChatView {
                 }
                 Err(e) => {
                     let _ = this.update(cx, |this, cx| {
-                        this.streaming = None;
-                        this.error = Some(e.to_string());
-                        cx.notify();
+                        this.apply_chat_failure(e, cx);
                     });
                 }
             }
@@ -338,6 +659,37 @@ impl EventEmitter<()> for ChatView {}
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The onboarding pages are the chat window's *empty states* — the
+        // welcome page when no account exists, the plans page when the
+        // account is unfunded. Any real page content (or composer text)
+        // short-circuits to the normal transcript.
+        let stage = self.current_stage(cx);
+        let content: gpui::AnyElement = match stage {
+            OnboardingStage::Welcome => self.render_welcome(window, cx).into_any_element(),
+            OnboardingStage::Plans => self.render_plans_page(window, cx).into_any_element(),
+            OnboardingStage::Ready => self.render_transcript(window, cx).into_any_element(),
+        };
+
+        let theme = cx.theme();
+        v_flex()
+            .key_context("ChatView")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
+                window.remove_window();
+            }))
+            .relative()
+            .size_full()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .child(content)
+            .child(title_bar_overlay(cx))
+    }
+}
+
+impl ChatView {
+    /// The normal page: transcript + composer in one scroll surface.
+    fn render_transcript(&self, window: &Window, cx: &Context<Self>) -> gpui::Stateful<Div> {
         let theme = cx.theme();
         let markdown_style = markdown_style(theme.mode.is_dark());
 
@@ -574,6 +926,26 @@ impl Render for ChatView {
                     ),
                 ),
             );
+
+            // A submit that failed with `InsufficientBalance` surfaces the
+            // plans right here, below the transcript — the same hairline
+            // list the onboarding plans page uses, not a modal.
+            if self.show_plans_after_error {
+                messages_col = messages_col.child(
+                    div().w_full().px_5().pt_6().child(
+                        prose_row().child(
+                            prose_col()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child("Add credit to continue"),
+                                )
+                                .child(self.render_plans_list(cx)),
+                        ),
+                    ),
+                );
+            }
         }
 
         // The composing editor lives at the foot of the scroll, styled
@@ -616,26 +988,265 @@ impl Render for ChatView {
             ),
         );
 
-        v_flex()
-            .key_context("ChatView")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::submit))
-            .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
-                window.remove_window();
-            }))
-            .relative()
-            .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
+        div()
+            .id("scroll")
+            .w_full()
+            .flex_1()
+            .overflow_y_scroll()
+            .child(messages_col)
+    }
+
+    /// The welcome page — the empty state when no account exists. Set like
+    /// a title page in the prose column: the wordmark, a short hairline,
+    /// three sentences of what Eidola is, and a single action.
+    fn render_welcome(&self, window: &Window, cx: &Context<Self>) -> Div {
+        let theme = cx.theme();
+        let ob = &self.onboarding;
+
+        let wordmark = v_flex()
+            .gap_4()
             .child(
                 div()
-                    .id("scroll")
-                    .w_full()
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .child(messages_col),
+                    .text_size(px(34.))
+                    .line_height(relative(1.2))
+                    .child("Eidola"),
             )
-            .child(title_bar_overlay(cx))
+            .child(div().w(rems(4.)).h(px(1.)).bg(theme.border));
+
+        // gap_6 = 1.5 rem — the same paragraph gap the transcript's
+        // markdown body uses, so the welcome reads with the page's rhythm.
+        let body = v_flex()
+            .gap_6()
+            .child(div().child(
+                "A quiet page for thinking with a machine — private by construction, \
+                 not by policy.",
+            ))
+            .child(div().child(
+                "Every request runs inside sealed, hardware-attested enclaves, and this \
+                 app verifies the cryptographic evidence before a word leaves your \
+                 machine. The full record of what was sent, spent, and proven lives \
+                 here, on your device.",
+            ))
+            .child(div().child(
+                "There is nothing to sign up for: an account is just an anonymous \
+                 number. Press Begin, and the page is yours.",
+            ));
+
+        let mut action = v_flex().gap_3().items_start().child(
+            h_flex().child(
+                Button::new("begin")
+                    .primary()
+                    .label("Begin")
+                    .disabled(ob.creating_account)
+                    .on_click(cx.listener(|this, _, _, cx| this.begin_onboarding(cx))),
+            ),
+        );
+        if ob.creating_account {
+            // Real in-flight request — see `begin_onboarding`.
+            action = action.child(
+                div()
+                    .text_sm()
+                    .italic()
+                    .text_color(theme.muted_foreground)
+                    .child("Creating your anonymous account…"),
+            );
+        }
+        if let Some(err) = ob.create_error.as_deref() {
+            action = action.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(SharedString::from(err.to_string())),
+            );
+        }
+
+        v_flex()
+            .size_full()
+            .pt(window.viewport_size().height * 0.22)
+            .px_5()
+            .child(
+                prose_row().child(
+                    prose_col()
+                        .gap_8()
+                        .child(wordmark)
+                        .child(body)
+                        .child(action),
+                ),
+            )
+    }
+
+    /// The plans page — the empty state when the account exists but holds
+    /// no balance and the wallet has no credentials.
+    fn render_plans_page(&self, window: &Window, cx: &Context<Self>) -> Div {
+        let theme = cx.theme();
+
+        let heading = v_flex()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(px(22.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Add credit"),
+            )
+            .child(div().text_color(theme.muted_foreground).child(
+                "Your account is ready. Choose a plan to put credit behind it — \
+                 checkout opens in your browser, and this page follows along.",
+            ));
+
+        let skip = h_flex().pt_2().child(
+            div()
+                .id("skip-plans")
+                .cursor_pointer()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .hover(|s| s.text_color(theme.foreground))
+                .child("I'll do this later")
+                .on_click(cx.listener(|this, _, _, cx| this.dismiss_onboarding(cx))),
+        );
+
+        v_flex()
+            .size_full()
+            .pt(window.viewport_size().height * 0.16)
+            .px_5()
+            .child(
+                prose_row().child(
+                    prose_col()
+                        .gap_6()
+                        .child(heading)
+                        .child(self.render_plans_list(cx))
+                        .child(skip),
+                ),
+            )
+    }
+
+    /// The plans list itself — shared between the onboarding plans page and
+    /// the below-transcript "add credit to continue" band. Hairline rules,
+    /// no cards: each plan is a row (name · price; credits underneath), and
+    /// clicking it opens checkout.
+    fn render_plans_list(&self, cx: &Context<Self>) -> Div {
+        let theme = cx.theme();
+        let core = self.core.read(cx);
+        let ob = &self.onboarding;
+
+        let mut list = v_flex().w_full();
+
+        if core.prices.is_empty() {
+            if core.busy {
+                // `fetch_plans_data` is in flight.
+                list = list.child(
+                    div()
+                        .italic()
+                        .text_color(theme.muted_foreground)
+                        .child("Loading plans…"),
+                );
+            } else if let Some(err) = core.error_message.as_deref() {
+                list = list
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.danger)
+                            .child(SharedString::from(err.to_string())),
+                    )
+                    .child(
+                        div()
+                            .id("retry-plans")
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .hover(|s| s.text_color(theme.foreground))
+                            .child("Try again")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.onboarding.plans_fetch_attempted =
+                                    this.core.update(cx, |core, cx| {
+                                        core.clear_error(cx);
+                                        core.fetch_plans_data(cx)
+                                    });
+                            })),
+                    );
+            } else {
+                list = list.child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child("No plans are available right now."),
+                );
+            }
+            return list;
+        }
+
+        for (idx, price) in core.prices.iter().enumerate() {
+            let price_line = if ob.checkout_pending.as_deref() == Some(price.id.as_str()) {
+                // Real in-flight request — see `begin_checkout`.
+                "Opening checkout…".to_string()
+            } else {
+                format!("{}{}", price.amount_display, price.recurrence)
+            };
+            let mut subline = format!("{} credits", format_credits(price.credits));
+            if let Some(desc) = price.product_description.as_deref() {
+                subline = format!("{subline} — {desc}");
+            }
+            let price_id = price.id.clone();
+
+            list =
+                list.child(
+                    v_flex()
+                        .id(("plan", idx))
+                        .w_full()
+                        .py_3()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.muted.opacity(0.35)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.begin_checkout(price_id.clone(), cx)
+                        }))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .items_baseline()
+                                .child(div().child(SharedString::from(price.product_name.clone())))
+                                .child(
+                                    div()
+                                        .text_color(theme.muted_foreground)
+                                        .child(SharedString::from(price_line)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(SharedString::from(subline)),
+                        ),
+                );
+        }
+        // Closing hairline under the last row.
+        list = list.child(div().w_full().h(px(1.)).bg(theme.border));
+
+        if ob.awaiting_checkout {
+            // The balance poll is live — one real request every ~3s.
+            list = list.child(
+                div()
+                    .pt_4()
+                    .italic()
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        "Waiting for checkout to finish in your browser — checking your \
+                         balance every few seconds…",
+                    ),
+            );
+        }
+        if let Some(err) = ob.plans_error.as_deref() {
+            list = list.child(
+                div()
+                    .pt_2()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(SharedString::from(err.to_string())),
+            );
+        }
+
+        list
     }
 }
 
@@ -680,6 +1291,34 @@ fn prose() -> Div {
 /// `max_w` lands centered in wide windows.
 fn prose_row() -> Div {
     h_flex().w_full().justify_center()
+}
+
+/// `prose()` as a vertical flex column, for multi-child onboarding content
+/// (the plain `prose()` div is block-level, where `gap` has no effect).
+fn prose_col() -> Div {
+    v_flex()
+        .w_full()
+        .max_w(rems(PROSE_MAX_WIDTH_REM))
+        .text_size(PROSE_FONT_SIZE)
+        .line_height(relative(PROSE_LINE_HEIGHT))
+}
+
+/// Format a credit amount with thousands separators (credits are micro-USD
+/// denominated, so the magnitudes are large).
+fn format_credits(credits: i64) -> String {
+    let raw = credits.abs().to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3 + 1);
+    if credits < 0 {
+        out.push('-');
+    }
+    let offset = raw.len() % 3;
+    for (i, ch) in raw.chars().enumerate() {
+        if i > 0 && (i + 3 - offset).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Friendly label for a chat role, used as the participant name in the
