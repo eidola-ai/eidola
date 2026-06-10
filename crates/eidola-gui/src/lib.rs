@@ -9,6 +9,7 @@ pub mod general;
 pub mod library;
 pub mod settings;
 pub mod theme;
+pub mod updates;
 pub mod wallet;
 
 use gpui::{
@@ -19,13 +20,14 @@ use gpui_component::Root;
 use gpui_component_assets::Assets;
 
 use crate::actions::{
-    About, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenLibrary, OpenSettings, Quit,
-    ShowAll, ToggleInspector, Zoom,
+    About, CheckForUpdates, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenLibrary,
+    OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
 };
 use crate::chat::ChatView;
 use crate::core::Core;
 use crate::library::LibraryView;
 use crate::settings::SettingsView;
+use crate::updates::UpdatesView;
 
 /// Application-scoped state. Stored as a gpui global so action handlers
 /// (which only get `&mut App`) can reach it.
@@ -40,6 +42,9 @@ struct AppGlobal {
     /// The single Library window, if open. Same singleton discipline as
     /// `settings_window`.
     library_window: Option<WindowHandle<Root>>,
+    /// The single Updates window, if open. Same singleton discipline as
+    /// `settings_window`.
+    updates_window: Option<WindowHandle<Root>>,
 }
 
 impl gpui::Global for AppGlobal {}
@@ -75,10 +80,17 @@ pub fn run() {
         });
 
         cx.set_global(AppGlobal {
-            core,
+            core: core.clone(),
             settings_window: None,
             library_window: None,
+            updates_window: None,
         });
+
+        // Verified update-notification polling: one check at launch, then
+        // every ~6h while running (tokio task on the core's runtime). A
+        // result that lands while no Updates window is open is reflected
+        // the next time one opens — no banners in chat windows.
+        core.read(cx).start_update_polling();
 
         // Order matters: `cx.set_menus` snapshots the keymap when it builds
         // NSMenuItems and attaches each item's `keyEquivalent` from
@@ -110,6 +122,7 @@ fn install_menus(cx: &mut App) {
             name: "Eidola".into(),
             items: vec![
                 MenuItem::action("About Eidola", About),
+                MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::Separator,
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::Separator,
@@ -302,6 +315,19 @@ fn install_action_handlers(cx: &mut App) {
         open_settings_window(cx);
     });
 
+    cx.on_action(|_: &CheckForUpdates, cx: &mut App| {
+        // Singleton, like Settings. Opening (or raising) the window is
+        // the manual-check gesture: the view triggers a fresh check on
+        // construction, and raising an existing window re-checks here so
+        // the user always gets a live answer.
+        if try_focus_existing_updates(cx) {
+            let core = cx.global::<AppGlobal>().core.clone();
+            core.update(cx, |c, cx| c.check_for_updates(cx));
+            return;
+        }
+        open_updates_window(cx);
+    });
+
     cx.on_action(|_: &NewSpace, cx: &mut App| {
         open_main_window(cx);
     });
@@ -418,6 +444,10 @@ fn try_focus_existing_library(cx: &mut App) -> bool {
     try_focus_existing_singleton(cx, |g| &mut g.library_window)
 }
 
+fn try_focus_existing_updates(cx: &mut App) -> bool {
+    try_focus_existing_singleton(cx, |g| &mut g.updates_window)
+}
+
 /// Edge-to-edge titlebar: macOS extends the content view under the
 /// traffic-light buttons and stops painting a separate titlebar background.
 /// Each view is responsible for leaving room at the top so the lights don't
@@ -517,6 +547,32 @@ fn open_library_window(cx: &mut App) {
 
     if let Ok(handle) = handle {
         cx.global_mut::<AppGlobal>().library_window = Some(handle);
+    }
+    cx.activate(true);
+}
+
+/// Open the Updates window — a small singleton (Eidola menu → "Check for
+/// Updates…", standard macOS placement under "About Eidola").
+fn open_updates_window(cx: &mut App) {
+    let core = cx.global::<AppGlobal>().core.clone();
+    let bounds = centered_window_bounds(cx, 480., 360.);
+
+    let opts = WindowOptions {
+        window_bounds: bounds,
+        titlebar: Some(transparent_titlebar()),
+        kind: WindowKind::Normal,
+        window_min_size: Some(size(px(420.), px(300.))),
+        ..Default::default()
+    };
+
+    let handle = cx.open_window(opts, |window, cx| {
+        theme::observe_window_appearance(window);
+        let view = cx.new(|cx| UpdatesView::new(core.clone(), window, cx));
+        cx.new(|cx| Root::new(view, window, cx))
+    });
+
+    if let Ok(handle) = handle {
+        cx.global_mut::<AppGlobal>().updates_window = Some(handle);
     }
     cx.activate(true);
 }

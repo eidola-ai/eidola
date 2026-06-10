@@ -20,6 +20,7 @@ A native Rust client for Eidola, built on [gpui](https://github.com/zed-industri
 |---|---|---|
 | `chat.rs` | `ChatView` | Main chat window — message list + input + Send action, plus the onboarding empty states (see [Onboarding](#onboarding--the-chat-windows-empty-states)) |
 | `library.rs` | `LibraryView` | Library window — table of contents of past spaces; reopen / archive |
+| `updates.rs` | `UpdatesView` | Updates window — the verified update-check state machine (see [Updates window](#updates-window)) |
 | `settings.rs` | `SettingsView` | Settings window — custom three-button tab strip switching between... |
 | `general.rs` | `GeneralView` | ...base URL + attestation state (read-mostly) |
 | `account.rs` | `AccountView` | ...account/balance/allocate/prices |
@@ -130,7 +131,16 @@ User-initiated submit is a special case: `submit` always sets `pending_tail = tr
 
 **Chat windows are non-singleton.** Every `NewSpace` invocation opens a fresh `ChatView` via `open_main_window` → `open_chat_window(cx, core, None)`; with `space_id: None` the view is a blank page whose space is created lazily by the first exchange (protecting the instant-⌘N pillar). The Library reopens an existing space via `open_space_window(cx, core, space_id)` (same chat window chrome, `Some(id)`): `ChatView::new` stores the id and asynchronously loads the space's persisted messages through the `Core::get_space_messages` bridge on construction, and the next submit continues that space. Opening the same space twice yields two independent windows — no dedup yet, acceptable v1. `open_chat_window` calls `cx.activate(true)` after `cx.open_window` so a window opened from another app's context (dock right-click while a different app is foreground) brings Eidola to the front rather than opening behind.
 
-**Settings and Library are singletons.** `AppGlobal.settings_window` / `AppGlobal.library_window` (`Option<WindowHandle<Root>>`) cache the handles, and `OpenSettings` / `OpenLibrary` raise the existing window via `window.activate_window()` if it's still open (shared helper `try_focus_existing_singleton`, parameterized over the `AppGlobal` slot). Both open paths are **synchronous** (via `App::open_window`) so the cache is populated before the handler returns. Liveness is checked by matching the cached `WindowId` against `cx.windows()` (the authoritative live list) — borrowing Zed's pattern, except Zed can use `AnyWindowHandle::downcast::<SettingsWindow>` directly because their settings root is uniquely typed; ours is `gpui_component::Root` (shared with chat windows), so we match by id instead. A stale id self-heals on the next invocation — no `on_release` bookkeeping needed. `OpenLibrary` additionally calls `core.fetch_spaces` on every invocation (not just first open) so a long-lived Library window doesn't show a stale listing.
+**Settings, Library, and Updates are singletons.** `AppGlobal.settings_window` / `AppGlobal.library_window` (`Option<WindowHandle<Root>>`) cache the handles, and `OpenSettings` / `OpenLibrary` raise the existing window via `window.activate_window()` if it's still open (shared helper `try_focus_existing_singleton`, parameterized over the `AppGlobal` slot). Both open paths are **synchronous** (via `App::open_window`) so the cache is populated before the handler returns. Liveness is checked by matching the cached `WindowId` against `cx.windows()` (the authoritative live list) — borrowing Zed's pattern, except Zed can use `AnyWindowHandle::downcast::<SettingsWindow>` directly because their settings root is uniquely typed; ours is `gpui_component::Root` (shared with chat windows), so we match by id instead. A stale id self-heals on the next invocation — no `on_release` bookkeeping needed. `OpenLibrary` additionally calls `core.fetch_spaces` on every invocation (not just first open) so a long-lived Library window doesn't show a stale listing. `CheckForUpdates` follows the same singleton pattern via `AppGlobal.updates_window`, and re-runs `core.check_for_updates` when raising an existing window so the menu gesture always produces a live check.
+
+## Updates window
+
+`updates.rs` renders the verified update-notification flow (`eidola_app_core::updates` — see the workspace `AGENTS.md` for the verification model and failure-mode matrix). Small singleton (480×360 default), opened via Eidola menu → "Check for Updates…" (directly under "About Eidola", the standard macOS placement).
+
+- **State is derived, not stored**: `UpdatesView::derive_display(core)` maps `Core.update_check` (the cached `UpdateCheckSnapshot`) + `Core.update_checking` to a `UpdatesDisplay` enum — `Checking` (only when a check is genuinely in flight *and* there's nothing else to show; a re-check over a standing result keeps the result up and just disables the footer button into "Checking…"), `NoneYet`, `UpToDate` (with last-checked relative time), `UpdateAvailable` (one primary action: "View Release…" → `cx.open_url`), `Unverifiable` (danger-tinted security band quoting the exact failure reason; deliberately **no** link to the artifact), `ClaimsChanged` (side-by-side expected/attested delta table; the only affordance is the explicit, non-primary "Treat as Update" → `Core::accept_changed_claims`), and `CheckFailed` (quiet muted copy — an offline blip is not a security signal).
+- **Background polling**: `run()` calls `core.start_update_polling()` at launch (app-core runs one check immediately + every ~6h on its tokio runtime, persisting results). The view constructor calls `Core::load_last_update_check` so a poll result that landed while no window was open is reflected on next open — no banners in chat windows.
+- **Core plumbing**: `Core.update_check` / `Core.update_checking` are the cached fields; `check_for_updates` uses `spawn_unguarded` with its own in-flight flag (never dropped by the shared `busy` debounce, no-op while already checking — which makes the constructor-triggered check and the menu handler's re-check naturally idempotent).
+- Behavior tests cover the display derivation for every matrix row plus stub no-op actions; visual snapshots cover all six states (`updates_*`), day+night.
 
 ## Library — table of contents, not a sidebar
 
@@ -151,7 +161,7 @@ All wired in `src/lib.rs::install_menus`, `install_keybindings`, `install_action
 
 ### Menus (`cx.set_menus`)
 
-- **Eidola**: About / Settings… / Hide / Hide Others / Show All / Quit
+- **Eidola**: About / Check for Updates… / Settings… / Hide / Hide Others / Show All / Quit
 - **File**: New Space / Library… / Close Window
 - **Edit**: Undo / Redo / Cut / Copy / Paste / Select All — Cut/Copy/Paste/Select All declared via `MenuItem::os_action(_, _, OsAction::*)` so they bind to the standard macOS selectors `cut:` / `copy:` / `paste:` / `selectAll:` and route through the responder chain to whatever has focus
 - **Window**: Minimize / Zoom

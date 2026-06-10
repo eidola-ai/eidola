@@ -25,6 +25,10 @@ actions!(
         Quit,
         /// Show the About panel.
         About,
+        /// Show the Updates window (singleton, like Settings) and run a
+        /// manual update check. Lives in the Eidola menu directly under
+        /// "About Eidola" — the standard macOS placement.
+        CheckForUpdates,
         /// Hide the application (macOS App menu standard, ⌘H).
         Hide,
         /// Hide all other applications (macOS App menu standard, ⌥⌘H).

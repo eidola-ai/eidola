@@ -4,6 +4,9 @@
 //! When you add a new view state, add it here as another `s.add(…)` call. The
 //! first run will write the golden image; subsequent runs verify against it.
 
+use eidola_app_core::updates::{
+    Claim, ClaimDelta, ClaimsComparison, UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease,
+};
 use eidola_app_core::{
     BalancePoolInfo, BalancesResult, ConfigState, CredentialInfo, InFlightCredentialInfo,
     MeasurementInfo, ModelInfo, PriceInfo, SpaceInfo, SpaceMessage,
@@ -14,6 +17,7 @@ use eidola_gui::core::Core;
 use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
 use eidola_gui::settings::SettingsView;
+use eidola_gui::updates::UpdatesView;
 use eidola_gui::wallet::WalletView;
 use gpui::{App, AppContext, Entity, px, size};
 use gpui_markdown_editor::{EditorState, Selection};
@@ -28,6 +32,135 @@ pub fn register(s: &mut Snapshots) {
     register_wallet(s);
     register_general(s);
     register_settings(s);
+    register_updates(s);
+}
+
+// ---------------------------------------------------------------------------
+// Updates window — one case per display state, at the window's real size
+// ---------------------------------------------------------------------------
+
+fn register_updates(s: &mut Snapshots) {
+    fn updates_core(cx: &mut App, setup: impl FnOnce(&mut Core)) -> Entity<Core> {
+        cx.new(|_| {
+            let mut c = Core::stub();
+            setup(&mut c);
+            c
+        })
+    }
+
+    fn snapshot(result: UpdateCheckResult) -> UpdateCheckSnapshot {
+        UpdateCheckSnapshot {
+            checked_at_ms: eidola_app_core::now_ms() - 23 * 60 * 1000,
+            result,
+        }
+    }
+
+    fn release(claims_accepted: bool) -> VerifiedRelease {
+        VerifiedRelease {
+            version: "0.2.0".into(),
+            tag: "v0.2.0".into(),
+            release_url: Some("https://github.com/eidola-ai/eidola/releases/tag/v0.2.0".into()),
+            published_at: Some("2026-06-01T12:00:00Z".into()),
+            ci_identity:
+                "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v0.2.0"
+                    .into(),
+            rekor_log_index: 168_338_903,
+            manifest_sha256: "ab".repeat(32),
+            claims_accepted,
+        }
+    }
+
+    let sz = size(px(480.), px(360.));
+
+    s.add("updates_checking", sz, |window, cx| {
+        let core = updates_core(cx, |c| c.update_checking = true);
+        cx.new(|cx| UpdatesView::new(core, window, cx))
+    });
+
+    s.add("updates_up_to_date", sz, move |window, cx| {
+        let core = updates_core(cx, |c| {
+            c.update_check = Some(snapshot(UpdateCheckResult::UpToDate {
+                latest_version: Some("0.1.0".into()),
+            }));
+        });
+        cx.new(|cx| UpdatesView::new(core, window, cx))
+    });
+
+    s.add("updates_check_failed", sz, move |window, cx| {
+        let core = updates_core(cx, |c| {
+            c.update_check = Some(snapshot(UpdateCheckResult::CheckFailed {
+                message: "GET https://api.github.com/...: connection timed out".into(),
+            }));
+        });
+        cx.new(|cx| UpdatesView::new(core, window, cx))
+    });
+
+    s.add("updates_available", sz, move |window, cx| {
+        let core = updates_core(cx, |c| {
+            c.update_check = Some(snapshot(UpdateCheckResult::UpdateAvailable {
+                release: release(false),
+            }));
+        });
+        cx.new(|cx| UpdatesView::new(core, window, cx))
+    });
+
+    s.add("updates_unverifiable", sz, move |window, cx| {
+        let core = updates_core(cx, |c| {
+            c.update_check = Some(snapshot(UpdateCheckResult::Unverifiable {
+                version: "0.2.0".into(),
+                tag: "v0.2.0".into(),
+                reason: "signature is not from the pinned release identity: leaf cert SAN URI \
+                         does not match the expected workflow pattern"
+                    .into(),
+            }));
+        });
+        cx.new(|cx| UpdatesView::new(core, window, cx))
+    });
+
+    s.add(
+        "updates_claims_changed",
+        size(px(480.), px(440.)),
+        move |window, cx| {
+            let core = updates_core(cx, |c| {
+                c.update_check = Some(snapshot(UpdateCheckResult::ClaimsChanged {
+                    release: release(false),
+                    comparison: ClaimsComparison {
+                        expected: vec![
+                            Claim {
+                                key: "manifest.schema_version".into(),
+                                value: "1".into(),
+                            },
+                            Claim {
+                                key: "enclave.snp_measurement".into(),
+                                value: "SEV-SNP launch measurement (48-byte hex)".into(),
+                            },
+                            Claim {
+                                key: "enclave.cmdline".into(),
+                                value: "kernel command line (non-empty)".into(),
+                            },
+                        ],
+                        attested: vec![Claim {
+                            key: "manifest.schema_version".into(),
+                            value: "2".into(),
+                        }],
+                        deltas: vec![
+                            ClaimDelta {
+                                key: "manifest.schema_version".into(),
+                                expected: Some("1".into()),
+                                attested: Some("2".into()),
+                            },
+                            ClaimDelta {
+                                key: "enclave.snp_measurement".into(),
+                                expected: Some("SEV-SNP launch measurement (48-byte hex)".into()),
+                                attested: None,
+                            },
+                        ],
+                    },
+                }));
+            });
+            cx.new(|cx| UpdatesView::new(core, window, cx))
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

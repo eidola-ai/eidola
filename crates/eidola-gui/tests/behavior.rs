@@ -11,12 +11,16 @@
 //! 4. Assert against the view/core's public state with `read_with`.
 
 use eidola_app_core::error::AppError;
+use eidola_app_core::updates::{
+    Claim, ClaimDelta, ClaimsComparison, UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease,
+};
 use eidola_app_core::{
     BalancesResult, ConfigState, CredentialInfo, ModelInfo, PriceInfo, SpaceInfo, SpaceMessage,
 };
 use eidola_gui::chat::{ChatView, OnboardingStage, Send, ToggleModelPicker};
 use eidola_gui::core::Core;
 use eidola_gui::library::LibraryView;
+use eidola_gui::updates::{UpdatesDisplay, UpdatesView, relative_time};
 use eidola_gui::wallet::WalletView;
 use gpui::{
     AnyWindowHandle, AppContext, Entity, Modifiers, TestAppContext, VisualTestContext,
@@ -884,6 +888,270 @@ fn non_balance_failure_does_not_surface_plans(cx: &mut TestAppContext) {
     view.read_with(cx, |v, _| {
         assert!(!v.show_plans_after_error);
     });
+}
+
+// ---------------------------------------------------------------------------
+// Updates window — display-state derivation for every matrix row
+// ---------------------------------------------------------------------------
+
+fn verified_release(claims_accepted: bool) -> VerifiedRelease {
+    VerifiedRelease {
+        version: "0.2.0".into(),
+        tag: "v0.2.0".into(),
+        release_url: Some("https://github.com/eidola-ai/eidola/releases/tag/v0.2.0".into()),
+        published_at: Some("2026-06-01T12:00:00Z".into()),
+        ci_identity:
+            "https://github.com/eidola-ai/eidola/.github/workflows/tinfoil-build.yml@refs/tags/v0.2.0"
+                .into(),
+        rekor_log_index: 123_456_789,
+        manifest_sha256: "ab".repeat(32),
+        claims_accepted,
+    }
+}
+
+fn claims_comparison() -> ClaimsComparison {
+    ClaimsComparison {
+        expected: vec![
+            Claim {
+                key: "manifest.schema_version".into(),
+                value: "1".into(),
+            },
+            Claim {
+                key: "enclave.snp_measurement".into(),
+                value: "SEV-SNP launch measurement (48-byte hex)".into(),
+            },
+        ],
+        attested: vec![Claim {
+            key: "manifest.schema_version".into(),
+            value: "2".into(),
+        }],
+        deltas: vec![
+            ClaimDelta {
+                key: "manifest.schema_version".into(),
+                expected: Some("1".into()),
+                attested: Some("2".into()),
+            },
+            ClaimDelta {
+                key: "enclave.snp_measurement".into(),
+                expected: Some("SEV-SNP launch measurement (48-byte hex)".into()),
+                attested: None,
+            },
+        ],
+    }
+}
+
+fn snapshot(result: UpdateCheckResult) -> UpdateCheckSnapshot {
+    UpdateCheckSnapshot {
+        checked_at_ms: eidola_app_core::now_ms() - 5 * 60 * 1000,
+        result,
+    }
+}
+
+fn open_updates(
+    cx: &mut TestAppContext,
+    core: &Entity<Core>,
+) -> (AnyWindowHandle, Entity<UpdatesView>) {
+    let core = core.clone();
+    open_view(cx, |window, cx| {
+        cx.new(|cx| UpdatesView::new(core.clone(), window, cx))
+    })
+}
+
+#[gpui::test]
+fn updates_view_none_yet_on_fresh_stub(cx: &mut TestAppContext) {
+    // Stub core: the constructor's load/check calls are no-ops, so the
+    // view sits honestly on "no check has completed yet".
+    let core = stub_core(cx, |_| {});
+    let (_window, view) = open_updates(cx, &core);
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.display(cx), UpdatesDisplay::NoneYet);
+    });
+    core.read_with(cx, |c, _| {
+        assert!(!c.update_checking, "stub check must not set in-flight");
+    });
+}
+
+#[gpui::test]
+fn updates_view_checking_state(cx: &mut TestAppContext) {
+    let core = stub_core(cx, |c| c.update_checking = true);
+    let (_window, view) = open_updates(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.display(cx), UpdatesDisplay::Checking);
+    });
+}
+
+#[gpui::test]
+fn updates_view_up_to_date_state(cx: &mut TestAppContext) {
+    // Matrix row: no newer `latest` release. Also covers "background-check
+    // result is reflected when the window opens": the snapshot is in the
+    // core *before* the view is constructed.
+    let core = stub_core(cx, |c| {
+        c.update_check = Some(snapshot(UpdateCheckResult::UpToDate {
+            latest_version: Some("0.1.0".into()),
+        }));
+    });
+    let (_window, view) = open_updates(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        let UpdatesDisplay::UpToDate {
+            latest_version,
+            checked_at_ms,
+        } = v.display(cx)
+        else {
+            panic!("expected UpToDate display");
+        };
+        assert_eq!(latest_version.as_deref(), Some("0.1.0"));
+        assert!(checked_at_ms > 0);
+    });
+}
+
+#[gpui::test]
+fn updates_view_update_available_state(cx: &mut TestAppContext) {
+    // Matrix row: verified update — one action, open the release page.
+    let core = stub_core(cx, |c| {
+        c.update_check = Some(snapshot(UpdateCheckResult::UpdateAvailable {
+            release: verified_release(false),
+        }));
+    });
+    let (_window, view) = open_updates(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        let UpdatesDisplay::UpdateAvailable { release } = v.display(cx) else {
+            panic!("expected UpdateAvailable display");
+        };
+        assert_eq!(release.version, "0.2.0");
+        assert!(!release.claims_accepted);
+    });
+}
+
+#[gpui::test]
+fn updates_view_unverifiable_state(cx: &mut TestAppContext) {
+    // Matrix row: hard visible security state — the display carries the
+    // exact failure reason and no release link.
+    let core = stub_core(cx, |c| {
+        c.update_check = Some(snapshot(UpdateCheckResult::Unverifiable {
+            version: "0.2.0".into(),
+            tag: "v0.2.0".into(),
+            reason: "signature is not from the pinned release identity".into(),
+        }));
+    });
+    let (_window, view) = open_updates(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        let UpdatesDisplay::Unverifiable {
+            version, reason, ..
+        } = v.display(cx)
+        else {
+            panic!("expected Unverifiable display");
+        };
+        assert_eq!(version, "0.2.0");
+        assert!(reason.contains("pinned release identity"));
+    });
+}
+
+#[gpui::test]
+fn updates_view_claims_changed_state(cx: &mut TestAppContext) {
+    // Matrix row: authentic but claims changed — side-by-side material is
+    // present and the release is NOT framed as an update.
+    let core = stub_core(cx, |c| {
+        c.update_check = Some(snapshot(UpdateCheckResult::ClaimsChanged {
+            release: verified_release(false),
+            comparison: claims_comparison(),
+        }));
+    });
+    let (_window, view) = open_updates(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        let UpdatesDisplay::ClaimsChanged {
+            release,
+            comparison,
+        } = v.display(cx)
+        else {
+            panic!("expected ClaimsChanged display");
+        };
+        assert!(!release.claims_accepted);
+        assert_eq!(comparison.deltas.len(), 2);
+        assert_eq!(comparison.expected.len(), 2);
+    });
+}
+
+#[gpui::test]
+fn updates_view_check_failed_state(cx: &mut TestAppContext) {
+    // Matrix row: network failure — quiet, carries the message + time.
+    let core = stub_core(cx, |c| {
+        c.update_check = Some(snapshot(UpdateCheckResult::CheckFailed {
+            message: "GET …: connection refused".into(),
+        }));
+    });
+    let (_window, view) = open_updates(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        let UpdatesDisplay::CheckFailed { message, .. } = v.display(cx) else {
+            panic!("expected CheckFailed display");
+        };
+        assert!(message.contains("connection refused"));
+    });
+}
+
+#[gpui::test]
+fn updates_view_rechecking_keeps_standing_result(cx: &mut TestAppContext) {
+    // While a re-check runs, the standing result stays up (the footer
+    // shows the in-flight hint) — Checking only masks an empty page.
+    let core = stub_core(cx, |c| {
+        c.update_check = Some(snapshot(UpdateCheckResult::UpToDate {
+            latest_version: None,
+        }));
+        c.update_checking = true;
+    });
+    let (_window, view) = open_updates(cx, &core);
+
+    view.read_with(cx, |v, cx| {
+        assert!(
+            matches!(v.display(cx), UpdatesDisplay::UpToDate { .. }),
+            "standing result must not be masked by a re-check"
+        );
+    });
+}
+
+#[gpui::test]
+fn updates_view_actions_are_noops_on_stub(cx: &mut TestAppContext) {
+    let core = stub_core(cx, |c| {
+        c.update_check = Some(snapshot(UpdateCheckResult::ClaimsChanged {
+            release: verified_release(false),
+            comparison: claims_comparison(),
+        }));
+    });
+    let (_window, view) = open_updates(cx, &core);
+
+    view.update(cx, |v, cx| {
+        v.check_now(cx);
+        v.accept_claims(cx);
+    });
+    cx.run_until_parked();
+
+    // No backend: neither flag flips, the standing state is untouched.
+    core.read_with(cx, |c, _| {
+        assert!(!c.update_checking);
+        assert!(matches!(
+            c.update_check.as_ref().map(|s| &s.result),
+            Some(UpdateCheckResult::ClaimsChanged { .. })
+        ));
+    });
+}
+
+#[gpui::test]
+fn relative_time_buckets(cx: &mut TestAppContext) {
+    let _ = cx;
+    let now = 1_000_000_000_000;
+    assert_eq!(relative_time(now - 10_000, now), "just now");
+    assert_eq!(relative_time(now - 5 * 60_000, now), "5m ago");
+    assert_eq!(relative_time(now - 3 * 3_600_000, now), "3h ago");
+    assert_eq!(relative_time(now - 49 * 3_600_000, now), "2d ago");
+    // Clock skew (then > now) clamps to "just now", never negative.
+    assert_eq!(relative_time(now + 60_000, now), "just now");
 }
 
 // ---------------------------------------------------------------------------

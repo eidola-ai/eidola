@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
+use eidola_app_core::updates::UpdateCheckSnapshot;
 use eidola_app_core::{
     AccountCreateResult, AllocateResult, AppCore, BalancesResult, ChatResult, ChatStreamEvent,
     ConfigState, CredentialInfo, InFlightCredentialInfo, ModelInfo, PriceInfo, SpaceInfo,
@@ -29,6 +30,11 @@ pub struct Core {
     pub models: Vec<ModelInfo>,
     /// Cached space listing for the Library window (archived excluded).
     pub spaces: Vec<SpaceInfo>,
+    /// Outcome of the most recent completed update check (manual or
+    /// background poll). The Updates window reads this reactively.
+    pub update_check: Option<UpdateCheckSnapshot>,
+    /// True while a manual update check is in flight.
+    pub update_checking: bool,
 
     pub error_message: Option<String>,
     pub busy: bool,
@@ -54,6 +60,8 @@ impl Core {
             spending_credentials: Vec::new(),
             models: Vec::new(),
             spaces: Vec::new(),
+            update_check: None,
+            update_checking: false,
             error_message: None,
             busy: false,
         })
@@ -72,6 +80,8 @@ impl Core {
             spending_credentials: Vec::new(),
             models: Vec::new(),
             spaces: Vec::new(),
+            update_check: None,
+            update_checking: false,
             error_message: None,
             busy: false,
         }
@@ -420,6 +430,75 @@ impl Core {
                 Err(e) => this.set_error(e, cx),
             },
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Updates — verified update-notification flow
+    // ------------------------------------------------------------------
+
+    /// Pull the persisted last-check snapshot into the cache (covers
+    /// background-poll results landing while no Updates window was open —
+    /// the next window open reflects them).
+    pub fn load_last_update_check(&mut self, cx: &mut Context<Self>) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        self.update_check = inner.last_update_check();
+        cx.notify();
+    }
+
+    /// Run a manual update check. Unguarded (must never be silently
+    /// dropped by the shared `busy` debounce); its own `update_checking`
+    /// flag makes re-entry a no-op while one is in flight.
+    pub fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if self.update_checking {
+            return;
+        }
+        let Some(core) = self.inner.clone() else {
+            return;
+        };
+        self.update_checking = true;
+        cx.notify();
+        self.spawn_unguarded(
+            cx,
+            move || async move { Ok(core.update_check().await) },
+            |this, result, cx| {
+                this.update_checking = false;
+                if let Ok(snapshot) = result {
+                    this.update_check = Some(snapshot);
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Record the user's explicit "treat as update" decision for a
+    /// claims-changed release, then refresh the cached snapshot so the
+    /// window re-renders as an available update.
+    pub fn accept_changed_claims(
+        &mut self,
+        version: String,
+        manifest_sha256: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        match inner.accept_changed_claims(version, manifest_sha256) {
+            Ok(()) => {
+                self.update_check = inner.last_update_check();
+                cx.notify();
+            }
+            Err(e) => self.set_error(e, cx),
+        }
+    }
+
+    /// Start the app-core background poll loop (launch + every ~6h).
+    /// Idempotent; no-op on stub cores.
+    pub fn start_update_polling(&self) {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.start_update_polling();
+        }
     }
 
     pub fn allocate_credits(&mut self, credits: i64, cx: &mut Context<Self>) {
