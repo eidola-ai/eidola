@@ -3,6 +3,7 @@ pub mod db;
 pub mod error;
 pub mod trust_root;
 pub mod updater;
+pub mod updates;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -222,6 +223,11 @@ struct Inner {
     config_path: PathBuf,
     data_dir: PathBuf,
     db: tokio::sync::OnceCell<turso::Database>,
+    /// Cached update-check state (last result + accepted-claims choice),
+    /// lazily loaded from `<data_dir>/update-state.json` on first access.
+    update_state: Mutex<Option<updates::UpdateState>>,
+    /// Latch so `start_update_polling` spawns at most one poll loop.
+    update_polling: std::sync::atomic::AtomicBool,
 }
 
 // --- Config helpers (sync) ---------------------------------------------------
@@ -238,6 +244,87 @@ impl Inner {
                 message: "account not configured".into(),
             }),
         }
+    }
+}
+
+// --- Update checking ----------------------------------------------------------
+
+impl Inner {
+    /// Cached-or-loaded copy of the persisted update state.
+    fn update_state_snapshot(&self) -> updates::UpdateState {
+        let mut guard = self.update_state.lock().expect("update_state lock");
+        guard
+            .get_or_insert_with(|| updates::load_state(&self.data_dir))
+            .clone()
+    }
+
+    /// Replace the cached state and persist it. A disk write failure is
+    /// logged, not fatal — the in-memory state stays authoritative for the
+    /// rest of the run.
+    fn store_update_state(&self, state: updates::UpdateState) {
+        if let Err(e) = updates::save_state(&self.data_dir, &state) {
+            eprintln!("warning: failed to persist update-check state: {e}");
+        }
+        *self.update_state.lock().expect("update_state lock") = Some(state);
+    }
+
+    /// Run one check and fold it into the persisted state (a `CheckFailed`
+    /// never clears a standing security state — see
+    /// [`updates::UpdateState::absorb`]). Returns the *effective* snapshot:
+    /// what the UI should now show.
+    async fn run_update_check(&self) -> updates::UpdateCheckSnapshot {
+        let mut state = self.update_state_snapshot();
+        let feed_url = self.load_config().update_feed_url();
+
+        let result = match updater::build_http_client() {
+            Ok(client) => {
+                let mut ctx = updates::CheckContext::new(feed_url, env!("CARGO_PKG_VERSION"));
+                ctx.accepted = state.accepted.clone();
+                updates::check_for_update(&client, &ctx).await
+            }
+            Err(e) => updates::UpdateCheckResult::CheckFailed {
+                message: format!("constructing HTTPS client: {e}"),
+            },
+        };
+
+        state.absorb(updates::UpdateCheckSnapshot {
+            checked_at_ms: now_ms(),
+            result,
+        });
+        let effective = state.last.clone().expect("absorb always leaves a snapshot");
+        self.store_update_state(state);
+        effective
+    }
+
+    fn accept_changed_claims(
+        &self,
+        version: String,
+        manifest_sha256: String,
+    ) -> Result<(), AppError> {
+        let mut state = self.update_state_snapshot();
+        state.accepted = Some(updates::AcceptedClaims {
+            version: version.clone(),
+            manifest_sha256: manifest_sha256.clone(),
+            accepted_at_ms: now_ms(),
+        });
+
+        // If the standing result is the claims-changed release being
+        // accepted, rewrite it as an available update so UIs reflect the
+        // choice without waiting for the next poll.
+        if let Some(snapshot) = state.last.as_mut()
+            && let updates::UpdateCheckResult::ClaimsChanged { release, .. } = &snapshot.result
+            && release.version == version
+            && release
+                .manifest_sha256
+                .eq_ignore_ascii_case(&manifest_sha256)
+        {
+            let mut release = release.clone();
+            release.claims_accepted = true;
+            snapshot.result = updates::UpdateCheckResult::UpdateAvailable { release };
+        }
+
+        self.store_update_state(state);
+        Ok(())
     }
 }
 
@@ -1858,6 +1945,8 @@ impl AppCore {
                 config_path: config_dir.join("config.toml"),
                 data_dir,
                 db: tokio::sync::OnceCell::new(),
+                update_state: Mutex::new(None),
+                update_polling: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -1981,6 +2070,70 @@ impl AppCore {
         cfg.account_id = None;
         cfg.account_secret = None;
         cfg.save_to(&self.inner.config_path)
+    }
+
+    // -----------------------------------------------------------------------
+    // Updates — verified update-notification flow (see `updates` module)
+    // -----------------------------------------------------------------------
+
+    /// Run one update check now: fetch the GitHub release marked `latest`
+    /// from the resolved feed, verify its `artifact-manifest.json` Sigstore
+    /// bundle against the embedded trust root, compare attested claims, and
+    /// persist the outcome. Infallible — every failure mode is a typed
+    /// [`updates::UpdateCheckResult`] variant.
+    pub async fn update_check(&self) -> updates::UpdateCheckSnapshot {
+        let inner = self.inner.clone();
+        match self
+            .runtime
+            .spawn(async move { inner.run_update_check().await })
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(e) => updates::UpdateCheckSnapshot {
+                checked_at_ms: now_ms(),
+                result: updates::UpdateCheckResult::CheckFailed {
+                    message: format!("update check task failed: {e}"),
+                },
+            },
+        }
+    }
+
+    /// The persisted outcome of the most recent completed check, if any.
+    /// Reflects background polls as well as manual checks.
+    pub fn last_update_check(&self) -> Option<updates::UpdateCheckSnapshot> {
+        self.inner.update_state_snapshot().last
+    }
+
+    /// Record the user's explicit "treat as update" decision for a
+    /// claims-changed release (matched by version + manifest hash). The
+    /// persisted last result is rewritten so UIs immediately see the
+    /// release as an accepted update.
+    pub fn accept_changed_claims(
+        &self,
+        version: String,
+        manifest_sha256: String,
+    ) -> Result<(), AppError> {
+        self.inner.accept_changed_claims(version, manifest_sha256)
+    }
+
+    /// Start the background poll loop: one check immediately, then one
+    /// every [`updates::POLL_INTERVAL`] (~6h) while the process runs.
+    /// Idempotent — at most one loop is ever spawned.
+    pub fn start_update_polling(&self) {
+        if self
+            .inner
+            .update_polling
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            loop {
+                let _ = inner.run_update_check().await;
+                tokio::time::sleep(updates::POLL_INTERVAL).await;
+            }
+        });
     }
 
     // -----------------------------------------------------------------------

@@ -65,6 +65,16 @@ pub struct Config {
     pub hardware_root_ca: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hardware_intermediate_ca: Option<String>,
+    /// Base URL of an alternate update feed (a GitHub-releases-API-shaped
+    /// server), for dev/test fixture servers. Same `*_override` pattern as
+    /// `base_url`: the resolved endpoint comes from [`Config::update_feed_url`],
+    /// which falls back to the trust-root pin.
+    #[serde(
+        rename = "update_feed",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub update_feed_override: Option<String>,
 }
 
 impl Config {
@@ -98,6 +108,19 @@ impl Config {
         self.base_url_override
             .as_deref()
             .unwrap_or(crate::trust_root::SERVER_URL)
+    }
+
+    /// The full URL of the latest-release endpoint the update checker
+    /// polls: `<update_feed override>/releases/latest` when the override is
+    /// set, otherwise the trust-root pin (`UPDATE_DISCOVERY_URL`, the
+    /// GitHub `releases/latest` API). The override is a *base* URL so a
+    /// dev/test fixture server mounts the same `/releases/latest` path the
+    /// real API serves.
+    pub fn update_feed_url(&self) -> String {
+        match self.update_feed_override.as_deref() {
+            Some(base) => format!("{}/releases/latest", base.trim_end_matches('/')),
+            None => crate::trust_root::UPDATE_DISCOVERY_URL.to_string(),
+        }
     }
 
     /// The set of enclave measurements the client will accept on TLS
@@ -351,6 +374,39 @@ tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
         assert_eq!(
             measurements[0].snp_measurement,
             crate::trust_root::SERVER_SNP_MEASUREMENT
+        );
+    }
+
+    #[test]
+    fn update_feed_url_resolves_override_and_pin() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.update_feed_url(),
+            crate::trust_root::UPDATE_DISCOVERY_URL
+        );
+
+        let cfg = Config {
+            update_feed_override: Some("http://127.0.0.1:9999/".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.update_feed_url(),
+            "http://127.0.0.1:9999/releases/latest"
+        );
+    }
+
+    #[test]
+    fn update_feed_override_round_trips_via_toml() {
+        let cfg = Config {
+            update_feed_override: Some("http://localhost:8123".into()),
+            ..Config::default()
+        };
+        let toml_text = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(toml_text.contains("update_feed"));
+        let parsed: Config = toml::from_str(&toml_text).expect("deserialize");
+        assert_eq!(
+            parsed.update_feed_override.as_deref(),
+            Some("http://localhost:8123")
         );
     }
 
