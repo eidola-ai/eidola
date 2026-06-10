@@ -2,7 +2,7 @@
 ///
 /// Each variant maps to a distinct failure mode so callers (CLI, GUI) can
 /// display appropriate feedback without parsing error strings.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AppError {
     /// A required configuration value is missing (base_url, account, etc.).
     #[error("not configured: {message}")]
