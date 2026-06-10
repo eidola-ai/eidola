@@ -6,6 +6,8 @@ Guidance for AI coding agents working on the gpui macOS app. Cross-cutting works
 
 A native Rust client for Eidola, built on [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the immediate-mode UI framework Zed is built on) and [gpui-component](https://github.com/longbridge/gpui-component) (a shadcn-style widget library on top of gpui). The sole macOS GUI for the project; the CLI in `crates/eidola-cli/` shares the same `crates/eidola-app-core/` backend. macOS-only today; Linux is the next target.
 
+**State & async doctrine — read first.** All state ownership, async tasks, and cross-window synchronization follow `docs/architecture/state.md` (domain stores, `Loadable`, task-as-field with replace-cancels, the invalidation bus, `WindowInput`). Where existing code in this crate contradicts the doctrine, the doctrine wins — the migration is in progress; do not extend the old patterns (`Core::spawn`/busy flag, detached tasks, view-owned domain data).
+
 ## Core wrapper (`src/core.rs`)
 
 `AppCore` lives in `crates/eidola-app-core/`; gpui can't host it directly because gpui's executor is smol-based and `AppCore` has its own tokio multi-thread runtime. The bridge:

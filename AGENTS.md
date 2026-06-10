@@ -101,7 +101,7 @@ The per-handshake nonce guarantees *freshness* — the enclave folds our random 
 
 ## App Core Architecture
 
-The GUI app and CLI share a common Rust core (`crates/eidola-app-core/`) consumed as a normal library — no FFI layer. All business logic — config management, local database, HTTP client construction, account operations, wallet/credential management, and chat inference — lives in the core crate. Consumers construct an `AppCore` and call its methods directly.
+The GUI app and CLI share a common Rust core (`crates/eidola-app-core/`) consumed as a normal library — no FFI layer. All business logic — config management, local database, HTTP client construction, account operations, wallet/credential management, and chat inference — lives in the core crate. Consumers construct an `AppCore` and call its methods directly. **State & async doctrine:** how state is owned, shared, mutated, and synchronized (domain stores, the invalidation bus, task ownership, atomicity rules) is governed by `docs/architecture/state.md`. All state-touching code follows it; do not invent parallel patterns.
 
 **Core crate modules:**
 
