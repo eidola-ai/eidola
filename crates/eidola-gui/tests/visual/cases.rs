@@ -16,6 +16,7 @@ use eidola_gui::library::LibraryView;
 use eidola_gui::settings::SettingsView;
 use eidola_gui::wallet::WalletView;
 use gpui::{App, AppContext, Entity, px, size};
+use gpui_markdown_editor::{EditorState, Selection};
 
 use super::harness::Snapshots;
 
@@ -361,6 +362,54 @@ fn register_chat(s: &mut Snapshots) {
                     ],
                 )
             })
+        },
+    );
+
+    // Composer (WYSIWYG markdown editor) populated with the constructs
+    // whose typography has to track the transcript: inline code inside a
+    // paragraph and inside list items, a tight list, and a code fence.
+    // This is the surface where inline-code sizing and list-item spacing
+    // are judged against the prose body under the real Circadian theme +
+    // Newsreader pairing (the editor crate's own snapshots render with
+    // the default system fonts, so they can't catch pairing problems).
+    s.add(
+        "chat_composer_markdown",
+        size(px(900.), px(640.)),
+        |window, cx| {
+            let core = stub_core_with_config(cx);
+            let view = cx.new(|cx| {
+                let view = ChatView::new(core, None, window, cx);
+                view_with_messages(
+                    view,
+                    vec![SpaceMessage {
+                        role: "user".into(),
+                        content: "Transcript turn above the composer, with `inline code` \
+                            for comparison."
+                            .into(),
+                    }],
+                )
+            });
+            let editor = view.read(cx).prompt_editor_for_test();
+            editor.update(cx, |editor, cx| {
+                let markdown = "Drafting a reply that mixes `Runtime::new()` and plain \
+                    prose in one paragraph.\n\
+                    \n\
+                    - the macro rewrites `main` for you\n\
+                    - manual setup hands you a runtime to `block_on`\n\
+                    - both drive the same scheduler\n\
+                    \n\
+                    And a fence for comparison:\n\
+                    \n\
+                    ```rust\n\
+                    let rt = Runtime::new()?;\n\
+                    ```\n";
+                editor.state = EditorState {
+                    markdown: markdown.into(),
+                    selection: Selection::Cursor(0),
+                };
+                cx.notify();
+            });
+            view
         },
     );
 

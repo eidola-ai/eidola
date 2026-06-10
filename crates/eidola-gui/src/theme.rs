@@ -7,9 +7,19 @@
 //! passed) and applies the matching config. We then re-sync every open window
 //! whenever the OS appearance changes.
 //!
-//! The starting palette is lifted from the marketing site
-//! (`www.eidola.ai/index.html`). It will drift; treat the website as the
-//! historical seed, not a contract.
+//! The palettes are anchored on two fixed backgrounds chosen for the
+//! product's "good paper at noon, reading lamp at midnight" feel:
+//!
+//! - **Day**: `#fefaf5` (254,250,245) — warm paper. Every other day surface
+//!   is the same warm family, translated up to track the brighter ground.
+//! - **Night**: `#15191e` (21,25,30) — a cool blue-grey dark. Night
+//!   *surfaces* (cards, chips, borders, rows) follow the blue-grey ramp of
+//!   the anchor, while *text* stays warm-grey and the brand stays warm
+//!   orange — the warm-on-cool tension is deliberate (lamplight on a dark
+//!   desk), so don't "fix" it by cooling the foregrounds.
+//!
+//! An earlier iteration seeded these palettes from the marketing site; the
+//! site is no longer the reference — these anchors are.
 //!
 //! The body font is **Newsreader** (SIL OFL 1.1), shipped as the upstream
 //! `productiontype/Newsreader` 16pt static instances and embedded into the
@@ -117,73 +127,75 @@ fn circadian_day() -> ThemeConfig {
 fn day_colors() -> ThemeConfigColors {
     let mut c = ThemeConfigColors::default();
 
-    // Surfaces
-    c.background = some("#faf7f2"); // bg
-    c.foreground = some("#1e1c19"); // text
-    c.border = some("#dcd6cc"); // rule
-    c.input = some("#e8e2d8"); // card-border
-    c.muted = some("#f4f0e9"); // code-bg
+    // Surfaces — every neutral is the anchor's warm family, translated up
+    // in lightness so cards/chips/rules keep their relative depth on the
+    // brighter paper.
+    c.background = some("#fefaf5"); // anchor: warm paper
+    c.foreground = some("#1e1c19"); // warm ink
+    c.border = some("#e0d9cf"); // hairline rule
+    c.input = some("#ece5db"); // card-border
+    c.muted = some("#f8f3ec"); // code-bg
     c.muted_foreground = some("#696258"); // text-sub
-    c.popover = some("#fffdf9"); // card
+    c.popover = some("#fffefb"); // card
     c.popover_foreground = some("#1e1c19");
-    c.accordion = some("#fffdf9");
+    c.accordion = some("#fffefb");
     c.overlay = some("#1e1c1980");
 
     // Brand / interaction
-    c.primary = some("#94522a"); // accent
-    c.primary_foreground = some("#faf7f2"); // bg, reads best on the warm orange
-    c.primary_hover = some("#824420"); // accent-text (slightly deeper)
+    c.primary = some("#94522a"); // warm orange
+    c.primary_foreground = some("#fefaf5"); // bg, reads best on the warm orange
+    c.primary_hover = some("#824420"); // slightly deeper
     c.primary_active = some("#6e3818");
     c.ring = some("#94522a");
     c.caret = some("#94522a");
     c.selection = some("#94522a");
-    c.link = some("#78411e"); // link
+    c.link = some("#78411e");
     c.link_hover = some("#94522a");
 
-    // Subtle / chip surfaces — the website's tag-bg/tag-text
-    c.secondary = some("#eee8de");
+    // Subtle / chip surfaces
+    c.secondary = some("#f2ebe1");
     c.secondary_foreground = some("#69553c");
-    c.secondary_hover = some("#e6dfd0");
-    c.secondary_active = some("#dcd3c0");
-    c.accent = some("#eee8de");
+    c.secondary_hover = some("#eae2d3");
+    c.secondary_active = some("#e0d6c3");
+    c.accent = some("#f2ebe1");
     c.accent_foreground = some("#69553c");
 
     // Status — keep semantics distinct from the warm orange brand colour.
     c.danger = some("#b3401a");
-    c.danger_foreground = some("#faf7f2");
+    c.danger_foreground = some("#fefaf5");
     c.success = some("#3f7d4a");
-    c.success_foreground = some("#faf7f2");
+    c.success_foreground = some("#fefaf5");
     c.warning = some("#a3741a");
-    c.warning_foreground = some("#faf7f2");
+    c.warning_foreground = some("#fefaf5");
     c.info = some("#3a6f8c");
-    c.info_foreground = some("#faf7f2");
+    c.info_foreground = some("#fefaf5");
 
     // Chrome
-    c.title_bar = some("#faf7f2");
-    c.title_bar_border = some("#e8e2d8");
-    c.tab_bar = some("#faf7f2");
-    c.tab_bar_segmented = some("#eee8de");
-    c.tab = some("#faf7f2");
-    c.tab_active = some("#fffdf9");
+    c.title_bar = some("#fefaf5");
+    c.title_bar_border = some("#ece5db");
+    c.tab_bar = some("#fefaf5");
+    c.tab_bar_segmented = some("#f2ebe1");
+    c.tab = some("#fefaf5");
+    c.tab_active = some("#fffefb");
     c.tab_active_foreground = some("#1e1c19");
     c.tab_foreground = some("#696258");
-    c.sidebar = some("#f2eee6"); // footer-bg
-    c.sidebar_border = some("#e8e2d8");
+    c.sidebar = some("#f6f1e9");
+    c.sidebar_border = some("#ece5db");
     c.sidebar_foreground = some("#1e1c19");
-    c.sidebar_accent = some("#eee8de");
+    c.sidebar_accent = some("#f2ebe1");
     c.sidebar_accent_foreground = some("#69553c");
     c.sidebar_primary = some("#94522a");
-    c.sidebar_primary_foreground = some("#faf7f2");
-    c.group_box = some("#f2eee6");
+    c.sidebar_primary_foreground = some("#fefaf5");
+    c.group_box = some("#f6f1e9");
     c.group_box_foreground = some("#1e1c19");
 
     // Lists / scroll
-    c.list = some("#faf7f2");
-    c.list_even = some("#f4f0e9");
-    c.list_head = some("#f2eee6");
-    c.list_hover = some("#eee8de");
-    c.scrollbar = some("#faf7f200");
-    c.scrollbar_thumb = some("#dcd6cc");
+    c.list = some("#fefaf5");
+    c.list_even = some("#f8f3ec");
+    c.list_head = some("#f6f1e9");
+    c.list_hover = some("#f2ebe1");
+    c.scrollbar = some("#fefaf500");
+    c.scrollbar_thumb = some("#e0d9cf");
     c.scrollbar_thumb_hover = some("#a39a8a");
 
     c
@@ -210,21 +222,25 @@ fn circadian_night() -> ThemeConfig {
 fn night_colors() -> ThemeConfigColors {
     let mut c = ThemeConfigColors::default();
 
-    // Surfaces
-    c.background = some("#141418");
-    c.foreground = some("#d4d0c8");
-    c.border = some("#302e34"); // rule
-    c.input = some("#302e34"); // card-border
-    c.muted = some("#1a1a20"); // code-bg
-    c.muted_foreground = some("#827d73");
-    c.popover = some("#1c1c21"); // card
+    // Surfaces — a blue-grey ramp derived from the anchor (#15191e keeps
+    // R < G < B all the way up, so every elevated surface stays in the
+    // anchor's cool family). The old palette's purple-grey neutrals
+    // (#302e34 etc.) clashed with the new ground; everything here is
+    // re-derived, not carried over.
+    c.background = some("#15191e"); // anchor: cool blue-grey dark
+    c.foreground = some("#d4d0c8"); // warm-grey — the reading-lamp tension
+    c.border = some("#2c343d"); // rule
+    c.input = some("#2c343d"); // card-border
+    c.muted = some("#1b2026"); // code-bg, one step above the ground
+    c.muted_foreground = some("#8a8478");
+    c.popover = some("#20262d"); // card
     c.popover_foreground = some("#d4d0c8");
-    c.accordion = some("#1c1c21");
+    c.accordion = some("#20262d");
     c.overlay = some("#000000a6");
 
-    // Brand / interaction — softened orange on dark
+    // Brand / interaction — softened warm orange on the cool dark
     c.primary = some("#c39669");
-    c.primary_foreground = some("#141418");
+    c.primary_foreground = some("#15191e");
     c.primary_hover = some("#c89e73");
     c.primary_active = some("#a47d52");
     c.ring = some("#c39669");
@@ -233,51 +249,51 @@ fn night_colors() -> ThemeConfigColors {
     c.link = some("#c89e73");
     c.link_hover = some("#d4ae87");
 
-    // Subtle / chip surfaces
-    c.secondary = some("#28262c");
-    c.secondary_foreground = some("#a09482");
-    c.secondary_hover = some("#302e34");
-    c.secondary_active = some("#3b393f");
-    c.accent = some("#28262c");
-    c.accent_foreground = some("#a09482");
+    // Subtle / chip surfaces — cool grounds, warm foregrounds
+    c.secondary = some("#262d35");
+    c.secondary_foreground = some("#a89c88");
+    c.secondary_hover = some("#2c343d");
+    c.secondary_active = some("#333c46");
+    c.accent = some("#262d35");
+    c.accent_foreground = some("#a89c88");
 
     // Status
     c.danger = some("#d2664b");
-    c.danger_foreground = some("#141418");
+    c.danger_foreground = some("#15191e");
     c.success = some("#7eae8a");
-    c.success_foreground = some("#141418");
+    c.success_foreground = some("#15191e");
     c.warning = some("#d2a45a");
-    c.warning_foreground = some("#141418");
+    c.warning_foreground = some("#15191e");
     c.info = some("#7fa4bf");
-    c.info_foreground = some("#141418");
+    c.info_foreground = some("#15191e");
 
     // Chrome
-    c.title_bar = some("#141418");
-    c.title_bar_border = some("#302e34");
-    c.tab_bar = some("#141418");
-    c.tab_bar_segmented = some("#28262c");
-    c.tab = some("#141418");
-    c.tab_active = some("#1c1c21");
+    c.title_bar = some("#15191e");
+    c.title_bar_border = some("#2c343d");
+    c.tab_bar = some("#15191e");
+    c.tab_bar_segmented = some("#262d35");
+    c.tab = some("#15191e");
+    c.tab_active = some("#20262d");
     c.tab_active_foreground = some("#d4d0c8");
-    c.tab_foreground = some("#827d73");
-    c.sidebar = some("#101014"); // footer-bg
-    c.sidebar_border = some("#302e34");
+    c.tab_foreground = some("#8a8478");
+    c.sidebar = some("#10141a"); // a step below the ground
+    c.sidebar_border = some("#2c343d");
     c.sidebar_foreground = some("#d4d0c8");
-    c.sidebar_accent = some("#28262c");
-    c.sidebar_accent_foreground = some("#a09482");
+    c.sidebar_accent = some("#262d35");
+    c.sidebar_accent_foreground = some("#a89c88");
     c.sidebar_primary = some("#c39669");
-    c.sidebar_primary_foreground = some("#141418");
-    c.group_box = some("#1a1a20");
+    c.sidebar_primary_foreground = some("#15191e");
+    c.group_box = some("#1b2026");
     c.group_box_foreground = some("#d4d0c8");
 
     // Lists / scroll
-    c.list = some("#141418");
-    c.list_even = some("#1a1a20");
-    c.list_head = some("#1c1c21");
-    c.list_hover = some("#28262c");
-    c.scrollbar = some("#14141800");
-    c.scrollbar_thumb = some("#302e34");
-    c.scrollbar_thumb_hover = some("#4a474f");
+    c.list = some("#15191e");
+    c.list_even = some("#1b2026");
+    c.list_head = some("#20262d");
+    c.list_hover = some("#262d35");
+    c.scrollbar = some("#15191e00");
+    c.scrollbar_thumb = some("#2c343d");
+    c.scrollbar_thumb_hover = some("#46505c");
 
     c
 }

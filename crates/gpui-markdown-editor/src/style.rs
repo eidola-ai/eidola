@@ -68,6 +68,14 @@ pub struct MarkdownStyle {
     /// Nested blockquotes apply this indent cumulatively, one per
     /// level.
     pub blockquote_indent: Pixels,
+    /// Vertical gap between blocks that live inside a list item,
+    /// expressed as a fraction of `paragraph_gap`. List items should
+    /// read as lines within one block — visibly tighter than the
+    /// paragraph rhythm — with the full `paragraph_gap` (plus
+    /// `container_boundary_gap`) only at the boundary between the
+    /// list and its non-list neighbors. 1.0 reproduces the old
+    /// "every item is a paragraph" spacing.
+    pub list_item_gap_factor: f32,
     /// Horizontal indent contributed by one list-item container —
     /// applied to the leaf content's left edge so each item's content
     /// (marker plus body) sits inset from the surrounding prose. The
@@ -97,9 +105,22 @@ pub struct MarkdownStyle {
     pub caret_color: Hsla,
     pub selection_color: Hsla,
 
+    /// Font family for *inline* code spans. Defaults to
+    /// `mono_font_family`, but is exposed separately because inline
+    /// code sits on the same shaped line as body text: gpui's
+    /// `TextRun` carries no per-run font size, so an inline span
+    /// cannot be sized independently of its line (~0.9× of body is
+    /// what good typography wants when the body is a serif). The
+    /// achievable lever is the *family* — hosts pairing a low-x-height
+    /// body face (e.g. a bookish serif) with a tall mono (Menlo) can
+    /// point this at an x-height-compatible mono so inline code reads
+    /// at the body's visual size, while fenced blocks (whole lines of
+    /// mono, no serif neighbors) keep `mono_font_family`.
+    pub inline_code_font_family: SharedString,
     /// Background color of an inline code span. Defaults to the
-    /// theme's `muted` (same as the outer code-block fill) so block
-    /// and inline code read cohesive.
+    /// theme's `accent` — the same chip color `gpui-component`'s
+    /// `TextView` paints behind inline code in the chat transcript,
+    /// keeping the two surfaces in lockstep.
     pub inline_code_background: Hsla,
     /// Text color for inline link text. Defaults to the theme's
     /// `primary` (the accent color used for actionable text in
@@ -140,6 +161,7 @@ impl MarkdownStyle {
             blockquote_border_inset: px(6.0),
             blockquote_border_color: theme.border,
 
+            list_item_gap_factor: 0.35,
             list_indent: px(8.0),
 
             text_color: theme.foreground,
@@ -148,7 +170,8 @@ impl MarkdownStyle {
             caret_color: theme.caret,
             selection_color: theme.selection,
 
-            inline_code_background: theme.muted,
+            inline_code_font_family: theme.mono_font_family.clone(),
+            inline_code_background: theme.accent,
             link_color: theme.link,
             thematic_break_color: theme.border,
             thematic_break_thickness: px(1.0),
@@ -244,6 +267,21 @@ impl MarkdownStyle {
         self
     }
 
+    pub fn list_item_gap_factor(mut self, factor: f32) -> Self {
+        self.list_item_gap_factor = factor;
+        self
+    }
+
+    pub fn inline_code_font_family(mut self, family: impl Into<SharedString>) -> Self {
+        self.inline_code_font_family = family.into();
+        self
+    }
+
+    pub fn inline_code_background(mut self, bg: Hsla) -> Self {
+        self.inline_code_background = bg;
+        self
+    }
+
     /// Final font size for `level` (1..=6). Uses the callback if set,
     /// otherwise a sensible default.
     pub fn size_for_heading(&self, level: u8) -> Pixels {
@@ -271,7 +309,7 @@ impl MarkdownStyle {
 /// positive values lighten. Used to derive the code-block content
 /// strip color from the outer fill so a Day/Night theme switch keeps
 /// them in proportion automatically.
-fn shift_lightness(mut color: Hsla, delta: f32) -> Hsla {
+pub(crate) fn shift_lightness(mut color: Hsla, delta: f32) -> Hsla {
     color.l = (color.l + delta).clamp(0.0, 1.0);
     color
 }

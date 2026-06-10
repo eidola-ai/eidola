@@ -697,8 +697,10 @@ impl Element for BlockElement {
         let mut style = Style::default();
         let font_size = font_size_for_block(&self.block.kind, &self.style);
         let line_height = font_size * self.style.line_height.0;
-        let spacing_above = spacing_above_for_block(&self.block.kind, &self.style);
-        let spacing_below = spacing_below_for_block(&self.block.kind, &self.style);
+        let spacing_above =
+            spacing_above_for_block(&self.block.kind, &self.block.containers, &self.style);
+        let spacing_below =
+            spacing_below_for_block(&self.block.kind, &self.block.containers, &self.style);
         let extra_above = container_boundary_extra(
             &self.block.containers,
             self.prev_containers.as_deref(),
@@ -965,7 +967,8 @@ impl Element for BlockElement {
         let style = self.style.clone();
         let font_size = font_size_for_block(&self.block.kind, &style);
         let line_height = font_size * style.line_height.0;
-        let spacing_above = spacing_above_for_block(&self.block.kind, &style);
+        let spacing_above =
+            spacing_above_for_block(&self.block.kind, &self.block.containers, &style);
         let extra_above = container_boundary_extra(
             &self.block.containers,
             self.prev_containers.as_deref(),
@@ -1148,7 +1151,8 @@ impl Element for BlockElement {
             }
         }
 
-        let spacing_below = spacing_below_for_block(&self.block.kind, &style);
+        let spacing_below =
+            spacing_below_for_block(&self.block.kind, &self.block.containers, &style);
         let extra_below = container_boundary_extra(
             &self.block.containers,
             self.next_containers.as_deref(),
@@ -1607,6 +1611,23 @@ impl Element for BlockElement {
             });
         } else {
             // Non-code blocks: no mask, no split.
+            //
+            // Run backgrounds (the inline-code chip fill carried on
+            // `TextRun::background_color`) paint first so the
+            // selection wash and the glyphs layer on top of them.
+            // `WrappedLine::paint` itself only draws glyphs +
+            // underline/strikethrough — backgrounds need the explicit
+            // `paint_background` pass or the chip never shows.
+            for laid in &prepaint.laid_out.lines {
+                let _ = laid.line.paint_background(
+                    laid.origin,
+                    laid.row_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
             for tq in selection_quads {
                 window.paint_quad(tq.quad);
             }
@@ -2201,7 +2222,22 @@ fn font_size_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
 /// content rows. With the previous "all above" model the bar extended
 /// roughly a `paragraph_gap` above the text top and stopped at the
 /// text bottom, which read as visually unbalanced.
-fn spacing_above_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
+///
+/// Blocks inside a list item (`containers` carries a
+/// `Container::ListItem`) tighten the non-heading factor by
+/// `style.list_item_gap_factor`: list items should read as lines
+/// within a block, not as full paragraphs. The full `paragraph_gap`
+/// re-appears at the list ↔ neighbor boundary because the non-list
+/// neighbor contributes its own untightened half plus the
+/// `container_boundary_extra` both sides add when chains differ.
+fn spacing_above_for_block(
+    kind: &BlockKind,
+    containers: &[Container],
+    style: &MarkdownStyle,
+) -> Pixels {
+    let in_list_item = containers
+        .iter()
+        .any(|c| matches!(c, Container::ListItem { .. }));
     let rems_factor = match kind {
         BlockKind::Heading { level } if *level <= 2 => 1.5,
         BlockKind::Heading { .. } => 1.25,
@@ -2209,7 +2245,13 @@ fn spacing_above_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
         | BlockKind::CodeBlock { .. }
         | BlockKind::ThematicBreak
         | BlockKind::DisplayMath { .. }
-        | BlockKind::Image { .. } => style.paragraph_gap.0,
+        | BlockKind::Image { .. } => {
+            if in_list_item {
+                style.paragraph_gap.0 * style.list_item_gap_factor
+            } else {
+                style.paragraph_gap.0
+            }
+        }
     };
     px(f32::from(style.font_size) * rems_factor / 2.0)
 }
@@ -2220,8 +2262,12 @@ fn spacing_above_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
 /// Mixed-kind transitions (e.g. paragraph → heading) average the two
 /// factors instead of using just the next block's, which slightly
 /// smooths the visual rhythm without disturbing same-kind sequences.
-fn spacing_below_for_block(kind: &BlockKind, style: &MarkdownStyle) -> Pixels {
-    spacing_above_for_block(kind, style)
+fn spacing_below_for_block(
+    kind: &BlockKind,
+    containers: &[Container],
+    style: &MarkdownStyle,
+) -> Pixels {
+    spacing_above_for_block(kind, containers, style)
 }
 
 /// Structural equality for two chain entries — ignores
@@ -2866,11 +2912,14 @@ fn build_runs_for_line(
 
         let merged = here_style;
         let mut run_font = base_font.clone();
-        // Inline code swaps the run's font family to mono. Don't
-        // override the heading weight — bold inline code inside a
-        // heading should still shape with the heading's weight.
+        // Inline code swaps the run's font family to the inline-code
+        // face (defaults to the mono family; see
+        // `MarkdownStyle::inline_code_font_family` for why it's a
+        // separate knob). Don't override the heading weight — bold
+        // inline code inside a heading should still shape with the
+        // heading's weight.
         if merged.code {
-            run_font.family = style.mono_font_family.clone();
+            run_font.family = style.inline_code_font_family.clone();
         }
         if merged.bold || base_weight == FontWeight::BOLD {
             run_font.weight = FontWeight::BOLD;
