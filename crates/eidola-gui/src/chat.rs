@@ -122,8 +122,11 @@ pub struct OnboardingFlow {
     /// flow on the plans page while the first prices/balances fetch is in
     /// flight, instead of flashing the blank page between the two states.
     pub entered_plans: bool,
-    /// A plans-data fetch has been kicked off for the current visit to the
-    /// plans stage. Guards the observe-driven auto-fetch from looping.
+    /// A plans-data fetch has actually started (or the prices were already
+    /// cached) for the current visit to the plans stage. Guards the
+    /// observe-driven auto-fetch from looping. Deliberately *not* set when
+    /// `Core::spawn`'s busy-debounce drops the call — the busy op's
+    /// completion notify is the retry trigger.
     plans_fetch_attempted: bool,
     /// The 3s balance-poll loop is already running.
     poll_running: bool,
@@ -326,8 +329,12 @@ impl ChatView {
             self.onboarding.plans_fetch_attempted = true;
             return;
         }
-        self.onboarding.plans_fetch_attempted = true;
-        self.core.update(cx, |core, cx| core.fetch_plans_data(cx));
+        // Latch only if the fetch actually started: `Core::spawn` silently
+        // drops the call while another core op is in flight (e.g. the
+        // startup fetch), and that op's completion notify is what re-runs
+        // us for the retry.
+        self.onboarding.plans_fetch_attempted =
+            self.core.update(cx, |core, cx| core.fetch_plans_data(cx));
     }
 
     /// "Begin" on the welcome page: create the anonymous account. There is
@@ -358,12 +365,15 @@ impl ChatView {
                     Ok(_) => {
                         // Move straight to the plans step: refresh the
                         // config snapshot (has_account flips true) and
-                        // fetch prices + the initial (zero) balance.
+                        // fetch prices + the initial (zero) balance. The
+                        // latch tracks whether the fetch actually started —
+                        // if the startup fetch is still busy the call is
+                        // dropped, and `maybe_fetch_plans_data` retries on
+                        // that op's completion notify.
                         this.onboarding.entered_plans = true;
-                        this.onboarding.plans_fetch_attempted = true;
-                        this.core.update(cx, |core, cx| {
+                        this.onboarding.plans_fetch_attempted = this.core.update(cx, |core, cx| {
                             core.refresh_config(cx);
-                            core.fetch_plans_data(cx);
+                            core.fetch_plans_data(cx)
                         });
                     }
                     Err(e) => this.onboarding.create_error = Some(e.to_string()),
@@ -1146,11 +1156,11 @@ impl ChatView {
                             .hover(|s| s.text_color(theme.foreground))
                             .child("Try again")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.onboarding.plans_fetch_attempted = true;
-                                this.core.update(cx, |core, cx| {
-                                    core.clear_error(cx);
-                                    core.fetch_plans_data(cx);
-                                });
+                                this.onboarding.plans_fetch_attempted =
+                                    this.core.update(cx, |core, cx| {
+                                        core.clear_error(cx);
+                                        core.fetch_plans_data(cx)
+                                    });
                             })),
                     );
             } else {

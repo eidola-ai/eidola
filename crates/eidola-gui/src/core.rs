@@ -323,9 +323,13 @@ impl Core {
     /// Fetch the data the onboarding plans page needs — prices and a fresh
     /// balance snapshot — in a single `spawn` (see `fetch_chat_startup` for
     /// why they're combined).
-    pub fn fetch_plans_data(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// Returns whether the fetch actually started (see `spawn`): callers
+    /// latch `plans_fetch_attempted` on this, so a busy-debounced drop stays
+    /// retryable on the next core notification.
+    pub fn fetch_plans_data(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(core) = self.inner.clone() else {
-            return;
+            return false;
         };
         self.spawn(
             cx,
@@ -342,7 +346,7 @@ impl Core {
                 }
                 Err(e) => this.set_error(e, cx),
             },
-        );
+        )
     }
 
     pub fn allocate_credits(&mut self, credits: i64, cx: &mut Context<Self>) {
@@ -393,23 +397,30 @@ impl Core {
     // Internal: bridge a tokio future into the gpui main-thread context.
     // ------------------------------------------------------------------
 
+    /// Returns whether the work was actually spawned: `false` when debounced
+    /// by `busy` or on a stub core. Callers that latch "I already fetched"
+    /// state must only set the latch on `true` — a dropped call completes no
+    /// future and updates no cache, so latching it would wedge the UI on
+    /// stale emptiness (the core notifies when the busy op finishes, which is
+    /// the retry signal).
     fn spawn<MakeFut, Fut, T, OnDone>(
         &mut self,
         cx: &mut Context<Self>,
         make_fut: MakeFut,
         on_done: OnDone,
-    ) where
+    ) -> bool
+    where
         MakeFut: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<T, AppError>> + Send + 'static,
         T: Send + 'static,
         OnDone: FnOnce(&mut Core, Result<T, AppError>, &mut Context<Core>) + 'static,
     {
         if self.busy {
-            return;
+            return false;
         }
         let Some(inner) = self.inner.as_ref() else {
             // Stub core (snapshot tests) — no backend to drive.
-            return;
+            return false;
         };
         self.busy = true;
         self.error_message = None;
@@ -435,6 +446,7 @@ impl Core {
             });
         });
         task.detach();
+        true
     }
 
     // ------------------------------------------------------------------
