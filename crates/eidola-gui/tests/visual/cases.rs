@@ -18,6 +18,7 @@ use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
 use eidola_gui::stores::{Stores, StoresStub};
 use eidola_gui::updates::UpdatesView;
+use eidola_gui::window_input::WindowInput;
 use gpui::{App, AppContext, px, size};
 use gpui_markdown_editor::{EditorState, Selection};
 
@@ -169,7 +170,7 @@ fn register_onboarding(s: &mut Snapshots) {
             let stores = stub_stores(cx, |s| {
                 s.config_state = Some(stub_config_state(false));
             });
-            cx.new(|cx| ChatView::new(stores, None, window, cx))
+            cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx))
         },
     );
 
@@ -186,7 +187,7 @@ fn register_onboarding(s: &mut Snapshots) {
                 });
                 s.prices = stub_prices();
             });
-            cx.new(|cx| ChatView::new(stores, None, window, cx))
+            cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx))
         },
     );
 
@@ -204,7 +205,7 @@ fn register_onboarding(s: &mut Snapshots) {
                 s.prices = stub_prices();
             });
             cx.new(|cx| {
-                let mut view = ChatView::new(stores, None, window, cx);
+                let mut view = ChatView::new(stores, None, WindowInput::new(cx), window, cx);
                 view.onboarding_mut_for_test().awaiting_checkout = true;
                 view
             })
@@ -226,7 +227,7 @@ fn register_onboarding(s: &mut Snapshots) {
                 s.prices = stub_prices();
             });
             cx.new(|cx| {
-                let mut view = ChatView::new(stores, None, window, cx);
+                let mut view = ChatView::new(stores, None, WindowInput::new(cx), window, cx);
                 view.set_messages_for_test(
                     vec![SpaceMessage {
                         role: "user".into(),
@@ -280,7 +281,7 @@ fn stub_prices() -> Vec<PriceInfo> {
 fn register_chat(s: &mut Snapshots) {
     s.add("chat_empty", size(px(900.), px(640.)), |window, cx| {
         let core = stub_stores_with_config(cx);
-        cx.new(|cx| ChatView::new(core, None, window, cx))
+        cx.new(|cx| ChatView::new(core, None, WindowInput::new(cx), window, cx))
     });
 
     // Narrow window — guards that the chapter delimiter tracks the prose
@@ -294,7 +295,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_stores_with_config(cx);
             cx.new(|cx| {
-                let view = ChatView::new(core, None, window, cx);
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
                 view_with_messages(
                     view,
                     vec![
@@ -332,7 +333,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_stores_with_config(cx);
             cx.new(|cx| {
-                let view = ChatView::new(core, None, window, cx);
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
                 view_with_messages(
                     view,
                     vec![
@@ -364,7 +365,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_stores_with_config(cx);
             cx.new(|cx| {
-                let view = ChatView::new(core, None, window, cx);
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
                 view_with_messages(
                     view,
                     vec![
@@ -392,7 +393,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_stores_with_config(cx);
             cx.new(|cx| {
-                let view = ChatView::new(core, None, window, cx);
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
                 view_with_messages(
                     view,
                     vec![
@@ -422,7 +423,7 @@ fn register_chat(s: &mut Snapshots) {
                 s.config_state = Some(stub_config_state(true));
             });
             cx.new(|cx| {
-                let view = ChatView::new(core, None, window, cx);
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
                 // Push a few messages directly into the view's state so we can
                 // render the populated chat without driving any async work.
                 view_with_messages(
@@ -457,7 +458,7 @@ fn register_chat(s: &mut Snapshots) {
                 s.config_state = Some(stub_config_state(true));
             });
             cx.new(|cx| {
-                let view = ChatView::new(core, None, window, cx);
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
                 view_with_messages(
                     view,
                     vec![
@@ -501,7 +502,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_stores_with_config(cx);
             let view = cx.new(|cx| {
-                let view = ChatView::new(core, None, window, cx);
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
                 view_with_messages(
                     view,
                     vec![SpaceMessage {
@@ -547,7 +548,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = model_stores(cx);
             cx.new(|cx| {
-                let mut view = ChatView::new(core, None, window, cx);
+                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
                 view.set_messages_for_test(
                     vec![
                         SpaceMessage {
@@ -564,7 +565,7 @@ fn register_chat(s: &mut Snapshots) {
                     ],
                     cx,
                 );
-                view.set_alt_held_for_test(true);
+                view.set_alt_held_for_test(true, cx);
                 view
             })
         },
@@ -580,7 +581,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = model_stores(cx);
             cx.new(|cx| {
-                let mut view = ChatView::new(core, None, window, cx);
+                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
                 view.set_messages_for_test(
                     vec![SpaceMessage {
                         role: "user".into(),
@@ -590,7 +591,7 @@ fn register_chat(s: &mut Snapshots) {
                 );
                 view.select_model("kimi-k2-6".into(), cx);
                 view.set_model_picker_open_for_test(true);
-                view.set_alt_held_for_test(true);
+                view.set_alt_held_for_test(true, cx);
                 view
             })
         },
@@ -599,7 +600,7 @@ fn register_chat(s: &mut Snapshots) {
     s.add("chat_thinking", size(px(900.), px(640.)), |window, cx| {
         let core = stub_stores_with_config(cx);
         cx.new(|cx| {
-            let view = ChatView::new(core, None, window, cx);
+            let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
             // Empty streaming response — renders the collapsed "Thinking…"
             // header with no body yet, the moment after the user submits.
             view_streaming(view, StreamingResponse::default(), cx)
@@ -617,7 +618,7 @@ fn register_chat(s: &mut Snapshots) {
             // visible alongside the answer.
             let core = stub_stores_with_config(cx);
             cx.new(|cx| {
-                let mut view = ChatView::new(core, None, window, cx);
+                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
                 view.set_messages_for_test(
                     vec![
                         SpaceMessage {
@@ -658,7 +659,7 @@ fn register_chat(s: &mut Snapshots) {
         |window, cx| {
             let core = stub_stores_with_config(cx);
             cx.new(|cx| {
-                let view = ChatView::new(core, None, window, cx);
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
                 let view = view_with_messages(
                     view,
                     vec![SpaceMessage {
@@ -854,7 +855,7 @@ fn register_settings(s: &mut Snapshots) {
     // General at rest: base URL pin, advanced rows hidden behind ⌥.
     s.add("settings_general", settings_size, |window, cx| {
         let core = settings_stores(cx);
-        cx.new(|cx| SettingsView::new(core, window, cx))
+        cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx))
     });
 
     // ⌥ held: advanced rows visible, with an overridden base URL and a
@@ -876,7 +877,7 @@ fn register_settings(s: &mut Snapshots) {
             state.trusted_measurements_are_override = true;
             s.config_state = Some(state);
         });
-        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
         let general = view.read(cx).general();
         general.update(cx, |g, cx| g.set_advanced(true, cx));
         view
@@ -885,7 +886,7 @@ fn register_settings(s: &mut Snapshots) {
     // Account pane: balance, pools with humanized expiry, plans.
     s.add("settings_account", settings_size, |window, cx| {
         let core = settings_stores(cx);
-        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
         view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
         view
     });
@@ -896,7 +897,7 @@ fn register_settings(s: &mut Snapshots) {
         settings_size,
         |window, cx| {
             let core = settings_stores(cx);
-            let view = cx.new(|cx| SettingsView::new(core, window, cx));
+            let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
             view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
             let account = view.read(cx).account();
             account.update(cx, |a, cx| a.request_reset(cx));
@@ -907,7 +908,7 @@ fn register_settings(s: &mut Snapshots) {
     // Wallet pane: the four lifecycle states in one honest listing.
     s.add("settings_wallet", settings_size, |window, cx| {
         let core = settings_stores(cx);
-        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
         view.update(cx, |v, cx| v.select(SettingsPane::Wallet, cx));
         view
     });

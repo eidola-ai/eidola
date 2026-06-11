@@ -16,6 +16,7 @@ pub mod stores;
 pub mod theme;
 pub mod updates;
 pub mod wallet;
+pub mod window_input;
 
 use gpui::{
     App, AppContext, Bounds, KeyBinding, Menu, MenuItem, OsAction, TitlebarOptions, WindowBounds,
@@ -34,6 +35,7 @@ use crate::record::RecordView;
 use crate::settings::SettingsView;
 use crate::stores::Stores;
 use crate::updates::UpdatesView;
+use crate::window_input::WindowInput;
 
 /// Application-scoped state. Stored as a gpui global so action handlers
 /// (which only get `&mut App`) can reach it.
@@ -555,7 +557,8 @@ fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
 
     let _ = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        let view = cx.new(|cx| ChatView::new(stores.clone(), space_id.clone(), window, cx));
+        let wi = WindowInput::new(cx);
+        let view = cx.new(|cx| ChatView::new(stores.clone(), space_id.clone(), wi, window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
 
@@ -660,7 +663,8 @@ fn open_settings_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        let view = cx.new(|cx| SettingsView::new(stores.clone(), window, cx));
+        let wi = WindowInput::new(cx);
+        let view = cx.new(|cx| SettingsView::new(stores.clone(), wi, window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
 

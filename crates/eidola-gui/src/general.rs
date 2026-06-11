@@ -4,11 +4,16 @@
 //! is the trust-root **pin** baked into the binary or a user **override**
 //! (with a one-click revert back to the pin). Everything else — attestation
 //! URL, domain separator, hardware CAs, trusted measurements — is advanced
-//! configuration that appears only while **⌥ is held** (tracked via
-//! `on_modifiers_changed` on the pane root; gpui delivers modifier changes
-//! to every painted element that registers, so no focus gymnastics needed).
-//! Measurement rows summarize and link to the Record window instead of
-//! dumping truncated hex.
+//! configuration that appears only while **⌥ is held**.
+//!
+//! The ⌥ state comes from the per-window `WindowInput` entity. `SettingsView`
+//! (the root) is the one view that registers `on_modifiers_changed` and
+//! mirrors events into it; `GeneralView` observes the entity here. This is
+//! the fix for wave-2 bug 2: gpui dispatches `ModifiersChangedEvent` along
+//! the focused element's ancestor path only, so a listener on this sibling
+//! pane would be dead while a text input in the Account/Wallet pane (or the
+//! Base URL field on this pane) has focus. Measurement rows summarize and
+//! link to the Record window instead of dumping truncated hex.
 
 use gpui::{
     AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
@@ -25,20 +30,32 @@ use gpui_component::{
 
 use crate::actions::OpenRecord;
 use crate::stores::ConfigStore;
+use crate::window_input::WindowInput;
 
 pub struct GeneralView {
     config: Entity<ConfigStore>,
     base_url_state: Entity<InputState>,
     /// Whether the Base URL row is in its edit state (input + save/cancel).
     editing_base_url: bool,
-    /// Whether the ⌥-revealed advanced section is visible. Mirrors the live
-    /// Option-key state via `on_modifiers_changed`.
+    /// Whether the ⌥-revealed advanced section is visible. Driven by the
+    /// per-window `WindowInput` entity observed below; `set_advanced` is the
+    /// single path (observer + behavior tests).
     advanced: bool,
     _subscriptions: Vec<Subscription>,
 }
 
 impl GeneralView {
-    pub fn new(config: Entity<ConfigStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// `window_input` is the per-window modifier entity owned by
+    /// `SettingsView`. This view observes it so ⌥ transitions fire
+    /// `set_advanced` regardless of which pane or input has focus in the
+    /// window — the fix for wave-2 bug 2. `GeneralView` never registers its
+    /// own `on_modifiers_changed` listener.
+    pub fn new(
+        config: Entity<ConfigStore>,
+        window_input: Entity<WindowInput>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let initial = config
             .read(cx)
             .state()
@@ -51,7 +68,17 @@ impl GeneralView {
                 .default_value(&initial)
         });
 
-        let _subscriptions = vec![cx.observe(&config, |_, _, cx| cx.notify())];
+        let _subscriptions = vec![
+            cx.observe(&config, |_, _, cx| cx.notify()),
+            // Mirror ⌥ transitions into the advanced flag. The observer fires
+            // whenever `WindowInput` emits (on every modifier change), so this
+            // is always in sync with the root's listener — even while a text
+            // input in a sibling pane has focus.
+            cx.observe(&window_input, |this: &mut Self, wi, cx| {
+                let alt = wi.read(cx).alt_held();
+                this.set_advanced(alt, cx);
+            }),
+        ];
 
         Self {
             config,
@@ -135,15 +162,10 @@ impl Render for GeneralView {
         let state = store.state().cloned();
         let error = store.error().map(|e| e.to_string());
 
-        let mut col = v_flex()
-            .id("general-pane")
-            .px_6()
-            .py_5()
-            .gap_4()
-            .w_full()
-            .on_modifiers_changed(cx.listener(|this, e: &gpui::ModifiersChangedEvent, _, cx| {
-                this.set_advanced(e.modifiers.alt, cx);
-            }));
+        // Note: ⌥ state is driven by the `WindowInput` observer installed in
+        // `new`; there is no `on_modifiers_changed` listener here. See the
+        // module doc for why the listener lives on the `SettingsView` root.
+        let mut col = v_flex().id("general-pane").px_6().py_5().gap_4().w_full();
 
         col = col.child(section_header("Server", cx));
 

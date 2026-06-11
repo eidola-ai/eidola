@@ -26,6 +26,7 @@ use eidola_gui::settings::{SettingsPane, SettingsView};
 use eidola_gui::stores::{Stores, StoresStub};
 use eidola_gui::updates::{UpdatesDisplay, UpdatesView, relative_time};
 use eidola_gui::wallet::WalletView;
+use eidola_gui::window_input::WindowInput;
 use gpui::{
     AnyWindowHandle, AppContext, Entity, Modifiers, TestAppContext, VisualTestContext,
     WindowOptions,
@@ -148,7 +149,7 @@ fn wallet_view_constructs_against_stub_stores(cx: &mut TestAppContext) {
 fn chat_submit_with_empty_prompt_is_noop(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores.clone(), None, window, cx))
+        cx.new(|cx| ChatView::new(stores.clone(), None, WindowInput::new(cx), window, cx))
     });
 
     view.read_with(cx, |v, cx| {
@@ -174,7 +175,7 @@ fn chat_submit_with_empty_prompt_is_noop(cx: &mut TestAppContext) {
 fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores.clone(), None, window, cx))
+        cx.new(|cx| ChatView::new(stores.clone(), None, WindowInput::new(cx), window, cx))
     });
 
     // Populate the prompt editor the same way a user would, then dispatch
@@ -228,7 +229,7 @@ fn chat_renders_markdown_messages_without_panicking(cx: &mut TestAppContext) {
     // of how many block elements its content parses into.
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores.clone(), None, window, cx))
+        cx.new(|cx| ChatView::new(stores.clone(), None, WindowInput::new(cx), window, cx))
     });
 
     view.update(cx, |v, cx| {
@@ -268,7 +269,15 @@ fn chat_view_records_existing_space_id(cx: &mut TestAppContext) {
     // the next submit continues the space instead of creating a new one.
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores.clone(), Some("space-123".into()), window, cx))
+        cx.new(|cx| {
+            ChatView::new(
+                stores.clone(),
+                Some("space-123".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
     });
     cx.run_until_parked();
 
@@ -282,7 +291,15 @@ fn chat_view_records_existing_space_id(cx: &mut TestAppContext) {
 fn stale_initial_space_load_does_not_replace_submitted_prompt(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores.clone(), Some("space-123".into()), window, cx))
+        cx.new(|cx| {
+            ChatView::new(
+                stores.clone(),
+                Some("space-123".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
     });
 
     let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
@@ -331,7 +348,15 @@ fn chat_view_renders_preloaded_messages(cx: &mut TestAppContext) {
     // produces: messages installed after construction.
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores.clone(), Some("space-123".into()), window, cx))
+        cx.new(|cx| {
+            ChatView::new(
+                stores.clone(),
+                Some("space-123".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
     });
 
     view.update(cx, |v, cx| {
@@ -370,10 +395,26 @@ fn two_windows_on_one_space_share_state(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
 
     let (window_a, view_a) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores.clone(), Some("space-shared".into()), window, cx))
+        cx.new(|cx| {
+            ChatView::new(
+                stores.clone(),
+                Some("space-shared".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
     });
     let (_window_b, view_b) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores.clone(), Some("space-shared".into()), window, cx))
+        cx.new(|cx| {
+            ChatView::new(
+                stores.clone(),
+                Some("space-shared".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
     });
     cx.run_until_parked();
 
@@ -447,9 +488,9 @@ fn alt_reveals_model_label(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_chat(cx, &stores);
 
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, cx| {
         assert!(
-            !v.model_revealed(),
+            !v.model_revealed(cx),
             "resting state is invisible — no model chrome until ⌥"
         );
     });
@@ -462,14 +503,17 @@ fn alt_reveals_model_label(cx: &mut TestAppContext) {
         alt: true,
         ..Modifiers::default()
     });
-    view.read_with(&vcx, |v, _| {
-        assert!(v.model_revealed(), "holding ⌥ must reveal the model label");
+    view.read_with(&vcx, |v, cx| {
+        assert!(
+            v.model_revealed(cx),
+            "holding ⌥ must reveal the model label"
+        );
     });
 
     vcx.simulate_modifiers_change(Modifiers::default());
-    view.read_with(&vcx, |v, _| {
+    view.read_with(&vcx, |v, cx| {
         assert!(
-            !v.model_revealed(),
+            !v.model_revealed(cx),
             "releasing ⌥ must return the page to its resting state"
         );
     });
@@ -490,10 +534,10 @@ fn picker_stays_open_after_alt_release(cx: &mut TestAppContext) {
 
     let mut vcx = VisualTestContext::from_window(window, cx);
     vcx.simulate_modifiers_change(Modifiers::default());
-    view.read_with(&vcx, |v, _| {
+    view.read_with(&vcx, |v, cx| {
         assert!(v.model_picker_open());
         assert!(
-            v.model_revealed(),
+            v.model_revealed(cx),
             "the open picker keeps its anchor label revealed"
         );
     });
@@ -1241,7 +1285,7 @@ fn relative_time_buckets(cx: &mut TestAppContext) {
 fn settings_nav_switches_panes(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
     });
 
     view.read_with(cx, |v, _| {
@@ -1266,7 +1310,7 @@ fn general_option_reveal_tracks_modifier_state(cx: &mut TestAppContext) {
     // live alt state — this drives the same method.
     let stores = stub_stores_with_config(cx);
     let (_window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(stores.clone(), window, cx))
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
     });
 
     let general = view.read_with(cx, |v, _| v.general());
@@ -1280,6 +1324,50 @@ fn general_option_reveal_tracks_modifier_state(cx: &mut TestAppContext) {
     // Releasing ⌥ hides it again.
     general.update(cx, |g, cx| g.set_advanced(false, cx));
     general.read_with(cx, |g, _| assert!(!g.advanced()));
+}
+
+/// Bug replay: wave-2 bug 2 — the Settings > General ⌥ reveal was dead
+/// because `ModifiersChangedEvent` dispatches along the focused element's
+/// ancestor path only. A `GeneralView`-local listener never fired while a
+/// text input in a sibling pane (or the Base URL input inside General itself)
+/// had focus. The fix: one listener on the `SettingsView` root (always an
+/// ancestor of whatever is focused) that mirrors events into `WindowInput`;
+/// `GeneralView` observes that entity.
+///
+/// This test replays the dispatch through `VisualTestContext::simulate_modifiers_change`
+/// (the same platform-event path as production — no mock shortcuts).
+#[gpui::test]
+fn settings_general_option_reveal_works_via_root_listener(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+    });
+
+    let general = view.read_with(cx, |v, _| v.general());
+    general.read_with(cx, |g, _| {
+        assert!(!g.advanced(), "advanced section hidden at rest");
+    });
+
+    // Drive the real modifier-changed dispatch path: platform event →
+    // window → gpui focus dispatch chain → `SettingsView` root listener →
+    // `WindowInput::update_modifiers` → `GeneralView` observer →
+    // `GeneralView::set_advanced(true)`.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_modifiers_change(Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    });
+    general.read_with(&vcx, |g, _| {
+        assert!(
+            g.advanced(),
+            "⌥ held must reveal advanced rows via the root listener"
+        );
+    });
+
+    vcx.simulate_modifiers_change(Modifiers::default());
+    general.read_with(&vcx, |g, _| {
+        assert!(!g.advanced(), "releasing ⌥ must hide advanced rows");
+    });
 }
 
 #[gpui::test]
@@ -1484,7 +1572,7 @@ fn stub_stores_with_config(cx: &mut TestAppContext) -> Stores {
 fn open_chat(cx: &mut TestAppContext, stores: &Stores) -> (AnyWindowHandle, Entity<ChatView>) {
     let stores = stores.clone();
     open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores.clone(), None, window, cx))
+        cx.new(|cx| ChatView::new(stores.clone(), None, WindowInput::new(cx), window, cx))
     })
 }
 

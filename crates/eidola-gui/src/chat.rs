@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::window_input::WindowInput;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{ModelInfo, SpaceMessage};
 use gpui::{
@@ -136,10 +137,11 @@ pub struct ChatView {
     /// list below the transcript's error band (not a modal).
     pub show_plans_after_error: bool,
 
-    /// Whether ⌥ is currently held (tracked via the root element's
-    /// `on_modifiers_changed`). While true, the model label reveals in the
-    /// title-bar band; at rest the page shows no model chrome at all.
-    alt_held: bool,
+    /// Per-window modifier state. The root registers the window's single
+    /// `on_modifiers_changed` listener and mirrors every event here.
+    /// `ChatView` observes this entity for the ⌥-reveal and picker-anchor
+    /// behavior; it never registers its own modifier listener.
+    window_input: Entity<WindowInput>,
     /// Whether the model picker panel is open (⌥⌘M or clicking the
     /// revealed label). The label stays revealed while the picker is open
     /// so the picker keeps its visual anchor after ⌥ is released.
@@ -258,9 +260,10 @@ impl ChatView {
     }
 
     /// Whether the model label is currently revealed in the title-bar band:
-    /// while ⌥ is held, or while the picker it anchors is open.
-    pub fn model_revealed(&self) -> bool {
-        self.alt_held || self.model_picker_open
+    /// while ⌥ is held (via `WindowInput`), or while the picker it anchors
+    /// is open.
+    pub fn model_revealed(&self, cx: &gpui::App) -> bool {
+        self.window_input.read(cx).alt_held() || self.model_picker_open
     }
 
     /// Whether the model picker panel is open.
@@ -279,20 +282,6 @@ impl ChatView {
             .read(cx)
             .last_submitted_model()
             .map(str::to_string)
-    }
-
-    /// Track ⌥ for the title-bar reveal. Registered on the root element via
-    /// `on_modifiers_changed`, so it fires for every modifier transition
-    /// while this window's focus chain is active.
-    pub fn handle_modifiers_changed(
-        &mut self,
-        event: &ModifiersChangedEvent,
-        cx: &mut Context<Self>,
-    ) {
-        if self.alt_held != event.modifiers.alt {
-            self.alt_held = event.modifiers.alt;
-            cx.notify();
-        }
     }
 
     /// Toggle the model picker (⌥⌘M, or clicking the revealed label).
@@ -324,9 +313,12 @@ impl ChatView {
 
     /// Test-only setter for the ⌥-reveal state, so snapshot tests can render
     /// the revealed label without synthesizing platform modifier events.
+    /// Writes through to the `WindowInput` entity so `model_revealed` stays
+    /// consistent.
     #[doc(hidden)]
-    pub fn set_alt_held_for_test(&mut self, alt: bool) {
-        self.alt_held = alt;
+    pub fn set_alt_held_for_test(&mut self, alt: bool, cx: &mut Context<Self>) {
+        self.window_input
+            .update(cx, |wi, cx| wi.set_alt_for_test(alt, cx));
     }
 
     /// Test-only setter for the picker's open state.
@@ -342,9 +334,15 @@ impl ChatView {
     /// reopens an existing space (the Library's path): its messages are
     /// loaded asynchronously on construction and the next exchange
     /// continues that space.
+    ///
+    /// `window_input` is the per-window modifier entity created by
+    /// `open_chat_window`. The root view's `on_modifiers_changed` listener
+    /// mirrors every modifier event into it; `ChatView` observes it for the
+    /// ⌥ reveal and never registers its own modifier listener.
     pub fn new(
         stores: Stores,
         space_id: Option<String>,
+        window_input: Entity<WindowInput>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -432,6 +430,10 @@ impl ChatView {
             }),
             cx.observe(&space, |_, _, cx| cx.notify()),
             cx.subscribe_in(&space, window, Self::on_space_event),
+            // Re-render when ⌥ transitions so the title-bar reveal responds
+            // immediately. The modifier state itself lives in `window_input`;
+            // the root view's single listener mirrors it there.
+            cx.observe(&window_input, |_, _, cx| cx.notify()),
         ];
 
         Self {
@@ -445,7 +447,7 @@ impl ChatView {
             error: None,
             onboarding: OnboardingFlow::default(),
             show_plans_after_error: false,
-            alt_held: false,
+            window_input,
             model_picker_open: false,
             focus_handle,
             _subscriptions,
@@ -787,6 +789,7 @@ impl Render for ChatView {
         };
 
         let theme = cx.theme();
+        let wi = self.window_input.clone();
         v_flex()
             .key_context("ChatView")
             .track_focus(&self.focus_handle)
@@ -797,8 +800,13 @@ impl Render for ChatView {
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
             }))
-            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
-                this.handle_modifiers_changed(event, cx)
+            // Single modifier listener for this window: mirrors every event
+            // into `WindowInput` so all descendant views observe it rather
+            // than registering their own listeners on non-ancestor elements.
+            .on_modifiers_changed(cx.listener(move |_, event: &ModifiersChangedEvent, _, cx| {
+                wi.update(cx, |wi, cx| {
+                    wi.update_modifiers(event, cx);
+                });
             }))
             .relative()
             .size_full()
@@ -1602,7 +1610,7 @@ impl ChatView {
                 linear_color_stop(bg.opacity(0.0), 1.0),
             ));
 
-        if stage == OnboardingStage::Ready && self.model_revealed() {
+        if stage == OnboardingStage::Ready && self.model_revealed(cx) {
             band = band.child(
                 div()
                     .id("model-label")
