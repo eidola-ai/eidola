@@ -97,16 +97,19 @@ impl SpacesStore {
     }
 
     /// Mint a blank space for ⌘N: id-less, instant, no transcript load. The
-    /// registry adopts it once its first exchange persists and assigns an id
-    /// (watched via the space's `StreamEnded` event).
+    /// registry adopts it once its first exchange persists and assigns an id —
+    /// whether that exchange *succeeds* (`StreamEnded`) or *fails after the
+    /// space was persisted* (`Failed`, where app-core's `ChatFailed` wrapper let
+    /// the space learn its id). Both events populate `Space::id()` before they
+    /// fire, so a single `adopt_blank` covers both.
     pub fn blank(&mut self, cx: &mut Context<Self>) -> Entity<Space> {
         let app_core = self.app_core.clone();
         let entity = cx.new(|_| Space::blank(app_core));
         let weak = entity.downgrade();
-        // Watch for the first id assignment: `StreamEnded` only fires after a
-        // finalized exchange, at which point `Space::id()` is populated.
         let sub = cx.subscribe(&entity, |this, space, event, cx| {
-            if let SpaceEvent::StreamEnded = event {
+            // `adopt_blank` is a no-op when the id is still `None` (a `Failed`
+            // before the space was persisted — e.g. `NoAccount` — never adopts).
+            if matches!(event, SpaceEvent::StreamEnded | SpaceEvent::Failed(_)) {
                 this.adopt_blank(&space, cx);
             }
         });

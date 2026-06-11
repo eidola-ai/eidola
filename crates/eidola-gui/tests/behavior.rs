@@ -479,6 +479,108 @@ fn two_windows_on_one_space_share_state(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+fn blank_space_adopts_id_on_wrapped_failure(cx: &mut TestAppContext) {
+    use eidola_gui::space::Space;
+
+    // A blank ⌘N space (id=None) whose FIRST exchange FAILS after the space was
+    // persisted must still learn its id — app-core wraps the post-persist error
+    // as `ChatFailed { space_id }`. The registry adopts the now-id'd entity on
+    // `Failed` exactly as it does on `StreamEnded`, so a later open of that id
+    // shares the SAME entity (no fork).
+    let stores = stub_stores_with_config(cx);
+
+    // Mint a blank space through the registry (this installs the adoption
+    // subscription on the SpacesStore).
+    let blank: Entity<Space> = stores.spaces.update(cx, |store, cx| store.blank(cx));
+    cx.run_until_parked();
+    blank.read_with(cx, |s, _| assert!(s.id().is_none(), "blank starts id-less"));
+
+    // Drive the wrapped-failure path: the same logic as `spawn_stream`'s error
+    // arm (adopt id from wrapper, emit `Failed` with the unwrapped source).
+    let wrapped = AppError::ChatFailed {
+        space_id: "space-adopted".into(),
+        source: Box::new(AppError::Server {
+            status: 500,
+            message: "upstream blew up".into(),
+        }),
+    };
+    blank.update(cx, |s, cx| s.apply_chat_failure_for_test(wrapped, cx));
+    cx.run_until_parked();
+
+    // The entity learned its id from the wrapper…
+    blank.read_with(cx, |s, _| {
+        assert_eq!(s.id(), Some("space-adopted"), "id adopted on failure");
+    });
+
+    // …and the registry adopted it: opening that id returns the SAME entity.
+    let reopened = stores
+        .spaces
+        .update(cx, |store, cx| store.open("space-adopted".into(), cx));
+    assert_eq!(
+        reopened.entity_id(),
+        blank.entity_id(),
+        "registry must adopt the blank on Failed — open(id) returns the same entity, no fork"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Account view — lifecycle failure surfacing
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn account_op_error_surfaces_and_clears(cx: &mut TestAppContext) {
+    // `AccountStore::create_account` must store its `Err` (honest-states rule:
+    // the Settings button can't silently do nothing). The banner renders from
+    // the stored error; the next attempt clears it.
+    let stores = stub_stores(cx, |s| {
+        // No account yet — the Account pane shows the "Create account" button.
+        s.config_state = Some(config_state(false));
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores.clone(), window, cx))
+    });
+    cx.run_until_parked();
+
+    // No error at rest.
+    stores.account.read_with(cx, |s, _| {
+        assert!(s.account_op_error().is_none(), "no error at rest");
+    });
+
+    // Stub a failing op by setting the field directly (no failing backend in
+    // the stub harness).
+    stores.account.update(cx, |s, cx| {
+        s.set_account_op_error_for_test(
+            Some(AppError::Network {
+                message: "create failed".into(),
+            }),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    stores.account.read_with(cx, |s, _| {
+        assert_eq!(
+            s.account_op_error().map(|e| e.to_string()),
+            Some("network error: create failed".to_string()),
+            "the failure is stored, not dropped",
+        );
+    });
+    // The view renders without panicking with the error present (the banner).
+    view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+
+    // A retry clears the error at the start of the attempt. On a stub there is
+    // no backend, so `create_account` clears the field and early-returns.
+    stores.account.update(cx, |s, cx| s.create_account(cx));
+    cx.run_until_parked();
+    stores.account.read_with(cx, |s, _| {
+        assert!(
+            s.account_op_error().is_none(),
+            "the next attempt clears the prior error",
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Chat view — model picker
 // ---------------------------------------------------------------------------

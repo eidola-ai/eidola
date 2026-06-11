@@ -497,7 +497,22 @@ impl Space {
                     let _ = this.update(cx, |this, cx| {
                         this.streaming = None;
                         this.submit_runner = None;
-                        cx.emit(SpaceEvent::Failed(e));
+                        // Blank-space id adoption on the FAILURE path: app-core
+                        // wraps any post-persist error as `ChatFailed` carrying
+                        // the now-persisted space id. If this is the first
+                        // exchange of a blank space (id still `None`), learn the
+                        // id from the wrapper so the registry can adopt this
+                        // entity (mirroring the `StreamEnded` success path) — a
+                        // later open of that id then shares this same `Space`.
+                        if this.id.is_none()
+                            && let Some(id) = e.chat_space_id()
+                        {
+                            this.id = Some(id.to_string());
+                        }
+                        // Surface the *unwrapped* source so the view's error
+                        // routing (and band copy) sees the real error variant,
+                        // not the id-carrying wrapper.
+                        cx.emit(SpaceEvent::Failed(e.root().clone()));
                         cx.notify();
                     });
                 }
@@ -568,5 +583,22 @@ impl Space {
         cx: &mut Context<Self>,
     ) -> bool {
         self.apply_loaded_transcript(Ok(messages), cx)
+    }
+
+    /// Test-only: drive the chat-failure outcome exactly as `spawn_stream`'s
+    /// error arm does — adopt the id from a `ChatFailed` wrapper if the space
+    /// is still blank, clear streaming, and emit `Failed` with the unwrapped
+    /// source. Drives the blank-space id-adoption-on-failure regression test.
+    #[doc(hidden)]
+    pub fn apply_chat_failure_for_test(&mut self, error: AppError, cx: &mut Context<Self>) {
+        self.streaming = None;
+        self.submit_runner = None;
+        if self.id.is_none()
+            && let Some(id) = error.chat_space_id()
+        {
+            self.id = Some(id.to_string());
+        }
+        cx.emit(SpaceEvent::Failed(error.root().clone()));
+        cx.notify();
     }
 }

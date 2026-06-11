@@ -720,7 +720,12 @@ impl ChatView {
     /// it); this method only sets the *window-local* error band + degraded
     /// onboarding presentation.
     pub fn apply_chat_failure(&mut self, e: AppError, cx: &mut Context<Self>) {
-        if matches!(e, AppError::InsufficientBalance { .. }) {
+        // Look through app-core's `ChatFailed` id-carrying wrapper before
+        // routing on variant. The `Space` already emits the unwrapped source,
+        // but `root()` keeps this correct if a wrapped error ever reaches here
+        // directly.
+        let root = e.root();
+        if matches!(root, AppError::InsufficientBalance { .. }) {
             self.show_plans_after_error = true;
             if !self.account.read(cx).prices().has_value() {
                 self.account.update(cx, |s, cx| {
@@ -729,7 +734,7 @@ impl ChatView {
                 });
             }
         }
-        self.error = Some(e.to_string());
+        self.error = Some(root.to_string());
         cx.notify();
     }
 
