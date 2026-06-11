@@ -160,6 +160,9 @@ impl Render for AccountView {
             .error()
             .or_else(|| account.prices().error())
             .map(|e| e.to_string());
+        // The last account create/reset failure, if any — surfaced so the
+        // Settings button never silently does nothing (honest-states rule).
+        let account_op_error = account.account_op_error().map(|e| e.to_string());
 
         let mut col = v_flex().px_6().py_5().gap_4().w_full();
 
@@ -236,6 +239,12 @@ impl Render for AccountView {
                             })),
                     ),
                 );
+        }
+
+        // Account create/reset failure — rendered right under the Account
+        // controls so a failed button click is never silent.
+        if let Some(err) = account_op_error.as_deref() {
+            col = col.child(error_banner(err, cx));
         }
 
         // --- Balance ------------------------------------------------------

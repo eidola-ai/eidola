@@ -33,6 +33,10 @@ pub struct AccountStore {
     /// Slot for the fire-and-notify `create_account` op (its own slot so it
     /// never cancels a balances/prices refresh).
     lifecycle_task: Option<Task<()>>,
+    /// The last account-lifecycle write error (create / reset), or `None`.
+    /// Honest-states rule: a failed Settings button must say so. Cleared at the
+    /// start of the next attempt and on success; rendered by `AccountView`.
+    account_op_error: Option<AppError>,
 }
 
 impl AccountStore {
@@ -44,6 +48,7 @@ impl AccountStore {
             balances_task: None,
             prices_task: None,
             lifecycle_task: None,
+            account_op_error: None,
         }
     }
 
@@ -63,6 +68,7 @@ impl AccountStore {
             balances_task: None,
             prices_task: None,
             lifecycle_task: None,
+            account_op_error: None,
         }
     }
 
@@ -171,21 +177,52 @@ impl AccountStore {
 
     // -- Account lifecycle writes ------------------------------------------
 
+    /// The last account-lifecycle (create / reset) error, if the most recent
+    /// attempt failed. Cleared at the start of the next attempt and on success.
+    pub fn account_op_error(&self) -> Option<&AppError> {
+        self.account_op_error.as_ref()
+    }
+
+    /// Test-only: set the account-op error directly so a behavior test can
+    /// render the failure banner without a failing backend.
+    #[doc(hidden)]
+    pub fn set_account_op_error_for_test(
+        &mut self,
+        error: Option<AppError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.account_op_error = error;
+        cx.notify();
+    }
+
     /// Create an account as a fire-and-notify store op (the Account settings
     /// pane's "Create account" button). Refreshes prices+balances on success;
     /// on a real backend it also emits `Change::Config`/`Change::Account`.
+    /// On failure the error is **stored** (honest-states rule — the button must
+    /// not silently do nothing) and rendered by `AccountView`.
     pub fn create_account(&mut self, cx: &mut Context<Self>) {
+        // Clear any prior error at the start of this attempt.
+        self.account_op_error = None;
+        cx.notify();
         let Some(core) = self.app_core.clone() else {
             return;
         };
         let task = cx.spawn(async move |this, cx| {
             let result = bridge(core, |c| async move { c.account_create().await }).await;
-            if result.is_ok() {
-                let _ = this.update(cx, |this, cx| {
-                    this.refresh_prices(cx);
-                    this.refresh_balances(cx);
-                });
-            }
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => {
+                        this.account_op_error = None;
+                        this.refresh_prices(cx);
+                        this.refresh_balances(cx);
+                    }
+                    Err(e) => {
+                        // Surface the failure instead of dropping it.
+                        this.account_op_error = Some(e);
+                        cx.notify();
+                    }
+                }
+            });
         });
         // Own the task in its own slot (not `.detach()`): it dies with the
         // store, never cancels a balances/prices refresh, and the result drives
@@ -195,14 +232,22 @@ impl AccountStore {
     }
 
     /// Reset the account (forget local keys). Synchronous core write; refreshes
-    /// the local cells to their now-empty state on the next bus tick.
+    /// the local cells to their now-empty state on the next bus tick. A failed
+    /// reset is stored (same honest-states treatment as create) and rendered.
     pub fn reset_account(&mut self, cx: &mut Context<Self>) {
+        self.account_op_error = None;
         let Some(core) = self.app_core.as_ref() else {
+            cx.notify();
             return;
         };
-        if core.reset_account().is_ok() {
-            self.balances = Loadable::NotLoaded;
-            self.balances_task = None;
+        match core.reset_account() {
+            Ok(()) => {
+                self.balances = Loadable::NotLoaded;
+                self.balances_task = None;
+            }
+            Err(e) => {
+                self.account_op_error = Some(e);
+            }
         }
         cx.notify();
     }
