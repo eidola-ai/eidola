@@ -3,6 +3,17 @@
   "source_repo": "tinfoilsh/confidential-model-router",
   "allowed": [
     {
+      "git_tag": "v0.0.107",
+      "built_at": "2026-06-05T15:54:28Z",
+      "artifact_digest": "sha256:634dfbd697de5f500256a62de43ff05070f11799cec3b373272c5c3802e82c1d",
+      "rekor_log_index": 1784388217,
+      "snp_measurement": "2b4c88e7dff7e4266d7bd280214b9007c11c0cb24c88336cb3c5e86eb612d0caee198de898a6ad64ca5038b9710304b2",
+      "tdx_measurement": {
+        "rtmr1": "46658ae5655794d3ea0130e2d425aa002f224c7a47c1eb1792f656d79f808aac6006ce84d71ee24d97c3eea42c867e51",
+        "rtmr2": "a57104fcc1641c29bb475d60be4265db6c11b4fae2f66ee33bbf25961bc54e3f4a8678069bc1ad7f1d843262b9704be9"
+      }
+    },
+    {
       "git_tag": "v0.0.106",
       "built_at": "2026-06-05T15:54:28Z",
       "artifact_digest": "sha256:0990a601cfaa6c8e88220b93f1ec8d771541aba9cf1dcc40b45cdb19f41796df",
@@ -11,17 +22,6 @@
       "tdx_measurement": {
         "rtmr1": "46658ae5655794d3ea0130e2d425aa002f224c7a47c1eb1792f656d79f808aac6006ce84d71ee24d97c3eea42c867e51",
         "rtmr2": "f43a9c66c563ef6684547880d085c3d2c5107e541f43d95b78f1c337960cf1989a6b401f148bc7f8b9e8b38d1570688e"
-      }
-    },
-    {
-      "git_tag": "v0.0.105",
-      "built_at": "2026-06-03T06:43:29Z",
-      "artifact_digest": "sha256:f439b8be320991b9e0b7ff59a118ca593b729436f1ff4788b10d5cb7130ad5cd",
-      "rekor_log_index": 1707906694,
-      "snp_measurement": "98262919d9dad02a669b4535c6c8c067a048b891352c80eff7fac5f50704764e209957e69de613e5cc3da6c497212f1d",
-      "tdx_measurement": {
-        "rtmr1": "9394ed8545c0af39a16370210f516e709495194d62ab64f03535cae1edc5c7932912df360b53a5302d106900587f7192",
-        "rtmr2": "f0aedbaeab5600038c430fafd8f8c9ca5c741041f8e6b083dc59408f130331c8b9a357b803f8b6e0af17770c1c223bf7"
       }
     }
   ]
