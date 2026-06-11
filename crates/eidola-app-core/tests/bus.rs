@@ -13,22 +13,46 @@
 //!
 //! ## Error-path emission coverage
 //!
-//! The partial-failure emissions added to `chat` and `chat_stream` require an
-//! HTTP server fixture to exercise end-to-end. The three error paths and their
-//! test status:
+//! The partial-failure emissions in `chat` and `chat_stream` require an HTTP
+//! server fixture to exercise end-to-end. The rule (`docs/architecture/state.md`,
+//! "every write emits"): **every explicit error exit AFTER the user-action
+//! commit emits `Change::Space(id)` plus `Change::SpaceIndex` when
+//! `is_new_space || auto_titled`**, mirroring the non-2xx arm — and *also*
+//! `Change::Record` once the request row is committed. The complete exit-point
+//! map (both functions now reorder the new-space row insert to AFTER credential
+//! resolution, so the rows below exist only once spendability is known):
 //!
 //! | Exit point | Writes committed | Emissions | Tested here |
 //! |---|---|---|---|
-//! | `chat`/`chat_stream` — `insert_pre_credential_refund` succeeds, any later step fails | Credential in `spending` state | `Wallet` | No — needs HTTP to reach that write |
-//! | `chat`/`chat_stream` — network-error arm, `process_refund` returns `Ok` | Successor credential written | `Wallet` | No — needs HTTP + network-failure injection |
-//! | `chat` — non-2xx response, after `insert_request` | Space, user-message, request rows | `Space(id)`, optionally `SpaceIndex`, `Record` | No — needs HTTP returning non-2xx |
-//! | `chat_stream` — non-2xx response, after `insert_request` inside that branch | Space, user-message, request rows | `Space(id)`, optionally `SpaceIndex`, `Record`; `Wallet` if refund recovered | No — needs HTTP returning non-2xx |
+//! | Pre-space failure (config, `NoAccount`, `InsufficientBalance`, zero-charge, `ensure_spendable_credential`) | **none** (new-space insert is deferred) | none — pure error, no orphan space | bus unit tests assert "no emit on error" |
+//! | `chat`/`chat_stream` — `insert_pre_credential_refund` succeeds, later step fails | Credential in `spending` state | `Wallet` | No — needs HTTP to reach that write |
+//! | `chat`/`chat_stream` — network-error arm (`send` `Err`), `process_refund` `Ok` | Successor credential + user turn | `Wallet`, `Space(id)`, `SpaceIndex`? | No — needs HTTP + network-failure injection |
+//! | `chat`/`chat_stream` — network-error arm, no refund recovered | User turn | `Space(id)`, `SpaceIndex`? | No — needs HTTP + network-failure injection |
+//! | `chat` (Ok arm) — `flush_attestations` / `resp.text()` / response JSON parse fails | User turn | `Space(id)`, `SpaceIndex`? | No — needs HTTP |
+//! | `chat` — refund-from-body `process_refund` fails | User turn | `Space(id)`, `SpaceIndex`? | No — needs HTTP |
+//! | `chat_stream` (Ok arm) — `flush_attestations` fails | User turn | `Space(id)`, `SpaceIndex`? | No — needs HTTP |
+//! | `chat_stream` — mid-SSE read failure (`chunk` `Err`) | User turn | `Space(id)`, `SpaceIndex`? | No — needs HTTP streaming |
+//! | `chat` — non-2xx response, after `insert_request` | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record` | No — needs HTTP returning non-2xx |
+//! | `chat_stream` — non-2xx response, after `insert_request` inside that branch | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record`; `Wallet` if refund recovered | No — needs HTTP returning non-2xx |
 //!
-//! These are asserted-by-inspection of the emit placement in `lib.rs`. The
-//! happy-path tests below confirm that the success-path emissions remain intact
-//! and that the shared infrastructure (bus capacity, multi-subscriber delivery)
-//! works. An integration test suite with a wiremock server would be the right
-//! place to add the error-path assertions.
+//! `SpaceIndex?` = emitted only when `is_new_space || auto_titled`. Plain `?` on
+//! the intervening local-DB action/content/antecedent inserts stays *unemitted*
+//! — those are internal-consistency (kill-`-9`-class) failures, not durable
+//! partial state a subscriber needs to reconcile.
+//!
+//! **Failure-path id adoption (item C).** Every error returned *after* the
+//! new-space row is persisted is wrapped as `AppError::ChatFailed { space_id }`
+//! (its `Display` defers to the source, so messages don't regress). This lets a
+//! blank GUI `Space` (id=`None`) learn its persisted id on failure even though
+//! no `ChatResult` was produced. Pre-space errors stay unwrapped. Unit-tested in
+//! `error.rs` (`chat_failed_display_defers_to_source`, `root_unwraps_*`,
+//! `chat_space_id_only_on_wrapper`).
+//!
+//! These emission placements are asserted-by-inspection in `lib.rs`. The
+//! happy-path tests below confirm the success-path emissions remain intact and
+//! that the shared infrastructure (bus capacity, multi-subscriber delivery)
+//! works. An integration suite with a wiremock server would be the right place
+//! to add the error-path assertions.
 
 use eidola_app_core::{AppCore, changes::Change};
 

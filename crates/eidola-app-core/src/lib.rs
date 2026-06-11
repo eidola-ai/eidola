@@ -1249,7 +1249,15 @@ impl Inner {
         let model_participant_id =
             db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
 
-        // Reuse existing space or create a new one
+        // Resolve the target space id WITHOUT inserting a new-space row yet.
+        // For an existing space we validate it and ensure the model
+        // participant; for a new (blank) space we only *mint* the id here and
+        // defer `insert_space` until after credential resolution, so a typed
+        // onboarding failure (`NoAccount` / `InsufficientBalance`) leaves no
+        // orphaned empty space behind. Nothing between this point and the
+        // deferred insert depends on the new space's row existing: the prior
+        // context query and charge estimation below see an empty history for a
+        // brand-new id (no actions yet), exactly as before.
         let (space_id, space_title) = if let Some(sid) = space_id {
             let row =
                 db::get_space(&db_conn, sid)
@@ -1263,17 +1271,12 @@ impl Inner {
                     .await; // ignore duplicate
             (sid.to_string(), row.title)
         } else {
-            let sid = Uuid::now_v7().to_string();
-            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
-            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
-                .await?;
-            db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
-                .await?;
-            (sid, None)
+            (Uuid::now_v7().to_string(), None)
         };
 
         // Load prior actions to build multi-turn context — needed both for
-        // credit estimation (total prompt size) and message assembly.
+        // credit estimation (total prompt size) and message assembly. For a
+        // freshly-minted (not-yet-inserted) space this is empty.
         let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
         let prior_messages = actions_to_messages(&prior_action_rows);
 
@@ -1300,6 +1303,26 @@ impl Inner {
         let cred = self
             .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
             .await?;
+
+        // Spendability is now known — durable writes from here on are safe.
+        // Insert the deferred new-space row (item A): a typed onboarding failure
+        // above (`NoAccount` / `InsufficientBalance`) left zero durable trace.
+        // From this point the space is persisted, so every error exit is wrapped
+        // with the space id (`wrap`) — closing the blank-space id-adoption gap
+        // (item C) so a `Space` entity learns its id even when the first
+        // exchange fails.
+        if is_new_space {
+            db::insert_space(&db_conn, &space_id, None, "unlinked", now).await?;
+            db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
+                .await?;
+            db::insert_space_participant(&db_conn, &space_id, &model_participant_id, "member", now)
+                .await?;
+        }
+        // Carries the now-persisted space id on any error returned below.
+        let wrap = |source: AppError| AppError::ChatFailed {
+            space_id: space_id.clone(),
+            source: Box::new(source),
+        };
 
         let credit_token =
             CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
@@ -1428,23 +1451,45 @@ impl Inner {
             .await;
         let response_at = now_ms();
 
+        // Emit the space changes committed by the user turn (space row +
+        // user-message, and the auto-title) so every window sees the persisted
+        // user turn even when the request itself fails. Mirrors the non-2xx
+        // arm's emissions, minus `Record` (the request row is not committed at
+        // these earlier exits). Call this before any error exit between here and
+        // the request-row insert.
+        let emit_user_turn = || {
+            if is_new_space || auto_titled {
+                self.bus.emit(Change::SpaceIndex);
+            }
+            self.bus.emit(Change::Space(space_id.clone()));
+        };
+
         let (status, response_text, body) = match chat_result {
             Ok(resp) => {
                 if let Some(new_cid) =
                     flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now)
-                        .await?
+                        .await
+                        .inspect_err(|_| emit_user_turn())
+                        .map_err(wrap)?
                 {
                     connection_id = Some(new_cid);
                 }
 
                 let status = resp.status();
-                let text = resp.text().await.map_err(|e| AppError::Network {
-                    message: format!("failed to read response: {e}"),
-                })?;
-                let parsed: serde_json::Value =
-                    serde_json::from_str(&text).map_err(|e| AppError::Network {
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|e| AppError::Network {
+                        message: format!("failed to read response: {e}"),
+                    })
+                    .inspect_err(|_| emit_user_turn())
+                    .map_err(wrap)?;
+                let parsed: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| AppError::Network {
                         message: format!("failed to parse response JSON: {e}"),
-                    })?;
+                    })
+                    .inspect_err(|_| emit_user_turn())
+                    .map_err(wrap)?;
                 (status, text, parsed)
             }
             Err(e) => {
@@ -1469,7 +1514,11 @@ impl Inner {
                     // Successor credential written — wallet state updated.
                     self.bus.emit(Change::Wallet);
                 }
-                return Err(original_err);
+                // The user turn (space row + user-message, auto-title) is
+                // already committed — emit it so other windows see the persisted
+                // turn, then wrap with the space id for blank-space adoption.
+                emit_user_turn();
+                return Err(wrap(original_err));
             }
         };
 
@@ -1488,7 +1537,9 @@ impl Inner {
                 cred.generation + 1,
                 now,
             )
-            .await?;
+            .await
+            .inspect_err(|_| emit_user_turn())
+            .map_err(wrap)?;
             refund_stored = true;
         }
 
@@ -1618,10 +1669,10 @@ impl Inner {
             }
             self.bus.emit(Change::Space(space_id.clone()));
             self.bus.emit(Change::Record);
-            return Err(AppError::Server {
+            return Err(wrap(AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
-            });
+            }));
         }
 
         // All durable writes succeeded — emit one message per affected domain.
@@ -1711,6 +1762,11 @@ impl Inner {
         let model_participant_id =
             db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
 
+        // Resolve the target space id WITHOUT inserting a new-space row yet
+        // (item A — mirrors `chat`). For a new (blank) space we only mint the
+        // id; `insert_space` is deferred until after credential resolution so a
+        // typed onboarding failure leaves no orphaned empty space. The prior
+        // context query below sees an empty history for a brand-new id.
         let (space_id, space_title) = if let Some(sid) = space_id {
             let row =
                 db::get_space(&db_conn, sid)
@@ -1723,13 +1779,7 @@ impl Inner {
                     .await;
             (sid.to_string(), row.title)
         } else {
-            let sid = Uuid::now_v7().to_string();
-            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
-            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
-                .await?;
-            db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
-                .await?;
-            (sid, None)
+            (Uuid::now_v7().to_string(), None)
         };
 
         let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
@@ -1757,6 +1807,23 @@ impl Inner {
         let cred = self
             .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
             .await?;
+
+        // Spendability is now known — insert the deferred new-space row (item A)
+        // and prepare the space-id wrapper (item C). From this point the space
+        // is persisted, so every error exit carries the space id for blank-space
+        // adoption.
+        if is_new_space {
+            db::insert_space(&db_conn, &space_id, None, "unlinked", now).await?;
+            db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
+                .await?;
+            db::insert_space_participant(&db_conn, &space_id, &model_participant_id, "member", now)
+                .await?;
+        }
+        // Carries the now-persisted space id on any error returned below.
+        let wrap = |source: AppError| AppError::ChatFailed {
+            space_id: space_id.clone(),
+            source: Box::new(source),
+        };
 
         let credit_token =
             CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
@@ -1886,11 +1953,23 @@ impl Inner {
             .send()
             .await;
 
+        // Emit the space changes committed by the user turn (space row +
+        // user-message + auto-title) so other windows see the persisted turn
+        // even when the request itself fails, before the request row is written.
+        let emit_user_turn = || {
+            if is_new_space || auto_titled {
+                self.bus.emit(Change::SpaceIndex);
+            }
+            self.bus.emit(Change::Space(space_id.clone()));
+        };
+
         let resp = match chat_result {
             Ok(resp) => {
                 if let Some(new_cid) =
                     flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now)
-                        .await?
+                        .await
+                        .inspect_err(|_| emit_user_turn())
+                        .map_err(wrap)?
                 {
                     connection_id = Some(new_cid);
                 }
@@ -1916,7 +1995,9 @@ impl Inner {
                     // Successor credential written — wallet state updated.
                     self.bus.emit(Change::Wallet);
                 }
-                return Err(original_err);
+                // User turn is committed — emit it, then wrap with the space id.
+                emit_user_turn();
+                return Err(wrap(original_err));
             }
         };
 
@@ -1974,10 +2055,10 @@ impl Inner {
             }
             self.bus.emit(Change::Space(space_id.clone()));
             self.bus.emit(Change::Record);
-            return Err(AppError::Server {
+            return Err(wrap(AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
-            });
+            }));
         }
 
         // Consume the SSE body. We accumulate bytes in a small buffer and
@@ -1994,9 +2075,15 @@ impl Inner {
         let mut finished = false;
 
         while let Some(chunk) = byte_stream.next().await {
-            let bytes = chunk.map_err(|e| AppError::Network {
-                message: format!("stream read failed: {e}"),
-            })?;
+            let bytes = chunk
+                .map_err(|e| AppError::Network {
+                    message: format!("stream read failed: {e}"),
+                })
+                // Mid-stream read failure: the user turn is committed (the
+                // request row is not yet) — emit the user turn so other windows
+                // see it, then wrap with the space id for blank-space adoption.
+                .inspect_err(|_| emit_user_turn())
+                .map_err(wrap)?;
             // Keep the raw bytes for the request log so we can debug
             // upstream behaviour the same way as the non-streaming path.
             response_buf.extend_from_slice(&bytes);
