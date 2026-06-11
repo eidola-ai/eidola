@@ -17,6 +17,10 @@ actions!(
         /// Bound to ⌘L on macOS. Singleton, like Settings: re-invoking
         /// raises the existing window.
         OpenLibrary,
+        /// Show the Record window — the raw local trail of attestations,
+        /// requests, and spending. Bound to ⇧⌘L on macOS (sibling of the
+        /// Library's ⌘L). Singleton, like Settings and Library.
+        OpenRecord,
         /// Close the focused window (chat or settings). Bound to ⌘W on
         /// macOS. Closing the last chat window does not quit the app —
         /// that's ⌘Q.
@@ -25,6 +29,10 @@ actions!(
         Quit,
         /// Show the About panel.
         About,
+        /// Show the Updates window (singleton, like Settings) and run a
+        /// manual update check. Lives in the Eidola menu directly under
+        /// "About Eidola" — the standard macOS placement.
+        CheckForUpdates,
         /// Hide the application (macOS App menu standard, ⌘H).
         Hide,
         /// Hide all other applications (macOS App menu standard, ⌥⌘H).

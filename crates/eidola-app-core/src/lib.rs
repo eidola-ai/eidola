@@ -1,8 +1,10 @@
+pub mod changes;
 pub mod config;
 pub mod db;
 pub mod error;
 pub mod trust_root;
 pub mod updater;
+pub mod updates;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -19,6 +21,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
 use error::AppError;
 
@@ -35,10 +38,24 @@ use error::AppError;
 #[derive(Clone, Debug)]
 pub struct ConfigState {
     pub base_url: String,
+    /// The resolved default inference model: the user's `default_model`
+    /// config override if set, otherwise the embedded fallback
+    /// ([`config::DEFAULT_MODEL`]).
+    pub default_model: String,
+    /// The trust-root pin baked into this binary. Equal to `base_url` unless
+    /// the user has set an override — the UI uses the pair to be honest
+    /// about override-vs-pin instead of presenting one undifferentiated URL.
+    pub base_url_pin: String,
+    /// Whether `base_url` comes from a user override (`true`) or the
+    /// embedded trust-root pin (`false`).
+    pub base_url_is_override: bool,
     pub has_account: bool,
     pub has_account_secret: bool,
     pub domain_separator: String,
     pub trusted_measurements: Vec<MeasurementInfo>,
+    /// Whether `trusted_measurements` is a user override list (`true`) or
+    /// the single pinned build measurement (`false`).
+    pub trusted_measurements_are_override: bool,
     pub has_hardware_root_ca: bool,
     pub has_hardware_intermediate_ca: bool,
     pub attestation_url: Option<String>,
@@ -147,6 +164,118 @@ pub struct SpaceMessage {
 pub struct ModelInfo {
     pub id: String,
     pub context_length: u64,
+    /// Credits charged per prompt token. Credits are micro-USD-denominated,
+    /// so this is numerically the same as USD per million prompt tokens.
+    /// Zero for per-request-priced models.
+    pub prompt_credits_per_token: f64,
+    /// Credits charged per completion token (see
+    /// [`prompt_credits_per_token`](Self::prompt_credits_per_token)).
+    pub completion_credits_per_token: f64,
+    /// Flat per-request price for models that charge per request rather
+    /// than per token (e.g. transcription); `None` for token-priced models.
+    pub request_credits: Option<f64>,
+}
+
+/// One credential row with its lifecycle state, as computed by the local
+/// `credential_lifecycle` view: `active` (spendable), `spending` (a spend
+/// proof is in flight / unsettled), `spent` (settled into a successor), or
+/// `expired` (issuer key past its expiry).
+#[derive(Clone, Debug)]
+pub struct CredentialLifecycleInfo {
+    pub nonce: String,
+    pub credits: i64,
+    pub generation: i64,
+    pub created_at: i64,
+    pub state: String,
+    /// For `spending`/`spent` credentials, the amount charged by the
+    /// in-flight (or settled) spend.
+    pub spend_amount: Option<i64>,
+}
+
+/// One row of the attestation listing in the Record.
+#[derive(Clone, Debug)]
+pub struct AttestationInfo {
+    pub hash: String,
+    pub pcr_digest: Option<String>,
+    pub created_at: i64,
+    /// Size of the stored raw document, in bytes.
+    pub doc_bytes: i64,
+    /// Number of recorded connections that presented this attestation.
+    pub connection_count: i64,
+}
+
+/// The full raw attestation document for the Record's detail view.
+#[derive(Clone, Debug)]
+pub struct AttestationDetail {
+    pub hash: String,
+    pub pcr_digest: Option<String>,
+    pub created_at: i64,
+    pub doc: Vec<u8>,
+}
+
+/// One row of the request listing in the Record — summary only; the raw
+/// header/body payloads come from [`AppCore::request_detail`].
+#[derive(Clone, Debug)]
+pub struct RequestInfo {
+    pub id: String,
+    pub method: String,
+    pub path: String,
+    pub response_status: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub request_at: i64,
+    pub error: Option<String>,
+    pub attempt_number: i64,
+    pub credential_nonce: Option<String>,
+    pub transport: Option<String>,
+    pub base_url: Option<String>,
+    pub attestation_hash: Option<String>,
+}
+
+/// The full recorded request/response pair, raw bodies included. This is
+/// the user's own traffic on their own machine — nothing is redacted.
+#[derive(Clone, Debug)]
+pub struct RequestDetail {
+    pub id: String,
+    pub method: String,
+    pub path: String,
+    pub request_headers: Option<String>,
+    pub request_body: Option<Vec<u8>>,
+    pub response_status: Option<i64>,
+    pub response_headers: Option<String>,
+    pub response_body: Option<Vec<u8>>,
+    pub request_at: i64,
+    pub response_at: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub error: Option<String>,
+    pub retry_of_id: Option<String>,
+    pub attempt_number: i64,
+    pub credential_nonce: Option<String>,
+    pub action_id: Option<String>,
+    pub transport: Option<String>,
+    pub base_url: Option<String>,
+    pub attestation_hash: Option<String>,
+}
+
+/// One row of the `spend_trail` view: credential → request → action → space.
+#[derive(Clone, Debug)]
+pub struct SpendTrailEntry {
+    pub credential_nonce: String,
+    pub spend_amount: Option<i64>,
+    pub credential_state: String,
+    pub request_id: String,
+    pub method: String,
+    pub path: String,
+    pub request_at: i64,
+    pub duration_ms: Option<i64>,
+    pub attempt_number: i64,
+    pub action_id: Option<String>,
+    pub action_type: Option<String>,
+    pub model: Option<String>,
+    pub credits_consumed: Option<i64>,
+    pub intent: Option<String>,
+    pub space_id: Option<String>,
+    pub space_title: Option<String>,
+    pub linkability: Option<String>,
 }
 
 /// Default number of credits to allocate into a fresh anonymous credential
@@ -208,6 +337,13 @@ struct Inner {
     config_path: PathBuf,
     data_dir: PathBuf,
     db: tokio::sync::OnceCell<turso::Database>,
+    /// Cached update-check state (last result + accepted-claims choice),
+    /// lazily loaded from `<data_dir>/update-state.json` on first access.
+    update_state: Mutex<Option<updates::UpdateState>>,
+    /// Latch so `start_update_polling` spawns at most one poll loop.
+    update_polling: std::sync::atomic::AtomicBool,
+    /// Invalidation bus — emits a [`Change`] after every durable commit.
+    bus: BroadcastSource,
 }
 
 // --- Config helpers (sync) ---------------------------------------------------
@@ -224,6 +360,88 @@ impl Inner {
                 message: "account not configured".into(),
             }),
         }
+    }
+}
+
+// --- Update checking ----------------------------------------------------------
+
+impl Inner {
+    /// Cached-or-loaded copy of the persisted update state.
+    fn update_state_snapshot(&self) -> updates::UpdateState {
+        let mut guard = self.update_state.lock().expect("update_state lock");
+        guard
+            .get_or_insert_with(|| updates::load_state(&self.data_dir))
+            .clone()
+    }
+
+    /// Replace the cached state and persist it. A disk write failure is
+    /// logged, not fatal — the in-memory state stays authoritative for the
+    /// rest of the run.  Emits [`Change::UpdateState`] after the write.
+    fn store_update_state(&self, state: updates::UpdateState) {
+        if let Err(e) = updates::save_state(&self.data_dir, &state) {
+            eprintln!("warning: failed to persist update-check state: {e}");
+        }
+        *self.update_state.lock().expect("update_state lock") = Some(state);
+        self.bus.emit(Change::UpdateState);
+    }
+
+    /// Run one check and fold it into the persisted state (a `CheckFailed`
+    /// never clears a standing security state — see
+    /// [`updates::UpdateState::absorb`]). Returns the *effective* snapshot:
+    /// what the UI should now show.
+    async fn run_update_check(&self) -> updates::UpdateCheckSnapshot {
+        let mut state = self.update_state_snapshot();
+        let feed_url = self.load_config().update_feed_url();
+
+        let result = match updater::build_http_client() {
+            Ok(client) => {
+                let mut ctx = updates::CheckContext::new(feed_url, env!("CARGO_PKG_VERSION"));
+                ctx.accepted = state.accepted.clone();
+                updates::check_for_update(&client, &ctx).await
+            }
+            Err(e) => updates::UpdateCheckResult::CheckFailed {
+                message: format!("constructing HTTPS client: {e}"),
+            },
+        };
+
+        state.absorb(updates::UpdateCheckSnapshot {
+            checked_at_ms: now_ms(),
+            result,
+        });
+        let effective = state.last.clone().expect("absorb always leaves a snapshot");
+        self.store_update_state(state);
+        effective
+    }
+
+    fn accept_changed_claims(
+        &self,
+        version: String,
+        manifest_sha256: String,
+    ) -> Result<(), AppError> {
+        let mut state = self.update_state_snapshot();
+        state.accepted = Some(updates::AcceptedClaims {
+            version: version.clone(),
+            manifest_sha256: manifest_sha256.clone(),
+            accepted_at_ms: now_ms(),
+        });
+
+        // If the standing result is the claims-changed release being
+        // accepted, rewrite it as an available update so UIs reflect the
+        // choice without waiting for the next poll.
+        if let Some(snapshot) = state.last.as_mut()
+            && let updates::UpdateCheckResult::ClaimsChanged { release, .. } = &snapshot.result
+            && release.version == version
+            && release
+                .manifest_sha256
+                .eq_ignore_ascii_case(&manifest_sha256)
+        {
+            let mut release = release.clone();
+            release.claims_accepted = true;
+            snapshot.result = updates::UpdateCheckResult::UpdateAvailable { release };
+        }
+
+        self.store_update_state(state);
+        Ok(())
     }
 }
 
@@ -331,6 +549,7 @@ impl Inner {
         cfg.account_id = Some(created.account_id.to_string());
         cfg.account_secret = Some(created.secret);
         cfg.save_to(&self.config_path)?;
+        self.bus.emit(Change::Config);
 
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
@@ -611,6 +830,11 @@ impl Inner {
         )
         .await?;
 
+        // Allocation moves credits from the account balance into a credential:
+        // both the wallet and account domains changed.
+        self.bus.emit(Change::Wallet);
+        self.bus.emit(Change::Account);
+
         Ok(AllocateResult {
             nonce: nonce_hex,
             credits: issued.credits,
@@ -641,6 +865,129 @@ impl Inner {
                 credits: r.credits,
                 generation: r.generation,
                 spend_amount: r.spend_amount,
+            })
+            .collect())
+    }
+
+    async fn wallet_lifecycle(&self) -> Result<Vec<CredentialLifecycleInfo>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_credential_lifecycle(&db_conn).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| CredentialLifecycleInfo {
+                nonce: r.nonce,
+                credits: r.credits,
+                generation: r.generation,
+                created_at: r.created_at,
+                state: r.state,
+                spend_amount: r.spend_amount,
+            })
+            .collect())
+    }
+
+    // --- The Record: read-only queries over the local trail -----------------
+
+    async fn list_attestations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AttestationInfo>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_attestations(&db_conn, limit, offset).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AttestationInfo {
+                hash: r.hash,
+                pcr_digest: r.pcr_digest,
+                created_at: r.created_at,
+                doc_bytes: r.doc_bytes,
+                connection_count: r.connection_count,
+            })
+            .collect())
+    }
+
+    async fn attestation_detail(&self, hash: &str) -> Result<Option<AttestationDetail>, AppError> {
+        let db_conn = self.db_conn().await?;
+        Ok(db::get_attestation(&db_conn, hash)
+            .await?
+            .map(|r| AttestationDetail {
+                hash: r.hash,
+                pcr_digest: r.pcr_digest,
+                created_at: r.created_at,
+                doc: r.doc,
+            }))
+    }
+
+    async fn list_requests(&self, limit: i64, offset: i64) -> Result<Vec<RequestInfo>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_requests(&db_conn, limit, offset).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| RequestInfo {
+                id: r.id,
+                method: r.method,
+                path: r.path,
+                response_status: r.response_status,
+                duration_ms: r.duration_ms,
+                request_at: r.request_at,
+                error: r.error,
+                attempt_number: r.attempt_number,
+                credential_nonce: r.credential_nonce,
+                transport: r.transport,
+                base_url: r.base_url,
+                attestation_hash: r.attestation_hash,
+            })
+            .collect())
+    }
+
+    async fn request_detail(&self, id: &str) -> Result<Option<RequestDetail>, AppError> {
+        let db_conn = self.db_conn().await?;
+        Ok(db::get_request(&db_conn, id).await?.map(|r| RequestDetail {
+            id: r.id,
+            method: r.method,
+            path: r.path,
+            request_headers: r.request_headers,
+            request_body: r.request_body,
+            response_status: r.response_status,
+            response_headers: r.response_headers,
+            response_body: r.response_body,
+            request_at: r.request_at,
+            response_at: r.response_at,
+            duration_ms: r.duration_ms,
+            error: r.error,
+            retry_of_id: r.retry_of_id,
+            attempt_number: r.attempt_number,
+            credential_nonce: r.credential_nonce,
+            action_id: r.action_id,
+            transport: r.transport,
+            base_url: r.base_url,
+            attestation_hash: r.attestation_hash,
+        }))
+    }
+
+    async fn spend_trail(&self, limit: i64, offset: i64) -> Result<Vec<SpendTrailEntry>, AppError> {
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_spend_trail(&db_conn, limit, offset).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SpendTrailEntry {
+                credential_nonce: r.credential_nonce,
+                spend_amount: r.spend_amount,
+                credential_state: r.credential_state,
+                request_id: r.request_id,
+                method: r.method,
+                path: r.path,
+                request_at: r.request_at,
+                duration_ms: r.duration_ms,
+                attempt_number: r.attempt_number,
+                action_id: r.action_id,
+                action_type: r.action_type,
+                model: r.model,
+                credits_consumed: r.credits_consumed,
+                intent: r.intent,
+                space_id: r.space_id,
+                space_title: r.space_title,
+                linkability: r.linkability,
             })
             .collect())
     }
@@ -706,6 +1053,10 @@ impl Inner {
             }
         }
 
+        if !recovered.is_empty() {
+            self.bus.emit(Change::Wallet);
+        }
+
         Ok(recovered)
     }
 
@@ -721,6 +1072,13 @@ impl Inner {
             .map(|m| ModelInfo {
                 id: m.id,
                 context_length: m.context_length,
+                prompt_credits_per_token: m.pricing.per_prompt_token.credits_per_unit(),
+                completion_credits_per_token: m.pricing.per_completion_token.credits_per_unit(),
+                request_credits: m
+                    .pricing
+                    .per_request
+                    .as_ref()
+                    .map(ScaledPriceInfo::credits_per_unit),
             })
             .collect())
     }
@@ -769,6 +1127,8 @@ impl Inner {
         db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
             .await?;
 
+        self.bus.emit(Change::SpaceIndex);
+
         Ok(SpaceInfo {
             id: space_id,
             title: title.map(String::from),
@@ -782,7 +1142,11 @@ impl Inner {
 
     async fn archive_space(&self, space_id: &str) -> Result<bool, AppError> {
         let db_conn = self.db_conn().await?;
-        db::archive_space(&db_conn, space_id, now_ms()).await
+        let archived = db::archive_space(&db_conn, space_id, now_ms()).await?;
+        if archived {
+            self.bus.emit(Change::SpaceIndex);
+        }
+        Ok(archived)
     }
 
     /// Find a credential that can cover `charge_credits`, auto-provisioning
@@ -833,7 +1197,9 @@ impl Inner {
             .ok_or_else(|| AppError::NotConfigured {
                 message: format!("space not found: {space_id}"),
             })?;
-        db::update_space_title(&db_conn, space_id, title).await
+        db::update_space_title(&db_conn, space_id, title).await?;
+        self.bus.emit(Change::SpaceIndex);
+        Ok(())
     }
 
     async fn chat(
@@ -845,6 +1211,9 @@ impl Inner {
         let cfg = self.load_config();
         let base_url = cfg.base_url();
         let now = now_ms();
+        // Track whether this chat implicitly creates a new space or auto-titles
+        // an existing untitled one — both touch the space index.
+        let is_new_space = space_id.is_none();
 
         let db_conn = self.db_conn().await?;
         let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
@@ -880,7 +1249,15 @@ impl Inner {
         let model_participant_id =
             db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
 
-        // Reuse existing space or create a new one
+        // Resolve the target space id WITHOUT inserting a new-space row yet.
+        // For an existing space we validate it and ensure the model
+        // participant; for a new (blank) space we only *mint* the id here and
+        // defer `insert_space` until after credential resolution, so a typed
+        // onboarding failure (`NoAccount` / `InsufficientBalance`) leaves no
+        // orphaned empty space behind. Nothing between this point and the
+        // deferred insert depends on the new space's row existing: the prior
+        // context query and charge estimation below see an empty history for a
+        // brand-new id (no actions yet), exactly as before.
         let (space_id, space_title) = if let Some(sid) = space_id {
             let row =
                 db::get_space(&db_conn, sid)
@@ -894,17 +1271,12 @@ impl Inner {
                     .await; // ignore duplicate
             (sid.to_string(), row.title)
         } else {
-            let sid = Uuid::now_v7().to_string();
-            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
-            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
-                .await?;
-            db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
-                .await?;
-            (sid, None)
+            (Uuid::now_v7().to_string(), None)
         };
 
         // Load prior actions to build multi-turn context — needed both for
-        // credit estimation (total prompt size) and message assembly.
+        // credit estimation (total prompt size) and message assembly. For a
+        // freshly-minted (not-yet-inserted) space this is empty.
         let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
         let prior_messages = actions_to_messages(&prior_action_rows);
 
@@ -931,6 +1303,26 @@ impl Inner {
         let cred = self
             .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
             .await?;
+
+        // Spendability is now known — durable writes from here on are safe.
+        // Insert the deferred new-space row (item A): a typed onboarding failure
+        // above (`NoAccount` / `InsufficientBalance`) left zero durable trace.
+        // From this point the space is persisted, so every error exit is wrapped
+        // with the space id (`wrap`) — closing the blank-space id-adoption gap
+        // (item C) so a `Space` entity learns its id even when the first
+        // exchange fails.
+        if is_new_space {
+            db::insert_space(&db_conn, &space_id, None, "unlinked", now).await?;
+            db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
+                .await?;
+            db::insert_space_participant(&db_conn, &space_id, &model_participant_id, "member", now)
+                .await?;
+        }
+        // Carries the now-persisted space id on any error returned below.
+        let wrap = |source: AppError| AppError::ChatFailed {
+            space_id: space_id.clone(),
+            source: Box::new(source),
+        };
 
         let credit_token =
             CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
@@ -971,6 +1363,9 @@ impl Inner {
             now,
         )
         .await?;
+        // Credential flipped to "spending" — wallet state changed regardless of
+        // whether the rest of the operation succeeds.
+        self.bus.emit(Change::Wallet);
 
         let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
         let challenge_digest = compute_challenge_digest();
@@ -1018,11 +1413,13 @@ impl Inner {
 
         // Auto-title: the first exchange in an untitled space names the
         // space after the user's prompt. Purely local — no model call.
+        let mut auto_titled = false;
         if space_title.is_none()
             && prior_messages.is_empty()
             && let Some(title) = derive_space_title(prompt)
         {
             db::update_space_title(&db_conn, &space_id, &title).await?;
+            auto_titled = true;
         }
 
         // Link to previous action as antecedent
@@ -1054,31 +1451,53 @@ impl Inner {
             .await;
         let response_at = now_ms();
 
+        // Emit the space changes committed by the user turn (space row +
+        // user-message, and the auto-title) so every window sees the persisted
+        // user turn even when the request itself fails. Mirrors the non-2xx
+        // arm's emissions, minus `Record` (the request row is not committed at
+        // these earlier exits). Call this before any error exit between here and
+        // the request-row insert.
+        let emit_user_turn = || {
+            if is_new_space || auto_titled {
+                self.bus.emit(Change::SpaceIndex);
+            }
+            self.bus.emit(Change::Space(space_id.clone()));
+        };
+
         let (status, response_text, body) = match chat_result {
             Ok(resp) => {
                 if let Some(new_cid) =
                     flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now)
-                        .await?
+                        .await
+                        .inspect_err(|_| emit_user_turn())
+                        .map_err(wrap)?
                 {
                     connection_id = Some(new_cid);
                 }
 
                 let status = resp.status();
-                let text = resp.text().await.map_err(|e| AppError::Network {
-                    message: format!("failed to read response: {e}"),
-                })?;
-                let parsed: serde_json::Value =
-                    serde_json::from_str(&text).map_err(|e| AppError::Network {
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|e| AppError::Network {
+                        message: format!("failed to read response: {e}"),
+                    })
+                    .inspect_err(|_| emit_user_turn())
+                    .map_err(wrap)?;
+                let parsed: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| AppError::Network {
                         message: format!("failed to parse response JSON: {e}"),
-                    })?;
+                    })
+                    .inspect_err(|_| emit_user_turn())
+                    .map_err(wrap)?;
                 (status, text, parsed)
             }
             Err(e) => {
                 // Network error — the server may or may not have received the
                 // request. Try to recover the refund token.
                 let original_err = AppError::from_request(e);
-                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
-                    let _ = process_refund(
+                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
+                    && process_refund(
                         &refund_obj,
                         &params,
                         &spend_proof,
@@ -1089,9 +1508,17 @@ impl Inner {
                         cred.generation + 1,
                         now,
                     )
-                    .await;
+                    .await
+                    .is_ok()
+                {
+                    // Successor credential written — wallet state updated.
+                    self.bus.emit(Change::Wallet);
                 }
-                return Err(original_err);
+                // The user turn (space row + user-message, auto-title) is
+                // already committed — emit it so other windows see the persisted
+                // turn, then wrap with the space id for blank-space adoption.
+                emit_user_turn();
+                return Err(wrap(original_err));
             }
         };
 
@@ -1110,7 +1537,9 @@ impl Inner {
                 cred.generation + 1,
                 now,
             )
-            .await?;
+            .await
+            .inspect_err(|_| emit_user_turn())
+            .map_err(wrap)?;
             refund_stored = true;
         }
 
@@ -1233,11 +1662,28 @@ impl Inner {
         .await?;
 
         if !status.is_success() {
-            return Err(AppError::Server {
+            // Space, user-message, and request rows are already committed.
+            // Wallet was emitted after insert_pre_credential_refund above.
+            if is_new_space || auto_titled {
+                self.bus.emit(Change::SpaceIndex);
+            }
+            self.bus.emit(Change::Space(space_id.clone()));
+            self.bus.emit(Change::Record);
+            return Err(wrap(AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
-            });
+            }));
         }
+
+        // All durable writes succeeded — emit one message per affected domain.
+        // SpaceIndex: a new space was implicitly created, or the space was
+        // auto-titled on its first exchange.
+        if is_new_space || auto_titled {
+            self.bus.emit(Change::SpaceIndex);
+        }
+        self.bus.emit(Change::Space(space_id.clone()));
+        self.bus.emit(Change::Wallet);
+        self.bus.emit(Change::Record);
 
         Ok(ChatResult {
             space_id,
@@ -1280,6 +1726,7 @@ impl Inner {
         let cfg = self.load_config();
         let base_url = cfg.base_url();
         let now = now_ms();
+        let is_new_space = space_id.is_none();
 
         let db_conn = self.db_conn().await?;
         let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
@@ -1315,6 +1762,11 @@ impl Inner {
         let model_participant_id =
             db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
 
+        // Resolve the target space id WITHOUT inserting a new-space row yet
+        // (item A — mirrors `chat`). For a new (blank) space we only mint the
+        // id; `insert_space` is deferred until after credential resolution so a
+        // typed onboarding failure leaves no orphaned empty space. The prior
+        // context query below sees an empty history for a brand-new id.
         let (space_id, space_title) = if let Some(sid) = space_id {
             let row =
                 db::get_space(&db_conn, sid)
@@ -1327,13 +1779,7 @@ impl Inner {
                     .await;
             (sid.to_string(), row.title)
         } else {
-            let sid = Uuid::now_v7().to_string();
-            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
-            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
-                .await?;
-            db::insert_space_participant(&db_conn, &sid, &model_participant_id, "member", now)
-                .await?;
-            (sid, None)
+            (Uuid::now_v7().to_string(), None)
         };
 
         let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
@@ -1361,6 +1807,23 @@ impl Inner {
         let cred = self
             .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
             .await?;
+
+        // Spendability is now known — insert the deferred new-space row (item A)
+        // and prepare the space-id wrapper (item C). From this point the space
+        // is persisted, so every error exit carries the space id for blank-space
+        // adoption.
+        if is_new_space {
+            db::insert_space(&db_conn, &space_id, None, "unlinked", now).await?;
+            db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
+                .await?;
+            db::insert_space_participant(&db_conn, &space_id, &model_participant_id, "member", now)
+                .await?;
+        }
+        // Carries the now-persisted space id on any error returned below.
+        let wrap = |source: AppError| AppError::ChatFailed {
+            space_id: space_id.clone(),
+            source: Box::new(source),
+        };
 
         let credit_token =
             CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
@@ -1401,6 +1864,9 @@ impl Inner {
             now,
         )
         .await?;
+        // Credential flipped to "spending" — wallet state changed regardless of
+        // whether the rest of the operation succeeds.
+        self.bus.emit(Change::Wallet);
 
         let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
         let challenge_digest = compute_challenge_digest();
@@ -1446,11 +1912,13 @@ impl Inner {
 
         // Auto-title: the first exchange in an untitled space names the
         // space after the user's prompt. Purely local — no model call.
+        let mut auto_titled = false;
         if space_title.is_none()
             && prior_messages.is_empty()
             && let Some(title) = derive_space_title(prompt)
         {
             db::update_space_title(&db_conn, &space_id, &title).await?;
+            auto_titled = true;
         }
 
         if let Some(ref ante_id) = last_action_id {
@@ -1485,11 +1953,23 @@ impl Inner {
             .send()
             .await;
 
+        // Emit the space changes committed by the user turn (space row +
+        // user-message + auto-title) so other windows see the persisted turn
+        // even when the request itself fails, before the request row is written.
+        let emit_user_turn = || {
+            if is_new_space || auto_titled {
+                self.bus.emit(Change::SpaceIndex);
+            }
+            self.bus.emit(Change::Space(space_id.clone()));
+        };
+
         let resp = match chat_result {
             Ok(resp) => {
                 if let Some(new_cid) =
                     flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now)
-                        .await?
+                        .await
+                        .inspect_err(|_| emit_user_turn())
+                        .map_err(wrap)?
                 {
                     connection_id = Some(new_cid);
                 }
@@ -1497,8 +1977,8 @@ impl Inner {
             }
             Err(e) => {
                 let original_err = AppError::from_request(e);
-                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
-                    let _ = process_refund(
+                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
+                    && process_refund(
                         &refund_obj,
                         &params,
                         &spend_proof,
@@ -1509,9 +1989,15 @@ impl Inner {
                         cred.generation + 1,
                         now,
                     )
-                    .await;
+                    .await
+                    .is_ok()
+                {
+                    // Successor credential written — wallet state updated.
+                    self.bus.emit(Change::Wallet);
                 }
-                return Err(original_err);
+                // User turn is committed — emit it, then wrap with the space id.
+                emit_user_turn();
+                return Err(wrap(original_err));
             }
         };
 
@@ -1521,8 +2007,8 @@ impl Inner {
         // Read it normally so we can surface a useful message.
         if !status.is_success() {
             let response_text = resp.text().await.unwrap_or_default();
-            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
-                let _ = process_refund(
+            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
+                && process_refund(
                     &refund_obj,
                     &params,
                     &spend_proof,
@@ -1533,7 +2019,11 @@ impl Inner {
                     cred.generation + 1,
                     now,
                 )
-                .await;
+                .await
+                .is_ok()
+            {
+                // Successor credential written — wallet state updated.
+                self.bus.emit(Change::Wallet);
             }
             db::insert_request(
                 &db_conn,
@@ -1557,10 +2047,18 @@ impl Inner {
                 },
             )
             .await?;
-            return Err(AppError::Server {
+            // Space, user-message, and request rows are already committed.
+            // Wallet was emitted after insert_pre_credential_refund above
+            // (and again above if the refund recovery succeeded).
+            if is_new_space || auto_titled {
+                self.bus.emit(Change::SpaceIndex);
+            }
+            self.bus.emit(Change::Space(space_id.clone()));
+            self.bus.emit(Change::Record);
+            return Err(wrap(AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
-            });
+            }));
         }
 
         // Consume the SSE body. We accumulate bytes in a small buffer and
@@ -1577,9 +2075,15 @@ impl Inner {
         let mut finished = false;
 
         while let Some(chunk) = byte_stream.next().await {
-            let bytes = chunk.map_err(|e| AppError::Network {
-                message: format!("stream read failed: {e}"),
-            })?;
+            let bytes = chunk
+                .map_err(|e| AppError::Network {
+                    message: format!("stream read failed: {e}"),
+                })
+                // Mid-stream read failure: the user turn is committed (the
+                // request row is not yet) — emit the user turn so other windows
+                // see it, then wrap with the space id for blank-space adoption.
+                .inspect_err(|_| emit_user_turn())
+                .map_err(wrap)?;
             // Keep the raw bytes for the request log so we can debug
             // upstream behaviour the same way as the non-streaming path.
             response_buf.extend_from_slice(&bytes);
@@ -1747,6 +2251,14 @@ impl Inner {
         )
         .await?;
 
+        // All durable writes succeeded — emit one message per affected domain.
+        if is_new_space || auto_titled {
+            self.bus.emit(Change::SpaceIndex);
+        }
+        self.bus.emit(Change::Space(space_id.clone()));
+        self.bus.emit(Change::Wallet);
+        self.bus.emit(Change::Record);
+
         Ok(ChatResult {
             space_id,
             content: full_content,
@@ -1782,6 +2294,9 @@ fn find_event_boundary(buf: &[u8]) -> Option<usize> {
 pub struct AppCore {
     runtime: tokio::runtime::Runtime,
     inner: Arc<Inner>,
+    /// The invalidation bus, shared with `Inner` so callers can subscribe
+    /// while `Inner` emits on the tokio runtime.
+    bus: BroadcastSource,
 }
 
 impl AppCore {
@@ -1831,14 +2346,36 @@ impl AppCore {
             .thread_stack_size(8 * 1024 * 1024) // 8 MB — matches default main-thread size
             .build()
             .expect("failed to create tokio runtime");
+        let bus = BroadcastSource::new();
         Self {
             runtime,
+            bus: bus.clone(),
             inner: Arc::new(Inner {
                 config_path: config_dir.join("config.toml"),
                 data_dir,
                 db: tokio::sync::OnceCell::new(),
+                update_state: Mutex::new(None),
+                update_polling: std::sync::atomic::AtomicBool::new(false),
+                bus,
             }),
         }
+    }
+
+    /// Subscribe to the invalidation bus.
+    ///
+    /// Returns a [`tokio::sync::broadcast::Receiver`] that receives a
+    /// [`changes::Change`] after every successful durable write in this
+    /// `AppCore` instance.  The receiver is independent — dropping it does
+    /// not affect the bus or other subscribers.
+    ///
+    /// ## Lagged receivers
+    ///
+    /// If a receiver falls more than [`changes::BUS_CAPACITY`] messages behind
+    /// it will receive [`tokio::sync::broadcast::error::RecvError::Lagged`].
+    /// Treat that as "refresh everything you care about" — at least that many
+    /// changes were missed.
+    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<changes::Change> {
+        self.bus.subscribe()
     }
 
     // -----------------------------------------------------------------------
@@ -1854,10 +2391,14 @@ impl AppCore {
         };
         ConfigState {
             base_url: cfg.base_url().to_string(),
+            default_model: cfg.default_model().to_string(),
+            base_url_pin: trust_root::SERVER_URL.to_string(),
+            base_url_is_override: cfg.base_url_override.is_some(),
             has_account: cfg.account_id.is_some(),
             has_account_secret: cfg.account_secret.is_some(),
             domain_separator: cfg.domain_separator().to_string(),
             trusted_measurements: cfg.trusted_measurements().iter().map(&to_info).collect(),
+            trusted_measurements_are_override: !cfg.trusted_measurements_override.is_empty(),
             has_hardware_root_ca: cfg.hardware_root_ca.is_some(),
             has_hardware_intermediate_ca: cfg.hardware_intermediate_ca.is_some(),
             attestation_url: cfg.attestation_url.clone(),
@@ -1867,27 +2408,62 @@ impl AppCore {
     pub fn set_base_url(&self, url: String) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.base_url_override = Some(url);
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
+    }
+
+    /// Persist the user's default inference model (the `default_model`
+    /// config override). New chat surfaces resolve their starting model
+    /// from this; an existing window's explicit selection is unaffected.
+    pub fn set_default_model(&self, model: String) -> Result<(), AppError> {
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err(AppError::Config {
+                message: "default model must not be empty".into(),
+            });
+        }
+        let mut cfg = self.inner.load_config();
+        cfg.default_model_override = Some(model);
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
+    }
+
+    /// Remove the user's base-URL override, reverting to the trust-root pin
+    /// baked into this binary.
+    pub fn clear_base_url_override(&self) -> Result<(), AppError> {
+        let mut cfg = self.inner.load_config();
+        cfg.base_url_override = None;
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     pub fn set_attestation_url(&self, url: String) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.attestation_url = Some(url);
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     pub fn set_hardware_root_ca(&self, pem: String) -> Result<(), AppError> {
         config::parse_cert_config(Some(&pem), "hardware_root_ca")?;
         let mut cfg = self.inner.load_config();
         cfg.hardware_root_ca = Some(pem.trim().to_string());
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     pub fn set_hardware_intermediate_ca(&self, pem: String) -> Result<(), AppError> {
         config::parse_cert_config(Some(&pem), "hardware_intermediate_ca")?;
         let mut cfg = self.inner.load_config();
         cfg.hardware_intermediate_ca = Some(pem.trim().to_string());
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     pub fn trust_measurement(
@@ -1907,6 +2483,7 @@ impl AppCore {
         }
         cfg.trusted_measurements_override.push(entry);
         cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
         Ok(true)
     }
 
@@ -1920,6 +2497,7 @@ impl AppCore {
         {
             cfg.trusted_measurements_override.remove(pos);
             cfg.save_to(&self.inner.config_path)?;
+            self.bus.emit(Change::Config);
             Ok(true)
         } else {
             Ok(false)
@@ -1936,14 +2514,82 @@ impl AppCore {
         let mut cfg = cfg;
         cfg.account_id = Some(id);
         cfg.account_secret = Some(secret);
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
     }
 
     pub fn reset_account(&self) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.account_id = None;
         cfg.account_secret = None;
-        cfg.save_to(&self.inner.config_path)
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Updates — verified update-notification flow (see `updates` module)
+    // -----------------------------------------------------------------------
+
+    /// Run one update check now: fetch the GitHub release marked `latest`
+    /// from the resolved feed, verify its `artifact-manifest.json` Sigstore
+    /// bundle against the embedded trust root, compare attested claims, and
+    /// persist the outcome. Infallible — every failure mode is a typed
+    /// [`updates::UpdateCheckResult`] variant.
+    pub async fn update_check(&self) -> updates::UpdateCheckSnapshot {
+        let inner = self.inner.clone();
+        match self
+            .runtime
+            .spawn(async move { inner.run_update_check().await })
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(e) => updates::UpdateCheckSnapshot {
+                checked_at_ms: now_ms(),
+                result: updates::UpdateCheckResult::CheckFailed {
+                    message: format!("update check task failed: {e}"),
+                },
+            },
+        }
+    }
+
+    /// The persisted outcome of the most recent completed check, if any.
+    /// Reflects background polls as well as manual checks.
+    pub fn last_update_check(&self) -> Option<updates::UpdateCheckSnapshot> {
+        self.inner.update_state_snapshot().last
+    }
+
+    /// Record the user's explicit "treat as update" decision for a
+    /// claims-changed release (matched by version + manifest hash). The
+    /// persisted last result is rewritten so UIs immediately see the
+    /// release as an accepted update.
+    pub fn accept_changed_claims(
+        &self,
+        version: String,
+        manifest_sha256: String,
+    ) -> Result<(), AppError> {
+        self.inner.accept_changed_claims(version, manifest_sha256)
+    }
+
+    /// Start the background poll loop: one check immediately, then one
+    /// every [`updates::POLL_INTERVAL`] (~6h) while the process runs.
+    /// Idempotent — at most one loop is ever spawned.
+    pub fn start_update_polling(&self) {
+        if self
+            .inner
+            .update_polling
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            loop {
+                let _ = inner.run_update_check().await;
+                tokio::time::sleep(updates::POLL_INTERVAL).await;
+            }
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -2016,10 +2662,83 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Every credential in the local wallet with its lifecycle state
+    /// (`active` / `spending` / `spent` / `expired`), newest first.
+    pub async fn wallet_lifecycle(&self) -> Result<Vec<CredentialLifecycleInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.wallet_lifecycle().await })
+            .await
+            .map_err(join_err)?
+    }
+
     pub async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.recover_spending_credentials().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    // -----------------------------------------------------------------------
+    // The Record — read-only queries over the local trail. Pure SELECTs;
+    // newest first; `limit`/`offset` for windowed fetches.
+    // -----------------------------------------------------------------------
+
+    pub async fn list_attestations(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AttestationInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.list_attestations(limit, offset).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The full raw attestation document, or `None` if the hash is unknown.
+    pub async fn attestation_detail(
+        &self,
+        hash: String,
+    ) -> Result<Option<AttestationDetail>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.attestation_detail(&hash).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn list_requests(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<RequestInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.list_requests(limit, offset).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The full recorded request/response pair (raw bodies included), or
+    /// `None` if the id is unknown.
+    pub async fn request_detail(&self, id: String) -> Result<Option<RequestDetail>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.request_detail(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    pub async fn spend_trail(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SpendTrailEntry>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.spend_trail(limit, offset).await })
             .await
             .map_err(join_err)?
     }
@@ -2182,12 +2901,28 @@ struct IssueCredentialsResponse {
 struct ModelPricingInfo {
     per_prompt_token: ScaledPriceInfo,
     per_completion_token: ScaledPriceInfo,
+    /// Present only for models priced per request (e.g. transcription).
+    #[serde(default)]
+    per_request: Option<ScaledPriceInfo>,
 }
 
 #[derive(Deserialize)]
 struct ScaledPriceInfo {
     value: u64,
     scale_factor: u64,
+}
+
+impl ScaledPriceInfo {
+    /// Credits per priced unit (token or request) as a float for display.
+    /// Charging math elsewhere stays in integer `value`/`scale_factor`
+    /// space; this is only the honest human-readable rate.
+    fn credits_per_unit(&self) -> f64 {
+        if self.scale_factor == 0 {
+            0.0
+        } else {
+            self.value as f64 / self.scale_factor as f64
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2710,6 +3445,29 @@ mod tests {
     #[test]
     fn params_from_domain_separator_rejects_wrong_format() {
         assert!(params_from_domain_separator("bad").is_err());
+    }
+
+    // --- Default model config ----------------------------------------------
+
+    #[test]
+    fn set_default_model_round_trips_through_config_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().to_path_buf();
+        let data_dir = dir.path().join("data");
+
+        let core = AppCore::new(config_dir.clone(), data_dir.clone());
+        assert_eq!(core.config_state().default_model, config::DEFAULT_MODEL);
+
+        core.set_default_model("kimi-k2-6".into()).unwrap();
+        assert_eq!(core.config_state().default_model, "kimi-k2-6");
+
+        // A fresh core over the same config dir sees the persisted value.
+        let core2 = AppCore::new(config_dir, data_dir);
+        assert_eq!(core2.config_state().default_model, "kimi-k2-6");
+
+        // Whitespace-only is rejected and leaves the config untouched.
+        assert!(core2.set_default_model("   ".into()).is_err());
+        assert_eq!(core2.config_state().default_model, "kimi-k2-6");
     }
 
     // --- Auto-provisioning decision logic ---------------------------------

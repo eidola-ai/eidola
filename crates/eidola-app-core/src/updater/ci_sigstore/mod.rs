@@ -62,14 +62,35 @@ pub struct VerifiedCiSignature {
 }
 
 /// Verify the bundle against the manifest bytes and the embedded trust
-/// root. Returns the verified facts on success.
-///
-/// **4c.1 stub** — does structural checks; cryptographic verification is
-/// marked with `TODO (4c.2)` below.
+/// root, pinning the CI identity to the compile-time
+/// [`trust_root::EXPECTED_CI_IDENTITY_PATTERN`] / [`trust_root::EXPECTED_CI_ISSUER`].
+/// Returns the verified facts on success.
 pub fn verify_ci_signature(
     manifest_bytes: &[u8],
     bundle_bytes: &[u8],
     trust: &TrustedRoot,
+) -> Result<VerifiedCiSignature, AppError> {
+    verify_ci_signature_with(
+        manifest_bytes,
+        bundle_bytes,
+        trust,
+        trust_root::EXPECTED_CI_IDENTITY_PATTERN,
+        trust_root::EXPECTED_CI_ISSUER,
+    )
+}
+
+/// Like [`verify_ci_signature`] but with an explicit identity pattern +
+/// issuer. Production callers pass the embedded pins (via
+/// [`verify_ci_signature`]); tests pass divergent pins to exercise the
+/// wrong-identity rejection path against real signed fixtures. Every
+/// cryptographic stage (Fulcio chain, signature, Rekor SET + inclusion
+/// proof) runs identically in both cases.
+pub fn verify_ci_signature_with(
+    manifest_bytes: &[u8],
+    bundle_bytes: &[u8],
+    trust: &TrustedRoot,
+    expected_identity_pattern: &str,
+    expected_issuer: &str,
 ) -> Result<VerifiedCiSignature, AppError> {
     use sha2::{Digest, Sha256};
 
@@ -252,22 +273,20 @@ pub fn verify_ci_signature(
     let leaf_info = cert::verify_chain_and_extract(&cert_der, &trust.fulcio_cas)?;
 
     // 3 (identity match).
-    if !cert::glob_matches(trust_root::EXPECTED_CI_IDENTITY_PATTERN, &leaf_info.san_uri) {
+    if !cert::glob_matches(expected_identity_pattern, &leaf_info.san_uri) {
         return Err(AppError::Update {
             message: format!(
-                "leaf cert SAN URI `{}` does not match expected pattern `{}` — the bundle was \
-                 not signed by our CI workflow",
-                leaf_info.san_uri,
-                trust_root::EXPECTED_CI_IDENTITY_PATTERN
+                "signature is not from the pinned release identity: leaf cert SAN URI `{}` \
+                 does not match expected pattern `{}`",
+                leaf_info.san_uri, expected_identity_pattern
             ),
         });
     }
-    if leaf_info.oidc_issuer != trust_root::EXPECTED_CI_ISSUER {
+    if leaf_info.oidc_issuer != expected_issuer {
         return Err(AppError::Update {
             message: format!(
                 "leaf cert OIDC issuer `{}` ≠ expected `{}`",
-                leaf_info.oidc_issuer,
-                trust_root::EXPECTED_CI_ISSUER
+                leaf_info.oidc_issuer, expected_issuer
             ),
         });
     }

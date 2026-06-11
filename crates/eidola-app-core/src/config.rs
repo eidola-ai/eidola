@@ -17,6 +17,10 @@ pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidola:inference:production:2
 /// against via the Tinfoil ATC `POST /attestation` endpoint.
 pub const DEFAULT_ATTESTATION_REPO: &str = "eidola-ai/eidola";
 
+/// Embedded fallback for the inference model used when neither the user's
+/// config (`default_model`) nor the caller specifies one.
+pub const DEFAULT_MODEL: &str = "gemma4-31b";
+
 /// Returns the default config file path: `<config_dir>/eidola/config.toml`.
 pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("eidola").join("config.toml"))
@@ -35,6 +39,12 @@ pub fn default_data_dir() -> Option<PathBuf> {
 pub struct Config {
     #[serde(rename = "base_url", default, skip_serializing_if = "Option::is_none")]
     pub base_url_override: Option<String>,
+    #[serde(
+        rename = "default_model",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_model_override: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +65,16 @@ pub struct Config {
     pub hardware_root_ca: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hardware_intermediate_ca: Option<String>,
+    /// Base URL of an alternate update feed (a GitHub-releases-API-shaped
+    /// server), for dev/test fixture servers. Same `*_override` pattern as
+    /// `base_url`: the resolved endpoint comes from [`Config::update_feed_url`],
+    /// which falls back to the trust-root pin.
+    #[serde(
+        rename = "update_feed",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub update_feed_override: Option<String>,
 }
 
 impl Config {
@@ -73,12 +93,34 @@ impl Config {
             .unwrap_or(DEFAULT_ATTESTATION_REPO)
     }
 
+    /// The inference model to use when the caller doesn't specify one: the
+    /// user's `default_model` override if set, otherwise the embedded
+    /// fallback ([`DEFAULT_MODEL`]).
+    pub fn default_model(&self) -> &str {
+        self.default_model_override
+            .as_deref()
+            .unwrap_or(DEFAULT_MODEL)
+    }
+
     /// The server URL to talk to: the user's `base_url` override if set,
     /// otherwise the trust-root pin baked into this binary.
     pub fn base_url(&self) -> &str {
         self.base_url_override
             .as_deref()
             .unwrap_or(crate::trust_root::SERVER_URL)
+    }
+
+    /// The full URL of the latest-release endpoint the update checker
+    /// polls: `<update_feed override>/releases/latest` when the override is
+    /// set, otherwise the trust-root pin (`UPDATE_DISCOVERY_URL`, the
+    /// GitHub `releases/latest` API). The override is a *base* URL so a
+    /// dev/test fixture server mounts the same `/releases/latest` path the
+    /// real API serves.
+    pub fn update_feed_url(&self) -> String {
+        match self.update_feed_override.as_deref() {
+            Some(base) => format!("{}/releases/latest", base.trim_end_matches('/')),
+            None => crate::trust_root::UPDATE_DISCOVERY_URL.to_string(),
+        }
     }
 
     /// The set of enclave measurements the client will accept on TLS
@@ -298,6 +340,32 @@ tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
     }
 
     #[test]
+    fn default_model_falls_back_to_embedded_value() {
+        let cfg = Config::default();
+        assert_eq!(cfg.default_model(), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn default_model_round_trips_via_toml() {
+        let original = Config {
+            default_model_override: Some("kimi-k2-6".into()),
+            ..Config::default()
+        };
+        let toml_text = toml::to_string_pretty(&original).expect("serialize");
+        assert!(
+            toml_text.contains("default_model = \"kimi-k2-6\""),
+            "override must serialize under the public `default_model` key: {toml_text}"
+        );
+        let parsed: Config = toml::from_str(&toml_text).expect("deserialize");
+        assert_eq!(parsed.default_model(), "kimi-k2-6");
+
+        // Absent key → override stays None and the resolver falls back.
+        let parsed: Config = toml::from_str("").expect("deserialize empty");
+        assert!(parsed.default_model_override.is_none());
+        assert_eq!(parsed.default_model(), DEFAULT_MODEL);
+    }
+
+    #[test]
     fn defaults_fall_back_to_trust_root_pin() {
         let cfg = Config::default();
         assert_eq!(cfg.base_url(), crate::trust_root::SERVER_URL);
@@ -306,6 +374,39 @@ tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
         assert_eq!(
             measurements[0].snp_measurement,
             crate::trust_root::SERVER_SNP_MEASUREMENT
+        );
+    }
+
+    #[test]
+    fn update_feed_url_resolves_override_and_pin() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.update_feed_url(),
+            crate::trust_root::UPDATE_DISCOVERY_URL
+        );
+
+        let cfg = Config {
+            update_feed_override: Some("http://127.0.0.1:9999/".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.update_feed_url(),
+            "http://127.0.0.1:9999/releases/latest"
+        );
+    }
+
+    #[test]
+    fn update_feed_override_round_trips_via_toml() {
+        let cfg = Config {
+            update_feed_override: Some("http://localhost:8123".into()),
+            ..Config::default()
+        };
+        let toml_text = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(toml_text.contains("update_feed"));
+        let parsed: Config = toml::from_str(&toml_text).expect("deserialize");
+        assert_eq!(
+            parsed.update_feed_override.as_deref(),
+            Some("http://localhost:8123")
         );
     }
 

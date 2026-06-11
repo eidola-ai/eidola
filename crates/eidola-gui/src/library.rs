@@ -8,10 +8,13 @@
 //! of the first message) with a right-aligned relative date in `text_sm`
 //! muted. An empty library is a single quiet line.
 
+use std::ops::Range;
+
 use eidola_app_core::SpaceInfo;
 use gpui::{
     App, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px, rems,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle,
+    Window, div, px, rems, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, IconName, Sizable,
@@ -20,7 +23,7 @@ use gpui_component::{
 };
 
 use crate::actions::CloseWindow;
-use crate::core::Core;
+use crate::stores::{SpacesStore, Stores};
 
 /// Vertical reserve under the macOS traffic lights — same pattern as
 /// `chat::TITLE_BAR_RESERVE` (the window uses the shared transparent
@@ -30,29 +33,40 @@ const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
 #[cfg(not(target_os = "macos"))]
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 
+/// Fixed row height for the virtualized listing. Rows are single-line by
+/// design (title + relative date), so `uniform_list`'s single-measure layout
+/// holds. Matches the former `py_3` single-line row rhythm.
+const ROW_H: gpui::Pixels = gpui::px(46.);
+
 pub struct LibraryView {
-    core: Entity<Core>,
+    stores: Stores,
+    spaces: Entity<SpacesStore>,
     /// Index of the row currently under the pointer, for the hover-revealed
     /// archive affordance.
     hovered: Option<usize>,
     /// Focus handle the root v_flex tracks, so the `CloseWindow` listener is
     /// in the dispatch path (same pattern as `SettingsView`).
     focus_handle: FocusHandle,
+    /// Scroll handle for the virtualized listing.
+    scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
 impl LibraryView {
-    pub fn new(core: Entity<Core>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let _subscriptions = vec![cx.observe(&core, |_, _, cx| cx.notify())];
-        core.update(cx, |c, cx| c.fetch_spaces(cx));
+    pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let spaces = stores.spaces.clone();
+        let _subscriptions = vec![cx.observe(&spaces, |_, _, cx| cx.notify())];
+        spaces.update(cx, |s, cx| s.refresh(cx));
 
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
         Self {
-            core,
+            stores,
+            spaces,
             hovered: None,
             focus_handle,
+            scroll: UniformListScrollHandle::new(),
             _subscriptions,
         }
     }
@@ -74,16 +88,33 @@ impl LibraryView {
     /// behavior tests can exercise the same path without synthesizing mouse
     /// events.
     pub fn archive(&mut self, space_id: String, cx: &mut Context<Self>) {
-        self.core.update(cx, |c, cx| c.archive_space(space_id, cx));
+        self.spaces.update(cx, |s, cx| s.archive(space_id, cx));
     }
 
     /// Open the given space in a new chat window. Deferred so the window
     /// opens after the current update cycle completes.
     pub fn open_space(&mut self, space_id: String, cx: &mut Context<Self>) {
-        let core = self.core.clone();
+        let stores = self.stores.clone();
         cx.defer(move |cx: &mut App| {
-            crate::open_space_window(cx, core, space_id);
+            crate::open_space_window(cx, stores, space_id);
         });
+    }
+
+    /// Render the visible window of listing rows. Indexer for the virtualized
+    /// `uniform_list` — clones only the visible slice from the store, so the
+    /// per-frame cost is O(visible), not O(loaded).
+    fn render_rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let visible: Vec<(usize, SpaceInfo)> = self
+            .spaces
+            .read(cx)
+            .list()
+            .get(range.clone())
+            .map(|slice| range.clone().zip(slice.iter().cloned()).collect())
+            .unwrap_or_default();
+        visible
+            .into_iter()
+            .map(|(idx, space)| self.render_row(idx, &space, cx).into_any_element())
+            .collect()
     }
 
     fn render_row(
@@ -130,7 +161,7 @@ impl LibraryView {
         let mut row = h_flex()
             .id(("space-row", idx))
             .w_full()
-            .py_3()
+            .h(ROW_H)
             .gap_3()
             .items_center()
             .cursor_pointer()
@@ -166,7 +197,7 @@ impl LibraryView {
 impl Render for LibraryView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let spaces = self.core.read(cx).spaces.clone();
+        let count = self.spaces.read(cx).list().len();
 
         let mut root = v_flex()
             .track_focus(&self.focus_handle)
@@ -200,7 +231,7 @@ impl Render for LibraryView {
                 .child(div().h(px(1.)).flex_1().bg(theme.border)),
         );
 
-        if spaces.is_empty() {
+        if count == 0 {
             return root.child(
                 h_flex()
                     .flex_1()
@@ -215,18 +246,29 @@ impl Render for LibraryView {
             );
         }
 
-        let mut list = v_flex().w_full().max_w(rems(34.)).px_10().pt_4().pb_8();
-        for (idx, space) in spaces.iter().enumerate() {
-            list = list.child(self.render_row(idx, space, cx));
-        }
+        // The listing is virtualized: `uniform_list` renders only the visible
+        // window of rows, so frame work is O(visible), not O(loaded). The
+        // list self-scrolls; the centering wrapper caps it at the prose
+        // measure and keeps it centered like the unvirtualized layout.
+        let list = uniform_list(
+            "library-list",
+            count,
+            cx.processor(|this, range: Range<usize>, _window, cx| this.render_rows(range, cx)),
+        )
+        .h_full()
+        .w_full()
+        .max_w(rems(34.))
+        .px_10()
+        .pt_4()
+        .track_scroll(&self.scroll);
 
         root.child(
-            div()
-                .id("library-scroll")
+            h_flex()
                 .w_full()
                 .flex_1()
-                .overflow_y_scroll()
-                .child(h_flex().w_full().justify_center().child(list)),
+                .min_h_0()
+                .justify_center()
+                .child(list),
         )
     }
 }

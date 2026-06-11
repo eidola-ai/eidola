@@ -1,16 +1,16 @@
-use std::sync::Arc;
 use std::time::Duration;
 
+use crate::window_input::WindowInput;
 use eidola_app_core::error::AppError;
-use eidola_app_core::{ChatStreamEvent, SpaceMessage};
+use eidola_app_core::{ModelInfo, SpaceMessage};
 use gpui::{
     AppContext, AsyncApp, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    InteractiveElement, IntoElement, ModifiersChangedEvent, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, actions, div,
-    linear_color_stop, linear_gradient, px, relative, rems,
+    linear_color_stop, linear_gradient, prelude::FluentBuilder, px, relative, rems,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, IconName,
+    ActiveTheme, Disableable, IconName, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     highlighter::HighlightTheme,
@@ -21,10 +21,12 @@ use gpui_component::{
 use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownStyle};
 
 use crate::actions::CloseWindow;
-use crate::core::Core;
-
-/// Default model to send to the inference endpoint.
-const DEFAULT_MODEL: &str = "gemma4-31b";
+use crate::plans::format_credits;
+// Re-exported for the chat surface's consumers (tests construct
+// `StreamingResponse` / read `ChatMessageView` through `eidola_gui::chat`).
+pub use crate::space::{ChatMessageView, StreamingResponse};
+use crate::space::{Space, SpaceEvent};
+use crate::stores::{AccountStore, ConfigStore, ModelsStore, Stores, WalletStore};
 
 /// Vertical space reserved at the top of the window for the macOS traffic
 /// lights. The window has a transparent titlebar (see
@@ -42,46 +44,18 @@ const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
 #[cfg(not(target_os = "macos"))]
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 
-actions!(chat, [Send]);
-
-/// In-flight assistant response. While this is `Some(...)`, the chat is
-/// streaming — `reasoning` and `content` grow as deltas arrive. On
-/// completion the streaming response is dropped; the captured reasoning
-/// is moved onto the just-finalized assistant entry in `messages` so the
-/// disclosure remains available after the stream ends.
-#[derive(Default, Clone)]
-pub struct StreamingResponse {
-    pub reasoning: String,
-    pub content: String,
-    /// Whether the reasoning disclosure is open. Independent of whether
-    /// reasoning has any content yet.
-    pub expanded: bool,
-    /// In-stream error: stream produced something the user should see,
-    /// but the request as a whole has not necessarily failed.
-    pub error: Option<String>,
-}
-
-/// A single rendered chat row: the persisted message plus any reasoning
-/// captured for it during streaming. Reasoning is ephemeral session
-/// state — the local DB stores only the assistant's final content — so
-/// older messages from a re-loaded space carry `reasoning = None`. New
-/// assistant messages adopt whatever reasoning was streaming at finalize.
-#[derive(Clone)]
-pub struct ChatMessageView {
-    pub message: SpaceMessage,
-    pub reasoning: Option<String>,
-    pub reasoning_expanded: bool,
-}
-
-impl ChatMessageView {
-    pub fn new(message: SpaceMessage) -> Self {
-        Self {
-            message,
-            reasoning: None,
-            reasoning_expanded: false,
-        }
-    }
-}
+actions!(
+    chat,
+    [
+        /// Submit the composer's markdown to the model. Bound to ⌘↩ in the
+        /// `ChatView` key context.
+        Send,
+        /// Toggle the quiet model picker anchored to the title-bar band.
+        /// Bound to ⌥⌘M in the `ChatView` key context; clicking the
+        /// ⌥-revealed model label is the pointer path to the same state.
+        ToggleModelPicker
+    ]
+);
 
 /// The chat window's onboarding stage, derived each render from the shared
 /// `Core` snapshots plus the view's local state. See
@@ -122,38 +96,56 @@ pub struct OnboardingFlow {
     /// flow on the plans page while the first prices/balances fetch is in
     /// flight, instead of flashing the blank page between the two states.
     pub entered_plans: bool,
-    /// A plans-data fetch has actually started (or the prices were already
-    /// cached) for the current visit to the plans stage. Guards the
-    /// observe-driven auto-fetch from looping. Deliberately *not* set when
-    /// `Core::spawn`'s busy-debounce drops the call — the busy op's
-    /// completion notify is the retry trigger.
+    /// A plans-data fetch has started (or the prices were already cached) for
+    /// the current visit to the plans stage. Guards the observe-driven
+    /// auto-fetch from looping. Each store refresh owns its own task slot, so
+    /// the fetch always starts — the latch is purely re-entry protection.
     plans_fetch_attempted: bool,
     /// The 3s balance-poll loop is already running.
     poll_running: bool,
 }
 
 pub struct ChatView {
-    core: Entity<Core>,
+    /// The store bundle — held whole because the chat surface reads several
+    /// domains (config, models, account, wallet) and opens spaces through the
+    /// `SpacesStore` registry.
+    stores: Stores,
+    config: Entity<ConfigStore>,
+    models: Entity<ModelsStore>,
+    account: Entity<AccountStore>,
+    wallet: Entity<WalletStore>,
+    /// The shared per-conversation domain entity. Owns the transcript,
+    /// streaming buffers, the submit runner, and the per-space model
+    /// selection — two windows on the same space hold the *same* `Space`, so
+    /// a submit/stream in one appears in the other (wave-2 bug 4). `ChatView`
+    /// is a window-local lens over it.
+    space: Entity<Space>,
     /// WYSIWYG markdown composer (`gpui-markdown-editor`). The user types
     /// here in styled-markdown view; on submit we read `state.markdown` and
-    /// send the raw source upstream.
+    /// send the raw source upstream. The composer draft is **window-local by
+    /// design** — two windows on one space are two cursors with two drafts
+    /// (see `docs/architecture/state.md`).
     prompt_editor: Entity<MarkdownEditor>,
-    space_id: Option<String>,
-    /// Conversation history shown in the scroll view. `pub` so snapshot tests
-    /// can render the view in a populated state without driving async chat.
-    pub messages: Vec<ChatMessageView>,
-    /// Bumped whenever local chat state moves ahead of an initial reload.
-    /// Reopened-space loads capture this value and only apply if it still
-    /// matches, so a slow initial load cannot hide a newly submitted exchange.
-    transcript_generation: u64,
-    /// In-flight streaming assistant response, or `None` when idle.
-    pub streaming: Option<StreamingResponse>,
+    /// The error band shown below the transcript. Window-local: set from the
+    /// space's `SpaceEvent::Failed` (and a transcript-load failure), so each
+    /// window can surface its own last-submit error and its own degraded
+    /// onboarding state.
     error: Option<String>,
     /// Onboarding flow state (welcome → plans → ready).
     onboarding: OnboardingFlow,
     /// A chat submit failed with `InsufficientBalance` — surface the plans
     /// list below the transcript's error band (not a modal).
     pub show_plans_after_error: bool,
+
+    /// Per-window modifier state. The root registers the window's single
+    /// `on_modifiers_changed` listener and mirrors every event here.
+    /// `ChatView` observes this entity for the ⌥-reveal and picker-anchor
+    /// behavior; it never registers its own modifier listener.
+    window_input: Entity<WindowInput>,
+    /// Whether the model picker panel is open (⌥⌘M or clicking the
+    /// revealed label). The label stays revealed while the picker is open
+    /// so the picker keeps its visual anchor after ⌥ is released.
+    model_picker_open: bool,
 
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -174,27 +166,54 @@ impl ChatView {
         self.prompt_editor.clone()
     }
 
-    /// Test-only setter for snapshot tests. Wraps each `SpaceMessage`
-    /// into a `ChatMessageView` with `reasoning = None`.
+    /// The shared `Space` entity this window is a lens over.
+    pub fn space(&self) -> &Entity<Space> {
+        &self.space
+    }
+
+    /// The transcript rows, read from the shared `Space`.
+    pub fn messages(&self, cx: &gpui::App) -> Vec<ChatMessageView> {
+        self.space.read(cx).messages().to_vec()
+    }
+
+    /// The current streaming response, read from the shared `Space`.
+    pub fn streaming(&self, cx: &gpui::App) -> Option<StreamingResponse> {
+        self.space.read(cx).streaming().cloned()
+    }
+
+    /// Test-only setter for snapshot tests. Writes the transcript into the
+    /// shared `Space`.
     #[doc(hidden)]
-    pub fn set_messages_for_test(&mut self, messages: Vec<SpaceMessage>) {
-        self.messages = messages.into_iter().map(ChatMessageView::new).collect();
+    pub fn set_messages_for_test(&mut self, messages: Vec<SpaceMessage>, cx: &mut Context<Self>) {
+        self.space
+            .update(cx, |s, cx| s.set_messages_for_test(messages, cx));
     }
 
     /// Test-only: attach reasoning to the message at `idx`, optionally
     /// expanded. Use after `set_messages_for_test`.
     #[doc(hidden)]
-    pub fn set_reasoning_for_test(&mut self, idx: usize, reasoning: String, expanded: bool) {
-        if let Some(entry) = self.messages.get_mut(idx) {
-            entry.reasoning = Some(reasoning);
-            entry.reasoning_expanded = expanded;
-        }
+    pub fn set_reasoning_for_test(
+        &mut self,
+        idx: usize,
+        reasoning: String,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.space.update(cx, |s, cx| {
+            s.set_reasoning_for_test(idx, reasoning, expanded, cx)
+        });
     }
 
-    /// Test-only setter for snapshot tests.
+    /// Test-only setter for snapshot tests. Writes the streaming state into
+    /// the shared `Space`.
     #[doc(hidden)]
-    pub fn set_streaming_for_test(&mut self, streaming: Option<StreamingResponse>) {
-        self.streaming = streaming;
+    pub fn set_streaming_for_test(
+        &mut self,
+        streaming: Option<StreamingResponse>,
+        cx: &mut Context<Self>,
+    ) {
+        self.space
+            .update(cx, |s, cx| s.set_streaming_for_test(streaming, cx));
     }
 
     /// Read access to the onboarding flow state, for behavior tests.
@@ -216,21 +235,96 @@ impl ChatView {
         self.error = error;
     }
 
-    /// Test-only: simulate completion of the initial reopened-space load.
-    #[doc(hidden)]
-    pub fn merge_initial_messages_for_test(
-        &mut self,
-        load_generation: u64,
-        messages: Vec<SpaceMessage>,
-    ) -> bool {
-        self.merge_initial_messages_from_db(load_generation, messages)
-    }
-
     /// The space this window is writing into, if one has been assigned —
     /// either passed at construction (opened from the Library) or set when
-    /// the first exchange creates a space.
-    pub fn space_id(&self) -> Option<&str> {
-        self.space_id.as_deref()
+    /// the first exchange creates a space. Reads through the shared `Space`.
+    pub fn space_id(&self, cx: &gpui::App) -> Option<String> {
+        self.space.read(cx).id().map(str::to_string)
+    }
+
+    // -- Model picker state -------------------------------------------------
+
+    /// The model the next send will use: the space's explicit selection if the
+    /// user picked one, otherwise the config default
+    /// (`ConfigState::default_model`), otherwise the embedded fallback
+    /// (stub cores in tests have no config snapshot).
+    pub fn current_model(&self, cx: &gpui::App) -> String {
+        if let Some(model) = self.space.read(cx).selected_model() {
+            return model.to_string();
+        }
+        self.config
+            .read(cx)
+            .state()
+            .map(|s| s.default_model.clone())
+            .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string())
+    }
+
+    /// Whether the model label is currently revealed in the title-bar band:
+    /// while ⌥ is held (via `WindowInput`), or while the picker it anchors
+    /// is open.
+    pub fn model_revealed(&self, cx: &gpui::App) -> bool {
+        self.window_input.read(cx).alt_held() || self.model_picker_open
+    }
+
+    /// Whether the model picker panel is open.
+    pub fn model_picker_open(&self) -> bool {
+        self.model_picker_open
+    }
+
+    /// The space's explicit model selection, if any.
+    pub fn selected_model(&self, cx: &gpui::App) -> Option<String> {
+        self.space.read(cx).selected_model().map(str::to_string)
+    }
+
+    /// The model id handed to the most recent submit (read from the space).
+    pub fn last_submitted_model(&self, cx: &gpui::App) -> Option<String> {
+        self.space
+            .read(cx)
+            .last_submitted_model()
+            .map(str::to_string)
+    }
+
+    /// Toggle the model picker (⌥⌘M, or clicking the revealed label).
+    pub fn toggle_model_picker(&mut self, cx: &mut Context<Self>) {
+        self.model_picker_open = !self.model_picker_open;
+        cx.notify();
+    }
+
+    /// Choose the model for this space's subsequent sends and close the
+    /// picker. A switch while a response is streaming applies to the *next*
+    /// send — the in-flight request is never hot-swapped (the selection lives
+    /// on the shared `Space`, so both windows see the change).
+    pub fn select_model(&mut self, id: String, cx: &mut Context<Self>) {
+        self.space.update(cx, |s, cx| s.select_model(id, cx));
+        self.model_picker_open = false;
+        cx.notify();
+    }
+
+    /// Persist this window's current model as the config default
+    /// (`default_model` override) — the picker's quiet "set as default"
+    /// affordance. The picker stays open so the moved "default" marker is
+    /// the visible confirmation.
+    pub fn set_current_model_as_default(&mut self, cx: &mut Context<Self>) {
+        let model = self.current_model(cx);
+        self.config
+            .update(cx, |c, cx| c.set_default_model(model, cx));
+        cx.notify();
+    }
+
+    /// Test-only setter for the ⌥-reveal state, so snapshot tests can render
+    /// the revealed label without synthesizing platform modifier events.
+    /// Writes through to the `WindowInput` entity so `model_revealed` stays
+    /// consistent.
+    #[doc(hidden)]
+    pub fn set_alt_held_for_test(&mut self, alt: bool, cx: &mut Context<Self>) {
+        self.window_input
+            .update(cx, |wi, cx| wi.set_alt_for_test(alt, cx));
+    }
+
+    /// Test-only setter for the picker's open state.
+    #[doc(hidden)]
+    pub fn set_model_picker_open_for_test(&mut self, open: bool) {
+        self.model_picker_open = open;
     }
 }
 
@@ -240,9 +334,15 @@ impl ChatView {
     /// reopens an existing space (the Library's path): its messages are
     /// loaded asynchronously on construction and the next exchange
     /// continues that space.
+    ///
+    /// `window_input` is the per-window modifier entity created by
+    /// `open_chat_window`. The root view's `on_modifiers_changed` listener
+    /// mirrors every modifier event into it; `ChatView` observes it for the
+    /// ⌥ reveal and never registers its own modifier listener.
     pub fn new(
-        core: Entity<Core>,
+        stores: Stores,
         space_id: Option<String>,
+        window_input: Entity<WindowInput>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -274,62 +374,110 @@ impl ChatView {
         // (no modifier) is bound in the editor's context and inserts
         // a newline as normal.
 
-        // One combined startup fetch: models, plus balances + wallet
-        // credentials when an account exists (the onboarding inputs).
-        core.update(cx, |core, cx| core.fetch_chat_startup(cx));
+        let config = stores.config.clone();
+        let models = stores.models.clone();
+        let account = stores.account.clone();
+        let wallet = stores.wallet.clone();
+        let spaces = stores.spaces.clone();
 
-        // Re-render when the shared core snapshots change (config,
-        // balances, prices, credentials), and lazily fetch the plans data
-        // the first time the derived stage lands on `Plans`.
-        let _subscriptions = vec![cx.observe(&core, |this: &mut Self, _, cx| {
-            this.maybe_fetch_plans_data(cx);
-            cx.notify();
-        })];
+        // Get-or-create the shared `Space` entity through the registry.
+        // `Some(id)` joins (or creates) the entity for an existing space — and
+        // kicks off the one transcript load; a second window opening the same
+        // id shares this entity (and its single load), which is the wave-2
+        // bug-4 fix. `None` mints a blank space (⌘N) that stays instant and is
+        // adopted into the registry once its first exchange assigns an id.
+        let space = match space_id {
+            Some(id) => spaces.update(cx, |s, cx| s.open(id, cx)),
+            None => spaces.update(cx, |s, cx| s.blank(cx)),
+        };
 
-        // Reopening an existing space: load its persisted messages in the
-        // background, same bridge `spawn_stream` uses for its post-stream
-        // re-fetch. Stub cores (tests) skip the load — tests preload via
-        // `set_messages_for_test`.
-        if let Some(sid) = space_id.clone()
-            && let Some(app_core) = core.read(cx).app_core()
-        {
-            let load_generation = 0;
-            let msgs_rx = Core::get_space_messages(app_core, sid);
-            cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
-                let msgs = msgs_rx.await.unwrap_or_else(|_| {
-                    Err(eidola_app_core::error::AppError::Internal {
-                        message: "fetch messages task cancelled".into(),
-                    })
-                });
-                let _ = this.update(cx, |this, cx| {
-                    match msgs {
-                        Ok(messages) => {
-                            this.merge_initial_messages_from_db(load_generation, messages);
-                        }
-                        Err(e) => {
-                            if this.transcript_generation == load_generation {
-                                this.error = Some(e.to_string());
-                            }
-                        }
-                    }
-                    cx.notify();
-                });
-            })
-            .detach();
+        // Onboarding inputs: when an account exists, the stage machine needs
+        // a balance snapshot and the active-credential list. The model list
+        // is refreshed app-globally at launch (and on `Change::Config`) by
+        // `ModelsStore` — the first window reads it from there rather than
+        // kicking its own fetch, which is the structural fix for wave-2's
+        // starved model list. Each refresh owns its own store task slot, so
+        // there is no shared busy gate to dodge.
+        let has_account = config
+            .read(cx)
+            .state()
+            .is_some_and(|s| s.has_account && s.has_account_secret);
+        if has_account {
+            account.update(cx, |s, cx| s.refresh_balances(cx));
+            wallet.update(cx, |s, cx| s.refresh(cx));
         }
 
+        // Re-render when the stores the onboarding stage depends on change,
+        // and lazily fetch the plans data the first time the derived stage
+        // lands on `Plans`. The `Space` gets both a plain `observe` (re-render
+        // on any change — transcript reloads, streaming deltas) and a
+        // semantic `subscribe` (`SpaceEvent`): tail-scroll keys off
+        // `StreamDelta`, and a failed submit (`Failed`) routes the degraded
+        // onboarding state, both window-local concerns.
+        let _subscriptions = vec![
+            cx.observe(&config, |this: &mut Self, _, cx| {
+                this.maybe_fetch_plans_data(cx);
+                cx.notify();
+            }),
+            cx.observe(&models, |_, _, cx| cx.notify()),
+            cx.observe(&account, |this: &mut Self, _, cx| {
+                this.maybe_fetch_plans_data(cx);
+                cx.notify();
+            }),
+            cx.observe(&wallet, |this: &mut Self, _, cx| {
+                this.maybe_fetch_plans_data(cx);
+                cx.notify();
+            }),
+            cx.observe(&space, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&space, window, Self::on_space_event),
+            // Re-render when ⌥ transitions so the title-bar reveal responds
+            // immediately. The modifier state itself lives in `window_input`;
+            // the root view's single listener mirrors it there.
+            cx.observe(&window_input, |_, _, cx| cx.notify()),
+        ];
+
         Self {
-            core,
+            stores,
+            config,
+            models,
+            account,
+            wallet,
+            space,
             prompt_editor,
-            space_id,
-            messages: Vec::new(),
-            transcript_generation: 0,
-            streaming: None,
             error: None,
             onboarding: OnboardingFlow::default(),
             show_plans_after_error: false,
+            window_input,
+            model_picker_open: false,
             focus_handle,
             _subscriptions,
+        }
+    }
+
+    /// React to a semantic `SpaceEvent` from the shared `Space`. Plain
+    /// re-render is handled by the sibling `observe`; here we handle the
+    /// window-local consequences: tail-scroll on a streaming delta and the
+    /// degraded-onboarding routing on a typed failure.
+    fn on_space_event(
+        &mut self,
+        _space: &Entity<Space>,
+        event: &SpaceEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SpaceEvent::StreamDelta => {
+                // Tail-scroll hook: the chat scroll surface is rebuilt each
+                // render, and there is no persistent scroll handle today, so a
+                // delta just needs a re-render to reflect the growing content.
+                cx.notify();
+            }
+            SpaceEvent::MessagesChanged | SpaceEvent::StreamEnded => {
+                cx.notify();
+            }
+            SpaceEvent::Failed(e) => {
+                self.apply_chat_failure(e.clone(), cx);
+            }
         }
     }
 
@@ -347,15 +495,17 @@ impl ChatView {
     /// balances fetch after account creation is still in flight,
     /// `entered_plans` holds the flow on the plans page so it doesn't flash
     /// through the blank page.
-    pub fn onboarding_stage(&self, core: &Core, composer_empty: bool) -> OnboardingStage {
-        if !self.messages.is_empty()
-            || self.streaming.is_some()
+    pub fn onboarding_stage(&self, cx: &gpui::App, composer_empty: bool) -> OnboardingStage {
+        let space = self.space.read(cx);
+        if !space.messages().is_empty()
+            || space.is_streaming()
             || self.error.is_some()
             || !composer_empty
         {
             return OnboardingStage::Ready;
         }
-        let Some(state) = core.config_state.as_ref() else {
+        let config = self.config.read(cx);
+        let Some(state) = config.state() else {
             return OnboardingStage::Ready;
         };
         if !state.has_account || !state.has_account_secret {
@@ -364,11 +514,13 @@ impl ChatView {
         if self.onboarding.dismissed {
             return OnboardingStage::Ready;
         }
-        let balance_known_zero = core.balances.as_ref().is_some_and(|b| b.available <= 0);
-        if balance_known_zero && core.credentials.is_empty() {
+        let balances = self.account.read(cx).balances();
+        let credentials_empty = self.wallet.read(cx).credentials().is_empty();
+        let balance_known_zero = balances.value().is_some_and(|b| b.available <= 0);
+        if balance_known_zero && credentials_empty {
             return OnboardingStage::Plans;
         }
-        if self.onboarding.entered_plans && core.balances.is_none() {
+        if self.onboarding.entered_plans && balances.value().is_none() {
             return OnboardingStage::Plans;
         }
         OnboardingStage::Ready
@@ -376,7 +528,7 @@ impl ChatView {
 
     fn current_stage(&self, cx: &Context<Self>) -> OnboardingStage {
         let composer_empty = self.prompt_editor.read(cx).state.markdown.trim().is_empty();
-        self.onboarding_stage(self.core.read(cx), composer_empty)
+        self.onboarding_stage(cx, composer_empty)
     }
 
     /// Kick off a prices+balances fetch the first time the derived stage
@@ -389,16 +541,18 @@ impl ChatView {
         if self.current_stage(cx) != OnboardingStage::Plans {
             return;
         }
-        if !self.core.read(cx).prices.is_empty() {
+        if self.account.read(cx).prices().has_value() {
             self.onboarding.plans_fetch_attempted = true;
             return;
         }
-        // Latch only if the fetch actually started: `Core::spawn` silently
-        // drops the call while another core op is in flight (e.g. the
-        // startup fetch), and that op's completion notify is what re-runs
-        // us for the retry.
-        self.onboarding.plans_fetch_attempted =
-            self.core.update(cx, |core, cx| core.fetch_plans_data(cx));
+        // Latch unconditionally now: each store refresh owns its own task
+        // slot (no shared busy gate), so a `Plans`-stage prices fetch always
+        // starts. We still guard against re-entry via the latch.
+        self.account.update(cx, |s, cx| {
+            s.refresh_prices(cx);
+            s.refresh_balances(cx);
+        });
+        self.onboarding.plans_fetch_attempted = true;
     }
 
     /// "Begin" on the welcome page: create the anonymous account. There is
@@ -411,12 +565,13 @@ impl ChatView {
         self.onboarding.create_error = None;
         cx.notify();
 
-        let Some(app_core) = self.core.read(cx).app_core() else {
-            // Stub core (behavior tests): the in-flight flag above is the
-            // observable state machine transition.
+        // Awaitable account-create: the onboarding flow owns the await in its
+        // own (detached, view-scoped) task and refreshes config/account on
+        // success. `None` on stub stores (behavior tests): the in-flight flag
+        // above is the observable state-machine transition.
+        let Some(rx) = self.account.read(cx).request_account_create() else {
             return;
         };
-        let rx = Core::account_create(app_core);
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let res = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
@@ -427,18 +582,17 @@ impl ChatView {
                 this.onboarding.creating_account = false;
                 match res {
                     Ok(_) => {
-                        // Move straight to the plans step: refresh the
-                        // config snapshot (has_account flips true) and
-                        // fetch prices + the initial (zero) balance. The
-                        // latch tracks whether the fetch actually started —
-                        // if the startup fetch is still busy the call is
-                        // dropped, and `maybe_fetch_plans_data` retries on
-                        // that op's completion notify.
+                        // Move straight to the plans step: refresh the config
+                        // snapshot (has_account flips true) and fetch prices +
+                        // the initial (zero) balance. Each refresh owns its own
+                        // store task slot, so the calls always start.
                         this.onboarding.entered_plans = true;
-                        this.onboarding.plans_fetch_attempted = this.core.update(cx, |core, cx| {
-                            core.refresh_config(cx);
-                            core.fetch_plans_data(cx)
+                        this.config.update(cx, |c, cx| c.refresh(cx));
+                        this.account.update(cx, |s, cx| {
+                            s.refresh_prices(cx);
+                            s.refresh_balances(cx);
                         });
+                        this.onboarding.plans_fetch_attempted = true;
                     }
                     Err(e) => this.onboarding.create_error = Some(e.to_string()),
                 }
@@ -458,10 +612,9 @@ impl ChatView {
         self.onboarding.plans_error = None;
         cx.notify();
 
-        let Some(app_core) = self.core.read(cx).app_core() else {
+        let Some(rx) = self.account.read(cx).request_checkout(price_id) else {
             return;
         };
-        let rx = Core::account_checkout(app_core, price_id);
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let res = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
@@ -500,9 +653,10 @@ impl ChatView {
         if self.onboarding.poll_running {
             return;
         }
-        let Some(app_core) = self.core.read(cx).app_core() else {
+        // Stub stores have no backend to poll.
+        if self.stores.app_core().is_none() {
             return;
-        };
+        }
         self.onboarding.poll_running = true;
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
@@ -513,9 +667,20 @@ impl ChatView {
                 if !keep_going {
                     break;
                 }
-                let res = match Core::account_balances(app_core.clone()).await {
+                // Ask the AccountStore for a fresh balances fetch via its
+                // awaitable `request_balances` — the poll (the initiator)
+                // owns the await here and writes the result back into the
+                // store, since the poll itself is the source of this change.
+                let Some(rx) = this
+                    .read_with(cx, |this, cx| this.account.read(cx).request_balances())
+                    .ok()
+                    .flatten()
+                else {
+                    break;
+                };
+                let res = match rx.await {
                     Ok(res) => res,
-                    Err(_) => break, // core dropped
+                    Err(_) => break, // task cancelled
                 };
                 let stop = this
                     .update(cx, |this, cx| {
@@ -525,10 +690,8 @@ impl ChatView {
                                 if balances.available > 0 {
                                     this.onboarding.awaiting_checkout = false;
                                 }
-                                this.core.update(cx, |core, cx| {
-                                    core.balances = Some(balances);
-                                    cx.notify();
-                                });
+                                this.account
+                                    .update(cx, |s, cx| s.set_balances(balances, cx));
                             }
                             Err(e) => {
                                 this.onboarding.plans_error =
@@ -550,85 +713,36 @@ impl ChatView {
         .detach();
     }
 
-    /// Route a failed chat submit. `InsufficientBalance` additionally
-    /// surfaces the plans list below the transcript via the error band —
-    /// typed routing, not string matching.
+    /// Route a failed chat submit. Called from the space's `SpaceEvent::Failed`
+    /// handler. `InsufficientBalance` additionally surfaces the plans list
+    /// below the transcript via the error band — typed routing, not string
+    /// matching. The streaming state itself is cleared by the `Space` (it owns
+    /// it); this method only sets the *window-local* error band + degraded
+    /// onboarding presentation.
     pub fn apply_chat_failure(&mut self, e: AppError, cx: &mut Context<Self>) {
-        self.streaming = None;
-        if matches!(e, AppError::InsufficientBalance { .. }) {
+        // Look through app-core's `ChatFailed` id-carrying wrapper before
+        // routing on variant. The `Space` already emits the unwrapped source,
+        // but `root()` keeps this correct if a wrapped error ever reaches here
+        // directly.
+        let root = e.root();
+        if matches!(root, AppError::InsufficientBalance { .. }) {
             self.show_plans_after_error = true;
-            if self.core.read(cx).prices.is_empty() {
-                self.core.update(cx, |core, cx| core.fetch_plans_data(cx));
+            if !self.account.read(cx).prices().has_value() {
+                self.account.update(cx, |s, cx| {
+                    s.refresh_prices(cx);
+                    s.refresh_balances(cx);
+                });
             }
         }
-        self.error = Some(e.to_string());
+        self.error = Some(root.to_string());
         cx.notify();
     }
 
-    /// Replace `messages` with a fresh list from the DB, preserving any
-    /// previously-attached reasoning by index (we only ever append in
-    /// this view, so positions are stable) and attaching the just-
-    /// captured streaming reasoning to the new last assistant entry if
-    /// non-empty.
-    fn merge_initial_messages_from_db(
-        &mut self,
-        load_generation: u64,
-        messages: Vec<SpaceMessage>,
-    ) -> bool {
-        if self.transcript_generation != load_generation {
-            return false;
-        }
-        self.merge_messages_from_db(messages, None);
-        true
-    }
-
-    fn merge_messages_from_db(
-        &mut self,
-        new_messages: Vec<SpaceMessage>,
-        new_reasoning: Option<String>,
-    ) {
-        let mut next: Vec<ChatMessageView> = new_messages
-            .into_iter()
-            .enumerate()
-            .map(|(idx, msg)| {
-                let prior = self.messages.get(idx);
-                let same_position = prior.is_some_and(|p| {
-                    p.message.role == msg.role && p.message.content == msg.content
-                });
-                ChatMessageView {
-                    message: msg,
-                    reasoning: if same_position {
-                        prior.and_then(|p| p.reasoning.clone())
-                    } else {
-                        None
-                    },
-                    reasoning_expanded: if same_position {
-                        prior.is_some_and(|p| p.reasoning_expanded)
-                    } else {
-                        false
-                    },
-                }
-            })
-            .collect();
-
-        if let Some(reasoning) = new_reasoning
-            && !reasoning.is_empty()
-        {
-            // Find the last assistant entry and attach the reasoning we
-            // captured during streaming.
-            if let Some(entry) = next
-                .iter_mut()
-                .rev()
-                .find(|e| e.message.role == "assistant")
-            {
-                entry.reasoning = Some(reasoning);
-            }
-        }
-        self.messages = next;
-    }
-
-    fn submit(&mut self, _: &Send, window: &mut Window, cx: &mut Context<Self>) {
-        if self.streaming.is_some() {
+    fn submit(&mut self, _: &Send, _window: &mut Window, cx: &mut Context<Self>) {
+        // Submit-during-streaming is a no-op (the current UX); the `Space`'s
+        // runner slot enforces this structurally, so we read it before
+        // touching the composer.
+        if self.space.read(cx).is_streaming() {
             return;
         }
 
@@ -643,92 +757,24 @@ impl ChatView {
             return;
         }
 
+        // Resolve the model at submit time (space selection → config default →
+        // embedded fallback). The `Space` records it before its own backend
+        // guard, so stub-core tests observe exactly what a real send would use.
+        let model = self.current_model(cx);
+
         self.prompt_editor.update(cx, |editor, cx| {
             editor.state = EditorState::default();
             cx.notify();
         });
-        self.transcript_generation = self.transcript_generation.wrapping_add(1);
-        self.messages.push(ChatMessageView::new(SpaceMessage {
-            role: "user".to_string(),
-            content: prompt.clone(),
-        }));
-        self.streaming = Some(StreamingResponse::default());
+        // Clear the window-local error band on a fresh submit. The transcript
+        // append + streaming entry + the streaming runner all live on the
+        // shared `Space`, so a second window on the same space sees them too.
         self.error = None;
         self.show_plans_after_error = false;
+        self.space.update(cx, |s, cx| {
+            s.submit(prompt, model, cx);
+        });
         cx.notify();
-
-        let Some(app_core) = self.core.read(cx).app_core() else {
-            // Stub core (behavior tests): the local state update above has
-            // already happened; without a real backend there is nothing more
-            // to do.
-            return;
-        };
-        let space_id = self.space_id.clone();
-
-        self.spawn_stream(app_core, prompt, space_id, window, cx);
-    }
-
-    /// Drive a streaming chat request from gpui's main thread.
-    fn spawn_stream(
-        &mut self,
-        app_core: Arc<eidola_app_core::AppCore>,
-        prompt: String,
-        space_id: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (mut event_rx, done_rx) =
-            Core::chat_stream(app_core.clone(), prompt, DEFAULT_MODEL.into(), space_id);
-
-        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
-            while let Some(event) = event_rx.recv().await {
-                let _ = this.update(cx, |this, cx| {
-                    if let Some(s) = this.streaming.as_mut() {
-                        match event {
-                            ChatStreamEvent::ReasoningDelta(d) => s.reasoning.push_str(&d),
-                            ChatStreamEvent::ContentDelta(d) => s.content.push_str(&d),
-                        }
-                    }
-                    cx.notify();
-                });
-            }
-
-            let outcome = done_rx.await.unwrap_or_else(|_| {
-                Err(eidola_app_core::error::AppError::Internal {
-                    message: "chat task cancelled".into(),
-                })
-            });
-
-            match outcome {
-                Ok(result) => {
-                    let msgs_rx = Core::get_space_messages(app_core, result.space_id.clone());
-                    let msgs = msgs_rx.await.unwrap_or_else(|_| {
-                        Err(eidola_app_core::error::AppError::Internal {
-                            message: "fetch messages task cancelled".into(),
-                        })
-                    });
-                    let _ = this.update(cx, |this, cx| {
-                        let captured_reasoning =
-                            this.streaming.as_ref().map(|s| s.reasoning.clone());
-                        this.streaming = None;
-                        this.space_id = Some(result.space_id);
-                        match msgs {
-                            Ok(messages) => {
-                                this.merge_messages_from_db(messages, captured_reasoning)
-                            }
-                            Err(e) => this.error = Some(e.to_string()),
-                        }
-                        cx.notify();
-                    });
-                }
-                Err(e) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.apply_chat_failure(e, cx);
-                    });
-                }
-            }
-        })
-        .detach();
     }
 }
 
@@ -748,19 +794,31 @@ impl Render for ChatView {
         };
 
         let theme = cx.theme();
+        let wi = self.window_input.clone();
         v_flex()
             .key_context("ChatView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::submit))
+            .on_action(
+                cx.listener(|this, _: &ToggleModelPicker, _, cx| this.toggle_model_picker(cx)),
+            )
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
+            }))
+            // Single modifier listener for this window: mirrors every event
+            // into `WindowInput` so all descendant views observe it rather
+            // than registering their own listeners on non-ancestor elements.
+            .on_modifiers_changed(cx.listener(move |_, event: &ModifiersChangedEvent, _, cx| {
+                wi.update(cx, |wi, cx| {
+                    wi.update_modifiers(event, cx);
+                });
             }))
             .relative()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(content)
-            .child(title_bar_overlay(cx))
+            .child(self.render_title_bar(stage, cx))
     }
 }
 
@@ -779,11 +837,18 @@ impl ChatView {
         // feel of long-form note tools.
         let composer_pb = window.viewport_size().height * 0.5;
 
+        // The transcript + streaming state live on the shared `Space`; read
+        // them once here. (Two windows on the same space render from the same
+        // entity, so a submit/stream in one appears in both.)
+        let space = self.space.read(cx);
+        let messages = space.messages();
+        let streaming = space.streaming().cloned();
+
         // pt(TITLE_BAR_RESERVE) handles the leading edge under the
         // traffic lights. No trailing pb on the column itself: the
         // composer's own pb (above) carries the bottom breath.
         let mut messages_col = v_flex().w_full().gap_0().pt(TITLE_BAR_RESERVE);
-        for (idx, entry) in self.messages.iter().enumerate() {
+        for (idx, entry) in messages.iter().enumerate() {
             let msg = &entry.message;
 
             // Chapter delimiter — a hairline rule + italic participant
@@ -846,10 +911,9 @@ impl ChatView {
                                     .icon(chevron)
                                     .label(SharedString::from("Thinking"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(entry) = this.messages.get_mut(idx) {
-                                            entry.reasoning_expanded = !entry.reasoning_expanded;
-                                            cx.notify();
-                                        }
+                                        this.space.update(cx, |s, cx| {
+                                            s.toggle_message_reasoning(idx, cx);
+                                        });
                                     })),
                             ),
                         ),
@@ -881,7 +945,7 @@ impl ChatView {
             messages_col = messages_col.child(row);
         }
 
-        if let Some(s) = self.streaming.as_ref() {
+        if let Some(s) = streaming.as_ref() {
             let fg = theme.foreground;
             let muted_fg = theme.muted_foreground;
             let danger = theme.danger;
@@ -919,10 +983,9 @@ impl ChatView {
                                     .icon(chevron)
                                     .label(SharedString::from("Thinking"))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(s) = this.streaming.as_mut() {
-                                            s.expanded = !s.expanded;
-                                            cx.notify();
-                                        }
+                                        this.space.update(cx, |s, cx| {
+                                            s.toggle_streaming_reasoning(cx);
+                                        });
                                     })),
                             ),
                         ),
@@ -1045,8 +1108,7 @@ impl ChatView {
         // height and the user couldn't click back into it after losing
         // focus). The floor matches one body line at the prose line-
         // height ratio so it doesn't visually grow once content arrives.
-        let has_preceding =
-            !self.messages.is_empty() || self.streaming.is_some() || self.error.is_some();
+        let has_preceding = !messages.is_empty() || streaming.is_some() || self.error.is_some();
         if has_preceding {
             messages_col = messages_col.child(chapter_delim(
                 participant_label("user"),
@@ -1202,27 +1264,31 @@ impl ChatView {
     /// clicking it opens checkout.
     fn render_plans_list(&self, cx: &Context<Self>) -> Div {
         let theme = cx.theme();
-        let core = self.core.read(cx);
+        let account = self.account.read(cx);
+        let prices_cell = account.prices();
+        let prices = prices_cell.value().cloned().unwrap_or_default();
+        let prices_loading = prices_cell.is_loading() || prices_cell.is_stale();
+        let prices_error = prices_cell.error().map(|e| e.to_string());
         let ob = &self.onboarding;
 
         let mut list = v_flex().w_full();
 
-        if core.prices.is_empty() {
-            if core.busy {
-                // `fetch_plans_data` is in flight.
+        if prices.is_empty() {
+            if prices_loading {
+                // A prices refresh is in flight.
                 list = list.child(
                     div()
                         .italic()
                         .text_color(theme.muted_foreground)
                         .child("Loading plans…"),
                 );
-            } else if let Some(err) = core.error_message.as_deref() {
+            } else if let Some(err) = prices_error {
                 list = list
                     .child(
                         div()
                             .text_sm()
                             .text_color(theme.danger)
-                            .child(SharedString::from(err.to_string())),
+                            .child(SharedString::from(err)),
                     )
                     .child(
                         div()
@@ -1233,11 +1299,11 @@ impl ChatView {
                             .hover(|s| s.text_color(theme.foreground))
                             .child("Try again")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.onboarding.plans_fetch_attempted =
-                                    this.core.update(cx, |core, cx| {
-                                        core.clear_error(cx);
-                                        core.fetch_plans_data(cx)
-                                    });
+                                this.account.update(cx, |s, cx| {
+                                    s.refresh_prices(cx);
+                                    s.refresh_balances(cx);
+                                });
+                                this.onboarding.plans_fetch_attempted = true;
                             })),
                     );
             } else {
@@ -1250,55 +1316,21 @@ impl ChatView {
             return list;
         }
 
-        for (idx, price) in core.prices.iter().enumerate() {
-            let price_line = if ob.checkout_pending.as_deref() == Some(price.id.as_str()) {
-                // Real in-flight request — see `begin_checkout`.
-                "Opening checkout…".to_string()
-            } else {
-                format!("{}{}", price.amount_display, price.recurrence)
-            };
-            let mut subline = format!("{} credits", format_credits(price.credits));
-            if let Some(desc) = price.product_description.as_deref() {
-                subline = format!("{subline} — {desc}");
-            }
-            let price_id = price.id.clone();
-
-            list =
-                list.child(
-                    v_flex()
-                        .id(("plan", idx))
-                        .w_full()
-                        .py_3()
-                        .gap_1()
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.muted.opacity(0.35)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.begin_checkout(price_id.clone(), cx)
-                        }))
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .justify_between()
-                                .items_baseline()
-                                .child(div().child(SharedString::from(price.product_name.clone())))
-                                .child(
-                                    div()
-                                        .text_color(theme.muted_foreground)
-                                        .child(SharedString::from(price_line)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child(SharedString::from(subline)),
-                        ),
-                );
-        }
-        // Closing hairline under the last row.
-        list = list.child(div().w_full().h(px(1.)).bg(theme.border));
+        // The rows themselves are shared with the Settings Account pane —
+        // see `crate::plans::plan_rows`. The click handler routes back into
+        // this view through a weak entity handle (`plan_rows` is a free
+        // function, so it can't take `cx.listener` directly).
+        let weak = cx.entity().downgrade();
+        let on_select: crate::plans::PlanSelectHandler =
+            std::rc::Rc::new(move |price_id, _window, app| {
+                let _ = weak.update(app, |this, cx| this.begin_checkout(price_id, cx));
+            });
+        list = list.child(crate::plans::plan_rows(
+            &prices,
+            ob.checkout_pending.as_deref(),
+            on_select,
+            cx,
+        ));
 
         if ob.awaiting_checkout {
             // The balance poll is live — one real request every ~3s.
@@ -1378,24 +1410,6 @@ fn prose_col() -> Div {
         .max_w(rems(PROSE_MAX_WIDTH_REM))
         .text_size(PROSE_FONT_SIZE)
         .line_height(relative(PROSE_LINE_HEIGHT))
-}
-
-/// Format a credit amount with thousands separators (credits are micro-USD
-/// denominated, so the magnitudes are large).
-fn format_credits(credits: i64) -> String {
-    let raw = credits.abs().to_string();
-    let mut out = String::with_capacity(raw.len() + raw.len() / 3 + 1);
-    if credits < 0 {
-        out.push('-');
-    }
-    let offset = raw.len() % 3;
-    for (i, ch) in raw.chars().enumerate() {
-        if i > 0 && (i + 3 - offset).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 /// Friendly label for a chat role, used as the participant name in the
@@ -1550,40 +1564,257 @@ fn markdown_style(is_dark: bool) -> TextViewStyle {
     })
 }
 
-/// Title-bar overlay: a gradient that fades from full `theme.background` at
-/// the top to fully transparent at the bottom of the reserve. Painted over
-/// the scroll area (positioned absolutely, last child wins z-order in gpui),
-/// so messages scrolling up under it dissolve smoothly instead of clipping.
-///
-/// Two non-aesthetic modifiers tame the title-bar band:
-///
-/// - `.cursor_default()` sets the platform cursor to `Arrow` over the band
-///   *and* causes gpui to register a hitbox here
-///   (`Interactivity::should_insert_hitbox` includes
-///   `style.mouse_cursor.is_some()`). Without it, the text below keeps
-///   winning the cursor-style lookup and the I-beam shows over the band.
-/// - `.block_mouse_except_scroll()` upgrades that hitbox to swallow click
-///   and drag events so a double-click-drag in the band doesn't fall
-///   through to `TextView`'s selectable handler and start a text
-///   selection underneath. Scroll passes through, so wheel-scrolling
-///   while the cursor is in the band still scrolls the chat.
-///
-/// macOS native titlebar behavior (drag, double-click-to-zoom) is handled
-/// by AppKit at the NSWindow layer before the gpui content view is asked,
-/// so blocking mouse on the gpui side doesn't disturb it.
-fn title_bar_overlay(cx: &gpui::App) -> impl IntoElement {
-    let bg = cx.theme().background;
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
-        .h(TITLE_BAR_RESERVE)
-        .cursor_default()
-        .block_mouse_except_scroll()
-        .bg(linear_gradient(
-            180.,
-            linear_color_stop(bg, 0.0),
-            linear_color_stop(bg.opacity(0.0), 1.0),
+impl ChatView {
+    /// Title-bar band: a gradient that fades from full `theme.background` at
+    /// the top to fully transparent at the bottom of the reserve. Painted
+    /// over the scroll area (positioned absolutely, last child wins z-order
+    /// in gpui), so messages scrolling up under it dissolve smoothly instead
+    /// of clipping.
+    ///
+    /// Two non-aesthetic modifiers tame the title-bar band:
+    ///
+    /// - `.cursor_default()` sets the platform cursor to `Arrow` over the
+    ///   band *and* causes gpui to register a hitbox here
+    ///   (`Interactivity::should_insert_hitbox` includes
+    ///   `style.mouse_cursor.is_some()`). Without it, the text below keeps
+    ///   winning the cursor-style lookup and the I-beam shows over the band.
+    /// - `.block_mouse_except_scroll()` upgrades that hitbox to swallow
+    ///   click and drag events so a double-click-drag in the band doesn't
+    ///   fall through to `TextView`'s selectable handler and start a text
+    ///   selection underneath. Scroll passes through, so wheel-scrolling
+    ///   while the cursor is in the band still scrolls the chat.
+    ///
+    /// macOS native titlebar behavior (drag, double-click-to-zoom) is
+    /// handled by AppKit at the NSWindow layer before the gpui content view
+    /// is asked, so blocking mouse on the gpui side doesn't disturb it.
+    ///
+    /// The band is also the home of the ⌥-revealed model label: at rest the
+    /// band is pure gradient (the page stays sacred), and while ⌥ is held —
+    /// or the picker it anchors is open — the current model id appears
+    /// right-aligned in `text_sm` muted italic, the same voice as the
+    /// chapter-delim labels. Children of the band are absolutely positioned
+    /// chrome, so the reveal cannot shift the page layout. The model chrome
+    /// only renders on the `Ready` stage — the onboarding pages have no
+    /// sends for it to describe.
+    fn render_title_bar(&self, stage: OnboardingStage, cx: &Context<Self>) -> Div {
+        let theme = cx.theme();
+        let bg = theme.background;
+        let mut band = h_flex()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(TITLE_BAR_RESERVE)
+            .justify_end()
+            .items_center()
+            .cursor_default()
+            .block_mouse_except_scroll()
+            .bg(linear_gradient(
+                180.,
+                linear_color_stop(bg, 0.0),
+                linear_color_stop(bg.opacity(0.0), 1.0),
+            ));
+
+        if stage == OnboardingStage::Ready && self.model_revealed(cx) {
+            band = band.child(
+                div()
+                    .id("model-label")
+                    .px_5()
+                    .text_sm()
+                    .italic()
+                    .text_color(theme.muted_foreground)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.foreground))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_model_picker(cx)))
+                    .child(SharedString::from(self.current_model(cx))),
+            );
+        }
+        if stage == OnboardingStage::Ready && self.model_picker_open {
+            band = band.child(self.render_model_picker(cx));
+        }
+        band
+    }
+
+    /// The model picker: a quiet panel anchored under the title-bar band's
+    /// right edge, listing `Core.models` with honest per-model info
+    /// (context length, credits per token — straight from the `/models`
+    /// payload). The current selection and the config default are marked;
+    /// a small footer affordance persists the current selection as the
+    /// default. Clicking outside dismisses; ⌥⌘M toggles.
+    ///
+    /// Hand-rolled rather than `gpui_component::Popover`: the open state
+    /// must live on the view (⌥⌘M and behavior tests drive it without a
+    /// pointer), the anchor is an absolutely-positioned band rather than an
+    /// in-flow trigger, and the band already paints above the scroll
+    /// content, so plain absolute positioning does everything `deferred(
+    /// anchored(…))` would. `popover_style` keeps the surface itself
+    /// consistent with gpui-component overlays under the Circadian theme.
+    fn render_model_picker(&self, cx: &Context<Self>) -> gpui::Stateful<Div> {
+        let theme = cx.theme();
+        let current = self.current_model(cx);
+        let default_model = self
+            .config
+            .read(cx)
+            .state()
+            .map(|s| s.default_model.clone())
+            .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string());
+        let models = self.models.read(cx).list().to_vec();
+
+        let mut panel = v_flex()
+            .id("model-picker")
+            .occlude()
+            .absolute()
+            .top(TITLE_BAR_RESERVE)
+            .right(px(12.))
+            .w(px(340.))
+            .max_h(px(420.))
+            .overflow_y_scroll()
+            .popover_style(cx)
+            .py_1()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.model_picker_open = false;
+                cx.notify();
+            }));
+
+        if models.is_empty() {
+            // Honest empty state: the model list hasn't loaded (or the
+            // fetch failed) — say what a send will actually use.
+            return panel.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(format!(
+                        "Model list unavailable — sends use {current}."
+                    ))),
+            );
+        }
+
+        for (idx, model) in models.iter().enumerate() {
+            let is_current = model.id == current;
+            let is_default = model.id == default_model;
+
+            let mut markers: Vec<&str> = Vec::new();
+            if is_current {
+                markers.push("current");
+            }
+            if is_default {
+                markers.push("default");
+            }
+
+            let mut name = div().text_sm().child(SharedString::from(model.id.clone()));
+            if is_current {
+                name = name.font_weight(gpui::FontWeight::SEMIBOLD);
+            }
+            let mut name_row = h_flex()
+                .w_full()
+                .justify_between()
+                .items_baseline()
+                .child(name);
+            if !markers.is_empty() {
+                name_row = name_row.child(
+                    div()
+                        .text_xs()
+                        .italic()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(markers.join(" · "))),
+                );
+            }
+
+            let id = model.id.clone();
+            panel = panel.child(
+                v_flex()
+                    .id(("model-row", idx))
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_0p5()
+                    .when(idx > 0, |d| d.border_t_1().border_color(theme.border))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.muted.opacity(0.5)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_model(id.clone(), cx)))
+                    .child(name_row)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(model_info_line(model))),
+                    ),
+            );
+        }
+
+        if current != default_model {
+            // Quiet, secondary: persist this window's model as the config
+            // default. Only offered when it would change anything.
+            let label = format!("Set {current} as default");
+            panel = panel.child(
+                div()
+                    .id("set-default-model")
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .italic()
+                    .text_color(theme.muted_foreground)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.foreground))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_current_model_as_default(cx)))
+                    .child(SharedString::from(label)),
+            );
+        }
+
+        panel
+    }
+}
+
+/// One honest line of per-model info for the picker, from the `/models`
+/// payload: context length plus the credit rates that will actually be
+/// charged. Per-request models show their flat rate; if the payload carried
+/// no pricing at all, only the context length is shown — we don't invent
+/// numbers.
+fn model_info_line(model: &ModelInfo) -> String {
+    // Per-request models (e.g. transcription) report no meaningful context
+    // length; showing "0-token context" would be noise, not honesty.
+    let ctx = (model.context_length > 0).then(|| {
+        format!(
+            "{}-token context",
+            format_credits(model.context_length as i64)
+        )
+    });
+    let price = if let Some(request) = model.request_credits {
+        Some(format!("{} credits per request", format_rate(request)))
+    } else if model.prompt_credits_per_token > 0.0 || model.completion_credits_per_token > 0.0 {
+        Some(format!(
+            "{} in / {} out credits per token",
+            format_rate(model.prompt_credits_per_token),
+            format_rate(model.completion_credits_per_token)
         ))
+    } else {
+        None
+    };
+    match (ctx, price) {
+        (Some(ctx), Some(price)) => format!("{ctx} · {price}"),
+        (Some(ctx), None) => ctx,
+        (None, Some(price)) => price,
+        (None, None) => "no published details".to_string(),
+    }
+}
+
+/// Format a credit rate: whole thousands get separators ("9,000"),
+/// everything else shows up to three decimals with trailing zeros trimmed
+/// ("1.500" → "1.5", "0.530" → "0.53", "3.000" → "3").
+fn format_rate(rate: f64) -> String {
+    if rate >= 1000.0 && rate.fract() == 0.0 {
+        return format_credits(rate as i64);
+    }
+    let s = format!("{rate:.3}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }

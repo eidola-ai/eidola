@@ -648,7 +648,7 @@ async fn fetch_url_network(
     Ok(bytes.to_vec())
 }
 
-fn build_http_client() -> Result<reqwest::Client, AppError> {
+pub(crate) fn build_http_client() -> Result<reqwest::Client, AppError> {
     // Idempotent — AppCore::new normally installs this; for standalone
     // updater callers (tests, future binaries) this is the safety net.
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
