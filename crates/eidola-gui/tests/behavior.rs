@@ -1526,6 +1526,71 @@ fn record_renders_stubbed_rows_without_backend(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn record_frame_work_is_constant_in_loaded_rows(cx: &mut TestAppContext) {
+    // The wave-2 bug-3 fix: with virtualization, the per-frame work (what the
+    // `uniform_list` closure does — render exactly the visible window) must be
+    // O(visible), not O(loaded). Load one page, then ten pages, and assert the
+    // visible-window render produces the same fixed number of rows in both
+    // cases (and far fewer than the total) — the structural guarantee. Also a
+    // coarse timing comparison: ten pages must not cost meaningfully more per
+    // frame than one.
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores.clone(), window, cx))
+    });
+
+    let one_page: Vec<_> = (0..51).map(|i| stub_request(&format!("r{i}"), i)).collect();
+    let ten_pages: Vec<_> = (0..510)
+        .map(|i| stub_request(&format!("r{i}"), i))
+        .collect();
+
+    // A fixed visible window (what a ~640px-tall viewport shows at ROW_H).
+    let visible = 0..12usize;
+
+    // One page loaded.
+    let (one_window, one_total, one_dur) = view.update(cx, |v, cx| {
+        v.set_requests_for_test(one_page.clone(), true);
+        v.select_section(RecordSection::Requests, cx);
+        let start = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..200 {
+            n = v.render_visible_window_for_test(visible.clone(), cx);
+        }
+        (n, v.display_len_for_test(), start.elapsed())
+    });
+
+    // Ten pages loaded.
+    let (ten_window, ten_total, ten_dur) = view.update(cx, |v, cx| {
+        v.set_requests_for_test(ten_pages.clone(), true);
+        let start = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..200 {
+            n = v.render_visible_window_for_test(visible.clone(), cx);
+        }
+        (n, v.display_len_for_test(), start.elapsed())
+    });
+
+    // The display model grew 10× …
+    assert_eq!(one_total, 52, "one page = 51 rows + load-more");
+    assert_eq!(ten_total, 511, "ten pages = 510 rows + load-more");
+    // … but the visible window rendered the same fixed count both times,
+    // far below the total — O(visible), not O(loaded).
+    assert_eq!(one_window, 12);
+    assert_eq!(
+        ten_window, 12,
+        "per-frame row count must not grow with loaded rows"
+    );
+
+    // Coarse timing: per-frame visible-window cost must not scale with the
+    // loaded-row count. Generous slack absorbs scheduler noise — we're
+    // catching O(loaded) regressions (which would be ~10×), not microbenching.
+    assert!(
+        ten_dur.as_secs_f64() < one_dur.as_secs_f64() * 4.0 + 0.05,
+        "frame work scaled with loaded rows: 1 page {one_dur:?} vs 10 pages {ten_dur:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
