@@ -1,6 +1,7 @@
 //! Eidola GUI library — exposes views and state used by the binary entry
 //! point in `main.rs` and by snapshot tests in `tests/visual.rs`.
 
+pub mod about;
 pub mod account;
 pub mod actions;
 pub mod bridge;
@@ -25,6 +26,7 @@ use gpui::{
 use gpui_component::Root;
 use gpui_component_assets::Assets;
 
+use crate::about::AboutView;
 use crate::actions::{
     About, CheckForUpdates, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenLibrary,
     OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
@@ -41,6 +43,9 @@ use crate::window_input::WindowInput;
 /// (which only get `&mut App`) can reach it.
 struct AppGlobal {
     stores: Stores,
+    /// The single About window, if open. Same singleton discipline as
+    /// `settings_window`.
+    about_window: Option<WindowHandle<Root>>,
     /// The single Settings window, if it's currently open. Used to enforce
     /// the macOS-typical singleton: re-invoking `OpenSettings` raises the
     /// existing window instead of opening another. We don't actively clear
@@ -107,6 +112,7 @@ pub fn run() {
 
         cx.set_global(AppGlobal {
             stores: stores.clone(),
+            about_window: None,
             settings_window: None,
             library_window: None,
             updates_window: None,
@@ -327,8 +333,12 @@ fn install_action_handlers(cx: &mut App) {
         cx.quit();
     });
 
-    cx.on_action(|_: &About, _cx: &mut App| {
-        // Future: show an about panel.
+    cx.on_action(|_: &About, cx: &mut App| {
+        // Singleton: raise the existing About window if alive.
+        if try_focus_existing_about(cx) {
+            return;
+        }
+        open_about_window(cx);
     });
 
     cx.on_action(|_: &OpenSettings, cx: &mut App| {
@@ -475,6 +485,10 @@ fn try_focus_existing_singleton(
     true
 }
 
+fn try_focus_existing_about(cx: &mut App) -> bool {
+    try_focus_existing_singleton(cx, |g| &mut g.about_window)
+}
+
 fn try_focus_existing_settings(cx: &mut App) -> bool {
     try_focus_existing_singleton(cx, |g| &mut g.settings_window)
 }
@@ -515,6 +529,32 @@ fn centered_window_bounds(cx: &mut App, w: f32, h: f32) -> Option<WindowBounds> 
         center,
         size(px(w), px(h)),
     )))
+}
+
+/// Open the About window — a small singleton (~360×420). Shows the wordmark,
+/// version, a quiet purpose copy (echoing the welcome page's voice), the
+/// license note, and a "View on GitHub" link.
+fn open_about_window(cx: &mut App) {
+    let bounds = centered_window_bounds(cx, 360., 420.);
+
+    let opts = WindowOptions {
+        window_bounds: bounds,
+        titlebar: Some(transparent_titlebar()),
+        kind: WindowKind::Normal,
+        window_min_size: Some(size(px(300.), px(340.))),
+        ..Default::default()
+    };
+
+    let handle = cx.open_window(opts, |window, cx| {
+        theme::observe_window_appearance(window);
+        let view = cx.new(|cx| AboutView::new(window, cx));
+        cx.new(|cx| Root::new(view, window, cx))
+    });
+
+    if let Ok(handle) = handle {
+        cx.global_mut::<AppGlobal>().about_window = Some(handle);
+    }
+    cx.activate(true);
 }
 
 fn open_main_window(cx: &mut App) {

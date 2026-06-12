@@ -12,6 +12,7 @@ use eidola_app_core::{
     CredentialLifecycleInfo, MeasurementInfo, ModelInfo, PriceInfo, RequestDetail, RequestInfo,
     SpaceInfo, SpaceMessage, SpendTrailEntry,
 };
+use eidola_gui::about::AboutView;
 use eidola_gui::chat::{ChatView, StreamingResponse};
 use eidola_gui::library::LibraryView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
@@ -31,6 +32,17 @@ pub fn register(s: &mut Snapshots) {
     register_settings(s);
     register_updates(s);
     register_record(s);
+    register_about(s);
+}
+
+// ---------------------------------------------------------------------------
+// About window
+// ---------------------------------------------------------------------------
+
+fn register_about(s: &mut Snapshots) {
+    s.add("about", size(px(360.), px(420.)), |window, cx| {
+        cx.new(|cx| AboutView::new(window, cx))
+    });
 }
 
 // ---------------------------------------------------------------------------

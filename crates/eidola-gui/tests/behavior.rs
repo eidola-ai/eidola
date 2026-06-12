@@ -18,6 +18,7 @@ use eidola_app_core::{
     AttestationDetail, AttestationInfo, BalancesResult, ConfigState, CredentialInfo,
     CredentialLifecycleInfo, ModelInfo, PriceInfo, RequestInfo, SpaceInfo, SpaceMessage,
 };
+use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
 use eidola_gui::chat::{ChatView, OnboardingStage, ParticipantIndicator, Send, ToggleModelPicker};
 use eidola_gui::library::LibraryView;
@@ -978,6 +979,22 @@ fn set_composer_text(
         });
     })
     .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// About view
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn about_view_constructs_without_panic(cx: &mut TestAppContext) {
+    // The About view has no stores and no async work — constructing and
+    // rendering it must not panic.
+    let (_window, view) = open_view(cx, |window, cx| cx.new(|cx| AboutView::new(window, cx)));
+
+    view.read_with(cx, |v, _| {
+        // Just assert the focus handle is valid (construction succeeded).
+        let _ = v.focus_handle();
+    });
 }
 
 // ---------------------------------------------------------------------------
