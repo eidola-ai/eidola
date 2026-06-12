@@ -1,5 +1,5 @@
 //! About window — a small singleton showing the wordmark, version, a quiet
-//! line of purpose, license note, and a "View on GitHub" link.
+//! line of purpose, source note, and a "View on GitHub" link.
 //!
 //! Same transparent-titlebar treatment as all other windows. Singleton so
 //! repeated "About Eidola" invocations raise the existing window rather than
@@ -82,11 +82,14 @@ impl Render for AboutView {
                  leaves your machine.",
             );
 
-        // License note.
+        // Source note. Deliberately no license claim: the repository does
+        // not yet carry a LICENSE file, and the About page must not assert
+        // terms that aren't durably true (the no-fake-states rule applies
+        // to legal claims too). Add the real license line when one lands.
         let license = div()
             .text_xs()
             .text_color(theme.muted_foreground)
-            .child("Open source under the MIT License.");
+            .child("Source available on GitHub.");
 
         // "View on GitHub" link — `cx.open_url` opens the default browser.
         let github_link = div()
