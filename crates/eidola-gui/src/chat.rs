@@ -6,8 +6,8 @@ use eidola_app_core::{ModelInfo, SpaceMessage};
 use gpui::{
     AnyElement, AppContext, AsyncApp, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, ListAlignment, ListState, ModifiersChangedEvent,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    WeakEntity, Window, actions, div, linear_color_stop, linear_gradient, list,
+    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, WeakEntity, Window, actions, div, linear_color_stop, linear_gradient, list,
     prelude::FluentBuilder, px, relative, rems,
 };
 use gpui_component::{
@@ -159,6 +159,17 @@ pub struct ChatView {
     /// any. `None` when the picker is closed or no row has been touched
     /// yet. Arrow keys move it; Enter selects; Esc dismisses.
     picker_highlighted: Option<usize>,
+    /// Tracked scroll handle for the model picker's row container. The picker
+    /// panel is a capped-height `overflow_y_scroll` div, so a long model list
+    /// scrolls internally; this handle lets keyboard navigation
+    /// (`PickerUp`/`PickerDown`, and opening with a far-down current selection)
+    /// scroll the highlighted row into view via `scroll_to_item`.
+    picker_scroll: ScrollHandle,
+    /// Test-only mirror of the last row index handed to
+    /// `picker_scroll.scroll_to_item` — `ScrollHandle` exposes no getter for its
+    /// pending active item, so this lets behavior tests assert the picker
+    /// scrolls to follow the keyboard highlight without a real paint pass.
+    last_picker_scroll_target: Option<usize>,
 
     /// Virtualized-transcript scroll state. `list()` renders only the visible
     /// window of `transcript_items`, so per-frame work is O(visible). The
@@ -369,13 +380,44 @@ impl ChatView {
 
     /// Toggle the model picker (⌥⌘M, or clicking the revealed label).
     /// Resets the keyboard highlight when the picker is opened so arrow
-    /// navigation starts fresh.
+    /// navigation starts fresh. On open, scroll the current model's row into
+    /// view so a far-down current selection isn't hidden below the fold of the
+    /// capped-height panel.
     pub fn toggle_model_picker(&mut self, cx: &mut Context<Self>) {
         self.model_picker_open = !self.model_picker_open;
         if !self.model_picker_open {
             self.picker_highlighted = None;
+        } else if let Some(ix) = self.current_model_index(cx) {
+            self.scroll_picker_to(ix);
         }
         cx.notify();
+    }
+
+    /// The row index of this space's current model in the picker's model list,
+    /// if present. Used to reveal the active selection when the picker opens.
+    fn current_model_index(&self, cx: &gpui::App) -> Option<usize> {
+        let current = self.current_model(cx);
+        self.models
+            .read(cx)
+            .list()
+            .iter()
+            .position(|m| m.id == current)
+    }
+
+    /// Scroll the keyboard-highlighted picker row into view. The picker rows are
+    /// the panel's leading children (one per model, index-aligned), so the model
+    /// index doubles as the scroll-child index for `scroll_to_item`.
+    fn scroll_highlight_into_view(&mut self) {
+        if let Some(ix) = self.picker_highlighted {
+            self.scroll_picker_to(ix);
+        }
+    }
+
+    /// Request the picker's scroll container reveal row `ix`, recording the
+    /// target for behavior tests (`ScrollHandle` has no getter for it).
+    fn scroll_picker_to(&mut self, ix: usize) {
+        self.picker_scroll.scroll_to_item(ix);
+        self.last_picker_scroll_target = Some(ix);
     }
 
     /// Dismiss the model picker without selecting anything (Esc).
@@ -400,6 +442,7 @@ impl ChatView {
             None | Some(0) => 0,
             Some(n) => n - 1,
         });
+        self.scroll_highlight_into_view();
         cx.notify();
     }
 
@@ -417,6 +460,7 @@ impl ChatView {
             None => 0,
             Some(n) => (n + 1).min(count - 1),
         });
+        self.scroll_highlight_into_view();
         cx.notify();
     }
 
@@ -439,6 +483,14 @@ impl ChatView {
     /// The keyboard-highlighted picker row index (if any).
     pub fn picker_highlighted(&self) -> Option<usize> {
         self.picker_highlighted
+    }
+
+    /// Test-only: the last row index the picker was asked to scroll into view
+    /// (via `scroll_to_item`). Lets behavior tests assert keyboard navigation
+    /// keeps the highlighted row visible in the capped-height panel.
+    #[doc(hidden)]
+    pub fn last_picker_scroll_target_for_test(&self) -> Option<usize> {
+        self.last_picker_scroll_target
     }
 
     /// Choose the model for this space's subsequent sends and close the
@@ -639,6 +691,8 @@ impl ChatView {
             participant_indicator: None,
             last_reconcile_was_reset: None,
             picker_highlighted: None,
+            picker_scroll: ScrollHandle::new(),
+            last_picker_scroll_target: None,
             focus_handle,
             _subscriptions,
         };
@@ -2364,8 +2418,12 @@ impl ChatView {
             .top(TITLE_BAR_RESERVE)
             .right(px(12.))
             .w(px(340.))
+            // Height cap so a long model list scrolls internally instead of
+            // overflowing the window; the tracked handle lets keyboard
+            // navigation scroll the highlighted row into view.
             .max_h(px(420.))
             .overflow_y_scroll()
+            .track_scroll(&self.picker_scroll)
             .popover_style(cx)
             .py_1()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {

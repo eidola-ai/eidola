@@ -1044,6 +1044,99 @@ fn picker_up_down_moves_highlight(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn picker_arrow_keys_scroll_highlight_into_view(cx: &mut TestAppContext) {
+    // A long model list exceeds the capped-height picker panel, so keyboard
+    // navigation must scroll the highlighted row into view (the QA bug: the
+    // highlight moved past the visible rows but the panel didn't scroll). The
+    // picker's tracked scroll handle is asked to reveal the highlighted row on
+    // every PickerDown/PickerUp; we assert the recorded scroll target follows
+    // the highlight.
+    let many: Vec<ModelInfo> = (0..30)
+        .map(|i| ModelInfo {
+            id: format!("model-{i:02}"),
+            context_length: 131_072,
+            prompt_credits_per_token: 1.0,
+            completion_credits_per_token: 2.0,
+            request_credits: None,
+        })
+        .collect();
+    let stores = stub_stores(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.models = many;
+    });
+    let (window, view) = open_chat(cx, &stores);
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+
+    // Drive the highlight far down the list; the scroll target must track it.
+    for expected in 0..15usize {
+        cx.update_window(window, |_, window, cx| {
+            focus.dispatch_action(&PickerDown, window, cx);
+        })
+        .unwrap();
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.picker_highlighted(), Some(expected));
+            assert_eq!(
+                v.last_picker_scroll_target_for_test(),
+                Some(expected),
+                "the panel scrolls to follow the keyboard highlight"
+            );
+        });
+    }
+
+    // Back up — the scroll target follows the highlight upward too.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&PickerUp, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.picker_highlighted(), Some(13));
+        assert_eq!(v.last_picker_scroll_target_for_test(), Some(13));
+    });
+}
+
+#[gpui::test]
+fn picker_open_reveals_far_down_current_selection(cx: &mut TestAppContext) {
+    // Opening the picker with a far-down current selection scrolls that row
+    // into view (so the active model isn't hidden below the fold).
+    let many: Vec<ModelInfo> = (0..30)
+        .map(|i| ModelInfo {
+            id: format!("model-{i:02}"),
+            context_length: 131_072,
+            prompt_credits_per_token: 1.0,
+            completion_credits_per_token: 2.0,
+            request_credits: None,
+        })
+        .collect();
+    let stores = stub_stores(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.models = many;
+    });
+    let (window, view) = open_chat(cx, &stores);
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+
+    // Select a far-down model for this space, then open the picker.
+    view.update(cx, |v, cx| v.select_model("model-22".into(), cx));
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+
+    view.read_with(cx, |v, _| {
+        assert!(v.model_picker_open());
+        assert_eq!(
+            v.last_picker_scroll_target_for_test(),
+            Some(22),
+            "opening scrolls the current selection into view"
+        );
+    });
+}
+
+#[gpui::test]
 fn picker_enter_selects_highlighted_model(cx: &mut TestAppContext) {
     // Enter selects the highlighted row and closes the picker.
     let stores = stub_stores(cx, |c| {
