@@ -56,6 +56,15 @@ impl<T> Loadable<T> {
         }
     }
 
+    /// Mutable access to the current value, if one is present.
+    pub fn value_mut(&mut self) -> Option<&mut T> {
+        match self {
+            Loadable::Loaded { value, .. } => Some(value),
+            Loadable::Failed { prior, .. } => prior.as_mut(),
+            _ => None,
+        }
+    }
+
     /// The error, if the cell is in the `Failed` state.
     pub fn error(&self) -> Option<&AppError> {
         match self {

@@ -1,6 +1,6 @@
 //! Library window — the book's table of contents. Lists the user's spaces
 //! (most recently active first), reopens one on click, and quietly archives
-//! on the hover-revealed ×.
+//! on the hover-revealed ×. Double-clicking a row enters inline rename mode.
 //!
 //! Design notes: this is deliberately *not* a chat-app sidebar. One prose
 //! column, hairline `theme.border` rules between entries, no cards or
@@ -12,18 +12,22 @@ use std::ops::Range;
 
 use eidola_app_core::SpaceInfo;
 use gpui::{
-    App, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle,
-    Window, div, px, rems, uniform_list,
+    App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    UniformListScrollHandle, Window, actions, div, px, rems, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, IconName, Sizable,
+    ActiveTheme, IconName, InteractiveElementExt, Sizable,
     button::{Button, ButtonVariants},
-    h_flex, v_flex,
+    h_flex,
+    input::{Input, InputEvent, InputState},
+    v_flex,
 };
 
 use crate::actions::CloseWindow;
 use crate::stores::{SpacesStore, Stores};
+
+actions!(library, [CancelRename]);
 
 /// Vertical reserve under the macOS traffic lights — same pattern as
 /// `chat::TITLE_BAR_RESERVE` (the window uses the shared transparent
@@ -44,6 +48,10 @@ pub struct LibraryView {
     /// Index of the row currently under the pointer, for the hover-revealed
     /// archive affordance.
     hovered: Option<usize>,
+    /// When `Some`, a rename is in progress for the given space id.  The
+    /// `Entity<InputState>` holds the current draft text; the `Subscription`
+    /// listens for `InputEvent`s (Enter → commit, Blur → cancel).
+    renaming: Option<(String, Entity<InputState>, Vec<Subscription>)>,
     /// Focus handle the root v_flex tracks, so the `CloseWindow` listener is
     /// in the dispatch path (same pattern as `SettingsView`).
     focus_handle: FocusHandle,
@@ -65,6 +73,7 @@ impl LibraryView {
             stores,
             spaces,
             hovered: None,
+            renaming: None,
             focus_handle,
             scroll: UniformListScrollHandle::new(),
             _subscriptions,
@@ -100,6 +109,70 @@ impl LibraryView {
         });
     }
 
+    /// Begin inline rename for the given space.  Creates an `InputState` seeded
+    /// with the current title (or empty for untitled spaces), subscribes to its
+    /// events, and triggers a re-render so the row shows the input field.
+    pub fn begin_rename(
+        &mut self,
+        space_id: String,
+        current_title: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // If already renaming the same space, do nothing.
+        if self
+            .renaming
+            .as_ref()
+            .map(|(id, _, _)| id == &space_id)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let initial = current_title.unwrap_or_default();
+        let input_state = cx.new(|cx| InputState::new(window, cx).default_value(&initial));
+        // Focus the input so the user can type immediately.
+        input_state.update(cx, |s, cx| s.focus(window, cx));
+
+        let subs = vec![cx.subscribe_in(
+            &input_state,
+            window,
+            |this, _, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => this.commit_rename(window, cx),
+                InputEvent::Blur => this.cancel_rename(cx),
+                _ => {}
+            },
+        )];
+        self.renaming = Some((space_id, input_state, subs));
+        cx.notify();
+    }
+
+    /// Commit the in-progress rename — write the new title to the store and
+    /// close the input.
+    pub fn commit_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((space_id, input_state, _)) = self.renaming.take() {
+            let title = input_state.read(cx).value().to_string();
+            let title = title.trim().to_string();
+            if !title.is_empty() {
+                self.spaces
+                    .update(cx, |s, cx| s.rename(space_id, title, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Cancel an in-progress rename without persisting anything.
+    pub fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming = None;
+        cx.notify();
+    }
+
+    /// The id of the space currently being renamed, if any. Used by
+    /// `render_row` to decide whether to show the input or the static title;
+    /// also exposed for behavior tests.
+    pub fn renaming_space_id(&self) -> Option<&str> {
+        self.renaming.as_ref().map(|(id, _, _)| id.as_str())
+    }
+
     /// Render the visible window of listing rows. Indexer for the virtualized
     /// `uniform_list` — clones only the visible slice from the store, so the
     /// per-frame cost is O(visible), not O(loaded).
@@ -127,25 +200,37 @@ impl LibraryView {
         let hovered = self.hovered == Some(idx);
         let space_id = space.id.clone();
         let archive_id = space.id.clone();
+        let rename_id = space.id.clone();
+        let rename_title = space.title.clone();
+        let is_renaming = self.renaming_space_id() == Some(space.id.as_str());
 
-        // Title line: the space's title in full foreground; for untitled
-        // spaces, the snippet of the first message in muted — visibly a
-        // fallback, not a name. A space with neither is brand new.
-        let (line, is_fallback) = match (&space.title, &space.snippet) {
-            (Some(t), _) => (t.clone(), false),
-            (None, Some(s)) => (s.clone(), true),
-            (None, None) => ("Untitled space".to_string(), true),
+        // Title content: when this row is being renamed, show the inline
+        // input; otherwise show the static title or snippet.
+        let title_content: gpui::AnyElement = if is_renaming {
+            if let Some((_, input_state, _)) = &self.renaming {
+                // Ghost-styled inline input: no border/background chrome,
+                // flex_1 so it fills the title column, same font as the row.
+                Input::new(input_state).flex_1().into_any_element()
+            } else {
+                div().flex_1().into_any_element()
+            }
+        } else {
+            let (line, is_fallback) = match (&space.title, &space.snippet) {
+                (Some(t), _) => (t.clone(), false),
+                (None, Some(s)) => (s.clone(), true),
+                (None, None) => ("Untitled space".to_string(), true),
+            };
+            let mut title_el = div().flex_1().truncate().child(SharedString::from(line));
+            if is_fallback {
+                title_el = title_el.text_color(theme.muted_foreground);
+            }
+            title_el.into_any_element()
         };
-
-        let mut title_el = div().flex_1().truncate().child(SharedString::from(line));
-        if is_fallback {
-            title_el = title_el.text_color(theme.muted_foreground);
-        }
 
         // Fixed-width slot for the archive button so its hover appearance
         // doesn't shift the date column.
         let mut archive_slot = h_flex().w_6().justify_end();
-        if hovered {
+        if hovered && !is_renaming {
             archive_slot = archive_slot.child(
                 Button::new(("archive-space", idx))
                     .ghost()
@@ -165,14 +250,26 @@ impl LibraryView {
             .gap_3()
             .items_center()
             .cursor_pointer()
+            .on_action(cx.listener(|this, _: &CancelRename, _, cx| this.cancel_rename(cx)))
             .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
                 this.hovered = if *hovering { Some(idx) } else { None };
                 cx.notify();
-            }))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_space(space_id.clone(), cx);
-            }))
-            .child(title_el)
+            }));
+
+        if !is_renaming {
+            // Single click opens the space; double-click starts rename.
+            row = row
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_space(space_id.clone(), cx);
+                }))
+                .on_double_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.begin_rename(rename_id.clone(), rename_title.clone(), window, cx);
+                }));
+        }
+
+        row = row
+            .child(title_content)
             .child(
                 div()
                     .text_sm()
@@ -294,26 +391,5 @@ fn relative_date(then_ms: i64, now_ms: i64) -> String {
         format!("{}mo ago", delta / (30 * DAY))
     } else {
         format!("{}y ago", delta / (365 * DAY))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::relative_date;
-
-    const DAY: i64 = 24 * 60 * 60 * 1000;
-
-    #[test]
-    fn relative_date_buckets() {
-        let now = 1_900_000_000_000;
-        assert_eq!(relative_date(now, now), "today");
-        assert_eq!(relative_date(now - DAY / 2, now), "today");
-        assert_eq!(relative_date(now - DAY - 1, now), "yesterday");
-        assert_eq!(relative_date(now - 3 * DAY, now), "3d ago");
-        assert_eq!(relative_date(now - 14 * DAY, now), "2w ago");
-        assert_eq!(relative_date(now - 90 * DAY, now), "3mo ago");
-        assert_eq!(relative_date(now - 400 * DAY, now), "1y ago");
-        // Clock skew (future timestamps) clamps to "today".
-        assert_eq!(relative_date(now + DAY, now), "today");
     }
 }

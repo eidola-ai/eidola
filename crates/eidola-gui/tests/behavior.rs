@@ -1227,6 +1227,68 @@ fn library_archive_removes_row(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn library_rename_updates_cached_title(cx: &mut TestAppContext) {
+    // Calling `SpacesStore::rename` must update the cached title immediately
+    // (optimistic local update) so the Library responds without a round-trip.
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![stub_space("s1", Some("Old title"), None, 1_000)];
+    });
+
+    let (_window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+
+    stores
+        .spaces
+        .update(cx, |s, cx| s.rename("s1".into(), "New title".into(), cx));
+    cx.run_until_parked();
+
+    stores.spaces.read_with(cx, |s, _| {
+        let title = s.list().first().and_then(|sp| sp.title.as_deref());
+        assert_eq!(
+            title,
+            Some("New title"),
+            "rename must update the cached row"
+        );
+    });
+}
+
+#[gpui::test]
+fn library_begin_rename_tracks_space(cx: &mut TestAppContext) {
+    // `begin_rename` must set the renaming state so the view knows which row
+    // is being renamed; `cancel_rename` must clear it.
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 1_000)];
+    });
+
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+
+    // No rename in progress at construction.
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.renaming_space_id(), None);
+    });
+
+    // Begin rename for s1.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.begin_rename("s1".into(), Some("Tides".into()), window, cx);
+        });
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.renaming_space_id(), Some("s1"));
+    });
+
+    // Cancel clears the state.
+    view.update(cx, |v, cx| v.cancel_rename(cx));
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.renaming_space_id(), None);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Onboarding state machine
 // ---------------------------------------------------------------------------
