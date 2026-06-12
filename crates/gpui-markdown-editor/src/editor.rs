@@ -919,6 +919,28 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::paste_plain))
+            // Map the Edit-menu action types (`gpui_component::input::*`)
+            // onto the editor's own implementations.  The OS routes the Edit
+            // menu through the responder chain via the `OsAction::*` selectors;
+            // those land as `gpui_component::input::{Cut,Copy,Paste,SelectAll}`
+            // dispatched to the focused element.  Without these handlers the
+            // actions fell through unhandled whenever the composer had focus.
+            .on_action(cx.listener(|this, _: &gpui_component::input::Cut, w, cx| {
+                this.cut(&Cut, w, cx);
+            }))
+            .on_action(cx.listener(|this, _: &gpui_component::input::Copy, w, cx| {
+                this.copy(&Copy, w, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &gpui_component::input::Paste, w, cx| {
+                    this.paste(&Paste, w, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &gpui_component::input::SelectAll, w, cx| {
+                    this.select_all(&SelectAll, w, cx);
+                }),
+            )
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
