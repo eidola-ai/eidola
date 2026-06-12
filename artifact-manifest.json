@@ -1,37 +1,37 @@
 {
   "artifacts": {
     "eidola-cli": {
-      "digest": "sha256:200768232f004b5142297373dbe1fd0ac6351d7b866c7d884d2f86161a17e59d",
+      "digest": "sha256:30631a3485ceae520961a2bac2495a6d4ddeefb92c0c6bb2be092019d76da9de",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-cli-macos-universal": {
-      "narHash": "sha256-MNzSvQRycULvY3OQyQWMJBAkevCRuzc9lCTbubLy0/w=",
+      "narHash": "sha256-28+x/ESr9MzG0T3tiDFzBsOb83lsOm7ikIDXRsppKq8=",
       "platform": "darwin/universal",
       "type": "nix"
     },
     "eidola-gui-macos-universal": {
-      "narHash": "sha256-Lb2U2Ld+FlnLDT0h+hfX71+f5HL3ksaN15/heoJd74E=",
+      "narHash": "sha256-x9B9htyYlp5tcszhfXYIVFvW4oVmsW4IDCF0ue9NlWE=",
       "platform": "darwin/universal",
       "type": "nix"
     },
     "eidola-postgres": {
-      "digest": "sha256:3c3bc53095fde1adbd6c484e751a2b4186b479b731f7c491f6d0bbaa43a1a992",
+      "digest": "sha256:f572932f6879be2af219094844f86934a841501359fe16056348f085f8ba4116",
       "platform": "linux/amd64",
       "type": "oci"
     },
     "eidola-server": {
-      "digest": "sha256:1eda0d411140f4ffda28db75adcd6a91928976928b5e8a24a4411f92f7537656",
+      "digest": "sha256:0c7737cf8a713af4c9890db2d69e4137c40424e0ee177e88698fbca251450d5d",
       "platform": "linux/amd64",
       "type": "oci"
     }
   },
   "enclave": {
-    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=34d44546a1cb7de8de4593839197741dee7e2339d32e3206c1ebbeec22ee8934",
-    "snp_measurement": "b124784fdf0d663908a547b7939e6ec11e9b40cc22f41eb7d5f7d52fdd2e5e77aa580dbb02fcb894601b9eca8518ae7f",
+    "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=0c2c1fa07b07522a8b0535977e53f1899ffeb72b95e59e7e2331890076d27d4b",
+    "snp_measurement": "107d1da184173ac3944c190ccc4c995cc6167c004a403a8c41cc8fc5824ddfa42805c14bf115d64677079060a4f26f2c",
     "tdx_measurement": {
       "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-      "rtmr2": "d5014826424433e05a546757ccf878f7f2bf173a3fc3ed80d37cc97492482ee6dc87c6a8f5a8668364752d6a3038cb46"
+      "rtmr2": "594d2b48cf08deda35b7a23723c7a188fe268adad18f2a915709e33174b7e1db80fed23b5f08a4a2924efbb14b76a26d"
     }
   },
   "schema_version": 1
