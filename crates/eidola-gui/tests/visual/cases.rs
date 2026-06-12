@@ -416,6 +416,126 @@ fn register_chat(s: &mut Snapshots) {
         },
     );
 
+    // REGRESSION (wave-4 QA round 3): the disappearing transcript. The real
+    // mechanism (proven from gpui list.rs at the pin): `splice`/`reset`
+    // replace items with `Unmeasured { size_hint: None }`, whose summary
+    // height is 0px, and paint only measures from the scroll anchor DOWN —
+    // so a wholesale reset while the reader is at the tail collapses every
+    // item above the anchor to zero height, making them unreachable. The
+    // killer transition is a stream FINALIZING while the list follows the
+    // tail (exactly the user's flow: submit → response streams in → ends):
+    // the StreamEnded rebuild reshaped the items, the old reset-always
+    // reconcile wiped all measured heights, the at-tail re-pin anchored at
+    // the end, and everything above became a zero-height void — scrolling
+    // up "jumped" through it and the first message read as gone forever.
+    // This case replays that flow: walk to the bottom (measuring along the
+    // way), engage tail-follow the way submit does, drive a stream start +
+    // finalize reshape, then walk back up to the top and screenshot: the
+    // first message ("Why is the sky blue?") must be visible.
+    s.add_with_step(
+        "chat_scroll_roundtrip_first_message",
+        size(px(760.), px(560.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
+                view.set_messages_for_test(
+                    vec![
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "Why is the sky blue?".into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content: "Sunlight is a fairly even mix across the visible spectrum. \
+                                As it crosses the atmosphere it meets molecules far smaller than \
+                                its wavelength, and those scatter short (blue) wavelengths far \
+                                more strongly than long (red) ones — the intensity goes as one \
+                                over the fourth power of the wavelength.\n\nSo blue light is \
+                                flung in every direction and reaches your eye from all across the \
+                                dome of the sky, while reds and yellows travel a straighter path. \
+                                At midday that paints the whole sky a soft blue."
+                                .into(),
+                        },
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "And at sunset?".into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content:
+                                "Near sunset the light skims a long, slanted path through the \
+                                air, the blue is scattered away entirely, and what survives to \
+                                reach you is the warm red-orange of a low sun. The same physics, \
+                                a longer path — so the colour that wins is the one that is left \
+                                after most of the blue has been thrown sideways out of the beam \
+                                before it ever gets to you."
+                                    .into(),
+                        },
+                    ],
+                    cx,
+                );
+                view
+            })
+        },
+        |cx, window, view| {
+            // Walk down to the bottom in small wheel-sized steps (positive =
+            // toward the tail), re-parking (painting) after each so the list
+            // measures items as they enter.
+            for _ in 0..24 {
+                cx.update_window(window, |_, _, cx| {
+                    view.update(cx, |v, cx| v.scroll_transcript_by_for_test(90., cx));
+                })
+                .ok();
+                cx.run_until_parked();
+            }
+            // Engage tail-follow exactly as submit does, then drive a stream
+            // start + finalize — the reshape pair that wiped all measured
+            // heights under the old reset-always reconcile.
+            cx.update_window(window, |_, _, cx| {
+                view.update(cx, |v, cx| {
+                    v.follow_tail_for_test(cx);
+                    v.set_streaming_for_test(
+                        Some(StreamingResponse {
+                            content: "The horizon trick again: a long slanted path strips the \
+                                blue out before it reaches you."
+                                .into(),
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                });
+            })
+            .ok();
+            cx.run_until_parked();
+            cx.update_window(window, |_, _, cx| {
+                view.update(cx, |v, cx| {
+                    v.append_message_for_test(
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content: "The horizon trick again: a long slanted path strips the \
+                                blue out before it reaches you."
+                                .into(),
+                        },
+                        cx,
+                    );
+                    v.set_streaming_for_test(None, cx);
+                });
+            })
+            .ok();
+            cx.run_until_parked();
+            // Walk back up to the top — through what was, pre-fix, a
+            // zero-height void where the earlier turns used to be.
+            for _ in 0..40 {
+                cx.update_window(window, |_, _, cx| {
+                    view.update(cx, |v, cx| v.scroll_transcript_by_for_test(-90., cx));
+                })
+                .ok();
+                cx.run_until_parked();
+            }
+        },
+    );
+
     // Narrow window — guards that the chapter delimiter tracks the prose
     // body's width edge-for-edge. Earlier the delim sized itself
     // independently and rendered small + left-aligned when the window was

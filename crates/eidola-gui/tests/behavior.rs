@@ -23,7 +23,7 @@ use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
 use eidola_gui::chat::{
     ChatView, DismissModelPicker, OnboardingStage, ParticipantIndicator, PickerConfirm, PickerDown,
-    PickerUp, Send, ToggleModelPicker,
+    PickerUp, Send, StreamingResponse, ToggleModelPicker,
 };
 use eidola_gui::library::LibraryView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
@@ -517,28 +517,39 @@ fn transcript_render_work_is_constant_in_message_count(cx: &mut TestAppContext) 
 
     // Set the transcript and let the `observe(&space)` reconcile the item
     // model (it fires on park), then render the visible window `iters` times.
-    // Returns (rows-per-frame, total-item-count, elapsed).
-    let measure = |cx: &mut TestAppContext, msgs: Vec<SpaceMessage>| {
-        view.update(cx, |v, cx| v.set_messages_for_test(msgs, cx));
-        cx.run_until_parked();
-        cx.update_window(window, |_, win, cx| {
-            view.update(cx, |v, cx| {
-                let total = v.transcript_item_count_for_test();
-                let start = std::time::Instant::now();
-                let mut n = 0;
-                for _ in 0..200 {
-                    n = v.render_transcript_window_for_test(visible.clone(), win, cx);
-                }
-                (n, total, start.elapsed())
-            })
-        })
-        .unwrap()
+    // Each iteration runs inside `VisualTestContext::draw`, which enters the
+    // app's element arena and CLEARS it (running drops) after the draw —
+    // elements built outside a draw land in a thread-local arena that is
+    // never cleared in tests, and the transcript's `TextView::new(&state)`
+    // elements hold `Entity<TextViewState>` clones that would otherwise trip
+    // the leak detector at teardown. Returns (rows-per-frame,
+    // total-item-count, elapsed).
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    let mut measure = |vcx: &mut VisualTestContext, msgs: Vec<SpaceMessage>| {
+        view.update(vcx, |v, cx| v.set_messages_for_test(msgs, cx));
+        vcx.run_until_parked();
+        let total = view.read_with(vcx, |v, _| v.transcript_item_count_for_test());
+        let start = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..200 {
+            vcx.draw(
+                Point::default(),
+                gpui::size(gpui::px(760.), gpui::px(560.)),
+                |win, cx| {
+                    view.update(cx, |v, cx| {
+                        n = v.render_transcript_window_for_test(visible.clone(), win, cx);
+                    });
+                    gpui::Empty
+                },
+            );
+        }
+        (n, total, start.elapsed())
     };
 
     // Short transcript (20 messages → 21 items incl. composer).
-    let (short_window, short_total, short_dur) = measure(cx, synth(20));
+    let (short_window, short_total, short_dur) = measure(&mut vcx, synth(20));
     // Long transcript (500 messages → 501 items incl. composer).
-    let (long_window, long_total, long_dur) = measure(cx, synth(500));
+    let (long_window, long_total, long_dur) = measure(&mut vcx, synth(500));
 
     // The item model grew 25× …
     assert_eq!(short_total, 21, "20 messages + composer");
@@ -560,6 +571,97 @@ fn transcript_render_work_is_constant_in_message_count(cx: &mut TestAppContext) 
     assert!(
         long_dur.as_secs_f64() < short_dur.as_secs_f64() * 5.0 + 0.1,
         "frame work scaled with message count: 20 msgs {short_dur:?} vs 500 msgs {long_dur:?}"
+    );
+}
+
+#[gpui::test]
+fn finalize_reshape_preserves_measured_heights(cx: &mut TestAppContext) {
+    // Round-3 regression detector, at the measurement level. gpui's `list()`
+    // sums `Unmeasured { size_hint: None }` items as 0px and only measures
+    // from the scroll anchor down, so a reconcile that replaces items the
+    // reader has already measured collapses everything above the anchor —
+    // the live symptom was the first message "disappearing" the moment a
+    // stream finalized, with the scroll jumping through the zero-height
+    // void. The end-state pixels self-heal under step-rendering (each paint
+    // re-measures at the new anchor), so the deterministic signal is the
+    // list's total measured height across the finalize reshape: it must not
+    // crater. Pre-fix (reset-always reconcile) this fails — the post-reshape
+    // draw re-measures only the visible tail window; post-fix (common-prefix
+    // suffix splice) the prefix heights survive.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_chat(cx, &stores);
+    view.update(cx, |v, cx| {
+        let msgs: Vec<SpaceMessage> = (0..8)
+            .map(|i| SpaceMessage {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!(
+                    "Turn {i}: a couple of sentences of body text so each row has a realistic \
+                     measured height under the prose typography, tall enough that the full \
+                     transcript comfortably overflows one viewport."
+                ),
+            })
+            .collect();
+        v.set_messages_for_test(msgs, cx);
+    });
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    let mut draw = |vcx: &mut VisualTestContext| {
+        let v = view.clone();
+        let _ = vcx.draw(
+            Point::default(),
+            gpui::size(gpui::px(760.), gpui::px(560.)),
+            |_, _| gpui::AnyView::from(v),
+        );
+    };
+
+    // Walk to the bottom in wheel steps, drawing after each, so every item
+    // gets a real measured height.
+    draw(&mut vcx);
+    for _ in 0..30 {
+        view.update(&mut vcx, |v, cx| v.scroll_transcript_by_for_test(90., cx));
+        draw(&mut vcx);
+    }
+    let height_before = view.read_with(&vcx, |v, _| v.transcript_max_scroll_offset_for_test());
+    assert!(
+        height_before > 400.0,
+        "repro precondition: the transcript must overflow the viewport by a page+ \
+         (measured max offset {height_before}px)"
+    );
+
+    // The killer transition: tail-follow engaged (as submit does), then a
+    // stream starts and finalizes — two reshapes while anchored at the end.
+    view.update(&mut vcx, |v, cx| {
+        v.follow_tail_for_test(cx);
+        v.set_streaming_for_test(
+            Some(StreamingResponse {
+                content: "A streaming answer long enough to land as a real row.".into(),
+                ..Default::default()
+            }),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    draw(&mut vcx);
+    view.update(&mut vcx, |v, cx| {
+        v.append_message_for_test(
+            SpaceMessage {
+                role: "assistant".into(),
+                content: "A streaming answer long enough to land as a real row.".into(),
+            },
+            cx,
+        );
+        v.set_streaming_for_test(None, cx);
+    });
+    vcx.run_until_parked();
+    draw(&mut vcx);
+
+    let height_after = view.read_with(&vcx, |v, _| v.transcript_max_scroll_offset_for_test());
+    eprintln!("measured max-offset: before {height_before}px, after {height_after}px");
+    assert!(
+        height_after >= height_before * 0.8,
+        "the finalize reshape collapsed measured heights above the anchor \
+         ({height_before}px -> {height_after}px): the round-3 disappearing-message bug"
     );
 }
 
@@ -2723,9 +2825,14 @@ fn second_submit_in_existing_space_keeps_all_messages(cx: &mut TestAppContext) {
             vec![0, 1, 2],
             "the new user turn appends without dropping the prior two"
         );
-        // Again a suffix-shifting reshape (the new message + streaming row land
-        // ahead of the trailing composer), so it must `reset`, not tail-splice.
-        assert_eq!(v.last_reconcile_was_reset_for_test(), Some(true));
+        // A suffix-shifting reshape: the new message + streaming row land
+        // ahead of the trailing composer. The reconcile replaces exactly the
+        // changed suffix (common-prefix splice) so the measured heights of
+        // the prior turns survive — `Some(false)` = the splice path. (The
+        // count invariant is asserted by `assert_consistent`; a wholesale
+        // reset here would wipe above-anchor heights to zero and reintroduce
+        // the round-3 disappearing-message bug.)
+        assert_eq!(v.last_reconcile_was_reset_for_test(), Some(false));
     });
 
     view.update(cx, |v, cx| v.push_content_delta_for_test("a2", cx));

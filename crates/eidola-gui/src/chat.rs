@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::window_input::WindowInput;
@@ -16,7 +17,7 @@ use gpui_component::{
     h_flex,
     highlighter::HighlightTheme,
     label::Label,
-    text::{TextView, TextViewStyle},
+    text::{TextView, TextViewState, TextViewStyle},
     v_flex,
 };
 use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownStyle};
@@ -209,9 +210,46 @@ pub struct ChatView {
     /// asserts that a suffix-shifting reshape (first/second submit) `reset`s
     /// rather than mis-splicing a bogus tail.
     last_reconcile_was_reset: Option<bool>,
+    /// Persistent markdown render states for the transcript's `TextView`s,
+    /// keyed by logical content. **Load-bearing for virtualization**: a
+    /// `TextView::markdown(id, …)` keeps its parsed state in the per-frame
+    /// element-id store (`window.use_keyed_state`), which is DROPPED when a
+    /// `list()` item unmounts above the viewport — the row then re-enters
+    /// with an unparsed state, measures ~zero, the heights above the scroll
+    /// anchor collapse (the observed scroll *jump*), and the message reads
+    /// as gone until a window reopen (wave-4 QA round 3). Owning the
+    /// `Entity<TextViewState>` here and rendering via `TextView::new(&state)`
+    /// (which skips `use_keyed_state` entirely) keeps the parse alive across
+    /// unmounts, so re-measure is always real. Entries are pruned to the
+    /// live message count on rebuild; the whole map is dropped on a
+    /// Circadian flip (`text_states_dark`) so code-block highlight colors —
+    /// baked in at parse time — re-parse under the new theme.
+    text_states: HashMap<TextKey, Entity<TextViewState>>,
+    /// Theme mode the cached `text_states` were parsed under.
+    text_states_dark: Option<bool>,
 
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Stable identity of one markdown body in the transcript, the key for
+/// `ChatView::text_states`. Message-indexed variants are pruned on rebuild
+/// when the transcript shrinks; the streaming/error slots are singletons
+/// whose text is simply re-set as content changes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum TextKey {
+    /// A persisted message body, by transcript index.
+    Message(usize),
+    /// A persisted assistant message's expanded reasoning, by index.
+    MessageThinking(usize),
+    /// The in-flight streaming body.
+    Streaming,
+    /// The in-flight streaming reasoning disclosure.
+    StreamingThinking,
+    /// The in-stream error line.
+    StreamingError,
+    /// The window-local error band body.
+    ErrorBand,
 }
 
 /// One row of the virtualized transcript — a `list()` item. The chapter
@@ -280,6 +318,23 @@ impl ChatView {
     /// shared `Space`.
     #[doc(hidden)]
     pub fn set_messages_for_test(&mut self, messages: Vec<SpaceMessage>, cx: &mut Context<Self>) {
+        self.space
+            .update(cx, |s, cx| s.set_messages_for_test(messages, cx));
+    }
+
+    /// Test-only: append one message to the shared `Space`'s transcript —
+    /// the shape of a stream finalizing (used with `set_streaming_for_test`
+    /// to replay the StreamEnded reshape in the round-3 repro).
+    #[doc(hidden)]
+    pub fn append_message_for_test(&mut self, message: SpaceMessage, cx: &mut Context<Self>) {
+        let mut messages: Vec<SpaceMessage> = self
+            .space
+            .read(cx)
+            .messages()
+            .iter()
+            .map(|m| m.message.clone())
+            .collect();
+        messages.push(message);
         self.space
             .update(cx, |s, cx| s.set_messages_for_test(messages, cx));
     }
@@ -721,6 +776,8 @@ impl ChatView {
             picker_highlighted: None,
             picker_scroll: ScrollHandle::new(),
             last_picker_scroll_target: None,
+            text_states: HashMap::new(),
+            text_states_dark: None,
             focus_handle,
             _subscriptions,
         };
@@ -979,6 +1036,53 @@ impl ChatView {
             offset_in_item: px(offset_px),
         });
         cx.notify();
+    }
+
+    /// Test-only: scroll the transcript list by `distance_px` (positive scrolls
+    /// down toward the tail, negative back up — `ListState::scroll_by` adds to
+    /// the pixel offset), the same primitive the wheel path drives. Used by the
+    /// scroll-round-trip repro to walk the viewport down to the bottom and back
+    /// up in small steps, exercising the measure/anchor machinery the way a
+    /// reader's trackpad would (rather than a single absolute `scroll_to`).
+    #[doc(hidden)]
+    pub fn scroll_transcript_by_for_test(&mut self, distance_px: f32, cx: &mut Context<Self>) {
+        self.list_state.scroll_by(px(distance_px));
+        cx.notify();
+    }
+
+    /// Test-only: the list's maximum scroll offset — the summed measured
+    /// height of all items beyond one viewport. The round-3 regression
+    /// detector: a reshape must not collapse the measured heights of items
+    /// above the anchor (`Unmeasured` items sum as 0px, so a reset-always
+    /// reconcile makes this value crater after a stream finalizes).
+    #[doc(hidden)]
+    pub fn transcript_max_scroll_offset_for_test(&self) -> f32 {
+        f32::from(self.list_state.max_offset_for_scrollbar().y)
+    }
+
+    /// Test-only: engage tail-follow exactly the way `submit` does. The
+    /// round-3 repro needs it because the disappearing-message mechanism
+    /// only triggers when a reshape lands while the list is following the
+    /// tail (the StreamEnded rebuild re-pins to the end; with collapsed
+    /// above-anchor heights everything above became unreachable).
+    #[doc(hidden)]
+    pub fn follow_tail_for_test(&mut self, cx: &mut Context<Self>) {
+        self.list_state.set_follow_mode(gpui::FollowMode::Tail);
+        self.list_state.scroll_to_end();
+        cx.notify();
+    }
+
+    /// Test-only: the *measured* height of transcript item `ix`, if the list has
+    /// laid it out and it sits at or below the logical scroll top. `None` when
+    /// the item is above the scroll top (the list keeps no bounds for those) or
+    /// has not been measured yet. The scroll-round-trip repro asserts the first
+    /// message's measured height stays non-trivial after it scrolls above the
+    /// viewport and back — a collapse to ~zero is the disappearing-message bug.
+    #[doc(hidden)]
+    pub fn list_item_height_for_test(&self, ix: usize) -> Option<f32> {
+        self.list_state
+            .bounds_for_item(ix)
+            .map(|b| f32::from(b.size.height))
     }
 
     /// Test-only: render exactly the items in `range` (what the `list()`
@@ -1362,32 +1466,66 @@ impl ChatView {
             return;
         }
 
+        // Prune cached markdown states for messages that no longer exist (a
+        // reload that shrank the transcript). Indexed entries only — the
+        // streaming/error singletons just get their text re-set on render.
+        let msg_count = self.space.read(cx).messages().len();
+        self.text_states.retain(|k, _| match k {
+            TextKey::Message(i) | TextKey::MessageThinking(i) => *i < msg_count,
+            _ => true,
+        });
+
         let was_following = self.list_state.is_following_tail();
         let composer_focus = self.prompt_editor.read(cx).focus_handle(cx);
 
-        // Always rebuild the list's item set wholesale so its count and per-item
-        // measurements can never drift from `transcript_items`. `list()` measures
-        // lazily (only the visible window is laid out per frame), so a full
-        // `reset` is cheap — there is no perf reason to preserve old measurements
-        // across a reshape, and the old "tail-append fast-path" that tried to was
-        // both *dead* (in this UI the trailing composer shifts on every real
-        // turn, so a turn append is never a pure prefix-extension) and a *latent
-        // footgun*: the first submit reshape `[Composer] → [Message, Streaming,
-        // Composer]` looks like a tail-append (new items land before the trailing
-        // composer), and a prefix-blind splice would leave `ListState` desynced —
-        // exactly the wave-4 regression where the first message vanished. The
-        // reset path makes that class of bug structurally impossible.
+        // Reconcile by COMMON-PREFIX SPLICE: replace exactly the suffix that
+        // changed, never the items before it. This is load-bearing for
+        // scroll correctness, not an optimization: `splice`/`reset` replace
+        // items with `Unmeasured { size_hint: None }`, whose summary height
+        // is **0px**, and paint only measures items from the scroll anchor
+        // *down* — so a wholesale reset while the reader is mid-page or at
+        // the tail collapses every item above the anchor to zero height,
+        // making them unreachable (the wave-4 round-3 bug: the first message
+        // "disappears" the moment a stream finalizes — the StreamEnded
+        // rebuild reset everything; scrolling up then "jumps" through the
+        // zero-height zone and the content above is gone until a reopen).
+        // The wave-4 round-1 bug was the opposite failure (a prefix-BLIND
+        // fast-path desyncing the count); the invariant that prevents both:
+        // the splice range is computed from the true longest common prefix,
+        // and the count is asserted below. In this UI every real transition
+        // is a suffix change ([…, Streaming, Composer] → […, Message,
+        // Composer]; turn appends land before the trailing composer), so the
+        // prefix — the reader's already-measured page — survives intact.
         //
-        // `reset(count)` already replaces every item with an unmeasured copy, so
-        // we splice the focus handles over that fresh set rather than resetting
-        // and re-splicing the range twice.
+        // A genuine full replacement (prefix == 0: the initial load shapes,
+        // or recovery from a desynced count) goes through `reset`, which
+        // also clears the logical scroll anchor — correct there, since those
+        // shapes land on a page whose resting position is the top.
         let count = new_items.len();
-        self.list_state.reset(count);
-        let focus_handles = (0..count).map(|ix| {
-            matches!(new_items[ix], TranscriptItem::Composer { .. }).then(|| composer_focus.clone())
-        });
-        self.list_state.splice_focusable(0..count, focus_handles);
-        self.last_reconcile_was_reset = Some(true);
+        let prefix = self
+            .transcript_items
+            .iter()
+            .zip(new_items.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if prefix == 0 || !in_sync {
+            self.list_state.reset(count);
+            let focus_handles = (0..count).map(|ix| {
+                matches!(new_items[ix], TranscriptItem::Composer { .. })
+                    .then(|| composer_focus.clone())
+            });
+            self.list_state.splice_focusable(0..count, focus_handles);
+            self.last_reconcile_was_reset = Some(true);
+        } else {
+            let old_len = self.transcript_items.len();
+            let focus_handles = (prefix..count).map(|ix| {
+                matches!(new_items[ix], TranscriptItem::Composer { .. })
+                    .then(|| composer_focus.clone())
+            });
+            self.list_state
+                .splice_focusable(prefix..old_len, focus_handles);
+            self.last_reconcile_was_reset = Some(false);
+        }
 
         self.transcript_items = new_items;
 
@@ -1567,6 +1705,14 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Cached markdown parses are theme-bound: code-block highlight colors
+        // are baked in at parse time, so a Circadian flip invalidates the
+        // whole cache (text is re-set and re-parsed under the new theme).
+        let dark = cx.theme().mode.is_dark();
+        if self.text_states_dark != Some(dark) {
+            self.text_states.clear();
+            self.text_states_dark = Some(dark);
+        }
         let Some(item) = self.transcript_items.get(ix).cloned() else {
             return div().into_any_element();
         };
@@ -1583,6 +1729,27 @@ impl ChatView {
         }
     }
 
+    /// Look up (or create) the persistent markdown state for `key` and
+    /// re-set its text (`set_text` early-returns when unchanged, so a
+    /// stable string re-parses exactly once). Render the result via
+    /// `TextView::new(&state)` — never `TextView::markdown(id, …)` inside a
+    /// transcript item; see the `text_states` field doc for why element-id
+    /// keyed state cannot survive `list()` unmounts.
+    fn cached_text_state(
+        &mut self,
+        key: TextKey,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextViewState> {
+        let state = self
+            .text_states
+            .entry(key)
+            .or_insert_with(|| cx.new(|cx| TextViewState::markdown(text, cx)))
+            .clone();
+        state.update(cx, |s, cx| s.set_text(text, cx));
+        state
+    }
+
     /// A persisted transcript message (with its leading chapter delim unless
     /// it is the first row of the page). One `SpaceMessage` = exactly one
     /// item, regardless of how many markdown blocks its content parses into.
@@ -1590,12 +1757,20 @@ impl ChatView {
     /// per message index, so the markdown parse is a one-time cost that
     /// survives list-item reuse (TextView early-returns on unchanged text).
     fn render_message_item(
-        &self,
+        &mut self,
         idx: usize,
         leading_delim: bool,
-        cx: &Context<Self>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
+        // Copy the colors out: the cached-text-state lookups below need
+        // `&mut cx`, which a live `&Theme` borrow would block.
+        let (c_danger, c_muted_fg, c_fg, c_border) = (
+            theme.danger,
+            theme.muted_foreground,
+            theme.foreground,
+            theme.border,
+        );
         let markdown_style = markdown_style(theme.mode.is_dark());
         let Some(entry) = self.space.read(cx).messages().get(idx).cloned() else {
             return div().into_any_element();
@@ -1610,22 +1785,18 @@ impl ChatView {
         // `theme.danger` for the label so the chrome itself signals the role.
         if leading_delim {
             let label_color = if msg.role == "error" {
-                theme.danger
+                c_danger
             } else {
-                theme.muted_foreground
+                c_muted_fg
             };
             container = container.child(chapter_delim(
                 participant_label(&msg.role),
-                theme.border,
+                c_border,
                 label_color,
             ));
         }
 
-        let fg = if msg.role == "error" {
-            theme.danger
-        } else {
-            theme.foreground
-        };
+        let fg = if msg.role == "error" { c_danger } else { c_fg };
 
         let mut row = v_flex()
             .id(("msg-row", idx))
@@ -1665,10 +1836,11 @@ impl ChatView {
                 ),
             );
             if entry.reasoning_expanded {
+                let ts = self.cached_text_state(TextKey::MessageThinking(idx), reasoning, cx);
                 row = row.child(
                     prose_row().child(
-                        prose().pl_4().text_color(theme.muted_foreground).child(
-                            TextView::markdown(("thinking-body", idx), reasoning.to_string())
+                        prose().pl_4().text_color(c_muted_fg).child(
+                            TextView::new(&ts)
                                 .selectable(true)
                                 .style(markdown_style.clone()),
                         ),
@@ -1680,7 +1852,8 @@ impl ChatView {
         let body: gpui::AnyElement = if msg.role == "error" {
             SharedString::from(msg.content.clone()).into_any_element()
         } else {
-            TextView::markdown(("msg", idx), msg.content.clone())
+            let ts = self.cached_text_state(TextKey::Message(idx), &msg.content, cx);
+            TextView::new(&ts)
                 .selectable(true)
                 .style(markdown_style.clone())
                 .into_any_element()
@@ -1694,15 +1867,16 @@ impl ChatView {
     /// partial body). The `("streaming-body", 0)` / `("streaming-thinking-
     /// body", 0)` TextView ids are stable across deltas, so the partial
     /// markdown re-parses only because its text grew — never spuriously.
-    fn render_streaming_item(&self, cx: &Context<Self>) -> AnyElement {
+    fn render_streaming_item(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
+        let fg = theme.foreground;
+        let muted_fg = theme.muted_foreground;
+        let danger = theme.danger;
+        let border = theme.border;
         let markdown_style = markdown_style(theme.mode.is_dark());
         let Some(s) = self.space.read(cx).streaming().cloned() else {
             return div().into_any_element();
         };
-        let fg = theme.foreground;
-        let muted_fg = theme.muted_foreground;
-        let danger = theme.danger;
 
         let mut container = v_flex().w_full().gap_0();
 
@@ -1710,7 +1884,7 @@ impl ChatView {
         // row underneath fills in as deltas arrive.
         container = container.child(chapter_delim(
             participant_label("assistant"),
-            theme.border,
+            border,
             muted_fg,
         ));
 
@@ -1748,15 +1922,13 @@ impl ChatView {
                 ),
             );
             if s.expanded {
+                let ts = self.cached_text_state(TextKey::StreamingThinking, &s.reasoning, cx);
                 col = col.child(
                     prose_row().child(
                         prose().pl_4().text_color(muted_fg).child(
-                            TextView::markdown(
-                                ("streaming-thinking-body", 0usize),
-                                s.reasoning.clone(),
-                            )
-                            .selectable(true)
-                            .style(markdown_style.clone()),
+                            TextView::new(&ts)
+                                .selectable(true)
+                                .style(markdown_style.clone()),
                         ),
                     ),
                 );
@@ -1772,10 +1944,11 @@ impl ChatView {
         }
 
         if !s.content.is_empty() {
+            let ts = self.cached_text_state(TextKey::Streaming, &s.content, cx);
             col = col.child(
                 prose_row().child(
                     prose().child(
-                        TextView::markdown(("streaming-body", 0usize), s.content.clone())
+                        TextView::new(&ts)
                             .selectable(true)
                             .style(markdown_style.clone()),
                     ),
@@ -1784,10 +1957,11 @@ impl ChatView {
         }
 
         if let Some(err) = s.error.as_deref() {
+            let ts = self.cached_text_state(TextKey::StreamingError, err, cx);
             col = col.child(
                 prose_row().child(
                     prose().text_color(danger).child(
-                        TextView::markdown(("streaming-error", 0usize), err.to_string())
+                        TextView::new(&ts)
                             .selectable(true)
                             .style(markdown_style.clone()),
                     ),
@@ -1800,8 +1974,10 @@ impl ChatView {
 
     /// The window-local error band (delim + body + optional below-band plans
     /// list when a submit failed with `InsufficientBalance`).
-    fn render_error_item(&self, cx: &Context<Self>) -> AnyElement {
+    fn render_error_item(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
+        let c_danger = theme.danger;
+        let c_border = theme.border;
         let markdown_style = markdown_style(theme.mode.is_dark());
         let Some(err) = self.error.clone() else {
             return div().into_any_element();
@@ -1815,14 +1991,15 @@ impl ChatView {
         // color through the row's `text_color`.
         container = container.child(chapter_delim(
             participant_label("error"),
-            theme.border,
-            theme.danger,
+            c_border,
+            c_danger,
         ));
+        let ts = self.cached_text_state(TextKey::ErrorBand, &err, cx);
         container = container.child(
-            div().w_full().px_5().text_color(theme.danger).child(
+            div().w_full().px_5().text_color(c_danger).child(
                 prose_row().child(
                     prose().child(
-                        TextView::markdown(("chat-error", 0usize), err)
+                        TextView::new(&ts)
                             .selectable(true)
                             .style(markdown_style.clone()),
                     ),
