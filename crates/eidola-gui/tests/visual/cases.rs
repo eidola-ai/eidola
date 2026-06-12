@@ -597,6 +597,58 @@ fn register_chat(s: &mut Snapshots) {
         },
     );
 
+    // Persistent participant indicator — scrolled mid-assistant-message.
+    // The transcript is scrolled so the "Eidola" chapter delim (item 1's
+    // leading delim) is off the top of the viewport and the body fills the
+    // page; the title-bar band's LEFT side now carries the italic "Eidola"
+    // label so the reader still knows whose turn they're reading. The right
+    // side stays bare (⌥ not held). Day + night.
+    s.add_with_step(
+        "chat_participant_indicator_scrolled",
+        size(px(760.), px(560.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
+                view.set_messages_for_test(
+                    vec![
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "Walk me through how Rayleigh scattering tints the sky."
+                                .into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content: "Sunlight is white — a fairly even mix across the visible \
+                                spectrum. As it crosses the atmosphere it meets molecules far \
+                                smaller than its wavelength, and those molecules scatter short \
+                                (blue) wavelengths far more strongly than long (red) ones — the \
+                                intensity goes as one over the fourth power of the wavelength.\n\n\
+                                So blue light is flung in every direction and reaches your eye \
+                                from all across the dome of the sky, while the reds and yellows \
+                                travel a straighter path. At midday that paints the whole sky a \
+                                soft blue. Near sunset the light skims a long, slanted path \
+                                through the air, the blue is scattered away entirely, and what \
+                                survives to reach you is the warm red-orange of a low sun."
+                                .into(),
+                        },
+                    ],
+                    cx,
+                );
+                view
+            })
+        },
+        |cx, window, view| {
+            // After the first paint measured the items, scroll into the
+            // assistant turn well past its "Eidola" delim band so the delim is
+            // off the top and the persistent indicator takes over.
+            cx.update_window(window, |_, _, cx| {
+                view.update(cx, |v, cx| v.scroll_transcript_for_test(1, 180., cx));
+            })
+            .ok();
+        },
+    );
+
     s.add("chat_thinking", size(px(900.), px(640.)), |window, cx| {
         let core = stub_stores_with_config(cx);
         cx.new(|cx| {

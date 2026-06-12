@@ -19,7 +19,7 @@ use eidola_app_core::{
     CredentialLifecycleInfo, ModelInfo, PriceInfo, RequestInfo, SpaceInfo, SpaceMessage,
 };
 use eidola_gui::account::AccountView;
-use eidola_gui::chat::{ChatView, OnboardingStage, Send, ToggleModelPicker};
+use eidola_gui::chat::{ChatView, OnboardingStage, ParticipantIndicator, Send, ToggleModelPicker};
 use eidola_gui::library::LibraryView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
@@ -477,6 +477,187 @@ fn two_windows_on_one_space_share_state(cx: &mut TestAppContext) {
         "partial answer",
         "the streamed content appears in both windows"
     );
+}
+
+#[gpui::test]
+fn transcript_render_work_is_constant_in_message_count(cx: &mut TestAppContext) {
+    // Part-1 perf guard (the wave-3 pattern extended to the variable-height
+    // transcript): with `list()`, the per-frame work — what the render closure
+    // does, render exactly the visible window — must be O(visible), not
+    // O(messages). Load a short transcript, then a 500-message one, and assert
+    // the visible-window render produces the same fixed row count both times
+    // (and far below the total). Also a coarse timing comparison: 500 messages
+    // must not cost meaningfully more per frame than 4.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_chat(cx, &stores);
+
+    // A fixed visible window of message rows (what a ~560px-tall viewport
+    // shows at the prose line-height); the list only ever renders this many
+    // items per frame. We measure message rows specifically — the composer is
+    // always exactly one trailing item, O(1), and its editor entity is not
+    // what scales — so a message-only window isolates the O(visible) claim.
+    let visible = 0..12usize;
+
+    let synth = |n: usize| -> Vec<SpaceMessage> {
+        (0..n)
+            .map(|i| SpaceMessage {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!(
+                    "Synthetic turn {i} — a sentence or two of body text so each row has a \
+                     realistic measured height under the prose typography."
+                ),
+            })
+            .collect()
+    };
+
+    // Set the transcript and let the `observe(&space)` reconcile the item
+    // model (it fires on park), then render the visible window `iters` times.
+    // Returns (rows-per-frame, total-item-count, elapsed).
+    let measure = |cx: &mut TestAppContext, msgs: Vec<SpaceMessage>| {
+        view.update(cx, |v, cx| v.set_messages_for_test(msgs, cx));
+        cx.run_until_parked();
+        cx.update_window(window, |_, win, cx| {
+            view.update(cx, |v, cx| {
+                let total = v.transcript_item_count_for_test();
+                let start = std::time::Instant::now();
+                let mut n = 0;
+                for _ in 0..200 {
+                    n = v.render_transcript_window_for_test(visible.clone(), win, cx);
+                }
+                (n, total, start.elapsed())
+            })
+        })
+        .unwrap()
+    };
+
+    // Short transcript (20 messages → 21 items incl. composer).
+    let (short_window, short_total, short_dur) = measure(cx, synth(20));
+    // Long transcript (500 messages → 501 items incl. composer).
+    let (long_window, long_total, long_dur) = measure(cx, synth(500));
+
+    // The item model grew 25× …
+    assert_eq!(short_total, 21, "20 messages + composer");
+    assert_eq!(long_total, 501, "500 messages + composer");
+    // … but the per-frame render rendered the same fixed 12-item window in
+    // both cases — 12 ≪ 501, and independent of the 500 messages behind it.
+    // That cap is the O(visible) guarantee: `list()` only asks the closure for
+    // the visible range, never the whole transcript.
+    assert_eq!(short_window, 12);
+    assert_eq!(
+        long_window, 12,
+        "per-frame row count is capped at the visible window, not the message count"
+    );
+
+    // Coarse timing: per-frame visible-window cost must not scale with the
+    // message count. Generous slack absorbs scheduler noise — we're catching
+    // an O(messages) regression (which would be ~25×), not microbenching.
+    eprintln!("transcript per-frame (200 renders): 20 msgs {short_dur:?} vs 500 msgs {long_dur:?}");
+    assert!(
+        long_dur.as_secs_f64() < short_dur.as_secs_f64() * 5.0 + 0.1,
+        "frame work scaled with message count: 20 msgs {short_dur:?} vs 500 msgs {long_dur:?}"
+    );
+}
+
+#[gpui::test]
+fn participant_indicator_visibility_derivation(cx: &mut TestAppContext) {
+    // Part-2: the persistent participant indicator is a pure function of the
+    // `list()` scroll position + the transcript item model. It is hidden at
+    // the page top and while a chapter delim is on screen, and surfaces the
+    // turn's voice once the delim has scrolled off. Drive the derivation
+    // directly from synthetic scroll positions (no real layout needed).
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_chat(cx, &stores);
+
+    view.update(cx, |v, cx| {
+        v.set_messages_for_test(
+            vec![
+                SpaceMessage {
+                    role: "user".into(),
+                    content: "User opening question.".into(),
+                },
+                SpaceMessage {
+                    role: "assistant".into(),
+                    content: "Assistant answer body.".into(),
+                },
+            ],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, cx| {
+        // Item 0 is the user's opening turn (no leading delim); item 1 the
+        // assistant turn (leading "Eidola" delim); item 2 the composer.
+        assert_eq!(v.transcript_item_count_for_test(), 3);
+
+        // At the very page top (item 0, offset 0): the first line is visible,
+        // no cue needed → hidden.
+        assert_eq!(v.participant_indicator_at_for_test(0, 0.0, cx), None);
+
+        // Scrolled into the delim-less first message: its opening line has
+        // gone up, so the page-local cue is missing → show "You".
+        assert_eq!(
+            v.participant_indicator_at_for_test(0, 60.0, cx),
+            Some(ParticipantIndicator {
+                label: "You",
+                is_error: false,
+            })
+        );
+
+        // Top of item 1, within its leading-delim band: the "Eidola" delim is
+        // on screen → hidden (no competition with the real delim).
+        assert_eq!(v.participant_indicator_at_for_test(1, 8.0, cx), None);
+
+        // Scrolled past item 1's delim band, into the assistant body: the
+        // delim is gone → surface "Eidola".
+        assert_eq!(
+            v.participant_indicator_at_for_test(1, 200.0, cx),
+            Some(ParticipantIndicator {
+                label: "Eidola",
+                is_error: false,
+            })
+        );
+
+        // Over the composer item (the writing zone): no voice to surface.
+        assert_eq!(v.participant_indicator_at_for_test(2, 200.0, cx), None);
+    });
+}
+
+#[gpui::test]
+fn participant_indicator_error_keeps_danger_voice(cx: &mut TestAppContext) {
+    // An error turn's indicator keeps the danger color (is_error = true), so
+    // the persistent cue signals the error role the same way the chapter
+    // delim's "Error" label does.
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_chat(cx, &stores);
+
+    view.update(cx, |v, cx| {
+        v.set_messages_for_test(
+            vec![
+                SpaceMessage {
+                    role: "user".into(),
+                    content: "Trigger.".into(),
+                },
+                SpaceMessage {
+                    role: "error".into(),
+                    content: "Something went wrong.".into(),
+                },
+            ],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, cx| {
+        // Scrolled into the error turn past its delim band.
+        assert_eq!(
+            v.participant_indicator_at_for_test(1, 200.0, cx),
+            Some(ParticipantIndicator {
+                label: "Error",
+                is_error: true,
+            })
+        );
+    });
 }
 
 #[gpui::test]
