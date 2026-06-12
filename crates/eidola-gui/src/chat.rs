@@ -179,6 +179,14 @@ pub struct ChatView {
     /// of the page or while a delim is visible. Recomputed from `list()` scroll
     /// state on every scroll and render — no layout shift (absolute chrome).
     participant_indicator: Option<ParticipantIndicator>,
+    /// Test-only record of how the last *reshaping* `rebuild_transcript`
+    /// reconciled the `ListState`: `Some(true)` = wholesale `reset`,
+    /// `Some(false)` = provable tail-append fast-path. A no-op reconcile (model
+    /// unchanged) leaves this untouched, so a re-render-only notify firing right
+    /// after a real reshape doesn't erase the record. The regression replay
+    /// asserts that a suffix-shifting reshape (first/second submit) `reset`s
+    /// rather than mis-splicing a bogus tail.
+    last_reconcile_was_reset: Option<bool>,
 
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -279,6 +287,16 @@ impl ChatView {
     ) {
         self.space
             .update(cx, |s, cx| s.set_streaming_for_test(streaming, cx));
+    }
+
+    /// Test-only: push a streaming content delta into the shared `Space`,
+    /// exactly as the real runner does (emits `SpaceEvent::StreamDelta`). The
+    /// regression repro uses this to drive the "model started responding"
+    /// moment that the disappearing-message bug surfaced at.
+    #[doc(hidden)]
+    pub fn push_content_delta_for_test(&mut self, delta: &str, cx: &mut Context<Self>) {
+        self.space
+            .update(cx, |s, cx| s.push_content_delta_for_test(delta, cx));
     }
 
     /// Read access to the onboarding flow state, for behavior tests.
@@ -619,6 +637,7 @@ impl ChatView {
             list_state,
             transcript_items: Vec::new(),
             participant_indicator: None,
+            last_reconcile_was_reset: None,
             picker_highlighted: None,
             focus_handle,
             _subscriptions,
@@ -793,6 +812,38 @@ impl ChatView {
     #[doc(hidden)]
     pub fn transcript_item_count_for_test(&self) -> usize {
         self.transcript_items.len()
+    }
+
+    /// Test-only: the `ListState`'s own item count. The regression repro
+    /// asserts this stays in lockstep with [`Self::transcript_item_count_for_test`]
+    /// — a desync is exactly the disappearing-message bug (the model has the
+    /// item but the list never measures/renders it).
+    #[doc(hidden)]
+    pub fn list_state_item_count_for_test(&self) -> usize {
+        self.list_state.item_count()
+    }
+
+    /// Test-only: how the last `rebuild_transcript` reconciled the list.
+    /// `Some(true)` = wholesale `reset`, `Some(false)` = tail-append fast-path,
+    /// `None` = early-returned (model unchanged). The regression replay asserts
+    /// a suffix-shifting reshape took the `reset` path, not a bogus tail-splice.
+    #[doc(hidden)]
+    pub fn last_reconcile_was_reset_for_test(&self) -> Option<bool> {
+        self.last_reconcile_was_reset
+    }
+
+    /// Test-only: the message indices currently present in the flat transcript
+    /// model, in order. Used by the regression repro to assert the user's first
+    /// message is reflected as a rendered `Message` item (not just persisted).
+    #[doc(hidden)]
+    pub fn transcript_message_indices_for_test(&self) -> Vec<usize> {
+        self.transcript_items
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::Message { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Test-only: scroll the transcript list so item `item_ix` is at the top
@@ -1147,15 +1198,37 @@ impl ChatView {
     /// display model: the `list()` render closure is a dumb indexer over
     /// `transcript_items`, so per-frame work stays O(visible).
     ///
-    /// Reconciliation is append-aware: when the new model merely extends the
-    /// old one (the overwhelmingly common case — a turn appended), we
-    /// `splice_focusable` only the appended tail so the reader's scroll
-    /// position is preserved exactly. When the shape changed mid-list (an
-    /// error band appeared, the first-message delim flipped, a reload reshaped
-    /// the middle) we `reset` the list to the new model. `pin_tail` (set by
-    /// submit / failure / stream-end and propagated from `is_following_tail`)
-    /// re-pins to the bottom after reconciliation so the freshest content
-    /// stays visible; a reader scrolled up mid-history is never yanked.
+    /// Reconciliation is **correctness-first**. The old append-aware heuristic
+    /// compared a *prefix* of the new model against the old one — but in this
+    /// UI the dynamic suffix (streaming row, error band, and the always-trailing
+    /// composer) moves on *every* real transition, so that prefix test was
+    /// simultaneously (a) a no-op fast-path that never actually fired for a turn
+    /// append, and (b) a latent footgun: any reshape that *looked* like a tail
+    /// append (`[Composer] → [Message, Streaming, Composer]` on the first
+    /// submit — the composer is the last item, so new items appear *before* it,
+    /// not after) would `splice` only a bogus tail and leave `ListState`'s item
+    /// count and per-item measurements out of step with `transcript_items`. A
+    /// desynced list never measures or paints the items it lost track of —
+    /// which is exactly the regression where the first user message vanishes
+    /// from the transcript the instant streaming begins (it is persisted fine;
+    /// the list just stopped rendering it). Regression replay:
+    /// `first_message_survives_streaming_start` in `tests/behavior.rs`.
+    ///
+    /// The fix: the fast-path fires **only** when the old model is a *complete*
+    /// prefix of the new one — i.e. the entire previous item sequence, suffix
+    /// included, is unchanged and items were appended strictly *after* it. That
+    /// is provably a tail-append, so splicing only the new tail preserves the
+    /// reader's exact scroll position. Every other reshape (any change anywhere
+    /// before the new tail — a turn inserted ahead of the composer, the
+    /// streaming row appearing/finalizing, an error band toggling, the
+    /// first-message delim flipping, a reload reshaping the middle) takes the
+    /// `reset` path, which rebuilds the list's item set wholesale so the count
+    /// and measurements can never drift from the model.
+    ///
+    /// `pin_tail` (set by submit / failure / stream-end, and propagated from
+    /// `is_following_tail` on the model-only `observe` path) re-pins to the
+    /// bottom after reconciliation so the freshest content stays visible; a
+    /// reader scrolled up mid-history is never yanked.
     ///
     /// The **composer is the final item** and is passed to `splice_focusable`
     /// with the editor's focus handle, so when it scrolls offscreen while
@@ -1163,35 +1236,44 @@ impl ChatView {
     /// single-scroll-surface, book-page feel under virtualization.
     fn rebuild_transcript(&mut self, pin_tail: bool, cx: &mut Context<Self>) {
         let new_items = self.compute_transcript_items(cx);
-        if new_items == self.transcript_items && self.list_state.item_count() == new_items.len() {
+        let in_sync = self.list_state.item_count() == self.transcript_items.len();
+        if new_items == self.transcript_items && in_sync {
             // Item model unchanged (e.g. a re-render-only notify): nothing to
-            // reconcile. A still-following stream re-pin is handled by the
-            // StreamDelta hook, not here.
+            // reconcile, and we leave `last_reconcile_was_reset` untouched so a
+            // no-op notify firing right after a real reshape doesn't erase the
+            // record of how that reshape reconciled. A still-following stream
+            // re-pin is handled by the StreamDelta hook, not here.
             return;
         }
 
         let was_following = self.list_state.is_following_tail();
-        let old = &self.transcript_items;
         let composer_focus = self.prompt_editor.read(cx).focus_handle(cx);
 
-        // Detect a pure tail-append: every old item is identical and present
-        // at the same index in the new model. Then we only splice the new
-        // suffix, preserving the scroll position the reader is at.
-        let is_append = new_items.len() >= old.len() && new_items[..old.len()] == old[..];
+        // A provable tail-append: the *entire* old model is an unchanged prefix
+        // of the new one (suffix included), so only items strictly after it were
+        // added. This is the one case where we can splice just the new tail and
+        // keep the reader's scroll position pixel-exact. Crucially it requires
+        // the list to already be in sync with the old model — otherwise we fall
+        // through to `reset`, which re-establishes the invariant from scratch.
+        let old_len = self.transcript_items.len();
+        let is_tail_append = in_sync
+            && new_items.len() > old_len
+            && new_items[..old_len] == self.transcript_items[..];
 
-        if is_append && self.list_state.item_count() == old.len() {
-            let added = new_items.len() - old.len();
-            if added > 0 {
-                let start = old.len();
-                let focus_handles = (start..new_items.len()).map(|ix| {
-                    matches!(new_items[ix], TranscriptItem::Composer { .. })
-                        .then(|| composer_focus.clone())
-                });
-                self.list_state
-                    .splice_focusable(start..start, focus_handles);
-            }
+        self.last_reconcile_was_reset = Some(!is_tail_append);
+        if is_tail_append {
+            let focus_handles = (old_len..new_items.len()).map(|ix| {
+                matches!(new_items[ix], TranscriptItem::Composer { .. })
+                    .then(|| composer_focus.clone())
+            });
+            self.list_state
+                .splice_focusable(old_len..old_len, focus_handles);
         } else {
-            // Shape changed mid-list — rebuild the list's item set wholesale.
+            // Any reshape (or a list/model desync): rebuild the list's item set
+            // wholesale so its count and measurements match the new model
+            // exactly. `reset` already replaces every item with an unmeasured
+            // copy, so we splice the focus handles over that fresh set rather
+            // than resetting and re-splicing the whole range twice.
             let count = new_items.len();
             self.list_state.reset(count);
             let focus_handles = (0..count).map(|ix| {

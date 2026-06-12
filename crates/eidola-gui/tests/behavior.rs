@@ -2260,3 +2260,191 @@ fn dispatch_send(view: &Entity<ChatView>, window: AnyWindowHandle, cx: &mut Test
     .unwrap();
     cx.run_until_parked();
 }
+
+#[gpui::test]
+fn first_message_survives_streaming_start(cx: &mut TestAppContext) {
+    // REGRESSION (wave-4 QA): in a fresh blank window, the user's first message
+    // disappeared from the transcript the instant streaming began. It was
+    // persisted fine — the bug was purely in `rebuild_transcript`'s reconcile:
+    // the first submit reshapes `[Composer]` → `[Message, Streaming, Composer]`,
+    // which is NOT a tail-append (new items land *before* the trailing
+    // composer), but the old prefix heuristic could treat it as one and splice
+    // only a bogus tail, leaving `ListState`'s item count out of step with
+    // `transcript_items` — and a desynced list never renders the items it lost
+    // track of. This replay drives the exact repro and asserts, at every step,
+    // that the user's message is present as a rendered `Message` item AND that
+    // the list count stays in lockstep with the model.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_chat(cx, &stores);
+
+    let assert_consistent = |cx: &mut TestAppContext, where_: &str| {
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.transcript_item_count_for_test(),
+                v.list_state_item_count_for_test(),
+                "{where_}: ListState item count desynced from the transcript model —                  the disappearing-message bug"
+            );
+        });
+    };
+
+    // Blank page: just the composer.
+    assert_consistent(cx, "blank");
+    view.read_with(cx, |v, _| {
+        assert!(v.transcript_message_indices_for_test().is_empty());
+    });
+
+    // Type and send the first message.
+    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    cx.update_window(window, |_, _, cx| {
+        prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::with_markdown("first message");
+            cx.notify();
+        });
+    })
+    .unwrap();
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&Send, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Submit appended the user turn and entered streaming. The user message
+    // must be a rendered Message item (index 0), and the model/list must agree.
+    assert_consistent(cx, "after submit");
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.transcript_message_indices_for_test(),
+            vec![0],
+            "the first user message must be a rendered transcript item"
+        );
+        // The reshape `[Composer] → [Message, Streaming, Composer]` is NOT a
+        // tail-append (new items land before the trailing composer), so it must
+        // take the wholesale `reset` path — never a tail-splice that leaves the
+        // list's per-item measurements pointing at the wrong rows.
+        assert_eq!(
+            v.last_reconcile_was_reset_for_test(),
+            Some(true),
+            "first submit must reset the list, not mis-splice a tail"
+        );
+    });
+
+    // The model starts responding — drive a streaming content delta. This is
+    // the exact moment QA saw the message vanish. It must still be there.
+    view.update(cx, |v, cx| v.push_content_delta_for_test("respo", cx));
+    cx.run_until_parked();
+    assert_consistent(cx, "after stream delta");
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.transcript_message_indices_for_test(),
+            vec![0],
+            "first message must survive the start of streaming"
+        );
+    });
+
+    // Stream ends: streaming row clears, the assistant turn lands. Both turns
+    // are present and the list is still consistent (mirrors the post-stream
+    // transcript reload — a `MessagesChanged`/`StreamEnded` reconcile).
+    view.update(cx, |v, cx| {
+        v.set_streaming_for_test(None, cx);
+        v.set_messages_for_test(
+            vec![
+                SpaceMessage {
+                    role: "user".into(),
+                    content: "first message".into(),
+                },
+                SpaceMessage {
+                    role: "assistant".into(),
+                    content: "response".into(),
+                },
+            ],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_consistent(cx, "after stream end + reload");
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.transcript_message_indices_for_test(),
+            vec![0, 1],
+            "both turns present after the transcript reload"
+        );
+    });
+}
+
+#[gpui::test]
+fn second_submit_in_existing_space_keeps_all_messages(cx: &mut TestAppContext) {
+    // The splice-vs-composer interaction in an *existing* space: a second
+    // submit reshapes `[M0, M1, Composer]` → `[M0, M1, M2, Streaming, Composer]`
+    // — again the new items land before the trailing composer, so it is not a
+    // tail-append. Every prior message must stay rendered and the list must
+    // stay consistent through submit and the first streaming delta.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_chat(cx, &stores);
+
+    view.update(cx, |v, cx| {
+        v.set_messages_for_test(
+            vec![
+                SpaceMessage {
+                    role: "user".into(),
+                    content: "q1".into(),
+                },
+                SpaceMessage {
+                    role: "assistant".into(),
+                    content: "a1".into(),
+                },
+            ],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let assert_consistent = |cx: &mut TestAppContext, where_: &str| {
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.transcript_item_count_for_test(),
+                v.list_state_item_count_for_test(),
+                "{where_}: list/model desync"
+            );
+        });
+    };
+    assert_consistent(cx, "existing space loaded");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.transcript_message_indices_for_test(), vec![0, 1]);
+    });
+
+    // Second submit.
+    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    cx.update_window(window, |_, _, cx| {
+        prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::with_markdown("q2");
+            cx.notify();
+        });
+    })
+    .unwrap();
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&Send, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    assert_consistent(cx, "after second submit");
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.transcript_message_indices_for_test(),
+            vec![0, 1, 2],
+            "the new user turn appends without dropping the prior two"
+        );
+        // Again a suffix-shifting reshape (the new message + streaming row land
+        // ahead of the trailing composer), so it must `reset`, not tail-splice.
+        assert_eq!(v.last_reconcile_was_reset_for_test(), Some(true));
+    });
+
+    view.update(cx, |v, cx| v.push_content_delta_for_test("a2", cx));
+    cx.run_until_parked();
+    assert_consistent(cx, "after second stream delta");
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.transcript_message_indices_for_test(), vec![0, 1, 2]);
+    });
+}
