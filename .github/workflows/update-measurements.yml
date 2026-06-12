@@ -6,24 +6,55 @@ on:
     - cron: "0 */6 * * *"
   workflow_dispatch:
 
+# All writes go through the minted App token below; GITHUB_TOKEN only ever
+# reads (the public upstream release, the attestation API, this repo's refs).
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+
+concurrency:
+  # Serialize runs so two overlapping schedules can't race to create the same
+  # measurements/<tag> branch or open duplicate PRs.
+  group: update-measurements
+  cancel-in-progress: false
 
 jobs:
   check-measurements:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Gated by the `update-measurements` Environment: a deployment-branch policy
+    # restricted to the default branch (`main`). Scheduled / dispatched runs
+    # execute the default-branch copy of this workflow, so only those runs can
+    # read the App secrets. This is what scopes the App credentials to this
+    # workflow running from `main`.
+    environment: update-measurements
     steps:
-      - name: Checkout code # zizmor: ignore[artipacked]
-        # This workflow opens a PR via `git push`, which needs the
-        # GITHUB_TOKEN persisted into .git/config. Allowed here.
+      - name: Mint App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.MEASUREMENT_APP_ID }}
+          private-key: ${{ secrets.MEASUREMENT_APP_PRIVATE_KEY }}
+          # Least-privilege installation token. The App must be granted at least
+          # these permissions on this repo; nothing else is requested, so the
+          # token can do nothing beyond committing the measurement file and
+          # opening its PR.
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout next
+        # Measurement updates branch from and target `next` (the integration
+        # trunk), even though the scheduled run executes from `main`. We never
+        # push over git — the commit is created through the Contents API below —
+        # so no git credentials need to be persisted into .git/config.
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: next
+          persist-credentials: false
 
       - name: Fetch latest Tinfoil release
         id: release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           REPO="tinfoilsh/confidential-model-router"
 
@@ -62,7 +93,7 @@ jobs:
       - name: Fetch sigstore attestation
         id: sigstore
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.release.outputs.artifact_hash }}
         run: |
           REPO="tinfoilsh/confidential-model-router"
@@ -129,40 +160,58 @@ jobs:
           echo "Updated ${FILE}:"
           cat "${FILE}"
 
-      - name: Check for existing PR
+      - name: Check for existing branch
         if: steps.check.outputs.changed == 'true'
         id: existing
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           BRANCH="measurements/${TAG}"
-          if git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null 2>&1; then
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "Branch ${BRANCH} already exists, skipping"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create pull request
+      - name: Commit and open pull request
         if: steps.check.outputs.changed == 'true' && steps.existing.outputs.skip != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # App token: produces a *verified* commit attributed to the App bot
+          # (the Contents API signs commits made through it) and ensures the
+          # opened PR triggers downstream CI (events from GITHUB_TOKEN do not).
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ steps.release.outputs.tag }}
           SNP: ${{ steps.release.outputs.snp }}
           RTMR1: ${{ steps.release.outputs.rtmr1 }}
           RTMR2: ${{ steps.release.outputs.rtmr2 }}
           LOG_INDEX: ${{ steps.sigstore.outputs.log_index }}
         run: |
+          set -euo pipefail
+
+          FILE="releases/trust/tinfoil-enclaves.json"
           BRANCH="measurements/${TAG}"
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Base the new branch on the exact `next` head we checked out, and
+          # capture the current (pre-edit) blob SHA the Contents API needs to
+          # replace the file.
+          BASE_SHA=$(git rev-parse HEAD)
+          BASE_BLOB_SHA=$(git rev-parse "HEAD:${FILE}")
 
-          git checkout -b "${BRANCH}"
-          git add releases/trust/tinfoil-enclaves.json
-          git commit -m "Update Tinfoil enclave measurements to ${TAG}"
-          git push -u origin "${BRANCH}"
+          # Create the branch ref pointing at next's head (no new commit yet).
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/heads/${BRANCH}" \
+            -f "sha=${BASE_SHA}"
+
+          # Create the single measurement commit via the Contents API. Using the
+          # App token, GitHub signs it (Verified) and attributes author and
+          # committer to the App bot automatically — no git identity to look up.
+          gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${FILE}" \
+            -f "message=Update Tinfoil enclave measurements to ${TAG}" \
+            -f "content=$(base64 -w0 "${FILE}")" \
+            -f "branch=${BRANCH}" \
+            -f "sha=${BASE_BLOB_SHA}"
 
           SHORT_SNP="${SNP:0:16}…${SNP: -16}"
           SHORT_RTMR1="${RTMR1:0:16}…${RTMR1: -16}"
@@ -192,4 +241,5 @@ jobs:
           gh pr create \
             --title "Update Tinfoil enclave measurements to ${TAG}" \
             --body-file /tmp/pr-body.md \
-            --base main
+            --head "${BRANCH}" \
+            --base next
