@@ -11,8 +11,8 @@
 
 use eidola_app_core::CredentialLifecycleInfo;
 use gpui::{
-    Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Subscription,
-    Window, div,
+    Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
+    Subscription, Window, div,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Sizable, StyledExt, WindowExt,
@@ -23,6 +23,7 @@ use gpui_component::{
 };
 
 use crate::plans::format_credits;
+use crate::probe::Probe as _;
 use crate::stores::WalletStore;
 
 pub struct WalletView {
@@ -149,13 +150,20 @@ impl Render for WalletView {
         let mut actions = h_flex().gap_2();
         if any_spending {
             actions = actions.child(
-                Button::new("recover-all")
-                    .small()
-                    .label("Recover in-flight")
-                    .disabled(busy)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.recover_all(window, cx);
-                    })),
+                // Probed wrapper for the a11y role/label — shrink-wraps the
+                // button so its bounds are an honest click target.
+                div()
+                    .id("recover-all-wrap")
+                    .probe("wallet/recover", gpui::Role::Button, "Recover in-flight")
+                    .child(
+                        Button::new("recover-all")
+                            .small()
+                            .label("Recover in-flight")
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.recover_all(window, cx);
+                            })),
+                    ),
             );
         }
         actions = actions.child(

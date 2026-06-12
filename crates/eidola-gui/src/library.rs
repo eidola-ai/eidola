@@ -26,6 +26,7 @@ use gpui_component::{
 };
 
 use crate::actions::CloseWindow;
+use crate::probe::Probe as _;
 use crate::stores::{SpacesStore, Stores};
 
 actions!(library, [CancelRename]);
@@ -241,6 +242,13 @@ impl LibraryView {
         let rename_id = space.id.clone();
         let rename_title = space.title.clone();
         let is_renaming = self.renaming_space_id() == Some(space.id.as_str());
+        // Accessible name for the row: the same text the title column renders.
+        let row_label: SharedString = space
+            .title
+            .clone()
+            .or_else(|| space.snippet.clone())
+            .unwrap_or_else(|| "Untitled space".to_string())
+            .into();
 
         // Title content: when this row is being renamed, show the inline
         // input; otherwise show the static title or snippet.
@@ -248,7 +256,20 @@ impl LibraryView {
             if let Some((_, input_state, _)) = &self.renaming {
                 // Ghost-styled inline input: no border/background chrome,
                 // flex_1 so it fills the title column, same font as the row.
-                Input::new(input_state).flex_1().into_any_element()
+                // The probed wrapper carries the a11y role/label (probe the
+                // wrapping div, not the gpui-component Input); it takes over
+                // the input's flex_1 slot so bounds stay honest.
+                div()
+                    .id("rename-input-wrap")
+                    .probe(
+                        "library/rename-input",
+                        gpui::Role::TextInput,
+                        "Rename space",
+                    )
+                    .flex_1()
+                    .flex()
+                    .child(Input::new(input_state).flex_1())
+                    .into_any_element()
             } else {
                 div().flex_1().into_any_element()
             }
@@ -290,6 +311,11 @@ impl LibraryView {
                 .child(
                     div()
                         .id(("rename-slot", idx))
+                        .probe(
+                            format!("library/row/{idx}/rename"),
+                            gpui::Role::Button,
+                            "Rename",
+                        )
                         .debug_selector(move || format!("rename-pencil-{idx}"))
                         .on_mouse_down(
                             gpui::MouseButton::Left,
@@ -324,6 +350,11 @@ impl LibraryView {
                 .child(
                     div()
                         .id(("archive-slot", idx))
+                        .probe(
+                            format!("library/row/{idx}/archive"),
+                            gpui::Role::Button,
+                            "Archive",
+                        )
                         .debug_selector(move || format!("archive-x-{idx}"))
                         .on_mouse_down(
                             gpui::MouseButton::Left,
@@ -348,6 +379,11 @@ impl LibraryView {
 
         let mut row = h_flex()
             .id(("space-row", idx))
+            .probe(
+                format!("library/row/{idx}"),
+                gpui::Role::ListItem,
+                row_label,
+            )
             .w_full()
             .h(ROW_H)
             .gap_3()

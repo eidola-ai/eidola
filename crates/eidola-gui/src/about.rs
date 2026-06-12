@@ -12,6 +12,7 @@ use gpui::{
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 use crate::actions::CloseWindow;
+use crate::probe::Probe as _;
 
 /// The version string baked in at compile time.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -94,6 +95,7 @@ impl Render for AboutView {
         // "View on GitHub" link — `cx.open_url` opens the default browser.
         let github_link = div()
             .id("github-link")
+            .probe("about/github", gpui::Role::Link, "View on GitHub")
             .text_sm()
             .cursor_pointer()
             .text_color(theme.link)

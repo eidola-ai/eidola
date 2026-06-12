@@ -311,7 +311,7 @@ The fix is a proper macOS bundle:
 
 ## Testing — two tiers
 
-Both run via `cargo test -p eidola-gui`. `crates/eidola-gui` has both `[lib]` and `[[bin]]` so the integration tests can import view modules.
+Both tiers run via `cargo test -p eidola-gui` (`crates/eidola-gui` has both `[lib]` and `[[bin]]` so the integration tests can import view modules). A third, non-gating tool — the interactive UI driver — sits alongside them for agent-led QA sessions; see [The UI driver](#the-ui-driver-examplesdriverrs--interactive-qa-sessions).
 
 ### Behavior tests (`tests/behavior.rs`) — the regression gate
 
@@ -344,11 +344,37 @@ Recipes: `just render-snapshots` (verify/write), `just render-snapshots-update` 
 
 Behavior tests catch logic regressions (clicking X must call `store.Y(z)`; an empty Send must be a no-op) and survive across platforms. Visual snapshots are the "did I accidentally change the layout?" check that's only meaningful to the dev making the change. Together they let agents make UI changes confidently: behavior tests gate the merge, visual snapshots let the agent verify the change *looks* right by reading the freshly-written PNG.
 
+### The UI driver (`examples/driver.rs`) — interactive QA sessions
+
+The third leg, sitting between the two tiers: a **long-running interactive session** ("Playwright for eidola-gui") that an agent drives over a JSON-lines stdin/stdout protocol. Run with `just driver` (→ `cargo run -p eidola-gui --example driver`; it's an *example* so cargo's dev-dependency unification gives it gpui's `test-support` feature outside `cargo test`). It boots a `VisualTestAppContext` — real Metal rendering into offscreen windows at (-10000,-10000), deterministic `TestDispatcher` underneath — installs the production keymap (`eidola_gui::install_keybindings`, made `pub` for exactly this), and then loops: one JSON request per stdin line, one JSON response per stdout line.
+
+- **Commands**: `scenes` / `open` (a named fixture scene, optional width/height) / `windows` / `elements` (named click targets with painted bounds, from the probe registry — see [Accessibility & QA probes](#accessibility--qa-probes)) / `click` (by probe `target` or x/y, with alt/command/shift) / `type` / `keys` (gpui keystroke syntax, e.g. `"cmd-enter"`) / `modifiers` (hold/release — drives the real `ModifiersChangedEvent` path, so ⌥ reveals work) / `scroll` / `resize` / `screenshot` (PNG to a path the agent `Read`s) / `theme` (day|night) / `settle` (advance the test clock + park) / `close` / `quit`. Full protocol docs in the example's module comment.
+- **Scenes** are stub-store fixtures mirroring `tests/visual/cases.rs` — onboarding welcome/plans, empty + populated chat (with a model list so the ⌥ reveal and picker are live), library, settings, updates, record. No backend, no network: store-backed flows stop at the stub guard exactly as behavior tests do, while all window-local interaction (composer editing, submit's local append, picker open/navigate/select, hover reveals, pane navigation) is fully live.
+- **Why this exists**: snapshots show one state; behavior tests assert one transition. The driver lets an agent *converse* with the UI — act, look at the actual pixels, act again — closing the QA loop that previously required a human. It needs no Accessibility/Screen Recording permissions, shows nothing on screen, and parallel sessions across worktrees don't interfere.
+- **Element staleness**: every `elements` call (and every by-name `click`) clears the window's probe entries, forces a fresh frame, and re-reads — so an unmounted element (a dismissed picker, a row scrolled out of a virtualized list) can never linger as a ghost target. Regression-tested in `tests/probe.rs`.
+- **Limits (v1)**: app-global action *handlers* (⌘N/⌘L/Settings…) aren't installed — they need the real `AppGlobal`/backend; window-scoped actions and keybindings all work. Scenes are stub-backed; a real-`AppCore`-against-mock-upstream scene is the natural extension once the wave-4 chat harness lands. macOS-only, like the visual tier.
+
+## Accessibility & QA probes
+
+gpui has AccessKit integration (zed #56065, in our pin): elements opt in per node — an element appears in the platform accessibility tree only if it carries an `ElementId` (`.id(…)`) **and** a role, with labels and state via the aria-style builders on `StatefulInteractiveElement` (`.role(…)`, `.aria_label(…)`, `.aria_selected(…)`, …). On macOS this produces real `NSAccessibility` nodes via `accesskit_macos`.
+
+Our annotation point is **`crate::probe::Probe`** — `el.id("…").probe(name, role, label)` — which does two things at once: sets the AccessKit role + label (always), and records the element's painted bounds into a process-global registry (only when probes are enabled — the driver's `elements`/`click target:` vocabulary). The pairing is the doctrine: **the accessible name is the driver's selector**, so the AT surface and the automated-QA surface are the same annotation and cannot drift apart. The registry is recorded via the public `canvas` idiom (an absolute, paint-nothing, hitbox-free child), because gpui keeps its own bounds maps (`debug_bounds`, the AccessKit tree) crate-private on real-rendering windows; probes are inert in production (the canvas child isn't even constructed when disabled, and the trait bound on `StatefulInteractiveElement` makes ".id() before .probe()" a compile error to forget).
+
+Conventions:
+
+- **Names** are slash-scoped lowercase paths: `chat/composer`, `chat/model-picker/row/{idx}`, `library/row/{idx}/archive`, `settings/nav/general`. Dynamic rows interpolate their index.
+- **Labels** are what a screen reader should say — user-meaningful, not internal names; dynamic where the content is (`"Model: gemma4-31b"`, a library row's title).
+- **Roles** come from `gpui::Role` (re-exported accesskit): Button, Link, Tab, ListBox/ListBoxOption, ListItem, TextInput, Alert, Group.
+- **gpui-component widgets** (`Button`, `Input`) don't implement the probe traits and have no a11y annotations at our pin (upstream is working on it — longbridge/gpui-component#2407): wrap them in a shrink-wrapped probed `div` (see `chat.rs`'s `begin-wrap` for the idiom and comment style). Caveat: the wrapper *announces* correctly but doesn't wire `on_a11y_action`, so AT-initiated activation isn't connected yet — clicks (human or driver) work as always. Wiring `on_a11y_action` on our own clickable divs is the natural next increment.
+- **New interactive UI must ship with probes.** When you add a clickable affordance, annotate it in the same change — it's one call, and it's what makes the element visible to both AT and the driver. Coverage is asserted in `tests/probe.rs`; extend it when you add probes to a new view.
+
+Zed itself currently ships with AccessKit force-disabled after early teething (zed #57954) — that's about *Zed's* rollout, not the gpui API; our annotated elements are a much smaller, fixture-tested surface. If instability appears in the real app, `Application::new_inaccessible()` is the upstream kill-switch to reach for.
+
 ## gpui / gpui-component pinning
 
 `gpui-component` (longbridge, rev `dadfca97fec7221acf3ce7047bccdc1eac0506b9`) pulls `gpui` and `gpui_platform` from `zed-industries/zed` without a rev. We mirror that exact spec in `Cargo.toml` so cargo unifies on a single `gpui` copy. `Cargo.lock` is the canonical pin for the resolved zed commit. gpui-component and gpui move in lockstep: a given gpui-component rev expects a matching gpui (e.g. the `flex_shrink_1`/`flex_grow_1` helpers it calls landed in gpui commit `8982fb17`), so bump both together.
 
-**The zed pin is held at `969a67fc`, deliberately *behind* `main`.** The next commit, `39f7849a` ("Log worst hanging tasks and actions", zed #57835), added a global action-timing profiler whose process-wide `ACTION_STATISTICS` spinlock isn't isolated per thread. It's harmless in the single-threaded UI at runtime, but libtest runs our `gpui-markdown-editor` behavior tests in parallel — concurrent `dispatch_action` calls clobber the one global `running` slot and `save_action_timing()` panics on `None`. `969a67fc` is the parent of that commit: it has the flex helpers gpui-component needs but predates the profiler. Because the deps are rev-less, the lock is the only thing holding this — **do not `cargo update` zed past `969a67fc` until the upstream profiler race is fixed** (re-test the editor suite under parallelism before advancing the pin).
+**The zed pin is at `34cd17f` (2026-06-11).** The pin was previously held back at `969a67fc` because the commit after it (zed #57835) added a global action-timing profiler whose process-wide `ACTION_STATISTICS` spinlock panicked under libtest's parallel `gpui-markdown-editor` behavior tests. Upstream fixed the race (zed #58813) and then made the profiler opt-in behind the `gpui/profiler` feature (zed #58942, off by default — we don't enable it), so the hold is obsolete. The historical rule stands as practice: when advancing the pin, re-run the full editor behavior suite under default libtest parallelism before committing the lock. The pin also includes gpui's AccessKit integration (zed #56065, merged 2026-05-27) — see [Accessibility & QA probes](#accessibility--qa-probes).
 
 ## Non-Rust dependencies
 

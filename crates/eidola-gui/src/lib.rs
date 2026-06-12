@@ -10,6 +10,7 @@ pub mod general;
 pub mod library;
 pub mod loadable;
 mod plans;
+pub mod probe;
 pub mod record;
 pub mod settings;
 pub mod space;
@@ -226,7 +227,9 @@ fn install_menus(cx: &mut App) {
     ]);
 }
 
-fn install_keybindings(cx: &mut App) {
+/// Public because the UI driver (`examples/driver.rs`) installs the same
+/// keymap as the real app so simulated keystrokes resolve identically.
+pub fn install_keybindings(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-n", NewSpace, None),

@@ -38,6 +38,7 @@ use gpui_component::{
 
 use crate::actions::CloseWindow;
 use crate::bridge;
+use crate::probe::Probe as _;
 use crate::stores::Stores;
 
 /// Horizontal clearance for the macOS traffic lights — the section strip
@@ -615,6 +616,12 @@ impl RecordView {
             let active = self.section == section && self.detail.is_none();
             let mut label = div()
                 .id(section.label())
+                .probe(
+                    format!("record/section/{}", section.label().to_lowercase()),
+                    gpui::Role::Tab,
+                    section.label(),
+                )
+                .aria_selected(active)
                 .text_sm()
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| this.select_section(section, cx)))
@@ -634,6 +641,7 @@ impl RecordView {
             .child(
                 div()
                     .id("record-refresh")
+                    .probe("record/refresh", gpui::Role::Button, "Refresh")
                     .text_xs()
                     .cursor_pointer()
                     .text_color(theme.muted_foreground)
