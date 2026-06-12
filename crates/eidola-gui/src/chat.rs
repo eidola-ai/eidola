@@ -54,7 +54,15 @@ actions!(
         /// Toggle the quiet model picker anchored to the title-bar band.
         /// Bound to ⌥⌘M in the `ChatView` key context; clicking the
         /// ⌥-revealed model label is the pointer path to the same state.
-        ToggleModelPicker
+        ToggleModelPicker,
+        /// Dismiss the model picker (Esc, while the picker is open).
+        DismissModelPicker,
+        /// Move the picker highlight one row up.
+        PickerUp,
+        /// Move the picker highlight one row down.
+        PickerDown,
+        /// Select the currently highlighted picker row (Enter).
+        PickerConfirm,
     ]
 );
 
@@ -147,6 +155,10 @@ pub struct ChatView {
     /// revealed label). The label stays revealed while the picker is open
     /// so the picker keeps its visual anchor after ⌥ is released.
     model_picker_open: bool,
+    /// The index of the keyboard-highlighted row in the model picker, if
+    /// any. `None` when the picker is closed or no row has been touched
+    /// yet. Arrow keys move it; Enter selects; Esc dismisses.
+    picker_highlighted: Option<usize>,
 
     /// Virtualized-transcript scroll state. `list()` renders only the visible
     /// window of `transcript_items`, so per-frame work is O(visible). The
@@ -338,9 +350,77 @@ impl ChatView {
     }
 
     /// Toggle the model picker (⌥⌘M, or clicking the revealed label).
+    /// Resets the keyboard highlight when the picker is opened so arrow
+    /// navigation starts fresh.
     pub fn toggle_model_picker(&mut self, cx: &mut Context<Self>) {
         self.model_picker_open = !self.model_picker_open;
+        if !self.model_picker_open {
+            self.picker_highlighted = None;
+        }
         cx.notify();
+    }
+
+    /// Dismiss the model picker without selecting anything (Esc).
+    pub fn dismiss_model_picker(&mut self, cx: &mut Context<Self>) {
+        self.model_picker_open = false;
+        self.picker_highlighted = None;
+        cx.notify();
+    }
+
+    /// Move the keyboard highlight up one row in the picker, wrapping
+    /// from the first row to the last.
+    pub fn picker_up(&mut self, cx: &mut Context<Self>) {
+        if !self.model_picker_open {
+            return;
+        }
+        let count = self.models.read(cx).list().len();
+        if count == 0 {
+            return;
+        }
+        self.picker_highlighted = Some(match self.picker_highlighted {
+            // From no selection or already at the top, move to 0 (clamp, not wrap).
+            None | Some(0) => 0,
+            Some(n) => n - 1,
+        });
+        cx.notify();
+    }
+
+    /// Move the keyboard highlight down one row in the picker, clamping at
+    /// the last row (no wrap).
+    pub fn picker_down(&mut self, cx: &mut Context<Self>) {
+        if !self.model_picker_open {
+            return;
+        }
+        let count = self.models.read(cx).list().len();
+        if count == 0 {
+            return;
+        }
+        self.picker_highlighted = Some(match self.picker_highlighted {
+            None => 0,
+            Some(n) => (n + 1).min(count - 1),
+        });
+        cx.notify();
+    }
+
+    /// Confirm the currently highlighted picker row (Enter). No-op when
+    /// nothing is highlighted.
+    pub fn picker_confirm(&mut self, cx: &mut Context<Self>) {
+        if !self.model_picker_open {
+            return;
+        }
+        let Some(idx) = self.picker_highlighted else {
+            return;
+        };
+        let models = self.models.read(cx).list().to_vec();
+        if let Some(model) = models.get(idx) {
+            let id = model.id.clone();
+            self.select_model(id, cx);
+        }
+    }
+
+    /// The keyboard-highlighted picker row index (if any).
+    pub fn picker_highlighted(&self) -> Option<usize> {
+        self.picker_highlighted
     }
 
     /// Choose the model for this space's subsequent sends and close the
@@ -350,6 +430,7 @@ impl ChatView {
     pub fn select_model(&mut self, id: String, cx: &mut Context<Self>) {
         self.space.update(cx, |s, cx| s.select_model(id, cx));
         self.model_picker_open = false;
+        self.picker_highlighted = None;
         cx.notify();
     }
 
@@ -378,6 +459,15 @@ impl ChatView {
     #[doc(hidden)]
     pub fn set_model_picker_open_for_test(&mut self, open: bool) {
         self.model_picker_open = open;
+        if !open {
+            self.picker_highlighted = None;
+        }
+    }
+
+    /// Test-only setter for the keyboard highlight index.
+    #[doc(hidden)]
+    pub fn set_picker_highlighted_for_test(&mut self, idx: Option<usize>) {
+        self.picker_highlighted = idx;
     }
 }
 
@@ -529,6 +619,7 @@ impl ChatView {
             list_state,
             transcript_items: Vec::new(),
             participant_indicator: None,
+            picker_highlighted: None,
             focus_handle,
             _subscriptions,
         };
@@ -1193,6 +1284,13 @@ impl Render for ChatView {
             .on_action(
                 cx.listener(|this, _: &ToggleModelPicker, _, cx| this.toggle_model_picker(cx)),
             )
+            // Picker keyboard navigation — no-ops when the picker is closed.
+            .on_action(
+                cx.listener(|this, _: &DismissModelPicker, _, cx| this.dismiss_model_picker(cx)),
+            )
+            .on_action(cx.listener(|this, _: &PickerUp, _, cx| this.picker_up(cx)))
+            .on_action(cx.listener(|this, _: &PickerDown, _, cx| this.picker_down(cx)))
+            .on_action(cx.listener(|this, _: &PickerConfirm, _, cx| this.picker_confirm(cx)))
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
             }))
@@ -2208,9 +2306,11 @@ impl ChatView {
             );
         }
 
+        let highlighted = self.picker_highlighted;
         for (idx, model) in models.iter().enumerate() {
             let is_current = model.id == current;
             let is_default = model.id == default_model;
+            let is_highlighted = highlighted == Some(idx);
 
             let mut markers: Vec<&str> = Vec::new();
             if is_current {
@@ -2248,6 +2348,11 @@ impl ChatView {
                     .py_2()
                     .gap_0p5()
                     .when(idx > 0, |d| d.border_t_1().border_color(theme.border))
+                    // Keyboard highlight: a quiet muted background, the same
+                    // opacity the hover style uses so the two states feel
+                    // consistent. The highlight is an honest state — it maps
+                    // exactly to the row Enter would select.
+                    .when(is_highlighted, |d| d.bg(theme.muted.opacity(0.5)))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.muted.opacity(0.5)))
                     .on_click(cx.listener(move |this, _, _, cx| this.select_model(id.clone(), cx)))

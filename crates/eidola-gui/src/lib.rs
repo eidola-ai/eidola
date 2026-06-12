@@ -246,6 +246,14 @@ fn install_keybindings(cx: &mut App) {
             crate::chat::ToggleModelPicker,
             Some("ChatView"),
         ),
+        // Picker keyboard navigation — all scoped to ChatView so they only
+        // fire while the chat composer has focus and don't conflict with
+        // global or MarkdownEditor bindings.  The picker gate is the action
+        // handler itself (methods early-return when picker is closed).
+        KeyBinding::new("escape", crate::chat::DismissModelPicker, Some("ChatView")),
+        KeyBinding::new("up", crate::chat::PickerUp, Some("ChatView")),
+        KeyBinding::new("down", crate::chat::PickerDown, Some("ChatView")),
+        KeyBinding::new("enter", crate::chat::PickerConfirm, Some("ChatView")),
     ]);
 
     install_markdown_editor_keybindings(cx);

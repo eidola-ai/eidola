@@ -20,7 +20,10 @@ use eidola_app_core::{
 };
 use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
-use eidola_gui::chat::{ChatView, OnboardingStage, ParticipantIndicator, Send, ToggleModelPicker};
+use eidola_gui::chat::{
+    ChatView, DismissModelPicker, OnboardingStage, ParticipantIndicator, PickerConfirm, PickerDown,
+    PickerUp, Send, ToggleModelPicker,
+};
 use eidola_gui::library::LibraryView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
@@ -942,6 +945,167 @@ fn selection_during_streaming_applies_to_next_send(cx: &mut TestAppContext) {
             "an in-flight stream is never hot-swapped"
         );
         assert_eq!(v.selected_model(cx).as_deref(), Some("kimi-k2-6"));
+    });
+}
+
+#[gpui::test]
+fn escape_dismisses_picker(cx: &mut TestAppContext) {
+    // Esc must close the picker when it's open, but is a no-op when closed.
+    let stores = stub_stores(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.models = stub_models();
+    });
+    let (window, view) = open_chat(cx, &stores);
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+
+    // Open the picker first.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| assert!(v.model_picker_open()));
+
+    // Escape dismisses it.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&DismissModelPicker, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(!v.model_picker_open(), "Esc must close the picker");
+        assert_eq!(v.picker_highlighted(), None, "highlight clears on dismiss");
+    });
+}
+
+#[gpui::test]
+fn picker_up_down_moves_highlight(cx: &mut TestAppContext) {
+    // Down increments the highlight; Up decrements it; both clamp at the ends.
+    let stores = stub_stores(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.models = stub_models(); // 2 models: index 0 and 1
+    });
+    let (window, view) = open_chat(cx, &stores);
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+
+    // Open the picker.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+
+    // Down from None → 0.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&PickerDown, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.picker_highlighted(),
+            Some(0),
+            "first Down highlights row 0"
+        );
+    });
+
+    // Down again → 1 (last row).
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&PickerDown, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.picker_highlighted(), Some(1));
+    });
+
+    // Down past end → stays at 1.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&PickerDown, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.picker_highlighted(), Some(1), "Down at end clamps");
+    });
+
+    // Up → 0.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&PickerUp, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.picker_highlighted(), Some(0));
+    });
+
+    // Up past start → stays at 0.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&PickerUp, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.picker_highlighted(), Some(0), "Up at start clamps");
+    });
+}
+
+#[gpui::test]
+fn picker_enter_selects_highlighted_model(cx: &mut TestAppContext) {
+    // Enter selects the highlighted row and closes the picker.
+    let stores = stub_stores(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.models = stub_models(); // index 0 = "gemma4-31b", index 1 = "kimi-k2-6"
+    });
+    let (window, view) = open_chat(cx, &stores);
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+
+    // Open picker and navigate to row 1.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+        focus.dispatch_action(&PickerDown, window, cx);
+        focus.dispatch_action(&PickerDown, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.picker_highlighted(), Some(1));
+    });
+
+    // Enter selects the highlighted model.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&PickerConfirm, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(!v.model_picker_open(), "Enter must close the picker");
+        assert_eq!(
+            v.selected_model(cx).as_deref(),
+            Some("kimi-k2-6"),
+            "Enter selects the highlighted model"
+        );
+        assert_eq!(
+            v.picker_highlighted(),
+            None,
+            "highlight clears after confirm"
+        );
+    });
+}
+
+#[gpui::test]
+fn picker_enter_with_no_highlight_is_noop(cx: &mut TestAppContext) {
+    // Enter with nothing highlighted must not close the picker or change
+    // the selection — there is nothing to confirm.
+    let stores = stub_stores(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.models = stub_models();
+    });
+    let (window, view) = open_chat(cx, &stores);
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| assert_eq!(v.picker_highlighted(), None));
+
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&PickerConfirm, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(v.model_picker_open(), "picker stays open with no highlight");
     });
 }
 
