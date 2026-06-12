@@ -1,6 +1,7 @@
 //! Library window — the book's table of contents. Lists the user's spaces
-//! (most recently active first), reopens one on click, and quietly archives
-//! on the hover-revealed ×. Double-clicking a row enters inline rename mode.
+//! (most recently active first), reopens one on click, and quietly reveals two
+//! ghost buttons on hover: a pencil that starts an inline rename and an × that
+//! archives.
 //!
 //! Design notes: this is deliberately *not* a chat-app sidebar. One prose
 //! column, hairline `theme.border` rules between entries, no cards or
@@ -17,7 +18,7 @@ use gpui::{
     UniformListScrollHandle, Window, actions, div, px, rems, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, IconName, InteractiveElementExt, Sizable,
+    ActiveTheme, IconName, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -91,6 +92,28 @@ impl LibraryView {
     #[doc(hidden)]
     pub fn set_hovered_for_test(&mut self, hovered: Option<usize>) {
         self.hovered = hovered;
+    }
+
+    /// Apply a hover transition for row `idx`. On hover-true the row becomes the
+    /// hovered one; on hover-false we clear **only if `idx` is still the hovered
+    /// row**. gpui doesn't order `on_hover` events across rows: moving the cursor
+    /// up the list, the row being *left* can fire `on_hover(false)` *after* the
+    /// row being *entered* fired `on_hover(true)`, so an unconditional clear
+    /// would wipe the new row's hover (the × flickering off when moving up the
+    /// list). Driven by the row's `on_hover` listener; exposed for behavior
+    /// tests so they can replay that out-of-order sequence directly.
+    pub fn set_row_hover(&mut self, idx: usize, hovering: bool, cx: &mut Context<Self>) {
+        if hovering {
+            self.hovered = Some(idx);
+        } else if self.hovered == Some(idx) {
+            self.hovered = None;
+        }
+        cx.notify();
+    }
+
+    /// The row index currently hovered, if any. Exposed for behavior tests.
+    pub fn hovered_row(&self) -> Option<usize> {
+        self.hovered
     }
 
     /// Archive a space. Called by the hover-revealed × button; public so
@@ -227,20 +250,37 @@ impl LibraryView {
             title_el.into_any_element()
         };
 
-        // Fixed-width slot for the archive button so its hover appearance
-        // doesn't shift the date column.
-        let mut archive_slot = h_flex().w_6().justify_end();
+        // Fixed-width reveal slot for the row affordances (pencil then ×), so
+        // their hover appearance doesn't shift the date column. Two quiet ghost
+        // buttons: the pencil starts the inline rename, the × archives. Both are
+        // revealed on hover and hidden while this row is itself being renamed.
+        let mut reveal_slot = h_flex().w_12().gap_1().justify_end();
         if hovered && !is_renaming {
-            archive_slot = archive_slot.child(
-                Button::new(("archive-space", idx))
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Close)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.archive(archive_id.clone(), cx);
-                    })),
-            );
+            reveal_slot = reveal_slot
+                .child(
+                    Button::new(("rename-space", idx))
+                        .ghost()
+                        .xsmall()
+                        // The bundled Lucide icon set has no pencil/`square-pen`
+                        // glyph; `case-sensitive` ("Aa") is the quiet text-edit
+                        // affordance that reads as "rename this title".
+                        .icon(IconName::CaseSensitive)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            // Don't let the click also open the row.
+                            cx.stop_propagation();
+                            this.begin_rename(rename_id.clone(), rename_title.clone(), window, cx);
+                        })),
+                )
+                .child(
+                    Button::new(("archive-space", idx))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.archive(archive_id.clone(), cx);
+                        })),
+                );
         }
 
         let mut row = h_flex()
@@ -252,20 +292,18 @@ impl LibraryView {
             .cursor_pointer()
             .on_action(cx.listener(|this, _: &CancelRename, _, cx| this.cancel_rename(cx)))
             .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
-                this.hovered = if *hovering { Some(idx) } else { None };
-                cx.notify();
+                this.set_row_hover(idx, *hovering, cx);
             }));
 
         if !is_renaming {
-            // Single click opens the space; double-click starts rename.
-            row = row
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open_space(space_id.clone(), cx);
-                }))
-                .on_double_click(cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.begin_rename(rename_id.clone(), rename_title.clone(), window, cx);
-                }));
+            // A single click opens the space. Rename is reached via the
+            // hover-revealed pencil button (see `reveal_slot`), not a
+            // double-click — a single click opens the row immediately, so the
+            // second click of a double landed in the new window, making the old
+            // double-click trigger unreachable.
+            row = row.on_click(cx.listener(move |this, _, _, cx| {
+                this.open_space(space_id.clone(), cx);
+            }));
         }
 
         row = row
@@ -280,7 +318,7 @@ impl LibraryView {
                         eidola_app_core::now_ms(),
                     ))),
             )
-            .child(archive_slot);
+            .child(reveal_slot);
 
         // Hairline rule between entries — a rule *between*, not a box
         // around, so the first row carries no leading rule.

@@ -1382,6 +1382,75 @@ fn library_begin_rename_tracks_space(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn library_hover_survives_out_of_order_leave(cx: &mut TestAppContext) {
+    // Hover-event ordering: moving the cursor *up* the list, gpui can fire the
+    // left row's `on_hover(false)` AFTER the entered row's `on_hover(true)`. The
+    // clear must be conditional on still being the hovered row, or the new row's
+    // hover (and its reveal buttons) gets wiped. Replay the down-the-list order:
+    // row B becomes hovered, then row A's stale leave fires — hover must stay B.
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            stub_space("s0", Some("Row A"), None, 1_000),
+            stub_space("s1", Some("Row B"), None, 2_000),
+        ];
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+
+    // Cursor enters row A (index 0).
+    view.update(cx, |v, cx| v.set_row_hover(0, true, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.hovered_row(), Some(0)));
+
+    // Cursor moves to row B: B's enter (true) fires first…
+    view.update(cx, |v, cx| v.set_row_hover(1, true, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.hovered_row(), Some(1)));
+
+    // …then A's leave (false) arrives late. Because A is no longer the hovered
+    // row, the clear is a no-op — hover stays on B.
+    view.update(cx, |v, cx| v.set_row_hover(0, false, cx));
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.hovered_row(),
+            Some(1),
+            "a stale leave from the left row must not clobber the entered row's hover"
+        );
+    });
+
+    // A real leave of the currently-hovered row still clears.
+    view.update(cx, |v, cx| v.set_row_hover(1, false, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.hovered_row(), None));
+}
+
+#[gpui::test]
+fn library_pencil_begins_rename(cx: &mut TestAppContext) {
+    // The hover-revealed pencil starts the inline rename (replacing the
+    // unreachable double-click trigger). It calls `begin_rename` directly, so
+    // exercising that method is the same path the pencil's on_click takes.
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 1_000)];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+
+    view.read_with(cx, |v, _| assert_eq!(v.renaming_space_id(), None));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.begin_rename("s1".into(), Some("Tides".into()), window, cx);
+        });
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.renaming_space_id(),
+            Some("s1"),
+            "the pencil's begin_rename puts the row into inline-rename mode"
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Onboarding state machine
 // ---------------------------------------------------------------------------
