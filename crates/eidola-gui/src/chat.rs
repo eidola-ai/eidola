@@ -2555,13 +2555,26 @@ impl ChatView {
                     .py_2()
                     .gap_0p5()
                     .when(idx > 0, |d| d.border_t_1().border_color(theme.border))
-                    // Keyboard highlight: a quiet muted background, the same
-                    // opacity the hover style uses so the two states feel
-                    // consistent. The highlight is an honest state — it maps
-                    // exactly to the row Enter would select.
-                    .when(is_highlighted, |d| d.bg(theme.muted.opacity(0.5)))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.muted.opacity(0.5)))
+                    // Keyboard highlight vs hover are now *distinct*. The earlier
+                    // highlight reused `theme.muted.opacity(0.5)`, which over the
+                    // popover surface (`#fffefb` in day) is imperceptible — the
+                    // QA "any arrow kills the highlight" report (the highlight
+                    // state was set correctly, it just painted invisibly). The
+                    // keyboard-selected row now takes the saturated `theme.accent`
+                    // selection color (the same one the sidebar nav pill uses), so
+                    // the row Enter would select is unmistakable. Hover keeps the
+                    // quieter `muted.opacity(0.5)` for unselected rows. **Keyboard
+                    // wins until the mouse moves:** a keyboard-highlighted row does
+                    // not register the hover override, so a stationary cursor that
+                    // a scroll moved a different row under can't visually steal the
+                    // selection — only an actual pointer move (which re-hovers and,
+                    // on click, selects) changes it.
+                    .when(is_highlighted, |d| {
+                        d.bg(theme.accent).text_color(theme.accent_foreground)
+                    })
+                    .when(!is_highlighted, |d| {
+                        d.cursor_pointer().hover(|s| s.bg(theme.muted.opacity(0.5)))
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| this.select_model(id.clone(), cx)))
                     .child(name_row)
                     .child(

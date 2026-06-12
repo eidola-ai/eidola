@@ -1044,6 +1044,47 @@ fn picker_up_down_moves_highlight(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn picker_highlight_survives_rerender(cx: &mut TestAppContext) {
+    // REGRESSION (wave-4 QA round 2, finding 2): "any arrow kills the
+    // highlight." The root cause was visual (the keyboard-highlight background
+    // reused `theme.muted.opacity(0.5)`, imperceptible over the popover surface
+    // — proven in the step-rendered visual case `chat_picker_keyboard_highlight`,
+    // and fixed by giving the keyboard row the saturated `theme.accent` color,
+    // distinct from hover). The highlight *state* must also be stable: it is set
+    // on PickerDown and must NOT be cleared by an ordinary re-render (a notify,
+    // an observe firing), which is what a stationary-cursor scroll would
+    // otherwise trigger. Here we set the highlight, then force re-render cycles,
+    // and assert it persists — keyboard highlight wins until an explicit action
+    // (Up/Down/Esc/Confirm/select) changes it.
+    let stores = stub_stores(cx, |c| {
+        c.config_state = Some(config_state(true));
+        c.models = stub_models();
+    });
+    let (window, view) = open_chat(cx, &stores);
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+        focus.dispatch_action(&PickerDown, window, cx);
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| assert_eq!(v.picker_highlighted(), Some(0)));
+
+    // Two forced re-renders (the kind a hover/scroll/observe would cause).
+    for _ in 0..2 {
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+    }
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.picker_highlighted(),
+            Some(0),
+            "the keyboard highlight must survive re-renders (not be cleared by hover/scroll)"
+        );
+    });
+}
+
+#[gpui::test]
 fn picker_arrow_keys_scroll_highlight_into_view(cx: &mut TestAppContext) {
     // A long model list exceeds the capped-height picker panel, so keyboard
     // navigation must scroll the highlighted row into view (the QA bug: the

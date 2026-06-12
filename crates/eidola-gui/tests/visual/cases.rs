@@ -729,6 +729,39 @@ fn register_chat(s: &mut Snapshots) {
         },
     );
 
+    // REGRESSION (wave-4 QA round 2, finding 2): pressing an arrow key in the
+    // open picker must HIGHLIGHT a row, not make the highlight vanish. Open the
+    // picker, then dispatch a real PickerDown through the focused action path
+    // (the same route a keystroke takes), re-park, and screenshot — the first
+    // row must show the highlight background. Driven through the real dispatch +
+    // paint path (not a direct state poke) so a regression in how the picker
+    // receives or repaints the highlight is caught.
+    s.add_with_step(
+        "chat_picker_keyboard_highlight",
+        size(px(705.), px(705.)),
+        |window, cx| {
+            let core = model_stores(cx);
+            cx.new(|cx| {
+                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
+                view.set_alt_held_for_test(true, cx);
+                view
+            })
+        },
+        |cx, window, view| {
+            let focus = view.read_with(cx, |v, _| v.focus_handle());
+            cx.update_window(window, |_, window, cx| {
+                focus.dispatch_action(&eidola_gui::chat::ToggleModelPicker, window, cx);
+            })
+            .ok();
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| {
+                focus.dispatch_action(&eidola_gui::chat::PickerDown, window, cx);
+            })
+            .ok();
+            cx.run_until_parked();
+        },
+    );
+
     // Persistent participant indicator — scrolled mid-assistant-message.
     // The transcript is scrolled so the "Eidola" chapter delim (item 1's
     // leading delim) is off the top of the viewport and the body fills the
