@@ -33,8 +33,8 @@ use eidola_gui::updates::{UpdatesDisplay, UpdatesView, relative_time};
 use eidola_gui::wallet::WalletView;
 use eidola_gui::window_input::WindowInput;
 use gpui::{
-    AnyWindowHandle, AppContext, Entity, Modifiers, TestAppContext, VisualTestContext,
-    WindowOptions,
+    AnyWindowHandle, AppContext, Entity, Modifiers, Point, TestAppContext, VisualTestContext,
+    WindowOptions, px,
 };
 use gpui_component::{Root, Theme};
 use gpui_markdown_editor::EditorState;
@@ -1488,6 +1488,90 @@ fn library_pencil_begins_rename(cx: &mut TestAppContext) {
             v.renaming_space_id(),
             Some("s1"),
             "the pencil's begin_rename puts the row into inline-rename mode"
+        );
+    });
+}
+
+#[gpui::test]
+fn library_pencil_click_does_not_also_open_row(cx: &mut TestAppContext) {
+    // REGRESSION (wave-4 QA round 2, finding 4): clicking the rename pencil
+    // sometimes BOTH started the inline rename AND opened the space window — a
+    // propagation/phase race. The row records its own pending mouse-down and
+    // captures it on the mouse-up *capture* phase (before the button's bubble
+    // click + stop_propagation runs), and `begin_rename` reshaping the row
+    // between down and up (title → input, reveal slot hidden) moves the
+    // hitboxes so the up can complete the ROW's click too. The fix blocks
+    // propagation on the affordance slot for BOTH mouse-down and mouse-up, and
+    // defers `begin_rename` so the click sequence resolves against the old
+    // layout.
+    //
+    // Mechanism (proven from gpui `div.rs` paint + `window.rs::dispatch_mouse_event`):
+    //   - On mouse-DOWN (bubble), every element with click listeners whose
+    //     hitbox is hovered records its own `pending_mouse_down`. The pencil is
+    //     nested in the row, so the row's hitbox is hovered too → the row arms.
+    //   - On mouse-UP, capture phase runs outer→inner and each element with a
+    //     pending down captures it (if still hovered); bubble phase runs
+    //     inner→outer and fires the captured click, breaking on stop_propagation.
+    //   The pencil's `stop_propagation` covers the *synchronous* up, but the
+    //   intermittent production failure is the reshape race: the pencil's click
+    //   runs `begin_rename`, which hides the reveal slot and swaps the title for
+    //   an input *between* the captured down and the firing up, so the up lands
+    //   on the row and completes the ROW's click too — opening the space on top
+    //   of the rename.
+    //
+    // The fix blocks propagation on the affordance slot for BOTH mouse-down (so
+    // the row never arms) AND mouse-up, and defers `begin_rename` so the reshape
+    // happens after the gesture resolves. This drives the real DOWN+UP gesture
+    // over the pencil's hitbox (located via `debug_bounds`) and asserts the
+    // invariant the fix guarantees: the pencil renames and the row never opens.
+    //
+    // Harness note: the *intermittent* production failure is a multi-frame
+    // timing race (hover flicker / re-paint between the physical down and up)
+    // that the deterministic test dispatcher cannot reproduce against the
+    // committed code — gpui's own #24600 "clear pending if the hitbox moved out
+    // from under the up" guard, the row dropping its `on_click` the moment it
+    // reshapes into rename mode, and the pencil's `stop_propagation` together
+    // cover every *synchronous* path. This test therefore guards the invariant
+    // (and regresses if the protections are removed: stripping the pencil's
+    // propagation blocking makes `open_space` fire here, `left: 1 == right: 0`).
+    // The mechanism evidence above is the primary artifact; the manual repro is
+    // clicking the pencil rapidly on a hovered row in the running app.
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 1_000)];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+    cx.run_until_parked();
+
+    // Reveal the row's affordances (the pencil only paints while hovered).
+    view.update(cx, |v, _| v.set_hovered_for_test(Some(0)));
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Give the window a definite size so the virtualized list lays out its
+    // rows (and the pencil's painted bounds become queryable).
+    vcx.simulate_resize(gpui::size(px(520.), px(620.)));
+    vcx.run_until_parked();
+    let bounds = vcx
+        .debug_bounds("rename-pencil-0")
+        .expect("the hover-revealed rename pencil must be painted with its debug selector");
+    let center: Point<gpui::Pixels> = bounds.center();
+
+    // The real user gesture: a single down+up click on the pencil.
+    vcx.simulate_click(center, Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.renaming_space_id(),
+            Some("s1"),
+            "clicking the pencil must start the inline rename"
+        );
+        assert_eq!(
+            v.open_space_requests_for_test(),
+            0,
+            "clicking the pencil must NOT also open the row (the propagation/reshape race)"
         );
     });
 }

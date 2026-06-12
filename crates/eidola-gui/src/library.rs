@@ -58,6 +58,11 @@ pub struct LibraryView {
     focus_handle: FocusHandle,
     /// Scroll handle for the virtualized listing.
     scroll: UniformListScrollHandle,
+    /// Test-only: how many times `open_space` has been invoked. Lets the
+    /// pencil-propagation regression test prove that clicking the rename pencil
+    /// does NOT also trigger the row's open (`open_space` itself defers a real
+    /// window open that a behavior test can't easily count).
+    open_space_requests: usize,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -77,6 +82,7 @@ impl LibraryView {
             renaming: None,
             focus_handle,
             scroll: UniformListScrollHandle::new(),
+            open_space_requests: 0,
             _subscriptions,
         }
     }
@@ -126,10 +132,19 @@ impl LibraryView {
     /// Open the given space in a new chat window. Deferred so the window
     /// opens after the current update cycle completes.
     pub fn open_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.open_space_requests += 1;
         let stores = self.stores.clone();
         cx.defer(move |cx: &mut App| {
             crate::open_space_window(cx, stores, space_id);
         });
+    }
+
+    /// Test-only: how many times `open_space` has fired. The pencil-rename
+    /// propagation regression test asserts this stays `0` when only the rename
+    /// pencil was clicked.
+    #[doc(hidden)]
+    pub fn open_space_requests_for_test(&self) -> usize {
+        self.open_space_requests
     }
 
     /// Begin inline rename for the given space.  Creates an `InputState` seeded
@@ -256,30 +271,78 @@ impl LibraryView {
         // revealed on hover and hidden while this row is itself being renamed.
         let mut reveal_slot = h_flex().w_12().gap_1().justify_end();
         if hovered && !is_renaming {
+            // **Both-phase propagation block.** Each affordance is wrapped in a
+            // slot div that stops propagation on *both* mouse-down and mouse-up
+            // (not just the click). The button's own `on_click` already calls
+            // `cx.stop_propagation()`, but that only covers the click's mouse-up
+            // *bubble* phase — the row records its own `pending_mouse_down` on
+            // mouse-DOWN and captures it on the mouse-up *capture* phase, both
+            // before the button's bubble click runs (gpui dispatches capture
+            // outer→inner, then bubble inner→outer; see gpui `div.rs` paint).
+            // Blocking the down stops the row from ever arming its pending
+            // click; blocking the up's capture is belt-and-suspenders. This is
+            // the structural half of the "pencil both renames and opens the row"
+            // race. The other half — `begin_rename` reshaping the row mid-event
+            // (title → input, reveal slot hidden) so hitboxes move between down
+            // and up — is closed by deferring `begin_rename` (below), so the
+            // whole click sequence resolves against the pre-rename layout.
             reveal_slot = reveal_slot
                 .child(
-                    Button::new(("rename-space", idx))
-                        .ghost()
-                        .xsmall()
-                        // The bundled Lucide icon set has no pencil/`square-pen`
-                        // glyph; `case-sensitive` ("Aa") is the quiet text-edit
-                        // affordance that reads as "rename this title".
-                        .icon(IconName::CaseSensitive)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            // Don't let the click also open the row.
-                            cx.stop_propagation();
-                            this.begin_rename(rename_id.clone(), rename_title.clone(), window, cx);
-                        })),
+                    div()
+                        .id(("rename-slot", idx))
+                        .debug_selector(move || format!("rename-pencil-{idx}"))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .on_mouse_up(
+                            gpui::MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .child(
+                            Button::new(("rename-space", idx))
+                                .ghost()
+                                .xsmall()
+                                // The bundled Lucide icon set has no
+                                // pencil/`square-pen` glyph; `case-sensitive`
+                                // ("Aa") is the quiet text-edit affordance that
+                                // reads as "rename this title".
+                                .icon(IconName::CaseSensitive)
+                                .on_click(cx.listener(move |_, _, window, cx| {
+                                    // Don't let the click also open the row.
+                                    cx.stop_propagation();
+                                    // Defer the reshape so the in-flight click
+                                    // sequence finishes against the old layout.
+                                    let id = rename_id.clone();
+                                    let title = rename_title.clone();
+                                    cx.defer_in(window, move |this, window, cx| {
+                                        this.begin_rename(id, title, window, cx);
+                                    });
+                                })),
+                        ),
                 )
                 .child(
-                    Button::new(("archive-space", idx))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.archive(archive_id.clone(), cx);
-                        })),
+                    div()
+                        .id(("archive-slot", idx))
+                        .debug_selector(move || format!("archive-x-{idx}"))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .on_mouse_up(
+                            gpui::MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .child(
+                            Button::new(("archive-space", idx))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.archive(archive_id.clone(), cx);
+                                })),
+                        ),
                 );
         }
 
