@@ -2610,3 +2610,156 @@ fn second_submit_in_existing_space_keeps_all_messages(cx: &mut TestAppContext) {
         assert_eq!(v.transcript_message_indices_for_test(), vec![0, 1, 2]);
     });
 }
+
+#[gpui::test]
+fn library_loaded_space_rests_at_top_not_tail(cx: &mut TestAppContext) {
+    // REGRESSION (wave-4 QA round 2, finding 1b): a space opened from the
+    // Library loads its transcript *after* the first paint. The load's
+    // `MessagesChanged` event used to call `rebuild_transcript(true)`, pinning
+    // the list to the tail — so a multi-turn conversation opened scrolled past
+    // its earlier messages (they read as "lost"). A reopened space must rest at
+    // the TOP and must NOT be following the tail.
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            ChatView::new(
+                stores.clone(),
+                Some("space-lib".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+
+    // First paint: empty transcript (stub backend never loads). Resting at top,
+    // not following.
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.is_following_tail_for_test(),
+            "blank space must not follow tail"
+        );
+        assert_eq!(v.scroll_top_item_ix_for_test(), 0);
+    });
+
+    // The async load completes via the REAL load path (apply_loaded_transcript),
+    // landing several turns. This emits MessagesChanged.
+    view.update(cx, |v, cx| {
+        v.apply_loaded_transcript_for_test(
+            vec![
+                SpaceMessage {
+                    role: "user".into(),
+                    content: "first question".into(),
+                },
+                SpaceMessage {
+                    role: "assistant".into(),
+                    content: "first answer".into(),
+                },
+                SpaceMessage {
+                    role: "user".into(),
+                    content: "second question".into(),
+                },
+                SpaceMessage {
+                    role: "assistant".into(),
+                    content: "second answer".into(),
+                },
+            ],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        // Every loaded turn is in the model (4 messages + composer).
+        assert_eq!(
+            v.transcript_message_indices_for_test(),
+            vec![0, 1, 2, 3],
+            "all loaded messages must be in the transcript model"
+        );
+        assert_eq!(
+            v.transcript_item_count_for_test(),
+            v.list_state_item_count_for_test(),
+            "list/model count must stay in lockstep after the load"
+        );
+        // The fix: the load must NOT engage tail-following, and the list must
+        // rest at the top (item_ix 0) so the earlier messages are visible.
+        assert!(
+            !v.is_following_tail_for_test(),
+            "an async transcript load must not yank the list into tail-follow"
+        );
+        assert_eq!(
+            v.scroll_top_item_ix_for_test(),
+            0,
+            "a reopened space must rest at the top, showing its first message"
+        );
+    });
+}
+
+#[gpui::test]
+fn submit_engages_tail_but_load_does_not(cx: &mut TestAppContext) {
+    // REGRESSION (wave-4 QA round 2, finding 1a): the tail policy must be owned
+    // by submit (and a genuine at-bottom reader), NOT by every transcript
+    // reshape. A submit brings the new exchange into view (follows tail); a
+    // StreamEnded reload keeps following; but the initial load (above) does not.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(stores.clone(), None, WindowInput::new(cx), window, cx))
+    });
+    cx.run_until_parked();
+
+    // Fresh blank window: not following.
+    view.read_with(cx, |v, _| {
+        assert!(!v.is_following_tail_for_test());
+    });
+
+    // Submit a real turn through the Send action.
+    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    cx.update_window(window, |_, _, cx| {
+        prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::with_markdown("hello");
+            cx.notify();
+        });
+    })
+    .unwrap();
+    dispatch_send(&view, window, cx);
+
+    // Submit engaged tail-follow (the new exchange is brought into view).
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.is_following_tail_for_test(),
+            "submit must engage tail-follow"
+        );
+    });
+
+    // Stream ends: the assistant turn lands. Still following (the reader was at
+    // the bottom), and every message survives.
+    view.update(cx, |v, cx| {
+        v.set_streaming_for_test(None, cx);
+        v.set_messages_for_test(
+            vec![
+                SpaceMessage {
+                    role: "user".into(),
+                    content: "hello".into(),
+                },
+                SpaceMessage {
+                    role: "assistant".into(),
+                    content: "hi back".into(),
+                },
+            ],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.is_following_tail_for_test(),
+            "an at-bottom reader keeps following across the stream-end reload"
+        );
+        assert_eq!(v.transcript_message_indices_for_test(), vec![0, 1]);
+        assert_eq!(
+            v.transcript_item_count_for_test(),
+            v.list_state_item_count_for_test()
+        );
+    });
+}

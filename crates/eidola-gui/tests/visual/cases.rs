@@ -296,6 +296,126 @@ fn register_chat(s: &mut Snapshots) {
         cx.new(|cx| ChatView::new(core, None, WindowInput::new(cx), window, cx))
     });
 
+    // REGRESSION (wave-4 QA round 2, finding 1b): a space opened from the
+    // Library loads its transcript *after* the first paint. The window renders
+    // once with an empty transcript (just the composer), then the async load
+    // completes and the messages must all appear. Construct the ChatView on a
+    // space id (the real `open_space_window` path) so its transcript starts
+    // `NotLoaded`, paint, then drive the *real* load-completion (through
+    // `apply_loaded_transcript`, not a direct poke), paint again. Every message
+    // must be visible. This is a dynamic transition the static `chat_with_*`
+    // snapshots never exercised.
+    s.add_with_step(
+        "chat_library_load_completes",
+        size(px(760.), px(620.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                // `Some(id)` joins the registry and (with a real backend) would
+                // kick the transcript load; with stub stores there is no
+                // backend, so the transcript rests `NotLoaded` — exactly the
+                // pre-load first-paint state.
+                ChatView::new(
+                    core,
+                    Some("space-lib".into()),
+                    WindowInput::new(cx),
+                    window,
+                    cx,
+                )
+            })
+        },
+        |cx, window, view| {
+            cx.update_window(window, |_, _, cx| {
+                view.update(cx, |v, cx| {
+                    v.apply_loaded_transcript_for_test(
+                        vec![
+                            SpaceMessage {
+                                role: "user".into(),
+                                content: "What did we decide about the enclave pin?".into(),
+                            },
+                            SpaceMessage {
+                                role: "assistant".into(),
+                                content: "We hold the zed pin at 969a67fc — deliberately behind \
+                                    main — until the upstream action-timing profiler race is \
+                                    fixed, because libtest runs the editor behavior tests in \
+                                    parallel."
+                                    .into(),
+                            },
+                            SpaceMessage {
+                                role: "user".into(),
+                                content: "And the cli trust root?".into(),
+                            },
+                            SpaceMessage {
+                                role: "assistant".into(),
+                                content: "The cli build COPYs releases/trust/server-enclave.json \
+                                    and embeds it as its trust root, so the enclave block is the \
+                                    single build-time input tying the cli to the server."
+                                    .into(),
+                            },
+                        ],
+                        cx,
+                    );
+                });
+            })
+            .ok();
+        },
+    );
+
+    // REGRESSION (wave-4 QA round 2, finding 1a): a longer conversation — later
+    // exchanges must not lose earlier messages. Drive three full
+    // submit→delta→StreamEnded cycles (the real transition shape), growing the
+    // transcript to six turns. Every turn must remain rendered after the third
+    // cycle. The static populated snapshots never drove these transitions.
+    s.add_with_step(
+        "chat_long_conversation_grows",
+        size(px(760.), px(620.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| ChatView::new(core, None, WindowInput::new(cx), window, cx))
+        },
+        |cx, window, view| {
+            for turn in 1..=3u32 {
+                // Drive a *real* submit through the Send action so the runner's
+                // append + tail engagement happen exactly as in production.
+                let (focus, editor) =
+                    view.read_with(cx, |v, _| (v.focus_handle(), v.prompt_editor_for_test()));
+                cx.update_window(window, |_, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.state = EditorState::with_markdown(format!(
+                            "Question number {turn}, please answer in detail."
+                        ));
+                        cx.notify();
+                    });
+                })
+                .ok();
+                cx.update_window(window, |_, window, cx| {
+                    focus.dispatch_action(&eidola_gui::chat::Send, window, cx);
+                })
+                .ok();
+                cx.run_until_parked();
+                // Stream ends: streaming clears and the assistant turn lands via
+                // the post-stream transcript reload (the StreamEnded reconcile).
+                cx.update_window(window, |_, _, cx| {
+                    view.update(cx, |v, cx| {
+                        let mut as_space: Vec<SpaceMessage> =
+                            v.messages(cx).into_iter().map(|m| m.message).collect();
+                        v.set_streaming_for_test(None, cx);
+                        as_space.push(SpaceMessage {
+                            role: "assistant".into(),
+                            content: format!(
+                                "This is the full answer to question {turn}, with enough text to \
+                                 occupy a couple of lines so the transcript actually grows."
+                            ),
+                        });
+                        v.set_messages_for_test(as_space, cx);
+                    });
+                })
+                .ok();
+                cx.run_until_parked();
+            }
+        },
+    );
+
     // Narrow window — guards that the chapter delimiter tracks the prose
     // body's width edge-for-edge. Earlier the delim sized itself
     // independently and rendered small + left-aligned when the window was

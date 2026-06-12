@@ -284,6 +284,23 @@ impl ChatView {
             .update(cx, |s, cx| s.set_messages_for_test(messages, cx));
     }
 
+    /// Test-only: drive the *real* async transcript-load completion path on
+    /// the shared `Space` (the Library-open path: a space constructed with an
+    /// id loads its transcript after the first paint, landing through
+    /// `apply_loaded_transcript`). Distinct from `set_messages_for_test`, which
+    /// pokes the transcript directly — this exercises the load-completes-after-
+    /// first-render transition the desync repro needs.
+    #[doc(hidden)]
+    pub fn apply_loaded_transcript_for_test(
+        &mut self,
+        messages: Vec<SpaceMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        self.space.update(cx, |s, cx| {
+            s.apply_loaded_transcript_for_test(messages, cx);
+        });
+    }
+
     /// Test-only: attach reasoning to the message at `idx`, optionally
     /// expanded. Use after `set_messages_for_test`.
     #[doc(hidden)]
@@ -746,9 +763,25 @@ impl ChatView {
                 cx.notify();
             }
             SpaceEvent::MessagesChanged | SpaceEvent::StreamEnded => {
-                // The transcript shape changed (a turn appended/finalized).
-                // Reconcile the item model; a still-following reader re-pins.
-                self.rebuild_transcript(true, cx);
+                // The transcript shape changed (a turn appended/finalized, or an
+                // async initial load / bus-driven reload landed). Reconcile the
+                // item model, but do **not** force a tail re-pin here: that is
+                // the *follow* policy, owned by `rebuild_transcript`'s
+                // `was_following` branch. A genuine follower (the reader is at
+                // the bottom — engaged on submit, or never scrolled away) is
+                // re-pinned to the freshest turn; a reader who reopened a space
+                // (rests at the top, not following) or scrolled up mid-history
+                // is left exactly where they were.
+                //
+                // Forcing `pin_tail=true` here was the wave-4 QA-round-2 bug: a
+                // space opened from the Library loads its transcript *after* the
+                // first paint, and that load's `MessagesChanged` yanked the list
+                // to the bottom — so a multi-turn conversation opened scrolled
+                // past its earlier messages (they read as "lost"), and a bus
+                // reload mid-read yanked a scrolled-up reader off their place.
+                // Submit still pins the tail explicitly (see `submit`), so the
+                // "writing scrolls under your hand" feel is unaffected.
+                self.rebuild_transcript(false, cx);
                 cx.notify();
             }
             SpaceEvent::Failed(e) => {
@@ -877,6 +910,24 @@ impl ChatView {
     #[doc(hidden)]
     pub fn transcript_item_count_for_test(&self) -> usize {
         self.transcript_items.len()
+    }
+
+    /// Test-only: whether the transcript list is currently following its tail.
+    /// The finding-1 regression repro asserts an initial async load does *not*
+    /// engage following (a reopened space rests at the top), while a submit
+    /// does (the new exchange is brought into view).
+    #[doc(hidden)]
+    pub fn is_following_tail_for_test(&self) -> bool {
+        self.list_state.is_following_tail()
+    }
+
+    /// Test-only: the list's logical scroll-top item index — which item is at
+    /// the top of the viewport. `0` means resting at the top (the first
+    /// message visible); a larger index means earlier messages have scrolled
+    /// off the top.
+    #[doc(hidden)]
+    pub fn scroll_top_item_ix_for_test(&self) -> usize {
+        self.list_state.logical_scroll_top().item_ix
     }
 
     /// Test-only: the `ListState`'s own item count. The regression repro
@@ -1263,37 +1314,37 @@ impl ChatView {
     /// display model: the `list()` render closure is a dumb indexer over
     /// `transcript_items`, so per-frame work stays O(visible).
     ///
-    /// Reconciliation is **correctness-first**. The old append-aware heuristic
-    /// compared a *prefix* of the new model against the old one — but in this
-    /// UI the dynamic suffix (streaming row, error band, and the always-trailing
-    /// composer) moves on *every* real transition, so that prefix test was
-    /// simultaneously (a) a no-op fast-path that never actually fired for a turn
-    /// append, and (b) a latent footgun: any reshape that *looked* like a tail
-    /// append (`[Composer] → [Message, Streaming, Composer]` on the first
-    /// submit — the composer is the last item, so new items appear *before* it,
-    /// not after) would `splice` only a bogus tail and leave `ListState`'s item
-    /// count and per-item measurements out of step with `transcript_items`. A
-    /// desynced list never measures or paints the items it lost track of —
-    /// which is exactly the regression where the first user message vanishes
-    /// from the transcript the instant streaming begins (it is persisted fine;
-    /// the list just stopped rendering it). Regression replay:
-    /// `first_message_survives_streaming_start` in `tests/behavior.rs`.
+    /// Reconciliation is **correctness-first and reset-always**. Any real
+    /// transition (a turn appended, the streaming row appearing/finalizing, an
+    /// error band toggling, an async initial load or bus reload landing) calls
+    /// `reset` + `splice_focusable` over the full range, so the `list()`'s item
+    /// count and per-item measurements can never drift from `transcript_items`.
+    /// `list()` measures lazily (only the visible window per frame), so a
+    /// wholesale reset is cheap — there is no perf reason to preserve old
+    /// measurements across a reshape.
     ///
-    /// The fix: the fast-path fires **only** when the old model is a *complete*
-    /// prefix of the new one — i.e. the entire previous item sequence, suffix
-    /// included, is unchanged and items were appended strictly *after* it. That
-    /// is provably a tail-append, so splicing only the new tail preserves the
-    /// reader's exact scroll position. Every other reshape (any change anywhere
-    /// before the new tail — a turn inserted ahead of the composer, the
-    /// streaming row appearing/finalizing, an error band toggling, the
-    /// first-message delim flipping, a reload reshaping the middle) takes the
-    /// `reset` path, which rebuilds the list's item set wholesale so the count
-    /// and measurements can never drift from the model.
+    /// The earlier "tail-append fast-path" (splice only the new suffix when the
+    /// old model is a complete prefix of the new one) was deleted because it was
+    /// both *dead* and a *latent footgun*. Dead: in this UI the trailing composer
+    /// shifts on every real turn, so a turn append is never a pure
+    /// prefix-extension and the fast-path never fired. Footgun: the first submit
+    /// reshape `[Composer] → [Message, Streaming, Composer]` *looks* like a
+    /// tail-append (the composer is last, so new items appear *before* it), and a
+    /// prefix-blind splice would leave `ListState` desynced — exactly the wave-4
+    /// regression where the first user message vanished from the transcript the
+    /// instant streaming began (persisted fine; the list just stopped measuring /
+    /// painting it). Resetting unconditionally makes that class impossible.
+    /// A `debug_assert` re-checks the count invariant after every reconcile.
+    /// Regression replay: `first_message_survives_streaming_start`.
     ///
-    /// `pin_tail` (set by submit / failure / stream-end, and propagated from
-    /// `is_following_tail` on the model-only `observe` path) re-pins to the
-    /// bottom after reconciliation so the freshest content stays visible; a
-    /// reader scrolled up mid-history is never yanked.
+    /// `pin_tail` (the submit / explicit bring-into-view intent) re-pins to the
+    /// bottom after reconciliation; otherwise an at-bottom reader
+    /// (`is_following_tail`) keeps following, while a reopened space (rests at
+    /// the top) and a reader scrolled up mid-history are left exactly where they
+    /// were. Crucially, the `MessagesChanged`/`StreamEnded` hooks pass
+    /// `pin_tail=false` — the initial async load must not yank the list to the
+    /// bottom (the wave-4 QA-round-2 "Library-opened space loses its earlier
+    /// messages" bug); submit pins the tail explicitly instead.
     ///
     /// The **composer is the final item** and is passed to `splice_focusable`
     /// with the editor's focus handle, so when it scrolls offscreen while
@@ -1314,47 +1365,50 @@ impl ChatView {
         let was_following = self.list_state.is_following_tail();
         let composer_focus = self.prompt_editor.read(cx).focus_handle(cx);
 
-        // A provable tail-append: the *entire* old model is an unchanged prefix
-        // of the new one (suffix included), so only items strictly after it were
-        // added. This is the one case where we can splice just the new tail and
-        // keep the reader's scroll position pixel-exact. Crucially it requires
-        // the list to already be in sync with the old model — otherwise we fall
-        // through to `reset`, which re-establishes the invariant from scratch.
-        let old_len = self.transcript_items.len();
-        let is_tail_append = in_sync
-            && new_items.len() > old_len
-            && new_items[..old_len] == self.transcript_items[..];
-
-        self.last_reconcile_was_reset = Some(!is_tail_append);
-        if is_tail_append {
-            let focus_handles = (old_len..new_items.len()).map(|ix| {
-                matches!(new_items[ix], TranscriptItem::Composer { .. })
-                    .then(|| composer_focus.clone())
-            });
-            self.list_state
-                .splice_focusable(old_len..old_len, focus_handles);
-        } else {
-            // Any reshape (or a list/model desync): rebuild the list's item set
-            // wholesale so its count and measurements match the new model
-            // exactly. `reset` already replaces every item with an unmeasured
-            // copy, so we splice the focus handles over that fresh set rather
-            // than resetting and re-splicing the whole range twice.
-            let count = new_items.len();
-            self.list_state.reset(count);
-            let focus_handles = (0..count).map(|ix| {
-                matches!(new_items[ix], TranscriptItem::Composer { .. })
-                    .then(|| composer_focus.clone())
-            });
-            self.list_state.splice_focusable(0..count, focus_handles);
-        }
+        // Always rebuild the list's item set wholesale so its count and per-item
+        // measurements can never drift from `transcript_items`. `list()` measures
+        // lazily (only the visible window is laid out per frame), so a full
+        // `reset` is cheap — there is no perf reason to preserve old measurements
+        // across a reshape, and the old "tail-append fast-path" that tried to was
+        // both *dead* (in this UI the trailing composer shifts on every real
+        // turn, so a turn append is never a pure prefix-extension) and a *latent
+        // footgun*: the first submit reshape `[Composer] → [Message, Streaming,
+        // Composer]` looks like a tail-append (new items land before the trailing
+        // composer), and a prefix-blind splice would leave `ListState` desynced —
+        // exactly the wave-4 regression where the first message vanished. The
+        // reset path makes that class of bug structurally impossible.
+        //
+        // `reset(count)` already replaces every item with an unmeasured copy, so
+        // we splice the focus handles over that fresh set rather than resetting
+        // and re-splicing the range twice.
+        let count = new_items.len();
+        self.list_state.reset(count);
+        let focus_handles = (0..count).map(|ix| {
+            matches!(new_items[ix], TranscriptItem::Composer { .. }).then(|| composer_focus.clone())
+        });
+        self.list_state.splice_focusable(0..count, focus_handles);
+        self.last_reconcile_was_reset = Some(true);
 
         self.transcript_items = new_items;
 
-        if pin_tail {
+        // The reconcile invariant: the `list()`'s item count must equal the flat
+        // model's length after every reconcile, or the list silently stops
+        // measuring/painting the items it lost track of (the disappearing-message
+        // class). Held by construction now (reset + splice over the full range),
+        // but asserted so any future divergence trips immediately in tests.
+        debug_assert_eq!(
+            self.list_state.item_count(),
+            self.transcript_items.len(),
+            "rebuild_transcript: ListState item count desynced from the transcript model"
+        );
+
+        if pin_tail || was_following {
+            // `pin_tail` is the submit/explicit-bring-into-view intent; an
+            // at-bottom reader (`was_following`) keeps following across a
+            // reshape. A reopened space (rests at top) and a scrolled-up reader
+            // are neither, so they are left exactly where they were — the load /
+            // reload no longer yanks them to the bottom.
             self.list_state.set_follow_mode(gpui::FollowMode::Tail);
-            self.list_state.scroll_to_end();
-        } else if was_following {
-            // Preserve an at-bottom reader's tail follow across a reshape.
             self.list_state.scroll_to_end();
         }
     }
