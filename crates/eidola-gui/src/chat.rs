@@ -1,13 +1,15 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::window_input::WindowInput;
 use eidola_app_core::error::AppError;
 use eidola_app_core::{ModelInfo, SpaceMessage};
 use gpui::{
-    AppContext, AsyncApp, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ModifiersChangedEvent, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, actions, div,
-    linear_color_stop, linear_gradient, prelude::FluentBuilder, px, relative, rems,
+    AnyElement, AppContext, AsyncApp, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, ListAlignment, ListState, ModifiersChangedEvent,
+    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, WeakEntity, Window, actions, div, linear_color_stop, linear_gradient, list,
+    prelude::FluentBuilder, px, relative, rems,
 };
 use gpui_component::{
     ActiveTheme, Disableable, IconName, StyledExt,
@@ -15,7 +17,7 @@ use gpui_component::{
     h_flex,
     highlighter::HighlightTheme,
     label::Label,
-    text::{TextView, TextViewStyle},
+    text::{TextView, TextViewState, TextViewStyle},
     v_flex,
 };
 use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownStyle};
@@ -44,6 +46,17 @@ const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
 #[cfg(not(target_os = "macos"))]
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 
+/// Left clearance for the title-bar band's left-aligned participant indicator
+/// so it doesn't render *behind* the macOS traffic lights (which AppKit draws
+/// at the top-left of the transparent titlebar). Same clearance constant family
+/// as `record::STRIP_LEFT_PAD` and gpui-component's `TITLE_BAR_LEFT_PADDING`
+/// (80px). Platform-gated like the other traffic-light reserves — no pad is
+/// needed off macOS, where the window has no overlaid stoplights.
+#[cfg(target_os = "macos")]
+const INDICATOR_LEFT_PAD: gpui::Pixels = gpui::px(80.);
+#[cfg(not(target_os = "macos"))]
+const INDICATOR_LEFT_PAD: gpui::Pixels = gpui::px(0.);
+
 actions!(
     chat,
     [
@@ -53,7 +66,15 @@ actions!(
         /// Toggle the quiet model picker anchored to the title-bar band.
         /// Bound to ⌥⌘M in the `ChatView` key context; clicking the
         /// ⌥-revealed model label is the pointer path to the same state.
-        ToggleModelPicker
+        ToggleModelPicker,
+        /// Dismiss the model picker (Esc, while the picker is open).
+        DismissModelPicker,
+        /// Move the picker highlight one row up.
+        PickerUp,
+        /// Move the picker highlight one row down.
+        PickerDown,
+        /// Select the currently highlighted picker row (Enter).
+        PickerConfirm,
     ]
 );
 
@@ -146,9 +167,120 @@ pub struct ChatView {
     /// revealed label). The label stays revealed while the picker is open
     /// so the picker keeps its visual anchor after ⌥ is released.
     model_picker_open: bool,
+    /// The index of the keyboard-highlighted row in the model picker, if
+    /// any. `None` when the picker is closed or no row has been touched
+    /// yet. Arrow keys move it; Enter selects; Esc dismisses.
+    picker_highlighted: Option<usize>,
+    /// Tracked scroll handle for the model picker's row container. The picker
+    /// panel is a capped-height `overflow_y_scroll` div, so a long model list
+    /// scrolls internally; this handle lets keyboard navigation
+    /// (`PickerUp`/`PickerDown`, and opening with a far-down current selection)
+    /// scroll the highlighted row into view via `scroll_to_item`.
+    picker_scroll: ScrollHandle,
+    /// Test-only mirror of the last row index handed to
+    /// `picker_scroll.scroll_to_item` — `ScrollHandle` exposes no getter for its
+    /// pending active item, so this lets behavior tests assert the picker
+    /// scrolls to follow the keyboard highlight without a real paint pass.
+    last_picker_scroll_target: Option<usize>,
+
+    /// Virtualized-transcript scroll state. `list()` renders only the visible
+    /// window of `transcript_items`, so per-frame work is O(visible). The
+    /// element-side `ListState` is the persistent scroll handle (the old
+    /// `overflow_y_scroll` div had none); `splice`/`remeasure`/`scroll_to_end`
+    /// drive the tail policy (see `rebuild_transcript`). Window-local: each
+    /// window has its own scroll position even on a shared `Space`.
+    list_state: ListState,
+    /// The current flat transcript model — one entry per `list()` item, the
+    /// composer included as the final item. Recomputed by `rebuild_transcript`
+    /// whenever the message/streaming/error shape changes; the render closure
+    /// is a dumb indexer over it (the Record/Library idiom). Its `len()` is the
+    /// list's item count.
+    transcript_items: Vec<TranscriptItem>,
+    /// The participant label shown in the title-bar band's left side while the
+    /// top of the viewport sits inside a message whose chapter delim has
+    /// scrolled off (see [`Self::participant_indicator`]). `None` at the top
+    /// of the page or while a delim is visible. Recomputed from `list()` scroll
+    /// state on every scroll and render — no layout shift (absolute chrome).
+    participant_indicator: Option<ParticipantIndicator>,
+    /// Persistent markdown render states for the transcript's `TextView`s,
+    /// keyed by logical content. **Load-bearing for virtualization**: a
+    /// `TextView::markdown(id, …)` keeps its parsed state in the per-frame
+    /// element-id store (`window.use_keyed_state`), which is DROPPED when a
+    /// `list()` item unmounts above the viewport — the row then re-enters
+    /// with an unparsed state, measures ~zero, the heights above the scroll
+    /// anchor collapse (the observed scroll *jump*), and the message reads
+    /// as gone until a window reopen (wave-4 QA round 3). Owning the
+    /// `Entity<TextViewState>` here and rendering via `TextView::new(&state)`
+    /// (which skips `use_keyed_state` entirely) keeps the parse alive across
+    /// unmounts, so re-measure is always real. Entries are pruned to the
+    /// live message count on rebuild; the whole map is dropped on a
+    /// Circadian flip (`text_states_dark`) so code-block highlight colors —
+    /// baked in at parse time — re-parse under the new theme. Each entry
+    /// carries an `observe` subscription: the markdown parse is **async**,
+    /// so a row can be measured during its empty not-yet-parsed frame and
+    /// scrolled out of the visible window (which is re-measured every
+    /// frame) before the parse lands — offscreen items keep cached heights,
+    /// so that small height would persist until the row is next visited.
+    /// The observation closes the hole: when a parse lands (the state
+    /// notifies), the owning transcript item is explicitly remeasured.
+    text_states: HashMap<TextKey, (Entity<TextViewState>, Subscription)>,
+    /// Theme mode the cached `text_states` were parsed under.
+    text_states_dark: Option<bool>,
 
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Stable identity of one markdown body in the transcript, the key for
+/// `ChatView::text_states`. Message-indexed variants are pruned on rebuild
+/// when the transcript shrinks; the streaming/error slots are singletons
+/// whose text is simply re-set as content changes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum TextKey {
+    /// A persisted message body, by transcript index.
+    Message(usize),
+    /// A persisted assistant message's expanded reasoning, by index.
+    MessageThinking(usize),
+    /// The in-flight streaming body.
+    Streaming,
+    /// The in-flight streaming reasoning disclosure.
+    StreamingThinking,
+    /// The in-stream error line.
+    StreamingError,
+    /// The window-local error band body.
+    ErrorBand,
+}
+
+/// One row of the virtualized transcript — a `list()` item. The chapter
+/// delimiter that introduces a turn travels *with* its message item (rather
+/// than being its own item) so the delim and the body it labels are measured
+/// and scrolled as one unit, and a delim never lands alone on an item where
+/// it could collapse. The composer is the final item, keeping the
+/// messages-plus-composer single-scroll-surface feel under virtualization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TranscriptItem {
+    /// A persisted transcript message at this index. Carries its own leading
+    /// chapter delim unless it is the very first row of the page.
+    Message { index: usize, leading_delim: bool },
+    /// The in-flight streaming assistant row (delim + thinking + partial body).
+    Streaming,
+    /// The window-local error band (delim + body + optional plans list).
+    Error,
+    /// The composer item (leading "You" delim when there's preceding content,
+    /// the editor, its min-height floor and half-viewport bottom padding).
+    Composer { leading_delim: bool },
+}
+
+/// The resolved participant indicator: the delim-voice label plus whether it
+/// is the error voice (which keeps the danger color). A pure projection of the
+/// `list()` scroll state + the transcript model — see
+/// [`ChatView::derive_participant_indicator`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParticipantIndicator {
+    /// The label text ("You" / "Eidola" / "Error").
+    pub label: &'static str,
+    /// The voice is an error turn — render in `theme.danger`, not muted.
+    pub is_error: bool,
 }
 
 impl ChatView {
@@ -189,6 +321,40 @@ impl ChatView {
             .update(cx, |s, cx| s.set_messages_for_test(messages, cx));
     }
 
+    /// Test-only: append one message to the shared `Space`'s transcript —
+    /// the shape of a stream finalizing (used with `set_streaming_for_test`
+    /// to replay the StreamEnded reshape in the round-3 repro).
+    #[doc(hidden)]
+    pub fn append_message_for_test(&mut self, message: SpaceMessage, cx: &mut Context<Self>) {
+        let mut messages: Vec<SpaceMessage> = self
+            .space
+            .read(cx)
+            .messages()
+            .iter()
+            .map(|m| m.message.clone())
+            .collect();
+        messages.push(message);
+        self.space
+            .update(cx, |s, cx| s.set_messages_for_test(messages, cx));
+    }
+
+    /// Test-only: drive the *real* async transcript-load completion path on
+    /// the shared `Space` (the Library-open path: a space constructed with an
+    /// id loads its transcript after the first paint, landing through
+    /// `apply_loaded_transcript`). Distinct from `set_messages_for_test`, which
+    /// pokes the transcript directly — this exercises the load-completes-after-
+    /// first-render transition the desync repro needs.
+    #[doc(hidden)]
+    pub fn apply_loaded_transcript_for_test(
+        &mut self,
+        messages: Vec<SpaceMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        self.space.update(cx, |s, cx| {
+            s.apply_loaded_transcript_for_test(messages, cx);
+        });
+    }
+
     /// Test-only: attach reasoning to the message at `idx`, optionally
     /// expanded. Use after `set_messages_for_test`.
     #[doc(hidden)]
@@ -214,6 +380,16 @@ impl ChatView {
     ) {
         self.space
             .update(cx, |s, cx| s.set_streaming_for_test(streaming, cx));
+    }
+
+    /// Test-only: push a streaming content delta into the shared `Space`,
+    /// exactly as the real runner does (emits `SpaceEvent::StreamDelta`). The
+    /// regression repro uses this to drive the "model started responding"
+    /// moment that the disappearing-message bug surfaced at.
+    #[doc(hidden)]
+    pub fn push_content_delta_for_test(&mut self, delta: &str, cx: &mut Context<Self>) {
+        self.space
+            .update(cx, |s, cx| s.push_content_delta_for_test(delta, cx));
     }
 
     /// Read access to the onboarding flow state, for behavior tests.
@@ -285,18 +461,157 @@ impl ChatView {
     }
 
     /// Toggle the model picker (⌥⌘M, or clicking the revealed label).
-    pub fn toggle_model_picker(&mut self, cx: &mut Context<Self>) {
+    /// Resets the keyboard highlight when the picker is opened so arrow
+    /// navigation starts fresh. On open, scroll the current model's row into
+    /// view so a far-down current selection isn't hidden below the fold of the
+    /// capped-height panel.
+    pub fn toggle_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.model_picker_open = !self.model_picker_open;
+        if !self.model_picker_open {
+            self.picker_highlighted = None;
+        } else if let Some(ix) = self.current_model_index(cx) {
+            self.scroll_picker_to(ix);
+        }
+        self.sync_picker_focus(window, cx);
         cx.notify();
+    }
+
+    /// Park keyboard focus to match the picker's open state.
+    ///
+    /// While the picker is open, focus rests on the `ChatView` root so the
+    /// `ChatView`-context picker-navigation bindings (`up` / `down` / `enter`
+    /// / `escape`) are the innermost matching entries in the focus chain. The
+    /// composer is a `MarkdownEditor` whose own `MarkdownEditor` key context
+    /// binds plain `up` / `down` / `enter`; with focus left on the editor
+    /// those more-specific bindings swallow the keystrokes and the picker
+    /// never receives them (the arrows kept moving the composer cursor — the
+    /// codex review finding). Moving focus off the editor takes its context
+    /// out of the focus chain so the picker bindings win.
+    ///
+    /// When the picker closes, focus returns to the composer so the user can
+    /// keep typing without a click. `escape` is unaffected by the editor
+    /// either way (the editor binds no `escape`), but routing it through the
+    /// same focus parking keeps every picker key uniform.
+    fn sync_picker_focus(&self, window: &mut Window, cx: &mut gpui::App) {
+        if self.model_picker_open {
+            window.focus(&self.focus_handle, cx);
+        } else {
+            let editor = self.prompt_editor.read(cx).focus_handle(cx);
+            window.focus(&editor, cx);
+        }
+    }
+
+    /// The row index of this space's current model in the picker's model list,
+    /// if present. Used to reveal the active selection when the picker opens.
+    fn current_model_index(&self, cx: &gpui::App) -> Option<usize> {
+        let current = self.current_model(cx);
+        self.models
+            .read(cx)
+            .list()
+            .iter()
+            .position(|m| m.id == current)
+    }
+
+    /// Scroll the keyboard-highlighted picker row into view. The picker rows are
+    /// the panel's leading children (one per model, index-aligned), so the model
+    /// index doubles as the scroll-child index for `scroll_to_item`.
+    fn scroll_highlight_into_view(&mut self) {
+        if let Some(ix) = self.picker_highlighted {
+            self.scroll_picker_to(ix);
+        }
+    }
+
+    /// Request the picker's scroll container reveal row `ix`, recording the
+    /// target for behavior tests (`ScrollHandle` has no getter for it).
+    fn scroll_picker_to(&mut self, ix: usize) {
+        self.picker_scroll.scroll_to_item(ix);
+        self.last_picker_scroll_target = Some(ix);
+    }
+
+    /// Dismiss the model picker without selecting anything (Esc, or a
+    /// click outside the panel). Restores composer focus.
+    pub fn dismiss_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.model_picker_open = false;
+        self.picker_highlighted = None;
+        self.sync_picker_focus(window, cx);
+        cx.notify();
+    }
+
+    /// Move the keyboard highlight up one row in the picker, wrapping
+    /// from the first row to the last.
+    pub fn picker_up(&mut self, cx: &mut Context<Self>) {
+        if !self.model_picker_open {
+            return;
+        }
+        let count = self.models.read(cx).list().len();
+        if count == 0 {
+            return;
+        }
+        self.picker_highlighted = Some(match self.picker_highlighted {
+            // From no selection or already at the top, move to 0 (clamp, not wrap).
+            None | Some(0) => 0,
+            Some(n) => n - 1,
+        });
+        self.scroll_highlight_into_view();
+        cx.notify();
+    }
+
+    /// Move the keyboard highlight down one row in the picker, clamping at
+    /// the last row (no wrap).
+    pub fn picker_down(&mut self, cx: &mut Context<Self>) {
+        if !self.model_picker_open {
+            return;
+        }
+        let count = self.models.read(cx).list().len();
+        if count == 0 {
+            return;
+        }
+        self.picker_highlighted = Some(match self.picker_highlighted {
+            None => 0,
+            Some(n) => (n + 1).min(count - 1),
+        });
+        self.scroll_highlight_into_view();
+        cx.notify();
+    }
+
+    /// Confirm the currently highlighted picker row (Enter). No-op when
+    /// nothing is highlighted.
+    pub fn picker_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.model_picker_open {
+            return;
+        }
+        let Some(idx) = self.picker_highlighted else {
+            return;
+        };
+        let models = self.models.read(cx).list().to_vec();
+        if let Some(model) = models.get(idx) {
+            let id = model.id.clone();
+            self.select_model(id, window, cx);
+        }
+    }
+
+    /// The keyboard-highlighted picker row index (if any).
+    pub fn picker_highlighted(&self) -> Option<usize> {
+        self.picker_highlighted
+    }
+
+    /// Test-only: the last row index the picker was asked to scroll into view
+    /// (via `scroll_to_item`). Lets behavior tests assert keyboard navigation
+    /// keeps the highlighted row visible in the capped-height panel.
+    #[doc(hidden)]
+    pub fn last_picker_scroll_target_for_test(&self) -> Option<usize> {
+        self.last_picker_scroll_target
     }
 
     /// Choose the model for this space's subsequent sends and close the
     /// picker. A switch while a response is streaming applies to the *next*
     /// send — the in-flight request is never hot-swapped (the selection lives
     /// on the shared `Space`, so both windows see the change).
-    pub fn select_model(&mut self, id: String, cx: &mut Context<Self>) {
+    pub fn select_model(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.space.update(cx, |s, cx| s.select_model(id, cx));
         self.model_picker_open = false;
+        self.picker_highlighted = None;
+        self.sync_picker_focus(window, cx);
         cx.notify();
     }
 
@@ -325,6 +640,15 @@ impl ChatView {
     #[doc(hidden)]
     pub fn set_model_picker_open_for_test(&mut self, open: bool) {
         self.model_picker_open = open;
+        if !open {
+            self.picker_highlighted = None;
+        }
+    }
+
+    /// Test-only setter for the keyboard highlight index.
+    #[doc(hidden)]
+    pub fn set_picker_highlighted_for_test(&mut self, idx: Option<usize>) {
+        self.picker_highlighted = idx;
     }
 }
 
@@ -428,7 +752,15 @@ impl ChatView {
                 this.maybe_fetch_plans_data(cx);
                 cx.notify();
             }),
-            cx.observe(&space, |_, _, cx| cx.notify()),
+            // The `Space` changing (a transcript reload landed, streaming
+            // buffers grew, a model selection moved) must re-derive the
+            // virtualized item model. `rebuild_transcript(false, …)` reconciles
+            // the `list()` item count without forcing a tail re-pin — that is
+            // reserved for the semantic `StreamDelta`/submit hooks below.
+            cx.observe(&space, |this: &mut Self, _, cx| {
+                this.rebuild_transcript(false, cx);
+                cx.notify();
+            }),
             cx.subscribe_in(&space, window, Self::on_space_event),
             // Re-render when ⌥ transitions so the title-bar reveal responds
             // immediately. The modifier state itself lives in `window_input`;
@@ -436,7 +768,23 @@ impl ChatView {
             cx.observe(&window_input, |_, _, cx| cx.notify()),
         ];
 
-        Self {
+        // The transcript renders through gpui's variable-height `list()`,
+        // anchored at the *top* (`ListAlignment::Top`) — a book page reads
+        // from the top down, and opening a space lands on its first line, the
+        // pre-virtualization resting state (the layout pass clamps the scroll
+        // to the top when content is shorter than the viewport, and to the
+        // first item otherwise). Overdraw of ~one viewport keeps scrolling
+        // smooth without measuring the whole transcript.
+        //
+        // Tail-follow (`FollowMode::Tail`) is engaged on *submit* (see
+        // `submit`), not at construction: a reopened space must rest at the
+        // top, and `set_follow_mode(Tail)` would immediately jump the scroll
+        // to the end. Once engaged, the list re-pins to the bottom on growth
+        // while the reader is at the bottom and disengages the instant they
+        // scroll up — exactly the tail policy.
+        let list_state = ListState::new(0, ListAlignment::Top, px(800.));
+
+        let mut this = Self {
             stores,
             config,
             models,
@@ -449,15 +797,35 @@ impl ChatView {
             show_plans_after_error: false,
             window_input,
             model_picker_open: false,
+            list_state,
+            transcript_items: Vec::new(),
+            participant_indicator: None,
+            picker_highlighted: None,
+            picker_scroll: ScrollHandle::new(),
+            last_picker_scroll_target: None,
+            text_states: HashMap::new(),
+            text_states_dark: None,
             focus_handle,
             _subscriptions,
-        }
+        };
+        // Seed the list's item model from whatever the (possibly preloaded)
+        // space already holds, so the first frame renders the right rows.
+        this.rebuild_transcript(false, cx);
+        this
     }
 
     /// React to a semantic `SpaceEvent` from the shared `Space`. Plain
-    /// re-render is handled by the sibling `observe`; here we handle the
-    /// window-local consequences: tail-scroll on a streaming delta and the
+    /// re-render and item-model reconciliation are handled by the sibling
+    /// `observe`; here we handle the window-local *tail policy* and the
     /// degraded-onboarding routing on a typed failure.
+    ///
+    /// Tail policy (the book-page "writing scrolls under your hand" feel):
+    /// the `list()` runs in `FollowMode::Tail`, so it auto-snaps to the
+    /// bottom while the reader is at the bottom and disengages the instant
+    /// they scroll up. On a streaming delta the streaming item's height grew,
+    /// so we `remeasure` it and, *if still following the tail*, `scroll_to_end`
+    /// so the freshest token stays visible — a reader who has scrolled up is
+    /// left undisturbed (`is_following_tail()` is false for them).
     fn on_space_event(
         &mut self,
         _space: &Entity<Space>,
@@ -467,18 +835,287 @@ impl ChatView {
     ) {
         match event {
             SpaceEvent::StreamDelta => {
-                // Tail-scroll hook: the chat scroll surface is rebuilt each
-                // render, and there is no persistent scroll handle today, so a
-                // delta just needs a re-render to reflect the growing content.
+                // The streaming row's content grew in place; its item index is
+                // stable (same `Streaming` slot), so remeasure rather than
+                // splice. Re-pin to the tail only while actively following.
+                if let Some(ix) = self.streaming_item_index() {
+                    self.list_state.remeasure_items(ix..ix + 1);
+                }
+                if self.list_state.is_following_tail() {
+                    self.list_state.scroll_to_end();
+                }
                 cx.notify();
             }
             SpaceEvent::MessagesChanged | SpaceEvent::StreamEnded => {
+                // The transcript shape changed (a turn appended/finalized, or an
+                // async initial load / bus-driven reload landed). Reconcile the
+                // item model, but do **not** force a tail re-pin here: that is
+                // the *follow* policy, owned by `rebuild_transcript`'s
+                // `was_following` branch. A genuine follower (the reader is at
+                // the bottom — engaged on submit, or never scrolled away) is
+                // re-pinned to the freshest turn; a reader who reopened a space
+                // (rests at the top, not following) or scrolled up mid-history
+                // is left exactly where they were.
+                //
+                // Forcing `pin_tail=true` here was the wave-4 QA-round-2 bug: a
+                // space opened from the Library loads its transcript *after* the
+                // first paint, and that load's `MessagesChanged` yanked the list
+                // to the bottom — so a multi-turn conversation opened scrolled
+                // past its earlier messages (they read as "lost"), and a bus
+                // reload mid-read yanked a scrolled-up reader off their place.
+                // Submit still pins the tail explicitly (see `submit`), so the
+                // "writing scrolls under your hand" feel is unaffected.
+                self.rebuild_transcript(false, cx);
                 cx.notify();
             }
             SpaceEvent::Failed(e) => {
                 self.apply_chat_failure(e.clone(), cx);
             }
         }
+    }
+
+    /// The list-item index of the in-flight streaming row, if present.
+    fn streaming_item_index(&self) -> Option<usize> {
+        self.transcript_items
+            .iter()
+            .position(|item| matches!(item, TranscriptItem::Streaming))
+    }
+
+    /// The delim voice (label + error-ness) that introduces the transcript
+    /// item at `ix` — i.e. whose turn that row belongs to. `None` for the
+    /// composer's own "You" frame and for an out-of-range index (the composer
+    /// is its own writing zone, not someone else's turn to surface).
+    fn item_voice(&self, ix: usize, cx: &gpui::App) -> Option<ParticipantIndicator> {
+        match self.transcript_items.get(ix)? {
+            TranscriptItem::Message { index, .. } => {
+                let role = self
+                    .space
+                    .read(cx)
+                    .messages()
+                    .get(*index)?
+                    .message
+                    .role
+                    .clone();
+                Some(ParticipantIndicator {
+                    label: participant_label(&role),
+                    is_error: role == "error",
+                })
+            }
+            TranscriptItem::Streaming => Some(ParticipantIndicator {
+                label: participant_label("assistant"),
+                is_error: false,
+            }),
+            TranscriptItem::Error => Some(ParticipantIndicator {
+                label: participant_label("error"),
+                is_error: true,
+            }),
+            TranscriptItem::Composer { .. } => None,
+        }
+    }
+
+    /// Derive the persistent participant indicator from the `list()` scroll
+    /// state and the item model — the cue that tells the reader *whose turn*
+    /// they're reading once the chapter delim has scrolled off the top.
+    ///
+    /// It is visible exactly when the top of the viewport sits **inside** a
+    /// message whose leading delim has scrolled off, and hidden the moment
+    /// the real delim (or the page top) is visible — so it fills in only when
+    /// the page-local cue is missing, never competing with it. Concretely,
+    /// for the item at the logical scroll top:
+    ///
+    /// - at the very top of the page (`item_ix == 0`, `offset == 0`) → hidden;
+    /// - if the scroll offset into that item is within the leading-delim band
+    ///   (the delim is on screen, or we're at the item's top edge) → hidden;
+    /// - otherwise (scrolled past the delim, or into a delim-less first
+    ///   message) → show that item's voice.
+    ///
+    /// Returns `None` over the composer (the writing zone is the reader's own
+    /// frame, not a turn to label). Pure function of the arguments, exercised
+    /// directly by [`Self::derive_participant_indicator_at`] in tests.
+    fn derive_participant_indicator(&self, cx: &gpui::App) -> Option<ParticipantIndicator> {
+        // No measured layout yet (item_count 0, or never painted): no cue.
+        if self.list_state.item_count() == 0 {
+            return None;
+        }
+        // While following the tail the reader is at the live edge — the
+        // streaming row's own delim is the cue, and the anchor shifts on
+        // every delta, which made the band label flicker (QA). The indicator
+        // exists for a reader *scrolled away* from the page-local cue; a
+        // follower never is.
+        if self.list_state.is_following_tail() {
+            return None;
+        }
+        let top = self.list_state.logical_scroll_top();
+        self.derive_participant_indicator_at(top.item_ix, top.offset_in_item, cx)
+    }
+
+    /// The pure core of [`Self::derive_participant_indicator`], split out so a
+    /// behavior test can drive the visibility rule directly from a synthetic
+    /// scroll position without a real layout pass.
+    fn derive_participant_indicator_at(
+        &self,
+        item_ix: usize,
+        offset_in_item: gpui::Pixels,
+        cx: &gpui::App,
+    ) -> Option<ParticipantIndicator> {
+        // At the page top, the delim (or the page's first line) is visible.
+        if item_ix == 0 && offset_in_item <= px(0.) {
+            return None;
+        }
+        // The leading-delim band: a delim row is `pt_8 + label + pb_6` tall.
+        // While the scroll offset into the top item is still within roughly
+        // that band, the delim itself is on (or just leaving) the screen, so
+        // the page-local cue is present and the indicator stays hidden. Once
+        // we've scrolled clearly past it, the cue is gone and we surface it.
+        // A delim-less first message (`item_ix == 0`) has no band — any
+        // offset past the top means its opening line has scrolled up.
+        let item = self.transcript_items.get(item_ix)?;
+        let has_leading_delim = match item {
+            TranscriptItem::Message { leading_delim, .. } => *leading_delim,
+            TranscriptItem::Composer { leading_delim } => *leading_delim,
+            TranscriptItem::Streaming | TranscriptItem::Error => true,
+        };
+        if has_leading_delim && offset_in_item < DELIM_BAND_HEIGHT {
+            return None;
+        }
+        self.item_voice(item_ix, cx)
+    }
+
+    /// Read-only access to the derived indicator, for behavior tests.
+    pub fn participant_indicator(&self) -> Option<&ParticipantIndicator> {
+        self.participant_indicator.as_ref()
+    }
+
+    /// Test-only: drive the visibility rule from a synthetic scroll position
+    /// without a real layout pass.
+    #[doc(hidden)]
+    pub fn participant_indicator_at_for_test(
+        &self,
+        item_ix: usize,
+        offset_px: f32,
+        cx: &gpui::App,
+    ) -> Option<ParticipantIndicator> {
+        self.derive_participant_indicator_at(item_ix, px(offset_px), cx)
+    }
+
+    /// Test-only: the current flat transcript item count (composer included).
+    #[doc(hidden)]
+    pub fn transcript_item_count_for_test(&self) -> usize {
+        self.transcript_items.len()
+    }
+
+    /// Test-only: whether the transcript list is currently following its tail.
+    /// The finding-1 regression repro asserts an initial async load does *not*
+    /// engage following (a reopened space rests at the top), while a submit
+    /// does (the new exchange is brought into view).
+    #[doc(hidden)]
+    pub fn is_following_tail_for_test(&self) -> bool {
+        self.list_state.is_following_tail()
+    }
+
+    /// Test-only: the list's logical scroll-top item index — which item is at
+    /// the top of the viewport. `0` means resting at the top (the first
+    /// message visible); a larger index means earlier messages have scrolled
+    /// off the top.
+    #[doc(hidden)]
+    pub fn scroll_top_item_ix_for_test(&self) -> usize {
+        self.list_state.logical_scroll_top().item_ix
+    }
+
+    /// Test-only: the `ListState`'s own item count. The regression repro
+    /// asserts this stays in lockstep with [`Self::transcript_item_count_for_test`]
+    /// — a desync is exactly the disappearing-message bug (the model has the
+    /// item but the list never measures/renders it).
+    #[doc(hidden)]
+    pub fn list_state_item_count_for_test(&self) -> usize {
+        self.list_state.item_count()
+    }
+
+    /// Test-only: the message indices currently present in the flat transcript
+    /// model, in order. Used by the regression repro to assert the user's first
+    /// message is reflected as a rendered `Message` item (not just persisted).
+    #[doc(hidden)]
+    pub fn transcript_message_indices_for_test(&self) -> Vec<usize> {
+        self.transcript_items
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::Message { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Test-only: scroll the transcript list so item `item_ix` is at the top
+    /// of the viewport, `offset_px` pixels into it. Used by snapshot cases to
+    /// render the scrolled state that surfaces the participant indicator.
+    /// (The list must have been painted at least once for the offset to take
+    /// full effect; snapshot cases render after `run_until_parked`.)
+    #[doc(hidden)]
+    pub fn scroll_transcript_for_test(
+        &mut self,
+        item_ix: usize,
+        offset_px: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.list_state.scroll_to(gpui::ListOffset {
+            item_ix,
+            offset_in_item: px(offset_px),
+        });
+        cx.notify();
+    }
+
+    /// Test-only: scroll the transcript list by `distance_px` (positive scrolls
+    /// down toward the tail, negative back up — `ListState::scroll_by` adds to
+    /// the pixel offset), the same primitive the wheel path drives. Used by the
+    /// scroll-round-trip repro to walk the viewport down to the bottom and back
+    /// up in small steps, exercising the measure/anchor machinery the way a
+    /// reader's trackpad would (rather than a single absolute `scroll_to`).
+    #[doc(hidden)]
+    pub fn scroll_transcript_by_for_test(&mut self, distance_px: f32, cx: &mut Context<Self>) {
+        self.list_state.scroll_by(px(distance_px));
+        cx.notify();
+    }
+
+    /// Test-only: the list's maximum scroll offset — the summed measured
+    /// height of all items beyond one viewport. The round-3 regression
+    /// detector: a reshape must not collapse the measured heights of items
+    /// above the anchor (`Unmeasured` items sum as 0px, so a reset-always
+    /// reconcile makes this value crater after a stream finalizes).
+    #[doc(hidden)]
+    pub fn transcript_max_scroll_offset_for_test(&self) -> f32 {
+        f32::from(self.list_state.max_offset_for_scrollbar().y)
+    }
+
+    /// Test-only: engage tail-follow exactly the way `submit` does. The
+    /// round-3 repro needs it because the disappearing-message mechanism
+    /// only triggers when a reshape lands while the list is following the
+    /// tail (the StreamEnded rebuild re-pins to the end; with collapsed
+    /// above-anchor heights everything above became unreachable).
+    #[doc(hidden)]
+    pub fn follow_tail_for_test(&mut self, cx: &mut Context<Self>) {
+        self.list_state.set_follow_mode(gpui::FollowMode::Tail);
+        self.list_state.scroll_to_end();
+        cx.notify();
+    }
+
+    /// Test-only: render exactly the items in `range` (what the `list()`
+    /// closure does for the visible window) and return how many produced a
+    /// non-empty element — the O(visible) per-frame work, for the perf guard.
+    #[doc(hidden)]
+    pub fn render_transcript_window_for_test(
+        &mut self,
+        range: std::ops::Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let mut n = 0;
+        for ix in range {
+            if ix < self.transcript_items.len() {
+                let _ = self.render_transcript_item(ix, window, cx);
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Derive the onboarding stage from the shared core snapshots and the
@@ -735,6 +1372,9 @@ impl ChatView {
             }
         }
         self.error = Some(root.to_string());
+        // The error band is a window-local transcript item; reconcile the
+        // model so it appears, and bring it into view (it's the new tail).
+        self.rebuild_transcript(true, cx);
         cx.notify();
     }
 
@@ -774,7 +1414,177 @@ impl ChatView {
         self.space.update(cx, |s, cx| {
             s.submit(prompt, model, cx);
         });
+        // Submit always brings the new exchange into view, regardless of where
+        // the reader had scrolled — re-engage tail follow and pin to the
+        // bottom. `Space::submit` appended the user turn + streaming row
+        // synchronously, so its `MessagesChanged` already reconciled the item
+        // model; here we assert the scroll intent. (Re-arming `Tail` also
+        // re-engages following if a prior scroll-up had disengaged it.)
+        self.list_state.set_follow_mode(gpui::FollowMode::Tail);
+        self.list_state.scroll_to_end();
         cx.notify();
+    }
+
+    /// Recompute the flat `TranscriptItem` model from the shared `Space` plus
+    /// the window-local error/plans state, and reconcile the `list()`'s item
+    /// count against it. This is the chat analogue of the Record/Library flat
+    /// display model: the `list()` render closure is a dumb indexer over
+    /// `transcript_items`, so per-frame work stays O(visible).
+    ///
+    /// Reconciliation is **correctness-first and reset-always**. Any real
+    /// transition (a turn appended, the streaming row appearing/finalizing, an
+    /// error band toggling, an async initial load or bus reload landing) calls
+    /// `reset` + `splice_focusable` over the full range, so the `list()`'s item
+    /// count and per-item measurements can never drift from `transcript_items`.
+    /// `list()` measures lazily (only the visible window per frame), so a
+    /// wholesale reset is cheap — there is no perf reason to preserve old
+    /// measurements across a reshape.
+    ///
+    /// The earlier "tail-append fast-path" (splice only the new suffix when the
+    /// old model is a complete prefix of the new one) was deleted because it was
+    /// both *dead* and a *latent footgun*. Dead: in this UI the trailing composer
+    /// shifts on every real turn, so a turn append is never a pure
+    /// prefix-extension and the fast-path never fired. Footgun: the first submit
+    /// reshape `[Composer] → [Message, Streaming, Composer]` *looks* like a
+    /// tail-append (the composer is last, so new items appear *before* it), and a
+    /// prefix-blind splice would leave `ListState` desynced — exactly the wave-4
+    /// regression where the first user message vanished from the transcript the
+    /// instant streaming began (persisted fine; the list just stopped measuring /
+    /// painting it). Resetting unconditionally makes that class impossible.
+    /// A `debug_assert` re-checks the count invariant after every reconcile.
+    /// Regression replay: `first_message_survives_streaming_start`.
+    ///
+    /// `pin_tail` (the submit / explicit bring-into-view intent) re-pins to the
+    /// bottom after reconciliation; otherwise an at-bottom reader
+    /// (`is_following_tail`) keeps following, while a reopened space (rests at
+    /// the top) and a reader scrolled up mid-history are left exactly where they
+    /// were. Crucially, the `MessagesChanged`/`StreamEnded` hooks pass
+    /// `pin_tail=false` — the initial async load must not yank the list to the
+    /// bottom (the wave-4 QA-round-2 "Library-opened space loses its earlier
+    /// messages" bug); submit pins the tail explicitly instead.
+    ///
+    /// The **composer is the final item** and is passed to `splice_focusable`
+    /// with the editor's focus handle, so when it scrolls offscreen while
+    /// focused the `list()` keeps rendering it for keyboard interaction — the
+    /// single-scroll-surface, book-page feel under virtualization.
+    fn rebuild_transcript(&mut self, pin_tail: bool, cx: &mut Context<Self>) {
+        let new_items = self.compute_transcript_items(cx);
+        let in_sync = self.list_state.item_count() == self.transcript_items.len();
+        if new_items == self.transcript_items && in_sync {
+            // Item model unchanged (e.g. a re-render-only notify): nothing
+            // to reconcile. A still-following stream re-pin is handled by
+            // the StreamDelta hook, not here.
+            return;
+        }
+
+        // Prune cached markdown states for messages that no longer exist (a
+        // reload that shrank the transcript). Indexed entries only — the
+        // streaming/error singletons just get their text re-set on render.
+        let msg_count = self.space.read(cx).messages().len();
+        self.text_states.retain(|k, _| match k {
+            TextKey::Message(i) | TextKey::MessageThinking(i) => *i < msg_count,
+            _ => true,
+        });
+
+        let was_following = self.list_state.is_following_tail();
+        let composer_focus = self.prompt_editor.read(cx).focus_handle(cx);
+
+        // Reconcile by COMMON-PREFIX SPLICE: replace exactly the suffix that
+        // changed, never the items before it. This is load-bearing for
+        // scroll correctness, not an optimization: `splice` replaces items
+        // with `Unmeasured { size_hint: None }`, whose summary height is
+        // **0px**, and only items inside the visible window are re-measured
+        // per frame — so replacing items the reader has already measured
+        // collapses everything above the anchor into an unreachable
+        // zero-height void (the wave-4 round-3 disappearing-message bug; the
+        // round-1 bug was the dual failure, a prefix-BLIND splice desyncing
+        // the count). The invariants that prevent both: the splice range
+        // comes from the true longest common prefix, and the count is
+        // asserted below. In this UI every real transition is a suffix
+        // change (turn appends land before the trailing composer), so the
+        // reader's measured page survives intact; a brand-new window's first
+        // reshape (prefix == 0) splices the full range from an anchor that
+        // is already at the top. `reset` exists only as recovery from a
+        // desynced count — it also clears the scroll anchor, which no normal
+        // transition wants.
+        let count = new_items.len();
+        let prefix = self
+            .transcript_items
+            .iter()
+            .zip(new_items.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if !in_sync {
+            self.list_state.reset(count);
+        }
+        let splice_from = if in_sync { prefix } else { 0 };
+        let old_len = if in_sync {
+            self.transcript_items.len()
+        } else {
+            count
+        };
+        let focus_handles = (splice_from..count).map(|ix| {
+            matches!(new_items[ix], TranscriptItem::Composer { .. }).then(|| composer_focus.clone())
+        });
+        self.list_state
+            .splice_focusable(splice_from..old_len, focus_handles);
+
+        self.transcript_items = new_items;
+
+        // The reconcile invariant: the `list()`'s item count must equal the flat
+        // model's length after every reconcile, or the list silently stops
+        // measuring/painting the items it lost track of (the disappearing-message
+        // class). Held by construction now (reset + splice over the full range),
+        // but asserted so any future divergence trips immediately in tests.
+        debug_assert_eq!(
+            self.list_state.item_count(),
+            self.transcript_items.len(),
+            "rebuild_transcript: ListState item count desynced from the transcript model"
+        );
+
+        if pin_tail || was_following {
+            // `pin_tail` is the submit/explicit-bring-into-view intent; an
+            // at-bottom reader (`was_following`) keeps following across a
+            // reshape. A reopened space (rests at top) and a scrolled-up reader
+            // are neither, so they are left exactly where they were — the load /
+            // reload no longer yanks them to the bottom.
+            self.list_state.set_follow_mode(gpui::FollowMode::Tail);
+            self.list_state.scroll_to_end();
+        }
+    }
+
+    /// Build the flat transcript model (no `ListState` mutation — pure).
+    /// Mirrors the order `render_transcript_item` renders: messages, then the
+    /// streaming row, then the error band, then the composer.
+    fn compute_transcript_items(&self, cx: &Context<Self>) -> Vec<TranscriptItem> {
+        let space = self.space.read(cx);
+        let message_count = space.messages().len();
+        let streaming = space.is_streaming();
+        let has_error = self.error.is_some();
+
+        let mut items = Vec::with_capacity(message_count + 2);
+        for index in 0..message_count {
+            // The very first row of the page has no leading delim (the user's
+            // opening text is the start of the page); every later turn does.
+            items.push(TranscriptItem::Message {
+                index,
+                leading_delim: index > 0,
+            });
+        }
+        if streaming {
+            items.push(TranscriptItem::Streaming);
+        }
+        if has_error {
+            items.push(TranscriptItem::Error);
+        }
+        // The composer is always the final item. It gets a leading "You" delim
+        // only when there is preceding content (otherwise the cursor sits at
+        // the top of a blank page).
+        let has_preceding = message_count > 0 || streaming || has_error;
+        items.push(TranscriptItem::Composer {
+            leading_delim: has_preceding,
+        });
+        items
     }
 }
 
@@ -787,6 +1597,19 @@ impl Render for ChatView {
         // account is unfunded. Any real page content (or composer text)
         // short-circuits to the normal transcript.
         let stage = self.current_stage(cx);
+
+        // Re-derive the persistent participant indicator from the `list()`
+        // scroll state each frame (scroll re-renders flow through here). Only
+        // meaningful on the transcript stage; the onboarding pages have no
+        // transcript to read a voice from. Storing it keeps the title-bar
+        // render reading one consistent value and lets behavior tests assert
+        // it. No layout shift — the band is absolute chrome.
+        self.participant_indicator = if stage == OnboardingStage::Ready {
+            self.derive_participant_indicator(cx)
+        } else {
+            None
+        };
+
         let content: gpui::AnyElement = match stage {
             OnboardingStage::Welcome => self.render_welcome(window, cx).into_any_element(),
             OnboardingStage::Plans => self.render_plans_page(window, cx).into_any_element(),
@@ -799,8 +1622,17 @@ impl Render for ChatView {
             .key_context("ChatView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| {
+                this.toggle_model_picker(window, cx)
+            }))
+            // Picker keyboard navigation — no-ops when the picker is closed.
+            .on_action(cx.listener(|this, _: &DismissModelPicker, window, cx| {
+                this.dismiss_model_picker(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PickerUp, _, cx| this.picker_up(cx)))
+            .on_action(cx.listener(|this, _: &PickerDown, _, cx| this.picker_down(cx)))
             .on_action(
-                cx.listener(|this, _: &ToggleModelPicker, _, cx| this.toggle_model_picker(cx)),
+                cx.listener(|this, _: &PickerConfirm, window, cx| this.picker_confirm(window, cx)),
             )
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
@@ -823,316 +1655,460 @@ impl Render for ChatView {
 }
 
 impl ChatView {
-    /// The normal page: transcript + composer in one scroll surface.
-    fn render_transcript(&self, window: &Window, cx: &Context<Self>) -> gpui::Stateful<Div> {
+    /// The normal page: transcript + composer in one virtualized scroll
+    /// surface. The transcript renders through gpui's variable-height
+    /// `list()` (`docs/architecture/state.md` → "Lists"): the element holds
+    /// the persistent `ListState` scroll handle and the render closure is a
+    /// dumb indexer over the precomputed `transcript_items` flat model, so
+    /// per-frame work is O(visible), not O(messages). The composer is the
+    /// final list item, preserving the single-scroll-surface, book-page feel.
+    ///
+    /// The leading edge under the traffic lights is the list's top *padding*
+    /// (accounted in the list's own layout), replacing the old
+    /// `pt(TITLE_BAR_RESERVE)` on a column inside an `overflow_y_scroll` div.
+    /// `.size_full()` makes the list fill its flex parent and scroll
+    /// internally (`ListSizingBehavior::Auto`); it must **not** be wrapped in
+    /// another scroll container.
+    fn render_transcript(&self, _window: &Window, cx: &Context<Self>) -> gpui::Stateful<Div> {
+        let weak = cx.entity().downgrade();
+        let list_state = self.list_state.clone();
+        let item_count = self.transcript_items.len();
+
+        let list = list(list_state, move |ix, window, cx| {
+            weak.upgrade()
+                .map(|view| view.update(cx, |this, cx| this.render_transcript_item(ix, window, cx)))
+                .unwrap_or_else(|| div().into_any_element())
+        })
+        .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+        .pt(TITLE_BAR_RESERVE)
+        .size_full();
+
+        // Wrap in a stable-id stateful div so the return type matches the
+        // other `Render` arms and so the list participates in the page's
+        // `relative` stacking with the absolute title-bar band painted over
+        // it. The div carries no scroll — the `list()` owns scrolling.
+        div()
+            .id("transcript")
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .child(if item_count == 0 {
+                div().into_any_element()
+            } else {
+                list.into_any_element()
+            })
+    }
+
+    /// Render one virtualized transcript item. Dispatches on the flat model;
+    /// the chapter delim that introduces a turn is rendered *inside* the same
+    /// item as its body so the two measure and scroll as one unit (and a
+    /// delim never lands alone on an item where it could collapse).
+    fn render_transcript_item(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Cached markdown parses are theme-bound: code-block highlight colors
+        // are baked in at parse time, so a Circadian flip invalidates the
+        // whole cache (text is re-set and re-parsed under the new theme).
+        let dark = cx.theme().mode.is_dark();
+        if self.text_states_dark != Some(dark) {
+            self.text_states.clear();
+            self.text_states_dark = Some(dark);
+        }
+        let Some(item) = self.transcript_items.get(ix).cloned() else {
+            return div().into_any_element();
+        };
+        match item {
+            TranscriptItem::Message {
+                index,
+                leading_delim,
+            } => self.render_message_item(index, leading_delim, cx),
+            TranscriptItem::Streaming => self.render_streaming_item(cx),
+            TranscriptItem::Error => self.render_error_item(cx),
+            TranscriptItem::Composer { leading_delim } => {
+                self.render_composer_item(leading_delim, window, cx)
+            }
+        }
+    }
+
+    /// Look up (or create) the persistent markdown state for `key` and
+    /// re-set its text (`set_text` early-returns when unchanged, so a
+    /// stable string re-parses exactly once). Render the result via
+    /// `TextView::new(&state)` — never `TextView::markdown(id, …)` inside a
+    /// transcript item; see the `text_states` field doc for why element-id
+    /// keyed state cannot survive `list()` unmounts.
+    fn cached_text_state(
+        &mut self,
+        key: TextKey,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextViewState> {
+        let state = match self.text_states.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.get().0.clone(),
+            std::collections::hash_map::Entry::Vacant(_) => {
+                let state = cx.new(|cx| TextViewState::markdown(text, cx));
+                // The parse is async: when it lands, remeasure the owning
+                // item so a height captured during the empty-parse frame can
+                // never go stale offscreen (see the `text_states` field doc).
+                let subscription = cx.observe(&state, move |this, _, cx| {
+                    this.remeasure_item_for_key(key);
+                    cx.notify();
+                });
+                self.text_states.insert(key, (state.clone(), subscription));
+                state
+            }
+        };
+        state.update(cx, |s, cx| s.set_text(text, cx));
+        state
+    }
+
+    /// Remeasure the transcript item that renders `key`'s markdown. Called
+    /// when its async parse lands; a no-op when the item is no longer in the
+    /// model (the subscription is pruned with its entry on rebuild).
+    fn remeasure_item_for_key(&mut self, key: TextKey) {
+        let ix = self.transcript_items.iter().position(|item| match key {
+            TextKey::Message(i) | TextKey::MessageThinking(i) => {
+                matches!(item, TranscriptItem::Message { index, .. } if *index == i)
+            }
+            TextKey::Streaming | TextKey::StreamingThinking | TextKey::StreamingError => {
+                matches!(item, TranscriptItem::Streaming)
+            }
+            TextKey::ErrorBand => matches!(item, TranscriptItem::Error),
+        });
+        if let Some(ix) = ix {
+            self.list_state.remeasure_items(ix..ix + 1);
+        }
+    }
+
+    /// A persisted transcript message (with its leading chapter delim unless
+    /// it is the first row of the page). One `SpaceMessage` = exactly one
+    /// item, regardless of how many markdown blocks its content parses into.
+    /// The `("msg", idx)` / `("thinking-body", idx)` TextView ids are stable
+    /// per message index, so the markdown parse is a one-time cost that
+    /// survives list-item reuse (TextView early-returns on unchanged text).
+    fn render_message_item(
+        &mut self,
+        idx: usize,
+        leading_delim: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
+        // Copy the colors out: the cached-text-state lookups below need
+        // `&mut cx`, which a live `&Theme` borrow would block.
+        let (c_danger, c_muted_fg, c_fg, c_border) = (
+            theme.danger,
+            theme.muted_foreground,
+            theme.foreground,
+            theme.border,
+        );
         let markdown_style = markdown_style(theme.mode.is_dark());
+        let Some(entry) = self.space.read(cx).messages().get(idx).cloned() else {
+            return div().into_any_element();
+        };
+        let msg = &entry.message;
 
-        // The composer carries a bottom padding of half the viewport
-        // height (computed here, applied below) so the cursor never sits
-        // pinned to the bottom edge of the window. As the user types and
-        // the cursor moves down, the parent scroll follows; the half-page
-        // of empty space below keeps the active line in the comfortable
-        // reading zone — the "writing surface scrolls under your hand"
-        // feel of long-form note tools.
-        let composer_pb = window.viewport_size().height * 0.5;
+        let mut container = v_flex().w_full().gap_0();
 
-        // The transcript + streaming state live on the shared `Space`; read
-        // them once here. (Two windows on the same space render from the same
-        // entity, so a submit/stream in one appears in both.)
-        let space = self.space.read(cx);
-        let messages = space.messages();
-        let streaming = space.streaming().cloned();
-
-        // pt(TITLE_BAR_RESERVE) handles the leading edge under the
-        // traffic lights. No trailing pb on the column itself: the
-        // composer's own pb (above) carries the bottom breath.
-        let mut messages_col = v_flex().w_full().gap_0().pt(TITLE_BAR_RESERVE);
-        for (idx, entry) in messages.iter().enumerate() {
-            let msg = &entry.message;
-
-            // Chapter delimiter — a hairline rule + italic participant
-            // name — replaces the per-row background tinting that used to
-            // distinguish speakers. Errors still use `theme.danger` for the
-            // label so the chrome itself signals the role.
-            //
-            // The very first message in a conversation has no leading
-            // delim: the user's text is always the *start* of the page
-            // (no header introducing it), and the second turn's delim
-            // (e.g. "Eidola") is what first signals a speaker change.
-            // Subsequent same-speaker messages still get their delim so
-            // the rhythm is preserved across turns.
-            if idx > 0 {
-                let label_color = if msg.role == "error" {
-                    theme.danger
-                } else {
-                    theme.muted_foreground
-                };
-                messages_col = messages_col.child(chapter_delim(
-                    participant_label(&msg.role),
-                    theme.border,
-                    label_color,
-                ));
-            }
-
-            let fg = if msg.role == "error" {
-                theme.danger
+        // Chapter delimiter — a hairline rule + italic participant name.
+        // The very first row has no leading delim (the user's opening text is
+        // the start of the page); every later turn does. Errors use
+        // `theme.danger` for the label so the chrome itself signals the role.
+        if leading_delim {
+            let label_color = if msg.role == "error" {
+                c_danger
             } else {
-                theme.foreground
+                c_muted_fg
             };
-
-            let mut row = v_flex()
-                .id(("msg-row", idx))
-                .w_full()
-                .px_5()
-                .gap_3()
-                .text_color(fg);
-
-            if let Some(reasoning) = entry.reasoning.as_deref()
-                && msg.role == "assistant"
-            {
-                let chevron = if entry.reasoning_expanded {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                };
-                // Wrap the Button in an `h_flex` so it sizes to its
-                // content; without a flex-row parent the button
-                // stretches to v_flex's full cross-axis width and the
-                // label ends up center-aligned. Centered inside a
-                // `prose_row` so the disclosure aligns with the reading
-                // column underneath rather than the row's hard left edge.
-                row = row.child(
-                    prose_row().child(
-                        prose().child(
-                            h_flex().child(
-                                Button::new(("toggle-thinking", idx))
-                                    .ghost()
-                                    .icon(chevron)
-                                    .label(SharedString::from("Thinking"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.space.update(cx, |s, cx| {
-                                            s.toggle_message_reasoning(idx, cx);
-                                        });
-                                    })),
-                            ),
-                        ),
-                    ),
-                );
-                if entry.reasoning_expanded {
-                    row = row.child(
-                        prose_row().child(
-                            prose().pl_4().text_color(theme.muted_foreground).child(
-                                TextView::markdown(("thinking-body", idx), reasoning.to_string())
-                                    .selectable(true)
-                                    .style(markdown_style.clone()),
-                            ),
-                        ),
-                    );
-                }
-            }
-
-            let body: gpui::AnyElement = if msg.role == "error" {
-                SharedString::from(msg.content.clone()).into_any_element()
-            } else {
-                TextView::markdown(("msg", idx), msg.content.clone())
-                    .selectable(true)
-                    .style(markdown_style.clone())
-                    .into_any_element()
-            };
-            row = row.child(prose_row().child(prose().child(body)));
-
-            messages_col = messages_col.child(row);
+            container = container.child(chapter_delim(
+                participant_label(&msg.role),
+                c_border,
+                label_color,
+            ));
         }
 
-        if let Some(s) = streaming.as_ref() {
-            let fg = theme.foreground;
-            let muted_fg = theme.muted_foreground;
-            let danger = theme.danger;
+        let fg = if msg.role == "error" { c_danger } else { c_fg };
 
-            // Same chapter delimiter pattern as a finalized assistant
-            // message; the row underneath will fill in as deltas arrive.
-            messages_col = messages_col.child(chapter_delim(
-                participant_label("assistant"),
-                theme.border,
-                muted_fg,
-            ));
+        let mut row = v_flex()
+            .id(("msg-row", idx))
+            .w_full()
+            .px_5()
+            .gap_3()
+            .text_color(fg);
 
-            let mut col = v_flex()
-                .id("streaming-row")
-                .w_full()
-                .px_5()
-                .gap_3()
-                .text_color(fg);
-
-            // Disclosure only appears once reasoning has actually
-            // arrived; before that we just show a "Thinking…" status so
-            // the user sees something is in flight.
-            if !s.reasoning.is_empty() {
-                let chevron = if s.expanded {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                };
-                col = col.child(
-                    prose_row().child(
-                        prose().child(
-                            h_flex().child(
-                                Button::new("toggle-thinking-streaming")
-                                    .ghost()
-                                    .icon(chevron)
-                                    .label(SharedString::from("Thinking"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.space.update(cx, |s, cx| {
-                                            s.toggle_streaming_reasoning(cx);
-                                        });
-                                    })),
-                            ),
-                        ),
-                    ),
-                );
-                if s.expanded {
-                    col = col.child(
-                        prose_row().child(
-                            prose().pl_4().text_color(muted_fg).child(
-                                TextView::markdown(
-                                    ("streaming-thinking-body", 0usize),
-                                    s.reasoning.clone(),
-                                )
-                                .selectable(true)
-                                .style(markdown_style.clone()),
-                            ),
-                        ),
-                    );
-                }
-            } else if s.content.is_empty() {
-                // No reasoning *and* no content yet — show the "still
-                // working" status indicator. Plain Label, no toggle, no
-                // markdown plumbing. Aligned with the prose column so the
-                // status doesn't visually jump when content arrives.
-                col = col.child(prose_row().child(
-                    prose().child(Label::new(SharedString::from("Thinking…")).text_color(muted_fg)),
-                ));
-            }
-
-            if !s.content.is_empty() {
-                col = col.child(
-                    prose_row().child(
-                        prose().child(
-                            TextView::markdown(("streaming-body", 0usize), s.content.clone())
-                                .selectable(true)
-                                .style(markdown_style.clone()),
-                        ),
-                    ),
-                );
-            }
-
-            if let Some(err) = s.error.as_deref() {
-                col = col.child(
-                    prose_row().child(
-                        prose().text_color(danger).child(
-                            TextView::markdown(("streaming-error", 0usize), err.to_string())
-                                .selectable(true)
-                                .style(markdown_style.clone()),
-                        ),
-                    ),
-                );
-            }
-
-            messages_col = messages_col.child(col);
-        }
-
-        if let Some(err) = self.error.as_ref() {
-            // Errors are rendered through `TextView::markdown` instead
-            // of a raw `SharedString` so the user can select and copy
-            // the text. `selectable(true)` is the only thing here that's
-            // load-bearing for that — markdown of a plain string is just
-            // plain text. The chapter delim's "Error" label is in
-            // `theme.danger`, and the body inherits the danger color
-            // through the row's `text_color`.
-            messages_col = messages_col.child(chapter_delim(
-                participant_label("error"),
-                theme.border,
-                theme.danger,
-            ));
-            messages_col = messages_col.child(
-                div().w_full().px_5().text_color(theme.danger).child(
-                    prose_row().child(
-                        prose().child(
-                            TextView::markdown(("chat-error", 0usize), err.clone())
-                                .selectable(true)
-                                .style(markdown_style.clone()),
+        if let Some(reasoning) = entry.reasoning.as_deref()
+            && msg.role == "assistant"
+        {
+            let chevron = if entry.reasoning_expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            };
+            // Wrap the Button in an `h_flex` so it sizes to its content;
+            // without a flex-row parent the button stretches to v_flex's full
+            // cross-axis width and the label ends up center-aligned. Centered
+            // inside a `prose_row` so the disclosure aligns with the reading
+            // column underneath rather than the row's hard left edge.
+            row = row.child(
+                prose_row().child(
+                    prose().child(
+                        h_flex().child(
+                            Button::new(("toggle-thinking", idx))
+                                .ghost()
+                                .icon(chevron)
+                                .label(SharedString::from("Thinking"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.space.update(cx, |s, cx| {
+                                        s.toggle_message_reasoning(idx, cx);
+                                    });
+                                })),
                         ),
                     ),
                 ),
             );
-
-            // A submit that failed with `InsufficientBalance` surfaces the
-            // plans right here, below the transcript — the same hairline
-            // list the onboarding plans page uses, not a modal.
-            if self.show_plans_after_error {
-                messages_col = messages_col.child(
-                    div().w_full().px_5().pt_6().child(
-                        prose_row().child(
-                            prose_col()
-                                .gap_4()
-                                .child(
-                                    div()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child("Add credit to continue"),
-                                )
-                                .child(self.render_plans_list(cx)),
+            if entry.reasoning_expanded {
+                let ts = self.cached_text_state(TextKey::MessageThinking(idx), reasoning, cx);
+                row = row.child(
+                    prose_row().child(
+                        prose().pl_4().text_color(c_muted_fg).child(
+                            TextView::new(&ts)
+                                .selectable(true)
+                                .style(markdown_style.clone()),
                         ),
                     ),
                 );
             }
         }
 
-        // The composing editor lives at the foot of the scroll, styled
-        // into the same prose column the body uses so it reads as a
-        // continuation of the page rather than a separate chrome
-        // element. A "You" chapter delim sits above it whenever there's
-        // preceding content, mirroring the way earlier turns are
-        // introduced; on a fresh, empty page the delim is omitted so the
-        // cursor sits cleanly at the top.
-        //
-        // The editor renders one gpui block per markdown block, so it
-        // grows naturally with content. The outer `overflow_y_scroll`
-        // div handles all of it (editor + preceding messages) as one
-        // continuous unit — the editor itself does not scroll
-        // internally.
-        //
-        // `min_h(...)` keeps the empty editor clickable even when its
-        // markdown is "" (the render pipeline emits no blocks in that
-        // state, so without a floor the editor would collapse to zero
-        // height and the user couldn't click back into it after losing
-        // focus). The floor matches one body line at the prose line-
-        // height ratio so it doesn't visually grow once content arrives.
-        let has_preceding = !messages.is_empty() || streaming.is_some() || self.error.is_some();
-        if has_preceding {
-            messages_col = messages_col.child(chapter_delim(
+        let body: gpui::AnyElement = if msg.role == "error" {
+            SharedString::from(msg.content.clone()).into_any_element()
+        } else {
+            let ts = self.cached_text_state(TextKey::Message(idx), &msg.content, cx);
+            TextView::new(&ts)
+                .selectable(true)
+                .style(markdown_style.clone())
+                .into_any_element()
+        };
+        row = row.child(prose_row().child(prose().child(body)));
+
+        container.child(row).into_any_element()
+    }
+
+    /// The in-flight streaming assistant row (delim + thinking disclosure +
+    /// partial body). The `("streaming-body", 0)` / `("streaming-thinking-
+    /// body", 0)` TextView ids are stable across deltas, so the partial
+    /// markdown re-parses only because its text grew — never spuriously.
+    fn render_streaming_item(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let fg = theme.foreground;
+        let muted_fg = theme.muted_foreground;
+        let danger = theme.danger;
+        let border = theme.border;
+        let markdown_style = markdown_style(theme.mode.is_dark());
+        let Some(s) = self.space.read(cx).streaming().cloned() else {
+            return div().into_any_element();
+        };
+
+        let mut container = v_flex().w_full().gap_0();
+
+        // Same chapter delimiter pattern as a finalized assistant message; the
+        // row underneath fills in as deltas arrive.
+        container = container.child(chapter_delim(
+            participant_label("assistant"),
+            border,
+            muted_fg,
+        ));
+
+        let mut col = v_flex()
+            .id("streaming-row")
+            .w_full()
+            .px_5()
+            .gap_3()
+            .text_color(fg);
+
+        // Disclosure only appears once reasoning has actually arrived; before
+        // that we just show a "Thinking…" status so the user sees something
+        // is in flight.
+        if !s.reasoning.is_empty() {
+            let chevron = if s.expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            };
+            col = col.child(
+                prose_row().child(
+                    prose().child(
+                        h_flex().child(
+                            Button::new("toggle-thinking-streaming")
+                                .ghost()
+                                .icon(chevron)
+                                .label(SharedString::from("Thinking"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.space.update(cx, |s, cx| {
+                                        s.toggle_streaming_reasoning(cx);
+                                    });
+                                })),
+                        ),
+                    ),
+                ),
+            );
+            if s.expanded {
+                let ts = self.cached_text_state(TextKey::StreamingThinking, &s.reasoning, cx);
+                col = col.child(
+                    prose_row().child(
+                        prose().pl_4().text_color(muted_fg).child(
+                            TextView::new(&ts)
+                                .selectable(true)
+                                .style(markdown_style.clone()),
+                        ),
+                    ),
+                );
+            }
+        } else if s.content.is_empty() {
+            // No reasoning *and* no content yet — show the "still working"
+            // status indicator. Plain Label, no toggle, no markdown plumbing.
+            // Aligned with the prose column so the status doesn't visually
+            // jump when content arrives.
+            col = col.child(prose_row().child(
+                prose().child(Label::new(SharedString::from("Thinking…")).text_color(muted_fg)),
+            ));
+        }
+
+        if !s.content.is_empty() {
+            let ts = self.cached_text_state(TextKey::Streaming, &s.content, cx);
+            col = col.child(
+                prose_row().child(
+                    prose().child(
+                        TextView::new(&ts)
+                            .selectable(true)
+                            .style(markdown_style.clone()),
+                    ),
+                ),
+            );
+        }
+
+        if let Some(err) = s.error.as_deref() {
+            let ts = self.cached_text_state(TextKey::StreamingError, err, cx);
+            col = col.child(
+                prose_row().child(
+                    prose().text_color(danger).child(
+                        TextView::new(&ts)
+                            .selectable(true)
+                            .style(markdown_style.clone()),
+                    ),
+                ),
+            );
+        }
+
+        container.child(col).into_any_element()
+    }
+
+    /// The window-local error band (delim + body + optional below-band plans
+    /// list when a submit failed with `InsufficientBalance`).
+    fn render_error_item(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let c_danger = theme.danger;
+        let c_border = theme.border;
+        let markdown_style = markdown_style(theme.mode.is_dark());
+        let Some(err) = self.error.clone() else {
+            return div().into_any_element();
+        };
+
+        let mut container = v_flex().w_full().gap_0();
+
+        // Errors render through `TextView::markdown` (not a raw `SharedString`)
+        // so the user can select and copy the text. The chapter delim's
+        // "Error" label is in `theme.danger`, and the body inherits the danger
+        // color through the row's `text_color`.
+        container = container.child(chapter_delim(
+            participant_label("error"),
+            c_border,
+            c_danger,
+        ));
+        let ts = self.cached_text_state(TextKey::ErrorBand, &err, cx);
+        container = container.child(
+            div().w_full().px_5().text_color(c_danger).child(
+                prose_row().child(
+                    prose().child(
+                        TextView::new(&ts)
+                            .selectable(true)
+                            .style(markdown_style.clone()),
+                    ),
+                ),
+            ),
+        );
+
+        // A submit that failed with `InsufficientBalance` surfaces the plans
+        // right here, below the transcript's error band — the same hairline
+        // list the onboarding plans page uses, not a modal.
+        if self.show_plans_after_error {
+            container = container.child(
+                div().w_full().px_5().pt_6().child(
+                    prose_row().child(
+                        prose_col()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child("Add credit to continue"),
+                            )
+                            .child(self.render_plans_list(cx)),
+                    ),
+                ),
+            );
+        }
+
+        container.into_any_element()
+    }
+
+    /// The composer item — the final list item. A "You" chapter delim sits
+    /// above it whenever there's preceding content (mirroring the way earlier
+    /// turns are introduced); on a fresh, empty page the delim is omitted so
+    /// the cursor sits cleanly at the top.
+    ///
+    /// The editor renders one gpui block per markdown block, so it grows
+    /// naturally with content; the enclosing `list()` handles overflow as one
+    /// continuous unit. `min_h(...)` keeps the empty editor clickable even
+    /// when its markdown is "" (the render pipeline emits no blocks then, so
+    /// without a floor the editor collapses to zero height and the user can't
+    /// click back into it after losing focus); the floor is one body line at
+    /// the prose line-height ratio.
+    ///
+    /// **Half-viewport bottom padding** below the editor keeps the cursor off
+    /// the bottom edge: there's always a half-page of empty space below the
+    /// active line, so the list's tail-follow keeps the typing zone in the
+    /// comfortable middle of the viewport as content grows. Computed from the
+    /// live viewport height so it tracks window resizes.
+    fn render_composer_item(
+        &self,
+        leading_delim: bool,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let composer_pb = window.viewport_size().height * 0.5;
+        let composer_min_h = PROSE_FONT_SIZE * PROSE_LINE_HEIGHT;
+
+        let mut container = v_flex().w_full().gap_0();
+        if leading_delim {
+            container = container.child(chapter_delim(
                 participant_label("user"),
                 theme.border,
                 theme.muted_foreground,
             ));
         }
-        let composer_min_h = PROSE_FONT_SIZE * PROSE_LINE_HEIGHT;
-        messages_col = messages_col.child(
-            div().w_full().px_5().pb(composer_pb).child(
-                prose_row().child(
-                    prose()
-                        .min_h(composer_min_h)
-                        .child(self.prompt_editor.clone()),
+        container
+            .child(
+                div().w_full().px_5().pb(composer_pb).child(
+                    prose_row().child(
+                        prose()
+                            .min_h(composer_min_h)
+                            .child(self.prompt_editor.clone()),
+                    ),
                 ),
-            ),
-        );
-
-        div()
-            .id("scroll")
-            .w_full()
-            .flex_1()
-            .overflow_y_scroll()
-            .child(messages_col)
+            )
+            .into_any_element()
     }
 
     /// The welcome page — the empty state when no account exists. Set like
@@ -1377,6 +2353,15 @@ const PROSE_LINE_HEIGHT: f32 = 1.65;
 /// the row so wide windows don't force the eye to track across the screen.
 const PROSE_MAX_WIDTH_REM: f32 = 40.;
 
+/// Approximate rendered height of a `chapter_delim` row — its `pt_8` (32px) +
+/// the `text_sm` label line + `pb_6` (24px). The persistent participant
+/// indicator stays hidden while the scroll offset into the viewport-top item
+/// is still within this band (the real delim is on or just leaving the
+/// screen), and surfaces once we've scrolled clearly past it. Slightly
+/// conservative so the hand-off from delim to indicator has no visible gap
+/// where neither cue is present.
+const DELIM_BAND_HEIGHT: gpui::Pixels = gpui::px(72.);
+
 /// Wrap a single block of book-typography content. Used around every
 /// `TextView::markdown` invocation in the chat (message bodies, reasoning
 /// disclosures, streaming partials, errors) so they all share one reading
@@ -1588,14 +2573,29 @@ impl ChatView {
     /// handled by AppKit at the NSWindow layer before the gpui content view
     /// is asked, so blocking mouse on the gpui side doesn't disturb it.
     ///
-    /// The band is also the home of the ⌥-revealed model label: at rest the
-    /// band is pure gradient (the page stays sacred), and while ⌥ is held —
-    /// or the picker it anchors is open — the current model id appears
-    /// right-aligned in `text_sm` muted italic, the same voice as the
-    /// chapter-delim labels. Children of the band are absolutely positioned
-    /// chrome, so the reveal cannot shift the page layout. The model chrome
-    /// only renders on the `Ready` stage — the onboarding pages have no
-    /// sends for it to describe.
+    /// The band hosts two quiet, coexisting cues, one per side:
+    ///
+    /// - **Right** — the ⌥-revealed model label (and the picker it anchors).
+    ///   At rest the band is pure gradient (the page stays sacred); while ⌥ is
+    ///   held — or the picker is open — the current model id appears
+    ///   right-aligned in `text_sm` muted italic. The right side is the
+    ///   *power-user, on-demand* cue.
+    /// - **Left** — the **persistent participant indicator**: when the top of
+    ///   the viewport has scrolled into a turn whose chapter delim is off
+    ///   screen, the delim's voice ("You" / "Eidola" / "Error") fades in
+    ///   left-aligned in that same `text_sm` muted-italic voice, so a reader
+    ///   deep in a long answer still knows whose turn they're reading. It is
+    ///   hidden at the page top and whenever a real delim is on screen (see
+    ///   [`Self::derive_participant_indicator`]); error turns keep the danger
+    ///   color. The chapter delim identifies the speaker *at the boundary*;
+    ///   this indicator carries that identity *forward* while the boundary is
+    ///   off screen — the two are designed as one system (the delim owns the
+    ///   in-page cue, the indicator the out-of-page one) so they never compete.
+    ///
+    /// Both cues are absolutely positioned chrome painted over the scroll
+    /// area, so neither can shift the page layout (no reflow on reveal/scroll).
+    /// They render only on the `Ready` stage — the onboarding pages have
+    /// neither a transcript voice nor sends to describe.
     fn render_title_bar(&self, stage: OnboardingStage, cx: &Context<Self>) -> Div {
         let theme = cx.theme();
         let bg = theme.background;
@@ -1615,6 +2615,33 @@ impl ChatView {
                 linear_color_stop(bg.opacity(0.0), 1.0),
             ));
 
+        // Left side: the persistent participant indicator. Absolutely
+        // positioned (full band height) so it sits independent of the
+        // right-aligned model label's flex flow — adding/removing it never
+        // shifts the model chrome. Its left edge is offset by
+        // `INDICATOR_LEFT_PAD` (80px on macOS, 0 elsewhere) so the label clears
+        // the macOS traffic lights instead of rendering behind them; `px_5`
+        // then adds the same inner inset the prose column uses.
+        if stage == OnboardingStage::Ready
+            && let Some(indicator) = self.participant_indicator.as_ref()
+        {
+            let color = if indicator.is_error {
+                theme.danger
+            } else {
+                theme.muted_foreground
+            };
+            band = band.child(
+                div()
+                    .absolute()
+                    .left(INDICATOR_LEFT_PAD)
+                    .px_5()
+                    .text_sm()
+                    .italic()
+                    .text_color(color)
+                    .child(SharedString::from(indicator.label)),
+            );
+        }
+
         if stage == OnboardingStage::Ready && self.model_revealed(cx) {
             band = band.child(
                 div()
@@ -1625,7 +2652,9 @@ impl ChatView {
                     .text_color(theme.muted_foreground)
                     .cursor_pointer()
                     .hover(|s| s.text_color(theme.foreground))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_model_picker(cx)))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.toggle_model_picker(window, cx)),
+                    )
                     .child(SharedString::from(self.current_model(cx))),
             );
         }
@@ -1667,13 +2696,19 @@ impl ChatView {
             .top(TITLE_BAR_RESERVE)
             .right(px(12.))
             .w(px(340.))
+            // Height cap so a long model list scrolls internally instead of
+            // overflowing the window; the tracked handle lets keyboard
+            // navigation scroll the highlighted row into view.
             .max_h(px(420.))
             .overflow_y_scroll()
+            .track_scroll(&self.picker_scroll)
             .popover_style(cx)
             .py_1()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.model_picker_open = false;
-                cx.notify();
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                // Click outside the panel dismisses it; route through
+                // `dismiss_model_picker` so composer focus is restored the
+                // same way Esc does.
+                this.dismiss_model_picker(window, cx);
             }));
 
         if models.is_empty() {
@@ -1691,9 +2726,11 @@ impl ChatView {
             );
         }
 
+        let highlighted = self.picker_highlighted;
         for (idx, model) in models.iter().enumerate() {
             let is_current = model.id == current;
             let is_default = model.id == default_model;
+            let is_highlighted = highlighted == Some(idx);
 
             let mut markers: Vec<&str> = Vec::new();
             if is_current {
@@ -1731,9 +2768,29 @@ impl ChatView {
                     .py_2()
                     .gap_0p5()
                     .when(idx > 0, |d| d.border_t_1().border_color(theme.border))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.muted.opacity(0.5)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_model(id.clone(), cx)))
+                    // Keyboard highlight vs hover are now *distinct*. The earlier
+                    // highlight reused `theme.muted.opacity(0.5)`, which over the
+                    // popover surface (`#fffefb` in day) is imperceptible — the
+                    // QA "any arrow kills the highlight" report (the highlight
+                    // state was set correctly, it just painted invisibly). The
+                    // keyboard-selected row now takes the saturated `theme.accent`
+                    // selection color (the same one the sidebar nav pill uses), so
+                    // the row Enter would select is unmistakable. Hover keeps the
+                    // quieter `muted.opacity(0.5)` for unselected rows. **Keyboard
+                    // wins until the mouse moves:** a keyboard-highlighted row does
+                    // not register the hover override, so a stationary cursor that
+                    // a scroll moved a different row under can't visually steal the
+                    // selection — only an actual pointer move (which re-hovers and,
+                    // on click, selects) changes it.
+                    .when(is_highlighted, |d| {
+                        d.bg(theme.accent).text_color(theme.accent_foreground)
+                    })
+                    .when(!is_highlighted, |d| {
+                        d.cursor_pointer().hover(|s| s.bg(theme.muted.opacity(0.5)))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_model(id.clone(), window, cx)
+                    }))
                     .child(name_row)
                     .child(
                         div()

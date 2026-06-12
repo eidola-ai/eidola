@@ -162,6 +162,39 @@ impl SpacesStore {
         cx.notify();
     }
 
+    /// Rename a space: update the cached row title immediately (optimistic,
+    /// so the Library responds without a round-trip), then write through
+    /// `AppCore::rename_space` and let `Change::SpaceIndex` drive the
+    /// reconciling refresh. On stub stores (no backend) the optimistic update
+    /// is the only visible effect — which is exactly what behavior tests assert.
+    pub fn rename(&mut self, space_id: String, title: String, cx: &mut Context<Self>) {
+        // Optimistic local update.
+        if let Some(list) = self.index.value_mut()
+            && let Some(row) = list.iter_mut().find(|s| s.id == space_id)
+        {
+            row.title = Some(title.clone());
+        }
+        cx.notify();
+
+        let Some(core) = self.app_core.clone() else {
+            return;
+        };
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = bridge(core, move |c| async move {
+                c.rename_space(space_id, title).await?;
+                c.list_spaces(false).await
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(spaces) = result {
+                    this.index = Loadable::loaded(spaces);
+                }
+                this.task = None;
+                cx.notify();
+            });
+        }));
+    }
+
     /// Archive a space: drop the cached row immediately (so the Library
     /// responds without a backend round-trip — and so stub tests exercise the
     /// local path), then archive core-side and let `Change::SpaceIndex` drive

@@ -2602,6 +2602,7 @@ dependencies = [
  "ed25519-dalek",
  "eidola-attestation",
  "futures-util",
+ "hex",
  "p256",
  "p384",
  "rand_core 0.6.4",

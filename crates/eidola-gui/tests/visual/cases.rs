@@ -9,9 +9,10 @@ use eidola_app_core::updates::{
 };
 use eidola_app_core::{
     AttestationDetail, AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState,
-    CredentialInfo, CredentialLifecycleInfo, InFlightCredentialInfo, MeasurementInfo, ModelInfo,
-    PriceInfo, RequestDetail, RequestInfo, SpaceInfo, SpaceMessage, SpendTrailEntry,
+    CredentialLifecycleInfo, MeasurementInfo, ModelInfo, PriceInfo, RequestDetail, RequestInfo,
+    SpaceInfo, SpaceMessage, SpendTrailEntry,
 };
+use eidola_gui::about::AboutView;
 use eidola_gui::chat::{ChatView, StreamingResponse};
 use eidola_gui::library::LibraryView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
@@ -31,6 +32,17 @@ pub fn register(s: &mut Snapshots) {
     register_settings(s);
     register_updates(s);
     register_record(s);
+    register_about(s);
+}
+
+// ---------------------------------------------------------------------------
+// About window
+// ---------------------------------------------------------------------------
+
+fn register_about(s: &mut Snapshots) {
+    s.add("about", size(px(360.), px(420.)), |window, cx| {
+        cx.new(|cx| AboutView::new(window, cx))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +295,246 @@ fn register_chat(s: &mut Snapshots) {
         let core = stub_stores_with_config(cx);
         cx.new(|cx| ChatView::new(core, None, WindowInput::new(cx), window, cx))
     });
+
+    // REGRESSION (wave-4 QA round 2, finding 1b): a space opened from the
+    // Library loads its transcript *after* the first paint. The window renders
+    // once with an empty transcript (just the composer), then the async load
+    // completes and the messages must all appear. Construct the ChatView on a
+    // space id (the real `open_space_window` path) so its transcript starts
+    // `NotLoaded`, paint, then drive the *real* load-completion (through
+    // `apply_loaded_transcript`, not a direct poke), paint again. Every message
+    // must be visible. This is a dynamic transition the static `chat_with_*`
+    // snapshots never exercised.
+    s.add_with_step(
+        "chat_library_load_completes",
+        size(px(760.), px(620.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                // `Some(id)` joins the registry and (with a real backend) would
+                // kick the transcript load; with stub stores there is no
+                // backend, so the transcript rests `NotLoaded` — exactly the
+                // pre-load first-paint state.
+                ChatView::new(
+                    core,
+                    Some("space-lib".into()),
+                    WindowInput::new(cx),
+                    window,
+                    cx,
+                )
+            })
+        },
+        |cx, window, view| {
+            cx.update_window(window, |_, _, cx| {
+                view.update(cx, |v, cx| {
+                    v.apply_loaded_transcript_for_test(
+                        vec![
+                            SpaceMessage {
+                                role: "user".into(),
+                                content: "What did we decide about the enclave pin?".into(),
+                            },
+                            SpaceMessage {
+                                role: "assistant".into(),
+                                content: "We hold the zed pin at 969a67fc — deliberately behind \
+                                    main — until the upstream action-timing profiler race is \
+                                    fixed, because libtest runs the editor behavior tests in \
+                                    parallel."
+                                    .into(),
+                            },
+                            SpaceMessage {
+                                role: "user".into(),
+                                content: "And the cli trust root?".into(),
+                            },
+                            SpaceMessage {
+                                role: "assistant".into(),
+                                content: "The cli build COPYs releases/trust/server-enclave.json \
+                                    and embeds it as its trust root, so the enclave block is the \
+                                    single build-time input tying the cli to the server."
+                                    .into(),
+                            },
+                        ],
+                        cx,
+                    );
+                });
+            })
+            .ok();
+        },
+    );
+
+    // REGRESSION (wave-4 QA round 2, finding 1a): a longer conversation — later
+    // exchanges must not lose earlier messages. Drive three full
+    // submit→delta→StreamEnded cycles (the real transition shape), growing the
+    // transcript to six turns. Every turn must remain rendered after the third
+    // cycle. The static populated snapshots never drove these transitions.
+    s.add_with_step(
+        "chat_long_conversation_grows",
+        size(px(760.), px(620.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| ChatView::new(core, None, WindowInput::new(cx), window, cx))
+        },
+        |cx, window, view| {
+            for turn in 1..=3u32 {
+                // Drive a *real* submit through the Send action so the runner's
+                // append + tail engagement happen exactly as in production.
+                let (focus, editor) =
+                    view.read_with(cx, |v, _| (v.focus_handle(), v.prompt_editor_for_test()));
+                cx.update_window(window, |_, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.state = EditorState::with_markdown(format!(
+                            "Question number {turn}, please answer in detail."
+                        ));
+                        cx.notify();
+                    });
+                })
+                .ok();
+                cx.update_window(window, |_, window, cx| {
+                    focus.dispatch_action(&eidola_gui::chat::Send, window, cx);
+                })
+                .ok();
+                cx.run_until_parked();
+                // Stream ends: streaming clears and the assistant turn lands via
+                // the post-stream transcript reload (the StreamEnded reconcile).
+                cx.update_window(window, |_, _, cx| {
+                    view.update(cx, |v, cx| {
+                        let mut as_space: Vec<SpaceMessage> =
+                            v.messages(cx).into_iter().map(|m| m.message).collect();
+                        v.set_streaming_for_test(None, cx);
+                        as_space.push(SpaceMessage {
+                            role: "assistant".into(),
+                            content: format!(
+                                "This is the full answer to question {turn}, with enough text to \
+                                 occupy a couple of lines so the transcript actually grows."
+                            ),
+                        });
+                        v.set_messages_for_test(as_space, cx);
+                    });
+                })
+                .ok();
+                cx.run_until_parked();
+            }
+        },
+    );
+
+    // REGRESSION (wave-4 QA round 3): the disappearing transcript. The real
+    // mechanism (proven from gpui list.rs at the pin): `splice`/`reset`
+    // replace items with `Unmeasured { size_hint: None }`, whose summary
+    // height is 0px, and paint only measures from the scroll anchor DOWN —
+    // so a wholesale reset while the reader is at the tail collapses every
+    // item above the anchor to zero height, making them unreachable. The
+    // killer transition is a stream FINALIZING while the list follows the
+    // tail (exactly the user's flow: submit → response streams in → ends):
+    // the StreamEnded rebuild reshaped the items, the old reset-always
+    // reconcile wiped all measured heights, the at-tail re-pin anchored at
+    // the end, and everything above became a zero-height void — scrolling
+    // up "jumped" through it and the first message read as gone forever.
+    // This case replays that flow: walk to the bottom (measuring along the
+    // way), engage tail-follow the way submit does, drive a stream start +
+    // finalize reshape, then walk back up to the top and screenshot: the
+    // first message ("Why is the sky blue?") must be visible.
+    s.add_with_step(
+        "chat_scroll_roundtrip_first_message",
+        size(px(760.), px(560.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
+                view.set_messages_for_test(
+                    vec![
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "Why is the sky blue?".into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content: "Sunlight is a fairly even mix across the visible spectrum. \
+                                As it crosses the atmosphere it meets molecules far smaller than \
+                                its wavelength, and those scatter short (blue) wavelengths far \
+                                more strongly than long (red) ones — the intensity goes as one \
+                                over the fourth power of the wavelength.\n\nSo blue light is \
+                                flung in every direction and reaches your eye from all across the \
+                                dome of the sky, while reds and yellows travel a straighter path. \
+                                At midday that paints the whole sky a soft blue."
+                                .into(),
+                        },
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "And at sunset?".into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content:
+                                "Near sunset the light skims a long, slanted path through the \
+                                air, the blue is scattered away entirely, and what survives to \
+                                reach you is the warm red-orange of a low sun. The same physics, \
+                                a longer path — so the colour that wins is the one that is left \
+                                after most of the blue has been thrown sideways out of the beam \
+                                before it ever gets to you."
+                                    .into(),
+                        },
+                    ],
+                    cx,
+                );
+                view
+            })
+        },
+        |cx, window, view| {
+            // Walk down to the bottom in small wheel-sized steps (positive =
+            // toward the tail), re-parking (painting) after each so the list
+            // measures items as they enter.
+            for _ in 0..24 {
+                cx.update_window(window, |_, _, cx| {
+                    view.update(cx, |v, cx| v.scroll_transcript_by_for_test(90., cx));
+                })
+                .ok();
+                cx.run_until_parked();
+            }
+            // Engage tail-follow exactly as submit does, then drive a stream
+            // start + finalize — the reshape pair that wiped all measured
+            // heights under the old reset-always reconcile.
+            cx.update_window(window, |_, _, cx| {
+                view.update(cx, |v, cx| {
+                    v.follow_tail_for_test(cx);
+                    v.set_streaming_for_test(
+                        Some(StreamingResponse {
+                            content: "The horizon trick again: a long slanted path strips the \
+                                blue out before it reaches you."
+                                .into(),
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                });
+            })
+            .ok();
+            cx.run_until_parked();
+            cx.update_window(window, |_, _, cx| {
+                view.update(cx, |v, cx| {
+                    v.append_message_for_test(
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content: "The horizon trick again: a long slanted path strips the \
+                                blue out before it reaches you."
+                                .into(),
+                        },
+                        cx,
+                    );
+                    v.set_streaming_for_test(None, cx);
+                });
+            })
+            .ok();
+            cx.run_until_parked();
+            // Walk back up to the top — through what was, pre-fix, a
+            // zero-height void where the earlier turns used to be.
+            for _ in 0..40 {
+                cx.update_window(window, |_, _, cx| {
+                    view.update(cx, |v, cx| v.scroll_transcript_by_for_test(-90., cx));
+                })
+                .ok();
+                cx.run_until_parked();
+            }
+        },
+    );
 
     // Narrow window — guards that the chapter delimiter tracks the prose
     // body's width edge-for-edge. Earlier the delim sized itself
@@ -589,11 +841,96 @@ fn register_chat(s: &mut Snapshots) {
                     }],
                     cx,
                 );
-                view.select_model("kimi-k2-6".into(), cx);
+                view.select_model("kimi-k2-6".into(), window, cx);
                 view.set_model_picker_open_for_test(true);
                 view.set_alt_held_for_test(true, cx);
                 view
             })
+        },
+    );
+
+    // REGRESSION (wave-4 QA round 2, finding 2): pressing an arrow key in the
+    // open picker must HIGHLIGHT a row, not make the highlight vanish. Open the
+    // picker, then dispatch a real PickerDown through the focused action path
+    // (the same route a keystroke takes), re-park, and screenshot — the first
+    // row must show the highlight background. Driven through the real dispatch +
+    // paint path (not a direct state poke) so a regression in how the picker
+    // receives or repaints the highlight is caught.
+    s.add_with_step(
+        "chat_picker_keyboard_highlight",
+        size(px(705.), px(705.)),
+        |window, cx| {
+            let core = model_stores(cx);
+            cx.new(|cx| {
+                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
+                view.set_alt_held_for_test(true, cx);
+                view
+            })
+        },
+        |cx, window, view| {
+            let focus = view.read_with(cx, |v, _| v.focus_handle());
+            cx.update_window(window, |_, window, cx| {
+                focus.dispatch_action(&eidola_gui::chat::ToggleModelPicker, window, cx);
+            })
+            .ok();
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| {
+                focus.dispatch_action(&eidola_gui::chat::PickerDown, window, cx);
+            })
+            .ok();
+            cx.run_until_parked();
+        },
+    );
+
+    // Persistent participant indicator — scrolled mid-assistant-message.
+    // The transcript is scrolled so the "Eidola" chapter delim (item 1's
+    // leading delim) is off the top of the viewport and the body fills the
+    // page; the title-bar band's LEFT side now carries the italic "Eidola"
+    // label so the reader still knows whose turn they're reading. The right
+    // side stays bare (⌥ not held). Day + night.
+    s.add_with_step(
+        "chat_participant_indicator_scrolled",
+        size(px(760.), px(560.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
+                view.set_messages_for_test(
+                    vec![
+                        SpaceMessage {
+                            role: "user".into(),
+                            content: "Walk me through how Rayleigh scattering tints the sky."
+                                .into(),
+                        },
+                        SpaceMessage {
+                            role: "assistant".into(),
+                            content: "Sunlight is white — a fairly even mix across the visible \
+                                spectrum. As it crosses the atmosphere it meets molecules far \
+                                smaller than its wavelength, and those molecules scatter short \
+                                (blue) wavelengths far more strongly than long (red) ones — the \
+                                intensity goes as one over the fourth power of the wavelength.\n\n\
+                                So blue light is flung in every direction and reaches your eye \
+                                from all across the dome of the sky, while the reds and yellows \
+                                travel a straighter path. At midday that paints the whole sky a \
+                                soft blue. Near sunset the light skims a long, slanted path \
+                                through the air, the blue is scattered away entirely, and what \
+                                survives to reach you is the warm red-orange of a low sun."
+                                .into(),
+                        },
+                    ],
+                    cx,
+                );
+                view
+            })
+        },
+        |cx, window, view| {
+            // After the first paint measured the items, scroll into the
+            // assistant turn well past its "Eidola" delim band so the delim is
+            // off the top and the persistent indicator takes over.
+            cx.update_window(window, |_, _, cx| {
+                view.update(cx, |v, cx| v.scroll_transcript_for_test(1, 180., cx));
+            })
+            .ok();
         },
     );
 
@@ -1153,6 +1490,8 @@ fn register_record(s: &mut Snapshots) {
                 attestation_hash: Some(
                     "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
                 ),
+                space_id: None,
+                space_title: None,
             }))));
             view
         })
