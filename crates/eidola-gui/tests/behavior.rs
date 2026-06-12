@@ -16,7 +16,8 @@ use eidola_app_core::updates::{
 };
 use eidola_app_core::{
     AttestationDetail, AttestationInfo, BalancesResult, ConfigState, CredentialInfo,
-    CredentialLifecycleInfo, ModelInfo, PriceInfo, RequestInfo, SpaceInfo, SpaceMessage,
+    CredentialLifecycleInfo, ModelInfo, PriceInfo, RequestDetail, RequestInfo, SpaceInfo,
+    SpaceMessage,
 };
 use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
@@ -1987,6 +1988,58 @@ fn record_renders_stubbed_rows_without_backend(cx: &mut TestAppContext) {
     view.read_with(cx, |v, _| {
         assert_eq!(v.section(), RecordSection::Attestations);
         assert!(v.detail().is_none());
+    });
+}
+
+#[gpui::test]
+fn record_request_detail_exposes_space_link(cx: &mut TestAppContext) {
+    // A RequestDetail with space_id set must make that id accessible so the
+    // rendering path can present a "Space" link row.  This test verifies the
+    // data plumbing (the detail struct carries the id); the actual
+    // `open_space_window` dispatch is deferred and requires a real AppGlobal,
+    // so we test the reachable data layer only.
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores.clone(), window, cx))
+    });
+
+    let detail = RequestDetail {
+        id: "req-linked".into(),
+        method: "POST".into(),
+        path: "/v1/chat/completions".into(),
+        request_headers: None,
+        request_body: None,
+        response_status: Some(200),
+        response_headers: None,
+        response_body: None,
+        request_at: 1_000,
+        response_at: None,
+        duration_ms: None,
+        error: None,
+        retry_of_id: None,
+        attempt_number: 1,
+        credential_nonce: None,
+        action_id: Some("act-1".into()),
+        transport: None,
+        base_url: None,
+        attestation_hash: None,
+        space_id: Some("space-abc".into()),
+        space_title: Some("The quantum eraser experiment".into()),
+    };
+
+    view.update(cx, |v, _| {
+        v.set_detail_for_test(Some(RecordDetail::Request(Box::new(detail))));
+    });
+
+    view.read_with(cx, |v, _| match v.detail() {
+        Some(RecordDetail::Request(d)) => {
+            assert_eq!(d.space_id.as_deref(), Some("space-abc"));
+            assert_eq!(
+                d.space_title.as_deref(),
+                Some("The quantum eraser experiment")
+            );
+        }
+        _ => panic!("expected Request detail"),
     });
 }
 

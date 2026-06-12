@@ -1217,6 +1217,8 @@ fn register_record(s: &mut Snapshots) {
                 attestation_hash: Some(
                     "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
                 ),
+                space_id: None,
+                space_title: None,
             }))));
             view
         })

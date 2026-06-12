@@ -254,6 +254,10 @@ pub struct RequestDetail {
     pub transport: Option<String>,
     pub base_url: Option<String>,
     pub attestation_hash: Option<String>,
+    /// The space this request belongs to, if any (via action → space join).
+    pub space_id: Option<String>,
+    /// The space's title, if set (may be `None` for untitled spaces).
+    pub space_title: Option<String>,
 }
 
 /// One row of the `spend_trail` view: credential → request → action → space.
@@ -979,6 +983,8 @@ impl Inner {
             transport: r.transport,
             base_url: r.base_url,
             attestation_hash: r.attestation_hash,
+            space_id: r.space_id,
+            space_title: r.space_title,
         }))
     }
 

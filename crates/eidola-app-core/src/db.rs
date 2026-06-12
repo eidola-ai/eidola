@@ -1201,6 +1201,8 @@ pub struct RequestDetailRow {
     pub transport: Option<String>,
     pub base_url: Option<String>,
     pub attestation_hash: Option<String>,
+    pub space_id: Option<String>,
+    pub space_title: Option<String>,
 }
 
 pub async fn get_request(
@@ -1213,9 +1215,12 @@ pub async fn get_request(
                     r.response_status, r.response_headers, r.response_body, \
                     r.request_at, r.response_at, r.duration_ms, r.error, \
                     r.retry_of_id, r.attempt_number, r.credential_nonce, r.action_id, \
-                    c.transport, c.base_url, c.attestation_hash \
+                    c.transport, c.base_url, c.attestation_hash, \
+                    a.space_id, s.title \
              FROM request r \
              LEFT JOIN connection c ON c.id = r.connection_id \
+             LEFT JOIN action a ON a.id = r.action_id \
+             LEFT JOIN space s ON s.id = a.space_id \
              WHERE r.id = ?1",
         )
         .await
@@ -1246,6 +1251,8 @@ pub async fn get_request(
             transport: row.get::<Option<String>>(16).map_err(AppError::db)?,
             base_url: row.get::<Option<String>>(17).map_err(AppError::db)?,
             attestation_hash: row.get::<Option<String>>(18).map_err(AppError::db)?,
+            space_id: row.get::<Option<String>>(19).map_err(AppError::db)?,
+            space_title: row.get::<Option<String>>(20).map_err(AppError::db)?,
         })),
     }
 }

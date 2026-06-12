@@ -1064,6 +1064,37 @@ impl RecordView {
             ));
         }
 
+        // Space cross-link: when this request belongs to a conversation, show
+        // a quiet link that opens the space window.  Label is the space title
+        // when one exists, the bare id otherwise — either way the user can
+        // jump from the raw trail back to the conversation.
+        if let (Some(space_id), space_label) = (
+            d.space_id.clone(),
+            d.space_title
+                .clone()
+                .unwrap_or_else(|| d.space_id.clone().unwrap_or_default()),
+        ) {
+            let stores = self.stores.clone();
+            col = col.child(kv_row(
+                "Space",
+                div()
+                    .id("open-space")
+                    .text_sm()
+                    .cursor_pointer()
+                    .text_color(theme.link)
+                    .hover(|s| s.text_color(theme.link_hover))
+                    .child(SharedString::from(space_label))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        let stores = stores.clone();
+                        let id = space_id.clone();
+                        cx.defer(move |cx| {
+                            crate::open_space_window(cx, stores, id);
+                        });
+                    })),
+                cx,
+            ));
+        }
+
         // The payloads are projected + fenced once in `DetailCache::build`;
         // the render path only reads them.
         col.children(self.detail_payload_sections(cx))
