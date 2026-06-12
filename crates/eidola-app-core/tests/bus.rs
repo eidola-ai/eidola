@@ -22,18 +22,24 @@
 //! map (both functions now reorder the new-space row insert to AFTER credential
 //! resolution, so the rows below exist only once spendability is known):
 //!
+//! The rows marked **`chat_path.rs`** are now *executed* against the in-process
+//! mock-upstream harness (`tests/chat_harness/`), which drives the real `chat` /
+//! `chat_stream` HTTP paths via the `with_test_http_client` seam and asserts
+//! BOTH the typed/wrapped error AND the emitted `Change`s — turning these from
+//! asserted-by-inspection into regression-gated.
+//!
 //! | Exit point | Writes committed | Emissions | Tested here |
 //! |---|---|---|---|
-//! | Pre-space failure (config, `NoAccount`, `InsufficientBalance`, zero-charge, `ensure_spendable_credential`) | **none** (new-space insert is deferred) | none — pure error, no orphan space | bus unit tests assert "no emit on error" |
-//! | `chat`/`chat_stream` — `insert_pre_credential_refund` succeeds, later step fails | Credential in `spending` state | `Wallet` | No — needs HTTP to reach that write |
-//! | `chat`/`chat_stream` — network-error arm (`send` `Err`), `process_refund` `Ok` | Successor credential + user turn | `Wallet`, `Space(id)`, `SpaceIndex`? | No — needs HTTP + network-failure injection |
-//! | `chat`/`chat_stream` — network-error arm, no refund recovered | User turn | `Space(id)`, `SpaceIndex`? | No — needs HTTP + network-failure injection |
-//! | `chat` (Ok arm) — `flush_attestations` / `resp.text()` / response JSON parse fails | User turn | `Space(id)`, `SpaceIndex`? | No — needs HTTP |
-//! | `chat` — refund-from-body `process_refund` fails | User turn | `Space(id)`, `SpaceIndex`? | No — needs HTTP |
-//! | `chat_stream` (Ok arm) — `flush_attestations` fails | User turn | `Space(id)`, `SpaceIndex`? | No — needs HTTP |
-//! | `chat_stream` — mid-SSE read failure (`chunk` `Err`) | User turn | `Space(id)`, `SpaceIndex`? | No — needs HTTP streaming |
-//! | `chat` — non-2xx response, after `insert_request` | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record` | No — needs HTTP returning non-2xx |
-//! | `chat_stream` — non-2xx response, after `insert_request` inside that branch | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record`; `Wallet` if refund recovered | No — needs HTTP returning non-2xx |
+//! | Pre-space failure (config, `NoAccount`, `InsufficientBalance`, zero-charge, `ensure_spendable_credential`) | **none** (new-space insert is deferred) | none — pure error, no orphan space | bus unit tests assert "no emit on error"; `NoAccount` / `InsufficientBalance` executed in `chat_path.rs` |
+//! | `chat`/`chat_stream` — `insert_pre_credential_refund` succeeds, later step fails | Credential in `spending` state | `Wallet` | `chat_path.rs` (every post-send failure test asserts `Wallet`; the failed-recovery test asserts the credential stays `spending`) |
+//! | `chat`/`chat_stream` — network-error arm (`send` `Err`), `process_refund` `Ok` | Successor credential + user turn | `Wallet`, `Space(id)`, `SpaceIndex`? | `chat_path.rs` (`network_error_after_send_*`; the non-2xx-with-recovery test covers the recovered-successor `Wallet`) |
+//! | `chat`/`chat_stream` — network-error arm, no refund recovered | User turn | `Space(id)`, `SpaceIndex`? | `chat_path.rs` (`network_error_after_send_*`) |
+//! | `chat` (Ok arm) — `flush_attestations` / `resp.text()` / response JSON parse fails | User turn | `Space(id)`, `SpaceIndex`? | Partial — the `resp.text()` failure on a dropped connection is exercised by `network_error_after_send_*` (reqwest may surface the drop in either arm); both arms emit the same user-turn set |
+//! | `chat` — refund-from-body `process_refund` fails | User turn | `Space(id)`, `SpaceIndex`? | No — needs a malformed inline refund (low value: identical emission set to the tested arms) |
+//! | `chat_stream` (Ok arm) — `flush_attestations` fails | User turn | `Space(id)`, `SpaceIndex`? | No — `flush_attestations` is a no-op under the no-attestation seam |
+//! | `chat_stream` — mid-SSE read failure (`chunk` `Err`) | User turn | `Space(id)`, `SpaceIndex`? | `chat_path.rs` (`mid_sse_abort_*`) |
+//! | `chat` — non-2xx response, after `insert_request` | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record` | `chat_path.rs` (`non_2xx_emits_record_and_space_*`) |
+//! | `chat_stream` — non-2xx response, after `insert_request` inside that branch | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record`; `Wallet` if refund recovered | `chat_path.rs` (`streaming_non_2xx_*`, `non_2xx_with_refund_recovery_*`, `non_2xx_with_failed_refund_recovery_*`) |
 //!
 //! `SpaceIndex?` = emitted only when `is_new_space || auto_titled`. Plain `?` on
 //! the intervening local-DB action/content/antecedent inserts stays *unemitted*
@@ -48,11 +54,12 @@
 //! `error.rs` (`chat_failed_display_defers_to_source`, `root_unwraps_*`,
 //! `chat_space_id_only_on_wrapper`).
 //!
-//! These emission placements are asserted-by-inspection in `lib.rs`. The
-//! happy-path tests below confirm the success-path emissions remain intact and
-//! that the shared infrastructure (bus capacity, multi-subscriber delivery)
-//! works. An integration suite with a wiremock server would be the right place
-//! to add the error-path assertions.
+//! The happy-path tests below confirm the success-path emissions remain intact
+//! and that the shared infrastructure (bus capacity, multi-subscriber delivery)
+//! works. The full chat HTTP paths — happy-path persistence/emission and the
+//! error-path emission rows above — live in `tests/chat_path.rs` on top of the
+//! `tests/chat_harness/` mock upstream; chat-path changes must extend that
+//! harness.
 
 use eidola_app_core::{AppCore, changes::Change};
 

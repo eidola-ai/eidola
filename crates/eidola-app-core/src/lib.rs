@@ -344,6 +344,14 @@ struct Inner {
     update_polling: std::sync::atomic::AtomicBool,
     /// Invalidation bus — emits a [`Change`] after every durable commit.
     bus: BroadcastSource,
+    /// Test-only HTTP client override. When `Some`, [`Inner::build_client`]
+    /// returns a clone of this client *instead of* constructing the
+    /// attesting client, letting integration tests drive `chat`/`chat_stream`
+    /// (and every other HTTP path) against a plain-HTTP mock upstream without
+    /// satisfying the per-handshake enclave attestation. Always `None` in
+    /// production — only [`AppCore::with_test_http_client`] ever sets it — so
+    /// the production attestation path is unchanged.
+    http_override: Option<reqwest::Client>,
 }
 
 // --- Config helpers (sync) ---------------------------------------------------
@@ -458,6 +466,15 @@ impl Inner {
         config: &Config,
         attestation_observer: Option<tinfoil_verifier::AttestationObserver>,
     ) -> Result<reqwest::Client, AppError> {
+        // Test seam: a plain-HTTP client injected via
+        // `AppCore::with_test_http_client` short-circuits attestation so
+        // integration tests can drive the HTTP paths against a mock upstream.
+        // `None` in every production build, so the attesting path below is the
+        // only one that ever runs outside tests. The attestation observer is
+        // simply never invoked on this client (no enclave to observe).
+        if let Some(client) = &self.http_override {
+            return Ok(client.clone());
+        }
         let origin = config.base_url();
         let allowed_measurements = config.trusted_measurements();
 
@@ -2340,6 +2357,34 @@ impl AppCore {
     /// `config_dir` — directory containing `config.toml`.
     /// `data_dir` — directory for the local database.
     pub fn new(config_dir: PathBuf, data_dir: PathBuf) -> Self {
+        Self::build(config_dir, data_dir, None)
+    }
+
+    /// Construct an `AppCore` whose HTTP client is the supplied plain
+    /// `reqwest::Client` instead of the attesting client.
+    ///
+    /// **Test-only seam.** This bypasses per-handshake enclave attestation so
+    /// integration tests can exercise `chat` / `chat_stream` (and the account /
+    /// credential HTTP paths) against an in-process mock upstream over plain
+    /// HTTP. It has no production use — `#[doc(hidden)]` keeps it out of the
+    /// rendered API — and `AppCore::new` always passes `None`, so the
+    /// production attestation path is untouched. Tests must still point
+    /// `base_url` at the mock (via [`AppCore::set_base_url`]); the injected
+    /// client only governs *how* requests are made, not *where*.
+    #[doc(hidden)]
+    pub fn with_test_http_client(
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        client: reqwest::Client,
+    ) -> Self {
+        Self::build(config_dir, data_dir, Some(client))
+    }
+
+    fn build(
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        http_override: Option<reqwest::Client>,
+    ) -> Self {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -2357,6 +2402,7 @@ impl AppCore {
                 update_state: Mutex::new(None),
                 update_polling: std::sync::atomic::AtomicBool::new(false),
                 bus,
+                http_override,
             }),
         }
     }

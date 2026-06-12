@@ -9,8 +9,8 @@ use eidola_app_core::updates::{
 };
 use eidola_app_core::{
     AttestationDetail, AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState,
-    CredentialInfo, CredentialLifecycleInfo, InFlightCredentialInfo, MeasurementInfo, ModelInfo,
-    PriceInfo, RequestDetail, RequestInfo, SpaceInfo, SpaceMessage, SpendTrailEntry,
+    CredentialLifecycleInfo, MeasurementInfo, ModelInfo, PriceInfo, RequestDetail, RequestInfo,
+    SpaceInfo, SpaceMessage, SpendTrailEntry,
 };
 use eidola_gui::chat::{ChatView, StreamingResponse};
 use eidola_gui::library::LibraryView;
