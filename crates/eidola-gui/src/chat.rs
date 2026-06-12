@@ -45,6 +45,17 @@ const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
 #[cfg(not(target_os = "macos"))]
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 
+/// Left clearance for the title-bar band's left-aligned participant indicator
+/// so it doesn't render *behind* the macOS traffic lights (which AppKit draws
+/// at the top-left of the transparent titlebar). Same clearance constant family
+/// as `record::STRIP_LEFT_PAD` and gpui-component's `TITLE_BAR_LEFT_PADDING`
+/// (80px). Platform-gated like the other traffic-light reserves — no pad is
+/// needed off macOS, where the window has no overlaid stoplights.
+#[cfg(target_os = "macos")]
+const INDICATOR_LEFT_PAD: gpui::Pixels = gpui::px(80.);
+#[cfg(not(target_os = "macos"))]
+const INDICATOR_LEFT_PAD: gpui::Pixels = gpui::px(0.);
+
 actions!(
     chat,
     [
@@ -2342,10 +2353,12 @@ impl ChatView {
             ));
 
         // Left side: the persistent participant indicator. Absolutely
-        // positioned (left edge, full band height) so it sits independent of
-        // the right-aligned model label's flex flow — adding/removing it never
-        // shifts the model chrome. `px_5` matches the prose column's left
-        // inset so the label aligns with the body text below it.
+        // positioned (full band height) so it sits independent of the
+        // right-aligned model label's flex flow — adding/removing it never
+        // shifts the model chrome. Its left edge is offset by
+        // `INDICATOR_LEFT_PAD` (80px on macOS, 0 elsewhere) so the label clears
+        // the macOS traffic lights instead of rendering behind them; `px_5`
+        // then adds the same inner inset the prose column uses.
         if stage == OnboardingStage::Ready
             && let Some(indicator) = self.participant_indicator.as_ref()
         {
@@ -2357,7 +2370,7 @@ impl ChatView {
             band = band.child(
                 div()
                     .absolute()
-                    .left_0()
+                    .left(INDICATOR_LEFT_PAD)
                     .px_5()
                     .text_sm()
                     .italic()
