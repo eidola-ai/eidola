@@ -202,14 +202,6 @@ pub struct ChatView {
     /// of the page or while a delim is visible. Recomputed from `list()` scroll
     /// state on every scroll and render — no layout shift (absolute chrome).
     participant_indicator: Option<ParticipantIndicator>,
-    /// Test-only record of how the last *reshaping* `rebuild_transcript`
-    /// reconciled the `ListState`: `Some(true)` = wholesale `reset`,
-    /// `Some(false)` = provable tail-append fast-path. A no-op reconcile (model
-    /// unchanged) leaves this untouched, so a re-render-only notify firing right
-    /// after a real reshape doesn't erase the record. The regression replay
-    /// asserts that a suffix-shifting reshape (first/second submit) `reset`s
-    /// rather than mis-splicing a bogus tail.
-    last_reconcile_was_reset: Option<bool>,
     /// Persistent markdown render states for the transcript's `TextView`s,
     /// keyed by logical content. **Load-bearing for virtualization**: a
     /// `TextView::markdown(id, …)` keeps its parsed state in the per-frame
@@ -223,8 +215,15 @@ pub struct ChatView {
     /// unmounts, so re-measure is always real. Entries are pruned to the
     /// live message count on rebuild; the whole map is dropped on a
     /// Circadian flip (`text_states_dark`) so code-block highlight colors —
-    /// baked in at parse time — re-parse under the new theme.
-    text_states: HashMap<TextKey, Entity<TextViewState>>,
+    /// baked in at parse time — re-parse under the new theme. Each entry
+    /// carries an `observe` subscription: the markdown parse is **async**,
+    /// so a row can be measured during its empty not-yet-parsed frame and
+    /// scrolled out of the visible window (which is re-measured every
+    /// frame) before the parse lands — offscreen items keep cached heights,
+    /// so that small height would persist until the row is next visited.
+    /// The observation closes the hole: when a parse lands (the state
+    /// notifies), the owning transcript item is explicitly remeasured.
+    text_states: HashMap<TextKey, (Entity<TextViewState>, Subscription)>,
     /// Theme mode the cached `text_states` were parsed under.
     text_states_dark: Option<bool>,
 
@@ -772,7 +771,6 @@ impl ChatView {
             list_state,
             transcript_items: Vec::new(),
             participant_indicator: None,
-            last_reconcile_was_reset: None,
             picker_highlighted: None,
             picker_scroll: ScrollHandle::new(),
             last_picker_scroll_target: None,
@@ -910,6 +908,14 @@ impl ChatView {
         if self.list_state.item_count() == 0 {
             return None;
         }
+        // While following the tail the reader is at the live edge — the
+        // streaming row's own delim is the cue, and the anchor shifts on
+        // every delta, which made the band label flicker (QA). The indicator
+        // exists for a reader *scrolled away* from the page-local cue; a
+        // follower never is.
+        if self.list_state.is_following_tail() {
+            return None;
+        }
         let top = self.list_state.logical_scroll_top();
         self.derive_participant_indicator_at(top.item_ix, top.offset_in_item, cx)
     }
@@ -996,15 +1002,6 @@ impl ChatView {
         self.list_state.item_count()
     }
 
-    /// Test-only: how the last `rebuild_transcript` reconciled the list.
-    /// `Some(true)` = wholesale `reset`, `Some(false)` = tail-append fast-path,
-    /// `None` = early-returned (model unchanged). The regression replay asserts
-    /// a suffix-shifting reshape took the `reset` path, not a bogus tail-splice.
-    #[doc(hidden)]
-    pub fn last_reconcile_was_reset_for_test(&self) -> Option<bool> {
-        self.last_reconcile_was_reset
-    }
-
     /// Test-only: the message indices currently present in the flat transcript
     /// model, in order. Used by the regression repro to assert the user's first
     /// message is reflected as a rendered `Message` item (not just persisted).
@@ -1070,19 +1067,6 @@ impl ChatView {
         self.list_state.set_follow_mode(gpui::FollowMode::Tail);
         self.list_state.scroll_to_end();
         cx.notify();
-    }
-
-    /// Test-only: the *measured* height of transcript item `ix`, if the list has
-    /// laid it out and it sits at or below the logical scroll top. `None` when
-    /// the item is above the scroll top (the list keeps no bounds for those) or
-    /// has not been measured yet. The scroll-round-trip repro asserts the first
-    /// message's measured height stays non-trivial after it scrolls above the
-    /// viewport and back — a collapse to ~zero is the disappearing-message bug.
-    #[doc(hidden)]
-    pub fn list_item_height_for_test(&self, ix: usize) -> Option<f32> {
-        self.list_state
-            .bounds_for_item(ix)
-            .map(|b| f32::from(b.size.height))
     }
 
     /// Test-only: render exactly the items in `range` (what the `list()`
@@ -1458,11 +1442,9 @@ impl ChatView {
         let new_items = self.compute_transcript_items(cx);
         let in_sync = self.list_state.item_count() == self.transcript_items.len();
         if new_items == self.transcript_items && in_sync {
-            // Item model unchanged (e.g. a re-render-only notify): nothing to
-            // reconcile, and we leave `last_reconcile_was_reset` untouched so a
-            // no-op notify firing right after a real reshape doesn't erase the
-            // record of how that reshape reconciled. A still-following stream
-            // re-pin is handled by the StreamDelta hook, not here.
+            // Item model unchanged (e.g. a re-render-only notify): nothing
+            // to reconcile. A still-following stream re-pin is handled by
+            // the StreamDelta hook, not here.
             return;
         }
 
@@ -1480,27 +1462,22 @@ impl ChatView {
 
         // Reconcile by COMMON-PREFIX SPLICE: replace exactly the suffix that
         // changed, never the items before it. This is load-bearing for
-        // scroll correctness, not an optimization: `splice`/`reset` replace
-        // items with `Unmeasured { size_hint: None }`, whose summary height
-        // is **0px**, and paint only measures items from the scroll anchor
-        // *down* — so a wholesale reset while the reader is mid-page or at
-        // the tail collapses every item above the anchor to zero height,
-        // making them unreachable (the wave-4 round-3 bug: the first message
-        // "disappears" the moment a stream finalizes — the StreamEnded
-        // rebuild reset everything; scrolling up then "jumps" through the
-        // zero-height zone and the content above is gone until a reopen).
-        // The wave-4 round-1 bug was the opposite failure (a prefix-BLIND
-        // fast-path desyncing the count); the invariant that prevents both:
-        // the splice range is computed from the true longest common prefix,
-        // and the count is asserted below. In this UI every real transition
-        // is a suffix change ([…, Streaming, Composer] → […, Message,
-        // Composer]; turn appends land before the trailing composer), so the
-        // prefix — the reader's already-measured page — survives intact.
-        //
-        // A genuine full replacement (prefix == 0: the initial load shapes,
-        // or recovery from a desynced count) goes through `reset`, which
-        // also clears the logical scroll anchor — correct there, since those
-        // shapes land on a page whose resting position is the top.
+        // scroll correctness, not an optimization: `splice` replaces items
+        // with `Unmeasured { size_hint: None }`, whose summary height is
+        // **0px**, and only items inside the visible window are re-measured
+        // per frame — so replacing items the reader has already measured
+        // collapses everything above the anchor into an unreachable
+        // zero-height void (the wave-4 round-3 disappearing-message bug; the
+        // round-1 bug was the dual failure, a prefix-BLIND splice desyncing
+        // the count). The invariants that prevent both: the splice range
+        // comes from the true longest common prefix, and the count is
+        // asserted below. In this UI every real transition is a suffix
+        // change (turn appends land before the trailing composer), so the
+        // reader's measured page survives intact; a brand-new window's first
+        // reshape (prefix == 0) splices the full range from an anchor that
+        // is already at the top. `reset` exists only as recovery from a
+        // desynced count — it also clears the scroll anchor, which no normal
+        // transition wants.
         let count = new_items.len();
         let prefix = self
             .transcript_items
@@ -1508,24 +1485,20 @@ impl ChatView {
             .zip(new_items.iter())
             .take_while(|(a, b)| a == b)
             .count();
-        if prefix == 0 || !in_sync {
+        if !in_sync {
             self.list_state.reset(count);
-            let focus_handles = (0..count).map(|ix| {
-                matches!(new_items[ix], TranscriptItem::Composer { .. })
-                    .then(|| composer_focus.clone())
-            });
-            self.list_state.splice_focusable(0..count, focus_handles);
-            self.last_reconcile_was_reset = Some(true);
-        } else {
-            let old_len = self.transcript_items.len();
-            let focus_handles = (prefix..count).map(|ix| {
-                matches!(new_items[ix], TranscriptItem::Composer { .. })
-                    .then(|| composer_focus.clone())
-            });
-            self.list_state
-                .splice_focusable(prefix..old_len, focus_handles);
-            self.last_reconcile_was_reset = Some(false);
         }
+        let splice_from = if in_sync { prefix } else { 0 };
+        let old_len = if in_sync {
+            self.transcript_items.len()
+        } else {
+            count
+        };
+        let focus_handles = (splice_from..count).map(|ix| {
+            matches!(new_items[ix], TranscriptItem::Composer { .. }).then(|| composer_focus.clone())
+        });
+        self.list_state
+            .splice_focusable(splice_from..old_len, focus_handles);
 
         self.transcript_items = new_items;
 
@@ -1741,13 +1714,41 @@ impl ChatView {
         text: &str,
         cx: &mut Context<Self>,
     ) -> Entity<TextViewState> {
-        let state = self
-            .text_states
-            .entry(key)
-            .or_insert_with(|| cx.new(|cx| TextViewState::markdown(text, cx)))
-            .clone();
+        let state = match self.text_states.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.get().0.clone(),
+            std::collections::hash_map::Entry::Vacant(_) => {
+                let state = cx.new(|cx| TextViewState::markdown(text, cx));
+                // The parse is async: when it lands, remeasure the owning
+                // item so a height captured during the empty-parse frame can
+                // never go stale offscreen (see the `text_states` field doc).
+                let subscription = cx.observe(&state, move |this, _, cx| {
+                    this.remeasure_item_for_key(key);
+                    cx.notify();
+                });
+                self.text_states.insert(key, (state.clone(), subscription));
+                state
+            }
+        };
         state.update(cx, |s, cx| s.set_text(text, cx));
         state
+    }
+
+    /// Remeasure the transcript item that renders `key`'s markdown. Called
+    /// when its async parse lands; a no-op when the item is no longer in the
+    /// model (the subscription is pruned with its entry on rebuild).
+    fn remeasure_item_for_key(&mut self, key: TextKey) {
+        let ix = self.transcript_items.iter().position(|item| match key {
+            TextKey::Message(i) | TextKey::MessageThinking(i) => {
+                matches!(item, TranscriptItem::Message { index, .. } if *index == i)
+            }
+            TextKey::Streaming | TextKey::StreamingThinking | TextKey::StreamingError => {
+                matches!(item, TranscriptItem::Streaming)
+            }
+            TextKey::ErrorBand => matches!(item, TranscriptItem::Error),
+        });
+        if let Some(ix) = ix {
+            self.list_state.remeasure_items(ix..ix + 1);
+        }
     }
 
     /// A persisted transcript message (with its leading chapter delim unless

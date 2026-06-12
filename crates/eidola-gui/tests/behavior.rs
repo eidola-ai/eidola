@@ -2707,15 +2707,10 @@ fn first_message_survives_streaming_start(cx: &mut TestAppContext) {
             vec![0],
             "the first user message must be a rendered transcript item"
         );
-        // The reshape `[Composer] → [Message, Streaming, Composer]` is NOT a
-        // tail-append (new items land before the trailing composer), so it must
-        // take the wholesale `reset` path — never a tail-splice that leaves the
-        // list's per-item measurements pointing at the wrong rows.
-        assert_eq!(
-            v.last_reconcile_was_reset_for_test(),
-            Some(true),
-            "first submit must reset the list, not mis-splice a tail"
-        );
+        // The reshape `[Composer] → [Message, Streaming, Composer]` has no
+        // common prefix, so the splice covers the full range — the count
+        // invariant asserted by `assert_consistent` is what prevents the
+        // round-1 prefix-blind mis-splice from recurring.
     });
 
     // The model starts responding — drive a streaming content delta. This is
@@ -2826,13 +2821,11 @@ fn second_submit_in_existing_space_keeps_all_messages(cx: &mut TestAppContext) {
             "the new user turn appends without dropping the prior two"
         );
         // A suffix-shifting reshape: the new message + streaming row land
-        // ahead of the trailing composer. The reconcile replaces exactly the
-        // changed suffix (common-prefix splice) so the measured heights of
-        // the prior turns survive — `Some(false)` = the splice path. (The
-        // count invariant is asserted by `assert_consistent`; a wholesale
-        // reset here would wipe above-anchor heights to zero and reintroduce
-        // the round-3 disappearing-message bug.)
-        assert_eq!(v.last_reconcile_was_reset_for_test(), Some(false));
+        // ahead of the trailing composer, and the common-prefix splice
+        // replaces exactly that suffix so the measured heights of the prior
+        // turns survive (the round-3 collapse detector,
+        // `finalize_reshape_preserves_measured_heights`, guards the
+        // measurement consequence directly).
     });
 
     view.update(cx, |v, cx| v.push_content_delta_for_test("a2", cx));
