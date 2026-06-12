@@ -524,8 +524,8 @@ fn transcript_render_work_is_constant_in_message_count(cx: &mut TestAppContext) 
     // elements hold `Entity<TextViewState>` clones that would otherwise trip
     // the leak detector at teardown. Returns (rows-per-frame,
     // total-item-count, elapsed).
-    let mut vcx = VisualTestContext::from_window(window.into(), cx);
-    let mut measure = |vcx: &mut VisualTestContext, msgs: Vec<SpaceMessage>| {
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    let measure = |vcx: &mut VisualTestContext, msgs: Vec<SpaceMessage>| {
         view.update(vcx, |v, cx| v.set_messages_for_test(msgs, cx));
         vcx.run_until_parked();
         let total = view.read_with(vcx, |v, _| v.transcript_item_count_for_test());
@@ -605,8 +605,8 @@ fn finalize_reshape_preserves_measured_heights(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    let mut vcx = VisualTestContext::from_window(window.into(), cx);
-    let mut draw = |vcx: &mut VisualTestContext| {
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    let draw = |vcx: &mut VisualTestContext| {
         let v = view.clone();
         let _ = vcx.draw(
             Point::default(),
