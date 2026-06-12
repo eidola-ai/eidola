@@ -465,14 +465,40 @@ impl ChatView {
     /// navigation starts fresh. On open, scroll the current model's row into
     /// view so a far-down current selection isn't hidden below the fold of the
     /// capped-height panel.
-    pub fn toggle_model_picker(&mut self, cx: &mut Context<Self>) {
+    pub fn toggle_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.model_picker_open = !self.model_picker_open;
         if !self.model_picker_open {
             self.picker_highlighted = None;
         } else if let Some(ix) = self.current_model_index(cx) {
             self.scroll_picker_to(ix);
         }
+        self.sync_picker_focus(window, cx);
         cx.notify();
+    }
+
+    /// Park keyboard focus to match the picker's open state.
+    ///
+    /// While the picker is open, focus rests on the `ChatView` root so the
+    /// `ChatView`-context picker-navigation bindings (`up` / `down` / `enter`
+    /// / `escape`) are the innermost matching entries in the focus chain. The
+    /// composer is a `MarkdownEditor` whose own `MarkdownEditor` key context
+    /// binds plain `up` / `down` / `enter`; with focus left on the editor
+    /// those more-specific bindings swallow the keystrokes and the picker
+    /// never receives them (the arrows kept moving the composer cursor — the
+    /// codex review finding). Moving focus off the editor takes its context
+    /// out of the focus chain so the picker bindings win.
+    ///
+    /// When the picker closes, focus returns to the composer so the user can
+    /// keep typing without a click. `escape` is unaffected by the editor
+    /// either way (the editor binds no `escape`), but routing it through the
+    /// same focus parking keeps every picker key uniform.
+    fn sync_picker_focus(&self, window: &mut Window, cx: &mut gpui::App) {
+        if self.model_picker_open {
+            window.focus(&self.focus_handle, cx);
+        } else {
+            let editor = self.prompt_editor.read(cx).focus_handle(cx);
+            window.focus(&editor, cx);
+        }
     }
 
     /// The row index of this space's current model in the picker's model list,
@@ -502,10 +528,12 @@ impl ChatView {
         self.last_picker_scroll_target = Some(ix);
     }
 
-    /// Dismiss the model picker without selecting anything (Esc).
-    pub fn dismiss_model_picker(&mut self, cx: &mut Context<Self>) {
+    /// Dismiss the model picker without selecting anything (Esc, or a
+    /// click outside the panel). Restores composer focus.
+    pub fn dismiss_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.model_picker_open = false;
         self.picker_highlighted = None;
+        self.sync_picker_focus(window, cx);
         cx.notify();
     }
 
@@ -548,7 +576,7 @@ impl ChatView {
 
     /// Confirm the currently highlighted picker row (Enter). No-op when
     /// nothing is highlighted.
-    pub fn picker_confirm(&mut self, cx: &mut Context<Self>) {
+    pub fn picker_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.model_picker_open {
             return;
         }
@@ -558,7 +586,7 @@ impl ChatView {
         let models = self.models.read(cx).list().to_vec();
         if let Some(model) = models.get(idx) {
             let id = model.id.clone();
-            self.select_model(id, cx);
+            self.select_model(id, window, cx);
         }
     }
 
@@ -579,10 +607,11 @@ impl ChatView {
     /// picker. A switch while a response is streaming applies to the *next*
     /// send — the in-flight request is never hot-swapped (the selection lives
     /// on the shared `Space`, so both windows see the change).
-    pub fn select_model(&mut self, id: String, cx: &mut Context<Self>) {
+    pub fn select_model(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.space.update(cx, |s, cx| s.select_model(id, cx));
         self.model_picker_open = false;
         self.picker_highlighted = None;
+        self.sync_picker_focus(window, cx);
         cx.notify();
     }
 
@@ -1593,16 +1622,18 @@ impl Render for ChatView {
             .key_context("ChatView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::submit))
-            .on_action(
-                cx.listener(|this, _: &ToggleModelPicker, _, cx| this.toggle_model_picker(cx)),
-            )
+            .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| {
+                this.toggle_model_picker(window, cx)
+            }))
             // Picker keyboard navigation — no-ops when the picker is closed.
-            .on_action(
-                cx.listener(|this, _: &DismissModelPicker, _, cx| this.dismiss_model_picker(cx)),
-            )
+            .on_action(cx.listener(|this, _: &DismissModelPicker, window, cx| {
+                this.dismiss_model_picker(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &PickerUp, _, cx| this.picker_up(cx)))
             .on_action(cx.listener(|this, _: &PickerDown, _, cx| this.picker_down(cx)))
-            .on_action(cx.listener(|this, _: &PickerConfirm, _, cx| this.picker_confirm(cx)))
+            .on_action(
+                cx.listener(|this, _: &PickerConfirm, window, cx| this.picker_confirm(window, cx)),
+            )
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
             }))
@@ -2621,7 +2652,9 @@ impl ChatView {
                     .text_color(theme.muted_foreground)
                     .cursor_pointer()
                     .hover(|s| s.text_color(theme.foreground))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_model_picker(cx)))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.toggle_model_picker(window, cx)),
+                    )
                     .child(SharedString::from(self.current_model(cx))),
             );
         }
@@ -2671,9 +2704,11 @@ impl ChatView {
             .track_scroll(&self.picker_scroll)
             .popover_style(cx)
             .py_1()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.model_picker_open = false;
-                cx.notify();
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                // Click outside the panel dismisses it; route through
+                // `dismiss_model_picker` so composer focus is restored the
+                // same way Esc does.
+                this.dismiss_model_picker(window, cx);
             }));
 
         if models.is_empty() {
@@ -2753,7 +2788,9 @@ impl ChatView {
                     .when(!is_highlighted, |d| {
                         d.cursor_pointer().hover(|s| s.bg(theme.muted.opacity(0.5)))
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_model(id.clone(), cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_model(id.clone(), window, cx)
+                    }))
                     .child(name_row)
                     .child(
                         div()

@@ -33,8 +33,8 @@ use eidola_gui::updates::{UpdatesDisplay, UpdatesView, relative_time};
 use eidola_gui::wallet::WalletView;
 use eidola_gui::window_input::WindowInput;
 use gpui::{
-    AnyWindowHandle, AppContext, Entity, Modifiers, Point, TestAppContext, VisualTestContext,
-    WindowOptions, px,
+    AnyWindowHandle, AppContext, Entity, Focusable, Modifiers, Point, TestAppContext,
+    VisualTestContext, WindowOptions, px,
 };
 use gpui_component::{Root, Theme};
 use gpui_markdown_editor::EditorState;
@@ -959,6 +959,67 @@ fn toggle_model_picker_action_round_trips(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn picker_open_parks_focus_off_composer(cx: &mut TestAppContext) {
+    // The codex review finding (PR #177): with focus left on the composer,
+    // its `MarkdownEditor` key context binds plain up/down/enter and swallows
+    // the picker arrows — so opening the picker while typing left the arrows
+    // moving the cursor instead of the highlight. The fix parks focus on the
+    // ChatView root while the picker is open (so the ChatView-context picker
+    // bindings are the innermost match) and returns it to the composer on
+    // close. This is structural — it can't be exercised by dispatching picker
+    // actions through the view handle (those bypass the focus chain), so this
+    // test asserts the focus parking directly.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_chat(cx, &stores);
+
+    let view_focus = view.read_with(cx, |v, _| v.focus_handle());
+    let editor_focus = view.read_with(cx, |v, cx| {
+        v.prompt_editor_for_test().read(cx).focus_handle(cx)
+    });
+
+    // At rest the composer holds focus — the cursor home for a "letter
+    // writing" feel (`ChatView::new` focuses the editor).
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            editor_focus.is_focused(window),
+            "composer is focused at rest"
+        );
+    })
+    .unwrap();
+
+    // Open the picker → focus parks on the ChatView root so the picker's
+    // up/down/enter bindings win over the editor's.
+    cx.update_window(window, |_, window, cx| {
+        view_focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            view_focus.is_focused(window),
+            "opening the picker parks focus on the ChatView root"
+        );
+        assert!(
+            !editor_focus.is_focused(window),
+            "the composer no longer holds focus while the picker is open"
+        );
+    })
+    .unwrap();
+
+    // Close (Esc) → focus returns to the composer so typing resumes.
+    cx.update_window(window, |_, window, cx| {
+        view_focus.dispatch_action(&DismissModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            editor_focus.is_focused(window),
+            "closing the picker returns focus to the composer"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui::test]
 fn submit_uses_config_default_model_when_nothing_selected(cx: &mut TestAppContext) {
     // New windows start from the user's default: with no per-window
     // selection, a send resolves the model from `ConfigState::default_model`.
@@ -1003,10 +1064,13 @@ fn selecting_a_model_changes_what_submit_sends(cx: &mut TestAppContext) {
     let (window, view) = open_chat(cx, &stores);
 
     // Selecting from the picker closes it and pins this window's model.
-    view.update(cx, |v, cx| {
-        v.set_model_picker_open_for_test(true);
-        v.select_model("kimi-k2-6".into(), cx);
-    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_model_picker_open_for_test(true);
+            v.select_model("kimi-k2-6".into(), window, cx);
+        });
+    })
+    .unwrap();
     view.read_with(cx, |v, cx| {
         assert_eq!(v.selected_model(cx).as_deref(), Some("kimi-k2-6"));
         assert_eq!(v.current_model(cx), "kimi-k2-6");
@@ -1040,7 +1104,10 @@ fn selection_during_streaming_applies_to_next_send(cx: &mut TestAppContext) {
 
     // Switching mid-stream must not touch the in-flight request — only
     // the space's selection for the *next* send.
-    view.update(cx, |v, cx| v.select_model("kimi-k2-6".into(), cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_model("kimi-k2-6".into(), window, cx));
+    })
+    .unwrap();
     view.read_with(cx, |v, cx| {
         assert_eq!(
             v.last_submitted_model(cx).as_deref(),
@@ -1263,7 +1330,10 @@ fn picker_open_reveals_far_down_current_selection(cx: &mut TestAppContext) {
     let focus = view.read_with(cx, |v, _| v.focus_handle());
 
     // Select a far-down model for this space, then open the picker.
-    view.update(cx, |v, cx| v.select_model("model-22".into(), cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.select_model("model-22".into(), window, cx));
+    })
+    .unwrap();
     cx.update_window(window, |_, window, cx| {
         focus.dispatch_action(&ToggleModelPicker, window, cx);
     })

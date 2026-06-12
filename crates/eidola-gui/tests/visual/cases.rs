@@ -841,7 +841,7 @@ fn register_chat(s: &mut Snapshots) {
                     }],
                     cx,
                 );
-                view.select_model("kimi-k2-6".into(), cx);
+                view.select_model("kimi-k2-6".into(), window, cx);
                 view.set_model_picker_open_for_test(true);
                 view.set_alt_held_for_test(true, cx);
                 view
