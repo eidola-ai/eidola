@@ -10,6 +10,8 @@
 //!    keystrokes take in production.
 //! 4. Assert against the view/core's public state with `read_with`.
 
+use eidola_app_core::AppCore;
+use eidola_app_core::changes::Change;
 use eidola_app_core::error::AppError;
 use eidola_app_core::updates::{
     Claim, ClaimDelta, ClaimsComparison, UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease,
@@ -28,7 +30,7 @@ use eidola_gui::chat::{
 use eidola_gui::library::LibraryView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
-use eidola_gui::stores::{Stores, StoresStub};
+use eidola_gui::stores::{self, Stores, StoresStub};
 use eidola_gui::updates::{UpdatesDisplay, UpdatesView, relative_time};
 use eidola_gui::wallet::WalletView;
 use eidola_gui::window_input::WindowInput;
@@ -2627,6 +2629,91 @@ fn record_frame_work_is_constant_in_loaded_rows(cx: &mut TestAppContext) {
         ten_dur.as_secs_f64() < one_dur.as_secs_f64() * 4.0 + 0.05,
         "frame work scaled with loaded rows: 1 page {one_dur:?} vs 10 pages {ten_dur:?}"
     );
+}
+
+/// An open Record window must learn that the local trail grew (codex finding
+/// on PR #179: `Change::Record` was dropped by the bus dispatch, so an open
+/// window never updated). The bus routes `Change::Record` to the
+/// `RecordStore` relay; the window observes it and marks itself stale —
+/// surfacing the "new entries — refresh" affordance rather than mutating
+/// rows under the user's scroll position. Refresh clears the marker.
+#[gpui::test]
+fn record_marks_stale_on_record_change_and_refresh_clears(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores.clone(), window, cx))
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert!(!v.stale(), "a fresh window starts un-stale")
+    });
+
+    // A durable Record write reaches the window through the bus bridge's
+    // dispatch (driven via the deterministic test seam).
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Record), cx));
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.stale(),
+            "a Change::Record must mark the open Record window stale"
+        );
+    });
+
+    // A `Lagged` (refresh-everything) may have dropped a Record change, so it
+    // must keep / set the marker too.
+    view.update(cx, |v, cx| v.refresh(cx));
+    view.read_with(cx, |v, _| assert!(!v.stale(), "refresh clears the marker"));
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, None, cx));
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(v.stale(), "a Lagged bus signal must also mark stale");
+    });
+}
+
+/// Replay of the Record stale-fetch race (codex finding on PR #179): a
+/// refresh while a page fetch is in flight must *cancel* that fetch, not let
+/// it land later and append duplicate/stale rows over the reset listing. The
+/// structural fix is task-as-field — the `Listing` owns its fetch task, so
+/// `refresh()`'s `Listing::default()` replacement drops (cancels) the
+/// in-flight task at the moment of reset. A cancelled task can never run its
+/// completion, so the race is impossible by construction; this test asserts
+/// the synchronous half (real backend, so fetches genuinely start; the
+/// listing resets to empty with exactly the new fetch in flight).
+#[gpui::test]
+fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
+    // A real `AppCore` over tempdirs (the Record queries are local-DB reads),
+    // mirroring `tests/stores.rs::test_core`. `_dir` keeps the tempdir alive.
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let _dir = tempfile::tempdir().unwrap();
+    let core = AppCore::new(_dir.path().to_path_buf(), _dir.path().join("data"));
+    core.set_base_url("https://127.0.0.1:1/v1".into()).unwrap();
+    let stores = cx.update(|cx| Stores::for_test(std::sync::Arc::new(core), cx));
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores.clone(), window, cx))
+    });
+
+    // Construction kicked the attestations fetch: in flight, no rows yet.
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.listing_state_for_test(),
+            (0, true),
+            "construction starts the first page fetch"
+        );
+    });
+
+    // Refresh mid-flight. Replacing the listing drops the in-flight task —
+    // the old fetch is cancelled and can never append — and starts exactly
+    // one new fetch over the reset (empty) rows.
+    view.update(cx, |v, cx| v.refresh(cx));
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.listing_state_for_test(),
+            (0, true),
+            "refresh resets the rows and owns a single fresh fetch; the \
+             superseded task was cancelled at replacement"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
