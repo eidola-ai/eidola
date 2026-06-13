@@ -10,6 +10,15 @@
 //! would flag the `AppCore` tokio runtime's background work as
 //! non-deterministic. The synchronous transition is exactly the structural
 //! property each test is about — no network result is needed.
+//!
+//! Not parking is no longer enough by itself: since zed's `TestScheduler`
+//! grew a cross-thread activity detector (any wake of a gpui task from a
+//! foreign thread records a non-determinism error, raced against the test
+//! body — the unreachable-URL tasks fail fast on the tokio side and their
+//! completion wakes the store task's gpui future from a tokio worker).
+//! `backed_stores` therefore calls `cx.executor().allow_parking()`, the
+//! upstream idiom for tests that intentionally mix real OS threads; it
+//! disables the detector without changing what these tests assert.
 
 use std::sync::Arc;
 
@@ -35,6 +44,8 @@ fn test_core() -> (Arc<AppCore>, tempfile::TempDir) {
 }
 
 fn backed_stores(cx: &mut TestAppContext) -> (Stores, tempfile::TempDir) {
+    // Declare the real tokio runtime to the test scheduler (see module docs).
+    cx.executor().allow_parking();
     let (core, dir) = test_core();
     let stores = cx.update(|cx| Stores::for_test(core, cx));
     (stores, dir)
