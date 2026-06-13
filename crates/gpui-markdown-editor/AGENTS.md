@@ -67,7 +67,9 @@ The first cut covers:
 - **Word-granular motion and selection-extension.** `MoveWordLeft` / `MoveWordRight` (and the `Extend*` variants) walk Unicode word boundaries via `unicode-segmentation`, skipping whitespace and punctuation. Default macOS bindings: Option+Arrow and Option+Shift+Arrow.
 - **Line- and word-aware deletion.** `DeleteWordBackward` / `DeleteWordForward` consume a word in the cursor's direction; `DeleteToLineStart` / `DeleteToLineEnd` consume to the line's visible content edge / line end. Inside a structural chain (BQ / LI) the target is clamped to the line's chain-prefix end so the `> ` / `- ` / continuation-indent bytes survive — deletion only affects content, not structure.
 - **Visual-position-aware vertical navigation.** Up / Down / Shift+Up / Shift+Down route through `MarkdownEditor::vertical_move`, which consults the previous frame's `LaidOutBlock` layout to step exactly one wrap-row in display coordinates (not source bytes). Two consequences: (a) navigation respects soft-wrap rows inside a single logical line, and (b) a long line → wrapped short row → long line round-trip lands back at the original visual column via an `intended_x` anchor that survives the streak (cleared on any non-vertical event by `dispatch_reset_intended_x_unless_vertical`). Headless tests with no laid-out blocks fall back to the source-byte `MoveUp` / `MoveDown` event so behavior tests still move predictably.
-- Inline code (`` `code` ``): mono font + faint background fill on the span content, hide / dim of the backtick delimiters per the cursor rule. Multi-backtick spans (`` ``a`b`` ``) work — the parser detects the opener / closer run lengths from the source bytes.
+- Inline code (`` `code` ``): mono-family text + a chip background fill on the span content, hide / dim of the backtick delimiters per the cursor rule. Multi-backtick spans (`` ``a`b`` ``) work — the parser detects the opener / closer run lengths from the source bytes. Two sizing/styling notes:
+  - **No per-run font size.** gpui's `TextRun` carries no font size — a whole display line shapes at one size — so inline code *cannot* be sized at the typographically ideal ~0.9× of body. The exposed lever is `MarkdownStyle::inline_code_font_family` (defaults to `mono_font_family`): hosts pairing a low-x-height serif body with a tall mono can point inline code at an x-height-compatible mono family so spans read at the body's visual size, while fenced blocks keep `mono_font_family`. (`crates/eidola-gui` does exactly this: Newsreader body, Courier New inline code, Menlo fences.)
+  - **The chip needs the explicit background pass.** `WrappedLine::paint` draws glyphs and line decorations only; `element.rs` paints `TextRun::background_color` via a separate `paint_background` loop *before* selection quads and glyphs. The chip color defaults to `theme.accent` — the same chip `gpui-component`'s `TextView` paints in the chat transcript — overridable via `MarkdownStyle::inline_code_background`.
 - Inline links (`[text](url)`): link-colored, single-underline text; hide / dim of the `[`, `](url)` delimiter pair per the cursor rule. Nested styling inside the link text composes (a `**bold**` inside a link picks up both the link color and the bold weight).
 - Thematic breaks (`---` / `***` / `___`): a `BlockKind::ThematicBreak` block kind with a thin horizontal rule painted as a per-block decoration centered on the row. The source bytes hide when the cursor is outside, dim when inside.
 - GFM task list items (`- [ ] todo` / `- [x] done`): the parser sets a `task: Option<bool>` field on `NodeKind::ListItem` whenever pulldown emits `Event::TaskListMarker(checked)` inside an item. The bullet's `marker_range` stays at `- ` (2 bytes) so the continuation-indent math is unchanged; the renderer adds a separate hide for the `[ ] ` / `[x] ` task bytes that follow, and the marker overlay paints `☐ ` / `☑ ` in place of the bullet glyph.
@@ -246,7 +248,11 @@ Real HTML / RTF passthrough depends on a gpui-side `ClipboardEntry::Html(String)
 
 ## Theme integration
 
-The editor does **not** carry its own color palette. `MarkdownStyle::from_theme` derives every color (text, secondary, delimiter, background) from `gpui_component::Theme`. Day / Night just work because they're the theme's job. Callers can override individual fields after construction (font size, heading callback, paragraph gap) the same way `eidola_gui::chat::markdown_style` overrides `TextViewStyle`.
+The editor does **not** carry its own color palette. `MarkdownStyle::from_theme` derives every color (text, secondary, delimiter, background) from `gpui_component::Theme`. Day / Night just work because they're the theme's job: `MarkdownEditor::render` re-derives **every theme-sourced color** (text, delimiter, background, caret, selection, link, blockquote border, thematic break, inline-code chip, code-block fills) from the live theme each frame, so a mode flip can't leave any of them stale — color fields are therefore *not* caller-overridable across frames; the typography knobs (font size, families, heading callback, paragraph gap, `list_item_gap_factor`, `inline_code_font_family`) are, the same way `eidola_gui::chat::markdown_style` overrides `TextViewStyle`.
+
+## Vertical rhythm
+
+Inter-block spacing is symmetric: each block reserves half its factor above and below (`spacing_above_for_block` / `spacing_below_for_block` in `element.rs`), so two stacked paragraphs are one `paragraph_gap` apart. Blocks whose container chain includes a `Container::ListItem` tighten that factor by `MarkdownStyle::list_item_gap_factor` (default 0.35 — items read as lines within one block, not as paragraphs); the full paragraph rhythm re-appears at the list ↔ neighbor boundary because the non-list neighbor contributes its untightened half plus the `container_boundary_gap` extra both sides add when chains differ. Headings keep their own (larger) factors even inside list items.
 
 ## Testing — two tiers (mirrors `crates/eidola-gui`)
 
@@ -293,7 +299,7 @@ cargo build -p gpui-markdown-editor
 cargo test -p gpui-markdown-editor
 
 # visual snapshots (write goldens on first run, then compare)
-cargo test -p gpui-markdown-editor --test visual
+EIDOLA_RUN_VISUAL_TESTS=1 cargo test -p gpui-markdown-editor --test visual
 UPDATE_SNAPSHOTS=1 cargo test -p gpui-markdown-editor --test visual
 
 # demo binary

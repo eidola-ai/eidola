@@ -22,7 +22,7 @@ down:
 db-reset:
     docker compose exec postgres dropdb -U eidola --if-exists eidola
     docker compose exec postgres createdb -U eidola eidola
-    docker compose exec postgres psql -U eidola -d eidola -f /docker-entrypoint-initdb.d/schema.sql
+    docker compose exec postgres psql -U eidola -d eidola -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/schema.sql
 
 # --- Build (local toolchain, fast iteration) ---
 
@@ -101,11 +101,18 @@ format:
 # aid (gitignored), not a regression gate. Pixel diffs aren't bit-stable
 # across machines, so committed regression checks live in tests/behavior.rs.
 render-snapshots *args:
-    cargo test -p eidola-gui --test visual {{ args }}
+    EIDOLA_RUN_VISUAL_TESTS=1 cargo test -p eidola-gui --test visual {{ args }}
 
 # Accept the current rendered output as the new local visual baseline.
 render-snapshots-update:
     UPDATE_SNAPSHOTS=1 cargo test -p eidola-gui --test visual
+
+# Interactive UI driver for agent-led QA: real offscreen-rendered windows
+# driven over a JSON-lines stdin/stdout protocol (open scenes, list named
+# elements, click, type, screenshot). Protocol docs in
+# crates/eidola-gui/examples/driver.rs.
+driver:
+    cargo run -p eidola-gui --example driver
 
 # Run all tests
 test:

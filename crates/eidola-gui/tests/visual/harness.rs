@@ -27,10 +27,18 @@ use image::RgbaImage;
 /// Cases capture nothing reusable — they construct fresh entities each call.
 type BuildRoot = Box<dyn Fn(&mut gpui::Window, &mut gpui::App) -> Entity<Root>>;
 
+/// An optional post-open step, run once after the window's first
+/// `run_until_parked` (so virtualized lists have measured their items) and
+/// before the screenshot. The harness re-parks afterwards. Used by cases that
+/// need to drive a scroll position that only sticks once item heights are
+/// known — e.g. the chat transcript's participant-indicator cases.
+type PostOpen = Box<dyn Fn(&mut VisualTestAppContext, gpui::AnyWindowHandle)>;
+
 struct Case {
     name: &'static str,
     size: Size<Pixels>,
     build: BuildRoot,
+    post_open: Option<PostOpen>,
 }
 
 const MODES: &[(ThemeMode, &str)] = &[(ThemeMode::Light, "day"), (ThemeMode::Dark, "night")];
@@ -70,6 +78,49 @@ impl Snapshots {
                 let view = build(window, cx);
                 cx.new(|cx| Root::new(view, window, cx))
             }),
+            post_open: None,
+        });
+    }
+
+    /// Like [`Self::add`], but the inner view entity is threaded into a
+    /// `step` closure that runs after the window's first paint (so a
+    /// virtualized list has measured its items) and before the screenshot.
+    /// The `step` mutates the view (e.g. scrolls the transcript), the harness
+    /// re-parks, then captures. The `build` closure must be `Fn` (invoked once
+    /// per theme mode); the captured entity is per-render via a `RefCell`.
+    pub fn add_with_step<V, F, S>(
+        &mut self,
+        name: &'static str,
+        size: Size<Pixels>,
+        build: F,
+        step: S,
+    ) where
+        V: Render + 'static,
+        F: Fn(&mut gpui::Window, &mut gpui::App) -> Entity<V> + 'static,
+        S: Fn(&mut VisualTestAppContext, gpui::AnyWindowHandle, &Entity<V>) + 'static,
+    {
+        // Per-render slot the build closure writes the inner entity into and
+        // the post-open step reads it back from. `Fn` (not `FnMut`) so the
+        // harness can invoke build/step once per mode.
+        let captured: std::rc::Rc<std::cell::RefCell<Option<Entity<V>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let build_captured = captured.clone();
+        let step_captured = captured.clone();
+        self.cases.push(Case {
+            name,
+            size,
+            build: Box::new(move |window, cx| {
+                let view = build(window, cx);
+                *build_captured.borrow_mut() = Some(view.clone());
+                cx.new(|cx| Root::new(view, window, cx))
+            }),
+            post_open: Some(Box::new(move |cx, window| {
+                let view = step_captured
+                    .borrow()
+                    .clone()
+                    .expect("build ran before post_open");
+                step(cx, window, &view);
+            })),
         });
     }
 
@@ -100,7 +151,12 @@ impl Snapshots {
                 let _ = std::fs::remove_file(&new_path);
 
                 cx.update(|cx| Theme::change(mode, None, cx));
-                let img = render_case(&mut cx, case.size, case.build.as_ref());
+                let img = render_case(
+                    &mut cx,
+                    case.size,
+                    case.build.as_ref(),
+                    case.post_open.as_ref(),
+                );
 
                 if !path.exists() || self.update {
                     img.save(&path).expect("write golden snapshot");
@@ -158,11 +214,18 @@ fn render_case(
     cx: &mut VisualTestAppContext,
     size: Size<Pixels>,
     build: &dyn Fn(&mut gpui::Window, &mut gpui::App) -> Entity<Root>,
+    post_open: Option<&PostOpen>,
 ) -> RgbaImage {
     let window = cx
         .open_offscreen_window(size, |window, cx| build(window, cx))
         .expect("open offscreen window");
     cx.run_until_parked();
+    if let Some(step) = post_open {
+        // The first paint has measured the list's items, so a scroll set now
+        // sticks. Run the step, then re-park so the scrolled frame lays out.
+        step(cx, window.into());
+        cx.run_until_parked();
+    }
     cx.capture_screenshot(window.into())
         .expect("capture screenshot")
 }

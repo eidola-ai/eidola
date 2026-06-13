@@ -818,25 +818,82 @@ pub struct SpaceRow {
     pub created_at: i64,
 }
 
-pub async fn list_spaces(conn: &Connection) -> Result<Vec<SpaceRow>, AppError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, title, created_at FROM space \
-             WHERE archived_at IS NULL \
-             ORDER BY created_at DESC",
-        )
-        .await
-        .map_err(AppError::db)?;
+/// One row of the space listing, with the cheap activity signals the UI
+/// needs to render a meaningful entry. `last_activity_at` is the max
+/// `action.created_at` in the space (falling back to the space's own
+/// `created_at` for empty spaces); `message_count` counts terminal
+/// (`complete`/`cancelled`) actions.
+pub struct SpaceListRow {
+    pub id: String,
+    pub title: Option<String>,
+    pub created_at: i64,
+    pub archived_at: Option<i64>,
+    pub last_activity_at: i64,
+    pub message_count: i64,
+}
+
+pub async fn list_spaces(
+    conn: &Connection,
+    include_archived: bool,
+) -> Result<Vec<SpaceListRow>, AppError> {
+    let filter = if include_archived {
+        ""
+    } else {
+        "WHERE s.archived_at IS NULL "
+    };
+    let sql = format!(
+        "SELECT s.id, s.title, s.created_at, s.archived_at, \
+                COALESCE(MAX(a.created_at), s.created_at) AS last_activity_at, \
+                COUNT(a.id) AS message_count \
+         FROM space s \
+         LEFT JOIN action a ON a.space_id = s.id \
+              AND a.status IN ('complete', 'cancelled') \
+         {filter}\
+         GROUP BY s.id, s.title, s.created_at, s.archived_at \
+         ORDER BY last_activity_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
     let mut rows = stmt.query(()).await.map_err(AppError::db)?;
     let mut results = Vec::new();
     while let Some(row) = rows.next().await.map_err(AppError::db)? {
-        results.push(SpaceRow {
+        results.push(SpaceListRow {
             id: row.get::<String>(0).map_err(AppError::db)?,
             title: row.get::<Option<String>>(1).map_err(AppError::db)?,
             created_at: row.get::<i64>(2).map_err(AppError::db)?,
+            archived_at: row.get::<Option<i64>>(3).map_err(AppError::db)?,
+            last_activity_at: row.get::<i64>(4).map_err(AppError::db)?,
+            message_count: row.get::<i64>(5).map_err(AppError::db)?,
         });
     }
     Ok(results)
+}
+
+/// First text content block of the first user_input action in a space —
+/// the raw source for the listing snippet shown for untitled spaces.
+pub async fn first_user_text(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT cb.text_content \
+             FROM action a \
+             JOIN content_block cb ON cb.action_id = a.id \
+             WHERE a.space_id = ?1 AND a.action_type = 'user_input' \
+               AND cb.block_type = 'text' \
+             ORDER BY a.created_at ASC, cb.ordinal ASC \
+             LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(row.get::<Option<String>>(0).map_err(AppError::db)?),
+    }
 }
 
 pub async fn get_space(conn: &Connection, space_id: &str) -> Result<Option<SpaceRow>, AppError> {
@@ -989,6 +1046,319 @@ pub async fn update_space_title(
 }
 
 // ---------------------------------------------------------------------------
+// The Record — read-only queries over the local trail (attestations,
+// requests, spend trail). Pure SELECTs over existing tables/views; these
+// exist so the GUI's Record window (and future CLI inspection commands) can
+// page through the raw local history without loading whole tables.
+// ---------------------------------------------------------------------------
+
+/// One row of the attestation listing. `doc_bytes` is the stored document's
+/// size; `connection_count` is how many recorded connections presented this
+/// attestation.
+pub struct AttestationListRow {
+    pub hash: String,
+    pub pcr_digest: Option<String>,
+    pub created_at: i64,
+    pub doc_bytes: i64,
+    pub connection_count: i64,
+}
+
+pub async fn list_attestations(
+    conn: &Connection,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<AttestationListRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.hash, a.pcr_digest, a.created_at, length(a.doc), COUNT(c.id) \
+             FROM attestation a \
+             LEFT JOIN connection c ON c.attestation_hash = a.hash \
+             GROUP BY a.hash, a.pcr_digest, a.created_at \
+             ORDER BY a.created_at DESC, a.hash \
+             LIMIT ?1 OFFSET ?2",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query([limit, offset]).await.map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(AttestationListRow {
+            hash: row.get::<String>(0).map_err(AppError::db)?,
+            pcr_digest: row.get::<Option<String>>(1).map_err(AppError::db)?,
+            created_at: row.get::<i64>(2).map_err(AppError::db)?,
+            doc_bytes: row.get::<i64>(3).map_err(AppError::db)?,
+            connection_count: row.get::<i64>(4).map_err(AppError::db)?,
+        });
+    }
+    Ok(results)
+}
+
+/// The full stored attestation document for the detail view.
+pub struct AttestationDocRow {
+    pub hash: String,
+    pub pcr_digest: Option<String>,
+    pub created_at: i64,
+    pub doc: Vec<u8>,
+}
+
+pub async fn get_attestation(
+    conn: &Connection,
+    hash: &str,
+) -> Result<Option<AttestationDocRow>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT hash, pcr_digest, created_at, doc FROM attestation WHERE hash = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(hash.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(AttestationDocRow {
+            hash: row.get::<String>(0).map_err(AppError::db)?,
+            pcr_digest: row.get::<Option<String>>(1).map_err(AppError::db)?,
+            created_at: row.get::<i64>(2).map_err(AppError::db)?,
+            doc: row.get::<Vec<u8>>(3).map_err(AppError::db)?,
+        })),
+    }
+}
+
+/// One row of the request listing — the summary line, without the (possibly
+/// large) header/body payloads. Joined against `connection` for transport
+/// metadata and the attestation link.
+pub struct RequestListRow {
+    pub id: String,
+    pub method: String,
+    pub path: String,
+    pub response_status: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub request_at: i64,
+    pub error: Option<String>,
+    pub attempt_number: i64,
+    pub credential_nonce: Option<String>,
+    pub transport: Option<String>,
+    pub base_url: Option<String>,
+    pub attestation_hash: Option<String>,
+}
+
+pub async fn list_requests(
+    conn: &Connection,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<RequestListRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.id, r.method, r.path, r.response_status, r.duration_ms, \
+                    r.request_at, r.error, r.attempt_number, r.credential_nonce, \
+                    c.transport, c.base_url, c.attestation_hash \
+             FROM request r \
+             LEFT JOIN connection c ON c.id = r.connection_id \
+             ORDER BY r.request_at DESC, r.id DESC \
+             LIMIT ?1 OFFSET ?2",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query([limit, offset]).await.map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(RequestListRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            method: row.get::<String>(1).map_err(AppError::db)?,
+            path: row.get::<String>(2).map_err(AppError::db)?,
+            response_status: row.get::<Option<i64>>(3).map_err(AppError::db)?,
+            duration_ms: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+            request_at: row.get::<i64>(5).map_err(AppError::db)?,
+            error: row.get::<Option<String>>(6).map_err(AppError::db)?,
+            attempt_number: row.get::<i64>(7).map_err(AppError::db)?,
+            credential_nonce: row.get::<Option<String>>(8).map_err(AppError::db)?,
+            transport: row.get::<Option<String>>(9).map_err(AppError::db)?,
+            base_url: row.get::<Option<String>>(10).map_err(AppError::db)?,
+            attestation_hash: row.get::<Option<String>>(11).map_err(AppError::db)?,
+        });
+    }
+    Ok(results)
+}
+
+/// The full stored request/response pair, raw bodies included.
+pub struct RequestDetailRow {
+    pub id: String,
+    pub method: String,
+    pub path: String,
+    pub request_headers: Option<String>,
+    pub request_body: Option<Vec<u8>>,
+    pub response_status: Option<i64>,
+    pub response_headers: Option<String>,
+    pub response_body: Option<Vec<u8>>,
+    pub request_at: i64,
+    pub response_at: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub error: Option<String>,
+    pub retry_of_id: Option<String>,
+    pub attempt_number: i64,
+    pub credential_nonce: Option<String>,
+    pub action_id: Option<String>,
+    pub transport: Option<String>,
+    pub base_url: Option<String>,
+    pub attestation_hash: Option<String>,
+    pub space_id: Option<String>,
+    pub space_title: Option<String>,
+}
+
+pub async fn get_request(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<RequestDetailRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.id, r.method, r.path, r.request_headers, r.request_body, \
+                    r.response_status, r.response_headers, r.response_body, \
+                    r.request_at, r.response_at, r.duration_ms, r.error, \
+                    r.retry_of_id, r.attempt_number, r.credential_nonce, r.action_id, \
+                    c.transport, c.base_url, c.attestation_hash, \
+                    a.space_id, s.title \
+             FROM request r \
+             LEFT JOIN connection c ON c.id = r.connection_id \
+             LEFT JOIN action a ON a.id = r.action_id \
+             LEFT JOIN space s ON s.id = a.space_id \
+             WHERE r.id = ?1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(RequestDetailRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            method: row.get::<String>(1).map_err(AppError::db)?,
+            path: row.get::<String>(2).map_err(AppError::db)?,
+            request_headers: row.get::<Option<String>>(3).map_err(AppError::db)?,
+            request_body: row.get::<Option<Vec<u8>>>(4).map_err(AppError::db)?,
+            response_status: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+            response_headers: row.get::<Option<String>>(6).map_err(AppError::db)?,
+            response_body: row.get::<Option<Vec<u8>>>(7).map_err(AppError::db)?,
+            request_at: row.get::<i64>(8).map_err(AppError::db)?,
+            response_at: row.get::<Option<i64>>(9).map_err(AppError::db)?,
+            duration_ms: row.get::<Option<i64>>(10).map_err(AppError::db)?,
+            error: row.get::<Option<String>>(11).map_err(AppError::db)?,
+            retry_of_id: row.get::<Option<String>>(12).map_err(AppError::db)?,
+            attempt_number: row.get::<i64>(13).map_err(AppError::db)?,
+            credential_nonce: row.get::<Option<String>>(14).map_err(AppError::db)?,
+            action_id: row.get::<Option<String>>(15).map_err(AppError::db)?,
+            transport: row.get::<Option<String>>(16).map_err(AppError::db)?,
+            base_url: row.get::<Option<String>>(17).map_err(AppError::db)?,
+            attestation_hash: row.get::<Option<String>>(18).map_err(AppError::db)?,
+            space_id: row.get::<Option<String>>(19).map_err(AppError::db)?,
+            space_title: row.get::<Option<String>>(20).map_err(AppError::db)?,
+        })),
+    }
+}
+
+/// One row of the `spend_trail` view: credential → request → action → space.
+pub struct SpendTrailRow {
+    pub credential_nonce: String,
+    pub spend_amount: Option<i64>,
+    pub credential_state: String,
+    pub request_id: String,
+    pub method: String,
+    pub path: String,
+    pub request_at: i64,
+    pub duration_ms: Option<i64>,
+    pub attempt_number: i64,
+    pub action_id: Option<String>,
+    pub action_type: Option<String>,
+    pub model: Option<String>,
+    pub credits_consumed: Option<i64>,
+    pub intent: Option<String>,
+    pub space_id: Option<String>,
+    pub space_title: Option<String>,
+    pub linkability: Option<String>,
+}
+
+pub async fn list_spend_trail(
+    conn: &Connection,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<SpendTrailRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT credential_nonce, spend_amount, credential_state, request_id, \
+                    method, path, request_at, duration_ms, attempt_number, \
+                    action_id, action_type, model, credits_consumed, intent, \
+                    space_id, space_title, linkability \
+             FROM spend_trail \
+             ORDER BY request_at DESC, request_id DESC \
+             LIMIT ?1 OFFSET ?2",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query([limit, offset]).await.map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(SpendTrailRow {
+            credential_nonce: row.get::<String>(0).map_err(AppError::db)?,
+            spend_amount: row.get::<Option<i64>>(1).map_err(AppError::db)?,
+            credential_state: row.get::<String>(2).map_err(AppError::db)?,
+            request_id: row.get::<String>(3).map_err(AppError::db)?,
+            method: row.get::<String>(4).map_err(AppError::db)?,
+            path: row.get::<String>(5).map_err(AppError::db)?,
+            request_at: row.get::<i64>(6).map_err(AppError::db)?,
+            duration_ms: row.get::<Option<i64>>(7).map_err(AppError::db)?,
+            attempt_number: row.get::<i64>(8).map_err(AppError::db)?,
+            action_id: row.get::<Option<String>>(9).map_err(AppError::db)?,
+            action_type: row.get::<Option<String>>(10).map_err(AppError::db)?,
+            model: row.get::<Option<String>>(11).map_err(AppError::db)?,
+            credits_consumed: row.get::<Option<i64>>(12).map_err(AppError::db)?,
+            intent: row.get::<Option<String>>(13).map_err(AppError::db)?,
+            space_id: row.get::<Option<String>>(14).map_err(AppError::db)?,
+            space_title: row.get::<Option<String>>(15).map_err(AppError::db)?,
+            linkability: row.get::<Option<String>>(16).map_err(AppError::db)?,
+        });
+    }
+    Ok(results)
+}
+
+/// One row per credential, with the lifecycle state computed by the
+/// `credential_lifecycle` view (`active` / `spending` / `spent` / `expired`).
+pub struct CredentialLifecycleRow {
+    pub nonce: String,
+    pub credits: i64,
+    pub generation: i64,
+    pub created_at: i64,
+    pub state: String,
+    pub spend_amount: Option<i64>,
+}
+
+pub async fn list_credential_lifecycle(
+    conn: &Connection,
+) -> Result<Vec<CredentialLifecycleRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT nonce, credits, generation, created_at, state, spend_amount \
+             FROM credential_lifecycle \
+             ORDER BY created_at DESC, nonce",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(CredentialLifecycleRow {
+            nonce: row.get::<String>(0).map_err(AppError::db)?,
+            credits: row.get::<i64>(1).map_err(AppError::db)?,
+            generation: row.get::<i64>(2).map_err(AppError::db)?,
+            created_at: row.get::<i64>(3).map_err(AppError::db)?,
+            state: row.get::<String>(4).map_err(AppError::db)?,
+            spend_amount: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+        });
+    }
+    Ok(results)
+}
+
+// ---------------------------------------------------------------------------
 // Migrations
 // ---------------------------------------------------------------------------
 
@@ -1118,6 +1488,380 @@ mod tests {
         let conn = db.connect().unwrap();
         initialize(&conn).await.unwrap();
         assert_eq!(get_user_version(&conn).await.unwrap(), LATEST_VERSION);
+    }
+
+    async fn add_user_action(
+        conn: &Connection,
+        space_id: &str,
+        participant_id: &str,
+        text: &str,
+        created_at: i64,
+    ) {
+        let action_id = uuid::Uuid::now_v7().to_string();
+        insert_action(
+            conn,
+            &ActionEntry {
+                id: action_id.clone(),
+                space_id: space_id.to_string(),
+                participant_id: participant_id.to_string(),
+                action_type: "user_input".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at,
+            },
+        )
+        .await
+        .unwrap();
+        insert_text_content_block(
+            conn,
+            &uuid::Uuid::now_v7().to_string(),
+            &action_id,
+            0,
+            "text",
+            text,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_spaces_reports_activity_and_excludes_archived() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+
+        // Space A: titled, two actions (latest at t=3000).
+        insert_space(&conn, "space-a", Some("Alpha"), "unlinked", 1_000)
+            .await
+            .unwrap();
+        add_user_action(&conn, "space-a", &user, "first question", 2_000).await;
+        add_user_action(&conn, "space-a", &user, "follow-up", 3_000).await;
+
+        // Space B: untitled, one action, more recent activity.
+        insert_space(&conn, "space-b", None, "unlinked", 1_500)
+            .await
+            .unwrap();
+        add_user_action(&conn, "space-b", &user, "what is a monad?", 4_000).await;
+
+        // Space C: empty (no actions yet).
+        insert_space(&conn, "space-c", None, "unlinked", 5_000)
+            .await
+            .unwrap();
+
+        // Space D: archived.
+        insert_space(&conn, "space-d", Some("Old"), "unlinked", 500)
+            .await
+            .unwrap();
+        assert!(archive_space(&conn, "space-d", 6_000).await.unwrap());
+
+        let rows = list_spaces(&conn, false).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        // Ordered by last activity, most recent first; archived excluded.
+        assert_eq!(ids, vec!["space-c", "space-b", "space-a"]);
+
+        let a = rows.iter().find(|r| r.id == "space-a").unwrap();
+        assert_eq!(a.title.as_deref(), Some("Alpha"));
+        assert_eq!(a.last_activity_at, 3_000);
+        assert_eq!(a.message_count, 2);
+        assert!(a.archived_at.is_none());
+
+        let b = rows.iter().find(|r| r.id == "space-b").unwrap();
+        assert!(b.title.is_none());
+        assert_eq!(b.last_activity_at, 4_000);
+        assert_eq!(b.message_count, 1);
+
+        // Empty space falls back to its own created_at.
+        let c = rows.iter().find(|r| r.id == "space-c").unwrap();
+        assert_eq!(c.last_activity_at, 5_000);
+        assert_eq!(c.message_count, 0);
+
+        // include_archived = true brings the archived space back.
+        let all = list_spaces(&conn, true).await.unwrap();
+        assert_eq!(all.len(), 4);
+        let d = all.iter().find(|r| r.id == "space-d").unwrap();
+        assert_eq!(d.archived_at, Some(6_000));
+
+        // Snippet source: first user text in the space.
+        assert_eq!(
+            first_user_text(&conn, "space-a").await.unwrap().as_deref(),
+            Some("first question")
+        );
+        assert_eq!(
+            first_user_text(&conn, "space-b").await.unwrap().as_deref(),
+            Some("what is a monad?")
+        );
+        assert_eq!(first_user_text(&conn, "space-c").await.unwrap(), None);
+    }
+
+    /// Seed a database with one connected story: two attestations, a
+    /// connection, three requests (one carrying a credential + action into a
+    /// space, one a retry, one errored), and a credential mid-spend. The
+    /// fixture all the Record query tests share.
+    async fn seed_record_fixture(conn: &Connection) {
+        // Wallet: issuer key + issued credential + a pending refund (spending).
+        upsert_issuer_key(
+            conn,
+            "ik-1",
+            "ph",
+            b"pub",
+            b"params",
+            99_999_999_999_999,
+            1_000,
+        )
+        .await
+        .unwrap();
+        insert_pre_credential_issuance(conn, "pc-1", "ik-1", b"pre", 10_000, 1_000)
+            .await
+            .unwrap();
+        insert_credential(conn, "nonce-1", "pc-1", "ik-1", b"cred", 10_000, 0, 1_100)
+            .await
+            .unwrap();
+        insert_pre_credential_refund(
+            conn, "pc-2", "nonce-1", "ik-1", b"pre2", 700, b"proof", 2_000,
+        )
+        .await
+        .unwrap();
+
+        // Transport: provider, attestations, connection.
+        let provider = ensure_provider(conn, "eidola", "inference", 1_000)
+            .await
+            .unwrap();
+        upsert_attestation(conn, "att-old", b"{\"v\":1}", None, 1_000)
+            .await
+            .unwrap();
+        upsert_attestation(conn, "att-new", b"{\"v\":2}", Some("pcr-abc"), 2_000)
+            .await
+            .unwrap();
+        insert_connection(
+            conn,
+            "conn-1",
+            &provider,
+            "https://e.example",
+            "clearnet",
+            Some("att-new"),
+            2_100,
+            2_100,
+        )
+        .await
+        .unwrap();
+
+        // Semantic: space + participant + a costed inference action.
+        insert_space(conn, "space-1", Some("Tides"), "unlinked", 1_000)
+            .await
+            .unwrap();
+        let agent = ensure_participant(conn, "agent", "eidola", None, 1_000)
+            .await
+            .unwrap();
+        insert_action(
+            conn,
+            &ActionEntry {
+                id: "act-1".into(),
+                space_id: "space-1".into(),
+                participant_id: agent,
+                action_type: "inference".into(),
+                status: "complete".into(),
+                intent: Some("answer".into()),
+                model: Some("gemma4-31b".into()),
+                input_tokens: Some(120),
+                output_tokens: Some(480),
+                credits_consumed: Some(700),
+                created_at: 2_200,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Requests: chat (credential-bearing, newest), a retry of it, and an
+        // older errored one with no connection.
+        insert_request(
+            conn,
+            &Request {
+                id: "req-err".into(),
+                connection_id: None,
+                action_id: None,
+                method: "GET".into(),
+                path: "/v1/models".into(),
+                request_headers: None,
+                request_body: None,
+                response_status: None,
+                response_headers: None,
+                response_body: None,
+                request_at: 1_500,
+                response_at: None,
+                duration_ms: None,
+                error: Some("connection refused".into()),
+                credential_nonce: None,
+                created_at: 1_500,
+            },
+        )
+        .await
+        .unwrap();
+        insert_request(
+            conn,
+            &Request {
+                id: "req-chat".into(),
+                connection_id: Some("conn-1".into()),
+                action_id: Some("act-1".into()),
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                request_headers: Some("content-type: application/json".into()),
+                request_body: Some(b"{\"model\":\"gemma4-31b\"}".to_vec()),
+                response_status: Some(200),
+                response_headers: Some("content-type: application/json".into()),
+                response_body: Some(b"{\"ok\":true}".to_vec()),
+                request_at: 2_200,
+                response_at: Some(2_900),
+                duration_ms: Some(700),
+                error: None,
+                credential_nonce: Some("nonce-1".into()),
+                created_at: 2_200,
+            },
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE request SET retry_of_id = 'req-err', attempt_number = 2 \
+             WHERE id = 'req-chat'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn record_attestation_queries() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        seed_record_fixture(&conn).await;
+
+        let rows = list_attestations(&conn, 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first.
+        assert_eq!(rows[0].hash, "att-new");
+        assert_eq!(rows[0].pcr_digest.as_deref(), Some("pcr-abc"));
+        assert_eq!(rows[0].doc_bytes, 7);
+        assert_eq!(rows[0].connection_count, 1);
+        assert_eq!(rows[1].hash, "att-old");
+        assert_eq!(rows[1].connection_count, 0);
+
+        // Pagination.
+        let page2 = list_attestations(&conn, 1, 1).await.unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].hash, "att-old");
+
+        // Detail returns the raw stored document.
+        let doc = get_attestation(&conn, "att-new").await.unwrap().unwrap();
+        assert_eq!(doc.doc, b"{\"v\":2}");
+        assert_eq!(doc.created_at, 2_000);
+        assert!(get_attestation(&conn, "missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn record_request_queries() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        seed_record_fixture(&conn).await;
+
+        let rows = list_requests(&conn, 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first, joined connection metadata present.
+        assert_eq!(rows[0].id, "req-chat");
+        assert_eq!(rows[0].method, "POST");
+        assert_eq!(rows[0].response_status, Some(200));
+        assert_eq!(rows[0].duration_ms, Some(700));
+        assert_eq!(rows[0].attempt_number, 2);
+        assert_eq!(rows[0].credential_nonce.as_deref(), Some("nonce-1"));
+        assert_eq!(rows[0].transport.as_deref(), Some("clearnet"));
+        assert_eq!(rows[0].attestation_hash.as_deref(), Some("att-new"));
+        // Connection-less request still lists, with NULL transport.
+        assert_eq!(rows[1].id, "req-err");
+        assert_eq!(rows[1].error.as_deref(), Some("connection refused"));
+        assert!(rows[1].transport.is_none());
+
+        // Pagination.
+        let page2 = list_requests(&conn, 1, 1).await.unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].id, "req-err");
+
+        // Detail carries the raw bodies, headers, and retry linkage.
+        let d = get_request(&conn, "req-chat").await.unwrap().unwrap();
+        assert_eq!(
+            d.request_body.as_deref(),
+            Some(b"{\"model\":\"gemma4-31b\"}".as_slice())
+        );
+        assert_eq!(
+            d.response_body.as_deref(),
+            Some(b"{\"ok\":true}".as_slice())
+        );
+        assert_eq!(
+            d.request_headers.as_deref(),
+            Some("content-type: application/json")
+        );
+        assert_eq!(d.retry_of_id.as_deref(), Some("req-err"));
+        assert_eq!(d.action_id.as_deref(), Some("act-1"));
+        assert_eq!(d.base_url.as_deref(), Some("https://e.example"));
+        assert!(get_request(&conn, "missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn record_spend_trail_and_lifecycle() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        seed_record_fixture(&conn).await;
+
+        // The credential has a pending refund and no successor → spending.
+        let trail = list_spend_trail(&conn, 10, 0).await.unwrap();
+        assert_eq!(trail.len(), 1, "only the credential-bearing request joins");
+        let t = &trail[0];
+        assert_eq!(t.credential_nonce, "nonce-1");
+        assert_eq!(t.credential_state, "spending");
+        assert_eq!(t.spend_amount, Some(700));
+        assert_eq!(t.request_id, "req-chat");
+        assert_eq!(t.action_id.as_deref(), Some("act-1"));
+        assert_eq!(t.model.as_deref(), Some("gemma4-31b"));
+        assert_eq!(t.credits_consumed, Some(700));
+        assert_eq!(t.space_id.as_deref(), Some("space-1"));
+        assert_eq!(t.space_title.as_deref(), Some("Tides"));
+        assert_eq!(t.linkability.as_deref(), Some("unlinked"));
+
+        let lc = list_credential_lifecycle(&conn).await.unwrap();
+        assert_eq!(lc.len(), 1);
+        assert_eq!(lc[0].state, "spending");
+        assert_eq!(lc[0].spend_amount, Some(700));
+
+        // Issuing the successor credential settles the spend → spent.
+        insert_credential(&conn, "nonce-2", "pc-2", "ik-1", b"cred2", 9_300, 1, 3_000)
+            .await
+            .unwrap();
+        let trail = list_spend_trail(&conn, 10, 0).await.unwrap();
+        assert_eq!(trail[0].credential_state, "spent");
+        let lc = list_credential_lifecycle(&conn).await.unwrap();
+        let states: Vec<(&str, &str)> = lc
+            .iter()
+            .map(|r| (r.nonce.as_str(), r.state.as_str()))
+            .collect();
+        assert_eq!(states, vec![("nonce-2", "active"), ("nonce-1", "spent")]);
+
+        // An expired issuer key flips its credentials to expired.
+        upsert_issuer_key(&conn, "ik-exp", "ph", b"pub", b"params", 1, 1_000)
+            .await
+            .unwrap();
+        insert_pre_credential_issuance(&conn, "pc-exp", "ik-exp", b"pre", 5, 4_000)
+            .await
+            .unwrap();
+        insert_credential(&conn, "nonce-exp", "pc-exp", "ik-exp", b"c", 5, 0, 4_000)
+            .await
+            .unwrap();
+        let lc = list_credential_lifecycle(&conn).await.unwrap();
+        let exp = lc.iter().find(|r| r.nonce == "nonce-exp").unwrap();
+        assert_eq!(exp.state, "expired");
     }
 
     #[tokio::test]

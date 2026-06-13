@@ -47,7 +47,7 @@ enum Command {
     Chat {
         /// The prompt to send
         prompt: String,
-        /// Model to use (defaults to first available)
+        /// Model to use (defaults to the configured `default_model`)
         #[arg(long, short)]
         model: Option<String>,
         /// Continue an existing conversation by space ID
@@ -59,11 +59,26 @@ enum Command {
         #[command(subcommand)]
         command: SpacesCommand,
     },
-    /// Check for a newer release and run the full verification pipeline
-    /// (CI Sigstore + human SSH+Rekor + template equality). Prints the
-    /// verified attestation prose. Does not install — that's a future
-    /// `--install` flag on this command once step 5 lands.
+    /// Check for and verify newer releases
     Update {
+        #[command(subcommand)]
+        command: UpdateCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum UpdateCommand {
+    /// Check whether a verified newer release exists (the release marked
+    /// `latest`, verified against the embedded trust root) and print the
+    /// outcome. States mirror the GUI's Updates window: up to date /
+    /// update available / unverifiable (security warning, exit code 2) /
+    /// claims changed (side-by-side, exit code 3) / check failed.
+    Check,
+    /// Run the full self-update verification pipeline (CI Sigstore +
+    /// human cosign+Rekor + template equality) against `release.json`.
+    /// Prints the verified attestation prose. Does not install — that's
+    /// a future `--install` flag once step 5 lands.
+    Verify {
         /// Pin the installed version explicitly (default: this binary's
         /// compile-time version). Useful for testing the continuity gate.
         #[arg(long)]
@@ -139,11 +154,22 @@ enum CredentialsCommand {
 #[derive(Subcommand)]
 enum SpacesCommand {
     /// List active conversation spaces
-    List,
+    List {
+        /// Include archived spaces
+        #[arg(long)]
+        archived: bool,
+    },
     /// Archive a conversation space
     Archive {
         /// Space ID to archive
         id: String,
+    },
+    /// Rename a conversation space
+    Rename {
+        /// Space ID to rename
+        id: String,
+        /// New title
+        title: String,
     },
 }
 
@@ -169,6 +195,24 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("error: {e}");
+        // The typed onboarding errors get actionable hints. (Chat
+        // auto-provisions credentials from the account balance, so these
+        // only fire when the account itself is missing or unfunded.) Look
+        // through the `ChatFailed` wrapper that `chat`/`chat_stream` attach
+        // once a space is persisted, so a wrapped `NoAccount` /
+        // `InsufficientBalance` still routes to its hint.
+        match e.root() {
+            AppError::NoAccount => {
+                eprintln!("hint: run `eidola account create` to create an anonymous account");
+            }
+            AppError::InsufficientBalance { .. } => {
+                eprintln!(
+                    "hint: run `eidola account prices`, then \
+                     `eidola account checkout <price_id>` to add credit"
+                );
+            }
+            _ => {}
+        }
         std::process::exit(1);
     }
 }
@@ -179,6 +223,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             let state = core.config_state();
             println!("config path: {:?}", config::default_config_path());
             println!("base_url: {}", state.base_url);
+            println!("default_model: {}", state.default_model);
             println!(
                 "account_id: {}",
                 if state.has_account {
@@ -422,7 +467,10 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             model,
             space,
         }) => {
-            let model = model.unwrap_or_else(|| "gemma4-31b".to_string());
+            // No --model flag → the user's configured default (the
+            // `default_model` override, falling back to the embedded
+            // default).
+            let model = model.unwrap_or_else(|| core.config_state().default_model);
 
             // Stream chunks straight to stdout. Reasoning goes to stderr
             // (dim, prefixed with "thinking: ") so a piped stdout still
@@ -483,15 +531,24 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             Ok(())
         }
         Some(Command::Spaces { command }) => match command {
-            SpacesCommand::List => {
-                let spaces = core.list_spaces().await?;
+            SpacesCommand::List { archived } => {
+                let spaces = core.list_spaces(archived).await?;
                 if spaces.is_empty() {
                     println!("no active spaces");
                     return Ok(());
                 }
                 for s in &spaces {
-                    let title = s.title.as_deref().unwrap_or("<untitled>");
-                    println!("{}: {}", s.id, title);
+                    let title = s
+                        .title
+                        .as_deref()
+                        .or(s.snippet.as_deref())
+                        .unwrap_or("<untitled>");
+                    let marker = if s.archived_at.is_some() {
+                        " [archived]"
+                    } else {
+                        ""
+                    };
+                    println!("{}: {}{}", s.id, title, marker);
                 }
                 Ok(())
             }
@@ -504,12 +561,37 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 }
                 Ok(())
             }
+            SpacesCommand::Rename { id, title } => {
+                core.rename_space(id.clone(), title).await?;
+                println!("renamed space {id}");
+                Ok(())
+            }
         },
         Some(Command::Update {
-            installed_version,
-            installed_git_commit,
-            fixtures_dir,
-            verbose,
+            command: UpdateCommand::Check,
+        }) => {
+            let snapshot = core.update_check().await;
+            print_update_check(&snapshot);
+            match snapshot.result {
+                // Distinct exit codes so scripts can route on the two
+                // states that need a human decision.
+                eidola_app_core::updates::UpdateCheckResult::Unverifiable { .. } => {
+                    std::process::exit(2);
+                }
+                eidola_app_core::updates::UpdateCheckResult::ClaimsChanged { .. } => {
+                    std::process::exit(3);
+                }
+                _ => Ok(()),
+            }
+        }
+        Some(Command::Update {
+            command:
+                UpdateCommand::Verify {
+                    installed_version,
+                    installed_git_commit,
+                    fixtures_dir,
+                    verbose,
+                },
         }) => {
             let installed_version =
                 installed_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
@@ -547,6 +629,95 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Some(s) => print_release_summary(&s),
             }
             Ok(())
+        }
+    }
+}
+
+/// Print one `update check` outcome — the same five states the GUI's
+/// Updates window renders, sharing the core types.
+fn print_update_check(snapshot: &eidola_app_core::updates::UpdateCheckSnapshot) {
+    use eidola_app_core::updates::UpdateCheckResult;
+
+    match &snapshot.result {
+        UpdateCheckResult::UpToDate { latest_version } => {
+            println!("Eidola {} is up to date.", env!("CARGO_PKG_VERSION"));
+            match latest_version {
+                Some(v) => println!("latest release: v{v}"),
+                None => println!("no release is marked latest yet"),
+            }
+        }
+        UpdateCheckResult::UpdateAvailable { release } => {
+            println!(
+                "Eidola v{} is available — cryptographically verified.",
+                release.version
+            );
+            if release.claims_accepted {
+                println!(
+                    "(its claims differ from this build's expectations; you previously chose \
+                     to treat it as an update)"
+                );
+            }
+            println!("  signed by: {}", release.ci_identity);
+            println!(
+                "  rekor:     https://search.sigstore.dev/?logIndex={}",
+                release.rekor_log_index
+            );
+            if let Some(url) = &release.release_url {
+                println!("  release:   {url}");
+            }
+        }
+        UpdateCheckResult::Unverifiable {
+            version,
+            tag,
+            reason,
+        } => {
+            eprintln!("SECURITY WARNING: release v{version} ({tag}) could not be verified.");
+            eprintln!();
+            eprintln!("  {reason}");
+            eprintln!();
+            eprintln!(
+                "This may be a fake release or a compromised update channel. Do not download \
+                 or install it. This warning persists until a later check finds a verifiable \
+                 latest release."
+            );
+        }
+        UpdateCheckResult::ClaimsChanged {
+            release,
+            comparison,
+        } => {
+            println!(
+                "Release v{} verified cryptographically, but its attested claims differ \
+                 from what this build expects.",
+                release.version
+            );
+            println!();
+            println!("  {:<40} {:<44} attested", "claim", "expected");
+            for delta in &comparison.deltas {
+                println!(
+                    "  {:<40} {:<44} {}",
+                    delta.key,
+                    delta.expected.as_deref().unwrap_or("—"),
+                    delta.attested.as_deref().unwrap_or("—"),
+                );
+            }
+            println!();
+            println!(
+                "{} of {} expected claims match. This release is NOT treated as an update \
+                 until you explicitly accept the change in the app's Updates window \
+                 (Eidola menu → Check for Updates…).",
+                comparison.expected.len().saturating_sub(
+                    comparison
+                        .deltas
+                        .iter()
+                        .filter(|d| d.expected.is_some())
+                        .count()
+                ),
+                comparison.expected.len(),
+            );
+        }
+        UpdateCheckResult::CheckFailed { message } => {
+            println!("Couldn't check for updates (offline?).");
+            println!("  {message}");
         }
     }
 }

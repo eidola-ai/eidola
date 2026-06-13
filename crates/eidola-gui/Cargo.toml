@@ -37,14 +37,24 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 
 eidola-app-core = { path = "../eidola-app-core" }
 gpui-markdown-editor = { path = "../gpui-markdown-editor" }
+serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 # Pulls in `VisualTestAppContext` and `Window::render_to_image`. Cargo unifies
-# this with the regular `gpui` dep, so feature flags merge for dev/test builds.
+# this with the regular `gpui` dep, so feature flags merge for dev/test builds
+# — and for examples, which is how `examples/driver.rs` reaches the visual
+# test context outside `cargo test`.
 gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+# The driver example's JSON-lines protocol.
+serde = { version = "1", features = ["derive"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support", "font-kit"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Store-level tests (tests/stores.rs) build a real `AppCore` over tempdirs and
+# install the crypto provider (mirrors app-core's own test setup).
+tempfile = "3"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
 
 [[test]]
 name = "visual"

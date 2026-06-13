@@ -850,6 +850,13 @@ impl Render for MarkdownEditor {
         self.style.background = theme.background;
         self.style.caret_color = theme.caret;
         self.style.selection_color = theme.selection;
+        self.style.link_color = theme.link;
+        self.style.blockquote_border_color = theme.border;
+        self.style.thematic_break_color = theme.border;
+        self.style.inline_code_background = theme.accent;
+        self.style.code_block_background = theme.muted;
+        self.style.code_block_content_background =
+            crate::style::shift_lightness(theme.muted, -0.04);
 
         // Reset per-frame state. Block elements re-populate `last_blocks`
         // during paint.
@@ -912,6 +919,28 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::paste_plain))
+            // Map the Edit-menu action types (`gpui_component::input::*`)
+            // onto the editor's own implementations.  The OS routes the Edit
+            // menu through the responder chain via the `OsAction::*` selectors;
+            // those land as `gpui_component::input::{Cut,Copy,Paste,SelectAll}`
+            // dispatched to the focused element.  Without these handlers the
+            // actions fell through unhandled whenever the composer had focus.
+            .on_action(cx.listener(|this, _: &gpui_component::input::Cut, w, cx| {
+                this.cut(&Cut, w, cx);
+            }))
+            .on_action(cx.listener(|this, _: &gpui_component::input::Copy, w, cx| {
+                this.copy(&Copy, w, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &gpui_component::input::Paste, w, cx| {
+                    this.paste(&Paste, w, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &gpui_component::input::SelectAll, w, cx| {
+                    this.select_all(&SelectAll, w, cx);
+                }),
+            )
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
