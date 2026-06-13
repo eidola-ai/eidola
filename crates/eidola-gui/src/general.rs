@@ -29,6 +29,7 @@ use gpui_component::{
 };
 
 use crate::actions::OpenRecord;
+use crate::probe::Probe as _;
 use crate::stores::ConfigStore;
 use crate::window_input::WindowInput;
 
@@ -172,25 +173,51 @@ impl Render for GeneralView {
         // --- Base URL: honest about override vs pin --------------------
         let mut base_value = v_flex().flex_1().gap_1();
         if self.editing_base_url {
-            base_value = base_value.child(Input::new(&self.base_url_state)).child(
-                h_flex()
-                    .gap_2()
-                    .pt_1()
-                    .child(
-                        Button::new("save-base-url")
-                            .primary()
-                            .small()
-                            .label("Save")
-                            .on_click(cx.listener(|this, _, _, cx| this.save_base_url(cx))),
-                    )
-                    .child(
-                        Button::new("cancel-base-url")
-                            .ghost()
-                            .small()
-                            .label("Cancel")
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel_edit_base_url(cx))),
-                    ),
-            );
+            base_value = base_value
+                .child(
+                    // Probed wrapper for the a11y role/label — probe the
+                    // wrapping div, not the gpui-component Input.
+                    div()
+                        .id("base-url-input-wrap")
+                        .probe(
+                            "settings/general/base-url",
+                            gpui::Role::TextInput,
+                            "Base URL",
+                        )
+                        .w_full()
+                        .flex()
+                        .child(Input::new(&self.base_url_state).flex_1()),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .pt_1()
+                        .child(
+                            // Probed wrapper for the a11y role/label — shrink-wraps
+                            // the button so its bounds are an honest click target.
+                            div()
+                                .id("save-base-url-wrap")
+                                .probe("settings/general/save", gpui::Role::Button, "Save")
+                                .child(
+                                    Button::new("save-base-url")
+                                        .primary()
+                                        .small()
+                                        .label("Save")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.save_base_url(cx)),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            Button::new("cancel-base-url")
+                                .ghost()
+                                .small()
+                                .label("Cancel")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.cancel_edit_base_url(cx)),
+                                ),
+                        ),
+                );
         } else if let Some(s) = state.as_ref() {
             base_value = base_value.child(
                 div()
@@ -216,6 +243,11 @@ impl Render for GeneralView {
             if s.base_url_is_override {
                 links = links.child(
                     quiet_link("revert-base-url", "Revert to pin", cx)
+                        .probe(
+                            "settings/general/revert-to-pin",
+                            gpui::Role::Button,
+                            "Revert to pin",
+                        )
                         .on_click(cx.listener(|this, _, _, cx| this.revert_base_url(cx))),
                 );
             }

@@ -20,6 +20,7 @@ use gpui_component::{
 };
 
 use crate::plans::{self, format_credits};
+use crate::probe::Probe as _;
 use crate::stores::{AccountStore, ConfigStore};
 
 pub struct AccountView {
@@ -188,21 +189,42 @@ impl Render for AccountView {
                             h_flex()
                                 .gap_2()
                                 .child(
-                                    Button::new("confirm-reset")
-                                        .danger()
-                                        .small()
-                                        .label("Reset account")
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.confirm_reset(cx)),
+                                    // Probed wrapper for the a11y role/label —
+                                    // shrink-wraps the button so its bounds are
+                                    // an honest click target.
+                                    div()
+                                        .id("confirm-reset-wrap")
+                                        .probe(
+                                            "settings/account/reset-confirm",
+                                            gpui::Role::Button,
+                                            "Reset account",
+                                        )
+                                        .child(
+                                            Button::new("confirm-reset")
+                                                .danger()
+                                                .small()
+                                                .label("Reset account")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.confirm_reset(cx)
+                                                })),
                                         ),
                                 )
                                 .child(
-                                    Button::new("cancel-reset")
-                                        .ghost()
-                                        .small()
-                                        .label("Keep account")
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.cancel_reset(cx)),
+                                    div()
+                                        .id("cancel-reset-wrap")
+                                        .probe(
+                                            "settings/account/reset-cancel",
+                                            gpui::Role::Button,
+                                            "Keep account",
+                                        )
+                                        .child(
+                                            Button::new("cancel-reset")
+                                                .ghost()
+                                                .small()
+                                                .label("Keep account")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.cancel_reset(cx)
+                                                })),
                                         ),
                                 ),
                         ),
@@ -212,6 +234,11 @@ impl Render for AccountView {
                     h_flex().pt_1().text_xs().child(
                         div()
                             .id("request-reset")
+                            .probe(
+                                "settings/account/reset",
+                                gpui::Role::Button,
+                                "Reset account…",
+                            )
                             .cursor_pointer()
                             .text_color(theme.muted_foreground)
                             .hover(|s| s.text_color(theme.danger))
@@ -230,13 +257,24 @@ impl Render for AccountView {
                 )
                 .child(
                     h_flex().child(
-                        Button::new("create-account")
-                            .primary()
-                            .small()
-                            .label("Create account")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.account.update(cx, |s, cx| s.create_account(cx));
-                            })),
+                        // Probed wrapper for the a11y role/label — shrink-wraps
+                        // the button so its bounds are an honest click target.
+                        div()
+                            .id("create-account-wrap")
+                            .probe(
+                                "settings/account/create",
+                                gpui::Role::Button,
+                                "Create account",
+                            )
+                            .child(
+                                Button::new("create-account")
+                                    .primary()
+                                    .small()
+                                    .label("Create account")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.account.update(cx, |s, cx| s.create_account(cx));
+                                    })),
+                            ),
                     ),
                 );
         }

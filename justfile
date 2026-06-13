@@ -107,6 +107,13 @@ render-snapshots *args:
 render-snapshots-update:
     UPDATE_SNAPSHOTS=1 cargo test -p eidola-gui --test visual
 
+# Interactive UI driver for agent-led QA: real offscreen-rendered windows
+# driven over a JSON-lines stdin/stdout protocol (open scenes, list named
+# elements, click, type, screenshot). Protocol docs in
+# crates/eidola-gui/examples/driver.rs.
+driver:
+    cargo run -p eidola-gui --example driver
+
 # Run all tests
 test:
     cargo test

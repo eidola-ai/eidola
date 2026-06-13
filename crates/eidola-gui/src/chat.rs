@@ -24,6 +24,7 @@ use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownStyle};
 
 use crate::actions::CloseWindow;
 use crate::plans::format_credits;
+use crate::probe::Probe as _;
 // Re-exported for the chat surface's consumers (tests construct
 // `StreamingResponse` / read `ChatMessageView` through `eidola_gui::chat`).
 pub use crate::space::{ChatMessageView, StreamingResponse};
@@ -1689,6 +1690,7 @@ impl ChatView {
         // it. The div carries no scroll — the `list()` owns scrolling.
         div()
             .id("transcript")
+            .probe("chat/transcript", gpui::Role::Group, "Transcript")
             .w_full()
             .flex_1()
             .min_h_0()
@@ -2028,15 +2030,21 @@ impl ChatView {
         ));
         let ts = self.cached_text_state(TextKey::ErrorBand, &err, cx);
         container = container.child(
-            div().w_full().px_5().text_color(c_danger).child(
-                prose_row().child(
-                    prose().child(
-                        TextView::new(&ts)
-                            .selectable(true)
-                            .style(markdown_style.clone()),
+            div()
+                .id("chat-error")
+                .probe("chat/error", gpui::Role::Alert, err.clone())
+                .w_full()
+                .px_5()
+                .text_color(c_danger)
+                .child(
+                    prose_row().child(
+                        prose().child(
+                            TextView::new(&ts)
+                                .selectable(true)
+                                .style(markdown_style.clone()),
+                        ),
                     ),
                 ),
-            ),
         );
 
         // A submit that failed with `InsufficientBalance` surfaces the plans
@@ -2103,6 +2111,8 @@ impl ChatView {
                 div().w_full().px_5().pb(composer_pb).child(
                     prose_row().child(
                         prose()
+                            .id("composer")
+                            .probe("chat/composer", gpui::Role::TextInput, "Message composer")
                             .min_h(composer_min_h)
                             .child(self.prompt_editor.clone()),
                     ),
@@ -2149,11 +2159,20 @@ impl ChatView {
 
         let mut action = v_flex().gap_3().items_start().child(
             h_flex().child(
-                Button::new("begin")
-                    .primary()
-                    .label("Begin")
-                    .disabled(ob.creating_account)
-                    .on_click(cx.listener(|this, _, _, cx| this.begin_onboarding(cx))),
+                // The probed wrapper carries the a11y role/label (the
+                // gpui-component Button has no a11y annotations at our pin);
+                // it shrink-wraps the button so its bounds are an honest
+                // click target.
+                div()
+                    .id("begin-wrap")
+                    .probe("chat/begin", gpui::Role::Button, "Begin")
+                    .child(
+                        Button::new("begin")
+                            .primary()
+                            .label("Begin")
+                            .disabled(ob.creating_account)
+                            .on_click(cx.listener(|this, _, _, cx| this.begin_onboarding(cx))),
+                    ),
             ),
         );
         if ob.creating_account {
@@ -2211,6 +2230,7 @@ impl ChatView {
         let skip = h_flex().pt_2().child(
             div()
                 .id("skip-plans")
+                .probe("chat/skip-plans", gpui::Role::Link, "I'll do this later")
                 .cursor_pointer()
                 .text_sm()
                 .text_color(theme.muted_foreground)
@@ -2269,6 +2289,7 @@ impl ChatView {
                     .child(
                         div()
                             .id("retry-plans")
+                            .probe("chat/retry-plans", gpui::Role::Link, "Try again")
                             .cursor_pointer()
                             .text_sm()
                             .text_color(theme.muted_foreground)
@@ -2643,9 +2664,15 @@ impl ChatView {
         }
 
         if stage == OnboardingStage::Ready && self.model_revealed(cx) {
+            let current = self.current_model(cx);
             band = band.child(
                 div()
                     .id("model-label")
+                    .probe(
+                        "chat/model-label",
+                        gpui::Role::Button,
+                        format!("Model: {current}"),
+                    )
                     .px_5()
                     .text_sm()
                     .italic()
@@ -2691,6 +2718,7 @@ impl ChatView {
 
         let mut panel = v_flex()
             .id("model-picker")
+            .probe("chat/model-picker", gpui::Role::ListBox, "Models")
             .occlude()
             .absolute()
             .top(TITLE_BAR_RESERVE)
@@ -2763,6 +2791,12 @@ impl ChatView {
             panel = panel.child(
                 v_flex()
                     .id(("model-row", idx))
+                    .probe(
+                        format!("chat/model-picker/row/{idx}"),
+                        gpui::Role::ListBoxOption,
+                        model.id.clone(),
+                    )
+                    .aria_selected(is_current)
                     .w_full()
                     .px_3()
                     .py_2()
@@ -2808,6 +2842,11 @@ impl ChatView {
             panel = panel.child(
                 div()
                     .id("set-default-model")
+                    .probe(
+                        "chat/model-picker/set-default",
+                        gpui::Role::Button,
+                        label.clone(),
+                    )
                     .w_full()
                     .px_3()
                     .py_2()

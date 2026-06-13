@@ -25,6 +25,7 @@ use gpui_component::{
 };
 
 use crate::actions::CloseWindow;
+use crate::probe::Probe as _;
 use crate::stores::{Stores, UpdateStore};
 
 /// Vertical reserve under the transparent titlebar so the traffic lights
@@ -183,6 +184,7 @@ impl Render for UpdatesView {
         let theme = cx.theme();
         let display = self.display(cx);
         let checking = self.update.read(cx).checking();
+        let check_label = if checking { "Checking…" } else { "Check Now" };
 
         let body: gpui::AnyElement = match &display {
             UpdatesDisplay::Checking => render_checking(cx).into_any_element(),
@@ -220,11 +222,20 @@ impl Render for UpdatesView {
                 .border_color(theme.border)
                 .gap_3()
                 .child(
-                    Button::new("check-now")
-                        .label(if checking { "Checking…" } else { "Check Now" })
-                        .small()
-                        .disabled(checking)
-                        .on_click(cx.listener(|this, _, _, cx| this.check_now(cx))),
+                    // The probed wrapper carries the a11y role/label (the
+                    // gpui-component Button has no a11y annotations at our
+                    // pin); it shrink-wraps the button so its bounds are an
+                    // honest click target.
+                    div()
+                        .id("check-now-wrap")
+                        .probe("updates/check", gpui::Role::Button, check_label)
+                        .child(
+                            Button::new("check-now")
+                                .label(check_label)
+                                .small()
+                                .disabled(checking)
+                                .on_click(cx.listener(|this, _, _, cx| this.check_now(cx))),
+                        ),
                 )
                 .child(div().flex_1())
                 .child(div().text_xs().text_color(theme.muted_foreground).child(
@@ -361,10 +372,17 @@ fn render_update_available(
         ));
     }
     col.child(div().h_2()).child(
-        Button::new("open-release")
-            .primary()
-            .label("View Release…")
-            .on_click(cx.listener(|this, _, _, cx| this.open_release_page(cx))),
+        // Probed wrapper for the a11y role/label — shrink-wraps the button so
+        // its bounds are an honest click target.
+        div()
+            .id("open-release-wrap")
+            .probe("updates/view-release", gpui::Role::Button, "View Release…")
+            .child(
+                Button::new("open-release")
+                    .primary()
+                    .label("View Release…")
+                    .on_click(cx.listener(|this, _, _, cx| this.open_release_page(cx))),
+            ),
     )
 }
 
@@ -489,11 +507,22 @@ fn render_claims_changed(
         )
         .child(
             h_flex().w_full().gap_2().child(
-                Button::new("treat-as-update")
-                    .outline()
-                    .label("Treat as Update")
-                    .small()
-                    .on_click(cx.listener(|this, _, _, cx| this.accept_claims(cx))),
+                // Probed wrapper for the a11y role/label — shrink-wraps the
+                // button so its bounds are an honest click target.
+                div()
+                    .id("treat-as-update-wrap")
+                    .probe(
+                        "updates/accept-claims",
+                        gpui::Role::Button,
+                        "Treat as Update",
+                    )
+                    .child(
+                        Button::new("treat-as-update")
+                            .outline()
+                            .label("Treat as Update")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| this.accept_claims(cx))),
+                    ),
             ),
         )
 }

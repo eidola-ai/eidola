@@ -17,6 +17,7 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use crate::account::AccountView;
 use crate::actions::CloseWindow;
 use crate::general::GeneralView;
+use crate::probe::Probe as _;
 use crate::stores::Stores;
 use crate::wallet::WalletView;
 use crate::window_input::WindowInput;
@@ -130,6 +131,12 @@ impl SettingsView {
         let active = self.selected == pane;
         let mut item = div()
             .id(pane.label())
+            .probe(
+                format!("settings/nav/{}", pane.label().to_lowercase()),
+                gpui::Role::Tab,
+                pane.label(),
+            )
+            .aria_selected(active)
             .w_full()
             .px_2p5()
             .py_1()
