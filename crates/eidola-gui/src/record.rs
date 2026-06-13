@@ -26,7 +26,7 @@ use eidola_app_core::{
 };
 use gpui::{
     AsyncApp, ClipboardItem, Context, Div, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
     UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
 };
 use gpui_component::{
@@ -197,6 +197,12 @@ struct Listing<T> {
     /// list closure stays O(visible).
     display: Vec<DisplayRow>,
     scroll: UniformListScrollHandle,
+    /// Supersede slot for this section's page fetch. Replacing the `Listing`
+    /// (refresh) drops the slot and cancels the in-flight task, so a
+    /// superseded fetch can never land late and append stale or duplicate
+    /// rows — replace-cancels, no generation counters
+    /// (`docs/architecture/state.md` → "Concurrency patterns").
+    task: Option<Task<()>>,
 }
 
 impl<T> Default for Listing<T> {
@@ -208,6 +214,7 @@ impl<T> Default for Listing<T> {
             loading: false,
             display: Vec::new(),
             scroll: UniformListScrollHandle::new(),
+            task: None,
         }
     }
 }
@@ -242,6 +249,18 @@ pub struct RecordView {
     detail: Option<DetailCache>,
     /// Identifier (hash or request id) of a detail fetch in flight.
     detail_pending: Option<String>,
+    /// Supersede slot for the detail fetch — one slot for both detail kinds,
+    /// so only the *latest* click's result can ever land (replace-cancels),
+    /// and closing the detail cancels the fetch outright.
+    detail_task: Option<Task<()>>,
+    /// The bus reported new Record rows since this window's last (re)fetch.
+    /// Surfaces the quiet "new entries — refresh" affordance in the strip;
+    /// rows are never mutated under the user's scroll position.
+    stale: bool,
+    /// `RecordStore` epoch this window last refreshed at.
+    seen_epoch: u64,
+    /// Keeps the `RecordStore` observation alive for the window's lifetime.
+    _record_observer: Subscription,
     error: Option<String>,
     focus_handle: FocusHandle,
 }
@@ -251,6 +270,17 @@ impl RecordView {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
+        // The Record is a window-scoped reader (the doctrine's "Record
+        // pattern"): it owns its rows and fetch tasks, and subscribes to the
+        // bus — via the RecordStore relay — only to mark itself stale.
+        let seen_epoch = stores.record.read(cx).epoch();
+        let record_observer = cx.observe(&stores.record, |this, store, cx| {
+            if store.read(cx).epoch() > this.seen_epoch && !this.stale {
+                this.stale = true;
+                cx.notify();
+            }
+        });
+
         let mut this = Self {
             stores,
             section: RecordSection::Attestations,
@@ -259,6 +289,10 @@ impl RecordView {
             spending: Listing::default(),
             detail: None,
             detail_pending: None,
+            detail_task: None,
+            stale: false,
+            seen_epoch,
+            _record_observer: record_observer,
             error: None,
             focus_handle,
         };
@@ -313,11 +347,18 @@ impl RecordView {
         self.detail_pending.as_deref()
     }
 
-    /// Switch sections. Closes any open detail; fetches the section's first
-    /// page on first visit.
+    /// Whether the bus has reported new Record rows since this window's last
+    /// (re)fetch.
+    pub fn stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Switch sections. Closes any open detail (cancelling an in-flight
+    /// detail fetch); fetches the section's first page on first visit.
     pub fn select_section(&mut self, section: RecordSection, cx: &mut Context<Self>) {
         self.detail = None;
         self.detail_pending = None;
+        self.detail_task = None;
         if self.section != section {
             self.section = section;
         }
@@ -332,14 +373,17 @@ impl RecordView {
         cx.notify();
     }
 
-    /// Re-fetch the current section from the top.
+    /// Re-fetch from the top. Resets every section — a Record change can
+    /// touch any of them, so the stale marker is only honest to clear if all
+    /// three re-read (the current one immediately; the others on next
+    /// visit). Replacing each `Listing` drops its in-flight fetch task, so a
+    /// superseded fetch can never land late and append duplicate rows.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        match self.section {
-            RecordSection::Attestations => self.attestations = Listing::default(),
-            RecordSection::Requests => self.requests = Listing::default(),
-            RecordSection::Spending => self.spending = Listing::default(),
-        }
-        self.rebuild_display(self.section);
+        self.attestations = Listing::default();
+        self.requests = Listing::default();
+        self.spending = Listing::default();
+        self.stale = false;
+        self.seen_epoch = self.stores.record.read(cx).epoch();
         self.fetch_page(self.section, cx);
         cx.notify();
     }
@@ -365,28 +409,33 @@ impl RecordView {
                 self.rebuild_display($section);
                 let offset = self.$listing.rows.len() as i64;
                 let rx = bridge::$helper(app_core, PAGE + 1, offset);
-                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                    let res = rx.await.unwrap_or_else(|_| {
-                        Err(AppError::Internal {
-                            message: "record query cancelled".into(),
-                        })
-                    });
-                    let _ = this.update(cx, |this, cx| {
-                        this.$listing.loading = false;
-                        this.$listing.loaded = true;
-                        match res {
-                            Ok(mut rows) => {
-                                this.$listing.has_more = rows.len() as i64 > PAGE;
-                                rows.truncate(PAGE as usize);
-                                this.$listing.rows.extend(rows);
+                // The listing owns its fetch (task-as-field): dropping the
+                // `Listing` (refresh) cancels the task, so only a fetch
+                // against the *current* listing can ever append rows.
+                self.$listing.task = Some(cx.spawn(
+                    async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                        let res = rx.await.unwrap_or_else(|_| {
+                            Err(AppError::Internal {
+                                message: "record query cancelled".into(),
+                            })
+                        });
+                        let _ = this.update(cx, |this, cx| {
+                            this.$listing.task = None;
+                            this.$listing.loading = false;
+                            this.$listing.loaded = true;
+                            match res {
+                                Ok(mut rows) => {
+                                    this.$listing.has_more = rows.len() as i64 > PAGE;
+                                    rows.truncate(PAGE as usize);
+                                    this.$listing.rows.extend(rows);
+                                }
+                                Err(e) => this.error = Some(e.to_string()),
                             }
-                            Err(e) => this.error = Some(e.to_string()),
-                        }
-                        this.rebuild_display($section);
-                        cx.notify();
-                    });
-                })
-                .detach();
+                            this.rebuild_display($section);
+                            cx.notify();
+                        });
+                    },
+                ));
             }};
         }
         match section {
@@ -408,28 +457,30 @@ impl RecordView {
             return;
         };
         let rx = bridge::attestation_detail(app_core, hash.clone());
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let res = rx.await.unwrap_or_else(|_| {
-                Err(AppError::Internal {
-                    message: "record query cancelled".into(),
-                })
-            });
-            let _ = this.update(cx, |this, cx| {
-                if this.detail_pending.as_deref() != Some(hash.as_str()) {
-                    return; // superseded by another click
-                }
-                this.detail_pending = None;
-                match res {
-                    Ok(Some(d)) => {
-                        this.detail = Some(DetailCache::build(RecordDetail::Attestation(d)))
+        // Replace-cancels: assigning the slot drops any in-flight detail
+        // fetch, so only the latest click's result can land — no staleness
+        // check needed.
+        self.detail_task = Some(cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let res = rx.await.unwrap_or_else(|_| {
+                    Err(AppError::Internal {
+                        message: "record query cancelled".into(),
+                    })
+                });
+                let _ = this.update(cx, |this, cx| {
+                    this.detail_task = None;
+                    this.detail_pending = None;
+                    match res {
+                        Ok(Some(d)) => {
+                            this.detail = Some(DetailCache::build(RecordDetail::Attestation(d)))
+                        }
+                        Ok(None) => this.error = Some(format!("attestation not found: {hash}")),
+                        Err(e) => this.error = Some(e.to_string()),
                     }
-                    Ok(None) => this.error = Some(format!("attestation not found: {hash}")),
-                    Err(e) => this.error = Some(e.to_string()),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+                    cx.notify();
+                });
+            },
+        ));
     }
 
     /// Open a request's raw request/response pair. Reachable from both the
@@ -442,34 +493,39 @@ impl RecordView {
             return;
         };
         let rx = bridge::request_detail(app_core, id.clone());
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let res = rx.await.unwrap_or_else(|_| {
-                Err(AppError::Internal {
-                    message: "record query cancelled".into(),
-                })
-            });
-            let _ = this.update(cx, |this, cx| {
-                if this.detail_pending.as_deref() != Some(id.as_str()) {
-                    return;
-                }
-                this.detail_pending = None;
-                match res {
-                    Ok(Some(d)) => {
-                        this.detail = Some(DetailCache::build(RecordDetail::Request(Box::new(d))))
+        // Replace-cancels, same as `open_attestation` — one slot covers both
+        // detail kinds, so the latest click always wins.
+        self.detail_task = Some(cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let res = rx.await.unwrap_or_else(|_| {
+                    Err(AppError::Internal {
+                        message: "record query cancelled".into(),
+                    })
+                });
+                let _ = this.update(cx, |this, cx| {
+                    this.detail_task = None;
+                    this.detail_pending = None;
+                    match res {
+                        Ok(Some(d)) => {
+                            this.detail =
+                                Some(DetailCache::build(RecordDetail::Request(Box::new(d))))
+                        }
+                        Ok(None) => this.error = Some(format!("request not found: {id}")),
+                        Err(e) => this.error = Some(e.to_string()),
                     }
-                    Ok(None) => this.error = Some(format!("request not found: {id}")),
-                    Err(e) => this.error = Some(e.to_string()),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+                    cx.notify();
+                });
+            },
+        ));
     }
 
-    /// Back from a detail to the section listing.
+    /// Back from a detail to the section listing. Dropping the detail task
+    /// cancels an in-flight fetch, so a slow detail can't reopen after the
+    /// user backed out.
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
         self.detail = None;
         self.detail_pending = None;
+        self.detail_task = None;
         cx.notify();
     }
 
@@ -517,6 +573,20 @@ impl RecordView {
         cx: &Context<Self>,
     ) -> usize {
         self.render_rows(self.section, range, cx).len()
+    }
+
+    /// Test hook: the current section's (row count, loading flag) — lets the
+    /// stale-fetch replay assert that a refresh during an in-flight fetch
+    /// resets the rows and starts a fresh (sole) fetch.
+    #[doc(hidden)]
+    pub fn listing_state_for_test(&self) -> (usize, bool) {
+        match self.section {
+            RecordSection::Attestations => {
+                (self.attestations.rows.len(), self.attestations.loading)
+            }
+            RecordSection::Requests => (self.requests.rows.len(), self.requests.loading),
+            RecordSection::Spending => (self.spending.rows.len(), self.spending.loading),
+        }
     }
 
     /// Test hook: number of display rows in the current section (data rows +
@@ -636,17 +706,26 @@ impl RecordView {
             strip = strip.child(label);
         }
 
+        // The bus-driven stale marker surfaces here: the refresh affordance
+        // quietly announces that new rows exist, instead of mutating the
+        // listing under the user's scroll position (the doctrine's "new
+        // entries — refresh" affordance).
+        let (refresh_label, refresh_color, refresh_hover) = if self.stale {
+            ("New entries — refresh", theme.link, theme.link_hover)
+        } else {
+            ("Refresh", theme.muted_foreground, theme.foreground)
+        };
         strip
             .child(div().flex_1())
             .child(
                 div()
                     .id("record-refresh")
-                    .probe("record/refresh", gpui::Role::Button, "Refresh")
+                    .probe("record/refresh", gpui::Role::Button, refresh_label)
                     .text_xs()
                     .cursor_pointer()
-                    .text_color(theme.muted_foreground)
-                    .hover(|s| s.text_color(theme.foreground))
-                    .child("Refresh")
+                    .text_color(refresh_color)
+                    .hover(move |s| s.text_color(refresh_hover))
+                    .child(refresh_label)
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             .child(
