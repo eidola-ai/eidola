@@ -136,6 +136,22 @@ pub struct ChatResult {
     pub credits_charged: i64,
 }
 
+/// Outcome of [`AppCore::post`] — saving a thought without requesting a
+/// response. Carries the (possibly newly created) space id and the persisted
+/// action/item ids so a caller can adopt them.
+#[derive(Clone, Debug)]
+pub struct PostResult {
+    pub space_id: String,
+    /// The persisted `user_input` action (gen 0 of a fresh item).
+    pub action_id: String,
+    /// The new item's stable identity (shared by future generations of this post).
+    pub item_id: String,
+    /// True when this post created the space.
+    pub is_new_space: bool,
+    /// True when this post auto-titled a previously untitled space.
+    pub auto_titled: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct SpaceInfo {
     pub id: String,
@@ -1170,6 +1186,109 @@ impl Inner {
             self.bus.emit(Change::SpaceIndex);
         }
         Ok(archived)
+    }
+
+    /// Save a thought as a `user_input` action **without requesting a
+    /// response** — the save-vs-request split (wave 5). Posting needs no
+    /// credential and no account; only `chat` / `request_response` spend.
+    ///
+    /// Creates the space when `space_id` is `None`, appends the user turn as a
+    /// fresh gen-0 item with a `reply` edge to the prior tail, auto-titles a
+    /// still-untitled space from its first post, and emits `Change::Space(id)`
+    /// (content changed) plus `Change::SpaceIndex` when the library listing
+    /// changed (new space or auto-title). Unlike `chat`, every write here is
+    /// unconditional — there is no credential gate to fail behind, so the post
+    /// always persists.
+    async fn post(&self, space_id: Option<&str>, prompt: &str) -> Result<PostResult, AppError> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(AppError::Internal {
+                message: "cannot post an empty thought".into(),
+            });
+        }
+
+        let db_conn = self.db_conn().await?;
+        let now = now_ms();
+
+        let user_participant_id =
+            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+
+        let (space_id, space_title, is_new_space) = if let Some(sid) = space_id {
+            let row =
+                db::get_space(&db_conn, sid)
+                    .await?
+                    .ok_or_else(|| AppError::NotConfigured {
+                        message: format!("space not found: {sid}"),
+                    })?;
+            (sid.to_string(), row.title, false)
+        } else {
+            let sid = Uuid::now_v7().to_string();
+            db::insert_space(&db_conn, &sid, None, "unlinked", now).await?;
+            db::insert_space_participant(&db_conn, &sid, &user_participant_id, "owner", now)
+                .await?;
+            (sid, None, true)
+        };
+
+        // No prior terminal action ⇒ this is the space's first post: eligible
+        // for auto-title, and there is no antecedent to link to.
+        let last_action_id = db::last_action_in_space(&db_conn, &space_id).await?;
+
+        let action_id = Uuid::now_v7().to_string();
+        let item_id = Uuid::now_v7().to_string();
+        db::insert_action(
+            &db_conn,
+            &db::ActionEntry {
+                id: action_id.clone(),
+                space_id: space_id.clone(),
+                participant_id: user_participant_id,
+                item_id: item_id.clone(),
+                supersedes_action_id: None,
+                action_type: "user_input".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at: now,
+            },
+        )
+        .await?;
+        db::insert_text_content_block(
+            &db_conn,
+            &Uuid::now_v7().to_string(),
+            &action_id,
+            0,
+            "text",
+            prompt,
+        )
+        .await?;
+
+        let mut auto_titled = false;
+        if space_title.is_none()
+            && last_action_id.is_none()
+            && let Some(title) = derive_space_title(prompt)
+        {
+            db::update_space_title(&db_conn, &space_id, &title).await?;
+            auto_titled = true;
+        }
+
+        if let Some(ref ante_id) = last_action_id {
+            db::insert_action_antecedent(&db_conn, &action_id, ante_id, 0, "reply").await?;
+        }
+
+        self.bus.emit(Change::Space(space_id.clone()));
+        if is_new_space || auto_titled {
+            self.bus.emit(Change::SpaceIndex);
+        }
+
+        Ok(PostResult {
+            space_id,
+            action_id,
+            item_id,
+            is_new_space,
+            auto_titled,
+        })
     }
 
     /// Find a credential that can cover `charge_credits`, auto-provisioning
@@ -2846,6 +2965,21 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.archive_space(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Save a thought without requesting a response (the save-vs-request
+    /// split). Needs no account or credential; creates the space when
+    /// `space_id` is `None`.
+    pub async fn post(
+        &self,
+        prompt: String,
+        space_id: Option<String>,
+    ) -> Result<PostResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.post(space_id.as_deref(), &prompt).await })
             .await
             .map_err(join_err)?
     }

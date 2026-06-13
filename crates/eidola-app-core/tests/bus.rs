@@ -298,6 +298,117 @@ fn rename_space_no_emit_on_failure() {
 }
 
 // ===========================================================================
+// post() — save a thought without requesting a response (wave 5)
+//
+// post() is the save side of the save-vs-request split: no credential, no
+// HTTP, so it's exercised directly here rather than through the chat harness.
+// Contract: emit Change::Space(id) on every successful post (content changed)
+// + Change::SpaceIndex only when the listing changed (new space or auto-title);
+// no emit on a failed (empty) post.
+// ===========================================================================
+
+#[test]
+fn post_new_space_emits_space_and_index_and_persists() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let mut rx = core.subscribe_changes();
+
+        let result = core
+            .runtime()
+            .block_on(core.post("Why is the sky blue?".into(), None))
+            .unwrap();
+        assert!(result.is_new_space);
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.iter().any(|c| matches!(c, Change::Space(_))),
+            "post should emit Space(id); got {changes:?}"
+        );
+        assert!(
+            changes.contains(&Change::SpaceIndex),
+            "post creating a space should emit SpaceIndex; got {changes:?}"
+        );
+
+        // The thought is durably persisted as a user turn.
+        let msgs = core
+            .runtime()
+            .block_on(core.get_space_messages(result.space_id))
+            .unwrap();
+        assert_eq!(msgs.len(), 1, "post should persist exactly one user turn");
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content, "Why is the sky blue?");
+    });
+}
+
+#[test]
+fn second_post_emits_space_but_not_index() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        // First post creates (and auto-titles) the space.
+        let first = core
+            .runtime()
+            .block_on(core.post("First thought".into(), None))
+            .unwrap();
+
+        // A second post into the same space changes content but not the
+        // library listing — Space without SpaceIndex.
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.post("Second thought".into(), Some(first.space_id.clone())))
+            .unwrap();
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.iter().any(|c| matches!(c, Change::Space(_))),
+            "second post should emit Space(id); got {changes:?}"
+        );
+        assert!(
+            !changes.contains(&Change::SpaceIndex),
+            "second post must not emit SpaceIndex (listing unchanged); got {changes:?}"
+        );
+
+        let msgs = core
+            .runtime()
+            .block_on(core.get_space_messages(first.space_id))
+            .unwrap();
+        assert_eq!(msgs.len(), 2);
+    });
+}
+
+#[test]
+fn empty_post_errors_and_does_not_emit() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let mut rx = core.subscribe_changes();
+
+        let result = core.runtime().block_on(core.post("   ".into(), None));
+        assert!(result.is_err(), "empty post should error");
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.is_empty(),
+            "failed post must not emit; got {changes:?}"
+        );
+    });
+}
+
+#[test]
+fn post_requires_no_account_or_credential() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        // No account configured and no credentials in the wallet: posting
+        // still succeeds (only a response request would need funding).
+        let result = core
+            .runtime()
+            .block_on(core.post("A thought needs no funding".into(), None));
+        assert!(
+            result.is_ok(),
+            "post must succeed with no account/credential; got {result:?}"
+        );
+    });
+}
+
+// ===========================================================================
 // UpdateState domain
 // ===========================================================================
 
