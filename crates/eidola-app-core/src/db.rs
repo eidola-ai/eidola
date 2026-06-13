@@ -631,6 +631,13 @@ pub struct ActionEntry {
     pub id: String,
     pub space_id: String,
     pub participant_id: String,
+    /// Stable identity shared by every generation of this item. For original
+    /// (gen-0) work, mint a fresh UUIDv7; an edit/regeneration reuses the
+    /// item_id of the action it supersedes.
+    pub item_id: String,
+    /// Prior generation this one replaces; `None` for gen 0. (The generation
+    /// *number* is derived from this chain, not stored.)
+    pub supersedes_action_id: Option<String>,
     pub action_type: String,
     pub status: String,
     pub intent: Option<String>,
@@ -643,13 +650,16 @@ pub struct ActionEntry {
 
 pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO action (id, space_id, participant_id, action_type, status, \
+        "INSERT INTO action (id, space_id, participant_id, item_id, \
+         supersedes_action_id, action_type, status, \
          intent, model, input_tokens, output_tokens, credits_consumed, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         (
             Value::Text(entry.id.clone()),
             Value::Text(entry.space_id.clone()),
             Value::Text(entry.participant_id.clone()),
+            Value::Text(entry.item_id.clone()),
+            opt_text(&entry.supersedes_action_id),
             Value::Text(entry.action_type.clone()),
             Value::Text(entry.status.clone()),
             opt_text(&entry.intent),
@@ -681,14 +691,17 @@ pub async fn insert_action_antecedent(
     action_id: &str,
     antecedent_action_id: &str,
     ordinal: i64,
+    relation: &str,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO action_antecedent (action_id, antecedent_action_id, ordinal) \
-         VALUES (?1, ?2, ?3)",
+        "INSERT INTO action_antecedent \
+         (action_id, antecedent_action_id, ordinal, relation) \
+         VALUES (?1, ?2, ?3, ?4)",
         (
             Value::Text(action_id.to_string()),
             Value::Text(antecedent_action_id.to_string()),
             Value::Integer(ordinal),
+            Value::Text(relation.to_string()),
         ),
     )
     .await
@@ -925,22 +938,25 @@ pub struct SpaceActionRow {
 }
 
 /// Returns actions in a space with their text content blocks, suitable for
-/// building the OpenAI messages array. Filters to terminal statuses and
-/// uses action_resolved to dereference origin references.
+/// building the OpenAI messages array. Filters to terminal statuses and to the
+/// *current* generation of each item (via item_current), so superseded
+/// generations never enter the context the model sees.
 pub async fn get_space_actions_for_context(
     conn: &Connection,
     space_id: &str,
 ) -> Result<Vec<SpaceActionRow>, AppError> {
     let mut stmt = conn
         .prepare(
-            "SELECT ar.action_id, ar.action_type, p.kind, ar.status, \
+            "SELECT a.id, a.action_type, p.kind, a.status, \
                     cb.text_content, cb.ordinal \
-             FROM action_resolved ar \
-             JOIN participant p ON p.id = ar.participant_id \
-             LEFT JOIN content_block cb ON cb.action_id = ar.content_source_id \
-             WHERE ar.space_id = ?1 \
-               AND ar.status IN ('complete', 'cancelled') \
-             ORDER BY ar.created_at ASC, cb.ordinal ASC",
+             FROM action a \
+             JOIN item_current ic \
+               ON ic.current_action_id = a.id \
+             JOIN participant p ON p.id = a.participant_id \
+             LEFT JOIN content_block cb ON cb.action_id = a.id \
+             WHERE a.space_id = ?1 \
+               AND a.status IN ('complete', 'cancelled') \
+             ORDER BY a.created_at ASC, cb.ordinal ASC",
         )
         .await
         .map_err(AppError::db)?;
@@ -1504,6 +1520,8 @@ mod tests {
                 id: action_id.clone(),
                 space_id: space_id.to_string(),
                 participant_id: participant_id.to_string(),
+                item_id: uuid::Uuid::now_v7().to_string(),
+                supersedes_action_id: None,
                 action_type: "user_input".to_string(),
                 status: "complete".to_string(),
                 intent: None,
@@ -1665,6 +1683,8 @@ mod tests {
                 id: "act-1".into(),
                 space_id: "space-1".into(),
                 participant_id: agent,
+                item_id: "item-1".into(),
+                supersedes_action_id: None,
                 action_type: "inference".into(),
                 status: "complete".into(),
                 intent: Some("answer".into()),

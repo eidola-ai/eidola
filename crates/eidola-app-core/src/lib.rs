@@ -1413,6 +1413,8 @@ impl Inner {
                 id: user_action_id.clone(),
                 space_id: space_id.clone(),
                 participant_id: user_participant_id,
+                item_id: Uuid::now_v7().to_string(),
+                supersedes_action_id: None,
                 action_type: "user_input".to_string(),
                 status: "complete".to_string(),
                 intent: None,
@@ -1447,7 +1449,7 @@ impl Inner {
 
         // Link to previous action as antecedent
         if let Some(ref ante_id) = last_action_id {
-            db::insert_action_antecedent(&db_conn, &user_action_id, ante_id, 0).await?;
+            db::insert_action_antecedent(&db_conn, &user_action_id, ante_id, 0, "reply").await?;
         }
 
         // Build the messages array: prior history + current prompt
@@ -1599,6 +1601,8 @@ impl Inner {
                 id: inference_action_id.clone(),
                 space_id: space_id.clone(),
                 participant_id: model_participant_id,
+                item_id: Uuid::now_v7().to_string(),
+                supersedes_action_id: None,
                 action_type: "inference".to_string(),
                 status: if status.is_success() {
                     "complete"
@@ -1615,7 +1619,8 @@ impl Inner {
             },
         )
         .await?;
-        db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0).await?;
+        db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0, "reply")
+            .await?;
 
         // Record context assembly: all prior actions + the new user action
         let context_assembly_id = Uuid::now_v7().to_string();
@@ -1912,6 +1917,8 @@ impl Inner {
                 id: user_action_id.clone(),
                 space_id: space_id.clone(),
                 participant_id: user_participant_id,
+                item_id: Uuid::now_v7().to_string(),
+                supersedes_action_id: None,
                 action_type: "user_input".to_string(),
                 status: "complete".to_string(),
                 intent: None,
@@ -1945,7 +1952,7 @@ impl Inner {
         }
 
         if let Some(ref ante_id) = last_action_id {
-            db::insert_action_antecedent(&db_conn, &user_action_id, ante_id, 0).await?;
+            db::insert_action_antecedent(&db_conn, &user_action_id, ante_id, 0, "reply").await?;
         }
 
         let mut messages: Vec<serde_json::Value> = prior_messages
@@ -2206,6 +2213,8 @@ impl Inner {
                 id: inference_action_id.clone(),
                 space_id: space_id.clone(),
                 participant_id: model_participant_id,
+                item_id: Uuid::now_v7().to_string(),
+                supersedes_action_id: None,
                 action_type: "inference".to_string(),
                 status: "complete".to_string(),
                 intent: None,
@@ -2217,7 +2226,8 @@ impl Inner {
             },
         )
         .await?;
-        db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0).await?;
+        db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0, "reply")
+            .await?;
 
         let context_assembly_id = Uuid::now_v7().to_string();
         db::insert_context_assembly(
