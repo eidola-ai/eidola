@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AppCore, AttestationDetail, AttestationInfo, ChatResult, ChatStreamEvent, RequestDetail,
-    RequestInfo, SpaceMessage, SpendTrailEntry,
+    AppCore, AttestationDetail, AttestationInfo, ChatResult, ChatStreamEvent, PostNode,
+    RequestDetail, RequestInfo, SpendTrailEntry,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -75,13 +75,15 @@ pub fn chat_stream(
     (event_rx, done_rx)
 }
 
-/// Load a space's persisted messages (the reopened-space initial load).
-pub fn get_space_messages(
+/// Load a space's threaded-post render tree (the reopened-space initial load
+/// and the post-stream reload). The flattened `PostNode` list the transcript
+/// renders from — see `AppCore::get_space_tree`.
+pub fn get_space_tree(
     core: Arc<AppCore>,
     space_id: String,
-) -> oneshot::Receiver<Result<Vec<SpaceMessage>, AppError>> {
+) -> oneshot::Receiver<Result<Vec<PostNode>, AppError>> {
     spawn_oneshot(core, move |core| async move {
-        core.get_space_messages(space_id).await
+        core.get_space_tree(space_id).await
     })
 }
 

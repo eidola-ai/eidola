@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, ChatStreamEvent, SpaceMessage};
+use eidola_app_core::{AppCore, ChatStreamEvent, PostNode, SpaceMessage};
 use gpui::{Context, EventEmitter, Task};
 
 use crate::bridge;
@@ -54,26 +54,108 @@ pub struct StreamingResponse {
     pub error: Option<String>,
 }
 
-/// A single rendered chat row: the persisted message plus any reasoning
-/// captured for it during streaming. Reasoning is ephemeral session state —
-/// the local DB stores only the assistant's final content — so older messages
-/// from a re-loaded space carry `reasoning = None`. New assistant messages
-/// adopt whatever reasoning was streaming at finalize.
+/// A single rendered chat row: the persisted post plus the byline identity
+/// shown in its gutter, and any reasoning captured for it during streaming.
+///
+/// The post-tree redesign (wave 5.3) feeds this from [`PostNode`]
+/// (`AppCore::get_space_tree`): the `byline` is the post's gutter label (the
+/// model name for an assistant turn, "You" for the human), and `action_id` /
+/// `item_id` carry the stable post identity the 5.4 hover affordances
+/// (reply / edit / regenerate) will wire to. `message` (role + concatenated
+/// text) is retained for the body render and the test API. Synthetic rows (the
+/// optimistic user turn, test fixtures) come through [`Self::new`], which
+/// derives the byline from the role and leaves the ids `None`.
+///
+/// Reasoning is ephemeral session state — the local DB stores only the
+/// assistant's final content — so older posts from a re-loaded space carry
+/// `reasoning = None`. New assistant posts adopt whatever reasoning was
+/// streaming at finalize.
 #[derive(Clone)]
 pub struct ChatMessageView {
     pub message: SpaceMessage,
+    /// The gutter byline ("You" / a model name / "Eidola" / "Error").
+    pub byline: String,
+    /// The post's current-generation action id, when this row came from the
+    /// post tree (`None` for synthetic/optimistic/test rows). The 5.4 hover
+    /// affordances key off this.
+    pub action_id: Option<String>,
+    /// The post's stable item id (see `action_id`).
+    pub item_id: Option<String>,
     pub reasoning: Option<String>,
     pub reasoning_expanded: bool,
 }
 
 impl ChatMessageView {
+    /// A synthetic row from a role/content message (the optimistic user turn
+    /// and test fixtures). The byline is derived from the role; the post ids
+    /// are unknown until the row is reloaded from the tree.
     pub fn new(message: SpaceMessage) -> Self {
+        let byline = byline_for_role(&message.role).to_string();
         Self {
             message,
+            byline,
+            action_id: None,
+            item_id: None,
             reasoning: None,
             reasoning_expanded: false,
         }
     }
+
+    /// A row from the persisted post tree: the body is the post's concatenated
+    /// text blocks, the byline is its participant identity, and the post ids
+    /// are carried for hover wiring.
+    pub fn from_post(node: PostNode) -> Self {
+        let role = match node.action_type.as_str() {
+            "user_input" => "user",
+            "inference" => "assistant",
+            "error" => "error",
+            _ => "assistant",
+        }
+        .to_string();
+        let content = node
+            .blocks
+            .iter()
+            .filter_map(|b| b.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("");
+        let byline = byline_for_participant(&node.participant.kind, &node.participant.label);
+        Self {
+            message: SpaceMessage { role, content },
+            byline,
+            action_id: Some(node.action_id),
+            item_id: Some(node.item_id),
+            reasoning: None,
+            reasoning_expanded: false,
+        }
+    }
+}
+
+/// The gutter byline for a synthetic row, from its chat role.
+fn byline_for_role(role: &str) -> &'static str {
+    match role {
+        "user" => "You",
+        "assistant" => "Eidola",
+        "error" => "Error",
+        _ => "—",
+    }
+}
+
+/// The gutter byline for a post-tree row, from its participant identity. An
+/// agent's byline is its model label; the human is "You".
+fn byline_for_participant(kind: &str, label: &str) -> String {
+    match kind {
+        "human" => "You".to_string(),
+        "agent" if !label.is_empty() => label.to_string(),
+        "agent" => "Eidola".to_string(),
+        "system" => "System".to_string(),
+        _ if !label.is_empty() => label.to_string(),
+        _ => "—".to_string(),
+    }
+}
+
+/// Map a freshly-loaded post tree into render rows.
+fn views_from_nodes(nodes: Vec<PostNode>) -> Vec<ChatMessageView> {
+    nodes.into_iter().map(ChatMessageView::from_post).collect()
 }
 
 /// Semantic events a `Space` emits. `cx.observe` covers plain re-render; these
@@ -273,13 +355,16 @@ impl Space {
             return;
         };
         self.transcript = std::mem::take(&mut self.transcript).to_loading();
-        let rx = bridge::get_space_messages(app_core, id);
+        let rx = bridge::get_space_tree(app_core, id);
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = rx.await.unwrap_or_else(|_| {
-                Err(AppError::Internal {
-                    message: "fetch messages task cancelled".into(),
+            let result = rx
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AppError::Internal {
+                        message: "fetch space tree task cancelled".into(),
+                    })
                 })
-            });
+                .map(views_from_nodes);
             let _ = this.update(cx, |this, cx| {
                 let _ = this.apply_loaded_transcript(result, cx);
                 this.load_task = None;
@@ -300,7 +385,7 @@ impl Space {
     /// Returns whether the load was applied.
     fn apply_loaded_transcript(
         &mut self,
-        result: Result<Vec<SpaceMessage>, AppError>,
+        result: Result<Vec<ChatMessageView>, AppError>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.streaming.is_some() {
@@ -309,7 +394,7 @@ impl Space {
         }
         match result {
             Ok(messages) => {
-                self.merge_messages_from_db(messages, None);
+                self.merge_from_db(messages, None);
                 cx.emit(SpaceEvent::MessagesChanged);
             }
             Err(error) => {
@@ -320,39 +405,24 @@ impl Space {
         true
     }
 
-    /// Merge a fresh DB message list into the transcript, preserving any
+    /// Merge a fresh post-tree render list into the transcript, preserving any
     /// previously-attached reasoning by index (we only ever append, so
     /// positions are stable) and attaching the just-captured streaming
-    /// reasoning to the new last assistant entry if non-empty.
-    fn merge_messages_from_db(
-        &mut self,
-        new_messages: Vec<SpaceMessage>,
-        new_reasoning: Option<String>,
-    ) {
-        let prior = self.transcript.value();
-        let mut next: Vec<ChatMessageView> = new_messages
-            .into_iter()
-            .enumerate()
-            .map(|(idx, msg)| {
-                let prior_entry = prior.and_then(|p| p.get(idx));
-                let same_position = prior_entry.is_some_and(|p| {
-                    p.message.role == msg.role && p.message.content == msg.content
-                });
-                ChatMessageView {
-                    message: msg,
-                    reasoning: if same_position {
-                        prior_entry.and_then(|p| p.reasoning.clone())
-                    } else {
-                        None
-                    },
-                    reasoning_expanded: if same_position {
-                        prior_entry.is_some_and(|p| p.reasoning_expanded)
-                    } else {
-                        false
-                    },
-                }
-            })
-            .collect();
+    /// reasoning to the new last assistant entry if non-empty. The incoming
+    /// rows carry the byline + post ids from the tree; only the ephemeral
+    /// reasoning state is carried forward from the prior snapshot.
+    fn merge_from_db(&mut self, mut next: Vec<ChatMessageView>, new_reasoning: Option<String>) {
+        let prior = self.transcript.value().cloned();
+        for (idx, entry) in next.iter_mut().enumerate() {
+            let prior_entry = prior.as_ref().and_then(|p| p.get(idx));
+            let same_position = prior_entry.is_some_and(|p| {
+                p.message.role == entry.message.role && p.message.content == entry.message.content
+            });
+            if same_position {
+                entry.reasoning = prior_entry.and_then(|p| p.reasoning.clone());
+                entry.reasoning_expanded = prior_entry.is_some_and(|p| p.reasoning_expanded);
+            }
+        }
 
         if let Some(reasoning) = new_reasoning
             && !reasoning.is_empty()
@@ -461,12 +531,15 @@ impl Space {
 
             match outcome {
                 Ok(result) => {
-                    let msgs_rx = bridge::get_space_messages(app_core, result.space_id.clone());
-                    let msgs = msgs_rx.await.unwrap_or_else(|_| {
-                        Err(AppError::Internal {
-                            message: "fetch messages task cancelled".into(),
+                    let msgs_rx = bridge::get_space_tree(app_core, result.space_id.clone());
+                    let msgs = msgs_rx
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(AppError::Internal {
+                                message: "fetch space tree task cancelled".into(),
+                            })
                         })
-                    });
+                        .map(views_from_nodes);
                     let _ = this.update(cx, |this, cx| {
                         let captured_reasoning =
                             this.streaming.as_ref().map(|s| s.reasoning.clone());
@@ -480,7 +553,7 @@ impl Space {
                         this.submit_runner = None;
                         match msgs {
                             Ok(messages) => {
-                                this.merge_messages_from_db(messages, captured_reasoning);
+                                this.merge_from_db(messages, captured_reasoning);
                                 cx.emit(SpaceEvent::MessagesChanged);
                                 cx.emit(SpaceEvent::StreamEnded);
                             }
@@ -582,7 +655,8 @@ impl Space {
         messages: Vec<SpaceMessage>,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.apply_loaded_transcript(Ok(messages), cx)
+        let views = messages.into_iter().map(ChatMessageView::new).collect();
+        self.apply_loaded_transcript(Ok(views), cx)
     }
 
     /// Test-only: drive the chat-failure outcome exactly as `spawn_stream`'s

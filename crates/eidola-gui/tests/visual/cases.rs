@@ -536,11 +536,10 @@ fn register_chat(s: &mut Snapshots) {
         },
     );
 
-    // Narrow window — guards that the chapter delimiter tracks the prose
-    // body's width edge-for-edge. Earlier the delim sized itself
-    // independently and rendered small + left-aligned when the window was
-    // narrower than the prose max-width cap. Snapshot here is wider than
-    // the rule's hairline so a regression would be obvious.
+    // Narrow window (below the `POST_GUTTER_MIN_WIDTH` breakpoint): the byline
+    // gutter collapses and each post's byline stacks *above* its body, full
+    // reading width. Guards the responsive byline-gutter layout at the narrow
+    // end and the page width invariants (`.w_full()` on the scroll/list tree).
     s.add(
         "chat_with_messages_narrow",
         size(px(480.), px(520.)),
@@ -566,19 +565,11 @@ fn register_chat(s: &mut Snapshots) {
         },
     );
 
-    // "Mid" width — wider than the prose max-width cap (640px) but well
-    // short of the original 900px reference. This is the size where the
-    // earlier flex-1-rules implementation collapsed: prose's max-w bound,
-    // but the inner h_flex's flex-1 rules had no definite parent width to
-    // grow into and rendered as a left-aligned label with no rules.
-    // 680px logical width — exactly the size where the user observed
-    // the delim outer container collapsing to content width in the live
-    // app (1360 physical at 2x DPR). The bug shows the outer `RED` debug
-    // border shrunk to wrap the absolute rule + label rather than
-    // stretching to the row width. Earlier we used a plain `div()` here
-    // and the offscreen renderer happened not to reproduce; switching
-    // the outer to `v_flex()` (matching the message row) made the live
-    // app and the test both stretch correctly.
+    // "Mid" width (680px) — still below the gutter breakpoint, so this is the
+    // wider end of the stacked-byline layout: the reading column hits its
+    // ~640px max-width cap and centers, with the byline stacked above. Guards
+    // that the post body honours the prose measure rather than running to the
+    // window edge as the window grows toward the breakpoint.
     s.add(
         "chat_with_messages_breakpoint",
         size(px(680.), px(640.)),
@@ -595,8 +586,8 @@ fn register_chat(s: &mut Snapshots) {
                         },
                         SpaceMessage {
                             role: "assistant".into(),
-                            content: "Delim outer should stretch to full row width regardless \
-                                of the prose column being narrower."
+                            content: "The reading column stays capped at the prose measure and \
+                                centers; the byline stacks above it below the gutter breakpoint."
                                 .into(),
                         },
                     ],
@@ -606,11 +597,10 @@ fn register_chat(s: &mut Snapshots) {
         },
     );
 
-    // Live-app width — mirrors the size where the user reported the
-    // delim breaking with rules visible only on the left side. If this
-    // reproduces locally, the bug is in our layout code; if it doesn't,
-    // there's something the offscreen renderer does differently from
-    // the live app harness.
+    // Wide window (well above the breakpoint): the byline sits in the
+    // left-margin gutter beside the reading column, the [gutter | body] pair
+    // centered as a unit. Guards the wide byline-gutter layout and that a very
+    // wide window doesn't stretch the body past the prose measure.
     s.add(
         "chat_with_messages_live",
         size(px(1400.), px(1000.)),
@@ -882,14 +872,13 @@ fn register_chat(s: &mut Snapshots) {
         },
     );
 
-    // Persistent participant indicator — scrolled mid-assistant-message.
-    // The transcript is scrolled so the "Eidola" chapter delim (item 1's
-    // leading delim) is off the top of the viewport and the body fills the
-    // page; the title-bar band's LEFT side now carries the italic "Eidola"
-    // label so the reader still knows whose turn they're reading. The right
-    // side stays bare (⌥ not held). Day + night.
+    // Scrolled mid-post — the transcript scrolled so a long assistant post's
+    // body fills the page and its byline has scrolled off the top. Post
+    // identity now lives in the gutter byline (which scrolls with the post),
+    // so once it's off-screen there's no separate persistent cue; this guards
+    // that scrolling into a long post reads cleanly. Day + night.
     s.add_with_step(
-        "chat_participant_indicator_scrolled",
+        "chat_scrolled_mid_post",
         size(px(760.), px(560.)),
         |window, cx| {
             let core = stub_stores_with_config(cx);
@@ -925,8 +914,8 @@ fn register_chat(s: &mut Snapshots) {
         },
         |cx, window, view| {
             // After the first paint measured the items, scroll into the
-            // assistant turn well past its "Eidola" delim band so the delim is
-            // off the top and the persistent indicator takes over.
+            // assistant post so its byline has scrolled off the top and the
+            // body fills the page.
             cx.update_window(window, |_, _, cx| {
                 view.update(cx, |v, cx| v.scroll_transcript_for_test(1, 180., cx));
             })

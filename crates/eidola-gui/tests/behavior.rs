@@ -22,8 +22,8 @@ use eidola_app_core::{
 use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
 use eidola_gui::chat::{
-    ChatView, DismissModelPicker, OnboardingStage, ParticipantIndicator, PickerConfirm, PickerDown,
-    PickerUp, Send, StreamingResponse, ToggleModelPicker,
+    ChatView, DismissModelPicker, OnboardingStage, PickerConfirm, PickerDown, PickerUp, Send,
+    StreamingResponse, ToggleModelPicker,
 };
 use eidola_gui::library::LibraryView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
@@ -591,7 +591,13 @@ fn finalize_reshape_preserves_measured_heights(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_chat(cx, &stores);
     view.update(cx, |v, cx| {
-        let msgs: Vec<SpaceMessage> = (0..8)
+        // Enough turns that the transcript overflows a viewport by a page+ on
+        // the *mocked* renderer, which doesn't measure async markdown body
+        // height — so the overflow has to come from each post's definite
+        // chrome (byline + inter-post rhythm), not its prose. (The old fixture
+        // leaned on the tall chapter delims for this; those were retired in the
+        // post redesign, so we lean on row count instead.)
+        let msgs: Vec<SpaceMessage> = (0..20)
             .map(|i| SpaceMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
                 content: format!(
@@ -665,107 +671,11 @@ fn finalize_reshape_preserves_measured_heights(cx: &mut TestAppContext) {
     );
 }
 
-#[gpui::test]
-fn participant_indicator_visibility_derivation(cx: &mut TestAppContext) {
-    // Part-2: the persistent participant indicator is a pure function of the
-    // `list()` scroll position + the transcript item model. It is hidden at
-    // the page top and while a chapter delim is on screen, and surfaces the
-    // turn's voice once the delim has scrolled off. Drive the derivation
-    // directly from synthetic scroll positions (no real layout needed).
-    let stores = stub_stores_with_config(cx);
-    let (_window, view) = open_chat(cx, &stores);
-
-    view.update(cx, |v, cx| {
-        v.set_messages_for_test(
-            vec![
-                SpaceMessage {
-                    role: "user".into(),
-                    content: "User opening question.".into(),
-                },
-                SpaceMessage {
-                    role: "assistant".into(),
-                    content: "Assistant answer body.".into(),
-                },
-            ],
-            cx,
-        );
-    });
-    cx.run_until_parked();
-
-    view.read_with(cx, |v, cx| {
-        // Item 0 is the user's opening turn (no leading delim); item 1 the
-        // assistant turn (leading "Eidola" delim); item 2 the composer.
-        assert_eq!(v.transcript_item_count_for_test(), 3);
-
-        // At the very page top (item 0, offset 0): the first line is visible,
-        // no cue needed → hidden.
-        assert_eq!(v.participant_indicator_at_for_test(0, 0.0, cx), None);
-
-        // Scrolled into the delim-less first message: its opening line has
-        // gone up, so the page-local cue is missing → show "You".
-        assert_eq!(
-            v.participant_indicator_at_for_test(0, 60.0, cx),
-            Some(ParticipantIndicator {
-                label: "You",
-                is_error: false,
-            })
-        );
-
-        // Top of item 1, within its leading-delim band: the "Eidola" delim is
-        // on screen → hidden (no competition with the real delim).
-        assert_eq!(v.participant_indicator_at_for_test(1, 8.0, cx), None);
-
-        // Scrolled past item 1's delim band, into the assistant body: the
-        // delim is gone → surface "Eidola".
-        assert_eq!(
-            v.participant_indicator_at_for_test(1, 200.0, cx),
-            Some(ParticipantIndicator {
-                label: "Eidola",
-                is_error: false,
-            })
-        );
-
-        // Over the composer item (the writing zone): no voice to surface.
-        assert_eq!(v.participant_indicator_at_for_test(2, 200.0, cx), None);
-    });
-}
-
-#[gpui::test]
-fn participant_indicator_error_keeps_danger_voice(cx: &mut TestAppContext) {
-    // An error turn's indicator keeps the danger color (is_error = true), so
-    // the persistent cue signals the error role the same way the chapter
-    // delim's "Error" label does.
-    let stores = stub_stores_with_config(cx);
-    let (_window, view) = open_chat(cx, &stores);
-
-    view.update(cx, |v, cx| {
-        v.set_messages_for_test(
-            vec![
-                SpaceMessage {
-                    role: "user".into(),
-                    content: "Trigger.".into(),
-                },
-                SpaceMessage {
-                    role: "error".into(),
-                    content: "Something went wrong.".into(),
-                },
-            ],
-            cx,
-        );
-    });
-    cx.run_until_parked();
-
-    view.read_with(cx, |v, cx| {
-        // Scrolled into the error turn past its delim band.
-        assert_eq!(
-            v.participant_indicator_at_for_test(1, 200.0, cx),
-            Some(ParticipantIndicator {
-                label: "Error",
-                is_error: true,
-            })
-        );
-    });
-}
+// The persistent participant-indicator system was retired in the wave-5.3
+// post redesign: post identity now lives in each post's own gutter byline
+// (rendered by `post_frame`), not a title-bar band cue. Its two derivation
+// tests were removed with it. Byline content is covered by the post-tree DTO
+// tests (app-core) and the visual snapshots.
 
 #[gpui::test]
 fn blank_space_adopts_id_on_wrapped_failure(cx: &mut TestAppContext) {
