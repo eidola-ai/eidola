@@ -135,6 +135,20 @@ There is no Send button. **⌘↩ posts *and* asks** (`Send` → `submit` → `S
 
 **Test wrapping invariant.** Behavior tests still wrap the view in `gpui_component::Root` (see `tests/behavior.rs::open_view`) even though the chat composer no longer uses `gpui_component::Input` — keeping Root mirrors production (`lib.rs::open_main_window`) and is required for any test that exercises SettingsView. The chat tests no longer *require* Root strictly, but the helper is shared across views so removing the wrap would split the harness.
 
+## Inline interaction model — one editor, moved to where the post lands
+
+The interaction model (wave 5.4, Mike's "inline" steer) is: **edit a post in place, and reply where the new post will render.** There is **one** editor entity (`prompt_editor`); its position is determined by the compose mode (two `ChatView` fields, mutually exclusive):
+
+- **Default (tail):** the editor is the trailing `Composer` item — a new post continuing the thread. `⌘↩` posts & asks, `⌘⇧↩` posts.
+- **`editing: Option<String>` (inline edit):** the `✎ edit` affordance loads the post's text into the editor and renders it **in the post's own row** (`render_message_item` returns the editor instead of the static body when `editing == this action_id`); the trailing composer is suppressed. `⌘↩`/`⌘⇧↩` commit via `Space::edit` → `AppCore::edit_post` (a new human generation — `item_current` resolves to it). Esc cancels, restoring the stashed `saved_draft`. (v1: both gestures save; "edit and ask" is a follow-up.)
+- **`replying_to: Option<String>` (inline reply):** the `⤷ reply` affordance places the editor **inline right after the target post** (`compute_transcript_items` inserts the `Composer` there), the reply's eventual position. `⌘↩`/`⌘⇧↩` link the new post to that target via `Space::submit`/`post_only`'s `reply_to` → `AppCore::chat_stream_reply`/`post_reply` — branching the thread when the target isn't the tail. Esc returns the editor to the bottom. The half-viewport composer breath is dropped while inline so it doesn't shove the following post down. (Refinement: the live reply editor renders flat; matching the eventual branch indent is deferred.)
+
+**Hover affordances** (`render_message_item`, gated on `hovered_post == idx`): a quiet row under the post — **Reply** (any post), **Edit** (your own posts), **Regenerate** (the assistant's, → `Space::regenerate_post` → `AppCore::regenerate`, a new agent generation). Built from the probed `affordance()` helper; only real persisted posts (with an `action_id`) carry them. `set_post_hover` uses the Library's out-of-order-leave guard.
+
+**The editor-focus splice** (`rebuild_transcript`): the editor focus handle is attached to whichever item currently holds the editor — the `Composer` item (tail or inline-reply), or the edited post's `Message` item — so an offscreen-focused editor keeps rendering under `list()` virtualization.
+
+**Deferred (Mike, design-acknowledged):** a floating / pane / windowed editor so a long scroll doesn't lose the editing surface (and the Google-Docs-style inline comment-thread variants). Start inline; revisit.
+
 ## WindowInput — per-window modifier state
 
 `src/window_input.rs` — `WindowInput` is a **per-window gpui entity** that holds the live keyboard modifier state for one window. It exists because `ModifiersChangedEvent` in gpui (at our pinned commit 969a67fc) dispatches along the **focused element's ancestor path only** — a listener on a sibling branch of the focused node never fires. Without `WindowInput`, a Settings pane's `on_modifiers_changed` listener was dead while a text input in a different pane had focus (wave-2 bug 2).
