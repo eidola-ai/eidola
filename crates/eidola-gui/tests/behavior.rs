@@ -16,8 +16,8 @@ use eidola_app_core::updates::{
 };
 use eidola_app_core::{
     AttestationDetail, AttestationInfo, BalancesResult, ConfigState, CredentialInfo,
-    CredentialLifecycleInfo, ModelInfo, PriceInfo, RequestDetail, RequestInfo, SpaceInfo,
-    SpaceMessage,
+    CredentialLifecycleInfo, ModelInfo, PostBlock, PostNode, PostParticipant, PriceInfo,
+    RequestDetail, RequestInfo, SpaceInfo, SpaceMessage,
 };
 use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
@@ -262,6 +262,93 @@ fn chat_post_only_appends_user_message_without_streaming(cx: &mut TestAppContext
             v.streaming(cx).is_none(),
             "post_only must NOT enter the streaming state — it requests nothing"
         );
+    });
+}
+
+/// A minimal fixture post for the inline-edit test (a user post with a real
+/// `action_id`, so the edit affordance applies).
+fn fixture_user_post(action_id: &str, text: &str) -> PostNode {
+    PostNode {
+        action_id: action_id.into(),
+        item_id: format!("item-{action_id}"),
+        parent_action_id: None,
+        participant: PostParticipant {
+            kind: "human".into(),
+            label: "user".into(),
+        },
+        action_type: "user_input".into(),
+        generation: 0,
+        generation_count: 1,
+        is_current: true,
+        model: None,
+        credits_consumed: None,
+        relation: None,
+        depth: 0,
+        is_branch: false,
+        blocks: vec![PostBlock {
+            block_type: "text".into(),
+            text: Some(text.into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }],
+        references: Vec::new(),
+        created_at: 0,
+    }
+}
+
+#[gpui::test]
+fn inline_edit_enters_suppresses_composer_and_cancels(cx: &mut TestAppContext) {
+    // ✎ edit moves the one editor entity onto the post (in-place editing): the
+    // trailing new-post composer is suppressed while editing, the editor is
+    // preloaded with the post's text, and Esc/cancel restores the prior draft.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(stores.clone(), None, WindowInput::new(cx), window, cx))
+    });
+
+    view.update(cx, |v, cx| {
+        v.set_post_tree_for_test(vec![fixture_user_post("a1", "hello there")], cx);
+    });
+    cx.run_until_parked();
+
+    // One message + the trailing composer.
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.transcript_item_count_for_test(), 2);
+        assert_eq!(v.editing(), None);
+    });
+
+    // Begin editing the post.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.begin_edit("a1".into(), "hello there".into(), window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.editing(), Some("a1"));
+        // The composer item is gone — the editor moved to the post in place.
+        assert_eq!(
+            v.transcript_item_count_for_test(),
+            1,
+            "trailing composer should be suppressed during an inline edit"
+        );
+        assert_eq!(
+            v.prompt_editor_for_test().read(cx).state.markdown,
+            "hello there",
+            "the editor should be preloaded with the post's text"
+        );
+    });
+
+    // Cancel restores the prior (empty) draft and the trailing composer.
+    view.update(cx, |v, cx| v.cancel_edit(cx));
+    cx.run_until_parked();
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.editing(), None);
+        assert_eq!(v.transcript_item_count_for_test(), 2);
+        assert_eq!(v.prompt_editor_for_test().read(cx).state.markdown, "");
     });
 }
 

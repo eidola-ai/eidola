@@ -598,6 +598,106 @@ impl Space {
         true
     }
 
+    /// Commit an inline edit — append a new human generation of `action_id`'s
+    /// item via `AppCore::edit_post`, then reload the tree (the edited post
+    /// replaces its prior generation in place). No credential, no model call.
+    pub fn edit(&mut self, action_id: String, new_prompt: String, cx: &mut Context<Self>) -> bool {
+        if self.submit_runner.is_some() || self.streaming.is_some() {
+            return false;
+        }
+        let new_prompt = new_prompt.trim().to_string();
+        if new_prompt.is_empty() {
+            return false;
+        }
+        let Some(app_core) = self.app_core.clone() else {
+            return true; // stub: no backend
+        };
+        let rx = bridge::edit_post(app_core.clone(), action_id, new_prompt);
+        self.submit_runner = Some(cx.spawn(async move |this, cx| {
+            let outcome = rx.await.unwrap_or_else(|_| {
+                Err(AppError::Internal {
+                    message: "edit task cancelled".into(),
+                })
+            });
+            Self::finish_reload(this, cx, app_core, outcome.map(|r| r.space_id)).await;
+        }));
+        true
+    }
+
+    /// Regenerate an inference — append a new agent generation of `action_id`'s
+    /// item via `AppCore::regenerate` (spends credits), then reload the tree.
+    pub fn regenerate_post(
+        &mut self,
+        action_id: String,
+        model: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.submit_runner.is_some() || self.streaming.is_some() {
+            return false;
+        }
+        self.last_submitted_model = Some(model.clone());
+        let Some(app_core) = self.app_core.clone() else {
+            return true; // stub: no backend
+        };
+        let rx = bridge::regenerate(app_core.clone(), action_id, model);
+        self.submit_runner = Some(cx.spawn(async move |this, cx| {
+            let outcome = rx.await.unwrap_or_else(|_| {
+                Err(AppError::Internal {
+                    message: "regenerate task cancelled".into(),
+                })
+            });
+            Self::finish_reload(this, cx, app_core, outcome.map(|r| r.space_id)).await;
+        }));
+        true
+    }
+
+    /// Shared completion for edit/regenerate: on success reload the tree from
+    /// the resulting space id (adopting it if the space was blank) and emit
+    /// `StreamEnded`; on failure surface `Failed`. Clears the runner slot.
+    async fn finish_reload(
+        this: gpui::WeakEntity<Self>,
+        cx: &mut gpui::AsyncApp,
+        app_core: Arc<AppCore>,
+        outcome: Result<String, AppError>,
+    ) {
+        match outcome {
+            Ok(space_id) => {
+                let msgs = bridge::get_space_tree(app_core, space_id.clone())
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(AppError::Internal {
+                            message: "fetch space tree task cancelled".into(),
+                        })
+                    })
+                    .map(views_from_nodes);
+                let _ = this.update(cx, |this, cx| {
+                    this.id = Some(space_id);
+                    this.submit_runner = None;
+                    match msgs {
+                        Ok(messages) => {
+                            this.merge_from_db(messages, None);
+                            cx.emit(SpaceEvent::MessagesChanged);
+                            cx.emit(SpaceEvent::StreamEnded);
+                        }
+                        Err(e) => {
+                            this.transcript =
+                                std::mem::take(&mut this.transcript).resolve(Err(e.clone()));
+                            cx.emit(SpaceEvent::Failed(e));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+            Err(e) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.submit_runner = None;
+                    cx.emit(SpaceEvent::Failed(e.root().clone()));
+                    cx.notify();
+                });
+            }
+        }
+    }
+
     /// Drive a streaming chat request inside the single runner slot. On
     /// completion the transcript is reloaded from the DB and the captured
     /// (ephemeral) reasoning is attached to the new last assistant entry.

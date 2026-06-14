@@ -189,6 +189,19 @@ pub struct ChatView {
     /// is a dumb indexer over it (the Record/Library idiom). Its `len()` is the
     /// list's item count.
     transcript_items: Vec<TranscriptItem>,
+    /// Inline edit target: the `action_id` of the post currently being edited
+    /// in place, if any. While set, that post renders the composer (preloaded
+    /// with its text) instead of its static body, and the trailing new-post
+    /// composer is suppressed — there is one editor entity, and edit moves it
+    /// to the post. `⌘↩`/`⌘⇧↩` commit the edit; Esc cancels.
+    editing: Option<String>,
+    /// The composer draft stashed when an inline edit began, restored on
+    /// cancel/commit so entering edit mode doesn't destroy an in-progress
+    /// new-post draft.
+    saved_draft: Option<String>,
+    /// The transcript message index the pointer is hovering, if any — gates the
+    /// per-post hover affordances (edit / regenerate / …). Window-local.
+    hovered_post: Option<usize>,
     /// Persistent markdown render states for the transcript's `TextView`s,
     /// keyed by logical content. **Load-bearing for virtualization**: a
     /// `TextView::markdown(id, …)` keeps its parsed state in the per-frame
@@ -788,6 +801,9 @@ impl ChatView {
             model_picker_open: false,
             list_state,
             transcript_items: Vec::new(),
+            editing: None,
+            saved_draft: None,
+            hovered_post: None,
             picker_highlighted: None,
             picker_scroll: ScrollHandle::new(),
             last_picker_scroll_target: None,
@@ -1249,12 +1265,126 @@ impl ChatView {
         cx.notify();
     }
 
+    // -- Inline edit / hover affordances -----------------------------------
+
+    /// The `action_id` of the post being edited in place, if any (tests).
+    pub fn editing(&self) -> Option<&str> {
+        self.editing.as_deref()
+    }
+
+    /// The transcript index currently hovered, if any (tests/snapshots).
+    pub fn hovered_post(&self) -> Option<usize> {
+        self.hovered_post
+    }
+
+    /// Track per-post hover, gating the affordance row. Mirrors the Library's
+    /// out-of-order-leave guard: only clear when the leaving row is still the
+    /// hovered one (entering the next row can fire before the prior's leave).
+    pub fn set_post_hover(&mut self, idx: usize, hovering: bool, cx: &mut Context<Self>) {
+        if hovering {
+            self.hovered_post = Some(idx);
+        } else if self.hovered_post == Some(idx) {
+            self.hovered_post = None;
+        }
+        cx.notify();
+    }
+
+    /// Begin editing a post in place: stash the current new-post draft, load the
+    /// post's text into the one editor, and move it to the post (the message
+    /// renders the editor instead of its static body). Focus the editor.
+    pub fn begin_edit(
+        &mut self,
+        action_id: String,
+        current_text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.space.read(cx).is_streaming() {
+            return;
+        }
+        self.saved_draft = Some(self.prompt_editor.read(cx).state.markdown.clone());
+        self.editing = Some(action_id);
+        self.hovered_post = None;
+        self.prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::with_markdown(&current_text);
+            cx.notify();
+        });
+        let editor_focus = self.prompt_editor.read(cx).focus_handle(cx);
+        window.focus(&editor_focus, cx);
+        self.rebuild_transcript(false, cx);
+        cx.notify();
+    }
+
+    /// Cancel an in-progress inline edit, restoring the stashed new-post draft.
+    pub fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing.take().is_none() {
+            return;
+        }
+        let draft = self.saved_draft.take().unwrap_or_default();
+        self.prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::with_markdown(&draft);
+            cx.notify();
+        });
+        self.rebuild_transcript(false, cx);
+        cx.notify();
+    }
+
+    /// Commit the in-progress inline edit: append a new human generation of the
+    /// edited post via `Space::edit`, restore the stashed draft, and leave edit
+    /// mode. A no-op (stays editing) on empty text.
+    fn commit_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(action_id) = self.editing.clone() else {
+            return;
+        };
+        let text = self
+            .prompt_editor
+            .read(cx)
+            .state
+            .markdown
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.editing = None;
+        let draft = self.saved_draft.take().unwrap_or_default();
+        self.prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::with_markdown(&draft);
+            cx.notify();
+        });
+        self.space.update(cx, |s, cx| {
+            s.edit(action_id, text, cx);
+        });
+        self.rebuild_transcript(false, cx);
+        cx.notify();
+    }
+
+    /// Regenerate an inference post (the ↻ affordance) — a new agent generation
+    /// of its item, charged. Resolves the model the same way a send would.
+    pub fn regenerate_post(&mut self, action_id: String, cx: &mut Context<Self>) {
+        if self.space.read(cx).is_streaming() {
+            return;
+        }
+        let model = self.current_model(cx);
+        self.hovered_post = None;
+        self.space.update(cx, |s, cx| {
+            s.regenerate_post(action_id, model, cx);
+        });
+        cx.notify();
+    }
+
     /// Post the composer **without** requesting a response (`⌘⇧↩`, the save
     /// side of save-vs-request). Mirrors `submit` but routes to
     /// `Space::post_only` and engages tail follow so the saved post comes into
     /// view; no model is resolved (nothing is asked).
     fn post_only(&mut self, _: &PostOnly, _window: &mut Window, cx: &mut Context<Self>) {
         if self.space.read(cx).is_streaming() {
+            return;
+        }
+        // In inline-edit mode both gestures commit the edit (v1: edit is a save;
+        // "edit and ask" is a follow-up).
+        if self.editing.is_some() {
+            self.commit_edit(cx);
             return;
         }
         let prompt = self
@@ -1286,6 +1416,12 @@ impl ChatView {
         // runner slot enforces this structurally, so we read it before
         // touching the composer.
         if self.space.read(cx).is_streaming() {
+            return;
+        }
+        // In inline-edit mode, ⌘↩ commits the edit (v1: edit and ask is a
+        // follow-up — see `post_only`).
+        if self.editing.is_some() {
+            self.commit_edit(cx);
             return;
         }
 
@@ -1426,8 +1562,23 @@ impl ChatView {
         } else {
             count
         };
+        // The editor lives in the Composer item, or — during an inline edit —
+        // in the edited post's Message item; attach the editor focus to
+        // whichever holds it so an offscreen-focused editor keeps rendering.
+        let editing_index = self.editing.as_deref().and_then(|id| {
+            self.space
+                .read(cx)
+                .messages()
+                .iter()
+                .position(|m| m.action_id.as_deref() == Some(id))
+        });
         let focus_handles = (splice_from..count).map(|ix| {
-            matches!(new_items[ix], TranscriptItem::Composer { .. }).then(|| composer_focus.clone())
+            let holds_editor = match new_items[ix] {
+                TranscriptItem::Composer { .. } => true,
+                TranscriptItem::Message { index, .. } => Some(index) == editing_index,
+                _ => false,
+            };
+            holds_editor.then(|| composer_focus.clone())
         });
         self.list_state
             .splice_focusable(splice_from..old_len, focus_handles);
@@ -1480,13 +1631,18 @@ impl ChatView {
         if has_error {
             items.push(TranscriptItem::Error);
         }
-        // The composer is always the final item. It gets a leading "You" delim
-        // only when there is preceding content (otherwise the cursor sits at
-        // the top of a blank page).
-        let has_preceding = message_count > 0 || streaming || has_error;
-        items.push(TranscriptItem::Composer {
-            leading_delim: has_preceding,
-        });
+        // The trailing new-post composer is suppressed during an inline edit:
+        // the single editor entity has moved to the edited post's own row (the
+        // Message item renders it in place of the static body). Outside edit
+        // mode the composer is the final item, with a leading "You" byline only
+        // when there is preceding content (else the cursor sits at the top of a
+        // blank page).
+        if self.editing.is_none() {
+            let has_preceding = message_count > 0 || streaming || has_error;
+            items.push(TranscriptItem::Composer {
+                leading_delim: has_preceding,
+            });
+        }
         items
     }
 }
@@ -1517,9 +1673,14 @@ impl Render for ChatView {
             .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| {
                 this.toggle_model_picker(window, cx)
             }))
-            // Picker keyboard navigation — no-ops when the picker is closed.
+            // Esc cancels an inline edit first; otherwise dismisses the picker
+            // (both no-ops when neither is active).
             .on_action(cx.listener(|this, _: &DismissModelPicker, window, cx| {
-                this.dismiss_model_picker(window, cx)
+                if this.editing.is_some() {
+                    this.cancel_edit(cx);
+                } else {
+                    this.dismiss_model_picker(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &PickerUp, _, cx| this.picker_up(cx)))
             .on_action(cx.listener(|this, _: &PickerDown, _, cx| this.picker_down(cx)))
@@ -1710,8 +1871,47 @@ impl ChatView {
         let fg = if is_error { c_danger } else { c_fg };
         let byline_color = if is_error { c_danger } else { c_muted_fg };
 
+        let action_id = entry.action_id.clone();
+        let role = msg.role.clone();
+        // This post is being edited in place: it renders the one editor entity
+        // instead of its static body.
+        let editing_this = action_id.is_some() && self.editing == action_id;
+        let hovered = self.hovered_post == Some(idx) && !editing_this;
+
         // The post body is one prose reading column.
         let mut body = post_body().gap_3().text_color(fg);
+
+        if editing_this {
+            // The post's content becomes editable in place (the inline-edit
+            // model): the one editor entity renders here, preloaded with the
+            // post's text by `begin_edit`.
+            let composer_min_h = PROSE_FONT_SIZE * PROSE_LINE_HEIGHT;
+            body = body
+                .child(
+                    div()
+                        .id(("edit-editor", idx))
+                        .probe("chat/edit-editor", gpui::Role::TextInput, "Edit post")
+                        .min_h(composer_min_h)
+                        .child(self.prompt_editor.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(c_muted_fg)
+                        .child("Editing · ⌘↩ save · esc cancel"),
+                );
+            return post_frame(
+                content_width,
+                entry.depth,
+                leading,
+                entry.byline.clone(),
+                byline_color,
+                c_border,
+                body,
+            )
+            .id(("msg-row", idx))
+            .into_any_element();
+        }
 
         if let Some(reasoning) = entry.reasoning.as_deref()
             && msg.role == "assistant"
@@ -1759,6 +1959,34 @@ impl ChatView {
         };
         body = body.child(content);
 
+        // Hover affordances: a quiet row of actions revealed under the post —
+        // edit your own posts, regenerate the assistant's. (Reply is the next
+        // inline increment.) Only real persisted posts (with an `action_id`)
+        // carry them.
+        if hovered && let Some(aid) = action_id.clone() {
+            let mut actions = h_flex().gap_4().pt_1().text_sm().text_color(c_muted_fg);
+            if role == "user" {
+                let text = msg.content.clone();
+                actions = actions.child(
+                    affordance(("edit", idx), "chat/post/edit", "Edit").on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.begin_edit(aid.clone(), text.clone(), window, cx);
+                        },
+                    )),
+                );
+            } else if role == "assistant" {
+                let aid2 = aid.clone();
+                actions = actions.child(
+                    affordance(("regen", idx), "chat/post/regenerate", "Regenerate").on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.regenerate_post(aid2.clone(), cx);
+                        }),
+                    ),
+                );
+            }
+            body = body.child(actions);
+        }
+
         post_frame(
             content_width,
             entry.depth,
@@ -1769,6 +1997,9 @@ impl ChatView {
             body,
         )
         .id(("msg-row", idx))
+        .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+            this.set_post_hover(idx, *hovering, cx);
+        }))
         .into_any_element()
     }
 
@@ -2364,6 +2595,22 @@ fn post_body() -> Div {
     v_flex()
         .text_size(PROSE_FONT_SIZE)
         .line_height(relative(PROSE_LINE_HEIGHT))
+}
+
+/// A quiet, clickable post affordance (the hover row's "Edit" / "Regenerate" /
+/// later "Reply"). A probed `div` so it's visible to AT and the driver; the
+/// caller attaches `.on_click`. Inherits the row's muted color; `cursor_pointer`
+/// signals it's actionable.
+fn affordance(
+    id: impl Into<gpui::ElementId>,
+    probe_name: &'static str,
+    label: &'static str,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .probe(probe_name, gpui::Role::Button, label)
+        .cursor_pointer()
+        .child(label)
 }
 
 /// Center the prose column horizontally within a full-width row. Wraps the

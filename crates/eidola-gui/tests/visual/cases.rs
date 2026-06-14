@@ -729,6 +729,105 @@ fn register_chat(s: &mut Snapshots) {
         },
     );
 
+    // Hover affordances — the quiet per-post actions revealed under a post on
+    // hover (Edit on your own posts, Regenerate on the assistant's). Here the
+    // assistant post is hovered, so its "Regenerate" affordance shows.
+    s.add_with_step(
+        "chat_post_hover_actions",
+        size(px(960.), px(620.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
+                view_with_tree(
+                    view,
+                    vec![
+                        fixture_post(
+                            "u1",
+                            "human",
+                            "user",
+                            "user_input",
+                            "Why is the sky blue?",
+                            0,
+                            false,
+                            1,
+                        ),
+                        fixture_post(
+                            "i1",
+                            "agent",
+                            "gemma4-31b",
+                            "inference",
+                            "Rayleigh scattering: short (blue) wavelengths scatter far more \
+                             than long (red) ones, so the daytime sky reads blue.",
+                            0,
+                            false,
+                            1,
+                        ),
+                    ],
+                    cx,
+                )
+            })
+        },
+        |cx, window, view| {
+            cx.update_window(window, |_, _, cx| {
+                view.update(cx, |v, cx| v.set_post_hover(1, true, cx));
+            })
+            .ok();
+        },
+    );
+
+    // Inline edit — the post's content becomes editable in place (the one
+    // editor entity moved onto the post); the trailing composer is suppressed.
+    s.add_with_step(
+        "chat_inline_edit",
+        size(px(960.), px(620.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
+                view_with_tree(
+                    view,
+                    vec![
+                        fixture_post(
+                            "u1",
+                            "human",
+                            "user",
+                            "user_input",
+                            "Summarize the deployment plan.",
+                            0,
+                            false,
+                            1,
+                        ),
+                        fixture_post(
+                            "i1",
+                            "agent",
+                            "gemma4-31b",
+                            "inference",
+                            "Cut at noon, promote once green.",
+                            0,
+                            false,
+                            1,
+                        ),
+                    ],
+                    cx,
+                )
+            })
+        },
+        |cx, window, view| {
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |v, cx| {
+                    v.begin_edit(
+                        "u1".into(),
+                        "Summarize the deployment plan.".into(),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .ok();
+        },
+    );
+
     s.add(
         "chat_with_messages",
         size(px(900.), px(640.)),

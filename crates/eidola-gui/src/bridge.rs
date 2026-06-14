@@ -87,6 +87,29 @@ pub fn post(
     })
 }
 
+/// Edit a post in place — append a new human generation of its item (the
+/// inline-edit commit). No credential, no model call.
+pub fn edit_post(
+    core: Arc<AppCore>,
+    action_id: String,
+    new_prompt: String,
+) -> oneshot::Receiver<Result<PostResult, AppError>> {
+    spawn_oneshot(core, move |core| async move {
+        core.edit_post(action_id, new_prompt).await
+    })
+}
+
+/// Regenerate an inference — append a new agent generation of its item.
+pub fn regenerate(
+    core: Arc<AppCore>,
+    action_id: String,
+    model: String,
+) -> oneshot::Receiver<Result<ChatResult, AppError>> {
+    spawn_oneshot(core, move |core| async move {
+        core.regenerate(action_id, model).await
+    })
+}
+
 /// Load a space's threaded-post render tree (the reopened-space initial load
 /// and the post-stream reload). The flattened `PostNode` list the transcript
 /// renders from — see `AppCore::get_space_tree`.
