@@ -195,6 +195,12 @@ pub struct ChatView {
     /// composer is suppressed — there is one editor entity, and edit moves it
     /// to the post. `⌘↩`/`⌘⇧↩` commit the edit; Esc cancels.
     editing: Option<String>,
+    /// Inline reply target: the `action_id` of the post being replied to, if
+    /// any. While set, the one editor renders as a post **inline right after
+    /// that post** (the reply's eventual position — a branch when the target
+    /// isn't the tail) instead of at the bottom; the next `⌘↩`/`⌘⇧↩` links the
+    /// new post to this target. Esc cancels.
+    replying_to: Option<String>,
     /// The composer draft stashed when an inline edit began, restored on
     /// cancel/commit so entering edit mode doesn't destroy an in-progress
     /// new-post draft.
@@ -802,6 +808,7 @@ impl ChatView {
             list_state,
             transcript_items: Vec::new(),
             editing: None,
+            replying_to: None,
             saved_draft: None,
             hovered_post: None,
             picker_highlighted: None,
@@ -889,6 +896,16 @@ impl ChatView {
     #[doc(hidden)]
     pub fn transcript_item_count_for_test(&self) -> usize {
         self.transcript_items.len()
+    }
+
+    /// Test-only: the flat-model index of the composer item, if present. Lets a
+    /// behavior test assert an inline reply puts the editor right after its
+    /// target (vs the trailing position) without a paint pass.
+    #[doc(hidden)]
+    pub fn composer_position_for_test(&self) -> Option<usize> {
+        self.transcript_items
+            .iter()
+            .position(|i| matches!(i, TranscriptItem::Composer { .. }))
     }
 
     /// Test-only: whether the transcript list is currently following its tail.
@@ -1272,6 +1289,41 @@ impl ChatView {
         self.editing.as_deref()
     }
 
+    /// The `action_id` of the post being replied to inline, if any (tests).
+    pub fn replying_to(&self) -> Option<&str> {
+        self.replying_to.as_deref()
+    }
+
+    /// Begin an inline reply to a post: the one editor moves to the reply's
+    /// eventual position (inline right after the target), and the next gesture
+    /// links the new post to it (branching if the target isn't the tail). The
+    /// composer's current draft is kept as the reply's content.
+    pub fn begin_reply(&mut self, action_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.space.read(cx).is_streaming() {
+            return;
+        }
+        // Replying and editing are mutually exclusive uses of the one editor.
+        if self.editing.is_some() {
+            self.cancel_edit(cx);
+        }
+        self.replying_to = Some(action_id);
+        self.hovered_post = None;
+        let editor_focus = self.prompt_editor.read(cx).focus_handle(cx);
+        window.focus(&editor_focus, cx);
+        self.rebuild_transcript(false, cx);
+        cx.notify();
+    }
+
+    /// Cancel an in-progress inline reply (the editor returns to the bottom).
+    /// The draft is kept — it's still a new post, just to the tail now.
+    pub fn cancel_reply(&mut self, cx: &mut Context<Self>) {
+        if self.replying_to.take().is_none() {
+            return;
+        }
+        self.rebuild_transcript(false, cx);
+        cx.notify();
+    }
+
     /// The transcript index currently hovered, if any (tests/snapshots).
     pub fn hovered_post(&self) -> Option<usize> {
         self.hovered_post
@@ -1403,8 +1455,11 @@ impl ChatView {
         });
         self.error = None;
         self.show_plans_after_error = false;
+        // An inline reply links the post to its target (branching); otherwise
+        // it's a tail post. Clear the reply target once consumed.
+        let reply_to = self.replying_to.take();
         self.space.update(cx, |s, cx| {
-            s.post_only(prompt, cx);
+            s.post_only(prompt, reply_to, cx);
         });
         self.list_state.set_follow_mode(gpui::FollowMode::Tail);
         self.list_state.scroll_to_end();
@@ -1450,8 +1505,11 @@ impl ChatView {
         // shared `Space`, so a second window on the same space sees them too.
         self.error = None;
         self.show_plans_after_error = false;
+        // An inline reply links the new turn to its target (branching);
+        // otherwise it continues the tail. Clear the target once consumed.
+        let reply_to = self.replying_to.take();
         self.space.update(cx, |s, cx| {
-            s.submit(prompt, model, cx);
+            s.submit(prompt, model, reply_to, cx);
         });
         // Submit always brings the new exchange into view, regardless of where
         // the reader had scrolled — re-engage tail follow and pin to the
@@ -1616,6 +1674,15 @@ impl ChatView {
         let streaming = space.is_streaming();
         let has_error = self.error.is_some();
 
+        // An inline reply renders the composer right *after* its target post
+        // (the reply's eventual position). Resolve the target's index, if any.
+        let reply_after = self.replying_to.as_deref().and_then(|id| {
+            space
+                .messages()
+                .iter()
+                .position(|m| m.action_id.as_deref() == Some(id))
+        });
+
         let mut items = Vec::with_capacity(message_count + 2);
         for index in 0..message_count {
             // The very first row of the page has no leading delim (the user's
@@ -1624,6 +1691,12 @@ impl ChatView {
                 index,
                 leading_delim: index > 0,
             });
+            // Inline reply: the composer slots in directly after its target.
+            if reply_after == Some(index) {
+                items.push(TranscriptItem::Composer {
+                    leading_delim: true,
+                });
+            }
         }
         if streaming {
             items.push(TranscriptItem::Streaming);
@@ -1631,13 +1704,14 @@ impl ChatView {
         if has_error {
             items.push(TranscriptItem::Error);
         }
-        // The trailing new-post composer is suppressed during an inline edit:
-        // the single editor entity has moved to the edited post's own row (the
-        // Message item renders it in place of the static body). Outside edit
-        // mode the composer is the final item, with a leading "You" byline only
-        // when there is preceding content (else the cursor sits at the top of a
+        // The trailing new-post composer is suppressed when the editor has moved
+        // elsewhere — an inline edit (the editor renders in the edited post's
+        // own row) or an inline reply (rendered above, after its target). Else
+        // the composer is the final item, with a leading "You" byline only when
+        // there is preceding content (otherwise the cursor sits at the top of a
         // blank page).
-        if self.editing.is_none() {
+        let editor_moved = self.editing.is_some() || reply_after.is_some();
+        if !editor_moved {
             let has_preceding = message_count > 0 || streaming || has_error;
             items.push(TranscriptItem::Composer {
                 leading_delim: has_preceding,
@@ -1673,11 +1747,13 @@ impl Render for ChatView {
             .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| {
                 this.toggle_model_picker(window, cx)
             }))
-            // Esc cancels an inline edit first; otherwise dismisses the picker
-            // (both no-ops when neither is active).
+            // Esc cancels an inline edit or reply first; otherwise dismisses the
+            // picker (all no-ops when none is active).
             .on_action(cx.listener(|this, _: &DismissModelPicker, window, cx| {
                 if this.editing.is_some() {
                     this.cancel_edit(cx);
+                } else if this.replying_to.is_some() {
+                    this.cancel_reply(cx);
                 } else {
                     this.dismiss_model_picker(window, cx);
                 }
@@ -1960,11 +2036,20 @@ impl ChatView {
         body = body.child(content);
 
         // Hover affordances: a quiet row of actions revealed under the post —
-        // edit your own posts, regenerate the assistant's. (Reply is the next
-        // inline increment.) Only real persisted posts (with an `action_id`)
-        // carry them.
+        // reply to any post (branches when it isn't the tail), edit your own
+        // posts, regenerate the assistant's. Only real persisted posts (with an
+        // `action_id`) carry them.
         if hovered && let Some(aid) = action_id.clone() {
             let mut actions = h_flex().gap_4().pt_1().text_sm().text_color(c_muted_fg);
+            // Reply — available on any post; branches when it isn't the tail.
+            let reply_aid = aid.clone();
+            actions = actions.child(
+                affordance(("reply", idx), "chat/post/reply", "Reply").on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.begin_reply(reply_aid.clone(), window, cx);
+                    },
+                )),
+            );
             if role == "user" {
                 let text = msg.content.clone();
                 actions = actions.child(
@@ -2166,7 +2251,16 @@ impl ChatView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let composer_pb = window.viewport_size().height * 0.5;
+        // The half-viewport bottom breath keeps the typing zone centered — but
+        // only when the composer is at the *tail*. An inline reply sits between
+        // posts, so it takes the ordinary inter-post rhythm instead (else it
+        // would shove the following post half a screen down).
+        let inline = self.replying_to.is_some();
+        let composer_pb = if inline {
+            POST_TOP_GAP
+        } else {
+            window.viewport_size().height * 0.5
+        };
         let composer_min_h = PROSE_FONT_SIZE * PROSE_LINE_HEIGHT;
 
         let body = post_body().child(

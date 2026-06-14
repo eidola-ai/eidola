@@ -462,7 +462,13 @@ impl Space {
     /// the honest "in flight" signal. Returns `true` if the submit was
     /// accepted (a turn was appended), `false` if it was a no-op (empty prompt
     /// or already streaming).
-    pub fn submit(&mut self, prompt: String, model: String, cx: &mut Context<Self>) -> bool {
+    pub fn submit(
+        &mut self,
+        prompt: String,
+        model: String,
+        reply_to: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.submit_runner.is_some() || self.streaming.is_some() {
             return false;
         }
@@ -505,7 +511,7 @@ impl Space {
             return true;
         };
         let space_id = self.id.clone();
-        self.spawn_stream(app_core, prompt, model, space_id, cx);
+        self.spawn_stream(app_core, prompt, model, space_id, reply_to, cx);
         true
     }
 
@@ -514,7 +520,12 @@ impl Space {
     /// via `AppCore::post` (no credential, no model call); on completion the
     /// transcript reloads from the tree and a blank space adopts its new id.
     /// Returns `true` if accepted, `false` if a no-op (empty / busy).
-    pub fn post_only(&mut self, prompt: String, cx: &mut Context<Self>) -> bool {
+    pub fn post_only(
+        &mut self,
+        prompt: String,
+        reply_to: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.submit_runner.is_some() || self.streaming.is_some() {
             return false;
         }
@@ -542,7 +553,7 @@ impl Space {
             return true;
         };
         let space_id = self.id.clone();
-        let rx = bridge::post(app_core.clone(), prompt, space_id);
+        let rx = bridge::post(app_core.clone(), prompt, space_id, reply_to);
         self.submit_runner = Some(cx.spawn(async move |this, cx| {
             let outcome = rx.await.unwrap_or_else(|_| {
                 Err(AppError::Internal {
@@ -707,10 +718,11 @@ impl Space {
         prompt: String,
         model: String,
         space_id: Option<String>,
+        reply_to: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let (mut event_rx, done_rx) =
-            bridge::chat_stream(app_core.clone(), prompt, model, space_id);
+            bridge::chat_stream(app_core.clone(), prompt, model, space_id, reply_to);
 
         self.submit_runner = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = event_rx.recv().await {

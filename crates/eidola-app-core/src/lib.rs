@@ -1303,7 +1303,16 @@ impl Inner {
     /// changed (new space or auto-title). Unlike `chat`, every write here is
     /// unconditional — there is no credential gate to fail behind, so the post
     /// always persists.
-    async fn post(&self, space_id: Option<&str>, prompt: &str) -> Result<PostResult, AppError> {
+    /// Save a `user_input` post. `reply_to`, when set, is the action this post
+    /// replies to (its structural thread parent) — a reply to a non-tail post
+    /// **branches** the thread there; when `None` the post links to the space's
+    /// current tail (the linear-continuation default).
+    async fn post(
+        &self,
+        space_id: Option<&str>,
+        prompt: &str,
+        reply_to: Option<&str>,
+    ) -> Result<PostResult, AppError> {
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Err(AppError::Internal {
@@ -1377,7 +1386,13 @@ impl Inner {
             auto_titled = true;
         }
 
-        if let Some(ref ante_id) = last_action_id {
+        // Link the structural `reply` edge: to the explicit `reply_to` target
+        // (branching there) when given, otherwise to the space's tail (linear
+        // continuation). A first post in a space has neither.
+        let reply_ante = reply_to
+            .map(str::to_string)
+            .or_else(|| last_action_id.clone());
+        if let Some(ref ante_id) = reply_ante {
             db::insert_action_antecedent(&db_conn, &action_id, ante_id, 0, "reply").await?;
         }
 
@@ -2000,7 +2015,7 @@ impl Inner {
         model: &str,
         space_id: Option<&str>,
     ) -> Result<ChatResult, AppError> {
-        let posted = self.post(space_id, prompt).await?;
+        let posted = self.post(space_id, prompt, None).await?;
         self.run_turn(
             &posted.space_id,
             model,
@@ -2577,9 +2592,10 @@ impl Inner {
         prompt: &str,
         model: &str,
         space_id: Option<&str>,
+        reply_to: Option<&str>,
         sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> Result<ChatResult, AppError> {
-        let posted = self.post(space_id, prompt).await?;
+        let posted = self.post(space_id, prompt, reply_to).await?;
         self.run_turn_stream(
             &posted.space_id,
             model,
@@ -2641,7 +2657,35 @@ impl AppCore {
         self.runtime
             .spawn(async move {
                 inner
-                    .chat_stream(&prompt, &model, space_id.as_deref(), sender)
+                    .chat_stream(&prompt, &model, space_id.as_deref(), None, sender)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Streaming chat that **replies to a specific post** — `reply_to` is the
+    /// action the new turn replies to, branching the thread there (vs the
+    /// linear tail-continuation of [`chat_stream`]).
+    pub async fn chat_stream_reply(
+        &self,
+        prompt: String,
+        model: String,
+        space_id: Option<String>,
+        reply_to: Option<String>,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .chat_stream(
+                        &prompt,
+                        &model,
+                        space_id.as_deref(),
+                        reply_to.as_deref(),
+                        sender,
+                    )
                     .await
             })
             .await
@@ -3160,7 +3204,27 @@ impl AppCore {
     ) -> Result<PostResult, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.post(space_id.as_deref(), &prompt).await })
+            .spawn(async move { inner.post(space_id.as_deref(), &prompt, None).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Save a post that **replies to a specific post** (`reply_to`), branching
+    /// the thread there rather than continuing the tail. The save side of an
+    /// inline reply.
+    pub async fn post_reply(
+        &self,
+        prompt: String,
+        space_id: Option<String>,
+        reply_to: Option<String>,
+    ) -> Result<PostResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .post(space_id.as_deref(), &prompt, reply_to.as_deref())
+                    .await
+            })
             .await
             .map_err(join_err)?
     }

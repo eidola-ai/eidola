@@ -828,6 +828,52 @@ fn register_chat(s: &mut Snapshots) {
         },
     );
 
+    // Inline reply — the editor placed at the reply's eventual position: right
+    // after the *first* post, mid-thread (a branch off the spine), rather than
+    // at the bottom. The trailing composer is suppressed.
+    s.add_with_step(
+        "chat_inline_reply",
+        size(px(960.), px(640.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
+                view_with_tree(
+                    view,
+                    vec![
+                        fixture_post(
+                            "u1",
+                            "human",
+                            "user",
+                            "user_input",
+                            "What's the release plan?",
+                            0,
+                            false,
+                            1,
+                        ),
+                        fixture_post(
+                            "i1",
+                            "agent",
+                            "gemma4-31b",
+                            "inference",
+                            "Cut at noon, promote once green.",
+                            0,
+                            false,
+                            1,
+                        ),
+                    ],
+                    cx,
+                )
+            })
+        },
+        |cx, window, view| {
+            cx.update_window(window, |_, window, cx| {
+                view.update(cx, |v, cx| v.begin_reply("u1".into(), window, cx));
+            })
+            .ok();
+        },
+    );
+
     s.add(
         "chat_with_messages",
         size(px(900.), px(640.)),

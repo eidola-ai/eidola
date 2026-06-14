@@ -353,6 +353,59 @@ fn inline_edit_enters_suppresses_composer_and_cancels(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn inline_reply_places_composer_after_target_and_cancels(cx: &mut TestAppContext) {
+    // ⤷ reply moves the one editor to the reply's eventual position — inline
+    // right after the target post (a branch when it isn't the tail) — instead
+    // of the trailing bottom. Esc returns it to the bottom.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(stores.clone(), None, WindowInput::new(cx), window, cx))
+    });
+
+    view.update(cx, |v, cx| {
+        v.set_post_tree_for_test(
+            vec![
+                fixture_user_post("u1", "first post"),
+                fixture_user_post("u2", "second post"),
+            ],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    // Default: composer trails (after both messages → index 2).
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.replying_to(), None);
+        assert_eq!(v.composer_position_for_test(), Some(2));
+    });
+
+    // Reply to the *first* post: the composer slots in right after it (index 1).
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_reply("u1".into(), window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.replying_to(), Some("u1"));
+        assert_eq!(
+            v.composer_position_for_test(),
+            Some(1),
+            "the reply composer should sit directly after its target post"
+        );
+        // Two messages + the inline composer, no trailing composer.
+        assert_eq!(v.transcript_item_count_for_test(), 3);
+    });
+
+    // Cancel returns the composer to the trailing position.
+    view.update(cx, |v, cx| v.cancel_reply(cx));
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.replying_to(), None);
+        assert_eq!(v.composer_position_for_test(), Some(2));
+    });
+}
+
+#[gpui::test]
 fn chat_renders_markdown_messages_without_panicking(cx: &mut TestAppContext) {
     // Markdown bodies (headings, lists, fenced code) flow through
     // `TextView::markdown` rather than a plain `SharedString`. This guards

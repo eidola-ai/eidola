@@ -56,12 +56,14 @@ where
 /// Streaming chat. Spawns the streaming call on the core's tokio runtime and
 /// returns an `mpsc` receiver of incremental deltas (closes when the stream
 /// ends) plus a `oneshot` receiver for the terminal `ChatResult`. Both are
-/// drained from gpui's main thread by `chat::ChatView::spawn_stream`.
+/// drained from gpui's main thread by `chat::ChatView::spawn_stream`. `reply_to`,
+/// when set, branches the new turn off that post (vs the linear tail).
 pub fn chat_stream(
     core: Arc<AppCore>,
     prompt: String,
     model: String,
     space_id: Option<String>,
+    reply_to: Option<String>,
 ) -> (
     mpsc::UnboundedReceiver<ChatStreamEvent>,
     oneshot::Receiver<Result<ChatResult, AppError>>,
@@ -69,7 +71,9 @@ pub fn chat_stream(
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (done_tx, done_rx) = oneshot::channel();
     core.runtime().handle().clone().spawn(async move {
-        let res = core.chat_stream(prompt, model, space_id, event_tx).await;
+        let res = core
+            .chat_stream_reply(prompt, model, space_id, reply_to, event_tx)
+            .await;
         let _ = done_tx.send(res);
     });
     (event_rx, done_rx)
@@ -77,13 +81,15 @@ pub fn chat_stream(
 
 /// Save a post without requesting a response (the save side of save-vs-request:
 /// `⌘⇧↩`). Creates the space when `space_id` is `None`; needs no credential.
+/// `reply_to`, when set, branches off that post (vs the linear tail).
 pub fn post(
     core: Arc<AppCore>,
     prompt: String,
     space_id: Option<String>,
+    reply_to: Option<String>,
 ) -> oneshot::Receiver<Result<PostResult, AppError>> {
     spawn_oneshot(core, move |core| async move {
-        core.post(prompt, space_id).await
+        core.post_reply(prompt, space_id, reply_to).await
     })
 }
 
