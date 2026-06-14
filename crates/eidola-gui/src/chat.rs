@@ -293,6 +293,20 @@ impl ChatView {
             .update(cx, |s, cx| s.set_messages_for_test(messages, cx));
     }
 
+    /// Test-only: write a fixture post tree (with depth/branch/generation
+    /// metadata) into the shared `Space`, then rebuild the item model — for
+    /// snapshot cases that render threaded branches and the generation switcher.
+    #[doc(hidden)]
+    pub fn set_post_tree_for_test(
+        &mut self,
+        nodes: Vec<eidola_app_core::PostNode>,
+        cx: &mut Context<Self>,
+    ) {
+        self.space
+            .update(cx, |s, cx| s.set_post_tree_for_test(nodes, cx));
+        self.rebuild_transcript(false, cx);
+    }
+
     /// Test-only: append one message to the shared `Space`'s transcript —
     /// the shape of a stream finalizing (used with `set_streaming_for_test`
     /// to replay the StreamEnded reshape in the round-3 repro).
@@ -1645,7 +1659,12 @@ impl ChatView {
         let theme = cx.theme();
         // Copy the colors out: the cached-text-state lookups below need
         // `&mut cx`, which a live `&Theme` borrow would block.
-        let (c_danger, c_muted_fg, c_fg) = (theme.danger, theme.muted_foreground, theme.foreground);
+        let (c_danger, c_muted_fg, c_fg, c_border) = (
+            theme.danger,
+            theme.muted_foreground,
+            theme.foreground,
+            theme.border,
+        );
         let markdown_style = markdown_style(theme.mode.is_dark());
         let Some(entry) = self.space.read(cx).messages().get(idx).cloned() else {
             return div().into_any_element();
@@ -1706,9 +1725,11 @@ impl ChatView {
 
         post_frame(
             content_width,
+            entry.depth,
             leading,
             entry.byline.clone(),
             byline_color,
+            c_border,
             body,
         )
         .id(("msg-row", idx))
@@ -1729,6 +1750,7 @@ impl ChatView {
         let fg = theme.foreground;
         let muted_fg = theme.muted_foreground;
         let danger = theme.danger;
+        let border = theme.border;
         let markdown_style = markdown_style(theme.mode.is_dark());
         let Some(s) = self.space.read(cx).streaming().cloned() else {
             return div().into_any_element();
@@ -1799,7 +1821,7 @@ impl ChatView {
             );
         }
 
-        post_frame(content_width, true, byline, muted_fg, body).into_any_element()
+        post_frame(content_width, 0, true, byline, muted_fg, border, body).into_any_element()
     }
 
     /// The window-local error band (an "Error" byline + body + optional
@@ -1812,6 +1834,7 @@ impl ChatView {
         let theme = cx.theme();
         let c_danger = theme.danger;
         let c_fg = theme.foreground;
+        let c_border = theme.border;
         let markdown_style = markdown_style(theme.mode.is_dark());
         let Some(err) = self.error.clone() else {
             return div().into_any_element();
@@ -1847,7 +1870,7 @@ impl ChatView {
                 .child(self.render_plans_list(cx));
         }
 
-        post_frame(content_width, true, "Error", c_danger, body).into_any_element()
+        post_frame(content_width, 0, true, "Error", c_danger, c_border, body).into_any_element()
     }
 
     /// The composer item — the final list item. It carries the same gutter
@@ -1890,9 +1913,17 @@ impl ChatView {
         if leading {
             // The draft tail of the thread: same gutter byline + rhythm as a
             // post, so it lines up with the conversation above.
-            post_frame(content_width, true, "You", theme.muted_foreground, body)
-                .pb(composer_pb)
-                .into_any_element()
+            post_frame(
+                content_width,
+                0,
+                true,
+                "You",
+                theme.muted_foreground,
+                theme.border,
+                body,
+            )
+            .pb(composer_pb)
+            .into_any_element()
         } else {
             // Blank page: the cursor sits at the top with no byline, at the
             // same definite reading width as a post.
@@ -2176,6 +2207,11 @@ const POST_GUTTER_MIN_WIDTH: gpui::Pixels = gpui::px(880.);
 /// between turns.
 const POST_TOP_GAP: gpui::Pixels = gpui::px(44.);
 
+/// Horizontal indent per branch depth level. The spine stays flat (depth 0);
+/// only genuine branches step in, each carrying a left-margin rail. Kept slight
+/// so deep branches don't narrow the reading column to nothing.
+const BRANCH_INDENT: gpui::Pixels = gpui::px(28.);
+
 /// Horizontal inset on each side of a post (matches `.px_5()` = 20px), kept as
 /// a constant so the reading-column width can be computed from the viewport.
 const POST_SIDE_PAD: gpui::Pixels = gpui::px(20.);
@@ -2215,33 +2251,50 @@ fn reading_column_width(content_width: gpui::Pixels, narrow: bool) -> gpui::Pixe
 /// [`post_body`] the caller has filled with the post's content (reasoning
 /// disclosure, markdown body, …) — `post_frame` sets its width. The byline is
 /// the quiet chrome voice (`text_sm`, muted or danger).
+#[allow(clippy::too_many_arguments)]
 fn post_frame(
     content_width: gpui::Pixels,
+    depth: usize,
     lead: bool,
     byline: impl Into<SharedString>,
     byline_color: gpui::Hsla,
+    rail_color: gpui::Hsla,
     body: Div,
 ) -> Div {
     let narrow = content_width < POST_GUTTER_MIN_WIDTH;
-    let body_w = reading_column_width(content_width, narrow);
+    // Branches step in by `depth` levels; the spine (depth 0) stays flat. The
+    // indent narrows the reading column so a branch body still fits.
+    let indent = BRANCH_INDENT * (depth as f32);
+    let body_w = (reading_column_width(content_width, narrow) - indent).max(gpui::px(220.));
     let byline_el = div()
         .text_sm()
         .text_color(byline_color)
         .child(byline.into());
 
+    // A branch carries a left-margin rail (the body's left border) so it reads
+    // as hanging off the spine; `pl_4` keeps the text off the rule.
+    let body = if depth > 0 {
+        body.border_l_1().border_color(rail_color).pl_4()
+    } else {
+        body
+    };
+
     let row = if narrow {
-        // Byline stacked above the body, both at the definite reading width.
+        // Byline stacked above the body, both at the definite reading width,
+        // the whole post indented by its branch depth.
         h_flex().w_full().justify_center().child(
             v_flex()
                 .w(body_w)
+                .pl(indent)
                 .gap_2()
                 .child(byline_el)
                 .child(body.w_full()),
         )
     } else {
-        // Byline right-aligned in the left-margin gutter; the [gutter | body]
-        // pair is centered as a unit. The body carries a definite width.
-        h_flex()
+        // Byline right-aligned in the left-margin gutter; the
+        // [gutter | indent | body] row is centered as a unit. The body carries
+        // a definite width.
+        let mut row = h_flex()
             .w_full()
             .justify_center()
             .items_start()
@@ -2253,8 +2306,11 @@ fn post_frame(
                     .flex()
                     .justify_end()
                     .child(byline_el),
-            )
-            .child(body.w(body_w))
+            );
+        if indent > gpui::px(0.) {
+            row = row.child(div().w(indent).flex_none());
+        }
+        row.child(body.w(body_w))
     };
 
     let mut frame = v_flex().w_full().px(POST_SIDE_PAD);

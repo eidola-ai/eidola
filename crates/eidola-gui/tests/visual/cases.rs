@@ -9,8 +9,8 @@ use eidola_app_core::updates::{
 };
 use eidola_app_core::{
     AttestationDetail, AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState,
-    CredentialLifecycleInfo, MeasurementInfo, ModelInfo, PriceInfo, RequestDetail, RequestInfo,
-    SpaceInfo, SpaceMessage, SpendTrailEntry,
+    CredentialLifecycleInfo, MeasurementInfo, ModelInfo, PostBlock, PostNode, PostParticipant,
+    PriceInfo, RequestDetail, RequestInfo, SpaceInfo, SpaceMessage, SpendTrailEntry,
 };
 use eidola_gui::about::AboutView;
 use eidola_gui::chat::{ChatView, StreamingResponse};
@@ -650,6 +650,78 @@ fn register_chat(s: &mut Snapshots) {
                             label centered and masking the line behind it."
                                     .into(),
                         },
+                    ],
+                    cx,
+                )
+            })
+        },
+    );
+
+    // Threaded branches — the spine stays flat; a second reply to an earlier
+    // post becomes an indented branch with a left-margin rail. Guards the
+    // step-3 branch render (depth indent + rail) at a wide width.
+    s.add(
+        "chat_with_branches",
+        size(px(960.), px(680.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
+                view_with_tree(
+                    view,
+                    vec![
+                        fixture_post(
+                            "u1",
+                            "human",
+                            "user",
+                            "user_input",
+                            "What's the plan for the release?",
+                            0,
+                            false,
+                            1,
+                        ),
+                        fixture_post(
+                            "i1",
+                            "agent",
+                            "gemma4-31b",
+                            "inference",
+                            "Cut v0.1.0 at noon, then promote `next` to `main` once the \
+                         artifact chain is green.",
+                            0,
+                            false,
+                            1,
+                        ),
+                        fixture_post(
+                            "u2",
+                            "human",
+                            "user",
+                            "user_input",
+                            "Sounds good — go ahead.",
+                            0,
+                            false,
+                            1,
+                        ),
+                        // A later reply to the *first* post — a branch off the spine.
+                        fixture_post(
+                            "u1b",
+                            "human",
+                            "user",
+                            "user_input",
+                            "Wait — what about staging first?",
+                            1,
+                            true,
+                            1,
+                        ),
+                        fixture_post(
+                            "i2",
+                            "agent",
+                            "gemma4-31b",
+                            "inference",
+                            "Good call. Deploy to staging, soak for an hour, then promote.",
+                            1,
+                            false,
+                            1,
+                        ),
                     ],
                     cx,
                 )
@@ -1593,4 +1665,56 @@ fn view_streaming(
 ) -> ChatView {
     view.set_streaming_for_test(Some(streaming), cx);
     view
+}
+
+fn view_with_tree(
+    mut view: ChatView,
+    nodes: Vec<PostNode>,
+    cx: &mut gpui::Context<ChatView>,
+) -> ChatView {
+    view.set_post_tree_for_test(nodes, cx);
+    view
+}
+
+/// Build a fixture `PostNode` for the branch/generation snapshot cases. The
+/// flattener's depth/branch metadata is supplied directly so the render can be
+/// exercised without a backend.
+#[allow(clippy::too_many_arguments)]
+fn fixture_post(
+    action_id: &str,
+    kind: &str,
+    label: &str,
+    action_type: &str,
+    text: &str,
+    depth: usize,
+    is_branch: bool,
+    generation_count: i64,
+) -> PostNode {
+    PostNode {
+        action_id: action_id.into(),
+        item_id: format!("item-{action_id}"),
+        parent_action_id: None,
+        participant: PostParticipant {
+            kind: kind.into(),
+            label: label.into(),
+        },
+        action_type: action_type.into(),
+        generation: generation_count - 1,
+        generation_count,
+        is_current: true,
+        model: (kind == "agent").then(|| label.to_string()),
+        credits_consumed: (kind == "agent").then_some(700),
+        relation: (depth > 0 || is_branch).then(|| "reply".to_string()),
+        depth,
+        is_branch,
+        blocks: vec![PostBlock {
+            block_type: "text".into(),
+            text: Some(text.into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }],
+        references: Vec::new(),
+        created_at: 0,
+    }
 }

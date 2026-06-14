@@ -81,6 +81,14 @@ pub struct ChatMessageView {
     pub action_id: Option<String>,
     /// The post's stable item id (see `action_id`).
     pub item_id: Option<String>,
+    /// Thread depth from the flattener: `0` is the spine, `> 0` an indented
+    /// branch. Drives the branch indent + margin rail in the render.
+    pub depth: usize,
+    /// `true` when this post is a non-first reply to its parent (a branch head).
+    pub is_branch: bool,
+    /// Total generations of this item (`>= 1`); `> 1` means the post has been
+    /// edited/regenerated and a generation switcher applies.
+    pub generation_count: i64,
     pub reasoning: Option<String>,
     pub reasoning_expanded: bool,
 }
@@ -96,6 +104,9 @@ impl ChatMessageView {
             byline,
             action_id: None,
             item_id: None,
+            depth: 0,
+            is_branch: false,
+            generation_count: 1,
             reasoning: None,
             reasoning_expanded: false,
         }
@@ -124,6 +135,9 @@ impl ChatMessageView {
             byline,
             action_id: Some(node.action_id),
             item_id: Some(node.item_id),
+            depth: node.depth,
+            is_branch: node.is_branch,
+            generation_count: node.generation_count,
             reasoning: None,
             reasoning_expanded: false,
         }
@@ -600,6 +614,15 @@ impl Space {
     pub fn set_messages_for_test(&mut self, messages: Vec<SpaceMessage>, cx: &mut Context<Self>) {
         self.transcript =
             Loadable::loaded(messages.into_iter().map(ChatMessageView::new).collect());
+        cx.notify();
+    }
+
+    /// Test-only: replace the transcript with a fixture post tree, preserving
+    /// each post's depth/branch/generation metadata — so snapshot cases can
+    /// render threaded branches and the generation switcher without a backend.
+    #[doc(hidden)]
+    pub fn set_post_tree_for_test(&mut self, nodes: Vec<PostNode>, cx: &mut Context<Self>) {
+        self.transcript = Loadable::loaded(views_from_nodes(nodes));
         cx.notify();
     }
 
