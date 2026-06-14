@@ -13,14 +13,14 @@
 //!
 //! ## Error-path emission coverage
 //!
-//! The partial-failure emissions in `chat` and `chat_stream` require an HTTP
-//! server fixture to exercise end-to-end. The rule (`docs/architecture/state.md`,
-//! "every write emits"): **every explicit error exit AFTER the user-action
-//! commit emits `Change::Space(id)` plus `Change::SpaceIndex` when
-//! `is_new_space || auto_titled`**, mirroring the non-2xx arm — and *also*
-//! `Change::Record` once the request row is committed. The complete exit-point
-//! map (both functions now reorder the new-space row insert to AFTER credential
-//! resolution, so the rows below exist only once spendability is known):
+//! `chat` / `chat_stream` are now `post` + `run_turn(Reply)` (wave 5.2b). `post`
+//! persists the user turn FIRST (no credential) and emits `Change::Space(id)` +
+//! `Change::SpaceIndex` (new space / auto-title). `run_turn` then does the
+//! request: `Change::Wallet` at spend start, `Change::Record` (+`Space`) on
+//! non-2xx, `Space`+`Wallet`+`Record` on success, and re-signals `Space` on its
+//! error exits — it never emits `SpaceIndex` (post owns that). Every `run_turn`
+//! error wraps the (always-persisted) space id. The exit-point map below lists
+//! the UNION of emissions across the post + run_turn pair:
 //!
 //! The rows marked **`chat_path.rs`** are now *executed* against the in-process
 //! mock-upstream harness (`tests/chat_harness/`), which drives the real `chat` /
@@ -30,7 +30,7 @@
 //!
 //! | Exit point | Writes committed | Emissions | Tested here |
 //! |---|---|---|---|
-//! | Pre-space failure (config, `NoAccount`, `InsufficientBalance`, zero-charge, `ensure_spendable_credential`) | **none** (new-space insert is deferred) | none — pure error, no orphan space | bus unit tests assert "no emit on error"; `NoAccount` / `InsufficientBalance` executed in `chat_path.rs` |
+//! | Funding failure at request time (`NoAccount`, `InsufficientBalance`, zero-charge) | The posted user turn (post committed it) | `Space(id)`, `SpaceIndex` (from post); error wraps the space id | `chat_path.rs` (`no_account_persists_post_*`, `insufficient_balance_persists_post_*`) — root() still routes onboarding; the post survives |
 //! | `chat`/`chat_stream` — `insert_pre_credential_refund` succeeds, later step fails | Credential in `spending` state | `Wallet` | `chat_path.rs` (every post-send failure test asserts `Wallet`; the failed-recovery test asserts the credential stays `spending`) |
 //! | `chat`/`chat_stream` — network-error arm (`send` `Err`), `process_refund` `Ok` | Successor credential + user turn | `Wallet`, `Space(id)`, `SpaceIndex`? | `chat_path.rs` (`network_error_after_send_*`; the non-2xx-with-recovery test covers the recovered-successor `Wallet`) |
 //! | `chat`/`chat_stream` — network-error arm, no refund recovered | User turn | `Space(id)`, `SpaceIndex`? | `chat_path.rs` (`network_error_after_send_*`) |
@@ -41,18 +41,18 @@
 //! | `chat` — non-2xx response, after `insert_request` | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record` | `chat_path.rs` (`non_2xx_emits_record_and_space_*`) |
 //! | `chat_stream` — non-2xx response, after `insert_request` inside that branch | Space, user-message, request rows | `Space(id)`, `SpaceIndex`?, `Record`; `Wallet` if refund recovered | `chat_path.rs` (`streaming_non_2xx_*`, `non_2xx_with_refund_recovery_*`, `non_2xx_with_failed_refund_recovery_*`) |
 //!
-//! `SpaceIndex?` = emitted only when `is_new_space || auto_titled`. Plain `?` on
-//! the intervening local-DB action/content/antecedent inserts stays *unemitted*
-//! — those are internal-consistency (kill-`-9`-class) failures, not durable
-//! partial state a subscriber needs to reconcile.
+//! `SpaceIndex?` = emitted by `post` when the listing changed (new space /
+//! auto-title); `run_turn` never emits it. Plain `?` on intervening local-DB
+//! action/content/antecedent inserts stays *unemitted* — internal-consistency
+//! (kill-`-9`-class) failures, not durable partial state to reconcile.
 //!
-//! **Failure-path id adoption (item C).** Every error returned *after* the
-//! new-space row is persisted is wrapped as `AppError::ChatFailed { space_id }`
-//! (its `Display` defers to the source, so messages don't regress). This lets a
-//! blank GUI `Space` (id=`None`) learn its persisted id on failure even though
-//! no `ChatResult` was produced. Pre-space errors stay unwrapped. Unit-tested in
-//! `error.rs` (`chat_failed_display_defers_to_source`, `root_unwraps_*`,
-//! `chat_space_id_only_on_wrapper`).
+//! **Failure-path id adoption (item C).** `post` persists the space before
+//! `run_turn` runs, so every `run_turn` error is wrapped as
+//! `AppError::ChatFailed { space_id }` (its `Display` defers to the source). A
+//! blank GUI `Space` (id=`None`) thus learns its persisted id even on a funding
+//! failure. Only post's own pre-persist errors (e.g. an empty prompt) stay
+//! unwrapped. Unit-tested in `error.rs` (`chat_failed_display_defers_to_source`,
+//! `root_unwraps_*`, `chat_space_id_only_on_wrapper`).
 //!
 //! The happy-path tests below confirm the success-path emissions remain intact
 //! and that the shared infrastructure (bus capacity, multi-subscriber delivery)
