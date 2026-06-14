@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AppCore, AttestationDetail, AttestationInfo, ChatResult, ChatStreamEvent, PostNode,
+    AppCore, AttestationDetail, AttestationInfo, ChatResult, ChatStreamEvent, PostNode, PostResult,
     RequestDetail, RequestInfo, SpendTrailEntry,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -73,6 +73,18 @@ pub fn chat_stream(
         let _ = done_tx.send(res);
     });
     (event_rx, done_rx)
+}
+
+/// Save a post without requesting a response (the save side of save-vs-request:
+/// `⌘⇧↩`). Creates the space when `space_id` is `None`; needs no credential.
+pub fn post(
+    core: Arc<AppCore>,
+    prompt: String,
+    space_id: Option<String>,
+) -> oneshot::Receiver<Result<PostResult, AppError>> {
+    spawn_oneshot(core, move |core| async move {
+        core.post(prompt, space_id).await
+    })
 }
 
 /// Load a space's threaded-post render tree (the reopened-space initial load

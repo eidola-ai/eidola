@@ -50,9 +50,12 @@ const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 actions!(
     chat,
     [
-        /// Submit the composer's markdown to the model. Bound to ⌘↩ in the
-        /// `ChatView` key context.
+        /// Post the composer's markdown **and** request a response. Bound to ⌘↩
+        /// in the `ChatView` key context (the save-and-ask gesture).
         Send,
+        /// Post the composer's markdown **without** requesting a response — the
+        /// save side of the save-vs-request split. Bound to ⌘⇧↩.
+        PostOnly,
         /// Toggle the quiet model picker anchored to the title-bar band.
         /// Bound to ⌥⌘M in the `ChatView` key context; clicking the
         /// ⌥-revealed model label is the pointer path to the same state.
@@ -1246,6 +1249,38 @@ impl ChatView {
         cx.notify();
     }
 
+    /// Post the composer **without** requesting a response (`⌘⇧↩`, the save
+    /// side of save-vs-request). Mirrors `submit` but routes to
+    /// `Space::post_only` and engages tail follow so the saved post comes into
+    /// view; no model is resolved (nothing is asked).
+    fn post_only(&mut self, _: &PostOnly, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.space.read(cx).is_streaming() {
+            return;
+        }
+        let prompt = self
+            .prompt_editor
+            .read(cx)
+            .state
+            .markdown
+            .trim()
+            .to_string();
+        if prompt.is_empty() {
+            return;
+        }
+        self.prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::default();
+            cx.notify();
+        });
+        self.error = None;
+        self.show_plans_after_error = false;
+        self.space.update(cx, |s, cx| {
+            s.post_only(prompt, cx);
+        });
+        self.list_state.set_follow_mode(gpui::FollowMode::Tail);
+        self.list_state.scroll_to_end();
+        cx.notify();
+    }
+
     fn submit(&mut self, _: &Send, _window: &mut Window, cx: &mut Context<Self>) {
         // Submit-during-streaming is a no-op (the current UX); the `Space`'s
         // runner slot enforces this structurally, so we read it before
@@ -1478,6 +1513,7 @@ impl Render for ChatView {
             .key_context("ChatView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::post_only))
             .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| {
                 this.toggle_model_picker(window, cx)
             }))

@@ -22,8 +22,8 @@ use eidola_app_core::{
 use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
 use eidola_gui::chat::{
-    ChatView, DismissModelPicker, OnboardingStage, PickerConfirm, PickerDown, PickerUp, Send,
-    StreamingResponse, ToggleModelPicker,
+    ChatView, DismissModelPicker, OnboardingStage, PickerConfirm, PickerDown, PickerUp, PostOnly,
+    Send, StreamingResponse, ToggleModelPicker,
 };
 use eidola_gui::library::LibraryView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
@@ -222,6 +222,46 @@ fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
         assert!(s.reasoning.is_empty());
         assert!(s.content.is_empty());
         assert!(!s.expanded);
+    });
+}
+
+#[gpui::test]
+fn chat_post_only_appends_user_message_without_streaming(cx: &mut TestAppContext) {
+    // ⌘⇧↩ — the save side of the split: it appends the user's post but, unlike
+    // Send, does NOT enter the streaming state (nothing is requested).
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(stores.clone(), None, WindowInput::new(cx), window, cx))
+    });
+
+    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    cx.update_window(window, |_, _, cx| {
+        prompt_editor.update(cx, |editor, cx| {
+            editor.state = EditorState::with_markdown("just a thought");
+            cx.notify();
+        });
+    })
+    .unwrap();
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&PostOnly, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, cx| {
+        let messages = v.messages(cx);
+        assert_eq!(
+            messages.len(),
+            1,
+            "post_only should append the user message"
+        );
+        assert_eq!(messages[0].message.content, "just a thought");
+        assert!(
+            v.streaming(cx).is_none(),
+            "post_only must NOT enter the streaming state — it requests nothing"
+        );
     });
 }
 

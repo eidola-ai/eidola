@@ -509,6 +509,95 @@ impl Space {
         true
     }
 
+    /// Save a post **without requesting a response** — the save side of the
+    /// save-vs-request split (`⌘⇧↩`). Appends the user's turn and persists it
+    /// via `AppCore::post` (no credential, no model call); on completion the
+    /// transcript reloads from the tree and a blank space adopts its new id.
+    /// Returns `true` if accepted, `false` if a no-op (empty / busy).
+    pub fn post_only(&mut self, prompt: String, cx: &mut Context<Self>) -> bool {
+        if self.submit_runner.is_some() || self.streaming.is_some() {
+            return false;
+        }
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            return false;
+        }
+
+        self.load_task = None;
+
+        // Optimistically append the user's turn (no streaming state — this path
+        // requests nothing).
+        let mut messages = self.transcript.value().cloned().unwrap_or_default();
+        messages.push(ChatMessageView::new(SpaceMessage {
+            role: "user".to_string(),
+            content: prompt.clone(),
+        }));
+        self.transcript = Loadable::loaded(messages);
+        cx.emit(SpaceEvent::MessagesChanged);
+        cx.notify();
+
+        let Some(app_core) = self.app_core.clone() else {
+            // Stub stores (behavior tests): the local append above is the
+            // observable effect; no backend to persist to.
+            return true;
+        };
+        let space_id = self.id.clone();
+        let rx = bridge::post(app_core.clone(), prompt, space_id);
+        self.submit_runner = Some(cx.spawn(async move |this, cx| {
+            let outcome = rx.await.unwrap_or_else(|_| {
+                Err(AppError::Internal {
+                    message: "post task cancelled".into(),
+                })
+            });
+            match outcome {
+                Ok(result) => {
+                    let msgs_rx = bridge::get_space_tree(app_core, result.space_id.clone());
+                    let msgs = msgs_rx
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(AppError::Internal {
+                                message: "fetch space tree task cancelled".into(),
+                            })
+                        })
+                        .map(views_from_nodes);
+                    let _ = this.update(cx, |this, cx| {
+                        this.id = Some(result.space_id.clone());
+                        this.submit_runner = None;
+                        match msgs {
+                            Ok(messages) => {
+                                this.merge_from_db(messages, None);
+                                cx.emit(SpaceEvent::MessagesChanged);
+                                // StreamEnded drives the registry's blank-space
+                                // adoption (it reads id()); a post earns an id
+                                // too, so reuse the same signal.
+                                cx.emit(SpaceEvent::StreamEnded);
+                            }
+                            Err(e) => {
+                                this.transcript =
+                                    std::mem::take(&mut this.transcript).resolve(Err(e.clone()));
+                                cx.emit(SpaceEvent::Failed(e));
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+                Err(e) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.submit_runner = None;
+                        if this.id.is_none()
+                            && let Some(id) = e.chat_space_id()
+                        {
+                            this.id = Some(id.to_string());
+                        }
+                        cx.emit(SpaceEvent::Failed(e.root().clone()));
+                        cx.notify();
+                    });
+                }
+            }
+        }));
+        true
+    }
+
     /// Drive a streaming chat request inside the single runner slot. On
     /// completion the transcript is reloaded from the DB and the captured
     /// (ephemeral) reasoning is attached to the new last assistant entry.
