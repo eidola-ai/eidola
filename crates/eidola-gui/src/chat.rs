@@ -1563,18 +1563,18 @@ impl ChatView {
         let Some(item) = self.transcript_items.get(ix).cloned() else {
             return div().into_any_element();
         };
-        // Responsive: below the breakpoint the byline gutter collapses and the
-        // byline stacks above the post instead (see `post_frame`).
-        let narrow = window.viewport_size().width < POST_GUTTER_MIN_WIDTH;
+        // The live viewport width drives the responsive layout *and* the
+        // definite reading-column width each post measures against.
+        let content_width = window.viewport_size().width;
         match item {
             TranscriptItem::Message {
                 index,
                 leading_delim,
-            } => self.render_message_item(index, leading_delim, narrow, cx),
-            TranscriptItem::Streaming => self.render_streaming_item(narrow, cx),
-            TranscriptItem::Error => self.render_error_item(narrow, cx),
+            } => self.render_message_item(index, leading_delim, content_width, cx),
+            TranscriptItem::Streaming => self.render_streaming_item(content_width, cx),
+            TranscriptItem::Error => self.render_error_item(content_width, cx),
             TranscriptItem::Composer { leading_delim } => {
-                self.render_composer_item(leading_delim, narrow, window, cx)
+                self.render_composer_item(leading_delim, content_width, window, cx)
             }
         }
     }
@@ -1639,7 +1639,7 @@ impl ChatView {
         &mut self,
         idx: usize,
         leading: bool,
-        narrow: bool,
+        content_width: gpui::Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
@@ -1656,7 +1656,7 @@ impl ChatView {
         let byline_color = if is_error { c_danger } else { c_muted_fg };
 
         // The post body is one prose reading column.
-        let mut body = prose_col().gap_3().text_color(fg);
+        let mut body = post_body().gap_3().text_color(fg);
 
         if let Some(reasoning) = entry.reasoning.as_deref()
             && msg.role == "assistant"
@@ -1704,9 +1704,15 @@ impl ChatView {
         };
         body = body.child(content);
 
-        post_frame(narrow, leading, entry.byline.clone(), byline_color, body)
-            .id(("msg-row", idx))
-            .into_any_element()
+        post_frame(
+            content_width,
+            leading,
+            entry.byline.clone(),
+            byline_color,
+            body,
+        )
+        .id(("msg-row", idx))
+        .into_any_element()
     }
 
     /// The in-flight streaming assistant post (byline + thinking disclosure +
@@ -1714,7 +1720,11 @@ impl ChatView {
     /// stable across deltas, so the partial markdown re-parses only because its
     /// text grew. The byline is the model the turn is running on (the space's
     /// last-submitted model), matching the byline it will carry once finalized.
-    fn render_streaming_item(&mut self, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_streaming_item(
+        &mut self,
+        content_width: gpui::Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let fg = theme.foreground;
         let muted_fg = theme.muted_foreground;
@@ -1730,7 +1740,7 @@ impl ChatView {
             .map(str::to_string)
             .unwrap_or_else(|| "Eidola".to_string());
 
-        let mut body = prose_col().gap_3().text_color(fg);
+        let mut body = post_body().gap_3().text_color(fg);
 
         // Disclosure only appears once reasoning has actually arrived; before
         // that we just show a "Thinking…" status so the user sees something
@@ -1789,12 +1799,16 @@ impl ChatView {
             );
         }
 
-        post_frame(narrow, true, byline, muted_fg, body).into_any_element()
+        post_frame(content_width, true, byline, muted_fg, body).into_any_element()
     }
 
     /// The window-local error band (an "Error" byline + body + optional
     /// below-band plans list when a submit failed with `InsufficientBalance`).
-    fn render_error_item(&mut self, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_error_item(
+        &mut self,
+        content_width: gpui::Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let c_danger = theme.danger;
         let c_fg = theme.foreground;
@@ -1807,7 +1821,7 @@ impl ChatView {
         // so the user can select and copy the text. The body inherits the
         // danger color through the column's `text_color`.
         let ts = self.cached_text_state(TextKey::ErrorBand, &err, cx);
-        let mut body = prose_col().gap_4().text_color(c_danger).child(
+        let mut body = post_body().gap_4().text_color(c_danger).child(
             div()
                 .id("chat-error")
                 .probe("chat/error", gpui::Role::Alert, err.clone())
@@ -1833,7 +1847,7 @@ impl ChatView {
                 .child(self.render_plans_list(cx));
         }
 
-        post_frame(narrow, true, "Error", c_danger, body).into_any_element()
+        post_frame(content_width, true, "Error", c_danger, body).into_any_element()
     }
 
     /// The composer item — the final list item. It carries the same gutter
@@ -1857,7 +1871,7 @@ impl ChatView {
     fn render_composer_item(
         &self,
         leading: bool,
-        narrow: bool,
+        content_width: gpui::Pixels,
         window: &mut Window,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -1865,7 +1879,7 @@ impl ChatView {
         let composer_pb = window.viewport_size().height * 0.5;
         let composer_min_h = PROSE_FONT_SIZE * PROSE_LINE_HEIGHT;
 
-        let body = prose_col().child(
+        let body = post_body().child(
             div()
                 .id("composer")
                 .probe("chat/composer", gpui::Role::TextInput, "Message composer")
@@ -1876,16 +1890,19 @@ impl ChatView {
         if leading {
             // The draft tail of the thread: same gutter byline + rhythm as a
             // post, so it lines up with the conversation above.
-            post_frame(narrow, true, "You", theme.muted_foreground, body)
+            post_frame(content_width, true, "You", theme.muted_foreground, body)
                 .pb(composer_pb)
                 .into_any_element()
         } else {
-            // Blank page: the cursor sits at the top with no byline.
+            // Blank page: the cursor sits at the top with no byline, at the
+            // same definite reading width as a post.
+            let narrow = content_width < POST_GUTTER_MIN_WIDTH;
+            let body_w = reading_column_width(content_width, narrow);
             div()
                 .w_full()
-                .px_5()
+                .px(POST_SIDE_PAD)
                 .pb(composer_pb)
-                .child(h_flex().w_full().justify_center().child(body))
+                .child(h_flex().w_full().justify_center().child(body.w(body_w)))
                 .into_any_element()
         }
     }
@@ -2159,39 +2176,71 @@ const POST_GUTTER_MIN_WIDTH: gpui::Pixels = gpui::px(880.);
 /// between turns.
 const POST_TOP_GAP: gpui::Pixels = gpui::px(44.);
 
+/// Horizontal inset on each side of a post (matches `.px_5()` = 20px), kept as
+/// a constant so the reading-column width can be computed from the viewport.
+const POST_SIDE_PAD: gpui::Pixels = gpui::px(20.);
+
+/// Gap between the gutter and the reading column in the wide layout (`gap_6`).
+const POST_GUTTER_GAP: gpui::Pixels = gpui::px(24.);
+
+/// The reading-column max width in pixels (`PROSE_MAX_WIDTH_REM` × the 16px rem).
+const PROSE_MAX_WIDTH_PX: gpui::Pixels = gpui::px(PROSE_MAX_WIDTH_REM * 16.0);
+
+/// The reading-column width for a post at a given viewport width — capped at the
+/// prose measure, shrunk to fit narrow windows (minus side padding, and the
+/// gutter + gap in the wide layout). **A definite width is load-bearing**: a
+/// markdown `TextView` computes its height from its width, and as a flexible
+/// child sharing a row with the gutter it would otherwise be measured at its
+/// one-line intrinsic width (short) and painted at the real width (tall),
+/// undercounting the `list()` item height so the next post overlaps it. A
+/// definite width makes the height-for-width measurement correct.
+fn reading_column_width(content_width: gpui::Pixels, narrow: bool) -> gpui::Pixels {
+    let reserved = if narrow {
+        POST_SIDE_PAD * 2.
+    } else {
+        POST_SIDE_PAD * 2. + GUTTER_WIDTH + POST_GUTTER_GAP
+    };
+    (content_width - reserved)
+        .min(PROSE_MAX_WIDTH_PX)
+        .max(gpui::px(0.))
+}
+
 /// Lay out one post: its gutter `byline` beside (wide) or above (narrow) the
 /// `body` reading column. `lead` adds the inter-post vertical rhythm (omitted
 /// for the first post). The byline + body unit is centered in the window so the
 /// reading column keeps a stable place regardless of window width.
 ///
-/// `body` is a [`prose_col`] the caller has filled with the post's content
-/// (reasoning disclosure, markdown body, …). The byline is the quiet chrome
-/// voice (`text_sm`, muted or danger).
+/// `content_width` is the live viewport width; the reading column is sized to a
+/// **definite** width from it (see [`reading_column_width`]). `body` is a
+/// [`post_body`] the caller has filled with the post's content (reasoning
+/// disclosure, markdown body, …) — `post_frame` sets its width. The byline is
+/// the quiet chrome voice (`text_sm`, muted or danger).
 fn post_frame(
-    narrow: bool,
+    content_width: gpui::Pixels,
     lead: bool,
     byline: impl Into<SharedString>,
     byline_color: gpui::Hsla,
     body: Div,
 ) -> Div {
+    let narrow = content_width < POST_GUTTER_MIN_WIDTH;
+    let body_w = reading_column_width(content_width, narrow);
     let byline_el = div()
         .text_sm()
         .text_color(byline_color)
         .child(byline.into());
 
     let row = if narrow {
-        // Byline stacked above the body, full reading column.
+        // Byline stacked above the body, both at the definite reading width.
         h_flex().w_full().justify_center().child(
             v_flex()
-                .w_full()
-                .max_w(rems(PROSE_MAX_WIDTH_REM))
+                .w(body_w)
                 .gap_2()
                 .child(byline_el)
-                .child(body),
+                .child(body.w_full()),
         )
     } else {
         // Byline right-aligned in the left-margin gutter; the [gutter | body]
-        // pair is centered as a unit.
+        // pair is centered as a unit. The body carries a definite width.
         h_flex()
             .w_full()
             .justify_center()
@@ -2205,14 +2254,24 @@ fn post_frame(
                     .justify_end()
                     .child(byline_el),
             )
-            .child(body)
+            .child(body.w(body_w))
     };
 
-    let mut frame = v_flex().w_full().px_5();
+    let mut frame = v_flex().w_full().px(POST_SIDE_PAD);
     if lead {
         frame = frame.pt(POST_TOP_GAP);
     }
     frame.child(row)
+}
+
+/// A post's reading column: a vertical flex with the book typography (size +
+/// leading) but **no width** — `post_frame` sets a definite width on it. Used
+/// for every post body so its markdown children measure their height against a
+/// definite width.
+fn post_body() -> Div {
+    v_flex()
+        .text_size(PROSE_FONT_SIZE)
+        .line_height(relative(PROSE_LINE_HEIGHT))
 }
 
 /// Center the prose column horizontally within a full-width row. Wraps the
