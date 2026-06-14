@@ -187,6 +187,84 @@ pub struct SpaceMessage {
     pub content: String,
 }
 
+/// The participant rendered in a post's gutter byline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostParticipant {
+    /// `human` | `agent` | `tool` | `system`.
+    pub kind: String,
+    /// Display label (e.g. "user", a model name, a tool name).
+    pub label: String,
+}
+
+/// One typed content block of a post — the renderable payload of the action's
+/// current generation, in `ordinal` order. v1 renders `text` / `thinking`; the
+/// tool fields are carried faithfully for the later tool render.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostBlock {
+    /// `text` | `thinking` | `code` | `tool_use` | `tool_result` | `image` | …
+    pub block_type: String,
+    pub text: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    /// JSON sidecar (tool args/results), if any.
+    pub data: Option<String>,
+}
+
+/// A non-structural antecedent edge (relation `reference`) of a post: a plain
+/// backlink, an inline quote (carries a `range`), or an embed. Rendered as the
+/// `❝ quote ❞ — re: X` chip at the top of a reply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostReference {
+    /// The action this post references.
+    pub antecedent_action_id: String,
+    pub ordinal: i64,
+    /// Quoted character range within the antecedent's content, if a quote.
+    pub range_start: Option<i64>,
+    pub range_end: Option<i64>,
+    pub annotation: Option<String>,
+}
+
+/// One render-row of the threaded space — an item's current generation,
+/// flattened from the reply DAG into a list (so `list()` virtualization
+/// survives). The flattener (`build_post_tree`) encodes the spine-vs-branch
+/// rule: the spine follows the first (chronological) reply and stays at the
+/// same depth; later siblings of a post become indented branches (`depth + 1`,
+/// `is_branch = true`). Regenerations are generations, not siblings — items are
+/// resolved to their current tip, so they never appear as branches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostNode {
+    pub action_id: String,
+    pub item_id: String,
+    /// The structural (`reply`) parent post, if any. `None` for a thread root.
+    /// v1 threads by the **raw** reply antecedent; re-rooting a child onto its
+    /// parent item's current tip (once edits create non-tip parents) is a 5.4
+    /// addition — a no-op until then.
+    pub parent_action_id: Option<String>,
+    pub participant: PostParticipant,
+    /// `user_input` | `inference` | … (the post's action type).
+    pub action_type: String,
+    /// Derived 0-based generation number of the current tip.
+    pub generation: i64,
+    /// Total number of generations of this item (`>= 1`); drives the 5.4
+    /// generation switcher.
+    pub generation_count: i64,
+    /// Always `true` — rows are resolved to the item tip. Carried for API
+    /// symmetry and the future non-tip render.
+    pub is_current: bool,
+    pub model: Option<String>,
+    pub credits_consumed: Option<i64>,
+    /// Edge relation to the structural parent (`reply`); `None` for a root.
+    pub relation: Option<String>,
+    /// Indent level: `0` is the spine; `> 0` is an indented branch.
+    pub depth: usize,
+    /// `true` when this post is a non-first reply to its parent — the head of a
+    /// branch off the spine.
+    pub is_branch: bool,
+    pub blocks: Vec<PostBlock>,
+    pub references: Vec<PostReference>,
+    pub created_at: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ModelInfo {
     pub id: String,
@@ -1164,6 +1242,21 @@ impl Inner {
             })?;
         let action_rows = db::get_space_actions_for_context(&db_conn, space_id).await?;
         Ok(actions_to_messages(&action_rows))
+    }
+
+    /// Build the threaded-post render tree for a space: each item resolved to
+    /// its current generation, the reply DAG flattened (spine flat, genuine
+    /// branches indented) into a list of [`PostNode`] render-rows. This is the
+    /// render DTO; `get_space_messages` remains the upstream-context view.
+    async fn get_space_tree(&self, space_id: &str) -> Result<Vec<PostNode>, AppError> {
+        let db_conn = self.db_conn().await?;
+        db::get_space(&db_conn, space_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            })?;
+        let data = db::get_space_tree_data(&db_conn, space_id).await?;
+        Ok(build_post_tree(data))
     }
 
     async fn create_space(&self, title: Option<&str>) -> Result<SpaceInfo, AppError> {
@@ -3030,6 +3123,17 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// The threaded-post render tree for a space (current generations, reply
+    /// DAG flattened to render-rows). The GUI's transcript renders from this;
+    /// `get_space_messages` remains the upstream-context view.
+    pub async fn get_space_tree(&self, space_id: String) -> Result<Vec<PostNode>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.get_space_tree(&space_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
     pub async fn create_space(&self, title: Option<String>) -> Result<SpaceInfo, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -3389,6 +3493,164 @@ fn actions_to_messages(action_rows: &[db::SpaceActionRow]) -> Vec<SpaceMessage> 
     }
 
     messages
+}
+
+/// Assemble the flattened threaded-post render list from the raw space-tree
+/// materials. Pure (no I/O) so the spine-vs-branch flattening is unit-testable
+/// without a database.
+///
+/// Threading uses the structural `reply` edges. The spine follows the first
+/// (chronological) reply of each post and stays at the same `depth`; later
+/// replies to the same post become branches (`depth + 1`, `is_branch = true`),
+/// and their own sub-spines recurse the rule. Multiple thread roots are treated
+/// as siblings of a virtual root (first root on the spine, the rest branches).
+/// Output order is a pre-order walk (each post, then its first reply's whole
+/// subtree, then later replies) — i.e. the spine reads top-to-bottom with
+/// branches hanging beneath the post they reply to.
+///
+/// v1 threads by the **raw** reply antecedent: a reply edge whose target isn't
+/// in the resolved post set (a non-tip generation once edits exist) is treated
+/// as absent, making that post a root. Re-rooting such a child onto its parent
+/// item's current tip is a 5.4 addition — a no-op while no edits exist.
+fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
+    use std::collections::HashMap;
+
+    let db::SpaceTreeData {
+        actions,
+        blocks,
+        edges,
+    } = data;
+
+    // Blocks grouped by action, preserving the query's (action, ordinal) order.
+    let mut blocks_by_action: HashMap<String, Vec<PostBlock>> = HashMap::new();
+    for b in blocks {
+        blocks_by_action
+            .entry(b.action_id)
+            .or_default()
+            .push(PostBlock {
+                block_type: b.block_type,
+                text: b.text_content,
+                tool_name: b.tool_name,
+                tool_call_id: b.tool_call_id,
+                data: b.data,
+            });
+    }
+
+    // The set of resolved post action ids (used to test whether a reply edge
+    // points at a renderable post).
+    let in_set: std::collections::HashSet<&str> =
+        actions.iter().map(|a| a.action_id.as_str()).collect();
+
+    // Split edges into the structural reply parent (at most one per action) and
+    // the non-structural references.
+    let mut reply_parent: HashMap<String, String> = HashMap::new();
+    let mut references_by_action: HashMap<String, Vec<PostReference>> = HashMap::new();
+    for e in edges {
+        if e.relation == "reply" {
+            // Only the first reply edge is structural (schema enforces one).
+            if in_set.contains(e.antecedent_action_id.as_str()) {
+                reply_parent
+                    .entry(e.action_id)
+                    .or_insert(e.antecedent_action_id);
+            }
+        } else {
+            references_by_action
+                .entry(e.action_id)
+                .or_default()
+                .push(PostReference {
+                    antecedent_action_id: e.antecedent_action_id,
+                    ordinal: e.ordinal,
+                    range_start: e.range_start,
+                    range_end: e.range_end,
+                    annotation: e.annotation,
+                });
+        }
+    }
+
+    // Children map (reverse of reply_parent). `actions` is already chronological
+    // (created_at, action_id), so children land in chronological order and roots
+    // keep their chronological order.
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    let mut roots: Vec<String> = Vec::new();
+    for a in &actions {
+        match reply_parent.get(&a.action_id) {
+            Some(parent) => children
+                .entry(parent.clone())
+                .or_default()
+                .push(a.action_id.clone()),
+            None => roots.push(a.action_id.clone()),
+        }
+    }
+
+    // Index the action rows for O(1) lookup during the walk.
+    let mut rows: HashMap<String, db::PostActionRow> = HashMap::with_capacity(actions.len());
+    for a in actions {
+        rows.insert(a.action_id.clone(), a);
+    }
+
+    // Pre-order walk with an explicit stack (avoids deep recursion on long
+    // linear threads). Each frame carries (action_id, depth, is_branch); we push
+    // children reversed so the first child pops next.
+    let mut out: Vec<PostNode> = Vec::with_capacity(rows.len());
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<(String, usize, bool)> = Vec::new();
+    for (i, root) in roots.iter().enumerate().rev() {
+        let (depth, is_branch) = if i == 0 { (0, false) } else { (1, true) };
+        stack.push((root.clone(), depth, is_branch));
+    }
+
+    while let Some((action_id, depth, is_branch)) = stack.pop() {
+        // Guard against malformed data forming a cycle (impossible by
+        // construction — one reply parent, backward-pointing edges — but cheap
+        // insurance against an infinite loop on bad input).
+        if !emitted.insert(action_id.clone()) {
+            continue;
+        }
+        let Some(row) = rows.get(&action_id) else {
+            continue;
+        };
+
+        out.push(PostNode {
+            action_id: row.action_id.clone(),
+            item_id: row.item_id.clone(),
+            parent_action_id: reply_parent.get(&action_id).cloned(),
+            participant: PostParticipant {
+                kind: row.participant_kind.clone(),
+                label: row.participant_label.clone(),
+            },
+            action_type: row.action_type.clone(),
+            generation: row.generation,
+            generation_count: row.generation + 1,
+            is_current: true,
+            model: row.model.clone(),
+            credits_consumed: row.credits_consumed,
+            relation: reply_parent.get(&action_id).map(|_| "reply".to_string()),
+            depth,
+            is_branch,
+            blocks: blocks_by_action
+                .get(&action_id)
+                .cloned()
+                .unwrap_or_default(),
+            references: references_by_action
+                .get(&action_id)
+                .cloned()
+                .unwrap_or_default(),
+            created_at: row.created_at,
+        });
+
+        if let Some(kids) = children.get(&action_id) {
+            for (i, kid) in kids.iter().enumerate().rev() {
+                let (kid_depth, kid_branch) = if i == 0 {
+                    (depth, false)
+                } else {
+                    (depth + 1, true)
+                };
+                stack.push((kid.clone(), kid_depth, kid_branch));
+            }
+        }
+    }
+
+    out
 }
 
 /// Maximum length of an auto-derived space title, in characters.
@@ -3918,5 +4180,276 @@ mod tests {
         let snippet = snippet_of(&long).unwrap();
         assert!(snippet.ends_with('…'));
         assert!(snippet.trim_end_matches('…').chars().count() <= 120);
+    }
+
+    // --- Post-tree flattening (build_post_tree) ----------------------------
+
+    /// A tip post action with sensible defaults; override the fields a test
+    /// cares about.
+    fn post_action(action_id: &str, item_id: &str, created_at: i64) -> db::PostActionRow {
+        db::PostActionRow {
+            action_id: action_id.into(),
+            item_id: item_id.into(),
+            participant_kind: "human".into(),
+            participant_label: "user".into(),
+            action_type: "user_input".into(),
+            model: None,
+            credits_consumed: None,
+            generation: 0,
+            created_at,
+        }
+    }
+
+    fn reply_edge(action_id: &str, antecedent: &str) -> db::AntecedentEdgeRow {
+        db::AntecedentEdgeRow {
+            action_id: action_id.into(),
+            antecedent_action_id: antecedent.into(),
+            ordinal: 0,
+            relation: "reply".into(),
+            range_start: None,
+            range_end: None,
+            annotation: None,
+        }
+    }
+
+    fn text_block(action_id: &str, text: &str) -> db::PostBlockRow {
+        db::PostBlockRow {
+            action_id: action_id.into(),
+            ordinal: 0,
+            block_type: "text".into(),
+            text_content: Some(text.into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }
+    }
+
+    /// A linear reply chain stays flat: every post is on the spine (depth 0).
+    #[test]
+    fn build_tree_linear_chain_is_flat() {
+        // u1 <- i1 <- u2 <- i2 (each replies to the prior tail).
+        let mut a1 = post_action("u1", "iu1", 1);
+        a1.action_type = "user_input".into();
+        let mut a2 = post_action("i1", "ii1", 2);
+        a2.action_type = "inference".into();
+        a2.participant_kind = "agent".into();
+        a2.participant_label = "kimi".into();
+        a2.model = Some("kimi".into());
+        let mut a3 = post_action("u2", "iu2", 3);
+        a3.action_type = "user_input".into();
+        let mut a4 = post_action("i2", "ii2", 4);
+        a4.action_type = "inference".into();
+
+        let data = db::SpaceTreeData {
+            actions: vec![a1, a2, a3, a4],
+            blocks: vec![
+                text_block("u1", "hello"),
+                text_block("i1", "hi there"),
+                text_block("u2", "more"),
+                text_block("i2", "ok"),
+            ],
+            edges: vec![
+                reply_edge("i1", "u1"),
+                reply_edge("u2", "i1"),
+                reply_edge("i2", "u2"),
+            ],
+        };
+
+        let tree = build_post_tree(data);
+        let ids: Vec<&str> = tree.iter().map(|n| n.action_id.as_str()).collect();
+        assert_eq!(ids, vec!["u1", "i1", "u2", "i2"]);
+        assert!(tree.iter().all(|n| n.depth == 0 && !n.is_branch));
+
+        let root = &tree[0];
+        assert_eq!(root.parent_action_id, None);
+        assert_eq!(root.relation, None);
+        assert_eq!(root.blocks, vec![text_block_dto("hello")]);
+
+        let inf = &tree[1];
+        assert_eq!(inf.parent_action_id.as_deref(), Some("u1"));
+        assert_eq!(inf.relation.as_deref(), Some("reply"));
+        assert_eq!(inf.participant.kind, "agent");
+        assert_eq!(inf.model.as_deref(), Some("kimi"));
+    }
+
+    fn text_block_dto(text: &str) -> PostBlock {
+        PostBlock {
+            block_type: "text".into(),
+            text: Some(text.into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }
+    }
+
+    /// When a post has more than one reply, the first (chronological) reply
+    /// continues the spine and later replies become indented branches; the walk
+    /// emits the first reply's whole subtree before the branch.
+    #[test]
+    fn build_tree_first_reply_spine_later_replies_branch() {
+        // root r; replies a (t=2) then b (t=3). a has its own reply a1 (t=4).
+        // b has its own reply b1 (t=5).
+        let data = db::SpaceTreeData {
+            actions: vec![
+                post_action("r", "ir", 1),
+                post_action("a", "ia", 2),
+                post_action("b", "ib", 3),
+                post_action("a1", "ia1", 4),
+                post_action("b1", "ib1", 5),
+            ],
+            blocks: vec![],
+            edges: vec![
+                reply_edge("a", "r"),
+                reply_edge("b", "r"),
+                reply_edge("a1", "a"),
+                reply_edge("b1", "b"),
+            ],
+        };
+
+        let tree = build_post_tree(data);
+        let shape: Vec<(&str, usize, bool)> = tree
+            .iter()
+            .map(|n| (n.action_id.as_str(), n.depth, n.is_branch))
+            .collect();
+        // r spine; a is first reply (spine); a1 continues a's spine; THEN b is
+        // the later reply (branch, depth 1) with b1 continuing its sub-spine.
+        assert_eq!(
+            shape,
+            vec![
+                ("r", 0, false),
+                ("a", 0, false),
+                ("a1", 0, false),
+                ("b", 1, true),
+                ("b1", 1, false),
+            ]
+        );
+    }
+
+    /// A branch off a branch indents again (only genuine branch points narrow;
+    /// the linear spine never does).
+    #[test]
+    fn build_tree_nested_branches_indent_cumulatively() {
+        // r -> a (spine). a has replies a1 (spine) and a2 (branch @1).
+        // a2 has replies a2a (spine @1) and a2b (branch @2).
+        let data = db::SpaceTreeData {
+            actions: vec![
+                post_action("r", "ir", 1),
+                post_action("a", "ia", 2),
+                post_action("a1", "ia1", 3),
+                post_action("a2", "ia2", 4),
+                post_action("a2a", "ia2a", 5),
+                post_action("a2b", "ia2b", 6),
+            ],
+            blocks: vec![],
+            edges: vec![
+                reply_edge("a", "r"),
+                reply_edge("a1", "a"),
+                reply_edge("a2", "a"),
+                reply_edge("a2a", "a2"),
+                reply_edge("a2b", "a2"),
+            ],
+        };
+
+        let tree = build_post_tree(data);
+        let shape: Vec<(&str, usize)> = tree
+            .iter()
+            .map(|n| (n.action_id.as_str(), n.depth))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("r", 0),
+                ("a", 0),
+                ("a1", 0),
+                ("a2", 1),
+                ("a2a", 1),
+                ("a2b", 2),
+            ]
+        );
+    }
+
+    /// generation_count reflects the item's total generations (an edit appends a
+    /// generation; only the tip is fetched, carrying the derived generation).
+    #[test]
+    fn build_tree_carries_generation_count() {
+        let mut tip = post_action("u1-gen2", "item-u1", 5);
+        tip.generation = 2; // gen-0 + gen-1 superseded; this tip is generation 2
+        let data = db::SpaceTreeData {
+            actions: vec![tip],
+            blocks: vec![text_block("u1-gen2", "edited text")],
+            edges: vec![],
+        };
+
+        let tree = build_post_tree(data);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].generation, 2);
+        assert_eq!(tree[0].generation_count, 3);
+        assert!(tree[0].is_current);
+    }
+
+    /// reference edges become PostReference entries (the quote chip), distinct
+    /// from the structural reply parent.
+    #[test]
+    fn build_tree_collects_reference_edges() {
+        let data = db::SpaceTreeData {
+            actions: vec![post_action("r", "ir", 1), post_action("a", "ia", 2)],
+            blocks: vec![],
+            edges: vec![
+                reply_edge("a", "r"),
+                db::AntecedentEdgeRow {
+                    action_id: "a".into(),
+                    antecedent_action_id: "r".into(),
+                    ordinal: 1,
+                    relation: "reference".into(),
+                    range_start: Some(0),
+                    range_end: Some(5),
+                    annotation: Some("see here".into()),
+                },
+            ],
+        };
+
+        let tree = build_post_tree(data);
+        let a = tree.iter().find(|n| n.action_id == "a").unwrap();
+        assert_eq!(a.parent_action_id.as_deref(), Some("r"));
+        assert_eq!(a.references.len(), 1);
+        assert_eq!(a.references[0].antecedent_action_id, "r");
+        assert_eq!(a.references[0].range_start, Some(0));
+        assert_eq!(a.references[0].annotation.as_deref(), Some("see here"));
+    }
+
+    /// A reply edge whose target isn't a resolved post (e.g. a non-tip
+    /// generation) is treated as absent, leaving the post a root — the v1
+    /// raw-antecedent behavior (re-rooting is a 5.4 addition).
+    #[test]
+    fn build_tree_dangling_reply_parent_becomes_root() {
+        let data = db::SpaceTreeData {
+            actions: vec![post_action("a", "ia", 2)],
+            blocks: vec![],
+            edges: vec![reply_edge("a", "missing-non-tip")],
+        };
+
+        let tree = build_post_tree(data);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].parent_action_id, None);
+        assert_eq!(tree[0].relation, None);
+        assert_eq!(tree[0].depth, 0);
+    }
+
+    /// Multiple thread roots are siblings of a virtual root: the first root is
+    /// on the spine, later roots are branches.
+    #[test]
+    fn build_tree_multiple_roots_first_spine_rest_branch() {
+        let data = db::SpaceTreeData {
+            actions: vec![post_action("r1", "ir1", 1), post_action("r2", "ir2", 2)],
+            blocks: vec![],
+            edges: vec![],
+        };
+
+        let tree = build_post_tree(data);
+        let shape: Vec<(&str, usize, bool)> = tree
+            .iter()
+            .map(|n| (n.action_id.as_str(), n.depth, n.is_branch))
+            .collect();
+        assert_eq!(shape, vec![("r1", 0, false), ("r2", 1, true)]);
     }
 }

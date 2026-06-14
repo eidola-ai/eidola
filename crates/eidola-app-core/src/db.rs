@@ -987,6 +987,176 @@ pub async fn get_space_actions_for_context(
     Ok(results)
 }
 
+// ---------------------------------------------------------------------------
+// Space tree — the materials for the threaded-post render (get_space_tree).
+//
+// Unlike get_space_actions_for_context (which flattens to OpenAI messages for
+// the model), this fetches each item's CURRENT generation (item tip) as a
+// renderable post, with its participant identity, derived generation number,
+// content blocks, and antecedent edges (structural `reply` parent + any
+// `reference` links). The Rust side (lib::build_post_tree) assembles these
+// into the flattened render-row list. Only post-bearing action types render;
+// trace types (request/tool/retrieval/…) are collapsed out here.
+// ---------------------------------------------------------------------------
+
+/// Action types that render as posts in the threaded view. Trace types are
+/// excluded so requests/tool plumbing don't appear as posts. (Widen this as
+/// tool_call/tool_result/error gain a post render.)
+pub const POST_ACTION_TYPES_SQL: &str = "'user_input', 'inference'";
+
+/// One renderable post — an item's current-generation action with its
+/// participant identity and derived generation number. Content blocks and
+/// antecedent edges come back separately (see [`SpaceTreeData`]).
+pub struct PostActionRow {
+    pub action_id: String,
+    pub item_id: String,
+    pub participant_kind: String,
+    pub participant_label: String,
+    pub action_type: String,
+    pub model: Option<String>,
+    pub credits_consumed: Option<i64>,
+    /// Derived 0-based generation number of this (tip) action. The item's total
+    /// generation count is `generation + 1`.
+    pub generation: i64,
+    pub created_at: i64,
+}
+
+/// One content block of a post, in `ordinal` order within its action.
+pub struct PostBlockRow {
+    pub action_id: String,
+    pub ordinal: i64,
+    pub block_type: String,
+    pub text_content: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub data: Option<String>,
+}
+
+/// One antecedent edge of a post (its `relation` distinguishes the structural
+/// `reply` parent from non-structural `reference` links).
+pub struct AntecedentEdgeRow {
+    pub action_id: String,
+    pub antecedent_action_id: String,
+    pub ordinal: i64,
+    pub relation: String,
+    pub range_start: Option<i64>,
+    pub range_end: Option<i64>,
+    pub annotation: Option<String>,
+}
+
+/// The raw materials for one space's threaded-post render.
+pub struct SpaceTreeData {
+    pub actions: Vec<PostActionRow>,
+    pub blocks: Vec<PostBlockRow>,
+    pub edges: Vec<AntecedentEdgeRow>,
+}
+
+/// Fetch the current-generation post actions of a space along with their
+/// content blocks and antecedent edges. Filters to terminal statuses, current
+/// generations (item tips via `is_current`), and post-bearing action types.
+pub async fn get_space_tree_data(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<SpaceTreeData, AppError> {
+    // Tip post actions, chronological.
+    let action_sql = format!(
+        "SELECT ar.action_id, ar.item_id, p.kind, p.label, ar.action_type, \
+                ar.model, ar.credits_consumed, ar.generation, ar.created_at \
+         FROM action_resolved ar \
+         JOIN participant p ON p.id = ar.participant_id \
+         WHERE ar.space_id = ?1 \
+           AND ar.is_current = 1 \
+           AND ar.status IN ('complete', 'cancelled') \
+           AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY ar.created_at ASC, ar.action_id ASC"
+    );
+    let mut stmt = conn.prepare(&action_sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut actions = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        actions.push(PostActionRow {
+            action_id: row.get::<String>(0).map_err(AppError::db)?,
+            item_id: row.get::<String>(1).map_err(AppError::db)?,
+            participant_kind: row.get::<String>(2).map_err(AppError::db)?,
+            participant_label: row.get::<String>(3).map_err(AppError::db)?,
+            action_type: row.get::<String>(4).map_err(AppError::db)?,
+            model: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            credits_consumed: row.get::<Option<i64>>(6).map_err(AppError::db)?,
+            generation: row.get::<i64>(7).map_err(AppError::db)?,
+            created_at: row.get::<i64>(8).map_err(AppError::db)?,
+        });
+    }
+
+    // Content blocks of those tip actions, in (action, ordinal) order.
+    let block_sql = format!(
+        "SELECT cb.action_id, cb.ordinal, cb.block_type, cb.text_content, \
+                cb.tool_name, cb.tool_call_id, cb.data \
+         FROM content_block cb \
+         JOIN action_resolved ar ON ar.action_id = cb.action_id \
+         WHERE ar.space_id = ?1 \
+           AND ar.is_current = 1 \
+           AND ar.status IN ('complete', 'cancelled') \
+           AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY cb.action_id ASC, cb.ordinal ASC"
+    );
+    let mut stmt = conn.prepare(&block_sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut blocks = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        blocks.push(PostBlockRow {
+            action_id: row.get::<String>(0).map_err(AppError::db)?,
+            ordinal: row.get::<i64>(1).map_err(AppError::db)?,
+            block_type: row.get::<String>(2).map_err(AppError::db)?,
+            text_content: row.get::<Option<String>>(3).map_err(AppError::db)?,
+            tool_name: row.get::<Option<String>>(4).map_err(AppError::db)?,
+            tool_call_id: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            data: row.get::<Option<String>>(6).map_err(AppError::db)?,
+        });
+    }
+
+    // Antecedent edges of those tip actions (reply + reference).
+    let edge_sql = format!(
+        "SELECT aa.action_id, aa.antecedent_action_id, aa.ordinal, aa.relation, \
+                aa.range_start, aa.range_end, aa.annotation \
+         FROM action_antecedent aa \
+         JOIN action_resolved ar ON ar.action_id = aa.action_id \
+         WHERE ar.space_id = ?1 \
+           AND ar.is_current = 1 \
+           AND ar.status IN ('complete', 'cancelled') \
+           AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY aa.action_id ASC, aa.ordinal ASC"
+    );
+    let mut stmt = conn.prepare(&edge_sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut edges = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        edges.push(AntecedentEdgeRow {
+            action_id: row.get::<String>(0).map_err(AppError::db)?,
+            antecedent_action_id: row.get::<String>(1).map_err(AppError::db)?,
+            ordinal: row.get::<i64>(2).map_err(AppError::db)?,
+            relation: row.get::<String>(3).map_err(AppError::db)?,
+            range_start: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+            range_end: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+            annotation: row.get::<Option<String>>(6).map_err(AppError::db)?,
+        });
+    }
+
+    Ok(SpaceTreeData {
+        actions,
+        blocks,
+        edges,
+    })
+}
+
 /// Returns the ID of the last terminal action in a space (for antecedent linking).
 pub async fn last_action_in_space(
     conn: &Connection,
@@ -1699,6 +1869,154 @@ mod tests {
             Some("what is a monad?")
         );
         assert_eq!(first_user_text(&conn, "space-c").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn get_space_tree_data_resolves_tips_filters_trace_and_returns_edges() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        let agent = ensure_participant(&conn, "agent", "kimi", None, 1_000)
+            .await
+            .unwrap();
+
+        insert_space(&conn, "space-t", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+
+        #[allow(clippy::too_many_arguments)]
+        async fn mk(
+            conn: &Connection,
+            id: &str,
+            participant: &str,
+            item: &str,
+            supersedes: Option<&str>,
+            ty: &str,
+            model: Option<&str>,
+            credits: Option<i64>,
+            at: i64,
+        ) {
+            insert_action(
+                conn,
+                &ActionEntry {
+                    id: id.to_string(),
+                    space_id: "space-t".to_string(),
+                    participant_id: participant.to_string(),
+                    item_id: item.to_string(),
+                    supersedes_action_id: supersedes.map(String::from),
+                    action_type: ty.to_string(),
+                    status: "complete".to_string(),
+                    intent: None,
+                    model: model.map(String::from),
+                    input_tokens: None,
+                    output_tokens: None,
+                    credits_consumed: credits,
+                    created_at: at,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // u1 (gen0) -> i1 (reply) -> then edit u1 to u1b (gen1, supersedes u1).
+        mk(&conn, "u1", &user, "iu1", None, "user_input", None, None, 1).await;
+        insert_text_content_block(&conn, "cb-u1", "u1", 0, "text", "first")
+            .await
+            .unwrap();
+        mk(
+            &conn,
+            "i1",
+            &agent,
+            "ii1",
+            None,
+            "inference",
+            Some("kimi"),
+            Some(700),
+            2,
+        )
+        .await;
+        insert_text_content_block(&conn, "cb-i1", "i1", 0, "text", "answer")
+            .await
+            .unwrap();
+        insert_action_antecedent(&conn, "i1", "u1", 0, "reply")
+            .await
+            .unwrap();
+        // Edit: u1b supersedes u1, replicating the (absent) reply edge.
+        mk(
+            &conn,
+            "u1b",
+            &user,
+            "iu1",
+            Some("u1"),
+            "user_input",
+            None,
+            None,
+            3,
+        )
+        .await;
+        insert_text_content_block(&conn, "cb-u1b", "u1b", 0, "text", "edited")
+            .await
+            .unwrap();
+        // A reference edge from the edited post.
+        conn.execute(
+            "INSERT INTO action_antecedent \
+             (action_id, antecedent_action_id, ordinal, relation, range_start, range_end, annotation) \
+             VALUES ('u1b', 'i1', 1, 'reference', 0, 6, 'quoting')",
+            (),
+        )
+        .await
+        .unwrap();
+        // A trace action (request) that must NOT render as a post.
+        mk(&conn, "req1", &user, "ireq", None, "request", None, None, 4).await;
+
+        let data = get_space_tree_data(&conn, "space-t").await.unwrap();
+
+        // Tips only: u1b (not the superseded u1) and i1. No trace action.
+        let mut ids: Vec<&str> = data.actions.iter().map(|a| a.action_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["i1", "u1b"]);
+
+        let u1b = data.actions.iter().find(|a| a.action_id == "u1b").unwrap();
+        assert_eq!(u1b.item_id, "iu1");
+        assert_eq!(
+            u1b.generation, 1,
+            "tip of a once-edited item is generation 1"
+        );
+        assert_eq!(u1b.participant_kind, "human");
+
+        let i1 = data.actions.iter().find(|a| a.action_id == "i1").unwrap();
+        assert_eq!(i1.generation, 0);
+        assert_eq!(i1.participant_kind, "agent");
+        assert_eq!(i1.model.as_deref(), Some("kimi"));
+        assert_eq!(i1.credits_consumed, Some(700));
+
+        // Blocks come back only for the tip actions.
+        let block_actions: Vec<&str> = data.blocks.iter().map(|b| b.action_id.as_str()).collect();
+        assert!(block_actions.contains(&"u1b"));
+        assert!(block_actions.contains(&"i1"));
+        assert!(!block_actions.contains(&"u1"), "superseded gen excluded");
+
+        // Edges: i1's reply -> u1 (raw, now non-tip), and u1b's reference -> i1.
+        let reply: Vec<_> = data
+            .edges
+            .iter()
+            .filter(|e| e.relation == "reply")
+            .collect();
+        assert_eq!(reply.len(), 1);
+        assert_eq!(reply[0].action_id, "i1");
+        assert_eq!(reply[0].antecedent_action_id, "u1");
+        let refs: Vec<_> = data
+            .edges
+            .iter()
+            .filter(|e| e.relation == "reference")
+            .collect();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].action_id, "u1b");
+        assert_eq!(refs[0].range_end, Some(6));
+        assert_eq!(refs[0].annotation.as_deref(), Some("quoting"));
     }
 
     /// Seed a database with one connected story: two attestations, a
