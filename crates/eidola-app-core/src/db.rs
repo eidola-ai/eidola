@@ -833,9 +833,10 @@ pub struct SpaceRow {
 
 /// One row of the space listing, with the cheap activity signals the UI
 /// needs to render a meaningful entry. `last_activity_at` is the max
-/// `action.created_at` in the space (falling back to the space's own
-/// `created_at` for empty spaces); `message_count` counts terminal
-/// (`complete`/`cancelled`) actions.
+/// `action.created_at` over **current generations** in the space (falling back
+/// to the space's own `created_at` for empty spaces); `message_count` counts
+/// terminal (`complete`/`cancelled`) **current-generation** actions — editing
+/// an item appends a generation but does not inflate the count.
 pub struct SpaceListRow {
     pub id: String,
     pub title: Option<String>,
@@ -861,6 +862,9 @@ pub async fn list_spaces(
          FROM space s \
          LEFT JOIN action a ON a.space_id = s.id \
               AND a.status IN ('complete', 'cancelled') \
+              AND NOT EXISTS ( \
+                  SELECT 1 FROM action sup WHERE sup.supersedes_action_id = a.id \
+              ) \
          {filter}\
          GROUP BY s.id, s.title, s.created_at, s.archived_at \
          ORDER BY last_activity_at DESC"
@@ -881,8 +885,10 @@ pub async fn list_spaces(
     Ok(results)
 }
 
-/// First text content block of the first user_input action in a space —
-/// the raw source for the listing snippet shown for untitled spaces.
+/// First text content block of the first user_input *item* in a space, at its
+/// **current generation** — the raw source for the listing snippet shown for
+/// untitled spaces. Ordered by `item_id` (UUIDv7, ~item-creation order) so an
+/// edit to the first post updates the snippet rather than leaving the original.
 pub async fn first_user_text(
     conn: &Connection,
     space_id: &str,
@@ -894,7 +900,10 @@ pub async fn first_user_text(
              JOIN content_block cb ON cb.action_id = a.id \
              WHERE a.space_id = ?1 AND a.action_type = 'user_input' \
                AND cb.block_type = 'text' \
-             ORDER BY a.created_at ASC, cb.ordinal ASC \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM action sup WHERE sup.supersedes_action_id = a.id \
+               ) \
+             ORDER BY a.item_id ASC, cb.ordinal ASC \
              LIMIT 1",
         )
         .await
@@ -993,6 +1002,80 @@ pub async fn last_action_in_space(
         .map_err(AppError::db)?;
     let mut rows = stmt
         .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// Returns `(item_id, space_id)` for an action, or `None` if it doesn't exist.
+/// Used by the generation paths (edit/regenerate) to locate the item an action
+/// belongs to.
+pub async fn action_item_and_space(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<(String, String)>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT item_id, space_id FROM action WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<String>(1).map_err(AppError::db)?,
+        ))),
+    }
+}
+
+/// Returns the current tip (the action no other action supersedes) of an item.
+pub async fn current_tip_of_item(
+    conn: &Connection,
+    space_id: &str,
+    item_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT current_action_id FROM item_current \
+             WHERE space_id = ?1 AND item_id = ?2",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([
+            Value::Text(space_id.to_string()),
+            Value::Text(item_id.to_string()),
+        ])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// Returns the `reply`-relation antecedent of an action (its structural thread
+/// parent), if any. A new generation replicates this so it keeps the item's
+/// place in the thread.
+pub async fn reply_antecedent(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT antecedent_action_id FROM action_antecedent \
+             WHERE action_id = ?1 AND relation = 'reply' LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
         .await
         .map_err(AppError::db)?;
     match rows.next().await.map_err(AppError::db)? {

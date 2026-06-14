@@ -409,6 +409,86 @@ fn post_requires_no_account_or_credential() {
 }
 
 // ===========================================================================
+// edit_post() — append a generation (human-side collaborative edit, wave 5)
+//
+// Exercises the 5.1 generation machinery end-to-end (supersedes chain +
+// item_current resolution): an edit appends a new generation, the default view
+// resolves to it, the prior generation is preserved, and the listing counts the
+// item once (editing does not inflate message_count).
+// ===========================================================================
+
+#[test]
+fn edit_post_appends_generation_replacing_default_view() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let first = core
+            .runtime()
+            .block_on(core.post("draft one".into(), None))
+            .unwrap();
+
+        let mut rx = core.subscribe_changes();
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(first.action_id.clone(), "draft two".into()))
+            .unwrap();
+
+        // Same item, a new action (a generation, not a replacement-in-place).
+        assert_eq!(edited.item_id, first.item_id);
+        assert_ne!(edited.action_id, first.action_id);
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.iter().any(|c| matches!(c, Change::Space(_))),
+            "edit should emit Space(id); got {changes:?}"
+        );
+        assert!(
+            changes.contains(&Change::SpaceIndex),
+            "edit may change the listing snippet; got {changes:?}"
+        );
+
+        // The default view resolves to the current generation only.
+        let msgs = core
+            .runtime()
+            .block_on(core.get_space_messages(first.space_id.clone()))
+            .unwrap();
+        assert_eq!(
+            msgs.len(),
+            1,
+            "edit replaces in the default view, not appends"
+        );
+        assert_eq!(msgs[0].content, "draft two");
+
+        // The listing counts the item once — editing must not inflate the count.
+        let spaces = core.runtime().block_on(core.list_spaces(false)).unwrap();
+        assert_eq!(spaces.len(), 1);
+        assert_eq!(
+            spaces[0].message_count, 1,
+            "edit must not inflate message_count; got {}",
+            spaces[0].message_count
+        );
+    });
+}
+
+#[test]
+fn edit_post_on_unknown_action_errors_without_emit() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let mut rx = core.subscribe_changes();
+
+        let result = core
+            .runtime()
+            .block_on(core.edit_post("no-such-action".into(), "x".into()));
+        assert!(result.is_err());
+
+        let changes = drain(&mut rx);
+        assert!(
+            changes.is_empty(),
+            "failed edit must not emit; got {changes:?}"
+        );
+    });
+}
+
+// ===========================================================================
 // UpdateState domain
 // ===========================================================================
 

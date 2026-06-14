@@ -1291,6 +1291,86 @@ impl Inner {
         })
     }
 
+    /// Edit an item by appending a new `user_input` generation — the human side
+    /// of collaborative editing. Append-only: the prior generation is preserved
+    /// and `item_current` now resolves to this one; the new generation
+    /// replicates the item's structural `reply` edge so it keeps its place in
+    /// the thread. No credential, no HTTP. `action_id` may be any generation of
+    /// the target item; the new generation supersedes the item's current tip.
+    async fn edit_post(&self, action_id: &str, new_prompt: &str) -> Result<PostResult, AppError> {
+        let new_prompt = new_prompt.trim();
+        if new_prompt.is_empty() {
+            return Err(AppError::Internal {
+                message: "cannot edit a post to empty".into(),
+            });
+        }
+
+        let db_conn = self.db_conn().await?;
+        let now = now_ms();
+
+        let (item_id, space_id) = db::action_item_and_space(&db_conn, action_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("action not found: {action_id}"),
+            })?;
+        let tip = db::current_tip_of_item(&db_conn, &space_id, &item_id)
+            .await?
+            .ok_or_else(|| AppError::Internal {
+                message: format!("item has no current generation: {item_id}"),
+            })?;
+        let reply_parent = db::reply_antecedent(&db_conn, &tip).await?;
+
+        let user_participant_id =
+            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
+
+        let new_action_id = Uuid::now_v7().to_string();
+        db::insert_action(
+            &db_conn,
+            &db::ActionEntry {
+                id: new_action_id.clone(),
+                space_id: space_id.clone(),
+                participant_id: user_participant_id,
+                item_id: item_id.clone(),
+                supersedes_action_id: Some(tip),
+                action_type: "user_input".to_string(),
+                status: "complete".to_string(),
+                intent: None,
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                credits_consumed: None,
+                created_at: now,
+            },
+        )
+        .await?;
+        db::insert_text_content_block(
+            &db_conn,
+            &Uuid::now_v7().to_string(),
+            &new_action_id,
+            0,
+            "text",
+            new_prompt,
+        )
+        .await?;
+        if let Some(ref ante) = reply_parent {
+            db::insert_action_antecedent(&db_conn, &new_action_id, ante, 0, "reply").await?;
+        }
+
+        // Content changed (Space), and the listing's snippet / last-activity may
+        // change (SpaceIndex). message_count does NOT change — list_spaces counts
+        // current generations, and an edit replaces one, it doesn't add an item.
+        self.bus.emit(Change::Space(space_id.clone()));
+        self.bus.emit(Change::SpaceIndex);
+
+        Ok(PostResult {
+            space_id,
+            action_id: new_action_id,
+            item_id,
+            is_new_space: false,
+            auto_titled: false,
+        })
+    }
+
     /// Find a credential that can cover `charge_credits`, auto-provisioning
     /// one from the account balance when none exists.
     ///
@@ -2980,6 +3060,21 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.post(space_id.as_deref(), &prompt).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Edit a post by appending a new generation (append-only; the prior
+    /// version is preserved and resolvable). `action_id` is any generation of
+    /// the target item.
+    pub async fn edit_post(
+        &self,
+        action_id: String,
+        new_prompt: String,
+    ) -> Result<PostResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.edit_post(&action_id, &new_prompt).await })
             .await
             .map_err(join_err)?
     }
