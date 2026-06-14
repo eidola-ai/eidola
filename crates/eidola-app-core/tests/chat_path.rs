@@ -313,6 +313,67 @@ fn auto_provisioning_empty_wallet_funded_account_succeeds() {
 // Typed failure: pre-space errors leave zero durable trace, emit nothing
 // ===========================================================================
 
+// ===========================================================================
+// Regenerate (Revise mode) — a new agent generation of an inference's item
+// ===========================================================================
+
+#[test]
+fn regenerate_replaces_answer_with_a_new_generation() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+
+        // The inference action id is reachable via the Record (spend trail:
+        // credential → request → action).
+        let trail = core
+            .runtime()
+            .block_on(core.spend_trail(10, 0))
+            .expect("spend trail");
+        let inference_action_id = trail
+            .iter()
+            .find_map(|e| e.action_id.clone())
+            .expect("spend trail carries the inference action id");
+
+        // Regenerate: a new generation of the SAME inference item (Revise),
+        // a second real spend.
+        let regen = core
+            .runtime()
+            .block_on(core.regenerate(inference_action_id, MODEL.into()))
+            .expect("regenerate should succeed");
+        assert_eq!(regen.space_id, result.space_id);
+        assert!(regen.credits_charged > 0);
+
+        // The default view shows the regenerated answer in place — still two
+        // messages (user + current answer), not three: Revise replaces in the
+        // default view, where Reply would have appended a sibling.
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(result.space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.len(),
+            2,
+            "regenerate replaces the answer, not appends; got {messages:?}"
+        );
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+
+        // Two model calls → two inference requests recorded (each generation is
+        // its own costed inference).
+        assert_eq!(mock.chat_hits(), 2);
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        assert_eq!(requests.len(), 2, "two inference requests recorded");
+    });
+}
+
 // Post-first contract (wave 5.2b): chat = post + run_turn. The post persists
 // the thought BEFORE the response request can fail on funding, so a NoAccount /
 // InsufficientBalance failure now leaves the saved post behind (and emits it),
