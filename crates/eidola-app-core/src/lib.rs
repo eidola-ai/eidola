@@ -152,6 +152,17 @@ pub struct PostResult {
     pub auto_titled: bool,
 }
 
+/// How a [`AppCore::run_turn`] response attaches to the thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseMode {
+    /// A new child node replying to the target action (the normal chat case):
+    /// fresh item, `reply` edge to the target.
+    Reply,
+    /// A new *generation* of the target's item (regenerate / agent revise):
+    /// shares the target's `item_id`, supersedes it, replicates its reply edge.
+    Revise,
+}
+
 #[derive(Clone, Debug)]
 pub struct SpaceInfo {
     pub id: String,
@@ -1424,18 +1435,31 @@ impl Inner {
         Ok(())
     }
 
-    async fn chat(
+    /// Drive an agent response *turn* against an already-persisted space — the
+    /// request side of the save-vs-request split. The user turn must already
+    /// exist (via `post`); `run_turn` provisions a credential, assembles context
+    /// from the space's current generations, calls the model, persists the
+    /// inference + request rows, and reconciles the refund.
+    ///
+    /// `target_action_id` + `mode` decide how the response attaches:
+    /// `Reply` → a new child item replying to the target; `Revise` → a new
+    /// generation of the target's item (regenerate / agent edit). `budget`, if
+    /// set, caps the estimated charge for this turn — the spend ceiling a future
+    /// multi-inference agent loop will check per iteration.
+    ///
+    /// v1 drives a single inference, shaped as one turn so the tool loop slots
+    /// in later as additional actions in the same chain.
+    async fn run_turn(
         &self,
-        prompt: &str,
+        space_id: &str,
         model: &str,
-        space_id: Option<&str>,
+        target_action_id: &str,
+        mode: ResponseMode,
+        budget: Option<i64>,
     ) -> Result<ChatResult, AppError> {
         let cfg = self.load_config();
         let base_url = cfg.base_url();
         let now = now_ms();
-        // Track whether this chat implicitly creates a new space or auto-titles
-        // an existing untitled one — both touch the space index.
-        let is_new_space = space_id.is_none();
 
         let db_conn = self.db_conn().await?;
         let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
@@ -1466,48 +1490,61 @@ impl Inner {
 
         let max_completion_tokens = (model_entry.context_length).min(4096) as u32;
 
-        let user_participant_id =
-            db::ensure_participant(&db_conn, "human", "user", None, now).await?;
         let model_participant_id =
             db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
 
-        // Resolve the target space id WITHOUT inserting a new-space row yet.
-        // For an existing space we validate it and ensure the model
-        // participant; for a new (blank) space we only *mint* the id here and
-        // defer `insert_space` until after credential resolution, so a typed
-        // onboarding failure (`NoAccount` / `InsufficientBalance`) leaves no
-        // orphaned empty space behind. Nothing between this point and the
-        // deferred insert depends on the new space's row existing: the prior
-        // context query and charge estimation below see an empty history for a
-        // brand-new id (no actions yet), exactly as before.
-        let (space_id, space_title) = if let Some(sid) = space_id {
-            let row =
-                db::get_space(&db_conn, sid)
-                    .await?
-                    .ok_or_else(|| AppError::NotConfigured {
-                        message: format!("space not found: {sid}"),
-                    })?;
-            // Ensure model participant is in the space (may be new model for this space)
-            let _ =
-                db::insert_space_participant(&db_conn, sid, &model_participant_id, "member", now)
-                    .await; // ignore duplicate
-            (sid.to_string(), row.title)
-        } else {
-            (Uuid::now_v7().to_string(), None)
+        // The space already exists (post created it). Validate it and ensure the
+        // model participant is a member.
+        db::get_space(&db_conn, space_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("space not found: {space_id}"),
+            })?;
+        let _ =
+            db::insert_space_participant(&db_conn, space_id, &model_participant_id, "member", now)
+                .await; // ignore duplicate
+        let space_id = space_id.to_string();
+
+        // The space is always persisted here, so every error exit carries its id
+        // for blank-space adoption (a request failure leaves the saved post).
+        let wrap = |source: AppError| AppError::ChatFailed {
+            space_id: space_id.clone(),
+            source: Box::new(source),
         };
 
-        // Load prior actions to build multi-turn context — needed both for
-        // credit estimation (total prompt size) and message assembly. For a
-        // freshly-minted (not-yet-inserted) space this is empty.
-        let prior_action_rows = db::get_space_actions_for_context(&db_conn, &space_id).await?;
-        let prior_messages = actions_to_messages(&prior_action_rows);
+        // Resolve how the inference attaches to the thread.
+        let (inf_item_id, inf_supersedes, inf_reply_to) = match mode {
+            ResponseMode::Reply => (
+                Uuid::now_v7().to_string(),
+                None,
+                Some(target_action_id.to_string()),
+            ),
+            ResponseMode::Revise => {
+                let (item_id, _sp) = db::action_item_and_space(&db_conn, target_action_id)
+                    .await?
+                    .ok_or_else(|| {
+                        wrap(AppError::NotConfigured {
+                            message: format!("target action not found: {target_action_id}"),
+                        })
+                    })?;
+                let reply_to = db::reply_antecedent(&db_conn, target_action_id).await?;
+                (item_id, Some(target_action_id.to_string()), reply_to)
+            }
+        };
 
-        // Estimate prompt size from ALL messages (prior history + current prompt)
-        let total_prompt_bytes: u128 = prior_messages
-            .iter()
-            .map(|m| m.content.len() as u128)
-            .sum::<u128>()
-            + prompt.len() as u128;
+        // Assemble context from the space's CURRENT generations. For Revise,
+        // exclude the generation we're replacing so the model doesn't see its
+        // own prior output. The posted user turn is already in this set.
+        let context_rows: Vec<db::SpaceActionRow> =
+            db::get_space_actions_for_context(&db_conn, &space_id)
+                .await?
+                .into_iter()
+                .filter(|r| !(mode == ResponseMode::Revise && r.action_id == target_action_id))
+                .collect();
+        let prior_messages = actions_to_messages(&context_rows);
+
+        // Estimate the charge from the assembled context.
+        let total_prompt_bytes: u128 = prior_messages.iter().map(|m| m.content.len() as u128).sum();
 
         let sf = model_entry.pricing.per_prompt_token.scale_factor as u128;
         let prompt_rate = model_entry.pricing.per_prompt_token.value as u128;
@@ -1517,34 +1554,24 @@ impl Inner {
         let charge_credits = prompt_credits + completion_credits;
 
         if charge_credits == 0 {
-            return Err(AppError::Credential {
+            return Err(wrap(AppError::Credential {
                 message: "computed charge is zero — model pricing may be missing".into(),
-            });
+            }));
+        }
+
+        // Spend budget ceiling for this turn.
+        if let Some(b) = budget
+            && charge_credits as i64 > b
+        {
+            return Err(wrap(AppError::Credential {
+                message: format!("estimated charge {charge_credits} exceeds the turn budget {b}"),
+            }));
         }
 
         let cred = self
             .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
-            .await?;
-
-        // Spendability is now known — durable writes from here on are safe.
-        // Insert the deferred new-space row (item A): a typed onboarding failure
-        // above (`NoAccount` / `InsufficientBalance`) left zero durable trace.
-        // From this point the space is persisted, so every error exit is wrapped
-        // with the space id (`wrap`) — closing the blank-space id-adoption gap
-        // (item C) so a `Space` entity learns its id even when the first
-        // exchange fails.
-        if is_new_space {
-            db::insert_space(&db_conn, &space_id, None, "unlinked", now).await?;
-            db::insert_space_participant(&db_conn, &space_id, &user_participant_id, "owner", now)
-                .await?;
-            db::insert_space_participant(&db_conn, &space_id, &model_participant_id, "member", now)
-                .await?;
-        }
-        // Carries the now-persisted space id on any error returned below.
-        let wrap = |source: AppError| AppError::ChatFailed {
-            space_id: space_id.clone(),
-            source: Box::new(source),
-        };
+            .await
+            .map_err(wrap)?;
 
         let credit_token =
             CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
@@ -1601,62 +1628,13 @@ impl Inner {
         let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
         let auth_value = format!("PrivateToken token=\"{token_b64}\"");
 
-        // Find the last action in the space for antecedent linking
-        let last_action_id = db::last_action_in_space(&db_conn, &space_id).await?;
-
-        // Insert the new user_input action
-        let user_action_id = Uuid::now_v7().to_string();
-        db::insert_action(
-            &db_conn,
-            &db::ActionEntry {
-                id: user_action_id.clone(),
-                space_id: space_id.clone(),
-                participant_id: user_participant_id,
-                item_id: Uuid::now_v7().to_string(),
-                supersedes_action_id: None,
-                action_type: "user_input".to_string(),
-                status: "complete".to_string(),
-                intent: None,
-                model: None,
-                input_tokens: None,
-                output_tokens: None,
-                credits_consumed: None,
-                created_at: now,
-            },
-        )
-        .await?;
-        db::insert_text_content_block(
-            &db_conn,
-            &Uuid::now_v7().to_string(),
-            &user_action_id,
-            0,
-            "text",
-            prompt,
-        )
-        .await?;
-
-        // Auto-title: the first exchange in an untitled space names the
-        // space after the user's prompt. Purely local — no model call.
-        let mut auto_titled = false;
-        if space_title.is_none()
-            && prior_messages.is_empty()
-            && let Some(title) = derive_space_title(prompt)
-        {
-            db::update_space_title(&db_conn, &space_id, &title).await?;
-            auto_titled = true;
-        }
-
-        // Link to previous action as antecedent
-        if let Some(ref ante_id) = last_action_id {
-            db::insert_action_antecedent(&db_conn, &user_action_id, ante_id, 0, "reply").await?;
-        }
-
-        // Build the messages array: prior history + current prompt
-        let mut messages: Vec<serde_json::Value> = prior_messages
+        // Build the messages array from the assembled context. The posted user
+        // turn is already part of it (post persisted it); the agent's response
+        // is appended below as a new action.
+        let messages: Vec<serde_json::Value> = prior_messages
             .iter()
             .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
             .collect();
-        messages.push(serde_json::json!({"role": "user", "content": prompt}));
 
         let request_body_json = serde_json::json!({
             "model": model,
@@ -1675,16 +1653,13 @@ impl Inner {
             .await;
         let response_at = now_ms();
 
-        // Emit the space changes committed by the user turn (space row +
-        // user-message, and the auto-title) so every window sees the persisted
-        // user turn even when the request itself fails. Mirrors the non-2xx
-        // arm's emissions, minus `Record` (the request row is not committed at
-        // these earlier exits). Call this before any error exit between here and
-        // the request-row insert.
+        // `post` already emitted the user turn's `Space(id)` + `SpaceIndex`
+        // before this turn began. On a run_turn error exit we re-signal the
+        // space so subscribers refresh (idempotent); `SpaceIndex` is not
+        // re-emitted here — the listing changes (new space / auto-title) were
+        // post's, and a failed request doesn't add an item. Call before any
+        // error exit between here and the request-row insert.
         let emit_user_turn = || {
-            if is_new_space || auto_titled {
-                self.bus.emit(Change::SpaceIndex);
-            }
             self.bus.emit(Change::Space(space_id.clone()));
         };
 
@@ -1793,6 +1768,8 @@ impl Inner {
             .and_then(|u| u.get("completion_tokens"))
             .and_then(|v| v.as_i64());
 
+        // Attach per mode: Reply → a fresh item; Revise → a new generation of
+        // the target's item (supersedes it, replicates its reply edge).
         let inference_action_id = Uuid::now_v7().to_string();
         db::insert_action(
             &db_conn,
@@ -1800,8 +1777,8 @@ impl Inner {
                 id: inference_action_id.clone(),
                 space_id: space_id.clone(),
                 participant_id: model_participant_id,
-                item_id: Uuid::now_v7().to_string(),
-                supersedes_action_id: None,
+                item_id: inf_item_id.clone(),
+                supersedes_action_id: inf_supersedes.clone(),
                 action_type: "inference".to_string(),
                 status: if status.is_success() {
                     "complete"
@@ -1818,10 +1795,12 @@ impl Inner {
             },
         )
         .await?;
-        db::insert_action_antecedent(&db_conn, &inference_action_id, &user_action_id, 0, "reply")
-            .await?;
+        if let Some(ref ante) = inf_reply_to {
+            db::insert_action_antecedent(&db_conn, &inference_action_id, ante, 0, "reply").await?;
+        }
 
-        // Record context assembly: all prior actions + the new user action
+        // Record context assembly: exactly the actions fed into this inference
+        // (the assembled context = current generations, Revise-excluded).
         let context_assembly_id = Uuid::now_v7().to_string();
         db::insert_context_assembly(
             &db_conn,
@@ -1834,13 +1813,15 @@ impl Inner {
         )
         .await?;
 
-        let prior_action_ids = db::space_action_ids(&db_conn, &space_id).await?;
-        for (pos, aid) in prior_action_ids.iter().enumerate() {
-            // Skip the inference action we just inserted (it's not context, it's the output)
-            if aid != &inference_action_id {
-                db::insert_context_assembly_action(&db_conn, &context_assembly_id, aid, pos as i64)
-                    .await?;
+        let mut fed_ids: Vec<String> = Vec::new();
+        for r in &context_rows {
+            if !fed_ids.contains(&r.action_id) {
+                fed_ids.push(r.action_id.clone());
             }
+        }
+        for (pos, aid) in fed_ids.iter().enumerate() {
+            db::insert_context_assembly_action(&db_conn, &context_assembly_id, aid, pos as i64)
+                .await?;
         }
 
         let response_content = body
@@ -1889,11 +1870,8 @@ impl Inner {
         .await?;
 
         if !status.is_success() {
-            // Space, user-message, and request rows are already committed.
-            // Wallet was emitted after insert_pre_credential_refund above.
-            if is_new_space || auto_titled {
-                self.bus.emit(Change::SpaceIndex);
-            }
+            // Inference (error status) + request rows committed; Wallet was
+            // emitted at spend start. post owns the user-turn SpaceIndex.
             self.bus.emit(Change::Space(space_id.clone()));
             self.bus.emit(Change::Record);
             return Err(wrap(AppError::Server {
@@ -1902,12 +1880,9 @@ impl Inner {
             }));
         }
 
-        // All durable writes succeeded — emit one message per affected domain.
-        // SpaceIndex: a new space was implicitly created, or the space was
-        // auto-titled on its first exchange.
-        if is_new_space || auto_titled {
-            self.bus.emit(Change::SpaceIndex);
-        }
+        // All durable writes succeeded — emit per affected domain. post owns the
+        // SpaceIndex (new space / auto-title); a response doesn't change the
+        // listing's identity.
         self.bus.emit(Change::Space(space_id.clone()));
         self.bus.emit(Change::Wallet);
         self.bus.emit(Change::Record);
@@ -1920,6 +1895,46 @@ impl Inner {
             output_tokens,
             credits_charged: charge_credits as i64,
         })
+    }
+
+    /// Save a turn and request a (blocking) response in one gesture — the
+    /// combined convenience that the CLI and one-shot callers use. Equivalent
+    /// to `post` followed by `run_turn(Reply)`: the post persists first (so a
+    /// funding failure leaves the saved thought), then the agent replies.
+    async fn chat(
+        &self,
+        prompt: &str,
+        model: &str,
+        space_id: Option<&str>,
+    ) -> Result<ChatResult, AppError> {
+        let posted = self.post(space_id, prompt).await?;
+        self.run_turn(
+            &posted.space_id,
+            model,
+            &posted.action_id,
+            ResponseMode::Reply,
+            None,
+        )
+        .await
+    }
+
+    /// Regenerate an inference: append a new generation of its item (agent
+    /// revise). `action_id` is any generation of the target item.
+    async fn regenerate(&self, action_id: &str, model: &str) -> Result<ChatResult, AppError> {
+        let db_conn = self.db_conn().await?;
+        let (item_id, space_id) = db::action_item_and_space(&db_conn, action_id)
+            .await?
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("action not found: {action_id}"),
+            })?;
+        let tip = db::current_tip_of_item(&db_conn, &space_id, &item_id)
+            .await?
+            .ok_or_else(|| AppError::Internal {
+                message: format!("item has no current generation: {item_id}"),
+            })?;
+        drop(db_conn);
+        self.run_turn(&space_id, model, &tip, ResponseMode::Revise, None)
+            .await
     }
 
     /// Streaming counterpart to `chat`. Mirrors the same setup (ACT token,
@@ -3096,6 +3111,20 @@ impl AppCore {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.chat(&prompt, &model, space_id.as_deref()).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Regenerate an inference: append a new generation of its item (agent
+    /// revise). `action_id` is any generation of the target item.
+    pub async fn regenerate(
+        &self,
+        action_id: String,
+        model: String,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.regenerate(&action_id, &model).await })
             .await
             .map_err(join_err)?
     }

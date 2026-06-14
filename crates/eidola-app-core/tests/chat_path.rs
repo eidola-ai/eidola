@@ -313,38 +313,61 @@ fn auto_provisioning_empty_wallet_funded_account_succeeds() {
 // Typed failure: pre-space errors leave zero durable trace, emit nothing
 // ===========================================================================
 
+// Post-first contract (wave 5.2b): chat = post + run_turn. The post persists
+// the thought BEFORE the response request can fail on funding, so a NoAccount /
+// InsufficientBalance failure now leaves the saved post behind (and emits it),
+// while root() still routes onboarding. (Replaces the pre-inversion
+// "leaves_zero_trace" tests; decision #1 made concrete.)
+
 #[test]
-fn no_account_leaves_zero_trace_and_no_emissions() {
+fn no_account_persists_post_then_fails_routing_to_onboarding() {
     run(|| {
         let (_mock, core, _dir) = setup(MockConfig::default());
-        // NO account configured and empty wallet → NoAccount before any space.
+        // No account, empty wallet: the post persists first, then the response
+        // request fails with NoAccount.
         let mut rx = core.subscribe_changes();
 
         let err = core
             .runtime()
             .block_on(core.chat("hi".into(), MODEL.into(), None))
             .expect_err("should fail with NoAccount");
+        // root() still routes onboarding; the error now carries the persisted
+        // space id (the post survived the funding failure).
         assert!(matches!(err.root(), AppError::NoAccount), "got {err:?}");
-        // Pre-space error stays unwrapped (no space id to adopt).
-        assert_eq!(err.chat_space_id(), None);
+        let space_id = err
+            .chat_space_id()
+            .expect("post persisted → space id carried")
+            .to_string();
 
+        // The saved thought is emitted (Space + SpaceIndex from post) and durable.
         let changes = drain(&mut rx);
         assert!(
-            changes.is_empty(),
-            "NoAccount must emit nothing; got {changes:?}"
+            changes.contains(&Change::Space(space_id.clone())),
+            "got {changes:?}"
+        );
+        assert!(changes.contains(&Change::SpaceIndex), "got {changes:?}");
+        assert!(
+            !changes.contains(&Change::Record),
+            "no Record before any request; got {changes:?}"
         );
 
-        // Zero durable trace: no space row was inserted.
         let spaces = core
             .runtime()
             .block_on(core.list_spaces(true))
             .expect("spaces");
-        assert!(spaces.is_empty(), "no orphan space; got {spaces:?}");
+        assert_eq!(spaces.len(), 1, "the post persisted; got {spaces:?}");
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "hi");
     });
 }
 
 #[test]
-fn insufficient_balance_leaves_zero_trace_and_no_emissions() {
+fn insufficient_balance_persists_post_then_fails_routing_to_plans() {
     run(|| {
         let (_mock, core, _dir) = setup(MockConfig {
             balance: 1, // cannot cover the charge
@@ -361,24 +384,33 @@ fn insufficient_balance_leaves_zero_trace_and_no_emissions() {
             matches!(err.root(), AppError::InsufficientBalance { .. }),
             "got {err:?}"
         );
-        assert_eq!(err.chat_space_id(), None);
+        let space_id = err
+            .chat_space_id()
+            .expect("post persisted → space id carried")
+            .to_string();
 
         let changes = drain(&mut rx);
-        // The balance fetch + allocate path does not commit anything; only the
-        // (failed) allocation could emit. No durable chat write happened, so no
-        // Space/Record. Account/Wallet are only emitted on a *successful*
-        // allocation.
+        // The post emitted Space + SpaceIndex; the request never spent, so no
+        // Record/Wallet.
+        assert!(
+            !space_changes(&changes).is_empty(),
+            "post should emit Space(id); got {changes:?}"
+        );
+        assert!(changes.contains(&Change::SpaceIndex), "got {changes:?}");
         assert!(
             !changes.contains(&Change::Record),
-            "no Record on pre-space failure; got {changes:?}"
+            "no Record on a pre-spend failure; got {changes:?}"
         );
-        assert!(space_changes(&changes).is_empty(), "got {changes:?}");
 
         let spaces = core
             .runtime()
             .block_on(core.list_spaces(true))
             .expect("spaces");
-        assert!(spaces.is_empty(), "no orphan space; got {spaces:?}");
+        assert_eq!(
+            spaces.len(),
+            1,
+            "the post persisted; got {space_id} {spaces:?}"
+        );
     });
 }
 
