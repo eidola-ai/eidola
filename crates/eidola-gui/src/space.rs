@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, ChatStreamEvent, PostNode, SpaceMessage};
+use eidola_app_core::{AppCore, ChatStreamEvent, PostNode, PostReference, SpaceMessage};
 use gpui::{Context, EventEmitter, Task};
 
 use crate::bridge;
@@ -89,6 +89,9 @@ pub struct ChatMessageView {
     /// Total generations of this item (`>= 1`); `> 1` means the post has been
     /// edited/regenerated and a generation switcher applies.
     pub generation_count: i64,
+    /// Non-structural antecedent links (`reference` edges) — inline quotes /
+    /// backlinks, rendered as `❝ quote ❞ — re: X` chips at the top of the post.
+    pub references: Vec<PostReference>,
     pub reasoning: Option<String>,
     pub reasoning_expanded: bool,
 }
@@ -107,6 +110,7 @@ impl ChatMessageView {
             depth: 0,
             is_branch: false,
             generation_count: 1,
+            references: Vec::new(),
             reasoning: None,
             reasoning_expanded: false,
         }
@@ -138,6 +142,7 @@ impl ChatMessageView {
             depth: node.depth,
             is_branch: node.is_branch,
             generation_count: node.generation_count,
+            references: node.references,
             reasoning: None,
             reasoning_expanded: false,
         }
@@ -154,11 +159,14 @@ fn byline_for_role(role: &str) -> &'static str {
     }
 }
 
-/// The gutter byline for a post-tree row, from its participant identity. An
-/// agent's byline is its model label; the human is "You".
+/// The gutter byline for a post-tree row, from its participant identity. The
+/// *local* human (the generic "user" participant) reads as "You"; any other
+/// human reads by name (multi-party spaces); an agent's byline is its model
+/// label.
 fn byline_for_participant(kind: &str, label: &str) -> String {
     match kind {
-        "human" => "You".to_string(),
+        "human" if label.is_empty() || label.eq_ignore_ascii_case("user") => "You".to_string(),
+        "human" => label.to_string(),
         "agent" if !label.is_empty() => label.to_string(),
         "agent" => "Eidola".to_string(),
         "system" => "System".to_string(),

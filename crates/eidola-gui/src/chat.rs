@@ -1983,10 +1983,53 @@ impl ChatView {
                 entry.byline.clone(),
                 byline_color,
                 c_border,
+                entry.generation_count,
                 body,
             )
             .id(("msg-row", idx))
             .into_any_element();
+        }
+
+        // Reference chips — a reply that quotes/links an earlier post shows the
+        // `❝ quote ❞ — re: <who>` reference at its top. The quote text is sliced
+        // from the referenced post's content by the edge's char range; a plain
+        // backlink (no range) just names the post.
+        if !entry.references.is_empty() {
+            let all = self.space.read(cx).messages().to_vec();
+            for r in &entry.references {
+                let target = all
+                    .iter()
+                    .find(|m| m.action_id.as_deref() == Some(r.antecedent_action_id.as_str()));
+                let who = target
+                    .map(|t| t.byline.clone())
+                    .unwrap_or_else(|| "a post".into());
+                let quote = match (target, r.range_start, r.range_end) {
+                    (Some(t), Some(s), Some(e)) if e > s => t
+                        .message
+                        .content
+                        .chars()
+                        .skip(s as usize)
+                        .take((e - s) as usize)
+                        .collect::<String>(),
+                    _ => String::new(),
+                };
+                let label = if quote.is_empty() {
+                    format!("re: {who}")
+                } else {
+                    format!("❝ {quote} ❞ — re: {who}")
+                };
+                body = body.child(
+                    div()
+                        .w_full()
+                        .pl_3()
+                        .border_l_2()
+                        .border_color(c_border)
+                        .text_sm()
+                        .italic()
+                        .text_color(c_muted_fg)
+                        .child(SharedString::from(label)),
+                );
+            }
         }
 
         if let Some(reasoning) = entry.reasoning.as_deref()
@@ -2079,6 +2122,7 @@ impl ChatView {
             entry.byline.clone(),
             byline_color,
             c_border,
+            entry.generation_count,
             body,
         )
         .id(("msg-row", idx))
@@ -2173,7 +2217,7 @@ impl ChatView {
             );
         }
 
-        post_frame(content_width, 0, true, byline, muted_fg, border, body).into_any_element()
+        post_frame(content_width, 0, true, byline, muted_fg, border, 1, body).into_any_element()
     }
 
     /// The window-local error band (an "Error" byline + body + optional
@@ -2222,7 +2266,7 @@ impl ChatView {
                 .child(self.render_plans_list(cx));
         }
 
-        post_frame(content_width, 0, true, "Error", c_danger, c_border, body).into_any_element()
+        post_frame(content_width, 0, true, "Error", c_danger, c_border, 1, body).into_any_element()
     }
 
     /// The composer item — the final list item. It carries the same gutter
@@ -2281,6 +2325,7 @@ impl ChatView {
                 "You",
                 theme.muted_foreground,
                 theme.border,
+                1,
                 body,
             )
             .pb(composer_pb)
@@ -2620,6 +2665,7 @@ fn post_frame(
     byline: impl Into<SharedString>,
     byline_color: gpui::Hsla,
     rail_color: gpui::Hsla,
+    generation_count: i64,
     body: Div,
 ) -> Div {
     let narrow = content_width < POST_GUTTER_MIN_WIDTH;
@@ -2627,10 +2673,22 @@ fn post_frame(
     // indent narrows the reading column so a branch body still fits.
     let indent = BRANCH_INDENT * (depth as f32);
     let body_w = (reading_column_width(content_width, narrow) - indent).max(gpui::px(220.));
-    let byline_el = div()
+    // The byline, plus a quiet generation badge when the post has been edited /
+    // regenerated (`vN` — the static stand-in for the 5.4 generation switcher).
+    let mut byline_el = h_flex()
+        .gap_1p5()
+        .items_baseline()
         .text_sm()
         .text_color(byline_color)
         .child(byline.into());
+    if generation_count > 1 {
+        byline_el = byline_el.child(
+            div()
+                .text_xs()
+                .text_color(byline_color)
+                .child(SharedString::from(format!("v{generation_count}"))),
+        );
+    }
 
     // A branch carries a left-margin rail (the body's left border) so it reads
     // as hanging off the spine; `pl_4` keeps the text off the rule.
