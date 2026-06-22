@@ -33,12 +33,29 @@ use std::path::PathBuf;
 use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
 use gpui_component::Root;
 use gpui_markdown_editor::editor::{
-    Backspace, Delete, Down, End, Enter, Home, Left, Right, ShiftEnter, ShiftLeft, ShiftRight,
-    ShiftTab, Tab,
+    Backspace, Delete, Down, End, Enter, Home, Left, Right, ShiftLeft, ShiftRight, ShiftTab, Tab,
 };
 use gpui_markdown_editor::{
-    BlockKind, Container, EditorEvent, EditorState, MarkdownEditor, RenderSpec, Selection,
+    BlockKind, Container, EditorEvent, EditorState, MarkdownEditor, MarkdownEditorState,
+    RenderSpec, Selection,
 };
+
+/// Minimal host view: holds the state entity and renders the `MarkdownEditor`
+/// element. The state entity is no longer `Render`, so the window root wraps
+/// it in this.
+struct EditorHarness {
+    state: Entity<MarkdownEditorState>,
+}
+
+impl gpui::Render for EditorHarness {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        MarkdownEditor::new(&self.state)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Session driver
@@ -47,7 +64,7 @@ use gpui_markdown_editor::{
 struct Session {
     cx: *mut TestAppContext,
     handle: AnyWindowHandle,
-    editor: Entity<MarkdownEditor>,
+    editor: Entity<MarkdownEditorState>,
     out_dir: PathBuf,
     transcript: String,
     step_count: usize,
@@ -63,12 +80,16 @@ impl Session {
 
         let (handle, editor) = cx.update(|cx| {
             gpui_component::init(cx);
-            let mut inner: Option<Entity<MarkdownEditor>> = None;
+            let mut inner: Option<Entity<MarkdownEditorState>> = None;
             let window = cx
                 .open_window(WindowOptions::default(), |window, cx| {
-                    let editor = cx.new(|cx| MarkdownEditor::with_state(editor_state, window, cx));
+                    let editor =
+                        cx.new(|cx| MarkdownEditorState::with_state(editor_state, window, cx));
                     inner = Some(editor.clone());
-                    cx.new(|cx| Root::new(editor, window, cx))
+                    let harness = cx.new(|_| EditorHarness {
+                        state: editor.clone(),
+                    });
+                    cx.new(|cx| Root::new(harness, window, cx))
                 })
                 .expect("open window");
             (window.into(), inner.expect("editor built"))
@@ -127,12 +148,7 @@ impl Session {
         let cx = self.cx();
         cx.update_window(handle, |_, _, cx| {
             editor.update(cx, |e, cx| {
-                let next = std::mem::take(&mut e.state);
-                e.state = gpui_markdown_editor::update::update(
-                    next,
-                    EditorEvent::InsertText(owned.clone()),
-                );
-                cx.notify();
+                e.apply_event_for_test(EditorEvent::InsertText(owned.clone()), cx);
             });
         })
         .unwrap();
@@ -147,8 +163,7 @@ impl Session {
     fn cursor_after(&mut self, needle: &str) -> &mut Self {
         let editor = self.editor.clone();
         let pos = editor.read_with(self.cx(), |e, _| {
-            e.state
-                .markdown
+            e.value()
                 .find(needle)
                 .map(|i| i + needle.len())
                 .unwrap_or_else(|| panic!("cursor_after: needle {needle:?} not found"))
@@ -160,8 +175,7 @@ impl Session {
     fn cursor_before(&mut self, needle: &str) -> &mut Self {
         let editor = self.editor.clone();
         let pos = editor.read_with(self.cx(), |e, _| {
-            e.state
-                .markdown
+            e.value()
                 .find(needle)
                 .unwrap_or_else(|| panic!("cursor_before: needle {needle:?} not found"))
         });
@@ -175,12 +189,10 @@ impl Session {
         let cx = self.cx();
         cx.update_window(handle, |_, _, cx| {
             editor.update(cx, |e, cx| {
-                let next = std::mem::take(&mut e.state);
-                e.state = gpui_markdown_editor::update::update(
-                    next,
+                e.apply_event_for_test(
                     EditorEvent::SetSelection(Selection::range(anchor, head)),
+                    cx,
                 );
-                cx.notify();
             });
         })
         .unwrap();
@@ -194,7 +206,7 @@ impl Session {
     fn select_span(&mut self, start_needle: &str, end_needle: &str) -> &mut Self {
         let editor = self.editor.clone();
         let (anchor, head) = editor.read_with(self.cx(), |e, _| {
-            let md = &e.state.markdown;
+            let md = e.value();
             let a = md
                 .find(start_needle)
                 .unwrap_or_else(|| panic!("select_span: start_needle {start_needle:?} not found"));
@@ -220,12 +232,7 @@ impl Session {
         let cx = self.cx();
         cx.update_window(handle, |_, _, cx| {
             editor.update(cx, |e, cx| {
-                let next = std::mem::take(&mut e.state);
-                e.state = gpui_markdown_editor::update::update(
-                    next,
-                    EditorEvent::SetSelection(Selection::Cursor(offset)),
-                );
-                cx.notify();
+                e.apply_event_for_test(EditorEvent::SetSelection(Selection::Cursor(offset)), cx);
             });
         })
         .unwrap();
@@ -243,9 +250,9 @@ impl Session {
         let editor = self.editor.clone();
         let (markdown, cursor, anchor, spec) = editor.read_with(self.cx(), |e, _| {
             (
-                e.state.markdown.clone(),
+                e.value().to_string(),
                 e.cursor_offset(),
-                e.state.selection.anchor(),
+                e.selection().anchor(),
                 e.render_spec(),
             )
         });
@@ -519,7 +526,14 @@ fn code_review_response_session(cx: &mut TestAppContext) {
         .keyframe("01-opener", "First paragraph thanking reviewers.");
 
     // Move to a new paragraph for the response list.
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "02-after-opener-enter",
         "Trailing empty row appears for the next paragraph.",
     );
@@ -536,7 +550,14 @@ fn code_review_response_session(cx: &mut TestAppContext) {
     // Add the quoted comment as a blockquote child of this item.
     // Standard usage: Enter, ShiftEnter (to stay inside the item but
     // start a new paragraph), then `> ` to open a BQ inside the item.
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "05-after-first-item-enter",
         "Enter at end of item should produce a fresh second item — author about \
          to undo and use Shift+Enter twice instead so the next thing belongs to *this* item.",
@@ -552,13 +573,25 @@ fn code_review_response_session(cx: &mut TestAppContext) {
         );
 
     // Two Shift+Enters → paragraph break inside the item (per AGENTS.md).
-    s.key(ShiftEnter, "ShiftEnter")
-        .key(ShiftEnter, "ShiftEnter")
-        .keyframe(
-            "07-paragraph-break-inside-item",
-            "Two Shift+Enters should produce a paragraph break inside item 1, \
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .keyframe(
+        "07-paragraph-break-inside-item",
+        "Two Shift+Enters should produce a paragraph break inside item 1, \
              with the indent matching the item's continuation column.",
-        );
+    );
 
     // Author types the blockquote of the reviewer's comment.
     s.type_("> ").keyframe(
@@ -574,13 +607,25 @@ fn code_review_response_session(cx: &mut TestAppContext) {
 
     // Now add the response after the blockquote — another paragraph in
     // the same item.
-    s.key(ShiftEnter, "ShiftEnter")
-        .key(ShiftEnter, "ShiftEnter")
-        .keyframe(
-            "10-paragraph-after-bq",
-            "Trying to leave the blockquote and continue typing inside item 1 — \
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .keyframe(
+        "10-paragraph-after-bq",
+        "Trying to leave the blockquote and continue typing inside item 1 — \
              expecting a paragraph break inside the item, *not* inside the BQ.",
-        );
+    );
 
     s.type_("Yes — the backfill uses a default and the schema change is online.")
         .keyframe(
@@ -590,22 +635,48 @@ fn code_review_response_session(cx: &mut TestAppContext) {
 
     // Add a fenced code block showing the migration. Code block opens
     // with ` ``` ` plus info string.
-    s.key(ShiftEnter, "ShiftEnter")
-        .key(ShiftEnter, "ShiftEnter")
-        .type_("```sql")
-        .keyframe(
-            "12-code-fence-opener",
-            "Opening a fenced code block inside item 1 — info string is `sql`.",
-        );
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .type_("```sql")
+    .keyframe(
+        "12-code-fence-opener",
+        "Opening a fenced code block inside item 1 — info string is `sql`.",
+    );
 
-    s.key(Enter, "Enter")
-        .type_("ALTER TABLE users\n  ADD COLUMN tier text NOT NULL DEFAULT 'free';")
-        .keyframe(
-            "13-code-content",
-            "Two-line code body. Inside code, Enter inserts a single `\\n`, not a paragraph break.",
-        );
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .type_("ALTER TABLE users\n  ADD COLUMN tier text NOT NULL DEFAULT 'free';")
+    .keyframe(
+        "13-code-content",
+        "Two-line code body. Inside code, Enter inserts a single `\\n`, not a paragraph break.",
+    );
 
-    s.key(Enter, "Enter").type_("```").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .type_("```")
+    .keyframe(
         "14-code-closer",
         "Closer fence typed; code block now bracketed.",
     );
@@ -615,7 +686,14 @@ fn code_review_response_session(cx: &mut TestAppContext) {
     // stay inside item 1 OR start item 2 — depends on Enter semantics.
     // The author would expect: Enter twice at the closer end → start
     // item 2 of the outer list.
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "15-after-code-closer-enter",
         "After the closer fence, expecting a new paragraph context. \
          Author about to start item 2 of the outer list.",
@@ -634,34 +712,76 @@ fn code_review_response_session(cx: &mut TestAppContext) {
         );
 
     // Quote the second comment.
-    s.key(ShiftEnter, "ShiftEnter")
-        .key(ShiftEnter, "ShiftEnter")
-        .type_("> Don't mock the worker; the test should hit a real DB.")
-        .keyframe("18-second-bq", "Reviewer quote in item 2.");
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .type_("> Don't mock the worker; the test should hit a real DB.")
+    .keyframe("18-second-bq", "Reviewer quote in item 2.");
 
     // Acknowledge with a sub-list of two ordered points.
-    s.key(ShiftEnter, "ShiftEnter")
-        .key(ShiftEnter, "ShiftEnter")
-        .type_("Agreed — splitting the ack into two parts:")
-        .keyframe("19-second-item-followup", "Lead-in for the sub-list.");
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .type_("Agreed — splitting the ack into two parts:")
+    .keyframe("19-second-item-followup", "Lead-in for the sub-list.");
 
-    s.key(ShiftEnter, "ShiftEnter")
-        .key(ShiftEnter, "ShiftEnter")
-        .type_("- Switched to a real testcontainers Postgres in the worker tests.")
-        .keyframe(
-            "20-sub-list-first-bullet",
-            "First bullet — author wants a *nested* list inside item 2. \
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .type_("- Switched to a real testcontainers Postgres in the worker tests.")
+    .keyframe(
+        "20-sub-list-first-bullet",
+        "First bullet — author wants a *nested* list inside item 2. \
              Pulldown will currently see this as a top-level continuation \
              unless the indent is right.",
-        );
+    );
 
-    s.key(Enter, "Enter")
-        .type_("Removed the in-memory `MockMigrator` shim entirely.")
-        .keyframe(
-            "21-sub-list-second-bullet",
-            "Second bullet of the sub-list. Enter inside a list item should \
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .type_("Removed the in-memory `MockMigrator` shim entirely.")
+    .keyframe(
+        "21-sub-list-second-bullet",
+        "Second bullet of the sub-list. Enter inside a list item should \
              produce the next bullet at the same depth.",
-        );
+    );
 
     // Recompose: copy the SQL code block and reuse it after the second
     // item. The author selects the code block from item 1 then pastes
@@ -685,11 +805,11 @@ fn code_review_response_session(cx: &mut TestAppContext) {
     let copied = {
         let editor = s.editor.clone();
         let cx = s.cx();
-        editor.read_with(cx, |e, _| match e.state.selection {
+        editor.read_with(cx, |e, _| match e.selection() {
             Selection::Range { anchor, head } => {
                 let lo = anchor.min(head);
                 let hi = anchor.max(head);
-                e.state.markdown[lo..hi].to_string()
+                e.value()[lo..hi].to_string()
             }
             Selection::Cursor(_) => String::new(),
         })
@@ -703,17 +823,37 @@ fn code_review_response_session(cx: &mut TestAppContext) {
             "Cursor at end of the document — about to paste the copied code block.",
         );
 
-    s.key(ShiftEnter, "ShiftEnter")
-        .key(ShiftEnter, "ShiftEnter")
-        .type_(&copied)
-        .keyframe(
-            "25-pasted-code-block",
-            "Pasted the SQL code block. Should land as a child of item 2 \
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .type_(&copied)
+    .keyframe(
+        "25-pasted-code-block",
+        "Pasted the SQL code block. Should land as a child of item 2 \
              (same indent context) since we used Shift+Enter twice.",
-        );
+    );
 
     // Add a fence closer.
-    s.key(Enter, "Enter").type_("```").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .type_("```")
+    .keyframe(
         "26-pasted-code-closer",
         "Closer fence appended to the pasted block.",
     );
@@ -792,8 +932,12 @@ fn code_review_response_session(cx: &mut TestAppContext) {
 // dispatcher above.
 #[allow(dead_code)]
 fn _used_actions() {
-    let _ = (Backspace, Delete, Down, End, Enter, Home, Left, Right);
-    let _ = (ShiftEnter, ShiftLeft, ShiftRight, ShiftTab, Tab);
+    let _ = (Backspace, Delete, Down, End, Home, Left, Right);
+    let _ = Enter {
+        secondary: false,
+        shift: false,
+    };
+    let _ = (ShiftLeft, ShiftRight, ShiftTab, Tab);
 }
 
 // ---------------------------------------------------------------------------
@@ -867,7 +1011,14 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
     s.type_chars_keyframed("> ", "01-bq-marker", "Opening a blockquote, char by char.");
     s.type_chars_keyframed("```", "02-bq-fence-open", "Typing the opening fence; expect the editor to recognize a code block once the third backtick lands.");
     s.type_chars_keyframed("rust", "03-bq-info", "Typing the language tag.");
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "04-bq-after-fence-enter",
         "Enter after the opener+info — without a closing fence, what does the editor do? \
          A naive Enter inserts `\\n\\n` (paragraph break) which would split the BQ; the \
@@ -878,7 +1029,7 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
         "05-bq-body",
         "Typing the body of the code block.",
     );
-    s.key(Enter, "Enter").keyframe(
+    s.key(Enter { secondary: false, shift: false }, "Enter").keyframe(
         "06-bq-after-body-enter",
         "Enter inside code body — literal `\\n` + chain prefix; closer below already exists from auto-close.",
     );
@@ -887,25 +1038,53 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
         "08-bq-block-complete",
         "Code block inside BQ should now be a closed fenced block.",
     );
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "09-bq-leave-enter",
         "Enter after the closing fence — does this leave the BQ scope or stay inside it?",
     );
 
     // Whatever state we're in, get out to top-level cleanly. If still in BQ,
     // pressing Enter again on an empty BQ row should outdent.
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "10-back-to-top-level",
         "Second Enter — expect to be at top level by now (any BQ scope dropped).",
     );
 
     s.type_chars_keyframed("- ", "11-li-marker", "Opening an unordered list item.");
     s.type_chars_keyframed("item", "12-li-content", "Item content.");
-    s.key(ShiftEnter, "ShiftEnter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .keyframe(
         "13-li-shift-enter-1",
         "First ShiftEnter — hard break inside the item, indent on next line.",
     );
-    s.key(ShiftEnter, "ShiftEnter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .keyframe(
         "14-li-shift-enter-2",
         "Second ShiftEnter — paragraph break inside the item.",
     );
@@ -915,32 +1094,71 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
         "Typing the opening fence inside the item.",
     );
     s.type_chars_keyframed("rust", "16-li-info", "Language tag.");
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "17-li-after-fence-enter",
         "Enter after opener inside an LI — auto-close should fire.",
     );
     s.type_chars_keyframed("let y = 2;", "18-li-body", "Code body inside the LI.");
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "19-li-after-body-enter",
         "Enter inside code body — literal `\\n`.",
     );
     s.type_chars_keyframed("```", "20-li-fence-close", "Closing fence.");
     s.keyframe("21-li-block-complete", "Code block inside LI complete.");
-    s.key(Enter, "Enter")
-        .keyframe("22-li-leave-enter", "Enter after the closing fence.");
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe("22-li-leave-enter", "Enter after the closing fence.");
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "23-back-to-top-level-after-li",
         "Second Enter — expect to be at top level.",
     );
 
     s.type_chars_keyframed("- ", "24-li2-marker", "Second list — top-level.");
     s.type_chars_keyframed("item", "25-li2-content", "Item content.");
-    s.key(ShiftEnter, "ShiftEnter")
-        .key(ShiftEnter, "ShiftEnter")
-        .keyframe(
-            "26-li2-paragraph-break",
-            "Paragraph break inside item 1 — about to open a BQ child.",
-        );
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .keyframe(
+        "26-li2-paragraph-break",
+        "Paragraph break inside item 1 — about to open a BQ child.",
+    );
     s.type_chars_keyframed("> ", "27-li2-bq-marker", "BQ marker inside the LI.");
     s.type_chars_keyframed(
         "```",
@@ -948,12 +1166,26 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
         "Opening fence inside [LI, BQ].",
     );
     s.type_chars_keyframed("rust", "29-li2-bq-info", "Language tag.");
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "30-li2-bq-after-fence-enter",
         "Enter after opener inside [LI, BQ] — auto-close should fire.",
     );
     s.type_chars_keyframed("let z = 3;", "31-li2-bq-body", "Body inside [LI, BQ] code.");
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "32-li2-bq-after-body-enter",
         "Enter inside [LI, BQ] code body.",
     );
@@ -962,11 +1194,25 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
         "34-li2-bq-block-complete",
         "Code block inside [LI, BQ] complete.",
     );
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "35-li2-bq-leave-enter",
         "Enter after closing fence in [LI, BQ].",
     );
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "36-back-to-top-level-after-li2",
         "Second Enter — expect to be at top level.",
     );
@@ -998,12 +1244,24 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
 
     s.type_chars_keyframed("- ", "40-prep-ul-marker", "Opening the outer UL.");
     s.type_chars_keyframed("out", "41-prep-ul-body", "UL item content.");
-    s.key(ShiftEnter, "ShiftEnter")
-        .key(ShiftEnter, "ShiftEnter")
-        .keyframe(
-            "42-prep-ul-paragraph-break",
-            "Paragraph break inside the UL item.",
-        );
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .keyframe(
+        "42-prep-ul-paragraph-break",
+        "Paragraph break inside the UL item.",
+    );
 
     s.type_chars_keyframed(
         "1. ",
@@ -1011,12 +1269,24 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
         "Opening the nested OL inside the UL.",
     );
     s.type_chars_keyframed("in", "44-prep-ol-body", "OL item content.");
-    s.key(ShiftEnter, "ShiftEnter")
-        .key(ShiftEnter, "ShiftEnter")
-        .keyframe(
-            "45-prep-ol-paragraph-break",
-            "Paragraph break inside the OL item.",
-        );
+    s.key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .key(
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+        "ShiftEnter",
+    )
+    .keyframe(
+        "45-prep-ol-paragraph-break",
+        "Paragraph break inside the OL item.",
+    );
 
     s.type_chars_keyframed("> ", "46-prep-bq1-marker", "Opening the outer BQ.");
     s.type_chars_keyframed(
@@ -1030,12 +1300,26 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
         "Opening fence inside [UL, OL, BQ, BQ].",
     );
     s.type_chars_keyframed("rust", "49-prep-fence-info", "Language tag.");
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "50-prep-after-fence-enter",
         "Enter at end of opener — auto-close should fire at chain [UL, OL, BQ, BQ].",
     );
     s.type_chars_keyframed("let n = 5;", "51-prep-body", "Code body.");
-    s.key(Enter, "Enter").keyframe(
+    s.key(
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+        "Enter",
+    )
+    .keyframe(
         "52-prep-after-body-enter",
         "Enter inside body — literal `\\n` plus chain prefix.",
     );
@@ -1050,7 +1334,7 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
     let initial_len = {
         let editor = s.editor.clone();
         let cx = s.cx();
-        editor.read_with(cx, |e, _| e.state.markdown.len())
+        editor.read_with(cx, |e, _| e.value().len())
     };
     let mut min_len_seen = initial_len;
     let mut steps_without_progress = 0usize;
@@ -1071,7 +1355,7 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
         let (markdown, cursor) = {
             let editor = s.editor.clone();
             let cx = s.cx();
-            editor.read_with(cx, |e, _| (e.state.markdown.clone(), e.cursor_offset()))
+            editor.read_with(cx, |e, _| (e.value().to_string(), e.cursor_offset()))
         };
         if markdown.is_empty() {
             s.keyframe("98-bs-empty", "Buffer empty.");
@@ -1105,7 +1389,7 @@ fn nested_code_blocks_session(cx: &mut TestAppContext) {
         let (next_md, next_cursor) = {
             let editor = s.editor.clone();
             let cx = s.cx();
-            editor.read_with(cx, |e, _| (e.state.markdown.clone(), e.cursor_offset()))
+            editor.read_with(cx, |e, _| (e.value().to_string(), e.cursor_offset()))
         };
         if next_md == markdown && next_cursor == cursor {
             if cursor == 0 && !markdown.is_empty() {

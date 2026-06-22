@@ -37,7 +37,6 @@ use gpui::{
     VisualTestContext, WindowOptions, px,
 };
 use gpui_component::{Root, Theme};
-use gpui_markdown_editor::EditorState;
 
 // ---------------------------------------------------------------------------
 // Stores fixture
@@ -192,11 +191,10 @@ fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
     // We write `EditorState` directly rather than driving the IME path
     // because behavior tests don't have a real text-input chain; this is
     // the same shortcut snapshot tests use to set up populated states.
-    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    let prompt_editor = view.read_with(cx, |v, _| v.editor_state_for_test());
     cx.update_window(window, |_, _, cx| {
         prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::with_markdown("hi there");
-            cx.notify();
+            editor.set_value("hi there", cx);
         });
     })
     .unwrap();
@@ -226,6 +224,59 @@ fn chat_submit_with_prompt_appends_user_message(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn composer_cmd_enter_routes_through_press_enter_to_submit(cx: &mut TestAppContext) {
+    // The wave-5.5 inversion: ChatView no longer binds ⌘↩ — the composer owns
+    // the chord. Dispatching the editor's `Enter { secondary: true }` action
+    // (what `cmd-enter` binds to in the `MarkdownEditor` context) must make the
+    // editor emit `PressEnter`, which `ChatView::on_editor_event` routes to
+    // `submit`. This exercises the full outward-event wiring, where the
+    // `&Send`-dispatch tests bypass it. We dispatch through the *editor's*
+    // focus handle (its element registers the action handler), not ChatView's.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ChatView::new(stores.clone(), None, WindowInput::new(cx), window, cx))
+    });
+
+    let editor = view.read_with(cx, |v, _| v.editor_state_for_test());
+    cx.update_window(window, |_, _, cx| {
+        editor.update(cx, |e, cx| e.set_value("via press-enter", cx));
+    })
+    .unwrap();
+
+    let editor_focus = editor.read_with(cx, |e, cx| e.focus_handle(cx));
+    cx.update_window(window, |_, window, cx| {
+        editor_focus.dispatch_action(
+            &gpui_markdown_editor::Enter {
+                secondary: true,
+                shift: false,
+            },
+            window,
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, cx| {
+        let messages = v.messages(cx);
+        assert_eq!(
+            messages.len(),
+            1,
+            "⌘↩ via PressEnter should append the user message"
+        );
+        assert_eq!(messages[0].message.content, "via press-enter");
+        assert!(
+            v.streaming(cx).is_some(),
+            "⌘↩ via PressEnter should enter the streaming state, like Send"
+        );
+        assert!(
+            v.editor_state_for_test().read(cx).value().is_empty(),
+            "the composer clears after a routed submit"
+        );
+    });
+}
+
+#[gpui::test]
 fn chat_post_only_appends_user_message_without_streaming(cx: &mut TestAppContext) {
     // ⌘⇧↩ — the save side of the split: it appends the user's post but, unlike
     // Send, does NOT enter the streaming state (nothing is requested).
@@ -234,11 +285,10 @@ fn chat_post_only_appends_user_message_without_streaming(cx: &mut TestAppContext
         cx.new(|cx| ChatView::new(stores.clone(), None, WindowInput::new(cx), window, cx))
     });
 
-    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    let prompt_editor = view.read_with(cx, |v, _| v.editor_state_for_test());
     cx.update_window(window, |_, _, cx| {
         prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::with_markdown("just a thought");
-            cx.notify();
+            editor.set_value("just a thought", cx);
         });
     })
     .unwrap();
@@ -336,7 +386,7 @@ fn inline_edit_enters_suppresses_composer_and_cancels(cx: &mut TestAppContext) {
             "trailing composer should be suppressed during an inline edit"
         );
         assert_eq!(
-            v.prompt_editor_for_test().read(cx).state.markdown,
+            v.editor_state_for_test().read(cx).value(),
             "hello there",
             "the editor should be preloaded with the post's text"
         );
@@ -348,7 +398,7 @@ fn inline_edit_enters_suppresses_composer_and_cancels(cx: &mut TestAppContext) {
     view.read_with(cx, |v, cx| {
         assert_eq!(v.editing(), None);
         assert_eq!(v.transcript_item_count_for_test(), 2);
-        assert_eq!(v.prompt_editor_for_test().read(cx).state.markdown, "");
+        assert_eq!(v.editor_state_for_test().read(cx).value(), "");
     });
 }
 
@@ -487,11 +537,10 @@ fn stale_initial_space_load_does_not_replace_submitted_prompt(cx: &mut TestAppCo
         })
     });
 
-    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    let prompt_editor = view.read_with(cx, |v, _| v.editor_state_for_test());
     cx.update_window(window, |_, _, cx| {
         prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::with_markdown("new prompt");
-            cx.notify();
+            editor.set_value("new prompt", cx);
         });
     })
     .unwrap();
@@ -1064,7 +1113,7 @@ fn picker_open_parks_focus_off_composer(cx: &mut TestAppContext) {
 
     let view_focus = view.read_with(cx, |v, _| v.focus_handle());
     let editor_focus = view.read_with(cx, |v, cx| {
-        v.prompt_editor_for_test().read(cx).focus_handle(cx)
+        v.editor_state_for_test().read(cx).focus_handle(cx)
     });
 
     // At rest the composer holds focus — the cursor home for a "letter
@@ -1531,12 +1580,11 @@ fn set_composer_text(
     cx: &mut TestAppContext,
     text: &str,
 ) {
-    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    let prompt_editor = view.read_with(cx, |v, _| v.editor_state_for_test());
     let text = text.to_string();
     cx.update_window(window, |_, _, cx| {
         prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::with_markdown(text.as_str());
-            cx.notify();
+            editor.set_value(text.as_str(), cx);
         });
     })
     .unwrap();
@@ -2843,11 +2891,10 @@ fn first_message_survives_streaming_start(cx: &mut TestAppContext) {
     });
 
     // Type and send the first message.
-    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    let prompt_editor = view.read_with(cx, |v, _| v.editor_state_for_test());
     cx.update_window(window, |_, _, cx| {
         prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::with_markdown("first message");
-            cx.notify();
+            editor.set_value("first message", cx);
         });
     })
     .unwrap();
@@ -2958,11 +3005,10 @@ fn second_submit_in_existing_space_keeps_all_messages(cx: &mut TestAppContext) {
     });
 
     // Second submit.
-    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    let prompt_editor = view.read_with(cx, |v, _| v.editor_state_for_test());
     cx.update_window(window, |_, _, cx| {
         prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::with_markdown("q2");
-            cx.notify();
+            editor.set_value("q2", cx);
         });
     })
     .unwrap();
@@ -3099,11 +3145,10 @@ fn submit_engages_tail_but_load_does_not(cx: &mut TestAppContext) {
     });
 
     // Submit a real turn through the Send action.
-    let prompt_editor = view.read_with(cx, |v, _| v.prompt_editor_for_test());
+    let prompt_editor = view.read_with(cx, |v, _| v.editor_state_for_test());
     cx.update_window(window, |_, _, cx| {
         prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::with_markdown("hello");
-            cx.notify();
+            editor.set_value("hello", cx);
         });
     })
     .unwrap();

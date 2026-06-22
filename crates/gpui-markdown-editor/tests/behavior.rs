@@ -17,25 +17,47 @@ use gpui::{
 use gpui_component::Root;
 use gpui_markdown_editor::editor::{
     Backspace, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward, DeleteWordForward,
-    DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Right, SelectAll, ShiftEnter,
-    ShiftRight, ShiftTab, ShiftWordLeft, ShiftWordRight, Tab, Up, WordLeft, WordRight,
+    DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Right, SelectAll, ShiftRight,
+    ShiftTab, ShiftWordLeft, ShiftWordRight, Tab, Up, WordLeft, WordRight,
 };
 use gpui_markdown_editor::{
-    BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, RenderSpec, Selection,
+    BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, MarkdownEditorState,
+    RenderSpec, Selection,
 };
+
+/// Minimal host view for the editor under test: holds the state entity and
+/// renders the `MarkdownEditor` element each frame, exactly as a real host
+/// does. The state entity is no longer `Render`, so the window root needs a
+/// view that drives the element.
+struct EditorHarness {
+    state: Entity<MarkdownEditorState>,
+}
+
+impl gpui::Render for EditorHarness {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        MarkdownEditor::new(&self.state)
+    }
+}
 
 fn open_editor(
     cx: &mut TestAppContext,
     state: EditorState,
-) -> (AnyWindowHandle, Entity<MarkdownEditor>) {
+) -> (AnyWindowHandle, Entity<MarkdownEditorState>) {
     cx.update(|cx| {
         gpui_component::init(cx);
-        let mut inner: Option<Entity<MarkdownEditor>> = None;
+        let mut inner: Option<Entity<MarkdownEditorState>> = None;
         let window = cx
             .open_window(WindowOptions::default(), |window, cx| {
-                let editor = cx.new(|cx| MarkdownEditor::with_state(state, window, cx));
+                let editor = cx.new(|cx| MarkdownEditorState::with_state(state, window, cx));
                 inner = Some(editor.clone());
-                cx.new(|cx| Root::new(editor, window, cx))
+                let harness = cx.new(|_| EditorHarness {
+                    state: editor.clone(),
+                });
+                cx.new(|cx| Root::new(harness, window, cx))
             })
             .expect("open window");
         (window.into(), inner.expect("editor built"))
@@ -48,10 +70,10 @@ fn open_editor(
 fn open_editor_narrow(
     cx: &mut TestAppContext,
     state: EditorState,
-) -> (AnyWindowHandle, Entity<MarkdownEditor>) {
+) -> (AnyWindowHandle, Entity<MarkdownEditorState>) {
     cx.update(|cx| {
         gpui_component::init(cx);
-        let mut inner: Option<Entity<MarkdownEditor>> = None;
+        let mut inner: Option<Entity<MarkdownEditorState>> = None;
         let bounds = Bounds {
             origin: point(px(0.), px(0.)),
             size: size(px(160.), px(400.)),
@@ -63,9 +85,12 @@ fn open_editor_narrow(
                     ..Default::default()
                 },
                 |window, cx| {
-                    let editor = cx.new(|cx| MarkdownEditor::with_state(state, window, cx));
+                    let editor = cx.new(|cx| MarkdownEditorState::with_state(state, window, cx));
                     inner = Some(editor.clone());
-                    cx.new(|cx| Root::new(editor, window, cx))
+                    let harness = cx.new(|_| EditorHarness {
+                        state: editor.clone(),
+                    });
+                    cx.new(|cx| Root::new(harness, window, cx))
                 },
             )
             .expect("open window");
@@ -76,7 +101,7 @@ fn open_editor_narrow(
 fn dispatch(
     cx: &mut TestAppContext,
     handle: AnyWindowHandle,
-    editor: &Entity<MarkdownEditor>,
+    editor: &Entity<MarkdownEditorState>,
     action: impl gpui::Action,
 ) {
     let focus = editor.read_with(cx, |e, _| e.focus_handle.clone());
@@ -87,7 +112,7 @@ fn dispatch(
     cx.run_until_parked();
 }
 
-fn current_spec(cx: &mut TestAppContext, editor: &Entity<MarkdownEditor>) -> RenderSpec {
+fn current_spec(cx: &mut TestAppContext, editor: &Entity<MarkdownEditorState>) -> RenderSpec {
     editor.read_with(cx, |e, _| e.render_spec())
 }
 
@@ -99,7 +124,7 @@ fn current_spec(cx: &mut TestAppContext, editor: &Entity<MarkdownEditor>) -> Ren
 fn editor_constructs_with_initial_state(cx: &mut TestAppContext) {
     let (_, editor) = open_editor(cx, EditorState::with_markdown("# hi"));
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "# hi");
+        assert_eq!(e.value(), "# hi");
         assert_eq!(e.cursor_offset(), 0);
     });
 }
@@ -113,9 +138,17 @@ fn enter_action_inserts_paragraph_break(cx: &mut TestAppContext) {
         selection: Selection::Cursor(2),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "ab\n\nc");
+        assert_eq!(e.value(), "ab\n\nc");
         assert_eq!(e.cursor_offset(), 4);
     });
 }
@@ -129,7 +162,7 @@ fn backspace_removes_one_grapheme(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "ac");
+        assert_eq!(e.value(), "ac");
         assert_eq!(e.cursor_offset(), 1);
     });
 }
@@ -143,7 +176,7 @@ fn delete_removes_forward_grapheme(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Delete);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "ac");
+        assert_eq!(e.value(), "ac");
         assert_eq!(e.cursor_offset(), 1);
     });
 }
@@ -240,7 +273,7 @@ fn shift_right_extends_selection(cx: &mut TestAppContext) {
     dispatch(cx, handle, &editor, ShiftRight);
     dispatch(cx, handle, &editor, ShiftRight);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.selection, Selection::range(1, 3));
+        assert_eq!(e.selection(), Selection::range(1, 3));
     });
 }
 
@@ -249,7 +282,7 @@ fn select_all_spans_document(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, EditorState::with_markdown("hello"));
     dispatch(cx, handle, &editor, SelectAll);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.selection, Selection::range(0, 5));
+        assert_eq!(e.selection(), Selection::range(0, 5));
     });
 }
 
@@ -264,10 +297,18 @@ fn shift_enter_at_end_of_paragraph_keeps_cursor_in_same_paragraph(cx: &mut TestA
         selection: Selection::Cursor(11),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, ShiftEnter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+    );
 
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "paragraph 1  \n");
+        assert_eq!(e.value(), "paragraph 1  \n");
         assert_eq!(e.cursor_offset(), 14);
     });
 
@@ -291,10 +332,18 @@ fn enter_at_end_of_paragraph_creates_visible_trailing_empty(cx: &mut TestAppCont
         selection: Selection::Cursor(11),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
 
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "paragraph 1\n\n");
+        assert_eq!(e.value(), "paragraph 1\n\n");
         assert_eq!(e.cursor_offset(), 13);
     });
 
@@ -325,21 +374,45 @@ fn enter_in_empty_doc_emits_one_visible_row_per_press(cx: &mut TestAppContext) {
     let spec0 = current_spec(cx, &editor);
     assert_eq!(spec0.blocks.len(), 1);
 
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "\n\n");
+        assert_eq!(e.value(), "\n\n");
         assert_eq!(e.cursor_offset(), 2);
     });
     let spec1 = current_spec(cx, &editor);
     assert_eq!(spec1.blocks.len(), 2);
 
-    dispatch(cx, handle, &editor, Enter);
-    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "\n\n\n\n"));
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "\n\n\n\n"));
     let spec2 = current_spec(cx, &editor);
     assert_eq!(spec2.blocks.len(), 3);
 
-    dispatch(cx, handle, &editor, Enter);
-    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "\n\n\n\n\n\n"));
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "\n\n\n\n\n\n"));
     let spec3 = current_spec(cx, &editor);
     assert_eq!(spec3.blocks.len(), 4);
 }
@@ -371,7 +444,7 @@ fn select_all_then_backspace_keeps_editor_usable(cx: &mut TestAppContext) {
     dispatch(cx, handle, &editor, SelectAll);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "");
+        assert_eq!(e.value(), "");
         assert_eq!(e.cursor_offset(), 0);
     });
     let spec = current_spec(cx, &editor);
@@ -380,9 +453,17 @@ fn select_all_then_backspace_keeps_editor_usable(cx: &mut TestAppContext) {
     // Pressing Enter from this empty state goes through the action
     // pipeline and produces `\n\n` (pairs model). Confirm render emits
     // multiple visible blocks.
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "\n\n");
+        assert_eq!(e.value(), "\n\n");
     });
     let spec = current_spec(cx, &editor);
     assert!(spec.blocks.len() >= 2);
@@ -494,10 +575,18 @@ fn enter_in_middle_of_paragraph_creates_paragraph_break(cx: &mut TestAppContext)
         selection: Selection::Cursor(5),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "hello\n\n world");
-        assert_no_soft_break(&e.state.markdown);
+        assert_eq!(e.value(), "hello\n\n world");
+        assert_no_soft_break(e.value());
     });
 }
 
@@ -512,14 +601,38 @@ fn three_enters_grow_into_three_visible_empty_rows(cx: &mut TestAppContext) {
     };
     let (handle, editor) = open_editor(cx, initial);
 
-    dispatch(cx, handle, &editor, Enter);
-    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "ab\n\n"));
-    dispatch(cx, handle, &editor, Enter);
-    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "ab\n\n\n\n"));
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "ab\n\n"));
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "ab\n\n\n\n"));
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "ab\n\n\n\n\n\n");
-        assert_no_soft_break(&e.state.markdown);
+        assert_eq!(e.value(), "ab\n\n\n\n\n\n");
+        assert_no_soft_break(e.value());
     });
 }
 
@@ -534,9 +647,9 @@ fn backspace_at_paragraph_break_merges_in_one_keystroke(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "firstsecond");
+        assert_eq!(e.value(), "firstsecond");
         assert_eq!(e.cursor_offset(), 5);
-        assert_no_soft_break(&e.state.markdown);
+        assert_no_soft_break(e.value());
     });
 }
 
@@ -551,12 +664,12 @@ fn backspace_through_empty_paragraphs_one_pair_at_a_time(cx: &mut TestAppContext
     let (handle, editor) = open_editor(cx, initial);
 
     dispatch(cx, handle, &editor, Backspace);
-    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "a\n\nb"));
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "a\n\nb"));
 
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "ab");
-        assert_no_soft_break(&e.state.markdown);
+        assert_eq!(e.value(), "ab");
+        assert_no_soft_break(e.value());
     });
 }
 
@@ -569,9 +682,9 @@ fn delete_forward_at_paragraph_break_merges(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Delete);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "firstsecond");
+        assert_eq!(e.value(), "firstsecond");
         assert_eq!(e.cursor_offset(), 5);
-        assert_no_soft_break(&e.state.markdown);
+        assert_no_soft_break(e.value());
     });
 }
 
@@ -591,9 +704,17 @@ fn enter_inside_code_block_inserts_single_newline(cx: &mut TestAppContext) {
         selection: Selection::Cursor(18),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "```rust\nlet x = 1;\n\n```");
+        assert_eq!(e.value(), "```rust\nlet x = 1;\n\n```");
         assert_eq!(e.cursor_offset(), 19);
     });
 }
@@ -608,9 +729,17 @@ fn enter_outside_code_block_inserts_paragraph_break(cx: &mut TestAppContext) {
         selection: Selection::Cursor(13),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "```\nx\n```\n\npa\n\nra");
+        assert_eq!(e.value(), "```\nx\n```\n\npa\n\nra");
     });
 }
 
@@ -643,7 +772,7 @@ fn backspace_inside_code_block_deletes_one_newline(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "```\nline1\nline2\n```");
+        assert_eq!(e.value(), "```\nline1\nline2\n```");
         assert_eq!(e.cursor_offset(), 10);
     });
 }
@@ -659,7 +788,7 @@ fn delete_forward_inside_code_block_deletes_one_newline(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Delete);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "```\nline1\nline2\n```");
+        assert_eq!(e.value(), "```\nline1\nline2\n```");
         assert_eq!(e.cursor_offset(), 9);
     });
 }
@@ -678,14 +807,10 @@ fn cursor_can_land_in_blank_line_inside_code_block(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _window, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            // Position 10 is the interior of the `\n\n` pair
-            // separating "line1" and "line2".
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(10)),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -709,23 +834,20 @@ fn pasted_multiline_inside_code_block_keeps_single_newlines(cx: &mut TestAppCont
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _window, cx| {
         editor.update(cx, |e, cx| {
-            // Simulate a paste of multiline source by setting the
-            // markdown directly, then running the post-pass via
-            // `update` to verify it doesn't promote the inner `\n`s.
-            e.state.markdown = "```\nline1\nline2\nline3\n```".into();
-            e.state.selection = Selection::Cursor(20);
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            // Simulate a paste of multiline source by setting the markdown
+            // directly, then running the post-pass via `update` to verify it
+            // doesn't promote the inner `\n`s.
+            e.set_value("```\nline1\nline2\nline3\n```", cx);
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(20)),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "```\nline1\nline2\nline3\n```");
+        assert_eq!(e.value(), "```\nline1\nline2\nline3\n```");
     });
 }
 
@@ -769,18 +891,16 @@ fn typing_inside_blockquote_keeps_it_a_blockquote(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText("!".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> hello!");
+        assert_eq!(e.value(), "> hello!");
         let spec = e.render_spec();
         assert!(
             spec.blocks.iter().any(|b| !b.containers.is_empty()),
@@ -847,17 +967,22 @@ fn enter_inside_blockquote_keeps_new_paragraph_at_same_depth(cx: &mut TestAppCon
         selection: Selection::Cursor(7),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> hello\n> \n> ");
+        assert_eq!(e.value(), "> hello\n> \n> ");
         assert_eq!(e.cursor_offset(), 13);
         // The paragraph the cursor sits in still belongs to a
         // blockquote (depth 1).
         assert_eq!(
-            gpui_markdown_editor::update::blockquote_depth_at(
-                &e.state.markdown,
-                e.cursor_offset(),
-            ),
+            gpui_markdown_editor::update::blockquote_depth_at(e.value(), e.cursor_offset(),),
             1,
         );
     });
@@ -870,14 +995,19 @@ fn enter_inside_nested_blockquote_keeps_depth(cx: &mut TestAppContext) {
         selection: Selection::Cursor(8),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> > deep\n> > \n> > ");
+        assert_eq!(e.value(), "> > deep\n> > \n> > ");
         assert_eq!(
-            gpui_markdown_editor::update::blockquote_depth_at(
-                &e.state.markdown,
-                e.cursor_offset(),
-            ),
+            gpui_markdown_editor::update::blockquote_depth_at(e.value(), e.cursor_offset(),),
             2,
         );
     });
@@ -892,9 +1022,17 @@ fn shift_enter_inside_blockquote_keeps_marker_on_continuation(cx: &mut TestAppCo
         selection: Selection::Cursor(7),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, ShiftEnter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> hello  \n> ");
+        assert_eq!(e.value(), "> hello  \n> ");
         assert_eq!(e.cursor_offset(), 12);
     });
 }
@@ -915,7 +1053,7 @@ fn backspace_at_end_of_depth_1_pair_outdents_to_depth_0(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> hello\n\n");
+        assert_eq!(e.value(), "> hello\n\n");
         assert_eq!(e.cursor_offset(), 9);
     });
 }
@@ -933,7 +1071,7 @@ fn backspace_at_end_of_depth_2_pair_outdents_to_depth_1(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> > deep\n> \n> ");
+        assert_eq!(e.value(), "> > deep\n> \n> ");
         assert_eq!(e.cursor_offset(), 14);
     });
 }
@@ -954,20 +1092,20 @@ fn successive_backspaces_walk_paragraph_through_nesting_levels(cx: &mut TestAppC
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
         // depth 2 → 1
-        assert_eq!(e.state.markdown, "> > deep\n> \n> ");
+        assert_eq!(e.value(), "> > deep\n> \n> ");
         assert_eq!(e.cursor_offset(), 14);
     });
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
         // depth 1 → 0
-        assert_eq!(e.state.markdown, "> > deep\n\n");
+        assert_eq!(e.value(), "> > deep\n\n");
         assert_eq!(e.cursor_offset(), 10);
     });
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
         // depth 0 break gets the original atomic pair delete; the
         // trailing empty paragraph merges into "deep".
-        assert_eq!(e.state.markdown, "> > deep");
+        assert_eq!(e.value(), "> > deep");
         assert_eq!(e.cursor_offset(), 8);
     });
 }
@@ -986,7 +1124,7 @@ fn backspace_outdents_interior_paragraph_not_just_trailing(cx: &mut TestAppConte
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> one\n\ntwo");
+        assert_eq!(e.value(), "> one\n\ntwo");
         assert_eq!(e.cursor_offset(), 7);
     });
 }
@@ -1004,7 +1142,7 @@ fn backspace_at_top_level_paragraph_break_still_merges(cx: &mut TestAppContext) 
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "p1p2");
+        assert_eq!(e.value(), "p1p2");
         assert_eq!(e.cursor_offset(), 2);
     });
 }
@@ -1024,7 +1162,7 @@ fn backspace_at_first_paragraph_in_blockquote_falls_through(cx: &mut TestAppCont
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "para\n\n>hi");
+        assert_eq!(e.value(), "para\n\n>hi");
     });
 }
 
@@ -1049,19 +1187,19 @@ fn backspace_outdent_preserves_no_soft_break_invariant(cx: &mut TestAppContext) 
     for _ in 0..3 {
         dispatch(cx, handle, &editor, Backspace);
         editor.read_with(cx, |e, _| {
-            let bytes = e.state.markdown.as_bytes();
+            let bytes = e.value().as_bytes();
             for p in 0..bytes.len() {
                 assert!(
                     !is_soft_break(bytes, p),
                     "soft break at byte {p} in {:?}",
-                    e.state.markdown,
+                    e.value(),
                 );
             }
         });
     }
     editor.read_with(cx, |e, _| {
         // Final state: depth-0 pair separating the two paragraphs.
-        assert_eq!(e.state.markdown, "> > > p1\n\np2");
+        assert_eq!(e.value(), "> > > p1\n\np2");
     });
 }
 
@@ -1075,21 +1213,27 @@ fn typing_inside_blockquote_after_enter_preserves_scope(cx: &mut TestAppContext)
         selection: Selection::Cursor(4),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText("p2".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> p1\n> \n> p2");
+        assert_eq!(e.value(), "> p1\n> \n> p2");
     });
 }
 
@@ -1136,12 +1280,10 @@ fn space_inside_blockquote_does_not_inject_extra_lines(cx: &mut TestAppContext) 
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText(" ".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -1149,7 +1291,7 @@ fn space_inside_blockquote_does_not_inject_extra_lines(cx: &mut TestAppContext) 
     editor.read_with(cx, |e, _| {
         // Exactly one space inserted — the trailing pair structure
         // is unchanged.
-        assert_eq!(e.state.markdown, "> blockquote \n> \n> ");
+        assert_eq!(e.value(), "> blockquote \n> \n> ");
         assert_eq!(e.cursor_offset(), 13);
     });
 
@@ -1158,19 +1300,14 @@ fn space_inside_blockquote_does_not_inject_extra_lines(cx: &mut TestAppContext) 
     // buffer must stay identical — no fresh promotion fires.
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let sel = e.state.selection;
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
-                gpui_markdown_editor::EditorEvent::SetSelection(sel),
-            );
-            cx.notify();
+            let sel = e.selection();
+            e.apply_event_for_test(gpui_markdown_editor::EditorEvent::SetSelection(sel), cx);
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> blockquote \n> \n> ");
+        assert_eq!(e.value(), "> blockquote \n> \n> ");
     });
 }
 
@@ -1191,12 +1328,10 @@ fn typing_gt_to_enter_nested_blockquote_does_not_inject_extra_lines(cx: &mut Tes
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText(">".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -1205,33 +1340,28 @@ fn typing_gt_to_enter_nested_blockquote_does_not_inject_extra_lines(cx: &mut Tes
         // Exactly one `>` appended. Trailing pair structure is
         // unchanged (still 4 lines: content + middle marker + new
         // marker line with the typed `>`).
-        assert_eq!(e.state.markdown, "> level 1\n> \n> >");
+        assert_eq!(e.value(), "> level 1\n> \n> >");
         assert_eq!(e.cursor_offset(), 16);
     });
 
     // Idempotent on re-update.
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let sel = e.state.selection;
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
-                gpui_markdown_editor::EditorEvent::SetSelection(sel),
-            );
-            cx.notify();
+            let sel = e.selection();
+            e.apply_event_for_test(gpui_markdown_editor::EditorEvent::SetSelection(sel), cx);
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> level 1\n> \n> >");
+        assert_eq!(e.value(), "> level 1\n> \n> >");
     });
 
     // The reported follow-on: right-arrow navigation must not
     // trigger fresh promotion either.
     dispatch(cx, handle, &editor, Right);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> level 1\n> \n> >");
+        assert_eq!(e.value(), "> level 1\n> \n> >");
     });
 }
 
@@ -1268,18 +1398,16 @@ fn typing_gt_on_interior_blank_bq_line_does_not_inject_lines(cx: &mut TestAppCon
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText(">".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> Level 1\n> \n> >\n> \n> Level 1");
+        assert_eq!(e.value(), "> Level 1\n> \n> >\n> \n> Level 1");
         assert_eq!(e.cursor_offset(), 16);
     });
 
@@ -1288,13 +1416,13 @@ fn typing_gt_on_interior_blank_bq_line_does_not_inject_lines(cx: &mut TestAppCon
     // arrow press.
     dispatch(cx, handle, &editor, Right);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> Level 1\n> \n> >\n> \n> Level 1");
+        assert_eq!(e.value(), "> Level 1\n> \n> >\n> \n> Level 1");
     });
     dispatch(cx, handle, &editor, Right);
     dispatch(cx, handle, &editor, Right);
     dispatch(cx, handle, &editor, Right);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> Level 1\n> \n> >\n> \n> Level 1");
+        assert_eq!(e.value(), "> Level 1\n> \n> >\n> \n> Level 1");
     });
 }
 
@@ -1315,12 +1443,10 @@ fn typing_gt_on_first_blank_bq_line_does_not_cascade(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText(">".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -1329,13 +1455,13 @@ fn typing_gt_on_first_blank_bq_line_does_not_cascade(cx: &mut TestAppContext) {
     // space because the cursor moves off it after insertion). All other
     // lines untouched.
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> Level 1\n> > \n> \n> \n> Level 1");
+        assert_eq!(e.value(), "> Level 1\n> > \n> \n> \n> Level 1");
     });
     dispatch(cx, handle, &editor, Right);
     dispatch(cx, handle, &editor, Right);
     dispatch(cx, handle, &editor, Right);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> Level 1\n> > \n> \n> \n> Level 1");
+        assert_eq!(e.value(), "> Level 1\n> > \n> \n> \n> Level 1");
     });
 }
 
@@ -1351,12 +1477,10 @@ fn cursor_cannot_set_inside_blockquote_pair(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(7)),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -1396,7 +1520,7 @@ fn delete_forward_at_pair_start_atomically_undoes_break(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Delete);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> helloworld");
+        assert_eq!(e.value(), "> helloworld");
         assert_eq!(e.cursor_offset(), 7);
     });
 }
@@ -1504,8 +1628,8 @@ fn select_across_paragraph_break_and_replace(cx: &mut TestAppContext) {
     // backspace path exercises selection deletion.
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "alta");
-        assert_no_soft_break(&e.state.markdown);
+        assert_eq!(e.value(), "alta");
+        assert_no_soft_break(e.value());
     });
 }
 
@@ -1539,9 +1663,17 @@ fn enter_at_end_of_unordered_item_creates_next_bullet(cx: &mut TestAppContext) {
         selection: Selection::Cursor(5),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- foo\n- ");
+        assert_eq!(e.value(), "- foo\n- ");
         assert_eq!(e.cursor_offset(), 8);
     });
 }
@@ -1553,9 +1685,17 @@ fn enter_at_end_of_ordered_item_increments_number(cx: &mut TestAppContext) {
         selection: Selection::Cursor(6),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. foo\n2. ");
+        assert_eq!(e.value(), "1. foo\n2. ");
     });
 }
 
@@ -1586,18 +1726,16 @@ fn typing_in_a_list_item_does_not_break_the_list(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText("X".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- fooX\n- bar");
+        assert_eq!(e.value(), "- fooX\n- bar");
         let spec = e.render_spec();
         let item_count = spec
             .blocks
@@ -1617,9 +1755,17 @@ fn enter_inside_list_inside_blockquote_keeps_both_scopes(cx: &mut TestAppContext
         selection: Selection::Cursor(7),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> - foo\n> - ");
+        assert_eq!(e.value(), "> - foo\n> - ");
     });
 }
 
@@ -1741,9 +1887,17 @@ fn enter_on_empty_top_level_item_exits_to_paragraph(cx: &mut TestAppContext) {
         selection: Selection::Cursor(8),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- foo\n\n");
+        assert_eq!(e.value(), "- foo\n\n");
         assert_eq!(e.cursor_offset(), 7);
     });
 }
@@ -1757,9 +1911,17 @@ fn enter_on_sole_empty_item_clears_buffer(cx: &mut TestAppContext) {
         selection: Selection::Cursor(2),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "");
+        assert_eq!(e.value(), "");
         assert_eq!(e.cursor_offset(), 0);
     });
 }
@@ -1773,12 +1935,20 @@ fn enter_on_empty_item_inside_blockquote_exits_to_bq_paragraph(cx: &mut TestAppC
         selection: Selection::Cursor(12),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // Result: BQ paragraph + BQ paragraph break + new empty BQ
         // line. The depth-D pair shape `\n> \n> ` carries the BQ
         // forward without re-introducing a list marker.
-        assert_eq!(e.state.markdown, "> - foo\n> \n> ");
+        assert_eq!(e.value(), "> - foo\n> \n> ");
     });
 }
 
@@ -1796,7 +1966,7 @@ fn backspace_at_start_of_top_level_item_strips_marker(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "foo");
+        assert_eq!(e.value(), "foo");
         assert_eq!(e.cursor_offset(), 0);
     });
 }
@@ -1817,7 +1987,7 @@ fn backspace_at_start_of_non_first_item_creates_paragraph_break(cx: &mut TestApp
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. Item one\n\nItem two");
+        assert_eq!(e.value(), "1. Item one\n\nItem two");
     });
 }
 
@@ -1833,7 +2003,7 @@ fn backspace_at_start_of_nested_item_dedents_to_sibling(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- a\n- b");
+        assert_eq!(e.value(), "- a\n- b");
     });
 }
 
@@ -1846,7 +2016,7 @@ fn backspace_at_start_of_ordered_item_strips_marker(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "foo");
+        assert_eq!(e.value(), "foo");
         assert_eq!(e.cursor_offset(), 0);
     });
 }
@@ -1903,8 +2073,24 @@ fn shift_enter_twice_inside_list_item_creates_paragraph_break(cx: &mut TestAppCo
         selection: Selection::Cursor(5),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, ShiftEnter);
-    dispatch(cx, handle, &editor, ShiftEnter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+    );
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // After the second Shift+Enter the buffer is
         // `- foo  \n    \n  ` — two consecutive hard breaks. The
@@ -1912,7 +2098,7 @@ fn shift_enter_twice_inside_list_item_creates_paragraph_break(cx: &mut TestAppCo
         // *between* the breaks (not the trailing one — cursor sits
         // there) gets its residual whitespace stripped, producing
         // the strictly-canonical `- foo\n\n  ` paragraph break.
-        assert_eq!(e.state.markdown, "- foo\n\n  ");
+        assert_eq!(e.value(), "- foo\n\n  ");
     });
 }
 
@@ -2083,9 +2269,17 @@ fn enter_inside_nested_list_creates_next_nested_item(cx: &mut TestAppContext) {
         selection: Selection::Cursor(18),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- outer\n  - nested\n  - ");
+        assert_eq!(e.value(), "- outer\n  - nested\n  - ");
     });
 }
 
@@ -2101,7 +2295,7 @@ fn tab_nests_top_level_item_under_previous_sibling(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- one\n  - two");
+        assert_eq!(e.value(), "- one\n  - two");
     });
 }
 
@@ -2115,7 +2309,7 @@ fn tab_on_first_item_is_a_noop(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- only");
+        assert_eq!(e.value(), "- only");
     });
 }
 
@@ -2131,7 +2325,7 @@ fn tab_nests_into_existing_nested_list(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- one\n  - nested\n  - two");
+        assert_eq!(e.value(), "- one\n  - nested\n  - two");
         // And it parses as one outer item with two nested items.
         let spec = e.render_spec();
         let depths: Vec<usize> = spec
@@ -2154,7 +2348,7 @@ fn tab_nests_already_nested_item_one_level_deeper(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- a\n  - b\n    - c");
+        assert_eq!(e.value(), "- a\n  - b\n    - c");
     });
 }
 
@@ -2169,7 +2363,7 @@ fn shift_tab_dedents_nested_item_to_sibling(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- a\n- b");
+        assert_eq!(e.value(), "- a\n- b");
     });
 }
 
@@ -2182,7 +2376,7 @@ fn shift_tab_dedents_triple_nested_to_double(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- a\n  - b\n  - c");
+        assert_eq!(e.value(), "- a\n  - b\n  - c");
     });
 }
 
@@ -2198,7 +2392,7 @@ fn shift_tab_on_top_level_item_drops_marker(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "foo");
+        assert_eq!(e.value(), "foo");
     });
 }
 
@@ -2211,7 +2405,7 @@ fn shift_tab_outside_a_list_is_a_noop(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "just a paragraph");
+        assert_eq!(e.value(), "just a paragraph");
     });
 }
 
@@ -2434,14 +2628,12 @@ fn cursor_at_real_start_of_list_item_line_snaps_forward(cx: &mut TestAppContext)
     };
     let (_, editor) = open_editor(cx, initial);
     let landed = cx.update(|cx| {
-        editor.update(cx, |e, _| {
-            let next = std::mem::take(&mut e.state);
+        editor.update(cx, |e, cx| {
             // Byte 12 = right after `\n`, real start of second line.
-            let updated = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(12)),
+                cx,
             );
-            e.state = updated;
             e.cursor_offset()
         })
     });
@@ -2487,13 +2679,11 @@ fn click_inside_hidden_marker_snaps_to_nearest_edge(cx: &mut TestAppContext) {
     };
     let (_, editor) = open_editor(cx, initial);
     let final_state = cx.update(|cx| {
-        editor.update(cx, |e, _| {
-            let next = std::mem::take(&mut e.state);
-            let updated = gpui_markdown_editor::update::update(
-                next,
+        editor.update(cx, |e, cx| {
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(1)),
+                cx,
             );
-            e.state = updated;
             e.cursor_offset()
         })
     });
@@ -2595,24 +2785,38 @@ fn shift_enter_at_end_of_list_item_with_following_item(cx: &mut TestAppContext) 
         selection: Selection::Cursor(11),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, ShiftEnter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+    );
     // After one Shift+Enter alone the existing item-2 line break
     // must NOT be misread as a second hard break — that's the
     // false-positive the user hit. The buffer should still have
     // a real hard-break continuation in item 1, with item 2
     // intact below.
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. Item one  \n   \n2. Item two");
+        assert_eq!(e.value(), "1. Item one  \n   \n2. Item two");
     });
-    dispatch(cx, handle, &editor, ShiftEnter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+    );
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText("A".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -2631,7 +2835,7 @@ fn shift_enter_at_end_of_list_item_with_following_item(cx: &mut TestAppContext) 
         // item 2 is still tight (`\n2.` rather than `\n\n2.`) —
         // that's the documented inter-item tightening rule kept
         // unchanged.
-        assert_eq!(e.state.markdown, "1. Item one\n\n   A\n2. Item two");
+        assert_eq!(e.value(), "1. Item one\n\n   A\n2. Item two");
         // Verify the parse: item 1 has two paragraph leaves
         // (depth 1), item 2 has one (depth 1).
         let spec = e.render_spec();
@@ -2819,23 +3023,21 @@ fn tab_on_ordered_item_starts_nested_list_at_one(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. Item one\n   1. ");
+        assert_eq!(e.value(), "1. Item one\n   1. ");
     });
     // Type one character to give pulldown content to parse.
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText("x".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. Item one\n   1. x");
+        assert_eq!(e.value(), "1. Item one\n   1. x");
         let spec = e.render_spec();
         let depths: Vec<usize> = spec
             .blocks
@@ -2859,7 +3061,7 @@ fn tab_on_ordered_item_joining_existing_nested_list_renumbers(cx: &mut TestAppCo
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. one\n   1. nested-1\n   2. two");
+        assert_eq!(e.value(), "1. one\n   1. nested-1\n   2. two");
     });
 }
 
@@ -2877,7 +3079,7 @@ fn shift_tab_on_nested_ordered_item_dedents_correct_one(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. Item one\n2. Item one, one");
+        assert_eq!(e.value(), "1. Item one\n2. Item one, one");
     });
 }
 
@@ -2893,7 +3095,7 @@ fn tab_preserves_continuation_lines_under_new_indent(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- one\n  - two  \n    cont");
+        assert_eq!(e.value(), "- one\n  - two  \n    cont");
     });
 }
 
@@ -3087,11 +3289,19 @@ fn enter_inside_code_inside_list_inserts_single_newline(cx: &mut TestAppContext)
         selection: Selection::Cursor(11), // mid-content on `code` line
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // Single `\n` inserted; the list-item next-marker rule
         // doesn't fire inside code content.
-        assert!(e.state.markdown.contains("```\n  cod\n"));
+        assert!(e.value().contains("```\n  cod\n"));
     });
 }
 
@@ -3134,7 +3344,7 @@ fn tab_at_depth_2_nests_to_depth_3(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- one\n  - two\n    - three");
+        assert_eq!(e.value(), "- one\n  - two\n    - three");
     });
 }
 
@@ -3158,7 +3368,7 @@ fn tab_inside_blockquote_list_nests_within_blockquote(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> - one\n>   - two");
+        assert_eq!(e.value(), "> - one\n>   - two");
     });
 }
 
@@ -3173,7 +3383,7 @@ fn shift_tab_at_depth_3_dedents_to_depth_2(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftTab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- one\n  - two\n  - three");
+        assert_eq!(e.value(), "- one\n  - two\n  - three");
     });
 }
 
@@ -3192,7 +3402,7 @@ fn shift_tab_at_top_level_inside_blockquote_becomes_paragraph_in_bq(cx: &mut Tes
         // The marker is dropped and the leading separator
         // becomes a depth-1 pair so the result stays inside the
         // BQ.
-        assert_eq!(e.state.markdown, "> - one\n> \n> two");
+        assert_eq!(e.value(), "> - one\n> \n> two");
     });
 }
 
@@ -3205,11 +3415,19 @@ fn empty_enter_on_top_level_item_becomes_paragraph(cx: &mut TestAppContext) {
         selection: Selection::Cursor(8),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // The empty item drops; cursor lands at a fresh empty
         // paragraph after the surviving item.
-        assert_eq!(e.state.markdown, "- one\n\n");
+        assert_eq!(e.value(), "- one\n\n");
     });
 }
 
@@ -3231,7 +3449,7 @@ fn backspace_at_li_wrapped_fence_start_unwraps_li(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "```js\nbody\n```");
+        assert_eq!(e.value(), "```js\nbody\n```");
     });
 }
 
@@ -3250,7 +3468,7 @@ fn backspace_at_bq_wrapped_fence_start_unwraps_bq(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "```js\nbody\n```");
+        assert_eq!(e.value(), "```js\nbody\n```");
     });
 }
 
@@ -3270,7 +3488,7 @@ fn backspace_on_empty_body_line_in_bq_fence_removes_whole_line(cx: &mut TestAppC
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
         // Empty body line gone; opener and closer untouched.
-        assert_eq!(e.state.markdown, "> ```js\n> ```");
+        assert_eq!(e.value(), "> ```js\n> ```");
     });
 }
 
@@ -3286,23 +3504,40 @@ fn backspace_on_empty_body_line_in_li_fence_removes_whole_line(cx: &mut TestAppC
         selection: Selection::Cursor(16),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         assert_eq!(
-            e.state.markdown, "1. ```js\n   body\n   \n   \n   ```",
+            e.value(),
+            "1. ```js\n   body\n   \n   \n   ```",
             "two Enters add two empty body lines",
         );
     });
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
         // One empty body line removed; one remains.
-        assert_eq!(e.state.markdown, "1. ```js\n   body\n   \n   ```");
+        assert_eq!(e.value(), "1. ```js\n   body\n   \n   ```");
     });
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
         // Second empty body line removed.
-        assert_eq!(e.state.markdown, "1. ```js\n   body\n   ```");
+        assert_eq!(e.value(), "1. ```js\n   body\n   ```");
     });
 }
 
@@ -3323,17 +3558,15 @@ fn typing_bq_marker_at_fence_opener_nests_entire_fence(cx: &mut TestAppContext) 
         let (handle, editor) = open_editor(cx, initial);
         cx.update_window(handle, |_, _, cx| {
             editor.update(cx, |e, cx| {
-                let next = std::mem::take(&mut e.state);
-                e.state = gpui_markdown_editor::update::update(
-                    next,
+                e.apply_event_for_test(
                     gpui_markdown_editor::EditorEvent::InsertText(insert.into()),
+                    cx,
                 );
-                cx.notify();
             });
         })
         .unwrap();
         cx.run_until_parked();
-        editor.read_with(cx, |e, _| e.state.markdown.clone())
+        editor.read_with(cx, |e, _| e.value().to_string())
     }
     // Typing just `>` (no space) — every line of the fence gains a
     // BQ prefix. The opener line keeps `>` without a trailing
@@ -3365,16 +3598,24 @@ fn enter_repeated_in_bq_wrapped_fence_body_keeps_bq_prefixes(cx: &mut TestAppCon
     };
     let (handle, editor) = open_editor(cx, initial);
     for _ in 0..4 {
-        dispatch(cx, handle, &editor, Enter);
+        dispatch(
+            cx,
+            handle,
+            &editor,
+            Enter {
+                secondary: false,
+                shift: false,
+            },
+        );
     }
     editor.read_with(cx, |e, _| {
         // Each Enter inserts `\n> ` (literal newline + BQ
         // continuation prefix); 4 Enters add 4 such pairs and
         // never strip an existing BQ marker. The fence stays
         // terminated.
-        assert_eq!(e.state.markdown, "> ```js\n> body\n> \n> \n> \n> \n> ```",);
+        assert_eq!(e.value(), "> ```js\n> body\n> \n> \n> \n> \n> ```",);
         assert!(gpui_markdown_editor::analysis::is_in_fenced_code(
-            &e.state.markdown,
+            e.value(),
             e.cursor_offset(),
         ));
     });
@@ -3395,9 +3636,17 @@ fn enter_at_opener_fence_start_in_li_inserts_new_list_item(cx: &mut TestAppConte
         selection: Selection::Cursor(3),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. \n2. ```js\n   body\n   ```");
+        assert_eq!(e.value(), "1. \n2. ```js\n   body\n   ```");
     });
 }
 
@@ -3414,7 +3663,7 @@ fn tab_inside_li_wrapped_fence_body_inserts_literal_tab(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. ```js\n   body\t\n   ```");
+        assert_eq!(e.value(), "1. ```js\n   body\t\n   ```");
         assert_eq!(e.cursor_offset(), 17);
     });
 }
@@ -3496,36 +3745,72 @@ fn multi_enter_from_nested_item_progresses_one_level_per_press(cx: &mut TestAppC
     };
     let (handle, editor) = open_editor(cx, initial);
 
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         assert_eq!(
-            e.state.markdown, "- parent\n  - child\n  - ",
+            e.value(),
+            "- parent\n  - child\n  - ",
             "Enter 1: new empty inner sibling",
         );
     });
 
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         assert_eq!(
-            e.state.markdown, "- parent\n  - child\n\n  ",
+            e.value(),
+            "- parent\n  - child\n\n  ",
             "Enter 2: empty-inner outdent → outer-LI continuation row",
         );
     });
 
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // Outer-LI sibling marker; *not* a stray inner marker.
         assert_eq!(
-            e.state.markdown, "- parent\n  - child\n\n\n- ",
+            e.value(),
+            "- parent\n  - child\n\n\n- ",
             "Enter 3: new top-level sibling after the outer LI",
         );
     });
 
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // Empty outer LI → paragraph at top level.
         assert_eq!(
-            e.state.markdown, "- parent\n  - child\n\n\n\n",
+            e.value(),
+            "- parent\n  - child\n\n\n\n",
             "Enter 4: empty outer LI drops marker, top-level paragraph",
         );
     });
@@ -3549,22 +3834,40 @@ fn double_enter_at_end_of_nested_item_outdents_on_second_press(cx: &mut TestAppC
     let (handle, editor) = open_editor(cx, initial);
 
     // First Enter: new empty inner sibling.
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         assert_eq!(
-            e.state.markdown, "- parent\n  - child\n  - ",
+            e.value(),
+            "- parent\n  - child\n  - ",
             "first Enter should create a new empty nested item",
         );
     });
 
     // Second Enter: cursor on empty inner item, should outdent.
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // Same shape as `empty_enter_on_nested_empty_item_outdents_to_outer_paragraph`
         // applied to the trailing empty inner: drop the inner marker,
         // leave the outer item's continuation indent for the new row.
         assert_eq!(
-            e.state.markdown, "- parent\n  - child\n\n  ",
+            e.value(),
+            "- parent\n  - child\n\n  ",
             "second Enter on empty inner item should outdent (Backspace-equivalent)",
         );
     });
@@ -3590,9 +3893,17 @@ fn empty_enter_on_nested_empty_item_outdents_to_outer_paragraph(cx: &mut TestApp
         selection: Selection::Cursor(10),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- one\n\n  ");
+        assert_eq!(e.value(), "- one\n\n  ");
     });
 }
 
@@ -3606,12 +3917,20 @@ fn empty_enter_on_top_level_item_inside_blockquote_stays_in_bq(cx: &mut TestAppC
         selection: Selection::Cursor(12),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // The empty item drops and a depth-1 paragraph break
         // takes its place — the rest of the BQ stays intact.
-        assert!(e.state.markdown.starts_with("> - one"));
-        assert!(e.state.markdown.contains("\n> \n> "));
+        assert!(e.value().starts_with("> - one"));
+        assert!(e.value().contains("\n> \n> "));
     });
 }
 
@@ -3628,7 +3947,7 @@ fn backspace_at_start_of_top_level_item_makes_paragraph(cx: &mut TestAppContext)
     editor.read_with(cx, |e, _| {
         // Marker is dropped; the line becomes a paragraph at top
         // level.
-        assert_eq!(e.state.markdown, "one");
+        assert_eq!(e.value(), "one");
     });
 }
 
@@ -3644,7 +3963,7 @@ fn backspace_at_start_of_nested_item_dedents_to_outer(cx: &mut TestAppContext) {
         // The inner marker stays — Backspace at the marker end of
         // a nested item strips parent-marker-width leading
         // spaces, dedenting the item by one level.
-        assert_eq!(e.state.markdown, "- one\n- two");
+        assert_eq!(e.value(), "- one\n- two");
     });
 }
 
@@ -3678,16 +3997,40 @@ fn enter_past_post_list_separator_does_not_reanimate_list(cx: &mut TestAppContex
         selection: Selection::Cursor(7),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
-    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "1. asdf\n2. "));
-    dispatch(cx, handle, &editor, Enter);
-    editor.read_with(cx, |e, _| assert_eq!(e.state.markdown, "1. asdf\n\n"));
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "1. asdf\n2. "));
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "1. asdf\n\n"));
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. asdf\n\n\n\n");
+        assert_eq!(e.value(), "1. asdf\n\n\n\n");
         // Cursor at the end so the user can keep typing on the
         // fresh row.
-        assert_eq!(e.state.selection, Selection::Cursor(11));
+        assert_eq!(e.selection(), Selection::Cursor(11));
     });
 }
 
@@ -3703,7 +4046,7 @@ fn manually_typed_ordered_list_start_is_preserved(cx: &mut TestAppContext) {
     // structural change, but the post-update normalization runs).
     dispatch(cx, handle, &editor, SelectAll);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "5. foo");
+        assert_eq!(e.value(), "5. foo");
     });
 }
 
@@ -3717,7 +4060,7 @@ fn manually_typed_ordered_list_in_blockquote_preserves_start(cx: &mut TestAppCon
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, SelectAll);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> 7. foo");
+        assert_eq!(e.value(), "> 7. foo");
     });
 }
 
@@ -3736,7 +4079,7 @@ fn ordered_list_with_manual_start_renumbers_subsequent_items_from_that_start(
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, SelectAll);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "5. one\n6. two\n7. three");
+        assert_eq!(e.value(), "5. one\n6. two\n7. three");
     });
 }
 
@@ -3761,7 +4104,7 @@ fn split_list_preserves_trailing_orphan_start(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. one\n\ntwo\n\n3. three");
+        assert_eq!(e.value(), "1. one\n\ntwo\n\n3. three");
     });
 }
 
@@ -3793,9 +4136,17 @@ fn enter_at_start_of_paragraph_after_list_inserts_paragraph_break(cx: &mut TestA
         selection: Selection::Cursor(8),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. one\n\n\n\ntwo\n\n1. three");
+        assert_eq!(e.value(), "1. one\n\n\n\ntwo\n\n1. three");
     });
 }
 
@@ -3830,10 +4181,7 @@ fn backspace_at_marker_end_of_top_level_item_with_nested_child_strips_orphan_ind
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(
-            e.state.markdown,
-            "1. level one\n\nlevel one\n\n1. level three",
-        );
+        assert_eq!(e.value(), "1. level one\n\nlevel one\n\n1. level three",);
     });
 }
 
@@ -3877,14 +4225,19 @@ fn backspace_then_enter_then_tab_sequence_does_not_crash(cx: &mut TestAppContext
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     dispatch(cx, handle, &editor, Tab);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        assert_eq!(
-            e.state.markdown,
-            "1. level one\n\n\n\nlevel one\n\n1. level three",
-        );
+        assert_eq!(e.value(), "1. level one\n\n\n\nlevel one\n\n1. level three",);
     });
 }
 
@@ -3929,7 +4282,7 @@ fn tab_on_ordered_item_with_existing_nested_child_does_not_panic(cx: &mut TestAp
         // 3-level deep ordered list — exactly the user's mental
         // model after one Tab on the parent.
         assert_eq!(
-            e.state.markdown,
+            e.value(),
             "1. level one\n   1. level one\n      1. level three",
         );
     });
@@ -3958,18 +4311,16 @@ fn tab_on_ordered_item_with_existing_nested_child_does_not_panic(cx: &mut TestAp
 fn type_text(
     cx: &mut TestAppContext,
     handle: AnyWindowHandle,
-    editor: &Entity<MarkdownEditor>,
+    editor: &Entity<MarkdownEditorState>,
     text: &str,
 ) {
     let owned = text.to_string();
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText(owned.clone()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -4172,7 +4523,7 @@ fn type_inside_code_at_depth_4_lands_in_code_content(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "Y");
     editor.read_with(cx, |e, _| {
-        assert!(e.state.markdown.contains("XY"), "Y typed into code body");
+        assert!(e.value().contains("XY"), "Y typed into code body");
         let spec = e.render_spec();
         let code = spec
             .blocks
@@ -4197,7 +4548,7 @@ fn type_at_end_of_innermost_item_keeps_full_chain(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "er");
     editor.read_with(cx, |e, _| {
-        assert!(e.state.markdown.ends_with("deeper"));
+        assert!(e.value().ends_with("deeper"));
         let spec = e.render_spec();
         let deepest = spec
             .blocks
@@ -4223,11 +4574,7 @@ fn type_at_start_of_innermost_content_keeps_full_chain(cx: &mut TestAppContext) 
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "X");
     editor.read_with(cx, |e, _| {
-        assert!(
-            e.state.markdown.contains("Xdeep"),
-            "got: {:?}",
-            e.state.markdown
-        );
+        assert!(e.value().contains("Xdeep"), "got: {:?}", e.value());
         let spec = e.render_spec();
         let deepest = spec
             .blocks
@@ -4250,15 +4597,23 @@ fn enter_at_end_of_innermost_item_stays_in_full_chain(cx: &mut TestAppContext) {
         selection: Selection::Cursor(src.len()),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // The new sibling line carries the same outer-item indent +
         // outer BQ marker + inner-item indent + inner BQ marker.
         // Pulldown picks up `  >   > ` as the depth-4 prefix.
         assert!(
-            e.state.markdown.starts_with("- > - > one\n  >   > "),
+            e.value().starts_with("- > - > one\n  >   > "),
             "got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -4279,9 +4634,9 @@ fn type_gt_at_start_of_nested_item_does_not_split_outer_scope(cx: &mut TestAppCo
     editor.read_with(cx, |e, _| {
         // Outer list and outer BQ both still present after typing.
         assert!(
-            e.state.markdown.starts_with("- > "),
+            e.value().starts_with("- > "),
             "outer list-item + BQ scope preserved, got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -4306,9 +4661,9 @@ fn backspace_at_start_of_innermost_item_dedents_one_level(cx: &mut TestAppContex
         // Outer `- > ` scope must remain — the editor only loses
         // the innermost container, not the whole stack.
         assert!(
-            e.state.markdown.starts_with("- "),
+            e.value().starts_with("- "),
             "outer list scope preserved, got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -4330,9 +4685,9 @@ fn delete_forward_at_end_of_inner_item_does_not_panic(cx: &mut TestAppContext) {
         // The buffer is still a list inside a BQ inside a list —
         // the chain shouldn't have collapsed.
         assert!(
-            e.state.markdown.contains("- "),
+            e.value().contains("- "),
             "still has list markers, got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -4351,9 +4706,9 @@ fn backspace_inside_code_at_depth_4_deletes_one_byte(cx: &mut TestAppContext) {
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
         assert!(
-            e.state.markdown.contains("ab\n"),
+            e.value().contains("ab\n"),
             "code body should now read `ab` not `abc`, got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
         let spec = e.render_spec();
         // Still a code block; chain still has both BQ levels.
@@ -4380,7 +4735,7 @@ fn select_all_then_backspace_clears_deep_nest_without_panicking(cx: &mut TestApp
     dispatch(cx, handle, &editor, SelectAll);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert!(e.state.markdown.is_empty());
+        assert!(e.value().is_empty());
         // Still produces at least one block to host the cursor.
         assert!(!e.render_spec().blocks.is_empty());
     });
@@ -4404,9 +4759,9 @@ fn shift_tab_at_innermost_of_4_level_alternation_dedents_one_level(cx: &mut Test
     editor.read_with(cx, |e, _| {
         // Outer `- > ` chain still present; inner `- ` dropped.
         assert!(
-            e.state.markdown.starts_with("- "),
+            e.value().starts_with("- "),
             "outer list still present, got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
         // The deepest leaf no longer carries 2 list-items — at
         // least one was dropped.
@@ -4440,7 +4795,7 @@ fn tab_on_a_sibling_inside_deep_nest_nests_within_existing_chain(cx: &mut TestAp
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Tab);
     editor.read_with(cx, |e, _| {
-        let md = &e.state.markdown;
+        let md = e.value();
         // The outer `- > ` scope stays — the only thing that
         // changed is the indent on the second inner-item line.
         assert!(md.starts_with("- > "), "outer chain preserved, got: {md:?}",);
@@ -4465,13 +4820,21 @@ fn empty_enter_on_innermost_item_in_deep_nest_dedents(cx: &mut TestAppContext) {
         selection: Selection::Cursor(src.len()),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // Outer `- > ` chain still present.
         assert!(
-            e.state.markdown.starts_with("- > - one"),
+            e.value().starts_with("- > - one"),
             "outer chain + first inner item preserved, got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -4593,9 +4956,9 @@ fn typing_a_blockquote_marker_into_a_list_item_deepens_scope(cx: &mut TestAppCon
         // that line. Either outcome must not corrupt the outer
         // list — the `- ` remains.
         assert!(
-            e.state.markdown.starts_with("- "),
+            e.value().starts_with("- "),
             "outer list-item marker preserved, got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -4669,7 +5032,7 @@ fn list_item_trailing_space_keeps_cursor_in_block(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "- foo ");
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- foo ");
+        assert_eq!(e.value(), "- foo ");
         assert_eq!(e.cursor_offset(), 6);
     });
 }
@@ -4684,14 +5047,22 @@ fn enter_on_empty_task_item_outdents_to_paragraph(cx: &mut TestAppContext) {
         selection: Selection::Cursor(6),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // The marker chrome is gone; the buffer now has just the
         // empty paragraph the cursor lands on.
         assert!(
-            !e.state.markdown.contains("[ ]"),
+            !e.value().contains("[ ]"),
             "task chrome should be gone after empty-Enter outdent, got {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -4704,12 +5075,20 @@ fn enter_on_empty_checked_task_item_outdents(cx: &mut TestAppContext) {
         selection: Selection::Cursor(6),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         assert!(
-            !e.state.markdown.contains("[x]"),
+            !e.value().contains("[x]"),
             "checked task chrome should be gone after empty-Enter outdent, got {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -4723,19 +5102,27 @@ fn enter_on_empty_task_in_a_list_drops_only_that_item(cx: &mut TestAppContext) {
         selection: Selection::Cursor(16),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         assert!(
-            e.state.markdown.starts_with("- [x] one"),
+            e.value().starts_with("- [x] one"),
             "first item should be preserved, got {:?}",
-            e.state.markdown,
+            e.value(),
         );
         // The trailing `- [ ] ` is gone (the empty task triggered
         // the outdent path).
         assert!(
-            !e.state.markdown.ends_with("- [ ] "),
+            !e.value().ends_with("- [ ] "),
             "empty task item should be removed, got {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -4750,9 +5137,17 @@ fn enter_at_end_of_task_item_creates_another_task_item(cx: &mut TestAppContext) 
         selection: Selection::Cursor(10),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- [x] done\n- [ ] ");
+        assert_eq!(e.value(), "- [x] done\n- [ ] ");
         // Cursor lands at the start of the new item's content.
         assert_eq!(e.cursor_offset(), 17);
     });
@@ -4765,9 +5160,17 @@ fn enter_at_end_of_unchecked_task_item_creates_another_task_item(cx: &mut TestAp
         selection: Selection::Cursor(10),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- [ ] todo\n- [ ] ");
+        assert_eq!(e.value(), "- [ ] todo\n- [ ] ");
         assert_eq!(e.cursor_offset(), 17);
     });
 }
@@ -4781,9 +5184,17 @@ fn enter_at_end_of_plain_unordered_item_does_not_become_task(cx: &mut TestAppCon
         selection: Selection::Cursor(5),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- foo\n- ");
+        assert_eq!(e.value(), "- foo\n- ");
     });
 }
 
@@ -4799,7 +5210,7 @@ fn typing_dash_then_letter_injects_marker_space(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "-foo");
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- foo");
+        assert_eq!(e.value(), "- foo");
     });
 }
 
@@ -4816,7 +5227,7 @@ fn typing_star_then_letter_injects_marker_space(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "*x");
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "* x");
+        assert_eq!(e.value(), "* x");
     });
 }
 
@@ -4829,7 +5240,7 @@ fn typing_plus_then_letter_injects_marker_space(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "+x");
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "+ x");
+        assert_eq!(e.value(), "+ x");
     });
 }
 
@@ -4845,7 +5256,7 @@ fn typing_double_dash_does_not_inject_space(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "--");
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "--");
+        assert_eq!(e.value(), "--");
     });
 }
 
@@ -4858,7 +5269,7 @@ fn typing_three_dashes_remains_thematic_break_candidate(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "---");
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "---");
+        assert_eq!(e.value(), "---");
     });
 }
 
@@ -4878,9 +5289,9 @@ fn typing_inside_existing_list_item_does_not_inject_space(cx: &mut TestAppContex
         // content is part of the item's continuation, not a new
         // sibling marker. The `-` stays adjacent to `bar`.
         assert!(
-            e.state.markdown.contains("-bar"),
+            e.value().contains("-bar"),
             "expected unchanged `-bar` inside item, got {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -4897,7 +5308,7 @@ fn typing_dash_alone_does_not_inject_space(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "-");
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "-");
+        assert_eq!(e.value(), "-");
     });
 }
 
@@ -4935,15 +5346,32 @@ fn build_3_level_list_from_scratch_via_tabs(cx: &mut TestAppContext) {
     };
     let (handle, editor) = open_editor(cx, initial);
     type_text(cx, handle, &editor, "- one");
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     dispatch(cx, handle, &editor, Tab);
     type_text(cx, handle, &editor, "two");
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     dispatch(cx, handle, &editor, Tab);
     type_text(cx, handle, &editor, "three");
     editor.read_with(cx, |e, _| {
         assert_eq!(
-            e.state.markdown, "- one\n  - two\n    - three",
+            e.value(),
+            "- one\n  - two\n    - three",
             "expected canonical 3-level list",
         );
     });
@@ -4987,17 +5415,11 @@ fn chain_remains_consistent_after_typing_at_innermost(cx: &mut TestAppContext) {
     };
     let (handle, editor) = open_editor(cx, initial);
     let chain_before = editor.read_with(cx, |e, _| {
-        gpui_markdown_editor::analysis::enclosing_containers_at(
-            &e.state.markdown,
-            e.cursor_offset(),
-        )
+        gpui_markdown_editor::analysis::enclosing_containers_at(e.value(), e.cursor_offset())
     });
     type_text(cx, handle, &editor, "X");
     let chain_after = editor.read_with(cx, |e, _| {
-        gpui_markdown_editor::analysis::enclosing_containers_at(
-            &e.state.markdown,
-            e.cursor_offset(),
-        )
+        gpui_markdown_editor::analysis::enclosing_containers_at(e.value(), e.cursor_offset())
     });
     assert_eq!(
         chain_before.len(),
@@ -5018,10 +5440,7 @@ fn end_of_outermost_list_followed_by_paragraph_does_not_reanimate(cx: &mut TestA
     };
     let (_handle, editor) = open_editor(cx, initial);
     let chain = editor.read_with(cx, |e, _| {
-        gpui_markdown_editor::analysis::enclosing_containers_at(
-            &e.state.markdown,
-            e.cursor_offset(),
-        )
+        gpui_markdown_editor::analysis::enclosing_containers_at(e.value(), e.cursor_offset())
     });
     assert!(
         chain.is_empty(),
@@ -5044,12 +5463,28 @@ fn cursor_chain_and_block_chain_agree_on_post_shift_enter_position(cx: &mut Test
         selection: Selection::Cursor(6),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, ShiftEnter);
-    dispatch(cx, handle, &editor, ShiftEnter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+    );
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+    );
     editor.read_with(cx, |e, _| {
         let cursor = e.cursor_offset();
         let cursor_chain = gpui_markdown_editor::analysis::enclosing_containers_at(
-            &e.state.markdown,
+            e.value(),
             cursor,
         );
         let spec = e.render_spec();
@@ -5064,7 +5499,7 @@ fn cursor_chain_and_block_chain_agree_on_post_shift_enter_position(cx: &mut Test
             cursor_in_list, block_in_list,
             "cursor walker says in_list={cursor_in_list} but block walker says in_list={block_in_list} \
              for source {:?} cursor={cursor}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -5080,16 +5515,30 @@ fn paragraph_break_inside_bq_in_list_keeps_full_continuation_prefix(cx: &mut Tes
         selection: Selection::Cursor(14), // after `> a`
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, ShiftEnter);
-    dispatch(cx, handle, &editor, ShiftEnter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+    );
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: true,
+        },
+    );
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText("b".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -5098,9 +5547,9 @@ fn paragraph_break_inside_bq_in_list_keeps_full_continuation_prefix(cx: &mut Tes
         // The trailing line carries the *outer item's* continuation
         // indent before the BQ marker, so the BQ stays inside item 1.
         assert!(
-            e.state.markdown.ends_with("   > b"),
+            e.value().ends_with("   > b"),
             "BQ continuation should keep `   > ` outer-indent prefix, got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -5119,12 +5568,10 @@ fn inserted_text_with_newline_inside_code_in_bq_keeps_single_newline(cx: &mut Te
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText("foo\nbar".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -5132,7 +5579,7 @@ fn inserted_text_with_newline_inside_code_in_bq_keeps_single_newline(cx: &mut Te
     editor.read_with(cx, |e, _| {
         // No `>   \n>` pair injected — the two lines remain a single
         // `\n` apart inside the code body.
-        let md = &e.state.markdown;
+        let md = e.value();
         assert!(
             md.contains("> foo\n> bar"),
             "expected `> foo\\n> bar` literal in code body, got: {md:?}",
@@ -5190,23 +5637,31 @@ fn enter_on_empty_inner_item_in_bq_in_outer_list_keeps_outer_indent(cx: &mut Tes
         selection: Selection::Cursor(src.len()),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // Trailing two BQ-prefix lines must carry the outer item's
         // `  ` continuation indent, not be at column 0.
         assert!(
-            !e.state.markdown.contains("\n> "),
+            !e.value().contains("\n> "),
             "found a column-0 `> ` line — outer LI continuation indent was dropped: {:?}",
-            e.state.markdown,
+            e.value(),
         );
         assert!(
-            e.state.markdown.ends_with("  > "),
+            e.value().ends_with("  > "),
             "buffer should end with a BQ continuation line at the outer item's indent column, got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
         // Outer list-item is still intact at the start.
         assert!(
-            e.state.markdown.starts_with("- This is a list."),
+            e.value().starts_with("- This is a list."),
             "outer item's first paragraph preserved",
         );
     });
@@ -5237,9 +5692,9 @@ fn shift_tab_on_inner_li_in_bq_wrapped_list_dedents(cx: &mut TestAppContext) {
         // Inner marker is now at the outer level (sibling of `1. This is a list`).
         // Result line should be `> 2. ` (BQ + sibling marker), not `>    2. `.
         assert!(
-            e.state.markdown.ends_with("\n> 2. "),
+            e.value().ends_with("\n> 2. "),
             "Shift+Tab should have dedented the inner item to sibling of outer LI; got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -5265,7 +5720,7 @@ fn backspace_on_empty_bq_paragraph_inside_li_drops_bq_scope(cx: &mut TestAppCont
         // the cursor lands on an empty (non-BQ) continuation row
         // still nested in the outer LI. The earlier BQ paragraph
         // ("This is a blockquote") survives.
-        let md = &e.state.markdown;
+        let md = e.value();
         let cursor = e.cursor_offset();
         let chain = gpui_markdown_editor::analysis::enclosing_containers_at(md, cursor);
 
@@ -5416,7 +5871,7 @@ fn empty_paragraph_after_bq_outdent_renders_at_top_level(cx: &mut TestAppContext
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        let md = &e.state.markdown;
+        let md = e.value();
         // The first BQ block ends after "blockquote."; everything
         // past that newline is structurally outside the BQ.
         let bq_end = md.find("blockquote.").unwrap() + "blockquote.".len();
@@ -5538,7 +5993,8 @@ fn backspace_at_trailing_li_continuation_atomic_deletes(cx: &mut TestAppContext)
         // Source has shrunk by exactly the `\n\n   ` paragraph-break-
         // with-indent (5 bytes).
         assert_eq!(
-            e.state.markdown, "1. List item one",
+            e.value(),
+            "1. List item one",
             "Backspace must atomic-delete the full paragraph break + LI indent",
         );
         assert_eq!(
@@ -5603,8 +6059,7 @@ fn backspace_on_alternating_chain_keeps_inner_li_scope(cx: &mut TestAppContext) 
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
         let cursor = e.cursor_offset();
-        let chain =
-            gpui_markdown_editor::analysis::enclosing_containers_at(&e.state.markdown, cursor);
+        let chain = gpui_markdown_editor::analysis::enclosing_containers_at(e.value(), cursor);
         // Chain has both LIs and the outer BQ: 3 entries total.
         let li_count = chain
             .iter()
@@ -5625,14 +6080,16 @@ fn backspace_on_alternating_chain_keeps_inner_li_scope(cx: &mut TestAppContext) 
             })
             .count();
         assert_eq!(
-            li_count, 2,
+            li_count,
+            2,
             "both LIs preserved in chain after BQ-outdent; chain: {chain:?}, buffer: {:?}",
-            e.state.markdown,
+            e.value(),
         );
         assert_eq!(
-            bq_count, 1,
+            bq_count,
+            1,
             "outer-BQ preserved, inner-BQ dropped; chain: {chain:?}, buffer: {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -5691,15 +6148,13 @@ fn synth_trailing_leaf_in_alternating_chain_keeps_inner_li(cx: &mut TestAppConte
     };
     let (_handle, editor) = open_editor(cx, initial);
     let (cursor_chain_len, block_chain_len) = editor.read_with(cx, |e, _| {
-        let cursor_chain = gpui_markdown_editor::analysis::enclosing_containers_at(
-            &e.state.markdown,
-            e.cursor_offset(),
-        );
+        let cursor_chain =
+            gpui_markdown_editor::analysis::enclosing_containers_at(e.value(), e.cursor_offset());
         let spec = e.render_spec();
         let trailing = spec
             .blocks
             .iter()
-            .find(|b| b.source_range.end == e.state.markdown.len())
+            .find(|b| b.source_range.end == e.value().len())
             .expect("trailing leaf");
         (cursor_chain.len(), trailing.containers.len())
     });
@@ -5762,18 +6217,12 @@ fn probe_hard_break_trailing_in_alternating_chain(cx: &mut TestAppContext) {
     eprintln!("\n# Source ({} bytes):", src.len());
     eprintln!("{src:?}");
 
-    fn dump(label: &str, e: &MarkdownEditor) {
+    fn dump(label: &str, e: &MarkdownEditorState) {
         eprintln!("\n## {label}");
-        eprintln!(
-            "buffer ({} bytes): {:?}",
-            e.state.markdown.len(),
-            e.state.markdown
-        );
+        eprintln!("buffer ({} bytes): {:?}", e.value().len(), e.value());
         eprintln!("cursor: {}", e.cursor_offset());
-        let chain = gpui_markdown_editor::analysis::enclosing_containers_at(
-            &e.state.markdown,
-            e.cursor_offset(),
-        );
+        let chain =
+            gpui_markdown_editor::analysis::enclosing_containers_at(e.value(), e.cursor_offset());
         eprintln!("cursor chain length: {}", chain.len());
         let spec = e.render_spec();
         for (i, b) in spec.blocks.iter().enumerate() {
@@ -5808,12 +6257,10 @@ fn probe_hard_break_trailing_in_alternating_chain(cx: &mut TestAppContext) {
 
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText("More".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -5836,14 +6283,10 @@ fn probe_alternating_chain_backspace_steps(cx: &mut TestAppContext) {
         let (handle, editor) = open_editor(cx, initial);
         editor.read_with(cx, |e, _| {
             eprintln!("\n## After {step} BS");
-            eprintln!(
-                "buffer: {:?}, len: {}",
-                e.state.markdown,
-                e.state.markdown.len()
-            );
+            eprintln!("buffer: {:?}, len: {}", e.value(), e.value().len());
             eprintln!("cursor: {}", e.cursor_offset());
             let chain = gpui_markdown_editor::analysis::enclosing_containers_at(
-                &e.state.markdown,
+                e.value(),
                 e.cursor_offset(),
             );
             eprintln!("cursor chain length: {}", chain.len());
@@ -5868,7 +6311,10 @@ fn probe_alternating_chain_backspace_steps(cx: &mut TestAppContext) {
             }
         });
         dispatch(cx, handle, &editor, Backspace);
-        state = editor.read_with(cx, |e, _| e.state.clone());
+        state = editor.read_with(cx, |e, _| EditorState {
+            markdown: e.value().into(),
+            selection: e.selection(),
+        });
     }
 }
 
@@ -5885,8 +6331,7 @@ fn probe_trailing_li_continuation_indent(cx: &mut TestAppContext) {
     editor.read_with(cx, |e, _| {
         let cursor = e.cursor_offset();
         eprintln!("cursor: {cursor}");
-        let chain =
-            gpui_markdown_editor::analysis::enclosing_containers_at(&e.state.markdown, cursor);
+        let chain = gpui_markdown_editor::analysis::enclosing_containers_at(e.value(), cursor);
         eprintln!("cursor chain length: {}", chain.len());
         let spec = e.render_spec();
         for (i, b) in spec.blocks.iter().enumerate() {
@@ -5911,7 +6356,7 @@ fn probe_trailing_li_continuation_indent(cx: &mut TestAppContext) {
     eprintln!("\n# After Backspace");
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        eprintln!("buffer: {:?}", e.state.markdown);
+        eprintln!("buffer: {:?}", e.value());
         eprintln!("cursor: {}", e.cursor_offset());
     });
     eprintln!("\n# Left arrows from initial cursor");
@@ -5942,7 +6387,7 @@ fn probe_empty_paragraph_after_bq_outdent(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        eprintln!("\nbuffer after Backspace: {:?}", e.state.markdown);
+        eprintln!("\nbuffer after Backspace: {:?}", e.value());
         eprintln!("cursor: {}", e.cursor_offset());
         let spec = e.render_spec();
         for (i, b) in spec.blocks.iter().enumerate() {
@@ -6032,7 +6477,7 @@ fn probe_left_backspace_on_empty_bq_in_li(cx: &mut TestAppContext) {
         let cursor_after_lefts = editor.read_with(cx, |e, _| e.cursor_offset());
         dispatch(cx, handle, &editor, Backspace);
         editor.read_with(cx, |e, _| {
-            let md = &e.state.markdown;
+            let md = e.value();
             let cursor = e.cursor_offset();
             // Render the buffer with `|` at cursor for visual scan.
             let mut visual = String::with_capacity(md.len() + 1);
@@ -6078,10 +6523,19 @@ fn enter_after_unterminated_fence_in_bq_auto_closes_with_chain_prefix(cx: &mut T
         selection: Selection::Cursor(9),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         assert_eq!(
-            e.state.markdown, "> ```rust\n> \n> ```",
+            e.value(),
+            "> ```rust\n> \n> ```",
             "auto-close should inject `\\n> \\n> ```` so the fence is terminated",
         );
         // Cursor lands on the body row (between fences), past the prefix.
@@ -6100,10 +6554,19 @@ fn enter_inside_terminated_fence_in_bq_inserts_newline_with_chain_prefix(cx: &mu
         selection: Selection::Cursor(16), // end of `> body`
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         assert_eq!(
-            e.state.markdown, "> ```rust\n> body\n> \n> ```",
+            e.value(),
+            "> ```rust\n> body\n> \n> ```",
             "Enter inside fenced code in a BQ should add `\\n> ` (not `\\n\\n` or bare `\\n`)",
         );
         // Cursor on the new empty body row, past the BQ prefix.
@@ -6122,21 +6585,28 @@ fn enter_on_empty_bq_paragraph_outdents_bq_scope(cx: &mut TestAppContext) {
         selection: Selection::Cursor(9), // end of trailing empty `> `
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // Trailing depth-1 BQ pair → top-level pair shape.
         assert_eq!(
-            e.state.markdown, "> a\n\n",
+            e.value(),
+            "> a\n\n",
             "empty-BQ Enter should outdent the BQ scope; got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
         // Cursor lands at the end of the new top-level shape.
         assert_eq!(e.cursor_offset(), 5);
         // Chain at cursor: empty (top level).
-        let chain = gpui_markdown_editor::analysis::enclosing_containers_at(
-            &e.state.markdown,
-            e.cursor_offset(),
-        );
+        let chain =
+            gpui_markdown_editor::analysis::enclosing_containers_at(e.value(), e.cursor_offset());
         assert!(
             chain.is_empty(),
             "cursor should be at top level after BQ outdent, got chain {chain:?}",
@@ -6196,12 +6666,10 @@ fn auto_close_orphan_dedupes_when_user_types_matching_closer(cx: &mut TestAppCon
     // will do; here we type and immediately backspace).
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText(String::new()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -6209,9 +6677,10 @@ fn auto_close_orphan_dedupes_when_user_types_matching_closer(cx: &mut TestAppCon
     editor.read_with(cx, |e, _| {
         // Orphan removed: only the user's typed closer survives.
         assert_eq!(
-            e.state.markdown, "> ```rust\n> body\n> ```\n",
+            e.value(),
+            "> ```rust\n> body\n> ```\n",
             "expected orphan opener to be deduped, got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -6262,7 +6731,7 @@ fn shift_tab_in_li_li_bq_does_not_panic_on_overlapping_strips(cx: &mut TestAppCo
     dispatch(cx, handle, &editor, ShiftTab);
     editor.read_with(cx, |e, _| {
         // Survive without panic; the buffer should be valid markdown.
-        let _ = e.state.markdown.len();
+        let _ = e.value().len();
     });
 }
 
@@ -6281,27 +6750,35 @@ fn auto_close_fence_fires_in_li_li_bq_chain(cx: &mut TestAppContext) {
         selection: Selection::Cursor(53), // end of `> ```js`
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // The buffer should now be terminated — auto-close injected a
         // body row + matching closer below the cursor, both carrying
         // the chain's continuation prefix.
         assert!(
             !gpui_markdown_editor::analysis::is_in_fenced_code(
-                &e.state.markdown,
-                e.state.markdown.len(),
+                e.value(),
+                e.value().len(),
             ),
             "after Enter the fence should be terminated; got: {:?}",
-            e.state.markdown,
+            e.value(),
         );
         // And the cursor should sit on the new body row, past the
         // chain prefix.
         let cursor = e.cursor_offset();
         let expected_body = "\n    > ";
         assert!(
-            e.state.markdown[..cursor].ends_with(expected_body),
+            e.value()[..cursor].ends_with(expected_body),
             "cursor should land on the new body row past `{expected_body}`; got buffer {:?} cursor {cursor}",
-            e.state.markdown,
+            e.value(),
         );
     });
 }
@@ -6313,17 +6790,15 @@ fn auto_close_fence_fires_in_li_li_bq_chain(cx: &mut TestAppContext) {
 fn set_cursor(
     cx: &mut TestAppContext,
     handle: AnyWindowHandle,
-    editor: &Entity<MarkdownEditor>,
+    editor: &Entity<MarkdownEditorState>,
     offset: usize,
 ) {
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::SetSelection(Selection::Cursor(offset)),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
@@ -6377,18 +6852,16 @@ fn typing_inside_display_math_updates_source(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText("^2".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "$$x^2$$");
+        assert_eq!(e.value(), "$$x^2$$");
         assert_eq!(e.cursor_offset(), 5);
     });
     // Still a DisplayMath block, still in edit mode.
@@ -6413,7 +6886,7 @@ fn backspace_inside_display_math_deletes_one_byte(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, Backspace);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "$$x^$$");
+        assert_eq!(e.value(), "$$x^$$");
         assert_eq!(e.cursor_offset(), 4);
     });
 }
@@ -6475,18 +6948,16 @@ fn typing_inside_inline_math_extends_latex(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText("^2".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "$x^2$");
+        assert_eq!(e.value(), "$x^2$");
         assert_eq!(e.cursor_offset(), 4);
     });
 }
@@ -6508,9 +6979,17 @@ fn typing_dollar_dollar_then_enter_auto_closes_block_math(cx: &mut TestAppContex
         selection: Selection::Cursor(2),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "$$\n\n$$");
+        assert_eq!(e.value(), "$$\n\n$$");
         // Cursor lands right after the first `\n`, on the empty body
         // row (column 0).
         assert_eq!(e.cursor_offset(), 3);
@@ -6537,10 +7016,18 @@ fn enter_inside_block_math_inserts_literal_newline(cx: &mut TestAppContext) {
         selection: Selection::Cursor(4), // after `x`
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // No promotion — single `\n` inserted.
-        assert_eq!(e.state.markdown, "$$\nx\n\n$$");
+        assert_eq!(e.value(), "$$\nx\n\n$$");
         assert_eq!(e.cursor_offset(), 5);
     });
     // Still a single block-math leaf, blank line preserved as content.
@@ -6597,10 +7084,18 @@ fn auto_close_inside_blockquote_carries_chain_prefix(cx: &mut TestAppContext) {
         selection: Selection::Cursor(4),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // `> $$` + `\n> ` (body) + `\n> $$` (closer) = "> $$\n> \n> $$"
-        assert_eq!(e.state.markdown, "> $$\n> \n> $$");
+        assert_eq!(e.value(), "> $$\n> \n> $$");
     });
 }
 
@@ -6664,9 +7159,7 @@ fn multi_line_block_math_with_trailing_newline_is_terminated_and_renders(cx: &mu
                 !edit_mode,
                 "expected display mode when cursor is outside the math block",
             );
-            let content = editor.read_with(cx, |e, _| {
-                e.state.markdown[content_range.clone()].to_string()
-            });
+            let content = editor.read_with(cx, |e, _| e.value()[content_range.clone()].to_string());
             assert_eq!(content, "\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n");
         }
         _ => unreachable!(),
@@ -6698,13 +7191,21 @@ fn enter_inside_terminated_block_math_with_trailing_newline_does_not_duplicate_f
         selection: Selection::Cursor(44),
     };
     let (handle, editor) = open_editor(cx, initial);
-    dispatch(cx, handle, &editor, Enter);
+    dispatch(
+        cx,
+        handle,
+        &editor,
+        Enter {
+            secondary: false,
+            shift: false,
+        },
+    );
     editor.read_with(cx, |e, _| {
         // Inside a *terminated* block, Enter inserts a literal `\n`
         // — `auto_close_math_edit` short-circuits to None for
         // terminated constructs.
         assert_eq!(
-            e.state.markdown,
+            e.value(),
             "$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n\n$$\n",
         );
         assert_eq!(e.cursor_offset(), 45);
@@ -6767,21 +7268,15 @@ fn bare_dash_in_block_math_body_does_not_get_marker_space_injected(cx: &mut Test
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            // Trigger enforce_invariants via an InsertText event — even
-            // a no-op insertion runs the post-pass over the buffer.
-            e.state = gpui_markdown_editor::update::update(
-                next,
-                gpui_markdown_editor::EditorEvent::InsertText("".into()),
-            );
-            cx.notify();
+            e.apply_event_for_test(gpui_markdown_editor::EditorEvent::InsertText("".into()), cx);
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
         assert_eq!(
-            e.state.markdown, "$$\n-x\n$$",
+            e.value(),
+            "$$\n-x\n$$",
             "verbatim math body must not have marker space injected",
         );
     });
@@ -6800,19 +7295,15 @@ fn bare_gt_in_block_math_body_does_not_get_bq_space_injected(cx: &mut TestAppCon
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
-                gpui_markdown_editor::EditorEvent::InsertText("".into()),
-            );
-            cx.notify();
+            e.apply_event_for_test(gpui_markdown_editor::EditorEvent::InsertText("".into()), cx);
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
         assert_eq!(
-            e.state.markdown, "$$\n>x\n$$",
+            e.value(),
+            "$$\n>x\n$$",
             "verbatim math body must not have BQ-prefix space injected",
         );
     });
@@ -6843,7 +7334,7 @@ fn backspace_on_prefix_only_line_in_bq_wrapped_math_eats_the_line(cx: &mut TestA
         // The whole prefix-only line (including its leading `\n`)
         // disappears; the cursor lands at the end of the previous
         // content row (right after `x`, before its trailing `\n`).
-        assert_eq!(e.state.markdown, "> $$\n> x\n> $$");
+        assert_eq!(e.value(), "> $$\n> x\n> $$");
         assert_eq!(e.cursor_offset(), 8);
     });
 }
@@ -6954,7 +7445,7 @@ fn shift_word_right_extends_selection(cx: &mut TestAppContext) {
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftWordRight);
-    editor.read_with(cx, |e, _| match e.state.selection {
+    editor.read_with(cx, |e, _| match e.selection() {
         Selection::Range { anchor, head } => {
             assert_eq!(anchor, 0);
             assert_eq!(head, 5);
@@ -6962,7 +7453,7 @@ fn shift_word_right_extends_selection(cx: &mut TestAppContext) {
         _ => panic!("expected range selection"),
     });
     dispatch(cx, handle, &editor, ShiftWordRight);
-    editor.read_with(cx, |e, _| match e.state.selection {
+    editor.read_with(cx, |e, _| match e.selection() {
         Selection::Range { anchor, head } => {
             assert_eq!(anchor, 0);
             assert_eq!(head, 10);
@@ -6979,7 +7470,7 @@ fn shift_word_left_extends_selection_backward(cx: &mut TestAppContext) {
     };
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, ShiftWordLeft);
-    editor.read_with(cx, |e, _| match e.state.selection {
+    editor.read_with(cx, |e, _| match e.selection() {
         Selection::Range { anchor, head } => {
             assert_eq!(anchor, 16);
             assert_eq!(head, 11);
@@ -7024,7 +7515,7 @@ fn delete_word_backward_removes_previous_word(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "hello ");
+        assert_eq!(e.value(), "hello ");
         assert_eq!(e.cursor_offset(), 6);
     });
 }
@@ -7043,7 +7534,7 @@ fn delete_word_backward_at_start_of_word_eats_preceding_whitespace_and_word(
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "world");
+        assert_eq!(e.value(), "world");
         assert_eq!(e.cursor_offset(), 0);
     });
 }
@@ -7057,7 +7548,7 @@ fn delete_word_backward_at_buffer_start_is_a_noop(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "hello");
+        assert_eq!(e.value(), "hello");
         assert_eq!(e.cursor_offset(), 0);
     });
 }
@@ -7073,7 +7564,7 @@ fn delete_word_forward_removes_next_word(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordForward);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, " world");
+        assert_eq!(e.value(), " world");
         assert_eq!(e.cursor_offset(), 0);
     });
 }
@@ -7089,7 +7580,7 @@ fn delete_word_forward_at_end_of_word_eats_following_whitespace_and_word(cx: &mu
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordForward);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "hello");
+        assert_eq!(e.value(), "hello");
         assert_eq!(e.cursor_offset(), 5);
     });
 }
@@ -7106,7 +7597,7 @@ fn delete_word_backward_with_selection_deletes_the_selection(cx: &mut TestAppCon
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "alpha  gamma");
+        assert_eq!(e.value(), "alpha  gamma");
         assert_eq!(e.cursor_offset(), 6);
     });
 }
@@ -7120,7 +7611,7 @@ fn delete_to_line_start_within_paragraph_removes_prefix(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "world");
+        assert_eq!(e.value(), "world");
         assert_eq!(e.cursor_offset(), 0);
     });
 }
@@ -7134,7 +7625,7 @@ fn delete_to_line_end_within_paragraph_removes_suffix(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineEnd);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "hello");
+        assert_eq!(e.value(), "hello");
         assert_eq!(e.cursor_offset(), 5);
     });
 }
@@ -7153,7 +7644,7 @@ fn delete_to_line_start_at_line_start_is_a_noop(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "line one\n\nline two");
+        assert_eq!(e.value(), "line one\n\nline two");
         assert_eq!(e.cursor_offset(), 10);
     });
 }
@@ -7172,7 +7663,7 @@ fn delete_to_line_start_on_second_paragraph_keeps_first(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "alpha\n\n gamma");
+        assert_eq!(e.value(), "alpha\n\n gamma");
         assert_eq!(e.cursor_offset(), 7);
     });
 }
@@ -7191,7 +7682,7 @@ fn delete_to_line_start_inside_list_item_preserves_marker(cx: &mut TestAppContex
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- ");
+        assert_eq!(e.value(), "- ");
         assert_eq!(e.cursor_offset(), 2);
     });
 }
@@ -7219,10 +7710,7 @@ fn delete_to_line_start_inside_blockquote_preserves_marker(cx: &mut TestAppConte
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(
-            e.state.markdown,
-            "> Paragraph 1\n> \n>  2\n> \n> Paragraph 3",
-        );
+        assert_eq!(e.value(), "> Paragraph 1\n> \n>  2\n> \n> Paragraph 3",);
         // Cursor lands at the content edge of the middle BQ line.
         assert_eq!(e.cursor_offset(), 19);
     });
@@ -7242,7 +7730,7 @@ fn delete_to_line_start_inside_nested_blockquote_preserves_all_markers(cx: &mut 
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> > > ");
+        assert_eq!(e.value(), "> > > ");
         assert_eq!(e.cursor_offset(), 6);
     });
 }
@@ -7259,7 +7747,7 @@ fn delete_to_line_start_at_content_edge_is_a_noop(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> hello");
+        assert_eq!(e.value(), "> hello");
         assert_eq!(e.cursor_offset(), 2);
     });
 }
@@ -7278,7 +7766,7 @@ fn delete_to_line_start_inside_bq_wrapped_list_item_preserves_both_markers(
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> - ");
+        assert_eq!(e.value(), "> - ");
         assert_eq!(e.cursor_offset(), 4);
     });
 }
@@ -7300,7 +7788,7 @@ fn delete_to_line_start_on_list_continuation_preserves_indent(cx: &mut TestAppCo
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- foo\n\n  ");
+        assert_eq!(e.value(), "- foo\n\n  ");
         assert_eq!(e.cursor_offset(), 9);
     });
 }
@@ -7323,7 +7811,7 @@ fn delete_to_line_start_in_bq_wrapped_li_continuation_preserves_both_prefixes(
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> - foo\n>   ");
+        assert_eq!(e.value(), "> - foo\n>   ");
         assert_eq!(e.cursor_offset(), 12);
     });
 }
@@ -7342,7 +7830,7 @@ fn delete_word_backward_inside_blockquote_preserves_marker(cx: &mut TestAppConte
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> hello");
+        assert_eq!(e.value(), "> hello");
         assert_eq!(e.cursor_offset(), 2);
     });
 }
@@ -7359,7 +7847,7 @@ fn delete_word_backward_inside_blockquote_at_word_boundary_deletes_word(cx: &mut
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> hello ");
+        assert_eq!(e.value(), "> hello ");
         assert_eq!(e.cursor_offset(), 8);
     });
 }
@@ -7385,7 +7873,7 @@ fn delete_word_forward_does_not_cross_into_next_blockquote_line(cx: &mut TestApp
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordForward);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> hello world\n> \n> goodbye");
+        assert_eq!(e.value(), "> hello world\n> \n> goodbye");
         assert_eq!(e.cursor_offset(), 13);
     });
 }
@@ -7402,7 +7890,7 @@ fn delete_to_line_start_preserves_multi_digit_ordered_marker(cx: &mut TestAppCon
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "10. ");
+        assert_eq!(e.value(), "10. ");
         assert_eq!(e.cursor_offset(), 4);
     });
 }
@@ -7420,7 +7908,7 @@ fn delete_to_line_start_in_deeply_nested_alternating_chain(cx: &mut TestAppConte
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineStart);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> - > - ");
+        assert_eq!(e.value(), "> - > - ");
         assert_eq!(e.cursor_offset(), 8);
     });
 }
@@ -7437,7 +7925,7 @@ fn delete_word_forward_does_not_cross_into_next_list_item_marker(cx: &mut TestAp
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordForward);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- foo\n- bar");
+        assert_eq!(e.value(), "- foo\n- bar");
         assert_eq!(e.cursor_offset(), 5);
     });
 }
@@ -7456,7 +7944,7 @@ fn delete_word_backward_at_buffer_start_inside_blockquote_is_noop(cx: &mut TestA
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteWordBackward);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "> hello");
+        assert_eq!(e.value(), "> hello");
         assert_eq!(e.cursor_offset(), 0);
     });
 }
@@ -7476,7 +7964,7 @@ fn delete_word_forward_top_level_crosses_newline(cx: &mut TestAppContext) {
         // The `\n\n` + "beta" are consumed in one keystroke. The
         // post-pass leaves the result as-is — no chain prefix to
         // restore.
-        assert_eq!(e.state.markdown, "alpha gamma");
+        assert_eq!(e.value(), "alpha gamma");
         assert_eq!(e.cursor_offset(), 5);
     });
 }
@@ -7493,7 +7981,7 @@ fn delete_to_line_end_inside_list_item_stops_at_newline(cx: &mut TestAppContext)
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineEnd);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "- hello \n- second");
+        assert_eq!(e.value(), "- hello \n- second");
         assert_eq!(e.cursor_offset(), 8);
     });
 }
@@ -7512,7 +8000,7 @@ fn delete_to_line_end_at_end_of_line_is_a_noop(cx: &mut TestAppContext) {
     let (handle, editor) = open_editor(cx, initial);
     dispatch(cx, handle, &editor, DeleteToLineEnd);
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "abc");
+        assert_eq!(e.value(), "abc");
         assert_eq!(e.cursor_offset(), 3);
     });
 }
@@ -7809,7 +8297,7 @@ fn down_from_short_paragraph_lands_on_first_wrap_row_of_long_paragraph(cx: &mut 
         // on font metrics, but the cursor MUST sit before the
         // (wrap) midpoint of the long paragraph.
         let para2_start = 5;
-        let para2_end = e.state.markdown.len();
+        let para2_end = e.value().len();
         let mid = (para2_start + para2_end) / 2;
         assert!(
             cursor >= para2_start && cursor < mid,
@@ -8054,18 +8542,16 @@ fn typing_on_empty_intermediate_li_marker_row_adds_content_to_item(cx: &mut Test
     let (handle, editor) = open_editor(cx, initial);
     cx.update_window(handle, |_, _, cx| {
         editor.update(cx, |e, cx| {
-            let next = std::mem::take(&mut e.state);
-            e.state = gpui_markdown_editor::update::update(
-                next,
+            e.apply_event_for_test(
                 gpui_markdown_editor::EditorEvent::InsertText("Two".into()),
+                cx,
             );
-            cx.notify();
         });
     })
     .unwrap();
     cx.run_until_parked();
     editor.read_with(cx, |e, _| {
-        assert_eq!(e.state.markdown, "1. One\n2. Two\n   1. Two, One");
+        assert_eq!(e.value(), "1. One\n2. Two\n   1. Two, One");
         // Cursor lands right after the inserted text.
         assert_eq!(e.cursor_offset(), 13);
     });

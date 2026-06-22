@@ -20,7 +20,7 @@ use gpui::{
 };
 use smallvec::SmallVec;
 
-use crate::editor::MarkdownEditor;
+use crate::editor::MarkdownEditorState;
 use crate::render_spec::{
     BlockKind, Container, ImageOverlay, InlineRun, InlineStyle, ListItemKind, MathOverlay,
     RenderBlock, Substitution,
@@ -49,7 +49,7 @@ pub struct BlockElement {
     /// Symmetric to `prev_containers` for the block immediately
     /// after this one. `None` at doc end.
     next_containers: Option<Vec<Container>>,
-    editor: Entity<MarkdownEditor>,
+    editor: Entity<MarkdownEditorState>,
     style: MarkdownStyle,
 }
 
@@ -62,7 +62,7 @@ impl BlockElement {
         next_block_start: Option<usize>,
         prev_containers: Option<Vec<Container>>,
         next_containers: Option<Vec<Container>>,
-        editor: Entity<MarkdownEditor>,
+        editor: Entity<MarkdownEditorState>,
         style: MarkdownStyle,
     ) -> Self {
         Self {
@@ -1353,7 +1353,9 @@ impl Element for BlockElement {
         cx: &mut App,
     ) {
         let (focus_handle, should_register) = self.editor.update(cx, |editor, _| {
-            let should = !editor.frame_input_handler_set;
+            // Skip IME registration entirely when read-only — a disabled
+            // editor accepts no typed text or composition.
+            let should = !editor.frame_input_handler_set && !editor.disabled;
             editor.frame_input_handler_set = true;
             (editor.focus_handle.clone(), should)
         });

@@ -21,7 +21,6 @@ use eidola_gui::stores::{Stores, StoresStub};
 use eidola_gui::updates::UpdatesView;
 use eidola_gui::window_input::WindowInput;
 use gpui::{App, AppContext, px, size};
-use gpui_markdown_editor::{EditorState, Selection};
 
 use super::harness::Snapshots;
 
@@ -421,13 +420,13 @@ fn register_chat(s: &mut Snapshots) {
                 // Drive a *real* submit through the Send action so the runner's
                 // append + tail engagement happen exactly as in production.
                 let (focus, editor) =
-                    view.read_with(cx, |v, _| (v.focus_handle(), v.prompt_editor_for_test()));
+                    view.read_with(cx, |v, _| (v.focus_handle(), v.editor_state_for_test()));
                 cx.update_window(window, |_, _, cx| {
                     editor.update(cx, |e, cx| {
-                        e.state = EditorState::with_markdown(format!(
-                            "Question number {turn}, please answer in detail."
-                        ));
-                        cx.notify();
+                        e.set_value(
+                            format!("Question number {turn}, please answer in detail."),
+                            cx,
+                        );
                     });
                 })
                 .ok();
@@ -1016,7 +1015,7 @@ fn register_chat(s: &mut Snapshots) {
                     cx,
                 )
             });
-            let editor = view.read(cx).prompt_editor_for_test();
+            let editor = view.read(cx).editor_state_for_test();
             editor.update(cx, |editor, cx| {
                 let markdown = "Drafting a reply that mixes `Runtime::new()` and plain \
                     prose in one paragraph.\n\
@@ -1030,11 +1029,7 @@ fn register_chat(s: &mut Snapshots) {
                     ```rust\n\
                     let rt = Runtime::new()?;\n\
                     ```\n";
-                editor.state = EditorState {
-                    markdown: markdown.into(),
-                    selection: Selection::Cursor(0),
-                };
-                cx.notify();
+                editor.set_value(markdown, cx);
             });
             view
         },

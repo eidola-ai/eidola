@@ -115,8 +115,11 @@ fn circadian_day() -> ThemeConfig {
         is_default: true,
         name: SharedString::new_static("Circadian Day"),
         mode: ThemeMode::Light,
-        font_family: Some(SharedString::new_static(FONT_FAMILY)),
-        radius: Some(8),
+        // font_family: Some(SharedString::new_static(FONT_FAMILY)),
+        font_size: Some(14.),
+        // mono_font_family: None(),
+        mono_font_size: Some(14.),
+        radius: Some(6),
         radius_lg: Some(12),
         shadow: Some(true),
         colors: day_colors(),
@@ -130,8 +133,8 @@ fn day_colors() -> ThemeConfigColors {
     // Surfaces — every neutral is the anchor's warm family, translated up
     // in lightness so cards/chips/rules keep their relative depth on the
     // brighter paper.
-    c.background = some("#fefaf5"); // anchor: warm paper
-    c.foreground = some("#1e1c19"); // warm ink
+    c.background = some("#fbf9f9"); // anchor: warm paper
+    c.foreground = some("#000000"); // warm ink
     c.border = some("#e0d9cf"); // hairline rule
     c.input = some("#ece5db"); // card-border
     c.muted = some("#f8f3ec"); // code-bg
@@ -190,14 +193,13 @@ fn day_colors() -> ThemeConfigColors {
     c.group_box_foreground = some("#1e1c19");
 
     // Lists / scroll
-    c.list = some("#fefaf5");
-    c.list_even = some("#f8f3ec");
-    c.list_head = some("#f6f1e9");
-    c.list_hover = some("#f2ebe1");
-    c.scrollbar = some("#fefaf500");
-    c.scrollbar_thumb = some("#e0d9cf");
-    c.scrollbar_thumb_hover = some("#a39a8a");
-
+    // c.list = some("#fefaf5");
+    // c.list_even = some("#f8f3ec");
+    // c.list_head = some("#f6f1e9");
+    // c.list_hover = some("#f2ebe1");
+    // c.scrollbar = some("#fefaf500");
+    // c.scrollbar_thumb = some("#e0d9cf");
+    // c.scrollbar_thumb_hover = some("#a39a8a");
     c
 }
 
@@ -228,7 +230,7 @@ fn night_colors() -> ThemeConfigColors {
     // (#302e34 etc.) clashed with the new ground; everything here is
     // re-derived, not carried over.
     c.background = some("#15191e"); // anchor: cool blue-grey dark
-    c.foreground = some("#d4d0c8"); // warm-grey — the reading-lamp tension
+    c.foreground = some("#ffffff"); // warm-grey — the reading-lamp tension
     c.border = some("#2c343d"); // rule
     c.input = some("#2c343d"); // card-border
     c.muted = some("#1b2026"); // code-bg, one step above the ground

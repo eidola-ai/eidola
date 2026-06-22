@@ -20,7 +20,9 @@ use gpui_component::{
     text::{TextView, TextViewState, TextViewStyle},
     v_flex,
 };
-use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownStyle};
+use gpui_markdown_editor::{
+    MarkdownEditor, MarkdownEditorEvent, MarkdownEditorState, MarkdownStyle,
+};
 
 use crate::actions::CloseWindow;
 use crate::plans::format_credits;
@@ -139,7 +141,7 @@ pub struct ChatView {
     /// send the raw source upstream. The composer draft is **window-local by
     /// design** — two windows on one space are two cursors with two drafts
     /// (see `docs/architecture/state.md`).
-    prompt_editor: Entity<MarkdownEditor>,
+    editor_state: Entity<MarkdownEditorState>,
     /// The error band shown below the transcript. Window-local: set from the
     /// space's `SpaceEvent::Failed` (and a transcript-load failure), so each
     /// window can surface its own last-submit error and its own degraded
@@ -284,12 +286,12 @@ impl ChatView {
         self.focus_handle.clone()
     }
 
-    /// Test-only access to the prompt editor entity, for behavior tests
-    /// that want to populate it the way a typing user would (by writing
-    /// `EditorState` directly).
+    /// Test-only access to the composer's editor state entity, for behavior
+    /// tests that want to populate it the way a typing user would (via
+    /// `set_value`).
     #[doc(hidden)]
-    pub fn prompt_editor_for_test(&self) -> Entity<MarkdownEditor> {
-        self.prompt_editor.clone()
+    pub fn editor_state_for_test(&self) -> Entity<MarkdownEditorState> {
+        self.editor_state.clone()
     }
 
     /// The shared `Space` entity this window is a lens over.
@@ -504,7 +506,7 @@ impl ChatView {
         if self.model_picker_open {
             window.focus(&self.focus_handle, cx);
         } else {
-            let editor = self.prompt_editor.read(cx).focus_handle(cx);
+            let editor = self.editor_state.read(cx).focus_handle(cx);
             window.focus(&editor, cx);
         }
     }
@@ -684,8 +686,10 @@ impl ChatView {
         // user types renders the same way the assistant's reply will once
         // it lands in the transcript. The pixel-fidelity goal is spelled
         // out in `crates/gpui-markdown-editor/AGENTS.md`.
-        let prompt_editor =
-            cx.new(|cx| MarkdownEditor::new("", window, cx).style(composer_markdown_style(cx)));
+        // The composer's retained state. Style + disabled are per-frame props
+        // applied where the `MarkdownEditor` element is built (see the
+        // composer render sites), so the state carries no style.
+        let editor_state = cx.new(|cx| MarkdownEditorState::new(window, cx));
 
         let focus_handle = cx.focus_handle();
 
@@ -695,7 +699,7 @@ impl ChatView {
         // `Send` through it), but production focus lives on the editor
         // itself — which is the right cursor home for a "letter writing"
         // feel.
-        let editor_focus = prompt_editor.read(cx).focus_handle(cx);
+        let editor_focus = editor_state.read(cx).focus_handle(cx);
         window.focus(&editor_focus, cx);
 
         // ⌘↩ submits without a custom subscription dance: the editor's
@@ -770,6 +774,12 @@ impl ChatView {
                 cx.notify();
             }),
             cx.subscribe_in(&space, window, Self::on_space_event),
+            // The composer reports submit-intent chords as outward events
+            // (the gpui-component `InputEvent` inversion): the editor owns
+            // `cmd-enter`/`cmd-shift-enter` and emits `PressEnter`, which we
+            // route to the semantic `submit` / `post_only` commands here —
+            // instead of ChatView binding the chords itself.
+            cx.subscribe_in(&editor_state, window, Self::on_editor_event),
             // Re-render when ⌥ transitions so the title-bar reveal responds
             // immediately. The modifier state itself lives in `window_input`;
             // the root view's single listener mirrors it there.
@@ -799,7 +809,7 @@ impl ChatView {
             account,
             wallet,
             space,
-            prompt_editor,
+            editor_state,
             error: None,
             onboarding: OnboardingFlow::default(),
             show_plans_after_error: false,
@@ -1068,7 +1078,7 @@ impl ChatView {
     }
 
     fn current_stage(&self, cx: &Context<Self>) -> OnboardingStage {
-        let composer_empty = self.prompt_editor.read(cx).state.markdown.trim().is_empty();
+        let composer_empty = self.editor_state.read(cx).is_empty();
         self.onboarding_stage(cx, composer_empty)
     }
 
@@ -1308,7 +1318,7 @@ impl ChatView {
         }
         self.replying_to = Some(action_id);
         self.hovered_post = None;
-        let editor_focus = self.prompt_editor.read(cx).focus_handle(cx);
+        let editor_focus = self.editor_state.read(cx).focus_handle(cx);
         window.focus(&editor_focus, cx);
         self.rebuild_transcript(false, cx);
         cx.notify();
@@ -1354,14 +1364,13 @@ impl ChatView {
         if self.space.read(cx).is_streaming() {
             return;
         }
-        self.saved_draft = Some(self.prompt_editor.read(cx).state.markdown.clone());
+        self.saved_draft = Some(self.editor_state.read(cx).value().to_string());
         self.editing = Some(action_id);
         self.hovered_post = None;
-        self.prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::with_markdown(&current_text);
-            cx.notify();
+        self.editor_state.update(cx, |editor, cx| {
+            editor.set_value(&current_text, cx);
         });
-        let editor_focus = self.prompt_editor.read(cx).focus_handle(cx);
+        let editor_focus = self.editor_state.read(cx).focus_handle(cx);
         window.focus(&editor_focus, cx);
         self.rebuild_transcript(false, cx);
         cx.notify();
@@ -1373,9 +1382,8 @@ impl ChatView {
             return;
         }
         let draft = self.saved_draft.take().unwrap_or_default();
-        self.prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::with_markdown(&draft);
-            cx.notify();
+        self.editor_state.update(cx, |editor, cx| {
+            editor.set_value(&draft, cx);
         });
         self.rebuild_transcript(false, cx);
         cx.notify();
@@ -1388,21 +1396,14 @@ impl ChatView {
         let Some(action_id) = self.editing.clone() else {
             return;
         };
-        let text = self
-            .prompt_editor
-            .read(cx)
-            .state
-            .markdown
-            .trim()
-            .to_string();
+        let text = self.editor_state.read(cx).value().trim().to_string();
         if text.is_empty() {
             return;
         }
         self.editing = None;
         let draft = self.saved_draft.take().unwrap_or_default();
-        self.prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::with_markdown(&draft);
-            cx.notify();
+        self.editor_state.update(cx, |editor, cx| {
+            editor.set_value(&draft, cx);
         });
         self.space.update(cx, |s, cx| {
             s.edit(action_id, text, cx);
@@ -1425,6 +1426,30 @@ impl ChatView {
         cx.notify();
     }
 
+    /// Route the composer's outward events. Today only `PressEnter` is acted
+    /// on: the primary-modifier chords map to the save-vs-ask gestures
+    /// (`⌘↩` → post & ask, `⌘⇧↩` → post only). Plain Enter never reaches here
+    /// (the editor inserts a newline), so unmodified chords are ignored.
+    fn on_editor_event(
+        &mut self,
+        _: &Entity<MarkdownEditorState>,
+        event: &MarkdownEditorEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let MarkdownEditorEvent::PressEnter {
+            secondary: true,
+            shift,
+        } = event
+        {
+            if *shift {
+                self.post_only(&PostOnly, window, cx);
+            } else {
+                self.submit(&Send, window, cx);
+            }
+        }
+    }
+
     /// Post the composer **without** requesting a response (`⌘⇧↩`, the save
     /// side of save-vs-request). Mirrors `submit` but routes to
     /// `Space::post_only` and engages tail follow so the saved post comes into
@@ -1439,19 +1464,12 @@ impl ChatView {
             self.commit_edit(cx);
             return;
         }
-        let prompt = self
-            .prompt_editor
-            .read(cx)
-            .state
-            .markdown
-            .trim()
-            .to_string();
+        let prompt = self.editor_state.read(cx).value().trim().to_string();
         if prompt.is_empty() {
             return;
         }
-        self.prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::default();
-            cx.notify();
+        self.editor_state.update(cx, |editor, cx| {
+            editor.clear(cx);
         });
         self.error = None;
         self.show_plans_after_error = false;
@@ -1480,13 +1498,7 @@ impl ChatView {
             return;
         }
 
-        let prompt = self
-            .prompt_editor
-            .read(cx)
-            .state
-            .markdown
-            .trim()
-            .to_string();
+        let prompt = self.editor_state.read(cx).value().trim().to_string();
         if prompt.is_empty() {
             return;
         }
@@ -1496,9 +1508,8 @@ impl ChatView {
         // guard, so stub-core tests observe exactly what a real send would use.
         let model = self.current_model(cx);
 
-        self.prompt_editor.update(cx, |editor, cx| {
-            editor.state = EditorState::default();
-            cx.notify();
+        self.editor_state.update(cx, |editor, cx| {
+            editor.clear(cx);
         });
         // Clear the window-local error band on a fresh submit. The transcript
         // append + streaming entry + the streaming runner all live on the
@@ -1584,7 +1595,7 @@ impl ChatView {
         });
 
         let was_following = self.list_state.is_following_tail();
-        let composer_focus = self.prompt_editor.read(cx).focus_handle(cx);
+        let composer_focus = self.editor_state.read(cx).focus_handle(cx);
 
         // Reconcile by COMMON-PREFIX SPLICE: replace exactly the suffix that
         // changed, never the items before it. This is load-bearing for
@@ -1968,7 +1979,11 @@ impl ChatView {
                         .id(("edit-editor", idx))
                         .probe("chat/edit-editor", gpui::Role::TextInput, "Edit post")
                         .min_h(composer_min_h)
-                        .child(self.prompt_editor.clone()),
+                        .child(
+                            MarkdownEditor::new(&self.editor_state)
+                                .style(composer_markdown_style(cx))
+                                .disabled(self.space.read(cx).is_streaming()),
+                        ),
                 )
                 .child(
                     div()
@@ -2312,7 +2327,11 @@ impl ChatView {
                 .id("composer")
                 .probe("chat/composer", gpui::Role::TextInput, "Message composer")
                 .min_h(composer_min_h)
-                .child(self.prompt_editor.clone()),
+                .child(
+                    MarkdownEditor::new(&self.editor_state)
+                        .style(composer_markdown_style(cx))
+                        .disabled(self.space.read(cx).is_streaming()),
+                ),
         );
 
         if leading {

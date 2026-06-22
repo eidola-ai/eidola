@@ -39,6 +39,16 @@ Architectural decisions:
 - **Keyboard input through gpui actions.** IME / dead-key composition uses `EntityInputHandler` (the gpui input-handler trait) — see the `examples/input.rs` upstream pattern.
 - **Shift-arrow extension state on `Selection::Range::anchor`**, which gpui updates from a cursor-state member directly.
 
+### Widget shape — state/element split (mirrors `gpui_component::Input`)
+
+The editor follows gpui-component's `InputState`/`Input` idiom: a retained **state entity** plus an ephemeral **render element**, not one `Render` entity.
+
+- **`MarkdownEditorState`** (the Entity) holds `state: EditorState`, `focus_handle`, `disabled`, and every cross-frame layout cache (`last_blocks`, `intended_x`, per-block scroll, `marked_range`). It implements `Focusable`, `EntityInputHandler` (IME — the reason the state half *must* be an entity), and `EventEmitter<MarkdownEditorEvent>`. It is **not** `Render`. The host owns one (`cx.new(|cx| MarkdownEditorState::new(window, cx))`), mutates it through `set_value` / `clear` (the `markdown`/`selection` are `pub(crate)` — no field-poking), reads it via `value()` / `selection()` / `is_empty()`, and `cx.subscribe`s to its events.
+- **`MarkdownEditor`** (the `#[derive(IntoElement)]` element) is built each frame: `MarkdownEditor::new(&state).style(..).disabled(..)`. Its `RenderOnce::render` absorbs the old entity render — derives theme colors over the caller's style overrides, syncs `disabled` onto the state, registers key/IME handlers via `window.listener_for(&state, MarkdownEditorState::method)` (the element→state bridge), and builds the `BlockElement`s. When `disabled`, no handlers are registered and the IME `replace_*` methods early-return (read-only).
+- **Outward events — `MarkdownEditorEvent`** (the `InputEvent` analogue): `Change` (text mutated), `PressEnter { secondary, shift }` (a submit-intent chord — the editor reports *intent*, the host decides *meaning*), `Focus`, `Blur`. The host subscribes; the editor never reaches outward and the host never reaches into fields. Plain Enter inserts a newline and emits nothing; only the modified chords the host bound to `Enter { secondary, .. }` emit `PressEnter`.
+- **Self-contained keymap.** `gpui_markdown_editor::init(cx)` installs the default macOS map (motion, editing, clipboard, and `enter`/`shift-enter`/`cmd-enter`/`cmd-shift-enter` → `Enter { secondary, shift }`) scoped to the `MarkdownEditor` key context — called once at startup like `gpui_component::init`. Hosts don't hand-roll bindings.
+- **Test seam.** `MarkdownEditorState::apply_event_for_test(event, cx)` (`#[doc(hidden)]`) drives the internal `update` pipeline for integration tests (a separate crate, so they can't see the `pub(crate)` `state`). Tests that need a `Render` root wrap the state in a tiny `EditorHarness { state }` whose render is `MarkdownEditor::new(&self.state)`.
+
 ## Minimum viable scope (current)
 
 The first cut covers:
@@ -240,7 +250,7 @@ Real HTML / RTF passthrough depends on a gpui-side `ClipboardEntry::Html(String)
 | `render_spec.rs` | `RenderSpec`, `RenderBlock`, `InlineRun`, `InlineStyle` |
 | `style.rs` | `MarkdownStyle` — derived from `gpui_component::Theme` |
 | `element.rs` | `BlockElement` — paints one block, owns a `display_to_source` map per shaped line |
-| `editor.rs` | `MarkdownEditor` — gpui `Render` view, owns state, dispatches actions |
+| `editor.rs` | `MarkdownEditorState` (state entity: focus, IME, caches, events, setters) + `MarkdownEditor` (the `RenderOnce` element) + `init` (keymap). See [Widget shape](#widget-shape--stateelement-split-mirrors-gpui_componentinput) |
 | `escapes.rs` | CommonMark §2.4 / §2.5 source-byte scanner. Returns one `ResolvedSpan` per `\X` or `&entity;` occurrence; the render post-pass turns each into a `Substitution` (cursor outside) or a dimmed `InlineRun` (cursor inside). |
 | `math.rs` | RaTeX adapter. `register_katex_fonts(text_system)` loads the bundled KaTeX TTFs; `typeset(latex, mode) -> MathLayout` parses + lays out a LaTeX expression; `MathLayout::paint(...)` walks RaTeX's `DisplayList` and emits native gpui paint ops (`paint_quad` for fraction bars and rects, `paint_path` for radicals, shaped glyph runs for letters / operators). |
 | `image.rs` | Image-cache adapter. `load(dest_url, window, cx) -> LoadedImage` routes a URL through gpui's image cache (`http`/`https`/`file`/absolute paths supported out of the box, embedded paths via the host's `AssetSource`). `inline_size` / `block_size` apply the height cap / width fit so inline and block images each scale predictably. `paint(image, bounds, window)` is the thin `window.paint_image` wrapper. Asynchronous: `LoadedImage::Loading` while in flight, `Failed` on error — the asset cache invalidates the view when a load resolves so the next frame sees the new state. |
@@ -248,7 +258,7 @@ Real HTML / RTF passthrough depends on a gpui-side `ClipboardEntry::Html(String)
 
 ## Theme integration
 
-The editor does **not** carry its own color palette. `MarkdownStyle::from_theme` derives every color (text, secondary, delimiter, background) from `gpui_component::Theme`. Day / Night just work because they're the theme's job: `MarkdownEditor::render` re-derives **every theme-sourced color** (text, delimiter, background, caret, selection, link, blockquote border, thematic break, inline-code chip, code-block fills) from the live theme each frame, so a mode flip can't leave any of them stale — color fields are therefore *not* caller-overridable across frames; the typography knobs (font size, families, heading callback, paragraph gap, `list_item_gap_factor`, `inline_code_font_family`) are, the same way `eidola_gui::chat::markdown_style` overrides `TextViewStyle`.
+The editor does **not** carry its own color palette. `MarkdownStyle::from_theme` derives every color (text, secondary, delimiter, background) from `gpui_component::Theme`. Day / Night just work because they're the theme's job: the `MarkdownEditor` element's `render` re-derives **every theme-sourced color** (text, delimiter, background, caret, selection, link, blockquote border, thematic break, inline-code chip, code-block fills) from the live theme each frame, so a mode flip can't leave any of them stale — color fields are therefore *not* caller-overridable across frames; the typography knobs (font size, families, heading callback, paragraph gap, `list_item_gap_factor`, `inline_code_font_family`) are, the same way `eidola_gui::chat::markdown_style` overrides `TextViewStyle`.
 
 ## Vertical rhythm
 
@@ -260,9 +270,9 @@ Inter-block spacing is symmetric: each block reserves half its factor above and 
 
 Built on `gpui::TestAppContext`. They run on libtest's worker thread with mocked rendering, so they're cheap and deterministic.
 
-- Construct an `Entity<MarkdownEditor>` with a known initial state.
-- Drive interactions through the view's `focus_handle` (the production dispatch path).
-- Assert against `EditorState`, `RenderSpec`, or `MarkdownEditor` public state with `read_with`.
+- Construct an `Entity<MarkdownEditorState>` with a known initial state (wrapped in an `EditorHarness` for a `Render` root).
+- Drive interactions through the state's `focus_handle` (the production dispatch path) or `apply_event_for_test` for pipeline-level steps.
+- Assert against `value()` / `selection()`, `RenderSpec`, or other public state with `read_with`.
 
 These cover state transitions and the renderer's pure-function decisions (delimiter hide vs. dim, inline runs, block kinds). They do **not** verify geometry — that's the visual tier.
 

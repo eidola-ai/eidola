@@ -1,27 +1,31 @@
-//! `MarkdownEditor` — the gpui entity that owns editor state and routes user
-//! input through the pure `update::update` pipeline.
+//! The editor's state/element split (mirrors `gpui_component::Input`):
 //!
-//! Wiring is intentionally minimal:
+//! - [`MarkdownEditorState`] is the retained **state entity** — it owns the
+//!   `EditorState`, focus, the IME `EntityInputHandler`, the cross-frame
+//!   layout caches, and emits [`MarkdownEditorEvent`]s. It is not `Render`.
+//! - [`MarkdownEditor`] is the per-frame **element** (`RenderOnce`) built via
+//!   `MarkdownEditor::new(&state)`; it registers the action/IME handlers
+//!   (routing into the state via `window.listener_for`) and paints the blocks.
+//! - [`init`] installs the default keymap (scoped to the `MarkdownEditor` key
+//!   context) so the editor is a drop-in — the host calls it once, like
+//!   `gpui_component::init`, instead of hand-rolling bindings.
 //!
-//! - One `actions!` block declares every editor action (`Backspace`, `Left`,
-//!   `Enter`, …). The hosting application must `cx.bind_keys` them — see
-//!   `bin/demo.rs` for the standard macOS map.
-//! - Text input goes through `EntityInputHandler` so dead-key composition,
-//!   non-Latin layouts, and pasted text all work without a separate code
-//!   path.
+//! Input flows through the pure `update::update` pipeline; text input goes
+//! through `EntityInputHandler` so dead-key composition, non-Latin layouts,
+//! and pasted text all share one code path.
 
 use std::collections::HashMap;
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle,
-    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    UTF16Selection, Window, actions, div, prelude::*, px,
+    Action, App, Bounds, ClipboardItem, Context, CursorStyle, Entity, EntityInputHandler,
+    FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, RenderOnce, Subscription, UTF16Selection, Window, actions, div, prelude::*, px,
 };
 use gpui_component::Theme;
 
 use crate::element::{BlockElement, LaidOutBlock};
-use crate::event::EditorEvent;
+use crate::event::{EditorEvent, MarkdownEditorEvent};
 use crate::parser::parse;
 use crate::render::render;
 use crate::render_spec::RenderSpec;
@@ -29,13 +33,27 @@ use crate::state::{EditorState, Selection};
 use crate::style::MarkdownStyle;
 use crate::update;
 
+/// Submit-intent action carrying the modifier state at the time Enter was
+/// pressed (mirrors gpui-component's `input::Enter`). The host binds the
+/// modified chords — `cmd-enter`, `cmd-shift-enter` — to this with the
+/// matching `secondary`/`shift` flags; the handler emits
+/// [`MarkdownEditorEvent::PressEnter`] for the modified chords and inserts a
+/// newline / line break for the plain ones. `no_json` because these are
+/// keystroke-bound, never invoked from a serialized keymap value.
+#[derive(Action, Clone, PartialEq, Eq)]
+#[action(namespace = markdown_editor, no_json)]
+pub struct Enter {
+    /// True when the platform primary modifier (⌘ on macOS) was held.
+    pub secondary: bool,
+    /// True when Shift was held.
+    pub shift: bool,
+}
+
 actions!(
     markdown_editor,
     [
         Backspace,
         Delete,
-        Enter,
-        ShiftEnter,
         Tab,
         ShiftTab,
         Left,
@@ -131,10 +149,20 @@ fn normalize_line_endings(text: &str) -> String {
     out
 }
 
-pub struct MarkdownEditor {
-    pub state: EditorState,
-    style: MarkdownStyle,
+/// The editor's retained state — the Entity half of the gpui-component
+/// `InputState`/`Input` split. The host owns one of these (`cx.new(...)`),
+/// passes it into the [`MarkdownEditor`](crate::MarkdownEditor) element each
+/// frame, mutates it through the setters (`set_value`/`clear`), and
+/// `cx.subscribe`s to its [`MarkdownEditorEvent`]s. It owns focus, the IME
+/// `EntityInputHandler`, and every cross-frame layout cache; it is *not*
+/// `Render` — the element renders it.
+pub struct MarkdownEditorState {
+    pub(crate) state: EditorState,
     pub focus_handle: FocusHandle,
+    /// When true, the element skips registering key/IME handlers and the
+    /// `EntityInputHandler` text-mutation methods early-return, so the surface
+    /// is read-only. Synced from the element's `.disabled(..)` prop each frame.
+    pub(crate) disabled: bool,
     is_selecting: bool,
     pub(crate) last_blocks: HashMap<usize, LaidOutBlock>,
     pub(crate) last_bounds: Option<Bounds<Pixels>>,
@@ -154,28 +182,35 @@ pub struct MarkdownEditor {
     /// row. Reset to `None` on any non-vertical event in
     /// `dispatch_reset_intended_x_unless_vertical`.
     intended_x: Option<Pixels>,
+    /// Focus/blur observers that translate gpui focus transitions into
+    /// outward [`MarkdownEditorEvent::Focus`]/[`Blur`](MarkdownEditorEvent::Blur).
+    /// Held so they live as long as the entity.
+    _focus_subscriptions: Vec<Subscription>,
 }
 
-impl MarkdownEditor {
-    pub fn new(markdown: impl Into<String>, _: &mut Window, cx: &mut Context<Self>) -> Self {
-        let style = MarkdownStyle::from_theme(cx);
-        Self::with_state_and_style(EditorState::with_markdown(markdown), style, cx)
+impl MarkdownEditorState {
+    /// Create an empty editor state. Chain [`default_value`](Self::default_value)
+    /// to seed initial markdown — mirrors `InputState::new(window, cx)`.
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_state(EditorState::new(), window, cx)
     }
 
-    pub fn with_state(state: EditorState, _: &mut Window, cx: &mut Context<Self>) -> Self {
-        let style = MarkdownStyle::from_theme(cx);
-        Self::with_state_and_style(state, style, cx)
-    }
-
-    fn with_state_and_style(
-        state: EditorState,
-        style: MarkdownStyle,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn with_state(state: EditorState, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        // Translate focus transitions into outward events so a host can react
+        // semantically (e.g. commit an inline edit on blur) without polling.
+        let _focus_subscriptions = vec![
+            cx.on_focus(&focus_handle, window, |_, _, cx| {
+                cx.emit(MarkdownEditorEvent::Focus);
+            }),
+            cx.on_blur(&focus_handle, window, |_, _, cx| {
+                cx.emit(MarkdownEditorEvent::Blur);
+            }),
+        ];
         Self {
             state,
-            style,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
+            disabled: false,
             is_selecting: false,
             last_blocks: HashMap::new(),
             last_bounds: None,
@@ -183,7 +218,57 @@ impl MarkdownEditor {
             marked_range: None,
             code_block_scrolls: HashMap::new(),
             intended_x: None,
+            _focus_subscriptions,
         }
+    }
+
+    /// Seed the initial markdown (builder form, used right after `new`).
+    pub fn default_value(mut self, markdown: impl Into<String>) -> Self {
+        self.state = EditorState::with_markdown(markdown);
+        self
+    }
+
+    /// The current markdown source. The read half of the host seam — replaces
+    /// reaching into a public `state` field.
+    pub fn value(&self) -> &str {
+        &self.state.markdown
+    }
+
+    /// The current selection.
+    pub fn selection(&self) -> Selection {
+        self.state.selection
+    }
+
+    /// True when the buffer is empty (after trimming) — the common host check
+    /// for "is there anything to submit?".
+    pub fn is_empty(&self) -> bool {
+        self.state.markdown.trim().is_empty()
+    }
+
+    /// Replace the entire buffer and collapse the cursor to the start. The
+    /// write half of the host seam; emits [`MarkdownEditorEvent::Change`].
+    pub fn set_value(&mut self, markdown: impl Into<String>, cx: &mut Context<Self>) {
+        self.state = EditorState::with_markdown(markdown);
+        self.marked_range = None;
+        self.intended_x = None;
+        cx.emit(MarkdownEditorEvent::Change);
+        cx.notify();
+    }
+
+    /// Clear the buffer. Convenience for `set_value("")`.
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.set_value("", cx);
+    }
+
+    /// Drive the internal update pipeline with a raw [`EditorEvent`], the way
+    /// a dispatched action or IME callback would. The crate's integration
+    /// tests (a separate crate, so they can't see the `pub(crate)` `state`
+    /// field) use this to script keypress sessions without synthesizing
+    /// platform events; not part of the host API — hosts mutate via
+    /// `set_value`/`clear` and key dispatch.
+    #[doc(hidden)]
+    pub fn apply_event_for_test(&mut self, event: EditorEvent, cx: &mut Context<Self>) {
+        self.dispatch(event, cx);
     }
 
     pub(crate) fn code_block_scroll(&self, block_index: usize) -> Pixels {
@@ -195,11 +280,6 @@ impl MarkdownEditor {
 
     pub(crate) fn set_code_block_scroll(&mut self, block_index: usize, offset: Pixels) {
         self.code_block_scrolls.insert(block_index, offset);
-    }
-
-    pub fn style(mut self, style: MarkdownStyle) -> Self {
-        self.style = style;
-        self
     }
 
     pub fn render_spec(&self) -> RenderSpec {
@@ -217,8 +297,15 @@ impl MarkdownEditor {
         // `intended_x` directly without going through this helper.
         self.intended_x = None;
         let next = std::mem::take(&mut self.state);
+        // Compare the buffer across the update so selection-only events
+        // (Move*/Extend*/SetSelection) don't masquerade as content changes.
+        // The composer buffer is small, so the clone is negligible.
+        let before = next.markdown.clone();
         self.state = update::update(next, event);
         self.marked_range = None;
+        if self.state.markdown != before {
+            cx.emit(MarkdownEditorEvent::Change);
+        }
         cx.notify();
     }
 
@@ -406,16 +493,27 @@ impl MarkdownEditor {
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorEvent::DeleteForward, cx);
     }
-    fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
-        // Context-aware insertion (code-block: `\n`; blockquote at
-        // depth D: `\n[prefix]\n[prefix]`; top-level: `\n\n`) is
-        // resolved inside `update::insert_newline`. The shell stays
-        // a pure router so keyboard, IME, paste, and programmatic
-        // dispatch all share the same rule.
+    fn enter(&mut self, action: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        if action.secondary {
+            // ⌘↩ / ⌘⇧↩ — a submit-intent chord. The editor reports the chord
+            // and leaves the buffer untouched; the host's subscriber decides
+            // what it means (post & ask vs post-only, commit-edit, reply…).
+            cx.emit(MarkdownEditorEvent::PressEnter {
+                secondary: true,
+                shift: action.shift,
+            });
+            return;
+        }
+        if action.shift {
+            // ⇧↩ — a hard line break within the current block.
+            self.dispatch(EditorEvent::InsertLineBreak, cx);
+            return;
+        }
+        // Plain ↩ — context-aware insertion (code-block: `\n`; blockquote at
+        // depth D: `\n[prefix]\n[prefix]`; top-level: `\n\n`) is resolved
+        // inside `update::insert_newline`. The shell stays a pure router so
+        // keyboard, IME, paste, and programmatic dispatch share the rule.
         self.dispatch(EditorEvent::InsertNewline, cx);
-    }
-    fn shift_enter(&mut self, _: &ShiftEnter, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::InsertLineBreak, cx);
     }
     fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
         // Tab in a list item nests it under the previous sibling.
@@ -705,7 +803,9 @@ impl MarkdownEditor {
     }
 }
 
-impl EntityInputHandler for MarkdownEditor {
+impl gpui::EventEmitter<MarkdownEditorEvent> for MarkdownEditorState {}
+
+impl EntityInputHandler for MarkdownEditorState {
     fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -746,6 +846,9 @@ impl EntityInputHandler for MarkdownEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.disabled {
+            return;
+        }
         let target = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -768,6 +871,9 @@ impl EntityInputHandler for MarkdownEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.disabled {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -795,6 +901,7 @@ impl EntityInputHandler for MarkdownEditor {
             range.start + new_text.len()
         };
         self.state.selection = Selection::Cursor(cursor);
+        cx.emit(MarkdownEditorEvent::Change);
         cx.notify();
     }
 
@@ -832,128 +939,190 @@ impl EntityInputHandler for MarkdownEditor {
     }
 }
 
-impl Focusable for MarkdownEditor {
+impl Focusable for MarkdownEditorState {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for MarkdownEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Refresh the style each frame so theme-mode flips re-derive colors
-        // (cheap — the style struct is plain Arc / Hsla).
-        self.style = self.style.clone();
-        // ^ keep the caller's overrides; only refresh theme-derived fields
+/// The editor's render half — the ephemeral element built each frame from a
+/// `MarkdownEditorState`, mirroring gpui-component's `Input::new(&state)`.
+/// Carries the per-render props (style overrides, disabled); holds no state
+/// of its own. Construct it in the host's `render` and drop it into the tree.
+#[derive(IntoElement)]
+pub struct MarkdownEditor {
+    state: Entity<MarkdownEditorState>,
+    style: Option<MarkdownStyle>,
+    disabled: bool,
+}
+
+impl MarkdownEditor {
+    /// Build the element over a host-owned state entity.
+    pub fn new(state: &Entity<MarkdownEditorState>) -> Self {
+        Self {
+            state: state.clone(),
+            style: None,
+            disabled: false,
+        }
+    }
+
+    /// Typographic / color overrides for this frame. Theme-derived color
+    /// fields are refreshed on top of these in `render`, so a caller only
+    /// needs to set the knobs it cares about (font size, leading, heading
+    /// scale, …) — see `MarkdownStyle::from_theme`.
+    pub fn style(mut self, style: MarkdownStyle) -> Self {
+        self.style = Some(style);
+        self
+    }
+
+    /// Render read-only: no key/IME handlers are registered and the
+    /// `EntityInputHandler` text mutations early-return, so the surface
+    /// displays but rejects input. Mirrors `Input::disabled`.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+}
+
+impl RenderOnce for MarkdownEditor {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // Per-frame reset + sync the disabled prop onto the state (so the
+        // IME handler can honor it). Block elements re-populate `last_blocks`
+        // during paint; `frame_input_handler_set` re-arms IME registration.
+        self.state.update(cx, |st, _| {
+            st.disabled = self.disabled;
+            st.last_blocks.clear();
+            st.frame_input_handler_set = false;
+            st.last_bounds = None;
+        });
+
+        // Final style = caller overrides (or the theme default) with the
+        // theme-derived color fields refreshed each frame, so a Circadian
+        // light/dark flip recolors live even if the caller built its style
+        // once. This is the old entity-render refresh, moved to the element.
+        let mut style = self
+            .style
+            .clone()
+            .unwrap_or_else(|| MarkdownStyle::from_theme(cx));
         let theme = Theme::global(cx);
-        self.style.text_color = theme.foreground;
-        self.style.delimiter_color = theme.muted_foreground;
-        self.style.background = theme.background;
-        self.style.caret_color = theme.caret;
-        self.style.selection_color = theme.selection;
-        self.style.link_color = theme.link;
-        self.style.blockquote_border_color = theme.border;
-        self.style.thematic_break_color = theme.border;
-        self.style.inline_code_background = theme.accent;
-        self.style.code_block_background = theme.muted;
-        self.style.code_block_content_background =
-            crate::style::shift_lightness(theme.muted, -0.04);
+        style.text_color = theme.foreground;
+        style.delimiter_color = theme.muted_foreground;
+        style.background = theme.background;
+        style.caret_color = theme.caret;
+        style.selection_color = theme.selection;
+        style.link_color = theme.link;
+        style.blockquote_border_color = theme.border;
+        style.thematic_break_color = theme.border;
+        style.inline_code_background = theme.accent;
+        style.code_block_background = theme.muted;
+        style.code_block_content_background = crate::style::shift_lightness(theme.muted, -0.04);
 
-        // Reset per-frame state. Block elements re-populate `last_blocks`
-        // during paint.
-        self.last_blocks.clear();
-        self.frame_input_handler_set = false;
+        let spec = self.state.read(cx).render_spec();
+        let state = self.state.clone();
+        let disabled = self.disabled;
 
-        let view: Entity<Self> = cx.entity();
-        let style = self.style.clone();
-        let spec = self.render_spec();
-
-        // Register the IME / EntityInputHandler at the container level so
-        // typed text and dead-key composition flow through
-        // `replace_text_in_range`.
-        self.last_bounds = None;
-
-        let block_count = spec.blocks.len();
         let mut container = div()
             .id("markdown-editor")
             .key_context("MarkdownEditor")
-            .track_focus(&self.focus_handle(cx))
-            .cursor(CursorStyle::IBeam)
+            .track_focus(&state.read(cx).focus_handle)
+            .when(!disabled, |c| c.cursor(CursorStyle::IBeam))
             .w_full()
             .flex()
             .flex_col()
-            .text_size(self.style.font_size)
-            .text_color(self.style.text_color)
-            .font_family(self.style.font_family.clone())
-            .on_action(cx.listener(Self::backspace))
-            .on_action(cx.listener(Self::delete))
-            .on_action(cx.listener(Self::enter))
-            .on_action(cx.listener(Self::shift_enter))
-            .on_action(cx.listener(Self::tab))
-            .on_action(cx.listener(Self::shift_tab))
-            .on_action(cx.listener(Self::left))
-            .on_action(cx.listener(Self::right))
-            .on_action(cx.listener(Self::up))
-            .on_action(cx.listener(Self::down))
-            .on_action(cx.listener(Self::shift_left))
-            .on_action(cx.listener(Self::shift_right))
-            .on_action(cx.listener(Self::shift_up))
-            .on_action(cx.listener(Self::shift_down))
-            .on_action(cx.listener(Self::home))
-            .on_action(cx.listener(Self::end))
-            .on_action(cx.listener(Self::shift_home))
-            .on_action(cx.listener(Self::shift_end))
-            .on_action(cx.listener(Self::document_start))
-            .on_action(cx.listener(Self::document_end))
-            .on_action(cx.listener(Self::shift_document_start))
-            .on_action(cx.listener(Self::shift_document_end))
-            .on_action(cx.listener(Self::word_left))
-            .on_action(cx.listener(Self::word_right))
-            .on_action(cx.listener(Self::shift_word_left))
-            .on_action(cx.listener(Self::shift_word_right))
-            .on_action(cx.listener(Self::delete_word_backward))
-            .on_action(cx.listener(Self::delete_word_forward))
-            .on_action(cx.listener(Self::delete_to_line_start))
-            .on_action(cx.listener(Self::delete_to_line_end))
-            .on_action(cx.listener(Self::select_all))
-            .on_action(cx.listener(Self::copy))
-            .on_action(cx.listener(Self::cut))
-            .on_action(cx.listener(Self::paste))
-            .on_action(cx.listener(Self::paste_plain))
-            // Map the Edit-menu action types (`gpui_component::input::*`)
-            // onto the editor's own implementations.  The OS routes the Edit
-            // menu through the responder chain via the `OsAction::*` selectors;
-            // those land as `gpui_component::input::{Cut,Copy,Paste,SelectAll}`
-            // dispatched to the focused element.  Without these handlers the
-            // actions fell through unhandled whenever the composer had focus.
-            .on_action(cx.listener(|this, _: &gpui_component::input::Cut, w, cx| {
-                this.cut(&Cut, w, cx);
-            }))
-            .on_action(cx.listener(|this, _: &gpui_component::input::Copy, w, cx| {
-                this.copy(&Copy, w, cx);
-            }))
-            .on_action(
-                cx.listener(|this, _: &gpui_component::input::Paste, w, cx| {
-                    this.paste(&Paste, w, cx);
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &gpui_component::input::SelectAll, w, cx| {
-                    this.select_all(&SelectAll, w, cx);
-                }),
-            )
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move));
+            .text_size(style.font_size)
+            .text_color(style.text_color)
+            .font_family(style.font_family.clone());
 
-        let block_starts: Vec<usize> = spec.blocks.iter().map(|b| b.source_range.start).collect();
-        // Snapshot each block's container chain *before* moving the
-        // blocks into elements so we can hand each `BlockElement` the
-        // chains of its immediate neighbors (used to add extra
-        // breathing room at container-boundary transitions).
+        // Key/IME handlers are registered only when editable. Each routes
+        // the action into the *state* entity via `window.listener_for`
+        // (the element→state bridge), the gpui-component idiom.
+        if !disabled {
+            container = container
+                .on_action(window.listener_for(&state, MarkdownEditorState::backspace))
+                .on_action(window.listener_for(&state, MarkdownEditorState::delete))
+                .on_action(window.listener_for(&state, MarkdownEditorState::enter))
+                .on_action(window.listener_for(&state, MarkdownEditorState::tab))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_tab))
+                .on_action(window.listener_for(&state, MarkdownEditorState::left))
+                .on_action(window.listener_for(&state, MarkdownEditorState::right))
+                .on_action(window.listener_for(&state, MarkdownEditorState::up))
+                .on_action(window.listener_for(&state, MarkdownEditorState::down))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_left))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_right))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_up))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_down))
+                .on_action(window.listener_for(&state, MarkdownEditorState::home))
+                .on_action(window.listener_for(&state, MarkdownEditorState::end))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_home))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_end))
+                .on_action(window.listener_for(&state, MarkdownEditorState::document_start))
+                .on_action(window.listener_for(&state, MarkdownEditorState::document_end))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_document_start))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_document_end))
+                .on_action(window.listener_for(&state, MarkdownEditorState::word_left))
+                .on_action(window.listener_for(&state, MarkdownEditorState::word_right))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_word_left))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_word_right))
+                .on_action(window.listener_for(&state, MarkdownEditorState::delete_word_backward))
+                .on_action(window.listener_for(&state, MarkdownEditorState::delete_word_forward))
+                .on_action(window.listener_for(&state, MarkdownEditorState::delete_to_line_start))
+                .on_action(window.listener_for(&state, MarkdownEditorState::delete_to_line_end))
+                .on_action(window.listener_for(&state, MarkdownEditorState::select_all))
+                .on_action(window.listener_for(&state, MarkdownEditorState::copy))
+                .on_action(window.listener_for(&state, MarkdownEditorState::cut))
+                .on_action(window.listener_for(&state, MarkdownEditorState::paste))
+                .on_action(window.listener_for(&state, MarkdownEditorState::paste_plain))
+                // Map the Edit-menu action types (`gpui_component::input::*`)
+                // onto the editor's own implementations. The OS routes the Edit
+                // menu through the responder chain via the `OsAction::*`
+                // selectors; those land as `gpui_component::input::{Cut,Copy,
+                // Paste,SelectAll}` dispatched to the focused element.
+                .on_action(
+                    window.listener_for(&state, |this, _: &gpui_component::input::Cut, w, cx| {
+                        this.cut(&Cut, w, cx)
+                    }),
+                )
+                .on_action(
+                    window.listener_for(&state, |this, _: &gpui_component::input::Copy, w, cx| {
+                        this.copy(&Copy, w, cx)
+                    }),
+                )
+                .on_action(
+                    window.listener_for(&state, |this, _: &gpui_component::input::Paste, w, cx| {
+                        this.paste(&Paste, w, cx)
+                    }),
+                )
+                .on_action(window.listener_for(
+                    &state,
+                    |this, _: &gpui_component::input::SelectAll, w, cx| {
+                        this.select_all(&SelectAll, w, cx)
+                    },
+                ))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    window.listener_for(&state, MarkdownEditorState::on_mouse_down),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    window.listener_for(&state, MarkdownEditorState::on_mouse_up),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    window.listener_for(&state, MarkdownEditorState::on_mouse_up),
+                )
+                .on_mouse_move(window.listener_for(&state, MarkdownEditorState::on_mouse_move));
+        }
+
+        let spec_blocks = spec.blocks;
+        let block_count = spec_blocks.len();
+        let block_starts: Vec<usize> = spec_blocks.iter().map(|b| b.source_range.start).collect();
+        // Snapshot each block's container chain *before* moving the blocks
+        // into elements so we can hand each `BlockElement` the chains of its
+        // immediate neighbors (used to add breathing room at container
+        // boundaries).
         let containers_per_block: Vec<Vec<crate::render_spec::Container>> =
-            spec.blocks.iter().map(|b| b.containers.clone()).collect();
-        for (idx, block) in spec.blocks.into_iter().enumerate() {
+            spec_blocks.iter().map(|b| b.containers.clone()).collect();
+        for (idx, block) in spec_blocks.into_iter().enumerate() {
             let is_last = idx + 1 == block_count;
             let next_block_start = block_starts.get(idx + 1).copied();
             let prev_containers = idx
@@ -967,15 +1136,105 @@ impl Render for MarkdownEditor {
                 next_block_start,
                 prev_containers,
                 next_containers,
-                view.clone(),
+                state.clone(),
                 style.clone(),
             ));
         }
 
         // The first `BlockElement::paint` of the frame registers the
-        // `EntityInputHandler` (so IME / typed text routes through
-        // `replace_text_in_range`). The guard flag is reset above on each
-        // render.
+        // `EntityInputHandler` (IME / typed text → `replace_text_in_range`),
+        // unless `disabled`.
         container
     }
+}
+
+/// Install the editor's default macOS keymap, scoped to the `MarkdownEditor`
+/// key context. Self-contained so the editor is a drop-in like
+/// `gpui_component::Input` (whose keymap `gpui_component::init` installs) —
+/// the host calls this once at startup instead of hand-rolling the bindings.
+///
+/// The submit chords (`cmd-enter`, `cmd-shift-enter`) bind the `Enter` action
+/// with `secondary: true`; the handler emits
+/// [`MarkdownEditorEvent::PressEnter`] rather than inserting, so the host
+/// subscribes for submit instead of binding the chords itself.
+pub fn init(cx: &mut App) {
+    let ctx = Some("MarkdownEditor");
+    cx.bind_keys([
+        // Enter chords — plain/shift insert; cmd-variants emit PressEnter.
+        gpui::KeyBinding::new(
+            "enter",
+            Enter {
+                secondary: false,
+                shift: false,
+            },
+            ctx,
+        ),
+        gpui::KeyBinding::new(
+            "shift-enter",
+            Enter {
+                secondary: false,
+                shift: true,
+            },
+            ctx,
+        ),
+        gpui::KeyBinding::new(
+            "cmd-enter",
+            Enter {
+                secondary: true,
+                shift: false,
+            },
+            ctx,
+        ),
+        gpui::KeyBinding::new(
+            "cmd-shift-enter",
+            Enter {
+                secondary: true,
+                shift: true,
+            },
+            ctx,
+        ),
+        // Editing
+        gpui::KeyBinding::new("backspace", Backspace, ctx),
+        gpui::KeyBinding::new("delete", Delete, ctx),
+        gpui::KeyBinding::new("tab", Tab, ctx),
+        gpui::KeyBinding::new("shift-tab", ShiftTab, ctx),
+        // Word / line delete (macOS standard: Option for word, Cmd for line).
+        gpui::KeyBinding::new("alt-backspace", DeleteWordBackward, ctx),
+        gpui::KeyBinding::new("alt-delete", DeleteWordForward, ctx),
+        gpui::KeyBinding::new("cmd-backspace", DeleteToLineStart, ctx),
+        gpui::KeyBinding::new("cmd-delete", DeleteToLineEnd, ctx),
+        // Caret motion
+        gpui::KeyBinding::new("left", Left, ctx),
+        gpui::KeyBinding::new("right", Right, ctx),
+        gpui::KeyBinding::new("up", Up, ctx),
+        gpui::KeyBinding::new("down", Down, ctx),
+        gpui::KeyBinding::new("shift-left", ShiftLeft, ctx),
+        gpui::KeyBinding::new("shift-right", ShiftRight, ctx),
+        gpui::KeyBinding::new("shift-up", ShiftUp, ctx),
+        gpui::KeyBinding::new("shift-down", ShiftDown, ctx),
+        gpui::KeyBinding::new("home", Home, ctx),
+        gpui::KeyBinding::new("end", End, ctx),
+        gpui::KeyBinding::new("cmd-left", Home, ctx),
+        gpui::KeyBinding::new("cmd-right", End, ctx),
+        gpui::KeyBinding::new("shift-home", ShiftHome, ctx),
+        gpui::KeyBinding::new("shift-end", ShiftEnd, ctx),
+        gpui::KeyBinding::new("cmd-shift-left", ShiftHome, ctx),
+        gpui::KeyBinding::new("cmd-shift-right", ShiftEnd, ctx),
+        gpui::KeyBinding::new("cmd-up", DocumentStart, ctx),
+        gpui::KeyBinding::new("cmd-down", DocumentEnd, ctx),
+        gpui::KeyBinding::new("cmd-shift-up", ShiftDocumentStart, ctx),
+        gpui::KeyBinding::new("cmd-shift-down", ShiftDocumentEnd, ctx),
+        // Word-granular motion (macOS standard: Option+arrows).
+        gpui::KeyBinding::new("alt-left", WordLeft, ctx),
+        gpui::KeyBinding::new("alt-right", WordRight, ctx),
+        gpui::KeyBinding::new("alt-shift-left", ShiftWordLeft, ctx),
+        gpui::KeyBinding::new("alt-shift-right", ShiftWordRight, ctx),
+        // Clipboard — scoped to the editor context so they coexist with
+        // `gpui_component::Input`'s own `Input`-context bindings.
+        gpui::KeyBinding::new("cmd-a", SelectAll, ctx),
+        gpui::KeyBinding::new("cmd-c", Copy, ctx),
+        gpui::KeyBinding::new("cmd-x", Cut, ctx),
+        gpui::KeyBinding::new("cmd-v", Paste, ctx),
+        gpui::KeyBinding::new("cmd-shift-v", PastePlain, ctx),
+    ]);
 }
