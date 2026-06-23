@@ -11,6 +11,7 @@
 #[cfg(target_os = "macos")]
 mod visual {
     pub mod cases;
+    pub mod fixtures;
     pub mod harness;
 }
 
