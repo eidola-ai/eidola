@@ -45,10 +45,12 @@ use std::rc::Rc;
 use gpui::{App, SharedString, Window};
 use gpui_component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 
-/// Body font family. Must match the family name embedded in the bundled TTFs.
+/// Prose font family. Must match the family name embedded in the bundled TTFs.
 /// CoreText returns the typographic family (nid 16) when set, otherwise nid 1;
 /// for our 16pt statics that resolves to `Newsreader 16pt` for every face.
-const FONT_FAMILY: &str = "Newsreader 16pt";
+/// Public so prose/narrative content can opt into Newsreader explicitly while
+/// the theme leaves components on the system UI font.
+pub const FONT_FAMILY: &str = "Newsreader 16pt";
 
 /// 16pt static instances from `productiontype/Newsreader`. Five faces are the
 /// minimum to make markdown bold/italic/heading weights render correctly:
@@ -115,7 +117,11 @@ fn circadian_day() -> ThemeConfig {
         is_default: true,
         name: SharedString::new_static("Circadian Day"),
         mode: ThemeMode::Light,
-        font_family: Some(SharedString::new_static(FONT_FAMILY)),
+        // Components (buttons, chrome, bylines) use the default system UI font.
+        // Prose/narrative content opts into Newsreader explicitly via its own
+        // `MarkdownStyle` (see `FONT_FAMILY`); the two font systems are kept
+        // separate on purpose.
+        font_family: None,
         font_size: Some(14.),
         mono_font_family: None,
         mono_font_size: Some(14.),
@@ -133,11 +139,11 @@ fn day_colors() -> ThemeConfigColors {
     // Surfaces — every neutral is the anchor's warm family, translated up
     // in lightness so cards/chips/rules keep their relative depth on the
     // brighter paper.
-    c.background = some("#fbf9f9"); // anchor: warm paper
+    c.background = some("#ffffff"); // anchor: warm paper
     c.foreground = some("#000000"); // warm ink
     c.border = some("#e0d9cf"); // hairline rule
     c.input = some("#ece5db"); // card-border
-    c.muted = some("#f8f3ec"); // code-bg
+    c.muted = some("#fbfbfb"); // code-bg (previously #fbf9f9)
     c.muted_foreground = some("#696258"); // text-sub
     c.popover = some("#fffefb"); // card
     c.popover_foreground = some("#1e1c19");
@@ -212,7 +218,9 @@ fn circadian_night() -> ThemeConfig {
         is_default: true,
         name: SharedString::new_static("Circadian Night"),
         mode: ThemeMode::Dark,
-        font_family: Some(SharedString::new_static(FONT_FAMILY)),
+        // System UI font for components; prose opts into Newsreader itself.
+        font_family: None,
+        font_size: Some(14.),
         radius: Some(8),
         radius_lg: Some(12),
         shadow: Some(true),
