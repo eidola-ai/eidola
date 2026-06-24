@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use eidola_gui::theme;
 use gpui::*;
@@ -33,6 +35,11 @@ const SIDE_PAD: Pixels = px(40.);
 /// that separates one depth level (one row of the tree) from the next.
 const POST_PAD_Y: Pixels = px(40.);
 const BAND_HEIGHT: Pixels = px(48.);
+
+/// Width of the topology minimap pinned to the right edge.
+const MINIMAP_WIDTH: Pixels = px(56.);
+/// Gap between sibling columns within a minimap row.
+const MINIMAP_COL_GAP: Pixels = px(6.);
 
 /// One post in the conversation tree: who wrote it, when, its markdown content,
 /// and its replies. The space is a tree of these (replies only); the UI follows
@@ -87,6 +94,16 @@ pub struct SpaceView {
     /// The axis the current scroll gesture is locked to (see [`ScrollAxis`]);
     /// `None` between gestures.
     scroll_axis: Option<ScrollAxis>,
+    /// Painted bounds of every post, keyed by node id, recorded each frame by a
+    /// `canvas` overlay (see [`record_bounds`]). The topology minimap reads
+    /// these (from the previous frame) to size its rows and decide which spans
+    /// are on-screen. Off-screen posts are still measured — the transcript is a
+    /// plain `overflow_scroll`, not a virtualized list, so every post prepaints.
+    post_bounds: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
+    /// Signature of the last minimap inputs (post bounds + viewport), so a
+    /// reflow or scroll triggers exactly one follow-up frame to redraw the
+    /// minimap, converging when the layout settles.
+    minimap_sig: f32,
     /// Set on mouse-down in the title-bar band, consumed on the first
     /// mouse-move to begin a native window drag (mirrors gpui-component's
     /// `TitleBar`: `start_window_move` wants a drag event, not the down).
@@ -109,6 +126,8 @@ impl SpaceView {
             bodies,
             scrolls,
             scroll_axis: None,
+            post_bounds: Rc::new(RefCell::new(HashMap::new())),
+            minimap_sig: f32::NAN,
             should_move_window: false,
         }
     }
@@ -153,6 +172,97 @@ impl SpaceView {
         let scrolled = (-handle.offset().x).as_f32();
         let idx = (scrolled / stride).round() as i64;
         idx.clamp(0, count as i64 - 1) as usize
+    }
+
+    /// The currently-viewed path through the tree as a list of levels. Level 0
+    /// is the root alone; each subsequent level is the children of the level
+    /// above's active node, paired with that active index.
+    fn selected_levels(&self, page_width: Pixels) -> Vec<(Vec<&Node>, usize)> {
+        let mut levels = vec![(vec![&self.root], 0usize)];
+        let mut node = &self.root;
+        while !node.children.is_empty() {
+            let active = self.active_child_index(node.id, page_width, node.children.len());
+            levels.push((node.children.iter().collect(), active));
+            node = &node.children[active];
+        }
+        levels
+    }
+
+    /// A cheap hash of the minimap's inputs (recorded post bounds + viewport
+    /// height) so `render` can tell when a redraw is warranted.
+    fn minimap_signature(&self, viewport_h: Pixels) -> f32 {
+        let mut sig = viewport_h.as_f32();
+        for (id, b) in self.post_bounds.borrow().iter() {
+            sig += id.len() as f32 + b.origin.y.as_f32() * 2.0 + b.size.height.as_f32() * 3.0;
+        }
+        sig
+    }
+
+    /// The topology minimap: a right-edge bar whose rows are the levels of the
+    /// selected path. Each row's height is the *selected* post's real height
+    /// (shared by every column in the row, so the unselected siblings are purely
+    /// topological), and the band gaps mirror the real inter-post spacing — so
+    /// the selected path is a true spatial map of the document.
+    ///
+    /// The scale is **fixed**: the longest possible root-to-leaf branch fills the
+    /// bar exactly (bottom-pinned), and a shorter selected branch ends partway
+    /// down with slack below it — just like the real scroll view. Because the
+    /// scale doesn't depend on the current selection, switching a branch leaves
+    /// every pixel above the change identical.
+    ///
+    /// The selected branch is drawn dark where it's on-screen and medium where
+    /// it's scrolled off; the unselected siblings (reachable with one horizontal
+    /// gesture) are drawn light.
+    fn render_minimap(
+        &self,
+        page_width: Pixels,
+        viewport_h: Pixels,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let fg = cx.theme().foreground;
+        let light = fg.opacity(0.18);
+        let medium = fg.opacity(0.45);
+        let dark = fg.opacity(0.78);
+
+        let container = div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(MINIMAP_WIDTH);
+
+        let bounds = self.post_bounds.borrow();
+        let height_of = |id: &str| bounds.get(id).map(|b| b.size.height.as_f32()).unwrap_or(0.);
+
+        // Fixed scale: the tallest possible branch fills the bar, independent of
+        // what's currently selected.
+        let longest = max_path_height(&self.root, &bounds);
+        if longest <= 0.0 || viewport_h <= px(0.) {
+            return container; // not measured yet
+        }
+        let scale = viewport_h.as_f32() / longest;
+
+        let levels = self.selected_levels(page_width);
+        let mut col = v_flex().w_full();
+        for (level, (sibs, active)) in levels.iter().enumerate() {
+            if level > 0 {
+                // The separator band's share of the scaled height.
+                col = col.child(div().w_full().h(px(BAND_HEIGHT.as_f32() * scale)));
+            }
+            // Every column in the row takes the *selected* branch's height.
+            let row_h = px(height_of(sibs[*active].id) * scale);
+            let mut row = h_flex().w_full().h(row_h).gap(MINIMAP_COL_GAP);
+            for (i, sib) in sibs.iter().enumerate() {
+                let cell = if i == *active {
+                    selected_column(bounds.get(sib.id).copied(), viewport_h, row_h, dark, medium)
+                } else {
+                    div().w_full().h_full().bg(light)
+                };
+                row = row.child(div().flex_1().h_full().child(cell));
+            }
+            col = col.child(row);
+        }
+        container.child(col)
     }
 
     /// Render a node's whole subtree: its post, then (if it has replies) a
@@ -277,6 +387,7 @@ impl SpaceView {
         );
 
         h_flex()
+            .relative()
             .w(page_width)
             .py(POST_PAD_Y)
             .justify_center()
@@ -284,6 +395,9 @@ impl SpaceView {
             .gap(GUTTER_GAP)
             .child(byline)
             .child(body)
+            // Records this post's painted bounds for the minimap (no layout
+            // effect — absolute overlay).
+            .child(record_bounds(self.post_bounds.clone(), node.id))
     }
 
     /// A draggable band across the top of the window standing in for the
@@ -319,7 +433,19 @@ impl SpaceView {
 impl Render for SpaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let page_width = window.viewport_size().width;
+        let viewport = window.viewport_size();
+        let page_width = viewport.width;
+
+        // The minimap reads bounds recorded during the *previous* paint. When
+        // those (or the viewport) change — reflow, scroll, selection — schedule
+        // one follow-up frame so the minimap catches up; this converges once the
+        // layout is stable, so it's not a per-frame spin.
+        let sig = self.minimap_signature(viewport.height);
+        if self.minimap_sig.to_bits() != sig.to_bits() {
+            self.minimap_sig = sig;
+            let entity = cx.entity();
+            window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
+        }
 
         // The whole tree is one recursively-nested element rooted at A.
         let tree = self.render_node(&self.root, page_width, cx);
@@ -345,7 +471,92 @@ impl Render for SpaceView {
                 scroll.style().restrict_scroll_to_axis = Some(true);
                 scroll
             })
+            // Topology minimap, painted last so it sits over everything.
+            .child(self.render_minimap(page_width, viewport.height, cx))
     }
+}
+
+/// The tallest root-to-leaf path height (posts + bands) using recorded post
+/// heights — the fixed denominator the minimap scales against, so the longest
+/// possible branch exactly fills the bar.
+fn max_path_height(node: &Node, bounds: &HashMap<&'static str, Bounds<Pixels>>) -> f32 {
+    let h = bounds
+        .get(node.id)
+        .map(|b| b.size.height.as_f32())
+        .unwrap_or(0.0);
+    if node.children.is_empty() {
+        return h;
+    }
+    let deepest = node
+        .children
+        .iter()
+        .map(|c| max_path_height(c, bounds))
+        .fold(0.0_f32, f32::max);
+    h + BAND_HEIGHT.as_f32() + deepest
+}
+
+/// An invisible, zero-layout-impact overlay that records its (absolute) painted
+/// bounds into `map` under `id` each frame. Placed over a post so the minimap
+/// can read the post's height and on-screen position.
+fn record_bounds(
+    map: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
+    id: &'static str,
+) -> impl IntoElement {
+    canvas(
+        move |bounds, _, _| {
+            map.borrow_mut().insert(id, bounds);
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full()
+}
+
+/// The minimap cell for the *selected* branch at a level: a full-height column
+/// split into medium (scrolled-off) and dark (on-screen) spans, derived from
+/// the post's painted bounds against the visible region.
+///
+/// Two corrections turn the recorded bounds into the post's true on-screen
+/// block:
+///
+/// - **`origin.y - POST_PAD_Y`.** The bounds-recorder `canvas`
+///   (`.absolute().size_full()`) is laid out at the post's *content-box* origin
+///   (inset by the post's vertical padding) yet sized to the full element, so
+///   its recorded `origin.y` sits `POST_PAD_Y` too low while its `height` is
+///   already the true block height. Subtracting `POST_PAD_Y` recovers the top.
+/// - **visible top = `TITLE_BAR_RESERVE`, not 0.** The content rests
+///   `TITLE_BAR_RESERVE` below the window top (the transparent-titlebar reserve)
+///   and that band is overlaid, so it's the real visible edge. Using 0 left a
+///   dead-zone where the first `TITLE_BAR_RESERVE` px of scrolling didn't move
+///   the dark span.
+fn selected_column(
+    post: Option<Bounds<Pixels>>,
+    viewport_h: Pixels,
+    col_h: Pixels,
+    dark: Hsla,
+    medium: Hsla,
+) -> Div {
+    let Some(pb) = post else {
+        return div().w_full().h(col_h).bg(medium);
+    };
+    let top = pb.origin.y.as_f32() - POST_PAD_Y.as_f32();
+    let height = pb.size.height.as_f32().max(1.0);
+    let vis_top = top.max(TITLE_BAR_RESERVE.as_f32());
+    let vis_bot = (top + height).min(viewport_h.as_f32());
+    if vis_bot <= vis_top {
+        // Fully scrolled off-screen.
+        return div().w_full().h(col_h).bg(medium);
+    }
+    let ch = col_h.as_f32();
+    let above = ((vis_top - top) / height).clamp(0.0, 1.0) * ch;
+    let visible = ((vis_bot - vis_top) / height).clamp(0.0, 1.0) * ch;
+    let below = (ch - above - visible).max(0.0);
+    v_flex()
+        .w_full()
+        .h(col_h)
+        .child(div().w_full().h(px(above)).bg(medium))
+        .child(div().w_full().h(px(visible)).bg(dark))
+        .child(div().w_full().h(px(below)).bg(medium))
 }
 
 /// The faint full-bleed separator band between a post and its replies. When the
