@@ -142,6 +142,12 @@ pub struct SpaceView {
     /// branch and its resting x are pinned here until the next gesture, so any
     /// trailing OS momentum is absorbed instead of drifting the page off-branch.
     snap_pin: Option<(&'static str, f32)>,
+    /// The `page_width` of the previous frame. Branch offsets are absolute
+    /// pixels but pages are window-width apart, so a window resize would shift
+    /// every offset relative to its branches. Diffing this against the current
+    /// width lets us remap offsets by the stride ratio (see
+    /// [`SpaceView::remap_for_resize`]), keeping the selected branch invariant.
+    last_page_width: Option<Pixels>,
     /// Painted bounds of every post, keyed by node id, recorded each frame by a
     /// `canvas` overlay (see [`record_bounds`]). The topology minimap reads
     /// these (from the previous frame) to size its rows and decide which spans
@@ -187,6 +193,7 @@ impl SpaceView {
             last_h_delta: px(0.),
             snap: None,
             snap_pin: None,
+            last_page_width: None,
             post_bounds: Rc::new(RefCell::new(HashMap::new())),
             minimap_sig: f32::NAN,
             minimap_visible: false,
@@ -378,6 +385,27 @@ impl SpaceView {
         if let Some(handle) = self.scrolls.get(node_id) {
             let off = handle.offset();
             handle.set_offset(point(px(x), off.y));
+        }
+    }
+
+    /// Rescale every branch scroller's horizontal offset by `ratio` (the new
+    /// page stride over the old) after a window resize. Pages sit at
+    /// `x = -index * stride`, so scaling the offset by the stride ratio keeps the
+    /// *exact* fractional page position — a snapped branch stays snapped on the
+    /// same branch (no glide), and the selected path is invariant to width. Any
+    /// in-flight glide / settle-pin is rescaled the same way so it stays
+    /// consistent if a resize lands mid-animation.
+    fn remap_for_resize(&mut self, ratio: f32) {
+        for handle in self.scrolls.values() {
+            let off = handle.offset();
+            handle.set_offset(point(px(off.x.as_f32() * ratio), off.y));
+        }
+        if let Some(a) = self.snap.as_mut() {
+            a.from_x *= ratio;
+            a.to_x *= ratio;
+        }
+        if let Some((_, x)) = self.snap_pin.as_mut() {
+            *x *= ratio;
         }
     }
 
@@ -728,6 +756,23 @@ impl Render for SpaceView {
         let theme = cx.theme();
         let viewport = window.viewport_size();
         let page_width = viewport.width;
+
+        // Window resize: branch offsets are absolute pixels but pages are a
+        // window-width apart, so a width change would slide every offset relative
+        // to its branches — leaving them mid-page and even reselecting a branch
+        // on a discrete jump (zoom / fullscreen / tiling). Remap every offset by
+        // the stride ratio so the selected branch and exact position survive any
+        // resize. We have no resize event with before/after, but the previous
+        // frame's width is enough — even a single-frame jump diffs cleanly here.
+        if let Some(prev) = self.last_page_width
+            && prev != page_width
+            && prev > px(0.)
+            && page_width > px(0.)
+        {
+            let ratio = (page_width + BAND_HEIGHT).as_f32() / (prev + BAND_HEIGHT).as_f32();
+            self.remap_for_resize(ratio);
+        }
+        self.last_page_width = Some(page_width);
 
         // The minimap reads bounds recorded during the *previous* paint. When
         // those (or the viewport) change — reflow, scroll, selection — schedule
