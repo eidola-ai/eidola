@@ -199,13 +199,13 @@ fn day_colors() -> ThemeConfigColors {
     c.group_box_foreground = some("#1e1c19");
 
     // Lists / scroll
-    // c.list = some("#fefaf5");
-    // c.list_even = some("#f8f3ec");
-    // c.list_head = some("#f6f1e9");
-    // c.list_hover = some("#f2ebe1");
-    // c.scrollbar = some("#fefaf500");
-    // c.scrollbar_thumb = some("#e0d9cf");
-    // c.scrollbar_thumb_hover = some("#a39a8a");
+    c.list = some("#fefaf5");
+    c.list_even = some("#f8f3ec");
+    c.list_head = some("#f6f1e9");
+    c.list_hover = some("#f2ebe1");
+    c.scrollbar = some("#fefaf500");
+    c.scrollbar_thumb = some("#e0d9cf");
+    c.scrollbar_thumb_hover = some("#a39a8a");
     c
 }
 

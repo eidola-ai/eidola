@@ -30,7 +30,6 @@ const PROSE_LINE_HEIGHT: f32 = 1.65;
 const GUTTER_WIDTH: Pixels = px(120.);
 const GUTTER_GAP: Pixels = px(28.);
 const BODY_MAX_WIDTH: Pixels = px(600.);
-const SIDE_PAD: Pixels = px(40.);
 
 /// Vertical breathing room around each post, plus the faint full-bleed band
 /// that separates one depth level (one row of the tree) from the next.
@@ -38,14 +37,14 @@ const POST_PAD_Y: Pixels = px(40.);
 const BAND_HEIGHT: Pixels = px(48.);
 
 /// Width of the topology minimap pinned to the right edge.
-const MINIMAP_WIDTH: Pixels = px(56.);
+const MINIMAP_WIDTH: Pixels = px(36.);
 /// Gap between sibling columns within a minimap row.
-const MINIMAP_COL_GAP: Pixels = px(6.);
+const MINIMAP_COL_GAP: Pixels = px(4.);
 /// How long the minimap lingers after scrolling stops / the cursor leaves it,
 /// before it fades (mirrors macOS overlay scrollbars).
-const MINIMAP_HIDE_DELAY: Duration = Duration::from_secs(1);
+const MINIMAP_HIDE_DELAY: Duration = Duration::from_millis(400);
 /// Fade-out duration once hiding begins.
-const MINIMAP_FADE: Duration = Duration::from_millis(400);
+const MINIMAP_FADE: Duration = Duration::from_millis(200);
 
 /// One post in the conversation tree: who wrote it, when, its markdown content,
 /// and its replies. The space is a tree of these (replies only); the UI follows
@@ -286,10 +285,10 @@ impl SpaceView {
         viewport_h: Pixels,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let fg = cx.theme().foreground;
+        let fg = cx.theme().scrollbar_thumb;
         let light = fg.opacity(0.18);
-        let medium = fg.opacity(0.45);
-        let dark = fg.opacity(0.78);
+        let medium = cx.theme().scrollbar_thumb.opacity(0.45);
+        let dark = cx.theme().scrollbar_thumb_hover.opacity(0.78);
 
         let mut container = div()
             .id("minimap")
@@ -451,7 +450,7 @@ impl SpaceView {
     fn render_post(&self, node: &Node, page_width: Pixels, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        let body_width = (page_width - GUTTER_WIDTH - GUTTER_GAP - SIDE_PAD * 2.)
+        let body_width = (page_width - GUTTER_WIDTH * 1.5 - GUTTER_GAP * 2)
             .min(BODY_MAX_WIDTH)
             .max(px(240.));
 
@@ -460,6 +459,7 @@ impl SpaceView {
             .w(GUTTER_WIDTH)
             .flex_none()
             .items_end()
+            .pt_5()
             .child(
                 div()
                     .text_sm()
@@ -492,6 +492,7 @@ impl SpaceView {
             .gap(GUTTER_GAP)
             .child(byline)
             .child(body)
+            .pr(GUTTER_WIDTH / 2. + GUTTER_GAP)
             // Records this post's painted bounds for the minimap (no layout
             // effect — absolute overlay).
             .child(record_bounds(self.post_bounds.clone(), node.id))
