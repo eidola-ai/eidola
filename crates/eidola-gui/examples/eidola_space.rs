@@ -50,6 +50,15 @@ struct Node {
     children: Vec<Node>,
 }
 
+/// Which axis a scroll gesture is locked to. Determined from the first real
+/// movement of a gesture and held until the gesture ends, so a mostly-vertical
+/// scroll never nudges the branches sideways (and vice versa).
+#[derive(Clone, Copy, PartialEq)]
+enum ScrollAxis {
+    Horizontal,
+    Vertical,
+}
+
 /// The space view renders a conversation *tree* as **recursively nested**
 /// scrollers. Each node renders its post, then (if it has replies) a separator
 /// band and a horizontal scroller whose pages are its children — and each of
@@ -71,9 +80,13 @@ pub struct SpaceView {
     /// One read-only markdown-editor state per node, keyed by node id.
     bodies: HashMap<&'static str, Entity<MarkdownEditorState>>,
     /// One horizontal `ScrollHandle` per node that has children, keyed by node
-    /// id. Only used to read the scroll position back (to highlight the active
-    /// page-indicator dot); the nesting itself carries the structure.
+    /// id. Read back to highlight the active page-indicator dot, and written
+    /// directly to undo the built-in scroller's stray horizontal nudge during a
+    /// vertical gesture.
     scrolls: HashMap<&'static str, ScrollHandle>,
+    /// The axis the current scroll gesture is locked to (see [`ScrollAxis`]);
+    /// `None` between gestures.
+    scroll_axis: Option<ScrollAxis>,
     /// Set on mouse-down in the title-bar band, consumed on the first
     /// mouse-move to begin a native window drag (mirrors gpui-component's
     /// `TitleBar`: `start_window_move` wants a drag event, not the down).
@@ -95,8 +108,32 @@ impl SpaceView {
             root,
             bodies,
             scrolls,
+            scroll_axis: None,
             should_move_window: false,
         }
+    }
+
+    /// Lock the scroll gesture to an axis. `Started`/`Ended` are gesture
+    /// boundaries that clear the lock; the first real movement of the next
+    /// gesture sets it. gpui has no `scrollend`, but macOS reports trackpad
+    /// phases (Began → `Started`, lift → `Ended`); momentum arrives as `Moved`
+    /// and simply re-locks to the same axis.
+    fn resolve_scroll_axis(&mut self, phase: TouchPhase, delta: Point<Pixels>) -> ScrollAxis {
+        if !matches!(phase, TouchPhase::Moved) {
+            self.scroll_axis = None;
+        }
+        if let Some(axis) = self.scroll_axis {
+            return axis;
+        }
+        let axis = if delta.y.as_f32().abs() >= delta.x.as_f32().abs() {
+            ScrollAxis::Vertical
+        } else {
+            ScrollAxis::Horizontal
+        };
+        if !delta.x.is_zero() || !delta.y.is_zero() {
+            self.scroll_axis = Some(axis);
+        }
+        axis
     }
 
     /// Which child page a node's scroller is resting on, derived from its scroll
@@ -147,17 +184,37 @@ impl SpaceView {
         // `items_stretch` so the vertical branch separators (and short branch
         // pages) fill the scroller's full height — the slack of a shorter branch
         // ends up at its bottom.
+        let node_id = node.id;
         let mut strip = h_flex()
             .id(SharedString::from(format!("{}-children", node.id)))
             .w(page_width)
             .items_stretch()
             .overflow_x_scroll()
-            .on_scroll_wheel(cx.listener(|_, ev: &ScrollWheelEvent, window, cx| {
+            // The gesture's locked axis decides which container moves. For a
+            // horizontal gesture the innermost branch scroller under the cursor
+            // claims it (its built-in already applied delta.x) and stops, so no
+            // ancestor scroller also moves. For a vertical gesture we *don't*
+            // stop: we only undo the stray horizontal step the built-in applied
+            // here, and let the event bubble so the one outer scroller does the
+            // vertical scroll **natively** — preserving smooth momentum. Every
+            // ancestor branch scroller undoes its own step the same way.
+            .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
                 let delta = ev.delta.pixel_delta(window.line_height());
-                if delta.x.as_f32().abs() > delta.y.as_f32().abs() {
-                    cx.stop_propagation();
+                match this.resolve_scroll_axis(ev.touch_phase, delta) {
+                    ScrollAxis::Horizontal => cx.stop_propagation(),
+                    ScrollAxis::Vertical => {
+                        if !delta.x.is_zero() {
+                            if let Some(handle) = this.scrolls.get(node_id) {
+                                let off = handle.offset();
+                                handle.set_offset(point(off.x - delta.x, off.y));
+                            }
+                        }
+                    }
                 }
             }));
+        // Only respond to the dominant axis — never let a pure-vertical delta
+        // bleed into horizontal motion via gpui's cross-axis fallback.
+        strip.style().restrict_scroll_to_axis = Some(true);
         if let Some(handle) = self.scrolls.get(node.id) {
             strip = strip.track_scroll(handle);
         }
@@ -276,13 +333,18 @@ impl Render for SpaceView {
             .font_family(theme.font_family.clone())
             .text_color(theme.foreground)
             .child(self.render_title_bar(cx))
-            .child(
-                div()
+            .child({
+                let mut scroll = div()
                     .id("scroll")
                     .size_full()
                     .overflow_y_scroll()
-                    .child(v_flex().w_full().pt(TITLE_BAR_RESERVE).child(tree)),
-            )
+                    .child(v_flex().w_full().pt(TITLE_BAR_RESERVE).child(tree));
+                // Vertical only: a horizontal swipe over a region with no branch
+                // scroller (e.g. the root post) must not scroll the page sideways
+                // (or, via the fallback, vertically).
+                scroll.style().restrict_scroll_to_axis = Some(true);
+                scroll
+            })
     }
 }
 
