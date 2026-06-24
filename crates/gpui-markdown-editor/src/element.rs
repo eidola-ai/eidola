@@ -1352,12 +1352,12 @@ impl Element for BlockElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (focus_handle, should_register) = self.editor.update(cx, |editor, _| {
+        let (focus_handle, should_register, disabled) = self.editor.update(cx, |editor, _| {
             // Skip IME registration entirely when read-only — a disabled
             // editor accepts no typed text or composition.
             let should = !editor.frame_input_handler_set && !editor.disabled;
             editor.frame_input_handler_set = true;
-            (editor.focus_handle.clone(), should)
+            (editor.focus_handle.clone(), should, editor.disabled)
         });
         if should_register {
             let editor_bounds = self.editor.read(cx).last_bounds.unwrap_or(bounds);
@@ -1582,7 +1582,10 @@ impl Element for BlockElement {
                     );
                 }
             }
-            if focused && let Some(tq) = cursor_for_delim {
+            if focused
+                && !disabled
+                && let Some(tq) = cursor_for_delim
+            {
                 window.paint_quad(tq.quad);
             }
 
@@ -1607,7 +1610,10 @@ impl Element for BlockElement {
                         );
                     }
                 }
-                if focused && let Some(tq) = cursor_for_content {
+                if focused
+                    && !disabled
+                    && let Some(tq) = cursor_for_content
+                {
                     window.paint_quad(tq.quad);
                 }
             });
@@ -1660,7 +1666,10 @@ impl Element for BlockElement {
             // paints exactly where its substitution placed pad
             // glyphs in the shaped line.
             paint_inline_image_overlays(&prepaint.inline_images, &prepaint.laid_out.lines, window);
-            if focused && let Some(tq) = cursor_quad {
+            if focused
+                && !disabled
+                && let Some(tq) = cursor_quad
+            {
                 window.paint_quad(tq.quad);
             }
         }

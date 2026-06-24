@@ -159,9 +159,11 @@ fn normalize_line_endings(text: &str) -> String {
 pub struct MarkdownEditorState {
     pub(crate) state: EditorState,
     pub focus_handle: FocusHandle,
-    /// When true, the element skips registering key/IME handlers and the
-    /// `EntityInputHandler` text-mutation methods early-return, so the surface
-    /// is read-only. Synced from the element's `.disabled(..)` prop each frame.
+    /// When true, the element skips registering mutating key/IME handlers, the
+    /// `EntityInputHandler` text-mutation methods early-return, and the caret is
+    /// not painted — so the surface is read-only. Selection, navigation, copy,
+    /// and select-all handlers are still registered, so the text can be selected
+    /// and copied. Synced from the element's `.disabled(..)` prop each frame.
     pub(crate) disabled: bool,
     is_selecting: bool,
     pub(crate) last_blocks: HashMap<usize, LaidOutBlock>,
@@ -975,9 +977,10 @@ impl MarkdownEditor {
         self
     }
 
-    /// Render read-only: no key/IME handlers are registered and the
-    /// `EntityInputHandler` text mutations early-return, so the surface
-    /// displays but rejects input. Mirrors `Input::disabled`.
+    /// Render read-only: no mutating key/IME handlers are registered, the
+    /// `EntityInputHandler` text mutations early-return, and the caret is
+    /// hidden, so the surface rejects edits. Text can still be selected (mouse
+    /// or shift-navigation) and copied. Mirrors `Input::disabled`.
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self
@@ -1025,7 +1028,10 @@ impl RenderOnce for MarkdownEditor {
             .id("markdown-editor")
             .key_context("MarkdownEditor")
             .track_focus(&state.read(cx).focus_handle)
-            .when(!disabled, |c| c.cursor(CursorStyle::IBeam))
+            // The IBeam cursor shows even when disabled: a read-only editor
+            // still supports selecting text (for copy), so the affordance
+            // should advertise that.
+            .cursor(CursorStyle::IBeam)
             .w_full()
             .flex()
             .flex_col()
@@ -1033,9 +1039,66 @@ impl RenderOnce for MarkdownEditor {
             .text_color(style.text_color)
             .font_family(style.font_family.clone());
 
-        // Key/IME handlers are registered only when editable. Each routes
-        // the action into the *state* entity via `window.listener_for`
-        // (the element→state bridge), the gpui-component idiom.
+        // Selection / navigation / copy handlers are registered even when
+        // disabled: a read-only editor still supports selecting text (mouse
+        // drag, shift-navigation, select-all) and copying it. None of these
+        // mutate the document. Each routes the action into the *state* entity
+        // via `window.listener_for` (the element→state bridge), the
+        // gpui-component idiom.
+        container = container
+            .on_action(window.listener_for(&state, MarkdownEditorState::left))
+            .on_action(window.listener_for(&state, MarkdownEditorState::right))
+            .on_action(window.listener_for(&state, MarkdownEditorState::up))
+            .on_action(window.listener_for(&state, MarkdownEditorState::down))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_left))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_right))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_up))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_down))
+            .on_action(window.listener_for(&state, MarkdownEditorState::home))
+            .on_action(window.listener_for(&state, MarkdownEditorState::end))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_home))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_end))
+            .on_action(window.listener_for(&state, MarkdownEditorState::document_start))
+            .on_action(window.listener_for(&state, MarkdownEditorState::document_end))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_document_start))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_document_end))
+            .on_action(window.listener_for(&state, MarkdownEditorState::word_left))
+            .on_action(window.listener_for(&state, MarkdownEditorState::word_right))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_word_left))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_word_right))
+            .on_action(window.listener_for(&state, MarkdownEditorState::select_all))
+            .on_action(window.listener_for(&state, MarkdownEditorState::copy))
+            // Map the read-only Edit-menu action types
+            // (`gpui_component::input::{Copy,SelectAll}`) onto the editor's own
+            // implementations. The OS routes the Edit menu through the
+            // responder chain via the `OsAction::*` selectors; those land as
+            // `gpui_component::input::*` dispatched to the focused element.
+            .on_action(
+                window.listener_for(&state, |this, _: &gpui_component::input::Copy, w, cx| {
+                    this.copy(&Copy, w, cx)
+                }),
+            )
+            .on_action(window.listener_for(
+                &state,
+                |this, _: &gpui_component::input::SelectAll, w, cx| {
+                    this.select_all(&SelectAll, w, cx)
+                },
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                window.listener_for(&state, MarkdownEditorState::on_mouse_down),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                window.listener_for(&state, MarkdownEditorState::on_mouse_up),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                window.listener_for(&state, MarkdownEditorState::on_mouse_up),
+            )
+            .on_mouse_move(window.listener_for(&state, MarkdownEditorState::on_mouse_move));
+
+        // Mutating handlers are registered only when editable.
         if !disabled {
             container = container
                 .on_action(window.listener_for(&state, MarkdownEditorState::backspace))
@@ -1043,74 +1106,26 @@ impl RenderOnce for MarkdownEditor {
                 .on_action(window.listener_for(&state, MarkdownEditorState::enter))
                 .on_action(window.listener_for(&state, MarkdownEditorState::tab))
                 .on_action(window.listener_for(&state, MarkdownEditorState::shift_tab))
-                .on_action(window.listener_for(&state, MarkdownEditorState::left))
-                .on_action(window.listener_for(&state, MarkdownEditorState::right))
-                .on_action(window.listener_for(&state, MarkdownEditorState::up))
-                .on_action(window.listener_for(&state, MarkdownEditorState::down))
-                .on_action(window.listener_for(&state, MarkdownEditorState::shift_left))
-                .on_action(window.listener_for(&state, MarkdownEditorState::shift_right))
-                .on_action(window.listener_for(&state, MarkdownEditorState::shift_up))
-                .on_action(window.listener_for(&state, MarkdownEditorState::shift_down))
-                .on_action(window.listener_for(&state, MarkdownEditorState::home))
-                .on_action(window.listener_for(&state, MarkdownEditorState::end))
-                .on_action(window.listener_for(&state, MarkdownEditorState::shift_home))
-                .on_action(window.listener_for(&state, MarkdownEditorState::shift_end))
-                .on_action(window.listener_for(&state, MarkdownEditorState::document_start))
-                .on_action(window.listener_for(&state, MarkdownEditorState::document_end))
-                .on_action(window.listener_for(&state, MarkdownEditorState::shift_document_start))
-                .on_action(window.listener_for(&state, MarkdownEditorState::shift_document_end))
-                .on_action(window.listener_for(&state, MarkdownEditorState::word_left))
-                .on_action(window.listener_for(&state, MarkdownEditorState::word_right))
-                .on_action(window.listener_for(&state, MarkdownEditorState::shift_word_left))
-                .on_action(window.listener_for(&state, MarkdownEditorState::shift_word_right))
                 .on_action(window.listener_for(&state, MarkdownEditorState::delete_word_backward))
                 .on_action(window.listener_for(&state, MarkdownEditorState::delete_word_forward))
                 .on_action(window.listener_for(&state, MarkdownEditorState::delete_to_line_start))
                 .on_action(window.listener_for(&state, MarkdownEditorState::delete_to_line_end))
-                .on_action(window.listener_for(&state, MarkdownEditorState::select_all))
-                .on_action(window.listener_for(&state, MarkdownEditorState::copy))
                 .on_action(window.listener_for(&state, MarkdownEditorState::cut))
                 .on_action(window.listener_for(&state, MarkdownEditorState::paste))
                 .on_action(window.listener_for(&state, MarkdownEditorState::paste_plain))
-                // Map the Edit-menu action types (`gpui_component::input::*`)
-                // onto the editor's own implementations. The OS routes the Edit
-                // menu through the responder chain via the `OsAction::*`
-                // selectors; those land as `gpui_component::input::{Cut,Copy,
-                // Paste,SelectAll}` dispatched to the focused element.
+                // Map the mutating Edit-menu action types
+                // (`gpui_component::input::{Cut,Paste}`) onto the editor's own
+                // implementations.
                 .on_action(
                     window.listener_for(&state, |this, _: &gpui_component::input::Cut, w, cx| {
                         this.cut(&Cut, w, cx)
                     }),
                 )
                 .on_action(
-                    window.listener_for(&state, |this, _: &gpui_component::input::Copy, w, cx| {
-                        this.copy(&Copy, w, cx)
-                    }),
-                )
-                .on_action(
                     window.listener_for(&state, |this, _: &gpui_component::input::Paste, w, cx| {
                         this.paste(&Paste, w, cx)
                     }),
-                )
-                .on_action(window.listener_for(
-                    &state,
-                    |this, _: &gpui_component::input::SelectAll, w, cx| {
-                        this.select_all(&SelectAll, w, cx)
-                    },
-                ))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    window.listener_for(&state, MarkdownEditorState::on_mouse_down),
-                )
-                .on_mouse_up(
-                    MouseButton::Left,
-                    window.listener_for(&state, MarkdownEditorState::on_mouse_up),
-                )
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    window.listener_for(&state, MarkdownEditorState::on_mouse_up),
-                )
-                .on_mouse_move(window.listener_for(&state, MarkdownEditorState::on_mouse_move));
+                );
         }
 
         let spec_blocks = spec.blocks;
