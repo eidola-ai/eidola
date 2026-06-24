@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use eidola_gui::theme;
 use gpui::*;
@@ -40,6 +41,11 @@ const BAND_HEIGHT: Pixels = px(48.);
 const MINIMAP_WIDTH: Pixels = px(56.);
 /// Gap between sibling columns within a minimap row.
 const MINIMAP_COL_GAP: Pixels = px(6.);
+/// How long the minimap lingers after scrolling stops / the cursor leaves it,
+/// before it fades (mirrors macOS overlay scrollbars).
+const MINIMAP_HIDE_DELAY: Duration = Duration::from_secs(1);
+/// Fade-out duration once hiding begins.
+const MINIMAP_FADE: Duration = Duration::from_millis(400);
 
 /// One post in the conversation tree: who wrote it, when, its markdown content,
 /// and its replies. The space is a tree of these (replies only); the UI follows
@@ -104,6 +110,16 @@ pub struct SpaceView {
     /// reflow or scroll triggers exactly one follow-up frame to redraw the
     /// minimap, converging when the layout settles.
     minimap_sig: f32,
+    /// macOS-style overlay-scrollbar visibility for the minimap.
+    /// `visible`: shown now (opacity 1). `gesturing`: fingers are on the
+    /// trackpad (between scroll `Started`/`Ended`), so it stays up even with no
+    /// movement. `hovered`: cursor over the bar. `fade_gen` bumps on each hide
+    /// to restart the fade-out animation. `hide_task` is the 1s linger timer.
+    minimap_visible: bool,
+    minimap_gesturing: bool,
+    minimap_hovered: bool,
+    minimap_fade_gen: usize,
+    minimap_hide_task: Option<Task<()>>,
     /// Set on mouse-down in the title-bar band, consumed on the first
     /// mouse-move to begin a native window drag (mirrors gpui-component's
     /// `TitleBar`: `start_window_move` wants a drag event, not the down).
@@ -128,6 +144,11 @@ impl SpaceView {
             scroll_axis: None,
             post_bounds: Rc::new(RefCell::new(HashMap::new())),
             minimap_sig: f32::NAN,
+            minimap_visible: false,
+            minimap_gesturing: false,
+            minimap_hovered: false,
+            minimap_fade_gen: 0,
+            minimap_hide_task: None,
             should_move_window: false,
         }
     }
@@ -153,6 +174,52 @@ impl SpaceView {
             self.scroll_axis = Some(axis);
         }
         axis
+    }
+
+    /// Record a scroll event for the minimap's show/hide. `moved` is whether
+    /// this event actually changed the scroll position (non-zero delta). Called
+    /// for every scroll event, whichever container handles it.
+    fn note_scroll_activity(&mut self, phase: TouchPhase, moved: bool, cx: &mut Context<Self>) {
+        match phase {
+            TouchPhase::Started => self.minimap_gesturing = true,
+            TouchPhase::Ended => self.minimap_gesturing = false,
+            TouchPhase::Moved => {}
+        }
+        // macOS-style: reveal only once the scroll actually moves, not on mere
+        // finger contact (a delta-free `Started`/stationary `Moved`). A contact
+        // that never scrolls thus never shows the bar.
+        if moved {
+            self.minimap_visible = true;
+        }
+        // Arm the linger timer on real movement, or on lift (so the 1s countdown
+        // starts precisely when the gesture ends). A contact-without-scroll
+        // arms nothing, leaving no stray polling task behind.
+        if moved || matches!(phase, TouchPhase::Ended) {
+            self.arm_minimap_hide(cx);
+            cx.notify();
+        }
+    }
+
+    /// (Re)start the linger timer. After `MINIMAP_HIDE_DELAY`, if fingers are
+    /// off the trackpad and the cursor isn't over the bar, fade it out;
+    /// otherwise re-check after another delay. Each scroll event / hover change
+    /// replaces this task, so the timer only elapses once everything has been
+    /// quiet for the full delay (covering momentum, which keeps emitting events,
+    /// and resting fingers, which keep `gesturing` set).
+    fn arm_minimap_hide(&mut self, cx: &mut Context<Self>) {
+        self.minimap_hide_task = Some(cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            cx.background_executor().timer(MINIMAP_HIDE_DELAY).await;
+            this.update(cx, |this, cx| {
+                if this.minimap_gesturing || this.minimap_hovered {
+                    this.arm_minimap_hide(cx);
+                } else if this.minimap_visible {
+                    this.minimap_visible = false;
+                    this.minimap_fade_gen = this.minimap_fade_gen.wrapping_add(1);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Which child page a node's scroller is resting on, derived from its scroll
@@ -218,13 +285,14 @@ impl SpaceView {
         page_width: Pixels,
         viewport_h: Pixels,
         cx: &Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let fg = cx.theme().foreground;
         let light = fg.opacity(0.18);
         let medium = fg.opacity(0.45);
         let dark = fg.opacity(0.78);
 
-        let container = div()
+        let mut container = div()
+            .id("minimap")
             .absolute()
             .top_0()
             .bottom_0()
@@ -237,32 +305,59 @@ impl SpaceView {
         // Fixed scale: the tallest possible branch fills the bar, independent of
         // what's currently selected.
         let longest = max_path_height(&self.root, &bounds);
-        if longest <= 0.0 || viewport_h <= px(0.) {
-            return container; // not measured yet
+        if longest > 0.0 && viewport_h > px(0.) {
+            let scale = viewport_h.as_f32() / longest;
+            let levels = self.selected_levels(page_width);
+            let mut col = v_flex().w_full();
+            for (level, (sibs, active)) in levels.iter().enumerate() {
+                if level > 0 {
+                    // The separator band's share of the scaled height.
+                    col = col.child(div().w_full().h(px(BAND_HEIGHT.as_f32() * scale)));
+                }
+                // Every column in the row takes the *selected* branch's height.
+                let row_h = px(height_of(sibs[*active].id) * scale);
+                let mut row = h_flex().w_full().h(row_h).gap(MINIMAP_COL_GAP);
+                for (i, sib) in sibs.iter().enumerate() {
+                    let cell = if i == *active {
+                        selected_column(
+                            bounds.get(sib.id).copied(),
+                            viewport_h,
+                            row_h,
+                            dark,
+                            medium,
+                        )
+                    } else {
+                        div().w_full().h_full().bg(light)
+                    };
+                    row = row.child(div().flex_1().h_full().child(cell));
+                }
+                col = col.child(row);
+            }
+            container = container.child(col);
         }
-        let scale = viewport_h.as_f32() / longest;
 
-        let levels = self.selected_levels(page_width);
-        let mut col = v_flex().w_full();
-        for (level, (sibs, active)) in levels.iter().enumerate() {
-            if level > 0 {
-                // The separator band's share of the scaled height.
-                col = col.child(div().w_full().h(px(BAND_HEIGHT.as_f32() * scale)));
-            }
-            // Every column in the row takes the *selected* branch's height.
-            let row_h = px(height_of(sibs[*active].id) * scale);
-            let mut row = h_flex().w_full().h(row_h).gap(MINIMAP_COL_GAP);
-            for (i, sib) in sibs.iter().enumerate() {
-                let cell = if i == *active {
-                    selected_column(bounds.get(sib.id).copied(), viewport_h, row_h, dark, medium)
-                } else {
-                    div().w_full().h_full().bg(light)
-                };
-                row = row.child(div().flex_1().h_full().child(cell));
-            }
-            col = col.child(row);
+        // macOS-style overlay visibility: shown instantly, faded out after the
+        // linger timer. Hovering the bar keeps it up.
+        if self.minimap_visible {
+            container
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    this.minimap_hovered = *hovered;
+                    this.arm_minimap_hide(cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else if self.minimap_fade_gen == 0 {
+            // Never shown yet — stay invisible without a fade-in flash.
+            container.opacity(0.0).into_any_element()
+        } else {
+            container
+                .with_animation(
+                    ("minimap-fade", self.minimap_fade_gen),
+                    Animation::new(MINIMAP_FADE),
+                    |el, delta| el.opacity(1.0 - delta),
+                )
+                .into_any_element()
         }
-        container.child(col)
     }
 
     /// Render a node's whole subtree: its post, then (if it has replies) a
@@ -310,6 +405,8 @@ impl SpaceView {
             // ancestor branch scroller undoes its own step the same way.
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
                 let delta = ev.delta.pixel_delta(window.line_height());
+                let moved = !delta.x.is_zero() || !delta.y.is_zero();
+                this.note_scroll_activity(ev.touch_phase, moved, cx);
                 match this.resolve_scroll_axis(ev.touch_phase, delta) {
                     ScrollAxis::Horizontal => cx.stop_propagation(),
                     ScrollAxis::Vertical => {
@@ -464,6 +561,13 @@ impl Render for SpaceView {
                     .id("scroll")
                     .size_full()
                     .overflow_y_scroll()
+                    // Catch scrolls that don't hit a branch scroller (e.g. over
+                    // the root post) for the minimap's show/hide.
+                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
+                        let delta = ev.delta.pixel_delta(window.line_height());
+                        let moved = !delta.x.is_zero() || !delta.y.is_zero();
+                        this.note_scroll_activity(ev.touch_phase, moved, cx);
+                    }))
                     .child(v_flex().w_full().pt(TITLE_BAR_RESERVE).child(tree));
                 // Vertical only: a horizontal swipe over a region with no branch
                 // scroller (e.g. the root post) must not scroll the page sideways
