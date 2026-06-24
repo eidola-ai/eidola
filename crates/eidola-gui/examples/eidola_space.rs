@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eidola_gui::theme;
 use gpui::*;
@@ -35,6 +35,11 @@ const BODY_MAX_WIDTH: Pixels = px(600.);
 /// that separates one depth level (one row of the tree) from the next.
 const POST_PAD_Y: Pixels = px(40.);
 const BAND_HEIGHT: Pixels = px(48.);
+
+/// Minimum per-event horizontal finger step (px) at release that counts as a
+/// directional *flick* — above this, the snap advances/retreats one branch in
+/// the flick's direction; below it, the snap goes to the nearest branch.
+const SNAP_FLING_THRESHOLD: f32 = 8.0;
 
 /// Width of the topology minimap pinned to the right edge.
 const MINIMAP_WIDTH: Pixels = px(36.);
@@ -71,6 +76,34 @@ enum ScrollAxis {
     Vertical,
 }
 
+/// An in-flight "scroll-snap" glide of one branch scroller toward a page
+/// boundary. gpui forwards macOS's already-decayed momentum deltas straight into
+/// the scroll offset and exposes no momentum-end signal (only the finger lift,
+/// `TouchPhase::Ended`), so a CSS-style "let momentum land on a snap point"
+/// isn't reachable by cooperating with the OS. Instead we take over at finger
+/// lift: capture the release velocity, then drive our own eased glide to the
+/// target branch and suppress the OS momentum that would otherwise fight it
+/// (see [`SpaceView::start_snap`]).
+#[derive(Clone, Copy)]
+struct SnapAnim {
+    /// The branch scroller (node with children) being animated.
+    node_id: &'static str,
+    /// Horizontal scroll offset (`ScrollHandle` x, ≤ 0) at the start and end of
+    /// the glide.
+    from_x: f32,
+    to_x: f32,
+    /// Wall-clock start and total duration of the glide.
+    start: Instant,
+    duration: Duration,
+}
+
+/// Cubic ease-out: fast departure, gentle arrival — reads as a thrown page
+/// floating to rest on its snap point.
+fn ease_out_cubic(t: f32) -> f32 {
+    let u = 1.0 - t;
+    1.0 - u * u * u
+}
+
 /// The space view renders a conversation *tree* as **recursively nested**
 /// scrollers. Each node renders its post, then (if it has replies) a separator
 /// band and a horizontal scroller whose pages are its children — and each of
@@ -99,6 +132,16 @@ pub struct SpaceView {
     /// The axis the current scroll gesture is locked to (see [`ScrollAxis`]);
     /// `None` between gestures.
     scroll_axis: Option<ScrollAxis>,
+    /// The most recent non-zero horizontal step of the live gesture, used as the
+    /// release velocity for the snap's flick decision. Reset on gesture start.
+    last_h_delta: Pixels,
+    /// The branch scroller currently gliding to a snap point (frame-driven), if
+    /// any (see [`SnapAnim`]). At most one snaps at a time.
+    snap: Option<SnapAnim>,
+    /// After a glide completes (or a release that was already aligned), the
+    /// branch and its resting x are pinned here until the next gesture, so any
+    /// trailing OS momentum is absorbed instead of drifting the page off-branch.
+    snap_pin: Option<(&'static str, f32)>,
     /// Painted bounds of every post, keyed by node id, recorded each frame by a
     /// `canvas` overlay (see [`record_bounds`]). The topology minimap reads
     /// these (from the previous frame) to size its rows and decide which spans
@@ -141,6 +184,9 @@ impl SpaceView {
             bodies,
             scrolls,
             scroll_axis: None,
+            last_h_delta: px(0.),
+            snap: None,
+            snap_pin: None,
             post_bounds: Rc::new(RefCell::new(HashMap::new())),
             minimap_sig: f32::NAN,
             minimap_visible: false,
@@ -219,6 +265,120 @@ impl SpaceView {
             })
             .ok();
         }));
+    }
+
+    /// Abort any in-flight snap glide and release its settle-pin. Called when a
+    /// fresh gesture begins, handing the branch's X back to the fingers.
+    fn cancel_snap(&mut self) {
+        self.snap = None;
+        self.snap_pin = None;
+    }
+
+    /// Begin (or immediately resolve) a snap glide for `node_id` from its current
+    /// resting position. Pages are `page_width + BAND_HEIGHT` apart; the target
+    /// branch is the nearest one, biased a page forward/back when the release was
+    /// a flick (`last_h_delta` past [`SNAP_FLING_THRESHOLD`]) — clamped to the
+    /// available branches. If already aligned we just pin; otherwise we start a
+    /// distance-scaled eased glide and kick the frame loop. Called once, on the
+    /// finger lift (`TouchPhase::Ended`) of a horizontal gesture.
+    fn start_snap(
+        &mut self,
+        node_id: &'static str,
+        page_width: Pixels,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if count <= 1 {
+            return;
+        }
+        let stride = (page_width + BAND_HEIGHT).as_f32();
+        if stride <= 0.0 {
+            return;
+        }
+        let off = match self.scrolls.get(node_id) {
+            Some(handle) => handle.offset(),
+            None => return,
+        };
+        let from_x = off.x.as_f32();
+        // Pages live at x = -index * stride, so the fractional page is -x / stride.
+        let cur = (-from_x) / stride;
+        let v = self.last_h_delta.as_f32();
+        // A forward flick (content dragged left) carries a negative delta.x.
+        let raw = if v <= -SNAP_FLING_THRESHOLD {
+            cur.floor() as i64 + 1
+        } else if v >= SNAP_FLING_THRESHOLD {
+            cur.ceil() as i64 - 1
+        } else {
+            cur.round() as i64
+        };
+        let target = raw.clamp(0, count as i64 - 1);
+        let to_x = -(target as f32) * stride;
+        let dist = (to_x - from_x).abs();
+        if dist < 0.5 {
+            // Already on a boundary: snap exactly and pin (absorbs stray momentum).
+            if let Some(handle) = self.scrolls.get(node_id) {
+                handle.set_offset(point(px(to_x), off.y));
+            }
+            self.snap = None;
+            self.snap_pin = Some((node_id, to_x));
+            cx.notify();
+            return;
+        }
+        // Scale the glide with distance so a single-branch hop is quick and a
+        // multi-branch correction still floats rather than lurches.
+        let dur = Duration::from_secs_f32((0.18 + (dist / stride) * 0.16).clamp(0.18, 0.42));
+        self.snap = Some(SnapAnim {
+            node_id,
+            from_x,
+            to_x,
+            start: Instant::now(),
+            duration: dur,
+        });
+        self.drive_snap(window, cx);
+    }
+
+    /// One frame of the active snap glide: ease the offset toward the target and,
+    /// until it arrives, schedule the next frame. On arrival the offset is pinned
+    /// (see [`SpaceView::snap_pin`]) so trailing momentum can't undo it.
+    fn drive_snap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(a) = self.snap else { return };
+        let t = (a.start.elapsed().as_secs_f32() / a.duration.as_secs_f32()).clamp(0.0, 1.0);
+        let x = a.from_x + (a.to_x - a.from_x) * ease_out_cubic(t);
+        if let Some(handle) = self.scrolls.get(a.node_id) {
+            let off = handle.offset();
+            handle.set_offset(point(px(x), off.y));
+        }
+        if t >= 1.0 {
+            self.snap = None;
+            self.snap_pin = Some((a.node_id, a.to_x));
+        } else {
+            let entity = cx.entity();
+            window.on_next_frame(move |window, cx| {
+                entity.update(cx, |this, cx| this.drive_snap(window, cx));
+            });
+        }
+        cx.notify();
+    }
+
+    /// Re-assert the glide-or-pin X for `node_id` over whatever the built-in
+    /// scroll listener just applied. Called from the horizontal scroll handler
+    /// (which runs *after* the built-in) so OS momentum arriving during/after the
+    /// glide is overwritten with the snapped position instead of moving the page.
+    /// A no-op when this node isn't snapping.
+    fn reassert_horizontal(&self, node_id: &str) {
+        let x = if let Some(a) = self.snap.filter(|a| a.node_id == node_id) {
+            let t = (a.start.elapsed().as_secs_f32() / a.duration.as_secs_f32()).clamp(0.0, 1.0);
+            a.from_x + (a.to_x - a.from_x) * ease_out_cubic(t)
+        } else if let Some((_, x)) = self.snap_pin.filter(|(id, _)| *id == node_id) {
+            x
+        } else {
+            return;
+        };
+        if let Some(handle) = self.scrolls.get(node_id) {
+            let off = handle.offset();
+            handle.set_offset(point(px(x), off.y));
+        }
     }
 
     /// Which child page a node's scroller is resting on, derived from its scroll
@@ -379,7 +539,7 @@ impl SpaceView {
 
         let count = node.children.len();
         let active = self.active_child_index(node.id, page_width, count);
-        column = column.child(render_band(page_width, count, active, &theme));
+        column = column.child(render_band(page_width, count, active, theme));
 
         // The branch scroller: each page is one child's full subtree. The
         // innermost scroller under the cursor claims a horizontal scroll (stops
@@ -406,16 +566,51 @@ impl SpaceView {
                 let delta = ev.delta.pixel_delta(window.line_height());
                 let moved = !delta.x.is_zero() || !delta.y.is_zero();
                 this.note_scroll_activity(ev.touch_phase, moved, cx);
-                match this.resolve_scroll_axis(ev.touch_phase, delta) {
-                    ScrollAxis::Horizontal => cx.stop_propagation(),
-                    ScrollAxis::Vertical => {
+
+                // Snap bookkeeping: a fresh gesture aborts any in-flight glide and
+                // returns control to the fingers; track the latest horizontal step
+                // as the release velocity for the flick decision.
+                match ev.touch_phase {
+                    TouchPhase::Started => {
+                        this.cancel_snap();
+                        this.last_h_delta = px(0.);
+                    }
+                    TouchPhase::Moved => {
                         if !delta.x.is_zero() {
-                            if let Some(handle) = this.scrolls.get(node_id) {
-                                let off = handle.offset();
-                                handle.set_offset(point(off.x - delta.x, off.y));
-                            }
+                            this.last_h_delta = delta.x;
                         }
                     }
+                    TouchPhase::Ended => {}
+                }
+                // Capture the gesture's locked axis before `resolve_scroll_axis`
+                // clears it on `Ended`, so we only snap a horizontal gesture.
+                let locked = this.scroll_axis;
+
+                match this.resolve_scroll_axis(ev.touch_phase, delta) {
+                    ScrollAxis::Horizontal => {
+                        cx.stop_propagation();
+                        // A glide (or its settle-pin) owns this node's X until the
+                        // next gesture: re-assert it over the momentum delta the
+                        // built-in listener just applied, so trailing OS momentum
+                        // can't drift the page off the snapped branch.
+                        this.reassert_horizontal(node_id);
+                    }
+                    ScrollAxis::Vertical => {
+                        if !delta.x.is_zero()
+                            && let Some(handle) = this.scrolls.get(node_id)
+                        {
+                            let off = handle.offset();
+                            handle.set_offset(point(off.x - delta.x, off.y));
+                        }
+                    }
+                }
+
+                // On finger lift of a horizontal gesture, glide to the nearest
+                // (or flicked-toward) branch.
+                if matches!(ev.touch_phase, TouchPhase::Ended)
+                    && locked == Some(ScrollAxis::Horizontal)
+                {
+                    this.start_snap(node_id, page_width, count, window, cx);
                 }
             }));
         // Only respond to the dominant axis — never let a pure-vertical delta
@@ -740,16 +935,18 @@ fn build_state(
     }
 }
 
-/// The seed tree for the experiment:
+/// The seed tree for the experiment. A has four direct replies (B, C, G, H) so
+/// snapping can be tested across — and *into the middle of* — a row of branches;
+/// G carries its own reply (I) so an intermediate branch isn't a dead end.
 ///
 /// ```text
-/// 0        A
-///         / \
-/// 1      B   C
-///       /|
-/// 2    D E
-///        |
-/// 3      F
+/// 0          A
+///        / / | \
+/// 1     B  C G  H
+///      /|    |
+/// 2   D E    I
+///       |
+/// 3     F
 /// ```
 fn sample_tree() -> Node {
     Node {
@@ -797,6 +994,28 @@ fn sample_tree() -> Node {
                 created_at: "10:04 AM",
                 content: "The load-bearing-post idea is the whole thing for me. In chat apps the first message is the most disposable – it scrolls into the dark within the hour. Here you're proposing the opposite: the origin stays lit, and everything is measured against it.\n\n\
                     Does that put a lot of pressure on the first sentence, though?",
+                children: vec![],
+            },
+            Node {
+                id: "G",
+                author: "Kimi K2",
+                created_at: "10:05 AM",
+                content: "I keep snagging on \"one gesture away.\" That's a spatial promise, not just a metaphor – it says the trunk is never more than a single motion behind you, no matter how far out on a limb you've climbed.\n\n\
+                    If that holds, depth stops being scary. You can wander because returning is cheap.",
+                children: vec![Node {
+                    id: "I",
+                    author: "Mara Vance",
+                    created_at: "10:09 AM",
+                    content: "Exactly – cheap return is what makes the wandering safe. The cost of a branch isn't the branch; it's forgetting how to get home. Keep that free and the tree can grow as wild as it likes.",
+                    children: vec![],
+                }],
+            },
+            Node {
+                id: "H",
+                author: "Mara Vance",
+                created_at: "10:05 AM",
+                content: "And there's the fourth direction this could go: not deeper and not back, but *sideways* – a reply that belongs to the root as much as the others, sitting beside them rather than beneath any one of them.\n\n\
+                    Four chairs at the same table, not a queue.",
                 children: vec![],
             },
         ],
