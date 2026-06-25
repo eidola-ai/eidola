@@ -920,13 +920,29 @@ impl SpaceView {
             Some(s) => float_top.min(s + half_pad),
             None => float_top,
         };
-        let bar_h = (win - top_y).max(chrome);
-        let body_h = (bar_h - chrome).max(0.0);
 
-        // Floating (overlaying the conversation) vs docked (flush in the page).
+        // Floating (overlaying the conversation) vs docked (following the page).
         let overlayed = top_y >= float_top - 0.5;
+        let docked = !overlayed;
         // Cached for the scroll handlers' session-ownership decision.
         self.composer_overlayed.set(overlayed);
+
+        // Docked height grows with scroll position, interpolated linearly: the
+        // floating height at the dock threshold (`top_y == float_top`), up to
+        // full height by the time the composer's top reaches the top of the
+        // window content. This resolves a partway internal scroll smoothly —
+        // as the bar grows the body fits more content, so the (frozen) offset
+        // clamps toward the top. Floating keeps its bottom-pinned height.
+        let full_h = (content + chrome).max(win);
+        let bar_h = if docked {
+            let denom = (float_top - TITLE_BAR_RESERVE.as_f32()).max(1.0);
+            let progress = ((float_top - top_y) / denom).clamp(0.0, 1.0);
+            float_bar_h + progress * (full_h - float_bar_h)
+        } else {
+            float_bar_h
+        };
+        let body_h = (bar_h - chrome).max(0.0);
+
         // Internal scroll position (≤ 0); < 0 means content is hidden above.
         let scrolled_down = self.composer_scroll.offset().y.as_f32() < -0.5;
 
