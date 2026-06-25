@@ -498,12 +498,16 @@ impl SpaceView {
         node
     }
 
-    /// Fixed vertical chrome of the composer bar: the margin above and below the
-    /// body. Each is *half* `POST_PAD_Y` — when floating that's the (thinner)
-    /// visible padding; when docked, `render_composer` adds the other half as a
-    /// gap above the bar so the band-to-body spacing matches the document.
+    /// Fixed vertical chrome of the composer bar: just the *top* margin (half
+    /// `POST_PAD_Y`). The matching bottom padding lives *inside* the scrolled
+    /// content (a `pb` on the editor body) instead — so it reads as breathing
+    /// room when the draft fits, but becomes usable scroll space when it
+    /// overflows. The float-height and runway math are unchanged because the
+    /// recorded content height grows by that same half (`record_height` measures
+    /// the `pb` too). When docked, `render_composer` adds the other half as a gap
+    /// above the bar so the band-to-body spacing matches the document.
     fn composer_chrome() -> f32 {
-        POST_PAD_Y.as_f32()
+        POST_PAD_Y.as_f32() / 2.0
     }
 
     /// Height of a branch's trailing runway item: at least one window tall (so
@@ -872,9 +876,10 @@ impl SpaceView {
         let win = window_h.as_f32();
         let chrome = Self::composer_chrome();
         let content = self.composer_content_h.borrow().as_f32();
-        // Half the document's inter-post spacing. The body keeps this much as its
-        // (top & bottom) padding; the dock adds the *other* half as a gap above
-        // the bar, so a docked composer reads with full `POST_PAD_Y` band-to-body
+        // Half the document's inter-post spacing. It's the bar's top padding
+        // (fixed chrome) and — mirrored as a `pb` inside the scrolled content —
+        // the bottom padding; the dock adds the *other* half as a gap above the
+        // bar so a docked composer reads with the full `POST_PAD_Y` band-to-body
         // spacing while a floating one is only half as thick.
         let half_pad = POST_PAD_Y.as_f32() / 2.0;
 
@@ -945,8 +950,12 @@ impl SpaceView {
             .child(
                 // Auto-height inner content so the recorder canvas captures the
                 // editor's *natural* height (the scroll viewport above clips it).
+                // The bottom padding lives here, inside the scrolled content: it
+                // shows as breathing room under a short draft, but scrolls away
+                // (becoming usable space) once the draft overflows.
                 div()
                     .w_full()
+                    .pb(px(half_pad))
                     .child(MarkdownEditor::new(&self.composer).style(prose_style(cx)))
                     .child(record_height(
                         self.composer_content_h.clone(),
