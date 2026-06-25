@@ -139,9 +139,11 @@ fn ease_out_cubic(t: f32) -> f32 {
 /// post's level while scrolling over a shallower region navigates the level
 /// that encloses it. Vertical scroll bubbles to the one outer page scroller.
 ///
-/// Because a branch scroller is as tall as its tallest child subtree, a shorter
-/// sibling leaves empty space *below* it — the root view is taller than any one
-/// branch needs, but that slack is always at the bottom.
+/// **Dynamic-height variant.** Each branch scroller is sized to its *selected*
+/// child's subtree (not the tallest), so the overall content height — and the
+/// minimap scale — track the active branch: switching branches grows or shrinks
+/// the document instead of holding one static maximum with slack at the bottom.
+/// Compare against `eidola_space` (the static-max version).
 pub struct SpaceView {
     /// The conversation tree (a single root for this experiment).
     root: Node,
@@ -540,6 +542,28 @@ impl SpaceView {
         px(window_h.as_f32().max(Self::composer_chrome() + content))
     }
 
+    /// Rendered height of the *currently selected* path from `node` down to its
+    /// leaf (post heights from the previous frame's recorded bounds, plus the
+    /// inter-level bands and the trailing runway). This is the dynamic variant's
+    /// core: the overall content height — and the minimap scale — track the
+    /// active branch (each branch scroller is sized to its selected child), so
+    /// switching branches grows/shrinks the document instead of holding one
+    /// static maximum.
+    fn selected_subtree_height(&self, node: &Node, page_width: Pixels, window_h: Pixels) -> f32 {
+        let h = self
+            .post_bounds
+            .borrow()
+            .get(node.id)
+            .map(|b| b.size.height.as_f32())
+            .unwrap_or(0.0);
+        if node.children.is_empty() {
+            return h + BAND_HEIGHT.as_f32() + self.runway_height(window_h).as_f32();
+        }
+        let active = self.active_child_index(node.id, page_width, node.children.len());
+        h + BAND_HEIGHT.as_f32()
+            + self.selected_subtree_height(&node.children[active], page_width, window_h)
+    }
+
     /// A cheap hash of the layout inputs the composer/minimap read from the
     /// *previous* frame (post + runway bounds, composer content height, viewport)
     /// so `render` can schedule exactly one catch-up frame when they change.
@@ -595,11 +619,12 @@ impl SpaceView {
         // and as a trailing minimap row so the dock area is part of the map.
         let slot_h = self.runway_height(viewport_h).as_f32();
 
-        // Fixed scale: the tallest possible branch fills the bar, independent of
-        // what's currently selected.
-        let longest = max_path_height(&self.root, &bounds, slot_h);
-        if longest > 0.0 && viewport_h > px(0.) {
-            let scale = viewport_h.as_f32() / longest;
+        // Dynamic scale: the *selected* path fills the bar exactly, so switching
+        // branches re-scales the minimap to the new active branch (rather than
+        // the static tallest-branch denominator the other variant uses).
+        let selected_h = self.selected_subtree_height(&self.root, page_width, viewport_h);
+        if selected_h > 0.0 && viewport_h > px(0.) {
+            let scale = viewport_h.as_f32() / selected_h;
             let levels = self.selected_levels(page_width);
             let mut col = v_flex().w_full();
             for (level, (sibs, active)) in levels.iter().enumerate() {
@@ -723,14 +748,18 @@ impl SpaceView {
         // innermost scroller under the cursor claims a horizontal scroll (stops
         // propagation) so it doesn't also move the scrollers above it; vertical
         // deltas fall through to the outer page scroller.
-        // `items_stretch` so the vertical branch separators (and short branch
-        // pages) fill the scroller's full height — the slack of a shorter branch
-        // ends up at its bottom.
+        // Dynamic height: size the scroller to the *selected* child's subtree
+        // (`items_start` + explicit height), so the document height tracks the
+        // active branch instead of the tallest sibling. Taller non-selected
+        // branches overflow and are clipped (off-screen horizontally until
+        // snapped to); the separators get an explicit `h_full` to match.
+        let strip_h = self.selected_subtree_height(&node.children[active], page_width, window_h);
         let node_id = node.id;
         let mut strip = h_flex()
             .id(SharedString::from(format!("{}-children", node.id)))
             .w(page_width)
-            .items_stretch()
+            .h(px(strip_h))
+            .items_start()
             .overflow_x_scroll()
             // The gesture's locked axis decides which container moves. For a
             // horizontal gesture the innermost branch scroller under the cursor
@@ -794,6 +823,10 @@ impl SpaceView {
         // Only respond to the dominant axis — never let a pure-vertical delta
         // bleed into horizontal motion via gpui's cross-axis fallback.
         strip.style().restrict_scroll_to_axis = Some(true);
+        // Clip a taller non-selected branch's vertical overflow to the selected
+        // height — it's off-screen horizontally, so this just keeps it from
+        // bleeding past the scroller during a switch.
+        strip.style().overflow.y = Some(Overflow::Hidden);
         if let Some(handle) = self.scrolls.get(node.id) {
             strip = strip.track_scroll(handle);
         }
@@ -802,7 +835,7 @@ impl SpaceView {
             // as the horizontal band, so a scroll across the seam reads as a
             // real boundary between two branches.
             if i > 0 {
-                strip = strip.child(div().w(BAND_HEIGHT).flex_none().bg(theme.muted));
+                strip = strip.child(div().w(BAND_HEIGHT).flex_none().h_full().bg(theme.muted));
             }
             // The page wrapper carries the child id so the per-post markdown
             // editors (which all share the element id "markdown-editor") get
@@ -1209,31 +1242,6 @@ fn record_height(cell: Rc<RefCell<Pixels>>, view: WeakEntity<SpaceView>) -> impl
     )
     .absolute()
     .size_full()
-}
-
-/// The tallest root-to-leaf path height (posts + bands), using recorded post
-/// heights and adding the trailing band + `slot_h` runway at each leaf — the
-/// fixed denominator the minimap scales against, so the longest possible branch
-/// (including its composer dock) exactly fills the bar.
-fn max_path_height(
-    node: &Node,
-    bounds: &HashMap<&'static str, Bounds<Pixels>>,
-    slot_h: f32,
-) -> f32 {
-    let h = bounds
-        .get(node.id)
-        .map(|b| b.size.height.as_f32())
-        .unwrap_or(0.0);
-    if node.children.is_empty() {
-        // Leaf: post, then the trailing separator band + composer runway.
-        return h + BAND_HEIGHT.as_f32() + slot_h;
-    }
-    let deepest = node
-        .children
-        .iter()
-        .map(|c| max_path_height(c, bounds, slot_h))
-        .fold(0.0_f32, f32::max);
-    h + BAND_HEIGHT.as_f32() + deepest
 }
 
 /// An invisible, zero-layout-impact overlay that records its (absolute) painted
