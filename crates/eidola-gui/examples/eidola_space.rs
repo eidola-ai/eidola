@@ -41,6 +41,16 @@ const BAND_HEIGHT: Pixels = px(48.);
 /// the flick's direction; below it, the snap goes to the nearest branch.
 const SNAP_FLING_THRESHOLD: f32 = 8.0;
 
+/// The composer — a single editable markdown pane pinned over the bottom of the
+/// window. Its body aligns with the posts (same gutter/centering/margins). It
+/// floats over the bottom, growing with content up to [`COMPOSER_MAX_FRACTION`]
+/// of the window, then scrolling internally; near the bottom of a branch it
+/// *docks* to the trailing separator and grows into the page (see
+/// [`SpaceView::render_composer`]).
+const COMPOSER_MAX_FRACTION: f32 = 0.5;
+/// Initial (italic) draft text.
+const COMPOSER_PLACEHOLDER: &str = "*Write something...*";
+
 /// Width of the topology minimap pinned to the right edge.
 const MINIMAP_WIDTH: Pixels = px(36.);
 /// Gap between sibling columns within a minimap row.
@@ -124,6 +134,25 @@ pub struct SpaceView {
     root: Node,
     /// One read-only markdown-editor state per node, keyed by node id.
     bodies: HashMap<&'static str, Entity<MarkdownEditorState>>,
+    /// The single editable composer pane (see [`SpaceView::render_composer`]).
+    composer: Entity<MarkdownEditorState>,
+    /// Internal scroll of the composer, used when its content exceeds the
+    /// floating cap; reading its state is unnecessary, but tracking it gives the
+    /// pane native wheel scrolling and lets the offset clamp as the pane grows.
+    composer_scroll: ScrollHandle,
+    /// The composer's scroll offset `y` captured at the end of the previous
+    /// wheel event — i.e. the *pre-scroll* offset for the current event (the
+    /// built-in listener runs first). Lets the composer absorb scroll until its
+    /// limit and only then chain to the page, with no double-scroll at the seam.
+    composer_prev_off_y: f32,
+    /// The composer's *natural* (unclipped) content height, recorded each frame
+    /// by a canvas inside the scrolled content. Drives both the floating-height
+    /// cap and the trailing runway item's height.
+    composer_content_h: Rc<RefCell<Pixels>>,
+    /// Painted bounds of each branch's trailing "runway" item (the empty space
+    /// below the last post that the composer docks into), keyed by leaf node id.
+    /// The selected leaf's entry positions the dock; all feed the minimap.
+    slot_bounds: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
     /// One horizontal `ScrollHandle` per node that has children, keyed by node
     /// id. Read back to highlight the active page-indicator dot, and written
     /// directly to undo the built-in scroller's stray horizontal nudge during a
@@ -185,9 +214,25 @@ impl SpaceView {
         let mut scrolls = HashMap::new();
         build_state(&root, &mut bodies, &mut scrolls, window, cx);
 
+        let composer = cx.new(|cx| {
+            MarkdownEditorState::with_state(
+                EditorState {
+                    markdown: COMPOSER_PLACEHOLDER.to_string(),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            )
+        });
+
         Self {
             root,
             bodies,
+            composer,
+            composer_scroll: ScrollHandle::new(),
+            composer_prev_off_y: 0.0,
+            composer_content_h: Rc::new(RefCell::new(px(0.))),
+            slot_bounds: Rc::new(RefCell::new(HashMap::new())),
             scrolls,
             scroll_axis: None,
             last_h_delta: px(0.),
@@ -442,12 +487,41 @@ impl SpaceView {
         levels
     }
 
-    /// A cheap hash of the minimap's inputs (recorded post bounds + viewport
-    /// height) so `render` can tell when a redraw is warranted.
+    /// The selected leaf — follow the active child at each level until a node
+    /// with no replies. Its trailing runway is the one the composer docks into.
+    fn selected_leaf(&self, page_width: Pixels) -> &Node {
+        let mut node = &self.root;
+        while !node.children.is_empty() {
+            let active = self.active_child_index(node.id, page_width, node.children.len());
+            node = &node.children[active];
+        }
+        node
+    }
+
+    /// Fixed vertical chrome of the composer bar: the post-matching margin above
+    /// and below the body.
+    fn composer_chrome() -> f32 {
+        2.0 * POST_PAD_Y.as_f32()
+    }
+
+    /// Height of a branch's trailing runway item: at least one window tall (so
+    /// the docked composer can stand alone, distraction-free), or as tall as the
+    /// composer's full content if that's larger.
+    fn runway_height(&self, window_h: Pixels) -> Pixels {
+        let content = self.composer_content_h.borrow().as_f32();
+        px(window_h.as_f32().max(Self::composer_chrome() + content))
+    }
+
+    /// A cheap hash of the layout inputs the composer/minimap read from the
+    /// *previous* frame (post + runway bounds, composer content height, viewport)
+    /// so `render` can schedule exactly one catch-up frame when they change.
     fn minimap_signature(&self, viewport_h: Pixels) -> f32 {
-        let mut sig = viewport_h.as_f32();
+        let mut sig = viewport_h.as_f32() + self.composer_content_h.borrow().as_f32() * 5.0;
         for (id, b) in self.post_bounds.borrow().iter() {
             sig += id.len() as f32 + b.origin.y.as_f32() * 2.0 + b.size.height.as_f32() * 3.0;
+        }
+        for (id, b) in self.slot_bounds.borrow().iter() {
+            sig += id.len() as f32 + b.origin.y.as_f32() * 7.0 + b.size.height.as_f32() * 11.0;
         }
         sig
     }
@@ -489,9 +563,13 @@ impl SpaceView {
         let bounds = self.post_bounds.borrow();
         let height_of = |id: &str| bounds.get(id).map(|b| b.size.height.as_f32()).unwrap_or(0.);
 
+        // Each branch ends in a band + composer runway; include it in the scale
+        // and as a trailing minimap row so the dock area is part of the map.
+        let slot_h = self.runway_height(viewport_h).as_f32();
+
         // Fixed scale: the tallest possible branch fills the bar, independent of
         // what's currently selected.
-        let longest = max_path_height(&self.root, &bounds);
+        let longest = max_path_height(&self.root, &bounds, slot_h);
         if longest > 0.0 && viewport_h > px(0.) {
             let scale = viewport_h.as_f32() / longest;
             let levels = self.selected_levels(page_width);
@@ -507,7 +585,12 @@ impl SpaceView {
                 for (i, sib) in sibs.iter().enumerate() {
                     let cell = if i == *active {
                         selected_column(
-                            bounds.get(sib.id).copied(),
+                            bounds.get(sib.id).map(|b| {
+                                (
+                                    b.origin.y.as_f32() - POST_PAD_Y.as_f32(),
+                                    b.size.height.as_f32(),
+                                )
+                            }),
                             viewport_h,
                             row_h,
                             dark,
@@ -520,6 +603,29 @@ impl SpaceView {
                 }
                 col = col.child(row);
             }
+
+            // The selected branch's trailing runway (where the composer docks):
+            // a band gap then a full-width row, drawn dark where on-screen.
+            if let Some((leaf_sibs, leaf_active)) = levels.last() {
+                let leaf_id = leaf_sibs[*leaf_active].id;
+                col = col.child(div().w_full().h(px(BAND_HEIGHT.as_f32() * scale)));
+                let runway_row_h = px(slot_h * scale);
+                let runway_block = self
+                    .slot_bounds
+                    .borrow()
+                    .get(leaf_id)
+                    .map(|b| (b.origin.y.as_f32(), b.size.height.as_f32()));
+                col = col.child(h_flex().w_full().h(runway_row_h).child(
+                    div().flex_1().h_full().child(selected_column(
+                        runway_block,
+                        viewport_h,
+                        runway_row_h,
+                        dark,
+                        medium,
+                    )),
+                ));
+            }
+
             container = container.child(col);
         }
 
@@ -551,7 +657,13 @@ impl SpaceView {
     /// separator band and a horizontal scroller whose pages are each child's
     /// *entire subtree* (recursively). The recursion builds the nesting that
     /// carries the tree structure.
-    fn render_node(&self, node: &Node, page_width: Pixels, cx: &Context<Self>) -> Div {
+    fn render_node(
+        &self,
+        node: &Node,
+        page_width: Pixels,
+        window_h: Pixels,
+        cx: &Context<Self>,
+    ) -> Div {
         let theme = cx.theme();
         // Definite pixel widths (not `w_full`) throughout the subtree: a page
         // lives inside an `overflow_x_scroll`, where percentage widths resolve
@@ -562,7 +674,17 @@ impl SpaceView {
             .child(self.render_post(node, page_width, cx));
 
         if node.children.is_empty() {
-            return column;
+            // The end of a branch: a separator band, then an empty "runway" item
+            // tall enough for the composer to dock into and stand alone at the
+            // bottom (see `runway_height`). The composer overlays this space; the
+            // item itself just reserves scroll room and records the dock line.
+            return column.child(render_band(page_width, 1, 0, theme)).child(
+                div()
+                    .w(page_width)
+                    .h(self.runway_height(window_h))
+                    .flex_none()
+                    .child(record_bounds(self.slot_bounds.clone(), node.id)),
+            );
         }
 
         let count = node.children.len();
@@ -662,7 +784,7 @@ impl SpaceView {
                     .id(SharedString::from(child.id))
                     .w(page_width)
                     .flex_none()
-                    .child(self.render_node(child, page_width, cx)),
+                    .child(self.render_node(child, page_width, window_h, cx)),
             );
         }
         column.child(strip)
@@ -719,6 +841,129 @@ impl SpaceView {
             // Records this post's painted bounds for the minimap (no layout
             // effect — absolute overlay).
             .child(record_bounds(self.post_bounds.clone(), node.id))
+    }
+
+    /// The composer: a single editable markdown pane pinned over the bottom of
+    /// the window, positioned and styled like a post (gutter, centered body,
+    /// matching margins).
+    ///
+    /// **Float vs. dock.** Its body grows with content up to
+    /// [`COMPOSER_MAX_FRACTION`] of the window, then scrolls internally — that's
+    /// the *floating* bar, bottom-aligned, available for quick notes while
+    /// reading. As the user scrolls a branch toward its end, the trailing runway
+    /// item rises; once its top would pass above the floating bar's top, the bar
+    /// *docks* to it (`top = min(float_top, slot_top)`) and grows into the page,
+    /// so it reads as one continuous scroll ending in the editor. As the bar
+    /// grows past the content, the internal scroll offset clamps to zero on its
+    /// own, revealing the whole draft.
+    fn render_composer(
+        &self,
+        page_width: Pixels,
+        window_h: Pixels,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let body_width = (page_width - GUTTER_WIDTH * 1.5 - GUTTER_GAP * 2)
+            .min(BODY_MAX_WIDTH)
+            .max(px(240.));
+
+        let win = window_h.as_f32();
+        let chrome = Self::composer_chrome();
+        let content = self.composer_content_h.borrow().as_f32();
+
+        // Floating bar: chrome + content, capped at half the window. Bottom-pinned.
+        let float_bar_h = (chrome + content).min(COMPOSER_MAX_FRACTION * win);
+        let float_top = win - float_bar_h;
+        // Dock: if the selected branch's runway top has risen above the floating
+        // top, follow it up (and grow). One-frame-lagged like the minimap.
+        let slot_top = self
+            .slot_bounds
+            .borrow()
+            .get(self.selected_leaf(page_width).id)
+            .map(|b| b.origin.y.as_f32());
+        let top_y = match slot_top {
+            Some(s) => float_top.min(s),
+            None => float_top,
+        };
+        let bar_h = (win - top_y).max(chrome);
+        let body_h = (bar_h - chrome).max(0.0);
+
+        // Byline gutter — a faint "Draft" standing in for the author slot, so the
+        // body aligns with the posts.
+        let byline = v_flex()
+            .w(GUTTER_WIDTH)
+            .flex_none()
+            .items_end()
+            .pt_5()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.muted_foreground)
+                    .child("Draft"),
+            );
+
+        let mut body = div()
+            .id("composer-body")
+            .w(body_width)
+            .h(px(body_h))
+            .overflow_y_scroll()
+            .track_scroll(&self.composer_scroll)
+            // Scroll chaining: the built-in listener has already applied (and
+            // clamped) this delta to `composer_scroll`. Consume the event (stop
+            // it reaching the page `#scroll` behind us) only while the composer
+            // still has room to scroll in this direction; once it's at its limit,
+            // let it bubble so the page scrolls instead. `composer_prev_off_y`
+            // is the pre-scroll offset (the built-in ran first), so the event
+            // that pins the composer still counts as consumed — no seam glitch.
+            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
+                let delta = ev.delta.pixel_delta(window.line_height()).y.as_f32();
+                let max = this.composer_scroll.max_offset().y.as_f32();
+                let pre = this.composer_prev_off_y;
+                let room_up = pre < -0.5; // can move toward 0 (reveal higher)
+                let room_down = pre > -max + 0.5; // can move toward -max (reveal lower)
+                let consumed =
+                    max > 0.5 && ((delta > 0.0 && room_up) || (delta < 0.0 && room_down));
+                if consumed {
+                    cx.stop_propagation();
+                }
+                this.composer_prev_off_y = this.composer_scroll.offset().y.as_f32();
+            }))
+            .child(
+                // Auto-height inner content so the recorder canvas captures the
+                // editor's *natural* height (the scroll viewport above clips it).
+                div()
+                    .w_full()
+                    .child(MarkdownEditor::new(&self.composer).style(prose_style(cx)))
+                    .child(record_height(
+                        self.composer_content_h.clone(),
+                        cx.entity().downgrade(),
+                    )),
+            );
+        body.style().restrict_scroll_to_axis = Some(true);
+
+        div()
+            .id("composer")
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(px(top_y))
+            .h(px(bar_h))
+            // Opaque so the conversation behind the bar is occluded.
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .w(page_width)
+                    .h_full()
+                    .pt(POST_PAD_Y)
+                    .justify_center()
+                    .items_start()
+                    .gap(GUTTER_GAP)
+                    .pr(GUTTER_WIDTH / 2. + GUTTER_GAP)
+                    .child(byline)
+                    .child(body),
+            )
+            .into_any_element()
     }
 
     /// A draggable band across the top of the window standing in for the
@@ -786,7 +1031,7 @@ impl Render for SpaceView {
         }
 
         // The whole tree is one recursively-nested element rooted at A.
-        let tree = self.render_node(&self.root, page_width, cx);
+        let tree = self.render_node(&self.root, page_width, viewport.height, cx);
 
         div()
             .relative()
@@ -816,26 +1061,63 @@ impl Render for SpaceView {
                 scroll.style().restrict_scroll_to_axis = Some(true);
                 scroll
             })
+            // The composer overlays the conversation (below the minimap so the
+            // scroll indicator stays visible over it).
+            .child(self.render_composer(page_width, viewport.height, cx))
             // Topology minimap, painted last so it sits over everything.
             .child(self.render_minimap(page_width, viewport.height, cx))
     }
 }
 
-/// The tallest root-to-leaf path height (posts + bands) using recorded post
-/// heights — the fixed denominator the minimap scales against, so the longest
-/// possible branch exactly fills the bar.
-fn max_path_height(node: &Node, bounds: &HashMap<&'static str, Bounds<Pixels>>) -> f32 {
+/// An invisible, zero-layout-impact overlay that records its own painted height
+/// into `cell` each frame. Placed inside the composer's (auto-height) content so
+/// we capture the editor's natural height even though the scroll viewport above
+/// it clips what's shown.
+///
+/// When the measured height *changes*, it schedules one follow-up frame so the
+/// composer resizes the same frame the content settles. Without this, the height
+/// is computed from the previous frame's recording, so a single edit (Enter,
+/// paste) wouldn't be reflected until the *next* interaction — the recorded
+/// value is written during paint, after the height was already computed.
+fn record_height(cell: Rc<RefCell<Pixels>>, view: WeakEntity<SpaceView>) -> impl IntoElement {
+    canvas(
+        move |bounds, window, _| {
+            let h = bounds.size.height;
+            if (cell.borrow().as_f32() - h.as_f32()).abs() > 0.5 {
+                *cell.borrow_mut() = h;
+                let view = view.clone();
+                window.on_next_frame(move |_, cx| {
+                    view.update(cx, |_, cx| cx.notify()).ok();
+                });
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full()
+}
+
+/// The tallest root-to-leaf path height (posts + bands), using recorded post
+/// heights and adding the trailing band + `slot_h` runway at each leaf — the
+/// fixed denominator the minimap scales against, so the longest possible branch
+/// (including its composer dock) exactly fills the bar.
+fn max_path_height(
+    node: &Node,
+    bounds: &HashMap<&'static str, Bounds<Pixels>>,
+    slot_h: f32,
+) -> f32 {
     let h = bounds
         .get(node.id)
         .map(|b| b.size.height.as_f32())
         .unwrap_or(0.0);
     if node.children.is_empty() {
-        return h;
+        // Leaf: post, then the trailing separator band + composer runway.
+        return h + BAND_HEIGHT.as_f32() + slot_h;
     }
     let deepest = node
         .children
         .iter()
-        .map(|c| max_path_height(c, bounds))
+        .map(|c| max_path_height(c, bounds, slot_h))
         .fold(0.0_f32, f32::max);
     h + BAND_HEIGHT.as_f32() + deepest
 }
@@ -861,8 +1143,9 @@ fn record_bounds(
 /// split into medium (scrolled-off) and dark (on-screen) spans, derived from
 /// the post's painted bounds against the visible region.
 ///
-/// Two corrections turn the recorded bounds into the post's true on-screen
-/// block:
+/// Takes the block's true on-screen `(top, height)` already in screen space.
+/// Posts apply two corrections before calling (the runway, having no padding,
+/// passes its recorded bounds directly):
 ///
 /// - **`origin.y - POST_PAD_Y`.** The bounds-recorder `canvas`
 ///   (`.absolute().size_full()`) is laid out at the post's *content-box* origin
@@ -875,17 +1158,16 @@ fn record_bounds(
 ///   dead-zone where the first `TITLE_BAR_RESERVE` px of scrolling didn't move
 ///   the dark span.
 fn selected_column(
-    post: Option<Bounds<Pixels>>,
+    block: Option<(f32, f32)>,
     viewport_h: Pixels,
     col_h: Pixels,
     dark: Hsla,
     medium: Hsla,
 ) -> Div {
-    let Some(pb) = post else {
+    let Some((top, height)) = block else {
         return div().w_full().h(col_h).bg(medium);
     };
-    let top = pb.origin.y.as_f32() - POST_PAD_Y.as_f32();
-    let height = pb.size.height.as_f32().max(1.0);
+    let height = height.max(1.0);
     let vis_top = top.max(TITLE_BAR_RESERVE.as_f32());
     let vis_bot = (top + height).min(viewport_h.as_f32());
     if vis_bot <= vis_top {
