@@ -498,10 +498,12 @@ impl SpaceView {
         node
     }
 
-    /// Fixed vertical chrome of the composer bar: the post-matching margin above
-    /// and below the body.
+    /// Fixed vertical chrome of the composer bar: the margin above and below the
+    /// body. Each is *half* `POST_PAD_Y` — when floating that's the (thinner)
+    /// visible padding; when docked, `render_composer` adds the other half as a
+    /// gap above the bar so the band-to-body spacing matches the document.
     fn composer_chrome() -> f32 {
-        2.0 * POST_PAD_Y.as_f32()
+        POST_PAD_Y.as_f32()
     }
 
     /// Height of a branch's trailing runway item: at least one window tall (so
@@ -870,23 +872,34 @@ impl SpaceView {
         let win = window_h.as_f32();
         let chrome = Self::composer_chrome();
         let content = self.composer_content_h.borrow().as_f32();
+        // Half the document's inter-post spacing. The body keeps this much as its
+        // (top & bottom) padding; the dock adds the *other* half as a gap above
+        // the bar, so a docked composer reads with full `POST_PAD_Y` band-to-body
+        // spacing while a floating one is only half as thick.
+        let half_pad = POST_PAD_Y.as_f32() / 2.0;
 
         // Floating bar: chrome + content, capped at half the window. Bottom-pinned.
         let float_bar_h = (chrome + content).min(COMPOSER_MAX_FRACTION * win);
         let float_top = win - float_bar_h;
-        // Dock: if the selected branch's runway top has risen above the floating
-        // top, follow it up (and grow). One-frame-lagged like the minimap.
+        // Dock: if the selected branch's runway top (plus the half-spacing gap)
+        // has risen above the floating top, follow it up (and grow). One-frame-
+        // lagged like the minimap.
         let slot_top = self
             .slot_bounds
             .borrow()
             .get(self.selected_leaf(page_width).id)
             .map(|b| b.origin.y.as_f32());
         let top_y = match slot_top {
-            Some(s) => float_top.min(s),
+            Some(s) => float_top.min(s + half_pad),
             None => float_top,
         };
         let bar_h = (win - top_y).max(chrome);
         let body_h = (bar_h - chrome).max(0.0);
+
+        // Floating (overlaying the conversation) vs docked (flush in the page).
+        let overlayed = top_y >= float_top - 0.5;
+        // Internal scroll position (≤ 0); < 0 means content is hidden above.
+        let scrolled_down = self.composer_scroll.offset().y.as_f32() < -0.5;
 
         // Byline gutter — a faint "Draft" standing in for the author slot, so the
         // body aligns with the posts.
@@ -942,7 +955,7 @@ impl SpaceView {
             );
         body.style().restrict_scroll_to_axis = Some(true);
 
-        div()
+        let mut composer = div()
             .id("composer")
             .absolute()
             .left_0()
@@ -955,15 +968,43 @@ impl SpaceView {
                 h_flex()
                     .w(page_width)
                     .h_full()
-                    .pt(POST_PAD_Y)
+                    .pt(px(half_pad))
                     .justify_center()
                     .items_start()
                     .gap(GUTTER_GAP)
                     .pr(GUTTER_WIDTH / 2. + GUTTER_GAP)
                     .child(byline)
                     .child(body),
-            )
-            .into_any_element()
+            );
+        // Inner top scroll-shadow: whenever the composer's content is scrolled
+        // down (floating *or* docked), a small, subtle shadow at the scroll
+        // viewport's top edge signals content above. It spans the *whole pane*
+        // (full width, over the gutter too), even though only the editor's
+        // contents scroll — and is pinned here (a sibling of the scroll) so it
+        // stays put as the content moves under it.
+        if scrolled_down {
+            composer = composer.child(
+                div()
+                    .absolute()
+                    .top(px(half_pad))
+                    .left_0()
+                    .right_0()
+                    .h(px(8.))
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(hsla(0., 0., 0., 0.08), 0.),
+                        linear_color_stop(hsla(0., 0., 0., 0.), 1.),
+                    )),
+            );
+        }
+        if overlayed {
+            // Floating: cast a subtle shadow up over the conversation behind it.
+            // (Docked, it's part of the page and casts nothing.)
+            composer = composer.shadow(vec![
+                BoxShadow::new(px(0.), px(-3.), hsla(0., 0., 0., 0.12)).blur_radius(px(18.)),
+            ]);
+        }
+        composer.into_any_element()
     }
 
     /// A draggable band across the top of the window standing in for the
