@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -86,6 +86,19 @@ enum ScrollAxis {
     Vertical,
 }
 
+/// Who owns a vertical scroll *session* — decided by where the gesture starts
+/// and held until the next gesture begins (so it spans momentum and direction
+/// reversals). A gesture that starts over the conversation, or over a docked
+/// composer, scrolls the `Body` (page) and freezes the composer's internal
+/// scroll for the whole session; one that starts over a *floating* composer is
+/// owned by the `Composer` (internal scroll only — the page never moves, even at
+/// the composer's scroll limits).
+#[derive(Clone, Copy, PartialEq)]
+enum ScrollOwner {
+    Body,
+    Composer,
+}
+
 /// An in-flight "scroll-snap" glide of one branch scroller toward a page
 /// boundary. gpui forwards macOS's already-decayed momentum deltas straight into
 /// the scroll offset and exposes no momentum-end signal (only the finger lift,
@@ -140,11 +153,18 @@ pub struct SpaceView {
     /// floating cap; reading its state is unnecessary, but tracking it gives the
     /// pane native wheel scrolling and lets the offset clamp as the pane grows.
     composer_scroll: ScrollHandle,
-    /// The composer's scroll offset `y` captured at the end of the previous
-    /// wheel event — i.e. the *pre-scroll* offset for the current event (the
-    /// built-in listener runs first). Lets the composer absorb scroll until its
-    /// limit and only then chain to the page, with no double-scroll at the seam.
+    /// The composer's internal scroll offset `y` as of the last render. When the
+    /// *body* owns the scroll session, we restore the composer to this value on
+    /// every wheel event (the built-in listener scrolls it first) so its internal
+    /// scroll stays frozen while the page scrolls. Synced each frame in `render`.
     composer_prev_off_y: f32,
+    /// Owner of the current vertical scroll session (see [`ScrollOwner`]); `None`
+    /// between gestures, decided on the first vertical move and reset on the next
+    /// gesture's `Started`.
+    scroll_owner: Option<ScrollOwner>,
+    /// Whether the composer is currently floating (vs docked), cached from the
+    /// last `render_composer` so a scroll handler can decide session ownership.
+    composer_overlayed: Cell<bool>,
     /// The composer's *natural* (unclipped) content height, recorded each frame
     /// by a canvas inside the scrolled content. Drives both the floating-height
     /// cap and the trailing runway item's height.
@@ -231,6 +251,8 @@ impl SpaceView {
             composer,
             composer_scroll: ScrollHandle::new(),
             composer_prev_off_y: 0.0,
+            scroll_owner: None,
+            composer_overlayed: Cell::new(false),
             composer_content_h: Rc::new(RefCell::new(px(0.))),
             slot_bounds: Rc::new(RefCell::new(HashMap::new())),
             scrolls,
@@ -903,6 +925,8 @@ impl SpaceView {
 
         // Floating (overlaying the conversation) vs docked (flush in the page).
         let overlayed = top_y >= float_top - 0.5;
+        // Cached for the scroll handlers' session-ownership decision.
+        self.composer_overlayed.set(overlayed);
         // Internal scroll position (≤ 0); < 0 means content is hidden above.
         let scrolled_down = self.composer_scroll.offset().y.as_f32() < -0.5;
 
@@ -927,25 +951,35 @@ impl SpaceView {
             .h(px(body_h))
             .overflow_y_scroll()
             .track_scroll(&self.composer_scroll)
-            // Scroll chaining: the built-in listener has already applied (and
-            // clamped) this delta to `composer_scroll`. Consume the event (stop
-            // it reaching the page `#scroll` behind us) only while the composer
-            // still has room to scroll in this direction; once it's at its limit,
-            // let it bubble so the page scrolls instead. `composer_prev_off_y`
-            // is the pre-scroll offset (the built-in ran first), so the event
-            // that pins the composer still counts as consumed — no seam glitch.
+            // Session ownership: this handler fires first when the cursor is over
+            // the composer, so a gesture that *starts* here claims the session —
+            // a floating composer owns it (`Composer`: internal scroll only, the
+            // page is locked out even at the limits), a docked one defers to the
+            // body (`Body`: page scrolls, internal scroll frozen). The built-in
+            // listener already scrolled `composer_scroll`; for a body-owned
+            // session we restore it to its last-render value so it stays put.
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
-                let delta = ev.delta.pixel_delta(window.line_height()).y.as_f32();
-                let max = this.composer_scroll.max_offset().y.as_f32();
-                let pre = this.composer_prev_off_y;
-                let room_up = pre < -0.5; // can move toward 0 (reveal higher)
-                let room_down = pre > -max + 0.5; // can move toward -max (reveal lower)
-                let consumed =
-                    max > 0.5 && ((delta > 0.0 && room_up) || (delta < 0.0 && room_down));
-                if consumed {
-                    cx.stop_propagation();
+                if matches!(ev.touch_phase, TouchPhase::Started) {
+                    this.scroll_owner = None;
                 }
-                this.composer_prev_off_y = this.composer_scroll.offset().y.as_f32();
+                let delta_y = ev.delta.pixel_delta(window.line_height()).y.as_f32();
+                if delta_y == 0.0 {
+                    return;
+                }
+                let floating = this.composer_overlayed.get();
+                let owner = *this.scroll_owner.get_or_insert(if floating {
+                    ScrollOwner::Composer
+                } else {
+                    ScrollOwner::Body
+                });
+                match owner {
+                    ScrollOwner::Composer => cx.stop_propagation(),
+                    ScrollOwner::Body => {
+                        let off = this.composer_scroll.offset();
+                        this.composer_scroll
+                            .set_offset(point(off.x, px(this.composer_prev_off_y)));
+                    }
+                }
             }))
             .child(
                 // Auto-height inner content so the recorder canvas captures the
@@ -1080,6 +1114,12 @@ impl Render for SpaceView {
             window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
         }
 
+        // Keep the composer's frozen-scroll baseline in step with its actual
+        // internal offset between gestures (it can shift as the pane docks/grows
+        // and the offset clamps), so a body-owned session restores to the right
+        // value the first time the composer slides under the cursor.
+        self.composer_prev_off_y = self.composer_scroll.offset().y.as_f32();
+
         // The whole tree is one recursively-nested element rooted at A.
         let tree = self.render_node(&self.root, page_width, viewport.height, cx);
 
@@ -1098,11 +1138,19 @@ impl Render for SpaceView {
                     .size_full()
                     .overflow_y_scroll()
                     // Catch scrolls that don't hit a branch scroller (e.g. over
-                    // the root post) for the minimap's show/hide.
+                    // the root post) for the minimap's show/hide, and claim the
+                    // scroll session for the body: reaching the page scroller
+                    // means the composer didn't own this gesture.
                     .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
                         let delta = ev.delta.pixel_delta(window.line_height());
                         let moved = !delta.x.is_zero() || !delta.y.is_zero();
                         this.note_scroll_activity(ev.touch_phase, moved, cx);
+                        if matches!(ev.touch_phase, TouchPhase::Started) {
+                            this.scroll_owner = None;
+                        }
+                        if !delta.y.is_zero() {
+                            this.scroll_owner.get_or_insert(ScrollOwner::Body);
+                        }
                     }))
                     .child(v_flex().w_full().pt(TITLE_BAR_RESERVE).child(tree));
                 // Vertical only: a horizontal swipe over a region with no branch
