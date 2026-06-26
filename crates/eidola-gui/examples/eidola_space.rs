@@ -307,6 +307,13 @@ impl SpaceView {
         self.drafts.contains(id)
     }
 
+    /// Whether the subtree rooted at `node` contains any draft (drafts are always
+    /// leaves, but can sit anywhere within a branch). Drives the info-colored
+    /// branch indicator for a branch that holds an unsent draft.
+    fn subtree_has_draft(&self, node: &Node) -> bool {
+        self.is_draft(node.id) || node.children.iter().any(|c| self.subtree_has_draft(c))
+    }
+
     /// Append a new draft reply as a child of `parent_id` (the node whose
     /// separator "+" was clicked), select that branch, and make the draft active
     /// (floating composer). The draft is a fresh editable editor; mints a unique
@@ -511,6 +518,50 @@ impl SpaceView {
         }
         // Scale the glide with distance so a single-branch hop is quick and a
         // multi-branch correction still floats rather than lurches.
+        let dur = Duration::from_secs_f32((0.18 + (dist / stride) * 0.16).clamp(0.18, 0.42));
+        self.snap = Some(SnapAnim {
+            node_id,
+            from_x,
+            to_x,
+            start: Instant::now(),
+            duration: dur,
+        });
+        self.drive_snap(window, cx);
+    }
+
+    /// Glide the `node_id` branch scroller to page `index` — a click on that
+    /// branch's indicator dot. Reuses the snap glide so it floats into place like
+    /// a flick, and pins the destination so any trailing input can't drift it.
+    fn glide_to_branch(
+        &mut self,
+        node_id: &'static str,
+        index: usize,
+        page_width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let stride = (page_width + BAND_HEIGHT).as_f32();
+        if stride <= 0.0 {
+            return;
+        }
+        let (from_x, off_y) = match self.scrolls.get(node_id) {
+            Some(h) => {
+                let o = h.offset();
+                (o.x.as_f32(), o.y)
+            }
+            None => return,
+        };
+        let to_x = -(index as f32) * stride;
+        self.cancel_snap();
+        let dist = (to_x - from_x).abs();
+        if dist < 0.5 {
+            if let Some(h) = self.scrolls.get(node_id) {
+                h.set_offset(point(px(to_x), off_y));
+            }
+            self.snap_pin = Some((node_id, to_x));
+            cx.notify();
+            return;
+        }
         let dur = Duration::from_secs_f32((0.18 + (dist / stride) * 0.16).clamp(0.18, 0.42));
         self.snap = Some(SnapAnim {
             node_id,
@@ -954,13 +1005,13 @@ impl SpaceView {
             if is_draft {
                 return column;
             }
-            return column.child(self.render_band(page_width, 1, 0, node.id, cx));
+            return column.child(self.render_band(page_width, node, cx));
         }
 
         let count = node.children.len();
         let active = self.active_child_index(node.id, page_width, count);
-        // The dotted band carries a "+" to add another sibling branch here.
-        column = column.child(self.render_band(page_width, count, active, node.id, cx));
+        // The dotted band carries the clickable branch indicators + a "+".
+        column = column.child(self.render_band(page_width, node, cx));
 
         // The branch scroller: each page is one child's full subtree. The
         // innermost scroller under the cursor claims a horizontal scroll (stops
@@ -1172,30 +1223,56 @@ impl SpaceView {
     }
 
     /// The faint full-bleed separator band between a post and what follows it.
-    /// When the post has more than one reply the band carries page-indicator dots
-    /// (active branch highlighted). It always carries a "+" affordance that
-    /// appends a draft reply as a new child of `parent_id` (a new sibling branch
+    /// When the post has more than one reply the band carries page-indicator dots,
+    /// one per branch: each is clickable (glides the scroller to that branch), the
+    /// active one is highlighted, and a branch whose subtree holds an unsent draft
+    /// is drawn in the theme's `info` color. It always carries a "+" affordance
+    /// that appends a draft reply as a new child of `node` (a new sibling branch
     /// for a post with replies, or the first reply to a leaf). A draft is a
     /// childless leaf you can't reply to, so it renders no band at all — there is
     /// never a separator following a draft to suppress.
-    fn render_band(
-        &self,
-        page_width: Pixels,
-        count: usize,
-        active: usize,
-        parent_id: &'static str,
-        cx: &Context<Self>,
-    ) -> Div {
+    fn render_band(&self, page_width: Pixels, node: &Node, cx: &Context<Self>) -> Div {
         let theme = cx.theme();
+        let info = theme.info;
+        let active_color = theme.muted_foreground;
+        let border = theme.border;
+        let band_bg = theme.muted;
+        let plus_fg = theme.muted_foreground;
+        let plus_bg = theme.background.opacity(0.55);
+        let plus_bg_hover = theme.background;
+
+        let parent_id = node.id;
+        let count = node.children.len();
+
         let mut row = h_flex().items_center().gap_3();
         if count >= 2 {
-            row = row.child(h_flex().gap_2().children((0..count).map(|i| {
-                div().size(px(5.)).rounded_full().bg(if i == active {
-                    theme.muted_foreground
-                } else {
-                    theme.border
-                })
-            })));
+            let active = self.active_child_index(node.id, page_width, count);
+            let dots = h_flex()
+                .gap_1()
+                .children(node.children.iter().enumerate().map(|(i, child)| {
+                    let base_color = if self.subtree_has_draft(child) {
+                        info
+                    } else {
+                        active_color
+                    };
+
+                    let color = if i == active {
+                        base_color
+                    } else {
+                        base_color.alpha(0.5)
+                    };
+
+                    div()
+                        .id(SharedString::from(format!("dot-{parent_id}-{i}")))
+                        .flex_none()
+                        .p(px(3.))
+                        .cursor_pointer()
+                        .child(div().size(px(5.)).rounded_full().bg(color))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.glide_to_branch(parent_id, i, page_width, window, cx);
+                        }))
+                }));
+            row = row.child(dots);
         }
         row = row.child(
             div()
@@ -1205,10 +1282,10 @@ impl SpaceView {
                 .rounded_full()
                 .items_center()
                 .justify_center()
-                .text_color(theme.muted_foreground)
-                .bg(theme.background.opacity(0.55))
+                .text_color(plus_fg)
+                .bg(plus_bg)
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.background))
+                .hover(move |s| s.bg(plus_bg_hover))
                 .child("+")
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.create_draft(parent_id, window, cx);
@@ -1217,7 +1294,7 @@ impl SpaceView {
         h_flex()
             .w(page_width)
             .h(BAND_HEIGHT)
-            .bg(theme.muted)
+            .bg(band_bg)
             .items_center()
             .justify_center()
             .child(row)
