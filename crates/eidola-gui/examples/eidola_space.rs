@@ -1,12 +1,14 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use eidola_gui::theme;
 use gpui::*;
 use gpui_component::{ActiveTheme, InteractiveElementExt, Root, h_flex, v_flex};
-use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownEditorState, MarkdownStyle};
+use gpui_markdown_editor::{
+    EditorState, MarkdownEditor, MarkdownEditorEvent, MarkdownEditorState, MarkdownStyle,
+};
 
 // ---------------------------------------------------------------------------
 // Layout constants. Kept inline (and a little duplicated from the real chat
@@ -46,10 +48,8 @@ const SNAP_FLING_THRESHOLD: f32 = 8.0;
 /// floats over the bottom, growing with content up to [`COMPOSER_MAX_FRACTION`]
 /// of the window, then scrolling internally; near the bottom of a branch it
 /// *docks* to the trailing separator and grows into the page (see
-/// [`SpaceView::render_composer`]).
+/// [`SpaceView::render_active_draft`]).
 const COMPOSER_MAX_FRACTION: f32 = 0.5;
-/// Initial (italic) draft text.
-const COMPOSER_PLACEHOLDER: &str = "";
 
 /// Width of the topology minimap pinned to the right edge.
 const MINIMAP_WIDTH: Pixels = px(36.);
@@ -143,37 +143,72 @@ fn ease_out_cubic(t: f32) -> f32 {
 /// child's subtree (not the tallest), so the overall content height — and the
 /// minimap scale — track the active branch: switching branches grows or shrinks
 /// the document instead of holding one static maximum with slack at the bottom.
-/// Compare against `eidola_space` (the static-max version).
+///
+/// **Editing model.** At rest there is no editor anywhere — every post ends in a
+/// separator band carrying a "+" that appends a *draft* reply (a new child of the
+/// post above it, see [`SpaceView::create_draft`]). A draft renders like any node
+/// but with an editable editor under a "Draft" gutter. Focusing a draft's editor
+/// makes it the [`SpaceView::active_draft`]: it adopts the floating/docking
+/// "composer" behavior — docked at its in-flow spot when scrolled to, floating
+/// pinned to the window bottom when scrolled above it *or* when the user has
+/// swiped to a different branch while editing (see
+/// [`SpaceView::render_active_draft`]). Escape (or focusing another draft)
+/// deactivates it back to a plain inline editor. A draft at the end of the
+/// selected branch reproduces the single-composer behavior exactly.
 pub struct SpaceView {
-    /// The conversation tree (a single root for this experiment).
+    /// The conversation tree (a single root for this experiment). Mutable: the
+    /// "+" affordance on a separator appends a *draft* child (see
+    /// [`SpaceView::create_draft`]).
     root: Node,
-    /// One read-only markdown-editor state per node, keyed by node id.
+    /// One markdown-editor state per node, keyed by node id. Posts are read-only
+    /// (`disabled`); draft nodes (ids in [`SpaceView::drafts`]) are editable.
     bodies: HashMap<&'static str, Entity<MarkdownEditorState>>,
-    /// The single editable composer pane (see [`SpaceView::render_composer`]).
-    composer: Entity<MarkdownEditorState>,
-    /// Internal scroll of the composer, used when its content exceeds the
-    /// floating cap; reading its state is unnecessary, but tracking it gives the
-    /// pane native wheel scrolling and lets the offset clamp as the pane grows.
+    /// Ids of nodes that are unsent *drafts* — rendered like any node but with an
+    /// editable editor and a "Draft" gutter. Created by the separator "+" button.
+    drafts: HashSet<&'static str>,
+    /// The draft whose editor currently has focus, if any. The active draft
+    /// adopts the floating/docking composer behavior (see
+    /// [`SpaceView::render_active_draft`]); every other draft is a plain inline
+    /// editor. `None` means no editor is floating — the default resting state.
+    active_draft: Option<&'static str>,
+    /// Focus subscriptions for draft editors (one per created draft): a draft's
+    /// `MarkdownEditorEvent::Focus` makes it the [`SpaceView::active_draft`].
+    /// Held so the subscriptions outlive the closure that created them.
+    draft_subs: Vec<Subscription>,
+    /// Monotonic counter for minting unique (leaked) `&'static str` draft ids.
+    next_draft_seq: usize,
+    /// Painted bounds of each *inline* (non-active) draft's body, keyed by draft
+    /// id — the editor's natural content height (distinct from the post's
+    /// window-clamped block in `post_bounds`). Read by [`SpaceView::floating_pad`]
+    /// to size the off-branch bottom padding to a tall selected-leaf draft.
+    draft_body_bounds: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
+    /// Internal scroll of the *active draft's* overlay, used when its content
+    /// exceeds the floating cap; tracking it gives the pane native wheel
+    /// scrolling and lets the offset clamp as the pane grows. Shared across
+    /// drafts since only one is active at a time.
     composer_scroll: ScrollHandle,
-    /// The composer's internal scroll offset `y` as of the last render. When the
-    /// *body* owns the scroll session, we restore the composer to this value on
-    /// every wheel event (the built-in listener scrolls it first) so its internal
-    /// scroll stays frozen while the page scrolls. Synced each frame in `render`.
+    /// The active draft overlay's internal scroll offset `y` as of the last
+    /// render. When the *body* owns the scroll session, we restore the overlay to
+    /// this value on every wheel event (the built-in listener scrolls it first)
+    /// so its internal scroll stays frozen while the page scrolls. Synced each
+    /// frame in `render`.
     composer_prev_off_y: f32,
     /// Owner of the current vertical scroll session (see [`ScrollOwner`]); `None`
     /// between gestures, decided on the first vertical move and reset on the next
     /// gesture's `Started`.
     scroll_owner: Option<ScrollOwner>,
-    /// Whether the composer is currently floating (vs docked), cached from the
-    /// last `render_composer` so a scroll handler can decide session ownership.
+    /// Whether the active draft overlay is currently floating (vs docked), cached
+    /// from the last `render_active_draft` so a scroll handler can decide session
+    /// ownership.
     composer_overlayed: Cell<bool>,
-    /// The composer's *natural* (unclipped) content height, recorded each frame
-    /// by a canvas inside the scrolled content. Drives both the floating-height
-    /// cap and the trailing runway item's height.
+    /// The active draft's *natural* (unclipped) content height, recorded each
+    /// frame by a canvas inside the overlay's scrolled content. Drives both the
+    /// floating-height cap and the in-flow placeholder's height.
     composer_content_h: Rc<RefCell<Pixels>>,
-    /// Painted bounds of each branch's trailing "runway" item (the empty space
-    /// below the last post that the composer docks into), keyed by leaf node id.
-    /// The selected leaf's entry positions the dock; all feed the minimap.
+    /// Painted bounds of the active draft's in-flow *placeholder* (the empty slot
+    /// it reserves in the tree while its editor floats in the overlay), keyed by
+    /// draft id. Positions the dock and feeds the minimap. At most one live entry
+    /// (the active draft); stale entries from past drafts are unread.
     slot_bounds: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
     /// One horizontal `ScrollHandle` per node that has children, keyed by node
     /// id. Read back to highlight the active page-indicator dot, and written
@@ -236,21 +271,14 @@ impl SpaceView {
         let mut scrolls = HashMap::new();
         build_state(&root, &mut bodies, &mut scrolls, window, cx);
 
-        let composer = cx.new(|cx| {
-            MarkdownEditorState::with_state(
-                EditorState {
-                    markdown: COMPOSER_PLACEHOLDER.to_string(),
-                    ..Default::default()
-                },
-                window,
-                cx,
-            )
-        });
-
         Self {
             root,
             bodies,
-            composer,
+            drafts: HashSet::new(),
+            active_draft: None,
+            draft_subs: Vec::new(),
+            next_draft_seq: 0,
+            draft_body_bounds: Rc::new(RefCell::new(HashMap::new())),
             composer_scroll: ScrollHandle::new(),
             composer_prev_off_y: 0.0,
             scroll_owner: None,
@@ -271,6 +299,86 @@ impl SpaceView {
             minimap_fade_gen: 0,
             minimap_hide_task: None,
             should_move_window: false,
+        }
+    }
+
+    /// Whether `id` names an unsent draft node.
+    fn is_draft(&self, id: &str) -> bool {
+        self.drafts.contains(id)
+    }
+
+    /// Append a new draft reply as a child of `parent_id` (the node whose
+    /// separator "+" was clicked), select that branch, and make the draft active
+    /// (floating composer). The draft is a fresh editable editor; mints a unique
+    /// leaked id (fine for a short-lived experiment — a handful of drafts).
+    fn create_draft(
+        &mut self,
+        parent_id: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let page_width = window.viewport_size().width;
+        self.next_draft_seq += 1;
+        // Leak a unique 'static id so it slots into the existing &'static-keyed
+        // maps and Copy closures without threading a SharedString everywhere.
+        let id: &'static str = Box::leak(format!("draft-{}", self.next_draft_seq).into_boxed_str());
+
+        let editor =
+            cx.new(|cx| MarkdownEditorState::with_state(EditorState::default(), window, cx));
+        // Focus on this draft's editor makes it the active (floating) draft.
+        let sub = cx.subscribe(&editor, move |this, _editor, event, cx| {
+            if matches!(event, MarkdownEditorEvent::Focus) && this.active_draft != Some(id) {
+                this.activate_draft(id, cx);
+            }
+        });
+        self.draft_subs.push(sub);
+        self.bodies.insert(id, editor.clone());
+        self.drafts.insert(id);
+
+        // Append the draft node to the parent and learn its (last) page index.
+        let mut new_index = 0usize;
+        if let Some(parent) = node_mut(&mut self.root, parent_id) {
+            parent.children.push(Node {
+                id,
+                author: "You",
+                created_at: "now",
+                content: "",
+                children: vec![],
+            });
+            new_index = parent.children.len() - 1;
+        }
+        // The parent now has children, so it needs a horizontal scroller.
+        self.scrolls.entry(parent_id).or_default();
+
+        // Select the new branch: jump (and pin) the parent scroller to it.
+        let stride = (page_width + BAND_HEIGHT).as_f32();
+        let to_x = -(new_index as f32) * stride;
+        if let Some(handle) = self.scrolls.get(parent_id) {
+            let off = handle.offset();
+            handle.set_offset(point(px(to_x), off.y));
+        }
+        self.cancel_snap();
+        self.snap_pin = Some((parent_id, to_x));
+
+        self.activate_draft(id, cx);
+        let focus = editor.read(cx).focus_handle.clone();
+        window.focus(&focus, cx);
+    }
+
+    /// Make `id` the active (floating) draft, resetting the shared overlay scroll
+    /// so a previously-scrolled draft's offset doesn't carry over.
+    fn activate_draft(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        self.active_draft = Some(id);
+        self.composer_scroll.set_offset(point(px(0.), px(0.)));
+        self.composer_prev_off_y = 0.0;
+        cx.notify();
+    }
+
+    /// Deactivate the active draft (Escape / external request). The draft stays
+    /// in the tree as a plain inline editor; only its floating behavior ends.
+    fn deactivate_active_draft(&mut self, cx: &mut Context<Self>) {
+        if self.active_draft.take().is_some() {
+            cx.notify();
         }
     }
 
@@ -528,7 +636,7 @@ impl SpaceView {
     /// room when the draft fits, but becomes usable scroll space when it
     /// overflows. The float-height and runway math are unchanged because the
     /// recorded content height grows by that same half (`record_height` measures
-    /// the `pb` too). When docked, `render_composer` adds the other half as a gap
+    /// the `pb` too). When docked, `render_active_draft` adds the other half as a gap
     /// above the bar so the band-to-body spacing matches the document.
     fn composer_chrome() -> f32 {
         POST_PAD_Y.as_f32() / 2.0
@@ -542,6 +650,46 @@ impl SpaceView {
         px(window_h.as_f32().max(Self::composer_chrome() + content))
     }
 
+    /// Bottom padding the scrolling page needs so the end of the selected branch
+    /// can clear a *floating* (off-branch) active draft. On the selected branch
+    /// the draft's in-flow placeholder already reserves this room (it docks), so
+    /// none is needed. Off-branch the floating bar (its content height, capped at
+    /// half the window) occludes the bottom of the window:
+    ///
+    /// - A normal selected leaf is flush at the bottom — pad by the whole bar.
+    /// - A selected leaf that is *itself* a draft is window-tall (min-height), so
+    ///   it already reserves slack below its content. Pad only for the shortfall:
+    ///   zero while its content is short, growing as it approaches/exceeds the
+    ///   window — never more than what's missing.
+    fn floating_pad(&self, page_width: Pixels, window_h: Pixels) -> f32 {
+        let Some(draft_id) = self.active_draft else {
+            return 0.0;
+        };
+        let leaf = self.selected_leaf(page_width);
+        if leaf.id == draft_id {
+            return 0.0;
+        }
+        let win = window_h.as_f32();
+        let float_bar_h = (Self::composer_chrome() + self.composer_content_h.borrow().as_f32())
+            .min(COMPOSER_MAX_FRACTION * win);
+        if !self.is_draft(leaf.id) {
+            return float_bar_h;
+        }
+        // Slack the min-window draft already leaves below its content: the post's
+        // bottom padding plus any min-height fill. `content` is the draft's
+        // natural body height (recorded inline), so `slack` shrinks to one
+        // `POST_PAD_Y` as the content grows past the window.
+        let pad_y = POST_PAD_Y.as_f32();
+        let content = self
+            .draft_body_bounds
+            .borrow()
+            .get(leaf.id)
+            .map(|b| b.size.height.as_f32())
+            .unwrap_or(0.0);
+        let slack = (win - pad_y - content).max(pad_y);
+        (float_bar_h - slack).max(0.0)
+    }
+
     /// Rendered height of the *currently selected* path from `node` down to its
     /// leaf (post heights from the previous frame's recorded bounds, plus the
     /// inter-level bands and the trailing runway). This is the dynamic variant's
@@ -550,14 +698,28 @@ impl SpaceView {
     /// switching branches grows/shrinks the document instead of holding one
     /// static maximum.
     fn selected_subtree_height(&self, node: &Node, page_width: Pixels, window_h: Pixels) -> f32 {
+        // The node's in-flow height: a post records into `post_bounds`; the active
+        // draft renders an empty placeholder that records into `slot_bounds`.
         let h = self
             .post_bounds
             .borrow()
             .get(node.id)
             .map(|b| b.size.height.as_f32())
+            .or_else(|| {
+                self.slot_bounds
+                    .borrow()
+                    .get(node.id)
+                    .map(|b| b.size.height.as_f32())
+            })
             .unwrap_or(0.0);
         if node.children.is_empty() {
-            return h + BAND_HEIGHT.as_f32() + self.runway_height(window_h).as_f32();
+            // The selected leaf. A draft leaf *is* the editing surface (at least a
+            // window tall), with no trailing separator; a normal leaf ends the
+            // conversation with a trailing separator band.
+            if self.is_draft(node.id) {
+                return h.max(window_h.as_f32());
+            }
+            return h + BAND_HEIGHT.as_f32();
         }
         let active = self.active_child_index(node.id, page_width, node.children.len());
         h + BAND_HEIGHT.as_f32()
@@ -574,6 +736,11 @@ impl SpaceView {
         }
         for (id, b) in self.slot_bounds.borrow().iter() {
             sig += id.len() as f32 + b.origin.y.as_f32() * 7.0 + b.size.height.as_f32() * 11.0;
+        }
+        // Inline draft body heights feed `floating_pad` (and thus the minimap
+        // scale), so a content change must trigger a catch-up frame too.
+        for (id, b) in self.draft_body_bounds.borrow().iter() {
+            sig += id.len() as f32 + b.size.height.as_f32() * 13.0;
         }
         sig
     }
@@ -613,11 +780,22 @@ impl SpaceView {
             .w(MINIMAP_WIDTH);
 
         let bounds = self.post_bounds.borrow();
-        let height_of = |id: &str| bounds.get(id).map(|b| b.size.height.as_f32()).unwrap_or(0.);
-
-        // Each branch ends in a band + composer runway; include it in the scale
-        // and as a trailing minimap row so the dock area is part of the map.
-        let slot_h = self.runway_height(viewport_h).as_f32();
+        let slot = self.slot_bounds.borrow();
+        // A node's painted block as `(top, height)` in screen space. Posts record
+        // into `post_bounds` (origin inset by `POST_PAD_Y` — undo it); the active
+        // draft's empty placeholder records into `slot_bounds` (no padding).
+        let block_of = |id: &str| -> Option<(f32, f32)> {
+            if let Some(b) = bounds.get(id) {
+                Some((
+                    b.origin.y.as_f32() - POST_PAD_Y.as_f32(),
+                    b.size.height.as_f32(),
+                ))
+            } else {
+                slot.get(id)
+                    .map(|b| (b.origin.y.as_f32(), b.size.height.as_f32()))
+            }
+        };
+        let height_of = |id: &str| block_of(id).map(|(_, h)| h).unwrap_or(0.);
 
         // Dynamic scale: the *selected* path fills the bar exactly, so switching
         // branches re-scales the minimap to the new active branch (rather than
@@ -628,7 +806,11 @@ impl SpaceView {
         // the top, instead of "growing" through the reserve.
         let reserve = TITLE_BAR_RESERVE.as_f32();
         let selected_h = self.selected_subtree_height(&self.root, page_width, viewport_h);
-        let total_h = reserve + selected_h;
+        // A floating off-branch draft adds bottom scroll padding to the page (see
+        // `floating_pad`); fold it into the denominator + a trailing spacer so the
+        // scroll indicator still maps 1:1 to the real scrollable height.
+        let pad = self.floating_pad(page_width, viewport_h);
+        let total_h = reserve + selected_h + pad;
         if total_h > 0.0 && viewport_h > px(0.) {
             let scale = viewport_h.as_f32() / total_h;
             let levels = self.selected_levels(page_width);
@@ -656,12 +838,7 @@ impl SpaceView {
                 for (i, sib) in sibs.iter().enumerate() {
                     let cell = if i == *active {
                         selected_column(
-                            bounds.get(sib.id).map(|b| {
-                                (
-                                    b.origin.y.as_f32() - POST_PAD_Y.as_f32(),
-                                    b.size.height.as_f32(),
-                                )
-                            }),
+                            block_of(sib.id),
                             // Conversation is visible from the window top (y = 0,
                             // under the transparent titlebar) to the window bottom.
                             0.0,
@@ -678,29 +855,20 @@ impl SpaceView {
                 col = col.child(row);
             }
 
-            // The selected branch's trailing runway (where the composer docks):
-            // a band gap then a full-width row, drawn dark where on-screen.
-            if let Some((leaf_sibs, leaf_active)) = levels.last() {
-                let leaf_id = leaf_sibs[*leaf_active].id;
+            // A non-draft selected leaf ends with a trailing separator band — a
+            // transparent gap in the map, mirroring the inter-level bands. A draft
+            // leaf is the editing surface itself and has no trailing band (its
+            // placeholder is already the final level above).
+            let leaf_is_draft = levels
+                .last()
+                .map(|(sibs, active)| self.is_draft(sibs[*active].id))
+                .unwrap_or(false);
+            if !leaf_is_draft {
                 col = col.child(div().w_full().h(px(BAND_HEIGHT.as_f32() * scale)));
-                let runway_row_h = px(slot_h * scale);
-                let runway_block = self
-                    .slot_bounds
-                    .borrow()
-                    .get(leaf_id)
-                    .map(|b| (b.origin.y.as_f32(), b.size.height.as_f32()));
-                col = col.child(h_flex().w_full().h(runway_row_h).child(
-                    div().flex_1().h_full().child(selected_column(
-                        runway_block,
-                        // The runway *is* the composer's dock — visible to the
-                        // window bottom (the composer is its own representation).
-                        0.0,
-                        viewport_h.as_f32(),
-                        runway_row_h,
-                        dark,
-                        medium,
-                    )),
-                ));
+            }
+            // The floating-draft bottom padding: empty scroll room at the very end.
+            if pad > 0.0 {
+                col = col.child(div().w_full().h(px(pad * scale)));
             }
 
             container = container.child(col);
@@ -742,31 +910,57 @@ impl SpaceView {
         cx: &Context<Self>,
     ) -> Div {
         let theme = cx.theme();
+        let is_draft = self.is_draft(node.id);
+        let is_active = self.active_draft == Some(node.id);
+        // A leaf on the selected path is the "final" post — the bottom of the
+        // visible conversation. For a draft (always a leaf) this also means it is
+        // *within* the selected branch (so its overlay docks rather than floats).
+        let is_final = node.children.is_empty() && self.selected_leaf(page_width).id == node.id;
+
         // Definite pixel widths (not `w_full`) throughout the subtree: a page
         // lives inside an `overflow_x_scroll`, where percentage widths resolve
         // against the scroller's (effectively unbounded) content size rather
         // than the page, collapsing everything to content width.
-        let mut column = v_flex()
-            .w(page_width)
-            .child(self.render_post(node, page_width, cx));
+        let mut column = v_flex().w(page_width);
 
-        if node.children.is_empty() {
-            // The end of a branch: a separator band, then an empty "runway" item
-            // tall enough for the composer to dock into and stand alone at the
-            // bottom (see `runway_height`). The composer overlays this space; the
-            // item itself just reserves scroll room and records the dock line.
-            return column.child(render_band(page_width, 1, 0, theme)).child(
+        if is_draft && is_active {
+            // The active draft's editor floats in the overlay (see
+            // `render_active_draft`); its in-flow slot is an empty placeholder
+            // that reserves scroll room and records the dock line + minimap
+            // bounds. A *final* draft reserves a full window-tall "runway" so it
+            // can stand alone at the bottom; otherwise just its content height.
+            let slot_h = if is_final {
+                self.runway_height(window_h)
+            } else {
+                px(Self::composer_chrome() + self.composer_content_h.borrow().as_f32())
+            };
+            column = column.child(
                 div()
                     .w(page_width)
-                    .h(self.runway_height(window_h))
+                    .h(slot_h)
                     .flex_none()
                     .child(record_bounds(self.slot_bounds.clone(), node.id)),
             );
+        } else {
+            column =
+                column.child(self.render_post(node, page_width, window_h, is_draft, is_final, cx));
+        }
+
+        if node.children.is_empty() {
+            // A draft is always a childless leaf you can't reply to, so it simply
+            // ends — no trailing separator (and on the selected branch a draft is
+            // therefore always the very last node). Every other leaf ends with a
+            // separator band whose "+" starts a reply here.
+            if is_draft {
+                return column;
+            }
+            return column.child(self.render_band(page_width, 1, 0, node.id, cx));
         }
 
         let count = node.children.len();
         let active = self.active_child_index(node.id, page_width, count);
-        column = column.child(render_band(page_width, count, active, theme));
+        // The dotted band carries a "+" to add another sibling branch here.
+        column = column.child(self.render_band(page_width, count, active, node.id, cx));
 
         // The branch scroller: each page is one child's full subtree. The
         // innermost scroller under the cursor claims a horizontal scroll (stops
@@ -876,44 +1070,78 @@ impl SpaceView {
     }
 
     /// One post: the right-aligned byline gutter (system font) beside the
-    /// centered reading column (Newsreader prose, read-only markdown).
-    fn render_post(&self, node: &Node, page_width: Pixels, cx: &Context<Self>) -> impl IntoElement {
+    /// centered reading column (Newsreader prose). A normal post is read-only
+    /// markdown with an author/time byline; a *draft* post (`is_draft`) is an
+    /// editable editor under a "Draft" byline. The active draft never reaches
+    /// here — its editor renders in the floating overlay instead (see
+    /// [`SpaceView::render_node`]).
+    fn render_post(
+        &self,
+        node: &Node,
+        page_width: Pixels,
+        window_h: Pixels,
+        is_draft: bool,
+        is_final: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
+        let id = node.id;
 
         let body_width = (page_width - GUTTER_WIDTH * 1.5 - GUTTER_GAP * 2)
             .min(BODY_MAX_WIDTH)
             .max(px(240.));
 
-        // Byline — UI/chrome voice (system font): bold name over a muted time.
-        let byline = v_flex()
-            .w(GUTTER_WIDTH)
-            .flex_none()
-            .items_end()
-            .pt_5()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.foreground)
-                    .child(SharedString::from(node.author)),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(SharedString::from(node.created_at)),
-            );
+        // Byline — UI/chrome voice (system font). A draft stands in a faint
+        // "Draft" where the author would be; a post shows its bold name + time.
+        let byline = if is_draft {
+            v_flex()
+                .w(GUTTER_WIDTH)
+                .flex_none()
+                .items_end()
+                .pt_5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.muted_foreground)
+                        .child("Draft"),
+                )
+        } else {
+            v_flex()
+                .w(GUTTER_WIDTH)
+                .flex_none()
+                .items_end()
+                .pt_5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.foreground)
+                        .child(SharedString::from(node.author)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(node.created_at)),
+                )
+        };
 
-        // Body — narrative voice (Newsreader prose), read-only markdown. A
-        // definite width makes the markdown's height-for-width measurement
-        // correct.
-        let body = div().w(body_width).child(
-            MarkdownEditor::new(&self.bodies[node.id])
+        // Body — narrative voice (Newsreader prose). Read-only for a post,
+        // editable for a draft. A definite width makes the markdown's
+        // height-for-width measurement correct.
+        let mut body = div().w(body_width).child(
+            MarkdownEditor::new(&self.bodies[id])
                 .style(prose_style(cx))
-                .disabled(true),
+                .disabled(!is_draft),
         );
+        if is_draft {
+            // Record the draft's natural content height (the body's own size,
+            // not the post's min-window block) for `floating_pad`.
+            body = body.child(record_bounds(self.draft_body_bounds.clone(), id));
+        }
 
-        h_flex()
+        let mut post = h_flex()
             .relative()
             .w(page_width)
             .py(POST_PAD_Y)
@@ -925,32 +1153,107 @@ impl SpaceView {
             .pr(GUTTER_WIDTH / 2. + GUTTER_GAP)
             // Records this post's painted bounds for the minimap (no layout
             // effect — absolute overlay).
-            .child(record_bounds(self.post_bounds.clone(), node.id))
+            .child(record_bounds(self.post_bounds.clone(), id));
+
+        if is_draft && is_final {
+            // The final draft is the bottom editing surface: at least a window
+            // tall so it stands alone (matches the active-draft runway).
+            post = post.min_h(window_h);
+        }
+        if is_draft {
+            // Clicking a draft (re)activates it even when it already had focus —
+            // e.g. after Escape, where no fresh `Focus` event would fire.
+            post = post.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.activate_draft(id, cx)),
+            );
+        }
+        post
     }
 
-    /// The composer: a single editable markdown pane pinned over the bottom of
-    /// the window, positioned and styled like a post (gutter, centered body,
-    /// matching margins).
+    /// The faint full-bleed separator band between a post and what follows it.
+    /// When the post has more than one reply the band carries page-indicator dots
+    /// (active branch highlighted). It always carries a "+" affordance that
+    /// appends a draft reply as a new child of `parent_id` (a new sibling branch
+    /// for a post with replies, or the first reply to a leaf). A draft is a
+    /// childless leaf you can't reply to, so it renders no band at all — there is
+    /// never a separator following a draft to suppress.
+    fn render_band(
+        &self,
+        page_width: Pixels,
+        count: usize,
+        active: usize,
+        parent_id: &'static str,
+        cx: &Context<Self>,
+    ) -> Div {
+        let theme = cx.theme();
+        let mut row = h_flex().items_center().gap_3();
+        if count >= 2 {
+            row = row.child(h_flex().gap_2().children((0..count).map(|i| {
+                div().size(px(5.)).rounded_full().bg(if i == active {
+                    theme.muted_foreground
+                } else {
+                    theme.border
+                })
+            })));
+        }
+        row = row.child(
+            div()
+                .id(SharedString::from(format!("plus-{parent_id}")))
+                .size(px(20.))
+                .flex_none()
+                .rounded_full()
+                .items_center()
+                .justify_center()
+                .text_color(theme.muted_foreground)
+                .bg(theme.background.opacity(0.55))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.background))
+                .child("+")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.create_draft(parent_id, window, cx);
+                })),
+        );
+        h_flex()
+            .w(page_width)
+            .h(BAND_HEIGHT)
+            .bg(theme.muted)
+            .items_center()
+            .justify_center()
+            .child(row)
+    }
+
+    /// The active draft's floating editor: the editable markdown pane pinned over
+    /// the bottom of the window, positioned and styled like a post (gutter,
+    /// centered body, matching margins). Renders nothing when no draft is active.
     ///
     /// **Float vs. dock.** Its body grows with content up to
     /// [`COMPOSER_MAX_FRACTION`] of the window, then scrolls internally — that's
-    /// the *floating* bar, bottom-aligned, available for quick notes while
-    /// reading. As the user scrolls a branch toward its end, the trailing runway
-    /// item rises; once its top would pass above the floating bar's top, the bar
-    /// *docks* to it (`top = min(float_top, slot_top)`) and grows into the page,
-    /// so it reads as one continuous scroll ending in the editor. As the bar
-    /// grows past the content, the internal scroll offset clamps to zero on its
-    /// own, revealing the whole draft.
-    fn render_composer(
+    /// the *floating* bar, bottom-aligned, available while reading. When the
+    /// draft is on the selected branch and the user scrolls toward it, its in-flow
+    /// placeholder rises; once its top would pass above the floating bar's top,
+    /// the bar *docks* to it (`top = min(float_top, slot_top)`) and grows into the
+    /// page, so it reads as one continuous scroll ending in the editor. When the
+    /// draft is *not* on the selected branch (the user swiped to a sibling while
+    /// editing), it always floats. As the bar grows past the content, the internal
+    /// scroll offset clamps to zero on its own, revealing the whole draft.
+    fn render_active_draft(
         &self,
         page_width: Pixels,
         window_h: Pixels,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let Some(draft_id) = self.active_draft else {
+            return div().into_any_element();
+        };
         let theme = cx.theme();
         let body_width = (page_width - GUTTER_WIDTH * 1.5 - GUTTER_GAP * 2)
             .min(BODY_MAX_WIDTH)
             .max(px(240.));
+
+        // On the selected branch the overlay docks to its placeholder; off it
+        // (swiped to a sibling while editing), it always floats.
+        let on_path = self.selected_leaf(page_width).id == draft_id;
 
         let win = window_h.as_f32();
         let chrome = Self::composer_chrome();
@@ -965,14 +1268,17 @@ impl SpaceView {
         // Floating bar: chrome + content, capped at half the window. Bottom-pinned.
         let float_bar_h = (chrome + content).min(COMPOSER_MAX_FRACTION * win);
         let float_top = win - float_bar_h;
-        // Dock: if the selected branch's runway top (plus the half-spacing gap)
+        // Dock: if the active draft's placeholder top (plus the half-spacing gap)
         // has risen above the floating top, follow it up (and grow). One-frame-
-        // lagged like the minimap.
-        let slot_top = self
-            .slot_bounds
-            .borrow()
-            .get(self.selected_leaf(page_width).id)
-            .map(|b| b.origin.y.as_f32());
+        // lagged like the minimap. Off the selected branch we don't dock at all.
+        let slot_top = if on_path {
+            self.slot_bounds
+                .borrow()
+                .get(draft_id)
+                .map(|b| b.origin.y.as_f32())
+        } else {
+            None
+        };
         let top_y = match slot_top {
             Some(s) => float_top.min(s + half_pad),
             None => float_top,
@@ -1063,7 +1369,7 @@ impl SpaceView {
                 div()
                     .w_full()
                     .pb(px(half_pad))
-                    .child(MarkdownEditor::new(&self.composer).style(prose_style(cx)))
+                    .child(MarkdownEditor::new(&self.bodies[draft_id]).style(prose_style(cx)))
                     .child(record_height(
                         self.composer_content_h.clone(),
                         cx.entity().downgrade(),
@@ -1080,6 +1386,14 @@ impl SpaceView {
             .h(px(bar_h))
             // Opaque so the conversation behind the bar is occluded.
             .bg(theme.background)
+            // Escape while editing deactivates the draft (it stays as a plain
+            // inline editor). The focused editor is a descendant, so its unhandled
+            // Escape bubbles to here.
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" {
+                    this.deactivate_active_draft(cx);
+                }
+            }))
             .child(
                 h_flex()
                     .w(page_width)
@@ -1225,16 +1539,25 @@ impl Render for SpaceView {
                             this.scroll_owner.get_or_insert(ScrollOwner::Body);
                         }
                     }))
-                    .child(v_flex().w_full().pt(TITLE_BAR_RESERVE).child(tree));
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .pt(TITLE_BAR_RESERVE)
+                            // Room to scroll the selected branch's tail clear of a
+                            // floating (off-branch) active draft; zero otherwise.
+                            .pb(px(self.floating_pad(page_width, viewport.height)))
+                            .child(tree),
+                    );
                 // Vertical only: a horizontal swipe over a region with no branch
                 // scroller (e.g. the root post) must not scroll the page sideways
                 // (or, via the fallback, vertically).
                 scroll.style().restrict_scroll_to_axis = Some(true);
                 scroll
             })
-            // The composer overlays the conversation (below the minimap so the
-            // scroll indicator stays visible over it).
-            .child(self.render_composer(page_width, viewport.height, cx))
+            // The active draft's editor overlays the conversation (below the
+            // minimap so the scroll indicator stays visible over it). Renders
+            // nothing when no draft is active — the default resting state.
+            .child(self.render_active_draft(page_width, viewport.height, cx))
             // Topology minimap, painted last so it sits over everything.
             .child(self.render_minimap(page_width, viewport.height, cx))
     }
@@ -1338,34 +1661,6 @@ fn selected_column(
         .child(div().w_full().h(px(below)).bg(medium))
 }
 
-/// The faint full-bleed separator band between a post and its replies. When the
-/// post has more than one reply, the band carries a row of page-indicator dots
-/// (the active branch highlighted); a single reply shows a plain band, so a
-/// non-branching conversation reads like a sequential list.
-fn render_band(
-    page_width: Pixels,
-    count: usize,
-    active: usize,
-    theme: &gpui_component::Theme,
-) -> Div {
-    let mut band = h_flex()
-        .w(page_width)
-        .h(BAND_HEIGHT)
-        .bg(theme.muted)
-        .items_center()
-        .justify_center();
-    if count >= 2 {
-        band = band.child(h_flex().gap_2().children((0..count).map(|i| {
-            div().size(px(5.)).rounded_full().bg(if i == active {
-                theme.muted_foreground
-            } else {
-                theme.border
-            })
-        })));
-    }
-    band
-}
-
 /// `MarkdownStyle` for prose bodies: Newsreader at a book size/leading with a
 /// gentle heading ramp. `from_theme` seeds the system font, so we override the
 /// family back to Newsreader for narrative content.
@@ -1383,6 +1678,20 @@ fn prose_style(cx: &App) -> MarkdownStyle {
         });
     style.font_family = theme::FONT_FAMILY.into();
     style
+}
+
+/// Depth-first search for the node with `id`, returning a mutable reference so a
+/// new draft child can be appended (see [`SpaceView::create_draft`]).
+fn node_mut<'a>(node: &'a mut Node, id: &str) -> Option<&'a mut Node> {
+    if node.id == id {
+        return Some(node);
+    }
+    for child in &mut node.children {
+        if let Some(found) = node_mut(child, id) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Walk the tree once, creating a read-only markdown-editor state for every
