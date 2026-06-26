@@ -596,12 +596,29 @@ impl SpaceView {
         let slot_h = self.runway_height(viewport_h).as_f32();
 
         // Fixed scale: the tallest possible branch fills the bar, independent of
-        // what's currently selected.
-        let longest = max_path_height(&self.root, &bounds, slot_h);
+        // what's currently selected. The empty title-bar reserve above the root
+        // is part of the scrollable content, so include it in the denominator
+        // (and as a spacer below) — that keeps the dark visible-window a
+        // consistent size as it slides off the top, instead of "growing" through
+        // the reserve.
+        let reserve = TITLE_BAR_RESERVE.as_f32();
+        let longest = reserve + max_path_height(&self.root, &bounds, slot_h);
         if longest > 0.0 && viewport_h > px(0.) {
             let scale = viewport_h.as_f32() / longest;
             let levels = self.selected_levels(page_width);
             let mut col = v_flex().w_full();
+            // The reserve scrolls off like content: dark while visible at the top.
+            let reserve_block = bounds
+                .get(self.root.id)
+                .map(|b| (b.origin.y.as_f32() - POST_PAD_Y.as_f32() - reserve, reserve));
+            col = col.child(selected_column(
+                reserve_block,
+                0.0,
+                viewport_h.as_f32(),
+                px(reserve * scale),
+                dark,
+                medium,
+            ));
             for (level, (sibs, active)) in levels.iter().enumerate() {
                 if level > 0 {
                     // The separator band's share of the scaled height.
@@ -619,7 +636,10 @@ impl SpaceView {
                                     b.size.height.as_f32(),
                                 )
                             }),
-                            viewport_h,
+                            // Conversation is visible from the window top (y = 0,
+                            // under the transparent titlebar) to the window bottom.
+                            0.0,
+                            viewport_h.as_f32(),
                             row_h,
                             dark,
                             medium,
@@ -646,7 +666,10 @@ impl SpaceView {
                 col = col.child(h_flex().w_full().h(runway_row_h).child(
                     div().flex_1().h_full().child(selected_column(
                         runway_block,
-                        viewport_h,
+                        // The runway *is* the composer's dock — visible to the
+                        // window bottom (the composer is its own representation).
+                        0.0,
+                        viewport_h.as_f32(),
                         runway_row_h,
                         dark,
                         medium,
@@ -1257,23 +1280,29 @@ fn record_bounds(
 /// split into medium (scrolled-off) and dark (on-screen) spans, derived from
 /// the post's painted bounds against the visible region.
 ///
-/// Takes the block's true on-screen `(top, height)` already in screen space.
-/// Posts apply two corrections before calling (the runway, having no padding,
-/// passes its recorded bounds directly):
+/// Takes the block's true on-screen `(top, height)` (screen space) and the
+/// visible region `[vis_top, vis_bot]` (also screen space) that the dark span is
+/// clipped against. Posts apply the `origin.y - POST_PAD_Y` correction before
+/// calling (the runway, having no top padding, passes its recorded bounds
+/// directly):
 ///
 /// - **`origin.y - POST_PAD_Y`.** The bounds-recorder `canvas`
 ///   (`.absolute().size_full()`) is laid out at the post's *content-box* origin
 ///   (inset by the post's vertical padding) yet sized to the full element, so
 ///   its recorded `origin.y` sits `POST_PAD_Y` too low while its `height` is
 ///   already the true block height. Subtracting `POST_PAD_Y` recovers the top.
-/// - **visible top = `TITLE_BAR_RESERVE`, not 0.** The content rests
-///   `TITLE_BAR_RESERVE` below the window top (the transparent-titlebar reserve)
-///   and that band is overlaid, so it's the real visible edge. Using 0 left a
-///   dead-zone where the first `TITLE_BAR_RESERVE` px of scrolling didn't move
-///   the dark span.
+///
+/// The visible region `[vis_top, vis_bot]` is supplied by the caller (screen
+/// space), not assumed: the conversation is visible from screen `y = 0` (it
+/// slides under the *transparent* titlebar — `render_title_bar` is painted
+/// behind the content and has no background) to `viewport_h`. An earlier version
+/// hard-coded `vis_top = TITLE_BAR_RESERVE`, which pushed the dark span down by
+/// that reserve; the empty reserve is instead represented by its own spacer row
+/// at the top of the minimap, so the dark window stays a consistent size.
 fn selected_column(
     block: Option<(f32, f32)>,
-    viewport_h: Pixels,
+    vis_top: f32,
+    vis_bot: f32,
     col_h: Pixels,
     dark: Hsla,
     medium: Hsla,
@@ -1282,15 +1311,15 @@ fn selected_column(
         return div().w_full().h(col_h).bg(medium);
     };
     let height = height.max(1.0);
-    let vis_top = top.max(TITLE_BAR_RESERVE.as_f32());
-    let vis_bot = (top + height).min(viewport_h.as_f32());
-    if vis_bot <= vis_top {
-        // Fully scrolled off-screen.
+    let vt = top.max(vis_top);
+    let vb = (top + height).min(vis_bot);
+    if vb <= vt {
+        // Fully scrolled off-screen (or fully behind the composer).
         return div().w_full().h(col_h).bg(medium);
     }
     let ch = col_h.as_f32();
-    let above = ((vis_top - top) / height).clamp(0.0, 1.0) * ch;
-    let visible = ((vis_bot - vis_top) / height).clamp(0.0, 1.0) * ch;
+    let above = ((vt - top) / height).clamp(0.0, 1.0) * ch;
+    let visible = ((vb - vt) / height).clamp(0.0, 1.0) * ch;
     let below = (ch - above - visible).max(0.0);
     v_flex()
         .w_full()
