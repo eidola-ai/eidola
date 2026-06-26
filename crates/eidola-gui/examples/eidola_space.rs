@@ -171,10 +171,11 @@ pub struct SpaceView {
     /// [`SpaceView::render_active_draft`]); every other draft is a plain inline
     /// editor. `None` means no editor is floating — the default resting state.
     active_draft: Option<&'static str>,
-    /// Focus subscriptions for draft editors (one per created draft): a draft's
+    /// Focus subscriptions for draft editors, keyed by draft id: a draft's
     /// `MarkdownEditorEvent::Focus` makes it the [`SpaceView::active_draft`].
-    /// Held so the subscriptions outlive the closure that created them.
-    draft_subs: Vec<Subscription>,
+    /// Held so the subscriptions outlive the closure that created them, and keyed
+    /// so a deleted draft's subscription is dropped with it.
+    draft_subs: HashMap<&'static str, Subscription>,
     /// Monotonic counter for minting unique (leaked) `&'static str` draft ids.
     next_draft_seq: usize,
     /// Painted bounds of each *inline* (non-active) draft's body, keyed by draft
@@ -276,7 +277,7 @@ impl SpaceView {
             bodies,
             drafts: HashSet::new(),
             active_draft: None,
-            draft_subs: Vec::new(),
+            draft_subs: HashMap::new(),
             next_draft_seq: 0,
             draft_body_bounds: Rc::new(RefCell::new(HashMap::new())),
             composer_scroll: ScrollHandle::new(),
@@ -338,7 +339,7 @@ impl SpaceView {
                 this.activate_draft(id, cx);
             }
         });
-        self.draft_subs.push(sub);
+        self.draft_subs.insert(id, sub);
         self.bodies.insert(id, editor.clone());
         self.drafts.insert(id);
 
@@ -373,20 +374,81 @@ impl SpaceView {
     }
 
     /// Make `id` the active (floating) draft, resetting the shared overlay scroll
-    /// so a previously-scrolled draft's offset doesn't carry over.
+    /// so a previously-scrolled draft's offset doesn't carry over. Switching away
+    /// from another draft retires it (deletes it if left blank).
     fn activate_draft(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        if self.active_draft != Some(id) {
+            self.retire_active_draft(cx);
+        }
         self.active_draft = Some(id);
         self.composer_scroll.set_offset(point(px(0.), px(0.)));
         self.composer_prev_off_y = 0.0;
         cx.notify();
     }
 
-    /// Deactivate the active draft (Escape / external request). The draft stays
-    /// in the tree as a plain inline editor; only its floating behavior ends.
+    /// Deactivate the active draft (Escape / external request). A draft left with
+    /// content stays in the tree as a plain inline editor; only its floating
+    /// behavior ends. A blank one is deleted (see [`SpaceView::retire_active_draft`]).
     fn deactivate_active_draft(&mut self, cx: &mut Context<Self>) {
-        if self.active_draft.take().is_some() {
+        if self.active_draft.is_some() {
+            self.retire_active_draft(cx);
             cx.notify();
         }
+    }
+
+    /// Clear the active draft. If its editor was left empty, delete the node too —
+    /// an abandoned blank draft (Escape, or switching to another) leaves no trace.
+    fn retire_active_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.active_draft.take() else {
+            return;
+        };
+        let empty = self
+            .bodies
+            .get(id)
+            .map(|e| e.read(cx).is_empty())
+            .unwrap_or(false);
+        if empty {
+            self.delete_draft(id, cx);
+        }
+    }
+
+    /// Remove a draft node from the tree and forget its editor/state. Used by
+    /// [`SpaceView::retire_active_draft`] for an abandoned blank draft. Clamps the
+    /// parent scroller back onto a still-valid branch (or drops it if the parent
+    /// is a leaf again).
+    fn delete_draft(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        if let Some(parent_id) = parent_of(&self.root, id) {
+            let remaining = match node_mut(&mut self.root, parent_id) {
+                Some(parent) => {
+                    parent.children.retain(|c| c.id != id);
+                    parent.children.len()
+                }
+                None => 0,
+            };
+            if remaining == 0 {
+                self.scrolls.remove(parent_id);
+            } else if let Some(pw) = self.last_page_width {
+                // The deleted branch may have been the selected one; clamp the
+                // scroller onto the nearest still-valid branch and pin it.
+                let stride = (pw + BAND_HEIGHT).as_f32();
+                if stride > 0.0
+                    && let Some(handle) = self.scrolls.get(parent_id).cloned()
+                {
+                    let off = handle.offset();
+                    let idx =
+                        ((-off.x.as_f32() / stride).round() as i64).clamp(0, remaining as i64 - 1);
+                    let to_x = -(idx as f32) * stride;
+                    handle.set_offset(point(px(to_x), off.y));
+                    self.cancel_snap();
+                    self.snap_pin = Some((parent_id, to_x));
+                }
+            }
+        }
+        self.drafts.remove(id);
+        self.bodies.remove(id);
+        self.draft_subs.remove(id);
+        self.draft_body_bounds.borrow_mut().remove(id);
+        cx.notify();
     }
 
     /// Lock the scroll gesture to an axis. `Started`/`Ended` are gesture
@@ -1235,7 +1297,6 @@ impl SpaceView {
         let theme = cx.theme();
         let info = theme.info;
         let active_color = theme.muted_foreground;
-        let border = theme.border;
         let band_bg = theme.muted;
         let plus_fg = theme.muted_foreground;
         let plus_bg = theme.background.opacity(0.55);
@@ -1755,6 +1816,20 @@ fn prose_style(cx: &App) -> MarkdownStyle {
         });
     style.font_family = theme::FONT_FAMILY.into();
     style
+}
+
+/// Depth-first search for the id of the node whose direct child is `id` (used to
+/// detach a deleted draft from its parent). `None` if `id` is the root or absent.
+fn parent_of(node: &Node, id: &str) -> Option<&'static str> {
+    for child in &node.children {
+        if child.id == id {
+            return Some(node.id);
+        }
+        if let Some(found) = parent_of(child, id) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Depth-first search for the node with `id`, returning a mutable reference so a
