@@ -183,6 +183,10 @@ pub struct SpaceView {
     /// window-clamped block in `post_bounds`). Read by [`SpaceView::floating_pad`]
     /// to size the off-branch bottom padding to a tall selected-leaf draft.
     draft_body_bounds: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
+    /// Vertical scroll of the whole page (the `#scroll` container). Tracked so the
+    /// "return home" affordance can scroll programmatically to dock the active
+    /// draft (see [`SpaceView::go_home`]).
+    page_scroll: ScrollHandle,
     /// Internal scroll of the *active draft's* overlay, used when its content
     /// exceeds the floating cap; tracking it gives the pane native wheel
     /// scrolling and lets the offset clamp as the pane grows. Shared across
@@ -280,6 +284,7 @@ impl SpaceView {
             draft_subs: HashMap::new(),
             next_draft_seq: 0,
             draft_body_bounds: Rc::new(RefCell::new(HashMap::new())),
+            page_scroll: ScrollHandle::new(),
             composer_scroll: ScrollHandle::new(),
             composer_prev_off_y: 0.0,
             scroll_owner: None,
@@ -633,6 +638,61 @@ impl SpaceView {
             duration: dur,
         });
         self.drive_snap(window, cx);
+    }
+
+    /// Select the branch leading to `target` at every level: set each ancestor's
+    /// scroller to the child on the root→target path. Used by
+    /// [`SpaceView::go_home`] to bring an off-branch active draft onto the
+    /// selected path. Instant (the off-screen branches aren't visible mid-jump).
+    fn select_path_to(&mut self, target: &'static str, page_width: Pixels) {
+        let Some(path) = path_ids(&self.root, target) else {
+            return;
+        };
+        let stride = (page_width + BAND_HEIGHT).as_f32();
+        for pair in path.windows(2) {
+            let (parent_id, child_id) = (pair[0], pair[1]);
+            let idx = node_ref(&self.root, parent_id)
+                .and_then(|p| p.children.iter().position(|c| c.id == child_id));
+            if let Some(idx) = idx
+                && let Some(handle) = self.scrolls.get(parent_id)
+            {
+                let off = handle.offset();
+                handle.set_offset(point(px(-(idx as f32) * stride), off.y));
+            }
+        }
+        self.cancel_snap();
+    }
+
+    /// "Return home": navigate to the active draft's branch and scroll the page so
+    /// its editor sits *just docked* — its top around the middle of the window.
+    /// The affordance under the floating "Draft" byline calls this.
+    fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft_id) = self.active_draft else {
+            return;
+        };
+        let page_width = window.viewport_size().width;
+        let win = window.viewport_size().height.as_f32();
+
+        // 1. Bring the draft's branch onto the selected path.
+        self.select_path_to(draft_id, page_width);
+
+        // 2. Scroll vertically so the draft's placeholder docks near mid-window.
+        // Its document top is everything on the (now-selected) path above it:
+        // `reserve + (whole path height − the draft's own height)`.
+        let total =
+            self.selected_subtree_height(&self.root, page_width, window.viewport_size().height);
+        let draft_h = node_ref(&self.root, draft_id)
+            .map(|n| self.selected_subtree_height(n, page_width, window.viewport_size().height))
+            .unwrap_or(0.0);
+        let placeholder_doc_top = TITLE_BAR_RESERVE.as_f32() + total - draft_h;
+        // Target the composer's top (= placeholder top + half_pad) at ~50% height.
+        let half_pad = POST_PAD_Y.as_f32() / 2.0;
+        let target_slot_top = 0.5 * win - half_pad;
+        // screen = doc + offset ⇒ offset = target_screen − doc (clamped ≤ 0).
+        let offset_y = (target_slot_top - placeholder_doc_top).min(0.0);
+        self.page_scroll
+            .set_offset(point(self.page_scroll.offset().x, px(offset_y)));
+        cx.notify();
     }
 
     /// One frame of the active snap glide: ease the offset toward the target and,
@@ -1448,8 +1508,9 @@ impl SpaceView {
         let scrolled_down = self.composer_scroll.offset().y.as_f32() < -0.5;
 
         // Byline gutter — a faint "Draft" standing in for the author slot, so the
-        // body aligns with the posts.
-        let byline = v_flex()
+        // body aligns with the posts. While floating it also carries a "return
+        // home" affordance that docks the editor back at its place in the branch.
+        let mut byline = v_flex()
             .w(GUTTER_WIDTH)
             .flex_none()
             .items_end()
@@ -1461,6 +1522,24 @@ impl SpaceView {
                     .text_color(theme.muted_foreground)
                     .child("Draft"),
             );
+        if overlayed {
+            let home_fg = theme.muted_foreground;
+            let home_fg_hover = theme.foreground;
+            let home_bg_hover = theme.muted;
+            byline = byline.child(
+                div()
+                    .id("draft-home")
+                    .mt_1()
+                    .px_1()
+                    .rounded_md()
+                    .text_sm()
+                    .text_color(home_fg)
+                    .cursor_pointer()
+                    .hover(move |s| s.text_color(home_fg_hover).bg(home_bg_hover))
+                    .child("⌂")
+                    .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx))),
+            );
+        }
 
         let mut body = div()
             .id("composer-body")
@@ -1662,6 +1741,7 @@ impl Render for SpaceView {
                     .id("scroll")
                     .size_full()
                     .overflow_y_scroll()
+                    .track_scroll(&self.page_scroll)
                     // Catch scrolls that don't hit a branch scroller (e.g. over
                     // the root post) for the minimap's show/hide, and claim the
                     // scroll session for the body: reaching the page scroller
@@ -1827,6 +1907,31 @@ fn parent_of(node: &Node, id: &str) -> Option<&'static str> {
         }
         if let Some(found) = parent_of(child, id) {
             return Some(found);
+        }
+    }
+    None
+}
+
+/// Depth-first search for the node with `id` (immutable).
+fn node_ref<'a>(node: &'a Node, id: &str) -> Option<&'a Node> {
+    if node.id == id {
+        return Some(node);
+    }
+    node.children.iter().find_map(|c| node_ref(c, id))
+}
+
+/// The list of node ids from the root down to `target` (inclusive), or `None` if
+/// `target` isn't in the tree. Each adjacent pair is a (parent, selected-child)
+/// step used by [`SpaceView::select_path_to`].
+fn path_ids(node: &Node, target: &str) -> Option<Vec<&'static str>> {
+    if node.id == target {
+        return Some(vec![node.id]);
+    }
+    for child in &node.children {
+        if let Some(mut sub) = path_ids(child, target) {
+            let mut path = vec![node.id];
+            path.append(&mut sub);
+            return Some(path);
         }
     }
     None
