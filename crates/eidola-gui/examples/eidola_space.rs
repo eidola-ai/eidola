@@ -1536,7 +1536,7 @@ impl SpaceView {
                     .text_color(home_fg)
                     .cursor_pointer()
                     .hover(move |s| s.text_color(home_fg_hover).bg(home_bg_hover))
-                    .child("⌂")
+                    .child("See in context")
                     .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx))),
             );
         }
