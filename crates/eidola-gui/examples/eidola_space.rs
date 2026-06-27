@@ -374,6 +374,16 @@ impl SpaceView {
         self.snap_pin = Some((parent_id, to_x));
 
         self.activate_draft(id, cx);
+
+        // Scroll the page so the new draft lands at its docked "home" position —
+        // but only when the page isn't already scrolled far enough to dock it on
+        // its own (creating a draft near the bottom of a long branch shouldn't
+        // yank the view back up). Offsets are ≤ 0, so the deeper scroll wins.
+        let target = self.home_offset_y(id, page_width, window.viewport_size().height);
+        let off = self.page_scroll.offset();
+        self.page_scroll
+            .set_offset(point(off.x, px(off.y.as_f32().min(target))));
+
         let focus = editor.read(cx).focus_handle.clone();
         window.focus(&focus, cx);
     }
@@ -663,33 +673,35 @@ impl SpaceView {
         self.cancel_snap();
     }
 
+    /// The page scroll offset (`y`, ≤ 0) that docks `draft_id`'s editor *just*
+    /// at its "home" position — its top around the middle of the window. Assumes
+    /// the draft is already on the selected path. The draft's placeholder document
+    /// top is everything on the path above it (`reserve + whole-path height − the
+    /// draft's own height`, which cancels the draft's height out); the target puts
+    /// the composer's top (placeholder top + half_pad) at ~50% of the window.
+    fn home_offset_y(&self, draft_id: &'static str, page_width: Pixels, window_h: Pixels) -> f32 {
+        let total = self.selected_subtree_height(&self.root, page_width, window_h);
+        let draft_h = node_ref(&self.root, draft_id)
+            .map(|n| self.selected_subtree_height(n, page_width, window_h))
+            .unwrap_or(0.0);
+        let placeholder_doc_top = TITLE_BAR_RESERVE.as_f32() + total - draft_h;
+        let half_pad = POST_PAD_Y.as_f32() / 2.0;
+        let target_slot_top = 0.5 * window_h.as_f32() - half_pad;
+        // screen = doc + offset ⇒ offset = target_screen − doc (clamped ≤ 0).
+        (target_slot_top - placeholder_doc_top).min(0.0)
+    }
+
     /// "Return home": navigate to the active draft's branch and scroll the page so
-    /// its editor sits *just docked* — its top around the middle of the window.
-    /// The affordance under the floating "Draft" byline calls this.
+    /// its editor sits *just docked*. The affordance under the floating "Draft"
+    /// byline calls this.
     fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft_id) = self.active_draft else {
             return;
         };
         let page_width = window.viewport_size().width;
-        let win = window.viewport_size().height.as_f32();
-
-        // 1. Bring the draft's branch onto the selected path.
+        // Bring the draft's branch onto the selected path, then dock it.
         self.select_path_to(draft_id, page_width);
-
-        // 2. Scroll vertically so the draft's placeholder docks near mid-window.
-        // Its document top is everything on the (now-selected) path above it:
-        // `reserve + (whole path height − the draft's own height)`.
-        let total =
-            self.selected_subtree_height(&self.root, page_width, window.viewport_size().height);
-        let draft_h = node_ref(&self.root, draft_id)
-            .map(|n| self.selected_subtree_height(n, page_width, window.viewport_size().height))
-            .unwrap_or(0.0);
-        let placeholder_doc_top = TITLE_BAR_RESERVE.as_f32() + total - draft_h;
-        // Target the composer's top (= placeholder top + half_pad) at ~50% height.
-        let half_pad = POST_PAD_Y.as_f32() / 2.0;
-        let target_slot_top = 0.5 * win - half_pad;
-        // screen = doc + offset ⇒ offset = target_screen − doc (clamped ≤ 0).
-        let offset_y = (target_slot_top - placeholder_doc_top).min(0.0);
+        let offset_y = self.home_offset_y(draft_id, page_width, window.viewport_size().height);
         self.page_scroll
             .set_offset(point(self.page_scroll.offset().x, px(offset_y)));
         cx.notify();
