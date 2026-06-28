@@ -295,12 +295,15 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
     });
-    // Seed one persisted post so its leaf carries a trailing "+" reply band
-    // (a blank space is only the composer draft, which has no band).
+    // Seed a post with a committed reply (a1 → a2) so a1's band carries the
+    // fork "+" (a leaf has no "+" — its tail draft is the reply affordance). The
+    // blank space's active root draft provides the floating composer probe.
     let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = probe_post("a2", "a committed reply");
+    a2.parent_action_id = Some("a1".into());
     cx.update(|cx| {
         space.update(cx, |s, cx| {
-            s.set_post_tree_for_test(vec![probe_post("a1", "a seeded root post")], cx)
+            s.set_post_tree_for_test(vec![probe_post("a1", "a seeded root post"), a2], cx)
         });
     });
     draw(cx, window);

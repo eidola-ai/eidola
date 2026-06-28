@@ -3369,29 +3369,105 @@ fn space_reply_branches_at_target_and_clears_on_submit(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
-fn space_escape_deletes_empty_draft_keeps_nonempty(cx: &mut TestAppContext) {
+fn space_auto_tail_draft_at_each_leaf(cx: &mut TestAppContext) {
+    // Every branch leaf gets an always-present, *docked* tail draft (the
+    // composer that replaces the leaf "+"); non-leaves do not.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = fixture_user_post("a2", "a committed reply");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "root"), a2], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        let parents = v.draft_parents_for_test();
+        assert!(
+            parents.contains(&Some("a2".to_string())),
+            "a tail draft sits at the leaf a2; parents = {parents:?}"
+        );
+        assert!(
+            !parents.contains(&Some("a1".to_string())),
+            "no tail draft at the non-leaf a1; parents = {parents:?}"
+        );
+        assert!(
+            !v.has_active_draft_for_test(),
+            "tail drafts are docked, not active"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_escape_keeps_empty_tail_draft(cx: &mut TestAppContext) {
+    // The blank-page root draft is a *tail* draft (the always-present
+    // end-of-branch composer), so Escape just docks it — it is NOT deleted.
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, None);
-
-    // The blank-page root draft is empty; Escape deletes it (leaves no trace).
     cx.update_window(window, |_, _, cx| {
         view.update(cx, |v, cx| v.deactivate_for_test(cx));
     })
     .unwrap();
     view.read_with(cx, |v, _| {
-        assert_eq!(v.draft_count_for_test(), 0, "an empty draft is deleted");
+        assert_eq!(v.draft_count_for_test(), 1, "an empty tail draft persists");
+        assert!(
+            !v.has_active_draft_for_test(),
+            "but is deactivated (docked)"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_escape_deletes_empty_fork_keeps_nonempty(cx: &mut TestAppContext) {
+    // An existing space (no auto root draft). Seed a1 → a2 (a2 is a committed
+    // reply to a1), so a draft on a1 is a *fork* (a1 already has a reply).
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = fixture_user_post("a2", "a committed reply");
+    a2.parent_action_id = Some("a1".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "root"), a2], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // An empty FORK draft on a1 → Escape deletes it (a transient new branch).
+    // (The auto tail draft on the leaf a2 persists — assert by parent, not by
+    // raw count.)
+    open_space_draft(&view, window, cx, Some("a1"));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.deactivate_for_test(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        let parents = v.draft_parents_for_test();
+        assert!(
+            !parents.contains(&Some("a1".to_string())),
+            "the empty fork on a1 was deleted; parents = {parents:?}"
+        );
         assert!(!v.has_active_draft_for_test());
     });
 
-    // A non-empty draft persists (deselected) when Escaped.
-    open_space_draft(&view, window, cx, None);
+    // A non-empty draft on a1 persists (deselected) when Escaped.
+    open_space_draft(&view, window, cx, Some("a1"));
     set_space_composer_text(&view, window, cx, "keep me");
     cx.update_window(window, |_, _, cx| {
         view.update(cx, |v, cx| v.deactivate_for_test(cx));
     })
     .unwrap();
     view.read_with(cx, |v, _| {
-        assert_eq!(v.draft_count_for_test(), 1, "a non-empty draft persists");
+        let parents = v.draft_parents_for_test();
+        assert!(
+            parents.contains(&Some("a1".to_string())),
+            "a non-empty fork persists; parents = {parents:?}"
+        );
         assert!(!v.has_active_draft_for_test(), "but is deactivated");
     });
 }

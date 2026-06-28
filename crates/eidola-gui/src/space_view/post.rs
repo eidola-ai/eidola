@@ -259,11 +259,27 @@ impl SpaceView {
         .into_any_element()
     }
 
+    /// Whether `node`'s subtree contains a draft **with content** — drives the
+    /// info-colored branch dots. An empty (just-docked) tail draft doesn't tint;
+    /// only once the user types does its branch read as in-progress.
+    fn subtree_has_draft_content(&self, node: &TreeNode, cx: &gpui::App) -> bool {
+        if matches!(node.src, NodeSrc::Draft)
+            && let Some(d) = self.drafts.iter().find(|d| d.id == node.id)
+            && !d.editor.read(cx).is_empty()
+        {
+            return true;
+        }
+        node.children
+            .iter()
+            .any(|c| self.subtree_has_draft_content(c, cx))
+    }
+
     /// The faint full-bleed separator band between a post and what follows it.
-    /// With more than one reply it carries clickable branch-indicator dots (glide
-    /// to that branch; active one highlighted); it always carries a "+" that
-    /// starts a reply to `node` (a new branch for a post with replies, the first
-    /// reply for a leaf).
+    /// With more than one branch it carries clickable branch-indicator dots
+    /// (glide to that branch; active one highlighted; a branch with an
+    /// in-progress draft tinted `info`). The "+" (start a new branch) shows only
+    /// on a post that already has a committed reply — a leaf's tail draft is its
+    /// own reply affordance.
     pub(crate) fn render_band(
         &self,
         node: &TreeNode,
@@ -295,9 +311,9 @@ impl SpaceView {
             let dots = h_flex()
                 .gap_1()
                 .children(dot_children.iter().enumerate().map(|(i, child)| {
-                    // A branch holding a draft is tinted `info`; the active one
-                    // is full-strength, the rest dimmed.
-                    let base = if super::model::subtree_has_draft(child) {
+                    // A branch with an in-progress (non-empty) draft is tinted
+                    // `info`; the active one is full-strength, the rest dimmed.
+                    let base = if self.subtree_has_draft_content(child, cx) {
                         info
                     } else {
                         active_color
@@ -333,26 +349,35 @@ impl SpaceView {
             row = row.child(dots);
         }
 
-        let add_id = parent_id.clone();
-        row = row.child(
-            div()
-                .id(SharedString::from(format!("space-add-{parent_id}")))
-                .probe("space/band/add", gpui::Role::Button, "Reply here")
-                .size(px(20.))
-                .flex_none()
-                .rounded_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(plus_fg)
-                .bg(plus_bg)
-                .cursor_pointer()
-                .hover(move |s| s.bg(plus_bg_hover))
-                .child("+")
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.create_draft(Some(add_id.clone()), window, cx);
-                })),
-        );
+        // The "+" forks a new branch — shown only on a post that already has a
+        // committed (persisted) reply. A leaf's only child is its tail draft (the
+        // docked composer), which is itself the reply affordance, so no "+".
+        let has_committed_reply = node
+            .children
+            .iter()
+            .any(|c| matches!(c.src, NodeSrc::Msg(_)));
+        if has_committed_reply {
+            let add_id = parent_id.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("space-add-{parent_id}")))
+                    .probe("space/band/add", gpui::Role::Button, "Reply here")
+                    .size(px(20.))
+                    .flex_none()
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(plus_fg)
+                    .bg(plus_bg)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(plus_bg_hover))
+                    .child("+")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.create_draft(Some(add_id.clone()), window, cx);
+                    })),
+            );
+        }
 
         h_flex()
             .w(page_width)

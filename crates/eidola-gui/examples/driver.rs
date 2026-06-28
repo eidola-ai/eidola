@@ -262,7 +262,7 @@ mod driver {
             },
             Scene {
                 name: "space_conversation",
-                description: "Space view: an existing linear conversation (no composer; click + to reply)",
+                description: "Space view: an existing conversation with a docked tail composer at the branch end",
                 default_size: size(px(760.), px(680.)),
                 build: |window, cx| {
                     let stores = ready_stores(cx);
@@ -283,7 +283,7 @@ mod driver {
             },
             Scene {
                 name: "space_branches",
-                description: "Space view: an existing branched post tree (kitchen-sink fixture)",
+                description: "Space view: a branched post tree with docked tail drafts (kitchen-sink fixture)",
                 default_size: size(px(900.), px(700.)),
                 build: |window, cx| {
                     let stores = ready_stores(cx);

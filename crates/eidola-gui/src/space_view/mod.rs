@@ -376,6 +376,15 @@ impl SpaceView {
         self.drafts.len()
     }
 
+    /// The parents of all current drafts (tests assert tail/fork presence).
+    #[doc(hidden)]
+    pub fn draft_parents_for_test(&self) -> Vec<Option<String>> {
+        self.drafts
+            .iter()
+            .map(|d| d.parent.as_ref().map(|s| s.to_string()))
+            .collect()
+    }
+
     /// The active draft's parent (the post it replies to), if any.
     #[doc(hidden)]
     pub fn active_draft_parent_for_test(&self) -> Option<String> {
@@ -434,6 +443,38 @@ impl SpaceView {
             .map(post_data_from)
             .collect();
         self.posts = posts;
+    }
+
+    /// The parents a **tail draft** attaches to: every current branch leaf (a
+    /// post nothing else replies to), or the root (`None`) when the space is
+    /// empty. A *fork* draft attaches to a non-leaf (a post with a committed
+    /// reply) and is therefore **not** in this set — which is how
+    /// [`Self::retire_active_draft`] / [`Self::sync_tail_drafts`] tell the
+    /// always-present tail composer from a transient branch.
+    pub(crate) fn tail_parents(&self) -> Vec<SharedString> {
+        if self.posts.is_empty() {
+            return Vec::new();
+        }
+        let with_child: HashSet<&str> = self
+            .posts
+            .iter()
+            .filter_map(|p| p.parent_action_id.as_deref())
+            .collect();
+        self.posts
+            .iter()
+            .filter_map(|p| p.action_id.as_deref())
+            .filter(|aid| !with_child.contains(aid))
+            .map(SharedString::from)
+            .collect()
+    }
+
+    /// Whether a draft replying to `parent` is a tail draft (its parent is a
+    /// current leaf, or it's the blank-space root draft).
+    pub(crate) fn is_tail_parent(&self, parent: Option<&str>) -> bool {
+        match parent {
+            None => self.posts.is_empty(),
+            Some(p) => self.tail_parents().iter().any(|t| t == p),
+        }
     }
 
     /// Resolve the model for a send: space selection → config default →
@@ -628,6 +669,9 @@ impl Render for SpaceView {
         // make sure every post/scroller has its editor + scroll handle.
         self.layout.ensure_width(page_width.as_f32());
         self.sync_bodies(window, cx);
+        // Keep a docked tail draft at the end of every branch (the always-present
+        // composer that replaces the leaf "+").
+        self.sync_tail_drafts(window, cx);
 
         let streaming = self.space.read(cx).is_streaming();
         let tree = self.effective_tree(page_width, streaming);

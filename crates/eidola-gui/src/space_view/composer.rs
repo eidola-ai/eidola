@@ -22,6 +22,10 @@ use gpui::{
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorEvent, MarkdownEditorState};
 
+use std::collections::HashSet;
+
+use crate::loadable::Loadable;
+
 use super::layout::body_width;
 use super::model::{self, TreeNode};
 use super::nav::ScrollOwner;
@@ -33,15 +37,16 @@ use super::{
 impl SpaceView {
     // -- Draft lifecycle ---------------------------------------------------
 
-    /// Create a new draft replying to `parent` (a band's "+"), make it the
-    /// active (floating) composer, and focus it. The branch selection + page
-    /// dock happen on the next render (`pending_select`), against the real tree.
-    pub(crate) fn create_draft(
+    /// Mint a draft node replying to `parent`: a fresh editor wired to activate
+    /// on focus and submit on the Enter chords, pushed into `drafts`. Returns its
+    /// id. Shared by the focused-fork path ([`Self::create_draft`]) and the
+    /// auto-ensured docked tail drafts ([`Self::sync_tail_drafts`]).
+    fn create_draft_node(
         &mut self,
         parent: Option<gpui::SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> gpui::SharedString {
         self.next_draft_seq += 1;
         let id = gpui::SharedString::from(format!("draft-{}", self.next_draft_seq));
         let editor = cx.new(|cx| MarkdownEditorState::new(window, cx));
@@ -75,18 +80,86 @@ impl SpaceView {
         self.drafts.push(Draft {
             id: id.clone(),
             parent,
-            editor: editor.clone(),
+            editor,
             _sub: sub,
         });
+        id
+    }
+
+    /// Open a draft replying to `parent` (a band's "+" / ⌘N): make it the active
+    /// (floating) composer and focus it. The branch selection + page dock happen
+    /// on the next render (`pending_select`), against the real tree.
+    pub(crate) fn create_draft(
+        &mut self,
+        parent: Option<gpui::SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.create_draft_node(parent, window, cx);
+        let focus = self.drafts.last().unwrap().editor.read(cx).focus_handle(cx);
         self.activate_draft(id.clone(), cx);
         self.pending_select = Some(id);
-
-        let focus = editor.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
     }
 
+    /// Ensure every branch leaf has a **tail draft** — the always-present,
+    /// docked end-of-branch composer that replaces the leaf "+": a draft whose
+    /// parent is a leaf (a post nothing replies to; the root `None` for a blank
+    /// space). Empty tail drafts persist (docked); empty, inactive drafts whose
+    /// parent is *not* a leaf (orphans, or a fork whose branch was committed) are
+    /// pruned. Skipped while streaming and until the transcript has loaded (so we
+    /// know the real leaves). Runs each frame in `render` (cheap + idempotent).
+    pub(crate) fn sync_tail_drafts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.space.read(cx).is_streaming() {
+            return;
+        }
+        if !matches!(self.space.read(cx).transcript(), Loadable::Loaded { .. }) {
+            return;
+        }
+
+        let leaf_parents = self.tail_parents(); // leaf action ids (Some-parents)
+        let want_root = self.posts.is_empty(); // blank space → root (None) tail draft
+
+        // Ensure the blank-space root tail draft.
+        if want_root && !self.drafts.iter().any(|d| d.parent.is_none()) {
+            self.create_draft_node(None, window, cx);
+        }
+        // Ensure a docked tail draft for each leaf that lacks one.
+        for parent in &leaf_parents {
+            let has = self
+                .drafts
+                .iter()
+                .any(|d| d.parent.as_deref() == Some(parent.as_ref()));
+            if !has {
+                self.create_draft_node(Some(parent.clone()), window, cx);
+            }
+        }
+
+        // Prune empty, inactive drafts whose parent is no longer a tail parent
+        // (an orphan, or a fork whose branch was committed). Compute the tail-set
+        // as a local so the filter borrows no `self` method.
+        let leaf_set: HashSet<&str> = leaf_parents.iter().map(|s| s.as_ref()).collect();
+        let active = self.active_draft.clone();
+        let stale: Vec<gpui::SharedString> = self
+            .drafts
+            .iter()
+            .filter(|d| {
+                let is_tail = match d.parent.as_deref() {
+                    None => want_root,
+                    Some(p) => leaf_set.contains(p),
+                };
+                Some(&d.id) != active.as_ref() && !is_tail && d.editor.read(cx).is_empty()
+            })
+            .map(|d| d.id.clone())
+            .collect();
+        for id in stale {
+            self.delete_draft(&id);
+        }
+    }
+
     /// Make `id` the active (floating) draft, retiring the previous one (which
-    /// is deleted if it was left empty). Resets the shared composer scroll.
+    /// is deleted if it was an empty *fork*; an empty tail draft just docks).
+    /// Resets the shared composer scroll.
     pub(crate) fn activate_draft(&mut self, id: gpui::SharedString, cx: &mut Context<Self>) {
         if self.active_draft.as_ref() != Some(&id) {
             self.retire_active_draft(cx);
@@ -97,9 +170,9 @@ impl SpaceView {
         cx.notify();
     }
 
-    /// Deactivate the active draft (Escape / external request). A draft with
-    /// content stays in the tree as a plain inline editor; only its floating
-    /// behavior ends. A blank one is deleted.
+    /// Deactivate the active draft (Escape / external request). An empty **tail**
+    /// draft stays as the docked end-of-branch composer; an empty **fork** draft
+    /// (a transient new branch) is deleted; a draft with content stays inline.
     pub(crate) fn deactivate_active_draft(&mut self, cx: &mut Context<Self>) {
         if self.active_draft.is_some() {
             self.retire_active_draft(cx);
@@ -107,19 +180,19 @@ impl SpaceView {
         }
     }
 
-    /// Clear the active draft, deleting it if its editor was left empty (an
-    /// abandoned blank draft leaves no trace).
+    /// Clear the active draft; delete it only if it was an **empty fork** (an
+    /// abandoned new branch). An empty tail draft is kept (docked) — it's the
+    /// always-present composer at the end of its branch.
     fn retire_active_draft(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.active_draft.take() else {
             return;
         };
-        let empty = self
-            .drafts
-            .iter()
-            .find(|d| d.id == id)
-            .map(|d| d.editor.read(cx).is_empty())
-            .unwrap_or(false);
-        if empty {
+        let Some(draft) = self.drafts.iter().find(|d| d.id == id) else {
+            return;
+        };
+        let empty = draft.editor.read(cx).is_empty();
+        let parent = draft.parent.clone();
+        if empty && !self.is_tail_parent(parent.as_deref()) {
             self.delete_draft(&id);
         }
     }
