@@ -74,9 +74,17 @@ impl SpaceView {
         let streaming = false; // the structure (not the live partial) drives the map
         let tree = self.effective_tree(page_width, streaming);
         let selected = self.selected_total_height(&tree, page_width, viewport_h);
+        // Use the *clamped* scroll position (see `render_minimap`) so transient
+        // momentum overshoot past the ends doesn't schedule a catch-up frame
+        // that would re-render the minimap mid-overshoot.
+        let total = TITLE_BAR_RESERVE.as_f32()
+            + selected
+            + self.floating_pad(&tree, page_width, viewport_h, false);
+        let min_y = (viewport_h.as_f32() - total).min(0.0);
+        let scroll_y = self.page_scroll.offset().y.as_f32().clamp(min_y, 0.0);
         viewport_h.as_f32()
             + self.composer_content_h.borrow().as_f32() * 5.0
-            + self.page_scroll.offset().y.as_f32() * 19.0
+            + scroll_y * 19.0
             + selected * 3.0
             + self.posts.len() as f32
     }
@@ -111,7 +119,15 @@ impl SpaceView {
         // 1:1 to the real scrollable height on every branch.
         let pad = self.floating_pad(roots, page_width, viewport_h, false);
         let total_h = reserve + selected_h + pad;
-        let scroll_y = self.page_scroll.offset().y.as_f32();
+        // Clamp the scroll position the indicator reflects to the content's real
+        // scrollable range `[window − content, 0]`. The page hard-stops at the
+        // ends, but the scroll handle's raw offset transiently *overshoots*
+        // during momentum before it resyncs; reading it unclamped made the
+        // minimap's visible-window slide past the end and flicker back. Clamping
+        // here makes the minimap a pure function of the settled position — a
+        // matching hard stop at both ends — without touching the real scroll.
+        let min_y = (viewport_h.as_f32() - total_h).min(0.0);
+        let scroll_y = self.page_scroll.offset().y.as_f32().clamp(min_y, 0.0);
 
         if total_h > 0.0 && viewport_h > px(0.) && !levels.is_empty() {
             let scale = viewport_h.as_f32() / total_h;
