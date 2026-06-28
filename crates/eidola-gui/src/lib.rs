@@ -14,6 +14,7 @@ pub mod probe;
 pub mod record;
 pub mod settings;
 pub mod space;
+pub mod space_view;
 pub mod stores;
 pub mod theme;
 pub mod updates;
@@ -32,10 +33,12 @@ use crate::actions::{
     About, CheckForUpdates, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenLibrary,
     OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
 };
+#[allow(unused_imports)]
 use crate::chat::ChatView;
 use crate::library::LibraryView;
 use crate::record::RecordView;
 use crate::settings::SettingsView;
+use crate::space_view::SpaceView;
 use crate::stores::Stores;
 use crate::updates::UpdatesView;
 use crate::window_input::WindowInput;
@@ -549,7 +552,7 @@ fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
     let _ = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
         let wi = WindowInput::new(cx);
-        let view = cx.new(|cx| ChatView::new(stores.clone(), space_id.clone(), wi, window, cx));
+        let view = cx.new(|cx| SpaceView::new(stores.clone(), space_id.clone(), wi, window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
 

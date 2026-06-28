@@ -81,6 +81,13 @@ pub struct ChatMessageView {
     pub action_id: Option<String>,
     /// The post's stable item id (see `action_id`).
     pub item_id: Option<String>,
+    /// The structural reply antecedent — the action this post replies to
+    /// (`None` for a root). The space-tree view relinks the flat transcript
+    /// into a navigable tree through this edge.
+    pub parent_action_id: Option<String>,
+    /// Wall-clock creation time (unix seconds) of the post, for the gutter
+    /// time byline. `0` for synthetic rows with no persisted timestamp.
+    pub created_at: i64,
     /// Thread depth from the flattener: `0` is the spine, `> 0` an indented
     /// branch. Drives the branch indent + margin rail in the render.
     pub depth: usize,
@@ -107,6 +114,8 @@ impl ChatMessageView {
             byline,
             action_id: None,
             item_id: None,
+            parent_action_id: None,
+            created_at: 0,
             depth: 0,
             is_branch: false,
             generation_count: 1,
@@ -139,6 +148,8 @@ impl ChatMessageView {
             byline,
             action_id: Some(node.action_id),
             item_id: Some(node.item_id),
+            parent_action_id: node.parent_action_id,
+            created_at: node.created_at,
             depth: node.depth,
             is_branch: node.is_branch,
             generation_count: node.generation_count,

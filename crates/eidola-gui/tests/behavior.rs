@@ -28,6 +28,7 @@ use eidola_gui::chat::{
 use eidola_gui::library::LibraryView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
+use eidola_gui::space_view::SpaceView;
 use eidola_gui::stores::{Stores, StoresStub};
 use eidola_gui::updates::{UpdatesDisplay, UpdatesView, relative_time};
 use eidola_gui::wallet::WalletView;
@@ -3192,4 +3193,155 @@ fn submit_engages_tail_but_load_does_not(cx: &mut TestAppContext) {
             v.list_state_item_count_for_test()
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// SpaceView — the tree-navigation conversation surface (wave-6).
+// ---------------------------------------------------------------------------
+
+fn open_space(
+    cx: &mut TestAppContext,
+    stores: &Stores,
+    space_id: Option<String>,
+) -> (AnyWindowHandle, Entity<SpaceView>) {
+    let stores = stores.clone();
+    open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores.clone(),
+                space_id.clone(),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    })
+}
+
+/// Set the composer's markdown directly (bypassing IME), like the chat helper.
+fn set_space_composer_text(
+    view: &Entity<SpaceView>,
+    window: AnyWindowHandle,
+    cx: &mut TestAppContext,
+    text: &str,
+) {
+    let editor = view.read_with(cx, |v, _| v.composer_state_for_test());
+    let text = text.to_string();
+    cx.update_window(window, |_, window, cx| {
+        let _ = window;
+        editor.update(cx, |e, cx| e.set_value(text, cx));
+    })
+    .unwrap();
+}
+
+fn dispatch_space_action<A: gpui::Action>(
+    view: &Entity<SpaceView>,
+    window: AnyWindowHandle,
+    cx: &mut TestAppContext,
+    action: A,
+) {
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&action, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn space_submit_appends_user_and_streams(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    set_space_composer_text(&view, window, cx, "hello space");
+    dispatch_space_action(&view, window, cx, Send);
+
+    view.read_with(cx, |v, cx| {
+        // The snapshot picked up the optimistic user turn, and the space is
+        // streaming (the stub leaves `streaming = Some`).
+        assert_eq!(v.post_count_for_test(), 1);
+        let space = v.space().read(cx);
+        assert!(space.is_streaming(), "submit enters the streaming state");
+        assert_eq!(space.messages()[0].message.role, "user");
+        assert_eq!(space.messages()[0].message.content, "hello space");
+    });
+}
+
+#[gpui::test]
+fn space_post_only_appends_user_without_streaming(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    set_space_composer_text(&view, window, cx, "just save this");
+    dispatch_space_action(&view, window, cx, PostOnly);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.post_count_for_test(), 1);
+        let space = v.space().read(cx);
+        assert!(!space.is_streaming(), "post-only does not stream");
+        assert_eq!(space.messages()[0].message.content, "just save this");
+    });
+}
+
+#[gpui::test]
+fn space_empty_submit_is_a_noop(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    // Composer left empty.
+    dispatch_space_action(&view, window, cx, Send);
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.post_count_for_test(), 0);
+        assert!(!v.space().read(cx).is_streaming());
+    });
+}
+
+#[gpui::test]
+fn space_reply_sets_branch_target_and_clears_on_submit(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+
+    // Seed a persisted post tree so there's a real post to reply to.
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the root post")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Start a reply to a1 → the composer branches there.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.start_reply_for_test("a1".into(), window, cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.reply_to_for_test().as_deref(), Some("a1"));
+    });
+
+    // Submitting consumes the reply target (back to the tail).
+    set_space_composer_text(&view, window, cx, "a branch reply");
+    dispatch_space_action(&view, window, cx, Send);
+    view.read_with(cx, |v, _| {
+        assert_eq!(
+            v.reply_to_for_test(),
+            None,
+            "reply target cleared on submit"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_joins_shared_entity_for_same_id(cx: &mut TestAppContext) {
+    // Two windows on one space share the same `Space` entity (the registry
+    // join), so a submit in one appears in the other.
+    let stores = stub_stores_with_config(cx);
+    let (w1, v1) = open_space(cx, &stores, Some("shared".into()));
+    let (_w2, v2) = open_space(cx, &stores, Some("shared".into()));
+    let e1 = v1.read_with(cx, |v, _| v.space().clone());
+    let e2 = v2.read_with(cx, |v, _| v.space().clone());
+    assert_eq!(e1.entity_id(), e2.entity_id());
+
+    set_space_composer_text(&v1, w1, cx, "from window one");
+    dispatch_space_action(&v1, w1, cx, Send);
+    // The second window's snapshot reflects the shared space.
+    v2.read_with(cx, |v, _| assert_eq!(v.post_count_for_test(), 1));
 }

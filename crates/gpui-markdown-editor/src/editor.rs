@@ -27,7 +27,7 @@ use gpui_component::Theme;
 use crate::element::{BlockElement, LaidOutBlock};
 use crate::event::{EditorEvent, MarkdownEditorEvent};
 use crate::parser::parse;
-use crate::render::render;
+use crate::render::{render, render_readonly};
 use crate::render_spec::RenderSpec;
 use crate::state::{EditorState, Selection};
 use crate::style::MarkdownStyle;
@@ -286,7 +286,16 @@ impl MarkdownEditorState {
 
     pub fn render_spec(&self) -> RenderSpec {
         let tree = parse(&self.state.markdown);
-        render(&self.state, &tree)
+        // A disabled (read-only) editor renders as *published* markdown: there
+        // is no live cursor, so every WYSIWYG delimiter is hidden and the
+        // content reads as finished prose. This is what makes a read-only post
+        // pixel-identical to a clean rendered reply (used by the space view to
+        // render every transcript post through the same editor as the composer).
+        if self.disabled {
+            render_readonly(&self.state, &tree)
+        } else {
+            render(&self.state, &tree)
+        }
     }
 
     pub fn cursor_offset(&self) -> usize {

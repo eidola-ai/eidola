@@ -52,7 +52,17 @@
 // `VisualTestAppContext` wraps the real Mac platform (offscreen Metal
 // rendering), so the driver is macOS-only — same gate as `tests/visual.rs`.
 #[cfg(target_os = "macos")]
+// The shared, backend-free post fixtures (also used by the visual snapshot
+// cases) — a branched `PostNode` tree to exercise the space view. Declared at
+// the file's top level so its `#[path]` resolves against `examples/` (a real
+// directory) rather than the inline `driver` module's virtual subdir.
+#[cfg(target_os = "macos")]
+#[path = "../tests/visual/fixtures.rs"]
+mod fixtures;
+
+#[cfg(target_os = "macos")]
 mod driver {
+    use super::fixtures;
     use std::collections::HashMap;
     use std::io::{BufRead, Write as _};
     use std::path::PathBuf;
@@ -69,6 +79,7 @@ mod driver {
     use eidola_gui::probe;
     use eidola_gui::record::RecordView;
     use eidola_gui::settings::SettingsView;
+    use eidola_gui::space_view::SpaceView;
     use eidola_gui::stores::{Stores, StoresStub};
     use eidola_gui::updates::UpdatesView;
     use eidola_gui::window_input::WindowInput;
@@ -234,6 +245,34 @@ mod driver {
                             ChatView::new(stores, None, WindowInput::new(cx), window, cx);
                         view.set_messages_for_test(conversation(), cx);
                         view
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_conversation",
+                description: "Space view: a linear conversation (tree scrollers + composer)",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view =
+                        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx));
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_branches",
+                description: "Space view: a branched post tree (kitchen-sink fixture)",
+                default_size: size(px(900.), px(700.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view =
+                        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx));
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
                     });
                     root(view, window, cx)
                 },

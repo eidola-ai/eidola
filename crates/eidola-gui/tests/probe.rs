@@ -10,10 +10,13 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use eidola_app_core::{BalancesResult, ConfigState, ModelInfo};
+use eidola_app_core::{
+    BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
+};
 use eidola_gui::chat::{ChatView, ToggleModelPicker};
 use eidola_gui::library::LibraryView;
 use eidola_gui::probe;
+use eidola_gui::space_view::SpaceView;
 use eidola_gui::stores::{Stores, StoresStub};
 use eidola_gui::window_input::WindowInput;
 use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
@@ -282,4 +285,74 @@ fn open_view<V: gpui::Render + 'static>(
             .expect("open test window");
         (window.into(), inner.expect("build closure produced a view"))
     })
+}
+
+#[gpui::test]
+fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    // Seed one persisted post so its leaf carries a trailing "+" reply band
+    // (a blank space is only the composer draft, which has no band).
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a seeded root post")], cx)
+        });
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"space/composer"),
+        "composer probe missing; recorded: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/band/add"),
+        "band reply affordance probe missing; recorded: {names:?}"
+    );
+
+    let composer = &entries
+        .iter()
+        .find(|(n, _)| n == "space/composer")
+        .unwrap()
+        .1;
+    assert_eq!(format!("{:?}", composer.role), "TextInput");
+    assert_eq!(composer.label.as_ref(), "Message composer");
+
+    probe::set_probes_enabled(false);
+}
+
+fn probe_post(action_id: &str, text: &str) -> PostNode {
+    PostNode {
+        action_id: action_id.into(),
+        item_id: format!("item-{action_id}"),
+        parent_action_id: None,
+        participant: PostParticipant {
+            kind: "human".into(),
+            label: "user".into(),
+        },
+        action_type: "user_input".into(),
+        generation: 0,
+        generation_count: 1,
+        is_current: true,
+        model: None,
+        credits_consumed: None,
+        relation: None,
+        depth: 0,
+        is_branch: false,
+        blocks: vec![PostBlock {
+            block_type: "text".into(),
+            text: Some(text.into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }],
+        references: Vec::new(),
+        created_at: 0,
+    }
 }

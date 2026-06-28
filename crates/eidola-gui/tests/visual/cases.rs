@@ -17,6 +17,7 @@ use eidola_gui::chat::{ChatView, StreamingResponse};
 use eidola_gui::library::LibraryView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
+use eidola_gui::space_view::SpaceView;
 use eidola_gui::stores::{Stores, StoresStub};
 use eidola_gui::updates::UpdatesView;
 use eidola_gui::window_input::WindowInput;
@@ -27,12 +28,40 @@ use super::harness::Snapshots;
 
 pub fn register(s: &mut Snapshots) {
     register_chat(s);
+    register_space(s);
     register_onboarding(s);
     register_library(s);
     register_settings(s);
     register_updates(s);
     register_record(s);
     register_about(s);
+}
+
+// ---------------------------------------------------------------------------
+// Space view — the tree-navigation conversation surface (wave-6)
+// ---------------------------------------------------------------------------
+
+fn register_space(s: &mut Snapshots) {
+    // The kitchen-sink post tree rendered through the new SpaceView: byline
+    // gutter, Newsreader prose posts (read-only `MarkdownEditor`, published —
+    // no delimiters), separator bands with the "+" reply affordance, and the
+    // floating "Draft" composer at the bottom.
+    s.add("space_branches", size(px(900.), px(720.)), |window, cx| {
+        let core = stub_stores_with_config(cx);
+        cx.new(|cx| {
+            let view = SpaceView::new(core, None, WindowInput::new(cx), window, cx);
+            view.space().update(cx, |sp, cx| {
+                sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
+            });
+            view
+        })
+    });
+
+    // A blank space: the cursor at the top of an empty page (just the composer).
+    s.add("space_empty", size(px(760.), px(680.)), |window, cx| {
+        let core = stub_stores_with_config(cx);
+        cx.new(|cx| SpaceView::new(core, None, WindowInput::new(cx), window, cx))
+    });
 }
 
 // ---------------------------------------------------------------------------
