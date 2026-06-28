@@ -178,12 +178,16 @@ impl SpaceView {
             NodeSrc::Draft if self.active_draft.as_deref() == Some(&node.id) => {
                 self.draft_slot_height(node, page_width, window_h)
             }
-            // An inactive draft renders inline as an editable post; use its
-            // measured height (a small reserve until it first measures).
+            // An inactive draft renders inline as an editable post, but reserves
+            // at least a full window (it's always the end of its branch), so
+            // there's perfect continuity with the active draft's runway slot —
+            // activating/deactivating it never resizes the layout. `min_h` on
+            // the inline frame makes the measured height honour the same floor.
             NodeSrc::Draft => self
                 .layout
                 .measured(&node.id)
-                .unwrap_or_else(|| window_h.as_f32() * 0.18),
+                .unwrap_or(0.0)
+                .max(window_h.as_f32()),
             NodeSrc::Streaming => self
                 .layout
                 .measured(&node.id)
@@ -298,6 +302,18 @@ impl SpaceView {
             .map(|(n, _)| self.node_height(n, page_width, window_h))
             .unwrap_or(0.0);
         TITLE_BAR_RESERVE.as_f32() + total - leaf_h
+    }
+
+    /// The page scroll `y`, clamped to the content's real scrollable range
+    /// `[scroll_min_y, 0]` (set once per frame in `render`). Read by everything
+    /// that *positions* content from the scroll offset, so transient momentum
+    /// overshoot past the ends never moves it (the generalized flicker fix).
+    pub(crate) fn clamped_scroll_y(&self) -> f32 {
+        self.page_scroll
+            .offset()
+            .y
+            .as_f32()
+            .clamp(self.scroll_min_y.get(), 0.0)
     }
 
     /// Total rendered height of the selected path from the active root.

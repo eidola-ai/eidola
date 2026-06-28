@@ -34,7 +34,7 @@ impl SpaceView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let h = self.node_height(node, page_width, window_h);
-        let screen_top = doc_y + self.page_scroll.offset().y.as_f32();
+        let screen_top = doc_y + self.clamped_scroll_y();
         let visible = screen_top + h > -VIRT_MARGIN && screen_top < window_h.as_f32() + VIRT_MARGIN;
         if visible {
             self.render_post(node, page_width, cx).into_any_element()
@@ -145,7 +145,7 @@ impl SpaceView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let h = self.node_height(node, page_width, window_h);
-        let screen_top = doc_y + self.page_scroll.offset().y.as_f32();
+        let screen_top = doc_y + self.clamped_scroll_y();
         let visible = screen_top + h > -VIRT_MARGIN && screen_top < window_h.as_f32() + VIRT_MARGIN;
         let editor = self
             .drafts
@@ -162,6 +162,7 @@ impl SpaceView {
         let theme = cx.theme();
         let bw = px(body_width(page_width));
         let focus = editor.read(cx).focus_handle(cx);
+        let id = node.id.clone();
 
         let byline_el = v_flex()
             .w(GUTTER_WIDTH)
@@ -179,16 +180,26 @@ impl SpaceView {
         h_flex()
             .relative()
             .w(page_width)
+            // A draft is always the end of its branch, so reserve at least a
+            // full window — the same `max(natural, window)` runway the active
+            // composer docks into — so activating/deactivating it never shifts
+            // the layout (`node_height` reports the same height).
+            .min_h(window_h)
             .py(POST_PAD_Y)
             .justify_center()
             .items_start()
             .gap(GUTTER_GAP)
             .pr(GUTTER_WIDTH / 2. + GUTTER_GAP)
-            // Clicking anywhere on the inline draft focuses its editor, whose
-            // Focus event re-activates it (floating composer).
+            // Clicking anywhere on the inline draft re-activates it (floating
+            // composer) and focuses its editor. We activate directly rather than
+            // rely on the editor's Focus event, which wouldn't fire if the
+            // editor already held focus (e.g. just after Escape deactivated it).
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |_, _, window, cx| window.focus(&focus, cx)),
+                cx.listener(move |this, _, window, cx| {
+                    this.activate_draft(id.clone(), cx);
+                    window.focus(&focus, cx);
+                }),
             )
             .child(byline_el)
             .child(

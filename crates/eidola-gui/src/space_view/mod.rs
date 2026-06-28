@@ -217,6 +217,13 @@ pub struct SpaceView {
 
     /// Vertical scroll of the whole page.
     pub(crate) page_scroll: ScrollHandle,
+    /// The most-negative valid page scroll `y` for the current frame (the
+    /// content hard-stops here). Set once per `render` from the real document
+    /// height; everything that *positions* content from the scroll offset reads
+    /// it via `clamped_scroll_y`, so transient momentum overshoot past the ends
+    /// never moves the docked composer / posts / minimap (the flicker fix,
+    /// generalized).
+    pub(crate) scroll_min_y: Cell<f32>,
     /// One horizontal scroller per node that has children, keyed by node id.
     pub(crate) scrolls: HashMap<SharedString, ScrollHandle>,
     /// The axis the current gesture is locked to (`None` between gestures).
@@ -306,6 +313,7 @@ impl SpaceView {
             slot_bounds: Rc::new(RefCell::new(HashMap::new())),
             scroll_owner: None,
             page_scroll: ScrollHandle::new(),
+            scroll_min_y: Cell::new(0.0),
             scrolls: HashMap::new(),
             scroll_axis: None,
             last_h_delta: px(0.),
@@ -650,6 +658,19 @@ impl Render for SpaceView {
             }
         }
 
+        // Cap the scroll position the frame *positions content from* to the
+        // content's real scrollable range. The page hard-stops at the ends, but
+        // the scroll handle's raw offset transiently overshoots during momentum;
+        // every consumer reads `clamped_scroll_y()` (which clamps to
+        // `[scroll_min_y, 0]`) so the docked composer / posts / minimap don't
+        // drift past the end and flicker. Set before any consumer below.
+        let floating_pad = self.floating_pad(&tree, page_width, window_h, streaming);
+        let total_doc = TITLE_BAR_RESERVE.as_f32()
+            + self.selected_total_height(&tree, page_width, window_h)
+            + floating_pad;
+        self.scroll_min_y
+            .set((window_h.as_f32() - total_doc).min(0.0));
+
         // Schedule a single catch-up frame when the minimap's layout inputs
         // change, so it converges once the layout settles.
         let sig = self.minimap_signature(page_width, window_h);
@@ -662,7 +683,6 @@ impl Render for SpaceView {
         // Keep the composer's frozen-scroll baseline in step between gestures.
         self.composer_prev_off_y = self.composer_scroll.offset().y.as_f32();
 
-        let floating_pad = self.floating_pad(&tree, page_width, window_h, streaming);
         let body = self.render_forest(
             &tree,
             TITLE_BAR_RESERVE.as_f32(),

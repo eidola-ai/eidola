@@ -281,10 +281,7 @@ impl SpaceView {
         let float_bar_h = (chrome + content).min(COMPOSER_MAX_FRACTION * win);
         let float_top = win - float_bar_h;
         let slot_top = if on_path {
-            Some(
-                self.placeholder_doc_top(roots, page_width, window_h)
-                    + self.page_scroll.offset().y.as_f32(),
-            )
+            Some(self.placeholder_doc_top(roots, page_width, window_h) + self.clamped_scroll_y())
         } else {
             None
         };
@@ -389,9 +386,13 @@ impl SpaceView {
             .top(px(top_y))
             .h(px(bar_h))
             .bg(theme.background)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
+                    // Deactivate (deleting it if empty) and move focus off the
+                    // editor to the view root, so a kept draft reads as exited
+                    // (no stray cursor) until it's clicked back into.
                     this.deactivate_active_draft(cx);
+                    window.focus(&this.focus_handle, cx);
                 }
             }))
             .child(
