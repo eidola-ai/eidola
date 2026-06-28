@@ -387,8 +387,9 @@ impl SpaceView {
                 div()
                     .text_sm()
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(theme.muted_foreground)
-                    .child("Draft"),
+                    .opacity(0.85)
+                    .text_color(theme.info)
+                    .child("You"),
             );
         if overlayed {
             let home_fg = theme.muted_foreground;

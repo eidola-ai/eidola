@@ -318,6 +318,18 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
         names.contains(&"space/band/add"),
         "band reply affordance probe missing; recorded: {names:?}"
     );
+    // The minimap is a navigable table of contents: a labelled Group of
+    // per-node Buttons.
+    assert!(
+        names.contains(&"space/minimap"),
+        "minimap group probe missing; recorded: {names:?}"
+    );
+    let map = entries.iter().find(|(n, _)| n == "space/minimap").unwrap();
+    assert_eq!(map.1.label.as_ref(), "Conversation map");
+    assert!(
+        names.iter().any(|n| n.starts_with("space/minimap/cell/")),
+        "minimap column probes missing; recorded: {names:?}"
+    );
 
     let composer = &entries
         .iter()

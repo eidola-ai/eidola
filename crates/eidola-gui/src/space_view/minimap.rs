@@ -12,11 +12,13 @@
 
 use gpui::{
     Animation, AnimationExt, AnyElement, Context, Hsla, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, WeakEntity, div, px,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity, div, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
-use super::model::TreeNode;
+use crate::probe::Probe as _;
+
+use super::model::{NodeSrc, TreeNode};
 use super::{
     BAND_HEIGHT, MINIMAP_COL_GAP, MINIMAP_FADE, MINIMAP_HIDE_DELAY, MINIMAP_WIDTH, SpaceView,
     TITLE_BAR_RESERVE,
@@ -85,6 +87,34 @@ impl SpaceView {
             + self.posts.len() as f32
     }
 
+    /// A screen-reader / table-of-contents label for a map column: the post's
+    /// byline plus a short snippet ("You: I keep circling back to…"), or "Draft"
+    /// / "Eidola, responding" for the overlays.
+    fn node_label(&self, node: &TreeNode) -> String {
+        match node.src {
+            NodeSrc::Streaming => "Eidola, responding".to_string(),
+            NodeSrc::Draft => "Draft".to_string(),
+            NodeSrc::Msg(i) => {
+                let Some(p) = self.posts.get(i) else {
+                    return "Post".to_string();
+                };
+                let snippet: String = p
+                    .content
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(56)
+                    .collect();
+                if snippet.is_empty() {
+                    p.byline.to_string()
+                } else {
+                    format!("{}: {}", p.byline, snippet)
+                }
+            }
+        }
+    }
+
     /// The topology minimap (see the module docs). Reads the selected path's
     /// cached heights; positions derive from the live page scroll offset.
     pub(crate) fn render_minimap(
@@ -98,9 +128,16 @@ impl SpaceView {
         let light = fg.opacity(0.18);
         let medium = cx.theme().scrollbar_thumb.opacity(0.45);
         let dark = cx.theme().scrollbar_thumb_hover.opacity(0.78);
+        // Drafts read in the `info` hue (matching the branch dots), at the same
+        // on-screen / off-screen / sibling opacity ramp as the scroll colors.
+        let info = cx.theme().info;
+        // Cells are click-to-navigate only while the map is up (it's a transient
+        // overlay; a faded-out 36px strip must not steal clicks).
+        let interactive = self.minimap_visible;
 
         let mut container = div()
             .id("space-minimap")
+            .probe("space/minimap", gpui::Role::Group, "Conversation map")
             .absolute()
             .top_0()
             .bottom_0()
@@ -148,19 +185,42 @@ impl SpaceView {
                 let screen_top = doc_y + scroll_y;
 
                 let mut row = h_flex().w_full().h(row_h).gap(MINIMAP_COL_GAP);
-                for (i, _sib) in sibs.iter().enumerate() {
-                    let cell = if i == *active {
-                        selected_column(
-                            Some((screen_top, h)),
-                            viewport_h.as_f32(),
-                            row_h,
-                            dark,
-                            medium,
-                        )
+                for (i, sib) in sibs.iter().enumerate() {
+                    let is_active = i == *active;
+                    // Drafts use `info`; everything else the scroll colors.
+                    let (on, off, flat) = if matches!(sib.src, NodeSrc::Draft) {
+                        (info.opacity(0.78), info.opacity(0.45), info.opacity(0.22))
                     } else {
-                        div().w_full().h_full().bg(light)
+                        (dark, medium, light)
                     };
-                    row = row.child(div().flex_1().h_full().child(cell));
+                    let cell = if is_active {
+                        selected_column(Some((screen_top, h)), viewport_h.as_f32(), row_h, on, off)
+                    } else {
+                        div().w_full().h_full().bg(flat)
+                    };
+
+                    // Each column is a click-to-navigate entry in the map's
+                    // "table of contents" — a labelled, selectable button.
+                    let sib_id = sib.id.clone();
+                    let mut wrap = div()
+                        .id(SharedString::from(format!("space-mm-{level}-{i}")))
+                        .probe(
+                            SharedString::from(format!("space/minimap/cell/{level}/{i}")),
+                            gpui::Role::Button,
+                            self.node_label(sib),
+                        )
+                        .aria_selected(is_active)
+                        .flex_1()
+                        .h_full()
+                        .child(cell);
+                    if interactive {
+                        wrap = wrap.cursor_pointer().on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.navigate_to_node(sib_id.clone(), window, cx);
+                            },
+                        ));
+                    }
+                    row = row.child(wrap);
                 }
                 col = col.child(row);
                 doc_y += h;

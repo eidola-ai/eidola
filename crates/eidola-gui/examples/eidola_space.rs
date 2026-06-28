@@ -57,7 +57,7 @@ const MINIMAP_WIDTH: Pixels = px(36.);
 const MINIMAP_COL_GAP: Pixels = px(4.);
 /// How long the minimap lingers after scrolling stops / the cursor leaves it,
 /// before it fades (mirrors macOS overlay scrollbars).
-const MINIMAP_HIDE_DELAY: Duration = Duration::from_millis(400);
+const MINIMAP_HIDE_DELAY: Duration = Duration::from_millis(800);
 /// Fade-out duration once hiding begins.
 const MINIMAP_FADE: Duration = Duration::from_millis(200);
 

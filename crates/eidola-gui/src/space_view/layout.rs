@@ -283,6 +283,34 @@ impl SpaceView {
         levels
     }
 
+    /// Document-space top of a node that is **on the selected path** (after
+    /// `select_path_to`), by accumulating heights down the path. `None` if the
+    /// node isn't on the selected path.
+    pub(crate) fn selected_path_doc_top(
+        &self,
+        roots: &[TreeNode],
+        node_id: &str,
+        page_width: Pixels,
+        window_h: Pixels,
+    ) -> Option<f32> {
+        let mut y = TITLE_BAR_RESERVE.as_f32();
+        for (i, (sibs, active)) in self
+            .selected_levels(roots, page_width)
+            .into_iter()
+            .enumerate()
+        {
+            if i > 0 {
+                y += BAND_HEIGHT.as_f32();
+            }
+            let node = sibs[active];
+            if node.id == node_id {
+                return Some(y);
+            }
+            y += self.node_height(node, page_width, window_h);
+        }
+        None
+    }
+
     /// Document-space top of the selected leaf's draft slot — everything on the
     /// selected path above it.
     pub(crate) fn placeholder_doc_top(
