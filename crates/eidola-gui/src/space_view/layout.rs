@@ -80,14 +80,22 @@ impl Layout {
 /// document total (and thus the scroll range and minimap scale) is approximately
 /// right before the post first scrolls into view and measures for real. Mirrors
 /// `MarkdownEditor`'s book typography: characters per line from the body width,
-/// lines from the content length, times the line height, plus the post's
-/// vertical padding. Deliberately rough — it is replaced by the real measured
-/// height the first frame the post is visible.
+/// lines from the content length, times the line height, plus the editor's own
+/// inter-block spacing and the post's vertical padding. Deliberately rough — it
+/// is replaced by the real measured height the first frame the post is visible.
+///
+/// `paragraph_gap` is the editor's inter-block spacing as a multiple of the font
+/// size (it pads half above / half below every block). The first block's leading
+/// half plus the last block's trailing half sum to one full gap of internal
+/// padding the editor *always* reserves; omitting it under-counts every post by
+/// a near-constant ~`font_size * paragraph_gap`, which made minimap columns grow
+/// a touch as each post first measured. The single-paragraph case is then exact.
 pub fn estimate_post_height(
     content: &str,
     body_width: f32,
     font_size: f32,
     line_height: f32,
+    paragraph_gap: f32,
     pad_y: f32,
 ) -> f32 {
     let char_w = (font_size * 0.5).max(1.0);
@@ -101,7 +109,10 @@ pub fn estimate_post_height(
     }
     // A blank post (the empty composer) still reserves one line.
     lines = lines.max(1.0);
-    lines * (font_size * line_height) + pad_y
+    // The editor's leading `spacing_above` + trailing `spacing_below` (half a
+    // `paragraph_gap` each) — a constant the old estimate dropped.
+    let editor_pad = font_size * paragraph_gap;
+    lines * (font_size * line_height) + editor_pad + pad_y
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +123,7 @@ pub fn estimate_post_height(
 use super::model::{NodeSrc, TreeNode};
 use super::{
     BAND_HEIGHT, BODY_MAX_WIDTH, COMPOSER_MAX_FRACTION, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y,
-    PROSE_FONT_SIZE, PROSE_LINE_HEIGHT, SpaceView, TITLE_BAR_RESERVE,
+    PROSE_FONT_SIZE, PROSE_LINE_HEIGHT, PROSE_PARAGRAPH_GAP, SpaceView, TITLE_BAR_RESERVE,
 };
 use gpui::Pixels;
 
@@ -199,6 +210,7 @@ impl SpaceView {
                     body_width(page_width),
                     PROSE_FONT_SIZE.as_f32(),
                     PROSE_LINE_HEIGHT,
+                    PROSE_PARAGRAPH_GAP,
                     POST_PAD_Y.as_f32() * 2.0,
                 )
             }),
@@ -402,11 +414,25 @@ mod tests {
 
     #[test]
     fn estimate_grows_with_content() {
-        let short = estimate_post_height("hi", 600.0, 17.0, 1.65, 80.0);
-        let long = estimate_post_height(&"word ".repeat(400), 600.0, 17.0, 1.65, 80.0);
+        let short = estimate_post_height("hi", 600.0, 17.0, 1.65, 1.5, 80.0);
+        let long = estimate_post_height(&"word ".repeat(400), 600.0, 17.0, 1.65, 1.5, 80.0);
         assert!(long > short * 4.0, "long content estimates much taller");
         // A blank reserves a line, not zero.
-        assert!(estimate_post_height("", 600.0, 17.0, 1.65, 80.0) > 80.0);
+        assert!(estimate_post_height("", 600.0, 17.0, 1.65, 1.5, 80.0) > 80.0);
+    }
+
+    #[test]
+    fn estimate_includes_editor_internal_spacing() {
+        // A single-line post: one line box + the editor's leading+trailing
+        // spacing (a full `paragraph_gap` of the font size) + the post padding.
+        // This is the term the old estimate dropped, which made columns grow on
+        // first measure.
+        let h = estimate_post_height("hi", 600.0, 17.0, 1.65, 1.5, 80.0);
+        let expected = 17.0 * 1.65 + 17.0 * 1.5 + 80.0;
+        assert!(
+            (h - expected).abs() < 0.01,
+            "single-line estimate {h} should match {expected} exactly",
+        );
     }
 
     #[test]

@@ -69,6 +69,10 @@ pub(crate) const TITLE_BAR_RESERVE: Pixels = px(0.);
 /// user types.
 pub(crate) const PROSE_FONT_SIZE: Pixels = px(17.);
 pub(crate) const PROSE_LINE_HEIGHT: f32 = 1.65;
+/// Inter-block spacing as a multiple of the font size (the editor splits it
+/// half above / half below each block). Kept here as the single source of truth
+/// for both [`prose_style`] and the height estimate, so they can't drift.
+pub(crate) const PROSE_PARAGRAPH_GAP: f32 = 1.5;
 
 /// The byline gutter (right-aligned author + time) and the centered reading
 /// column it sits beside.
@@ -109,7 +113,7 @@ pub(crate) fn prose_style(cx: &gpui::App) -> MarkdownStyle {
     let mut style = MarkdownStyle::from_theme(cx)
         .font_size(PROSE_FONT_SIZE)
         .line_height(rems(PROSE_LINE_HEIGHT))
-        .paragraph_gap(rems(1.5))
+        .paragraph_gap(rems(PROSE_PARAGRAPH_GAP))
         .heading_base_font_size(PROSE_FONT_SIZE)
         .heading_font_size(|level, base| match level {
             1 => base * 1.5,

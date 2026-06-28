@@ -535,7 +535,7 @@ fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
         Some(d) => {
             let s = d.bounds().size;
             let smaller = f32::min(s.width.as_f32(), s.height.as_f32());
-            (smaller * 0.9).min(705.0)
+            (smaller * 0.9).min(840.0)
         }
         None => 820.0,
     };
