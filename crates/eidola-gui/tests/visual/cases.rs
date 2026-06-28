@@ -42,14 +42,15 @@ pub fn register(s: &mut Snapshots) {
 // ---------------------------------------------------------------------------
 
 fn register_space(s: &mut Snapshots) {
-    // The kitchen-sink post tree rendered through the new SpaceView: byline
-    // gutter, Newsreader prose posts (read-only `MarkdownEditor`, published —
-    // no delimiters), separator bands with the "+" reply affordance, and the
-    // floating "Draft" composer at the bottom.
+    // An *existing* space (Some id → no composer at rest): the kitchen-sink post
+    // tree rendered through the new SpaceView — byline gutter, Newsreader prose
+    // posts (read-only `MarkdownEditor`, published — no delimiters), and
+    // separator bands with the "+" reply affordance. You click "+" to start a
+    // draft.
     s.add("space_branches", size(px(900.), px(720.)), |window, cx| {
         let core = stub_stores_with_config(cx);
         cx.new(|cx| {
-            let view = SpaceView::new(core, None, WindowInput::new(cx), window, cx);
+            let view = SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
             view.space().update(cx, |sp, cx| {
                 sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
             });
@@ -57,8 +58,9 @@ fn register_space(s: &mut Snapshots) {
         })
     });
 
-    // A blank space: the cursor at the top of an empty page (just the composer).
-    s.add("space_empty", size(px(760.), px(680.)), |window, cx| {
+    // A brand-new blank space: the composer open at the top of an empty page
+    // (the cursor in a fresh notebook).
+    s.add("space_blank", size(px(760.), px(680.)), |window, cx| {
         let core = stub_stores_with_config(cx);
         cx.new(|cx| SpaceView::new(core, None, WindowInput::new(cx), window, cx))
     });

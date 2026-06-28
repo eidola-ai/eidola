@@ -160,6 +160,13 @@ fn build_node(i: usize, posts: &[PostData], children: &[Vec<usize>]) -> TreeNode
     }
 }
 
+/// Whether `node`'s subtree contains an unsent draft (drafts are leaves, but a
+/// draft can sit anywhere within a branch). Drives the info-colored branch
+/// indicator for a branch that holds a draft.
+pub fn subtree_has_draft(node: &TreeNode) -> bool {
+    matches!(node.src, NodeSrc::Draft) || node.children.iter().any(subtree_has_draft)
+}
+
 /// Depth-first search for the node with `id` (immutable).
 pub fn node_ref<'a>(roots: &'a [TreeNode], id: &str) -> Option<&'a TreeNode> {
     for node in roots {

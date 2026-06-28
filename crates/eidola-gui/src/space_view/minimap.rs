@@ -72,11 +72,8 @@ impl SpaceView {
         viewport_h: gpui::Pixels,
     ) -> f32 {
         let streaming = false; // the structure (not the live partial) drives the map
-        let (tree, _) = self.effective_tree(page_width, streaming);
-        let selected = match tree.first() {
-            Some(root) => self.selected_subtree_height(root, page_width, viewport_h),
-            None => 0.0,
-        };
+        let tree = self.effective_tree(page_width, streaming);
+        let selected = self.selected_total_height(&tree, page_width, viewport_h);
         viewport_h.as_f32()
             + self.composer_content_h.borrow().as_f32() * 5.0
             + self.page_scroll.offset().y.as_f32() * 19.0
@@ -108,11 +105,12 @@ impl SpaceView {
 
         let levels = self.selected_levels(roots, page_width);
         let reserve = TITLE_BAR_RESERVE.as_f32();
-        let selected_h = match roots.first() {
-            Some(root) => self.selected_subtree_height(root, page_width, viewport_h),
-            None => 0.0,
-        };
-        let total_h = reserve + selected_h;
+        let selected_h = self.selected_total_height(roots, page_width, viewport_h);
+        // A floating, off-branch draft pads the page bottom (item 4); fold it
+        // into the denominator + a trailing spacer so the scroll indicator maps
+        // 1:1 to the real scrollable height on every branch.
+        let pad = self.floating_pad(roots, page_width, viewport_h, false);
+        let total_h = reserve + selected_h + pad;
         let scroll_y = self.page_scroll.offset().y.as_f32();
 
         if total_h > 0.0 && viewport_h > px(0.) && !levels.is_empty() {
@@ -158,6 +156,10 @@ impl SpaceView {
                 }
                 col = col.child(row);
                 doc_y += h;
+            }
+            // Trailing scroll room for a floating off-branch draft.
+            if pad > 0.0 {
+                col = col.child(div().w_full().h(px(pad * scale)));
             }
             container = container.child(col);
         }

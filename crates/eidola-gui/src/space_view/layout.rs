@@ -111,8 +111,8 @@ pub fn estimate_post_height(
 
 use super::model::{NodeSrc, TreeNode};
 use super::{
-    BAND_HEIGHT, BODY_MAX_WIDTH, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y, PROSE_FONT_SIZE,
-    PROSE_LINE_HEIGHT, SpaceView, TITLE_BAR_RESERVE,
+    BAND_HEIGHT, BODY_MAX_WIDTH, COMPOSER_MAX_FRACTION, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y,
+    PROSE_FONT_SIZE, PROSE_LINE_HEIGHT, SpaceView, TITLE_BAR_RESERVE,
 };
 use gpui::Pixels;
 
@@ -171,10 +171,19 @@ impl SpaceView {
     }
 
     /// The node's own in-flow block height: a post's measured (or estimated)
-    /// height, the streaming reply's measured height, or the draft's runway slot.
+    /// height, the streaming reply's measured height, the active draft's runway
+    /// slot, or an inactive draft's measured inline height.
     pub(crate) fn node_height(&self, node: &TreeNode, page_width: Pixels, window_h: Pixels) -> f32 {
         match node.src {
-            NodeSrc::Draft => self.draft_slot_height(node, page_width, window_h),
+            NodeSrc::Draft if self.active_draft.as_deref() == Some(&node.id) => {
+                self.draft_slot_height(node, page_width, window_h)
+            }
+            // An inactive draft renders inline as an editable post; use its
+            // measured height (a small reserve until it first measures).
+            NodeSrc::Draft => self
+                .layout
+                .measured(&node.id)
+                .unwrap_or_else(|| window_h.as_f32() * 0.18),
             NodeSrc::Streaming => self
                 .layout
                 .measured(&node.id)
@@ -291,17 +300,41 @@ impl SpaceView {
         TITLE_BAR_RESERVE.as_f32() + total - leaf_h
     }
 
-    /// Bottom padding for the page so a branch tail can clear a *floating*
-    /// off-branch composer. Phase 1 keeps the composer on the selected leaf, so
-    /// this is zero (the composer docks at the page bottom).
+    /// Total rendered height of the selected path from the active root.
+    pub(crate) fn selected_total_height(
+        &self,
+        roots: &[TreeNode],
+        page_width: Pixels,
+        window_h: Pixels,
+    ) -> f32 {
+        match self.active_root(roots, page_width) {
+            Some(root) => self.selected_subtree_height(root, page_width, window_h),
+            None => 0.0,
+        }
+    }
+
+    /// Bottom padding the page needs so the selected branch's tail can scroll
+    /// clear of a *floating, off-branch* active draft. On the draft's own branch
+    /// its in-flow slot already reserves the room (it docks), so this is zero;
+    /// off-branch the floating bar (its content height, capped at half the
+    /// window) occludes the bottom, so pad by it. This is what lets the minimap
+    /// and the scroll range account for a foreign floating draft (item 4).
     pub(crate) fn floating_pad(
         &self,
-        _roots: &[TreeNode],
-        _page_width: Pixels,
-        _window_h: Pixels,
+        roots: &[TreeNode],
+        page_width: Pixels,
+        window_h: Pixels,
         _streaming: bool,
     ) -> f32 {
-        0.0
+        let Some(active) = self.active_draft.as_deref() else {
+            return 0.0;
+        };
+        if self.selected_leaf_id(roots, page_width).as_deref() == Some(active) {
+            return 0.0; // on its own branch — docks, no extra room needed
+        }
+        let win = window_h.as_f32();
+        let content = self.composer_content_h.borrow().as_f32();
+        (Self::composer_chrome() + content).min(COMPOSER_MAX_FRACTION * win)
     }
 }
 

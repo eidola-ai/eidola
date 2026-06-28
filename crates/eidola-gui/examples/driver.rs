@@ -250,13 +250,32 @@ mod driver {
                 },
             },
             Scene {
-                name: "space_conversation",
-                description: "Space view: a linear conversation (tree scrollers + composer)",
+                name: "space_blank",
+                description: "Space view: a brand-new blank space (composer open at top)",
                 default_size: size(px(760.), px(680.)),
                 build: |window, cx| {
                     let stores = ready_stores(cx);
                     let view =
                         cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_conversation",
+                description: "Space view: an existing linear conversation (no composer; click + to reply)",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    // An *existing* space (Some id) opens without a composer.
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
                     let space = view.read(cx).space().clone();
                     space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
                     root(view, window, cx)
@@ -264,12 +283,19 @@ mod driver {
             },
             Scene {
                 name: "space_branches",
-                description: "Space view: a branched post tree (kitchen-sink fixture)",
+                description: "Space view: an existing branched post tree (kitchen-sink fixture)",
                 default_size: size(px(900.), px(700.)),
                 build: |window, cx| {
                     let stores = ready_stores(cx);
-                    let view =
-                        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx));
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
                     let space = view.read(cx).space().clone();
                     space.update(cx, |s, cx| {
                         s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)

@@ -3218,20 +3218,39 @@ fn open_space(
     })
 }
 
-/// Set the composer's markdown directly (bypassing IME), like the chat helper.
+/// Set the active draft's composer markdown directly (bypassing IME).
 fn set_space_composer_text(
     view: &Entity<SpaceView>,
     window: AnyWindowHandle,
     cx: &mut TestAppContext,
     text: &str,
 ) {
-    let editor = view.read_with(cx, |v, _| v.composer_state_for_test());
+    let editor = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("an active draft (composer) is open");
     let text = text.to_string();
     cx.update_window(window, |_, window, cx| {
         let _ = window;
         editor.update(cx, |e, cx| e.set_value(text, cx));
     })
     .unwrap();
+}
+
+/// Open a draft (the blank-page composer, or a band reply when `parent` is set).
+fn open_space_draft(
+    view: &Entity<SpaceView>,
+    window: AnyWindowHandle,
+    cx: &mut TestAppContext,
+    parent: Option<&str>,
+) {
+    let parent = parent.map(str::to_string);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(parent.clone(), window, cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
 }
 
 fn dispatch_space_action<A: gpui::Action>(
@@ -3249,16 +3268,42 @@ fn dispatch_space_action<A: gpui::Action>(
 }
 
 #[gpui::test]
-fn space_submit_appends_user_and_streams(cx: &mut TestAppContext) {
+fn space_blank_opens_with_composer_existing_does_not(cx: &mut TestAppContext) {
+    // A brand-new (blank ⌘N) space opens with the composer ready.
+    let stores = stub_stores_with_config(cx);
+    let (_w, blank) = open_space(cx, &stores, None);
+    blank.read_with(cx, |v, _| {
+        assert!(
+            v.has_active_draft_for_test(),
+            "a blank space opens with the composer"
+        );
+        assert_eq!(v.active_draft_parent_for_test(), None, "root draft");
+    });
+
+    // A reopened space with history opens WITHOUT a composer (click "+" to start).
+    let (_w2, existing) = open_space(cx, &stores, Some("has-history".into()));
+    existing.read_with(cx, |v, _| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "an existing space opens with no composer"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_submit_appends_user_streams_and_consumes_draft(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, None);
     set_space_composer_text(&view, window, cx, "hello space");
     dispatch_space_action(&view, window, cx, Send);
 
     view.read_with(cx, |v, cx| {
-        // The snapshot picked up the optimistic user turn, and the space is
-        // streaming (the stub leaves `streaming = Some`).
+        // The snapshot picked up the optimistic user turn, the space is
+        // streaming (the stub leaves `streaming = Some`), and the draft was
+        // consumed (it's now a persisted post).
         assert_eq!(v.post_count_for_test(), 1);
+        assert_eq!(v.draft_count_for_test(), 0, "submit consumes the draft");
+        assert!(!v.has_active_draft_for_test());
         let space = v.space().read(cx);
         assert!(space.is_streaming(), "submit enters the streaming state");
         assert_eq!(space.messages()[0].message.role, "user");
@@ -3294,7 +3339,7 @@ fn space_empty_submit_is_a_noop(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn space_reply_sets_branch_target_and_clears_on_submit(cx: &mut TestAppContext) {
+fn space_reply_branches_at_target_and_clears_on_submit(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
     let (window, view) = open_space(cx, &stores, None);
 
@@ -3308,24 +3353,46 @@ fn space_reply_sets_branch_target_and_clears_on_submit(cx: &mut TestAppContext) 
     .unwrap();
     cx.run_until_parked();
 
-    // Start a reply to a1 → the composer branches there.
-    cx.update_window(window, |_, window, cx| {
-        view.update(cx, |v, cx| v.start_reply_for_test("a1".into(), window, cx));
-    })
-    .unwrap();
+    // The "+" on a1's band opens a draft replying to a1 (the prior empty root
+    // draft is retired). The active draft's parent is a1.
+    open_space_draft(&view, window, cx, Some("a1"));
     view.read_with(cx, |v, _| {
-        assert_eq!(v.reply_to_for_test().as_deref(), Some("a1"));
+        assert_eq!(v.active_draft_parent_for_test().as_deref(), Some("a1"));
     });
 
-    // Submitting consumes the reply target (back to the tail).
+    // Submitting consumes the draft.
     set_space_composer_text(&view, window, cx, "a branch reply");
     dispatch_space_action(&view, window, cx, Send);
     view.read_with(cx, |v, _| {
-        assert_eq!(
-            v.reply_to_for_test(),
-            None,
-            "reply target cleared on submit"
-        );
+        assert!(!v.has_active_draft_for_test(), "draft consumed on submit");
+    });
+}
+
+#[gpui::test]
+fn space_escape_deletes_empty_draft_keeps_nonempty(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+
+    // The blank-page root draft is empty; Escape deletes it (leaves no trace).
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.deactivate_for_test(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.draft_count_for_test(), 0, "an empty draft is deleted");
+        assert!(!v.has_active_draft_for_test());
+    });
+
+    // A non-empty draft persists (deselected) when Escaped.
+    open_space_draft(&view, window, cx, None);
+    set_space_composer_text(&view, window, cx, "keep me");
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.deactivate_for_test(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.draft_count_for_test(), 1, "a non-empty draft persists");
+        assert!(!v.has_active_draft_for_test(), "but is deactivated");
     });
 }
 
@@ -3340,6 +3407,8 @@ fn space_joins_shared_entity_for_same_id(cx: &mut TestAppContext) {
     let e2 = v2.read_with(cx, |v, _| v.space().clone());
     assert_eq!(e1.entity_id(), e2.entity_id());
 
+    // An existing space opens with no composer; open one, then submit.
+    open_space_draft(&v1, w1, cx, None);
     set_space_composer_text(&v1, w1, cx, "from window one");
     dispatch_space_action(&v1, w1, cx, Send);
     // The second window's snapshot reflects the shared space.

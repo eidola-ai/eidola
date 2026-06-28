@@ -1,16 +1,23 @@
-//! The composer — the single live, editable `MarkdownEditor`, pinned over the
-//! bottom of the window. It aligns with the posts (same gutter/centering),
-//! grows with content up to [`COMPOSER_MAX_FRACTION`] of the window then scrolls
-//! internally, and *docks* into the page near the bottom of the selected branch.
+//! Drafts + the composer — the unsent-reply model.
 //!
-//! `⌘↩` persists the human post (reply-targeted) **and** streams an assistant
-//! reply as the new selected leaf; `⌘⇧↩` posts the human turn only. A band's
-//! "+" sets [`SpaceView::reply_to`] to that post, branching the thread there.
+//! A band's "+" creates a [`Draft`](super::Draft): a local UI node with its own
+//! editor, attached to the persisted tree as a leaf of the post it replies to.
+//! Drafts **persist** when deselected (they keep their content and their place
+//! in the tree, taking real vertical space and tinting their branch's
+//! navigation dots), exactly like the `examples/eidola_space.rs` mockup.
+//!
+//! One draft is *active* at a time — the focused one — and adopts the
+//! floating/docking composer behavior: its editor floats over the bottom, its
+//! in-flow slot a placeholder. Focusing another draft (or Escape) retires the
+//! current one; a retired **empty** draft is deleted, leaving no trace.
+//!
+//! `⌘↩` (`Send`) persists the active draft and streams a reply; `⌘⇧↩`
+//! (`PostOnly`) persists it without asking. Both consume the draft.
 
 use gpui::{
-    AnyElement, BoxShadow, Context, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, ScrollWheelEvent, StatefulInteractiveElement, Styled, TouchPhase, Window, div,
-    hsla, linear_color_stop, linear_gradient, point, px,
+    AnyElement, AppContext, BoxShadow, Context, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, ScrollWheelEvent, StatefulInteractiveElement, Styled, TouchPhase,
+    Window, div, hsla, linear_color_stop, linear_gradient, point, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorEvent, MarkdownEditorState};
@@ -19,190 +26,277 @@ use super::layout::body_width;
 use super::model::{self, TreeNode};
 use super::nav::ScrollOwner;
 use super::{
-    BAND_HEIGHT, COMPOSER_MAX_FRACTION, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y, PostOnly, Send,
-    SpaceView, TITLE_BAR_RESERVE, prose_style,
+    COMPOSER_MAX_FRACTION, Draft, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y, PostOnly, Send, SpaceView,
+    TITLE_BAR_RESERVE, prose_style,
 };
 
 impl SpaceView {
-    /// Route the composer's outward events. `PressEnter` with the primary
-    /// modifier maps to the save-vs-ask gestures (`⌘↩` post & ask, `⌘⇧↩` post
-    /// only); plain Enter never reaches here (the editor inserts a newline).
-    pub(crate) fn on_editor_event(
+    // -- Draft lifecycle ---------------------------------------------------
+
+    /// Create a new draft replying to `parent` (a band's "+"), make it the
+    /// active (floating) composer, and focus it. The branch selection + page
+    /// dock happen on the next render (`pending_select`), against the real tree.
+    pub(crate) fn create_draft(
         &mut self,
-        _: &gpui::Entity<MarkdownEditorState>,
-        event: &MarkdownEditorEvent,
+        parent: Option<gpui::SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let MarkdownEditorEvent::PressEnter {
-            secondary: true,
-            shift,
-        } = event
-        {
-            if *shift {
-                self.post_only(&PostOnly, window, cx);
-            } else {
-                self.submit(&Send, window, cx);
-            }
-        }
-    }
+        self.next_draft_seq += 1;
+        let id = gpui::SharedString::from(format!("draft-{}", self.next_draft_seq));
+        let editor = cx.new(|cx| MarkdownEditorState::new(window, cx));
 
-    /// `⌘↩` — persist the composer's markdown and stream a reply.
-    pub(crate) fn submit(&mut self, _: &Send, window: &mut Window, cx: &mut Context<Self>) {
-        if self.space.read(cx).is_streaming() {
-            return;
-        }
-        let prompt = self.composer.read(cx).value().trim().to_string();
-        if prompt.is_empty() {
-            return;
-        }
-        let model = self.current_model(cx);
-        let reply_to = self.resolve_reply_to(window.viewport_size().width, cx);
-        self.composer.update(cx, |e, cx| e.clear(cx));
-        self.error = None;
-        self.reply_to = None;
-        self.space.update(cx, |s, cx| {
-            s.submit(prompt, model, reply_to, cx);
+        // The draft's editor drives both activation (focus) and submit
+        // (`PressEnter`): focusing it makes it the active draft; the modified
+        // Enter chords route to the save-vs-ask gestures.
+        let sub_id = id.clone();
+        let sub =
+            cx.subscribe_in(
+                &editor,
+                window,
+                move |this, _editor, event, window, cx| match event {
+                    MarkdownEditorEvent::Focus if this.active_draft.as_ref() != Some(&sub_id) => {
+                        this.activate_draft(sub_id.clone(), cx);
+                    }
+                    MarkdownEditorEvent::PressEnter {
+                        secondary: true,
+                        shift,
+                    } => {
+                        if *shift {
+                            this.post_only(&PostOnly, window, cx);
+                        } else {
+                            this.submit(&Send, window, cx);
+                        }
+                    }
+                    _ => {}
+                },
+            );
+
+        self.drafts.push(Draft {
+            id: id.clone(),
+            parent,
+            editor: editor.clone(),
+            _sub: sub,
         });
-        self.scroll_to_tail(window, cx);
-        cx.notify();
-    }
+        self.activate_draft(id.clone(), cx);
+        self.pending_select = Some(id);
 
-    /// `⌘⇧↩` — persist the composer's markdown without requesting a reply.
-    pub(crate) fn post_only(&mut self, _: &PostOnly, window: &mut Window, cx: &mut Context<Self>) {
-        if self.space.read(cx).is_streaming() {
-            return;
-        }
-        let prompt = self.composer.read(cx).value().trim().to_string();
-        if prompt.is_empty() {
-            return;
-        }
-        let reply_to = self.resolve_reply_to(window.viewport_size().width, cx);
-        self.composer.update(cx, |e, cx| e.clear(cx));
-        self.error = None;
-        self.reply_to = None;
-        self.space.update(cx, |s, cx| {
-            s.post_only(prompt, reply_to, cx);
-        });
-        self.scroll_to_tail(window, cx);
-        cx.notify();
-    }
-
-    /// The antecedent action id the new post should reply to: the explicit
-    /// `reply_to` (a branch) or the selected leaf (continue where the reader is
-    /// looking). `None` for a blank space's first post. Only a real persisted
-    /// action id is a valid antecedent.
-    fn resolve_reply_to(&self, page_width: gpui::Pixels, cx: &gpui::App) -> Option<String> {
-        let _ = cx;
-        let base = model::build_tree(&self.posts);
-        let target = self.reply_target_id(&base, page_width)?;
-        self.posts
-            .iter()
-            .find(|p| p.action_id.as_deref() == Some(target.as_ref()))
-            .and_then(|p| p.action_id.clone())
-            .map(|s| s.to_string())
-    }
-
-    /// Start a reply to `target` (a band's "+"): branch the composer there.
-    /// Selects the path to `target`, points its scroller at the (to-be-appended)
-    /// draft page, and focuses the composer.
-    pub(crate) fn start_reply(
-        &mut self,
-        target: gpui::SharedString,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let page_width = window.viewport_size().width;
-        self.reply_to = Some(target.clone());
-        let base = model::build_tree(&self.posts);
-        self.select_path_to(&base, &target, page_width);
-        if let Some(node) = model::node_ref(&base, &target) {
-            // The draft is appended after the persisted children.
-            let draft_idx = node.children.len();
-            let stride = (page_width + BAND_HEIGHT).as_f32();
-            let to_x = -(draft_idx as f32) * stride;
-            let handle = self.scrolls.entry(target.clone()).or_default();
-            let off = handle.offset();
-            handle.set_offset(point(px(to_x), off.y));
-            self.cancel_snap();
-            self.snap_pin = Some((target.clone(), to_x));
-        }
-        let focus = self.composer.read(cx).focus_handle(cx);
+        let focus = editor.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
+    }
+
+    /// Make `id` the active (floating) draft, retiring the previous one (which
+    /// is deleted if it was left empty). Resets the shared composer scroll.
+    pub(crate) fn activate_draft(&mut self, id: gpui::SharedString, cx: &mut Context<Self>) {
+        if self.active_draft.as_ref() != Some(&id) {
+            self.retire_active_draft(cx);
+        }
+        self.active_draft = Some(id);
+        self.composer_scroll.set_offset(point(px(0.), px(0.)));
+        self.composer_prev_off_y = 0.0;
+        cx.notify();
+    }
+
+    /// Deactivate the active draft (Escape / external request). A draft with
+    /// content stays in the tree as a plain inline editor; only its floating
+    /// behavior ends. A blank one is deleted.
+    pub(crate) fn deactivate_active_draft(&mut self, cx: &mut Context<Self>) {
+        if self.active_draft.is_some() {
+            self.retire_active_draft(cx);
+            cx.notify();
+        }
+    }
+
+    /// Clear the active draft, deleting it if its editor was left empty (an
+    /// abandoned blank draft leaves no trace).
+    fn retire_active_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.active_draft.take() else {
+            return;
+        };
+        let empty = self
+            .drafts
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.editor.read(cx).is_empty())
+            .unwrap_or(false);
+        if empty {
+            self.delete_draft(&id);
+        }
+    }
+
+    /// Remove a draft from the tree and forget its editor/state. The parent
+    /// scroller re-clamps onto a still-valid branch at render time
+    /// (`active_child_index` clamps to the new child count).
+    fn delete_draft(&mut self, id: &str) {
+        self.drafts.retain(|d| d.id != id);
+        self.layout.retain(&|live| live != id);
+    }
+
+    // -- Submit ------------------------------------------------------------
+
+    /// Route the composer's outward events when dispatched as actions (tests /
+    /// menu). The editor's own subscription (see `create_draft`) is the
+    /// production path; this keeps `Send`/`PostOnly` dispatchable.
+    pub(crate) fn submit(&mut self, _: &Send, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_active_draft(false, window, cx);
+    }
+
+    pub(crate) fn post_only(&mut self, _: &PostOnly, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_active_draft(true, window, cx);
+    }
+
+    /// Persist the active draft (and stream a reply unless `post_only`),
+    /// consuming the draft. A no-op while streaming, with no active draft, or on
+    /// an empty draft.
+    fn send_active_draft(&mut self, post_only: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.space.read(cx).is_streaming() {
+            return;
+        }
+        let Some(active) = self.active_draft.clone() else {
+            return;
+        };
+        let Some(draft) = self.drafts.iter().find(|d| d.id == active) else {
+            return;
+        };
+        let editor = draft.editor.clone();
+        let parent = draft.parent.clone();
+        let prompt = editor.read(cx).value().trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+
+        // The reply antecedent is the draft's parent, but only a real persisted
+        // action id is valid (a `None`/synthetic parent → app-core uses the
+        // tail).
+        let reply_to = parent.and_then(|p| {
+            self.posts
+                .iter()
+                .find(|post| post.action_id.as_deref() == Some(p.as_ref()))
+                .and_then(|post| post.action_id.clone())
+                .map(|s| s.to_string())
+        });
+
+        // Consume the draft (it's becoming a persisted post). Clearing the
+        // active slot before `Space::submit` avoids briefly showing the draft
+        // beside the optimistic post.
+        self.active_draft = None;
+        self.delete_draft(&active);
+        self.error = None;
+
+        if post_only {
+            self.space.update(cx, |s, cx| {
+                s.post_only(prompt, reply_to, cx);
+            });
+        } else {
+            let model = self.current_model(cx);
+            self.space.update(cx, |s, cx| {
+                s.submit(prompt, model, reply_to, cx);
+            });
+        }
         self.scroll_to_tail(window, cx);
         cx.notify();
     }
+
+    // -- Scrolling ---------------------------------------------------------
 
     /// Scroll the page so the bottom of the selected branch (the composer /
     /// streaming leaf) sits at the window bottom.
     fn scroll_to_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let viewport = window.viewport_size();
         let streaming = self.space.read(cx).is_streaming();
-        let (tree, _) = self.effective_tree(viewport.width, streaming);
-        let total = match tree.len() {
-            0 => 0.0,
-            1 => self.selected_subtree_height(&tree[0], viewport.width, viewport.height),
-            _ => {
-                let active =
-                    self.active_child_index(model::ROOT_SCROLLER_ID, viewport.width, tree.len());
-                self.selected_subtree_height(
-                    &tree[active.min(tree.len() - 1)],
-                    viewport.width,
-                    viewport.height,
-                )
-            }
-        };
+        let tree = self.effective_tree(viewport.width, streaming);
+        let total = self.selected_total_height(&tree, viewport.width, viewport.height);
         let doc = TITLE_BAR_RESERVE.as_f32() + total;
         let y = (viewport.height.as_f32() - doc).min(0.0);
         let off = self.page_scroll.offset();
         self.page_scroll.set_offset(point(off.x, px(y)));
     }
 
-    /// "See in context": dock the composer back at its place in the branch.
+    /// Dock the active draft at its "home": its slot top around 40% of the
+    /// window, computed from the (already-selected) tree.
+    pub(crate) fn dock_active_draft(
+        &self,
+        roots: &[TreeNode],
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+    ) {
+        let doc_top = self.placeholder_doc_top(roots, page_width, window_h);
+        let target = window_h.as_f32() * 0.4;
+        let y = (target - doc_top).min(0.0);
+        let off = self.page_scroll.offset();
+        self.page_scroll.set_offset(point(off.x, px(y)));
+    }
+
+    /// "See in context": dock the active draft back at its place in the branch.
     pub(crate) fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_to_tail(window, cx);
+        let viewport = window.viewport_size();
+        let streaming = self.space.read(cx).is_streaming();
+        let tree = self.effective_tree(viewport.width, streaming);
+        if let Some(active) = self.active_draft.clone()
+            && model::node_ref(&tree, &active).is_some()
+        {
+            self.select_path_to(&tree, &active, viewport.width);
+            self.dock_active_draft(&tree, viewport.width, viewport.height);
+        }
         cx.notify();
     }
 
-    /// The composer overlay: the editable markdown pane pinned over the bottom,
-    /// styled like a post. Floats (bottom-aligned, overlaying the conversation)
-    /// when its in-flow slot is below the fold, and docks to the slot when
-    /// scrolled to. Renders nothing while streaming (no compose surface then).
+    // -- The floating composer ---------------------------------------------
+
+    /// The active draft's editor, pinned over the bottom and styled like a post.
+    /// Floats (bottom-aligned, overlaying the conversation) when its in-flow slot
+    /// is below the fold or when the user has swiped to another branch while
+    /// editing; docks to the slot when scrolled to on its own branch. Renders
+    /// nothing when no draft is active.
     pub(crate) fn render_active_draft(
         &self,
         roots: &[TreeNode],
         page_width: gpui::Pixels,
         window_h: gpui::Pixels,
-        streaming: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
-        if streaming {
+        let Some(active) = self.active_draft.clone() else {
             return div().into_any_element();
-        }
+        };
+        let Some(editor) = self
+            .drafts
+            .iter()
+            .find(|d| d.id == active)
+            .map(|d| d.editor.clone())
+        else {
+            return div().into_any_element();
+        };
         let theme = cx.theme();
         let bw = px(body_width(page_width));
+
+        // On its own branch the overlay docks to its placeholder; off it (swiped
+        // to a sibling while editing) it always floats.
+        let on_path = self.selected_leaf_id(roots, page_width).as_ref() == Some(&active);
 
         let win = window_h.as_f32();
         let chrome = Self::composer_chrome();
         let content = self.composer_content_h.borrow().as_f32();
         let half_pad = POST_PAD_Y.as_f32() / 2.0;
 
-        // Floating bar: chrome + content, capped at half the window, bottom-pinned.
         let float_bar_h = (chrome + content).min(COMPOSER_MAX_FRACTION * win);
         let float_top = win - float_bar_h;
-        // Dock: if the draft slot's top (plus the half-spacing gap) has risen
-        // above the floating top, follow it up. Computed from the live scroll
-        // offset so the threshold tracks the scroll with no one-frame lag.
-        let slot_top = self.placeholder_doc_top(roots, page_width, window_h)
-            + self.page_scroll.offset().y.as_f32();
-        let top_y = float_top.min(slot_top + half_pad);
+        let slot_top = if on_path {
+            Some(
+                self.placeholder_doc_top(roots, page_width, window_h)
+                    + self.page_scroll.offset().y.as_f32(),
+            )
+        } else {
+            None
+        };
+        let top_y = match slot_top {
+            Some(s) => float_top.min(s + half_pad),
+            None => float_top,
+        };
 
         let overlayed = top_y >= float_top - 0.5;
         let docked = !overlayed;
         self.composer_overlayed.set(overlayed);
 
-        // Docked height grows with scroll position; floating keeps its
-        // bottom-pinned height.
         let full_h = (content + chrome).max(win);
         let bar_h = if docked {
             let denom = (float_top - TITLE_BAR_RESERVE.as_f32()).max(1.0);
@@ -214,8 +308,6 @@ impl SpaceView {
         let body_h = (bar_h - chrome).max(0.0);
         let scrolled_down = self.composer_scroll.offset().y.as_f32() < -0.5;
 
-        // Byline gutter — a faint "Draft", plus a "See in context" affordance
-        // while floating.
         let mut byline = v_flex()
             .w(GUTTER_WIDTH)
             .flex_none()
@@ -280,7 +372,7 @@ impl SpaceView {
                 div()
                     .w_full()
                     .pb(px(half_pad))
-                    .child(MarkdownEditor::new(&self.composer).style(prose_style(cx)))
+                    .child(MarkdownEditor::new(&editor).style(prose_style(cx)))
                     .child(record_height(
                         self.composer_content_h.clone(),
                         cx.entity().downgrade(),
@@ -297,13 +389,9 @@ impl SpaceView {
             .top(px(top_y))
             .h(px(bar_h))
             .bg(theme.background)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
                 if ev.keystroke.key == "escape" {
-                    // Esc clears a branch reply target, returning the composer to
-                    // the tail.
-                    if this.reply_to.take().is_some() {
-                        this.go_home(window, cx);
-                    }
+                    this.deactivate_active_draft(cx);
                 }
             }))
             .child(

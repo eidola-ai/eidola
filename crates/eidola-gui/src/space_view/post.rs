@@ -5,8 +5,8 @@
 //! shape their text.
 
 use gpui::{
-    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, WeakEntity, canvas, div, px,
+    AnyElement, Context, Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity, canvas, div, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::MarkdownEditor;
@@ -132,6 +132,78 @@ impl SpaceView {
             ))
     }
 
+    /// An *inactive* draft rendered inline: a "Draft" byline beside its editable
+    /// body, taking real vertical space in the tree. Clicking it focuses the
+    /// editor, which re-activates the draft (floating composer). Off-screen it
+    /// renders as a sized placeholder (virtualization), like a post.
+    pub(crate) fn render_inactive_draft(
+        &self,
+        node: &TreeNode,
+        doc_y: f32,
+        page_width: gpui::Pixels,
+        window_h: gpui::Pixels,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let h = self.node_height(node, page_width, window_h);
+        let screen_top = doc_y + self.page_scroll.offset().y.as_f32();
+        let visible = screen_top + h > -VIRT_MARGIN && screen_top < window_h.as_f32() + VIRT_MARGIN;
+        let editor = self
+            .drafts
+            .iter()
+            .find(|d| d.id == node.id)
+            .map(|d| d.editor.clone());
+        let Some(editor) = editor else {
+            return div().w(page_width).h(px(h)).flex_none().into_any_element();
+        };
+        if !visible {
+            return div().w(page_width).h(px(h)).flex_none().into_any_element();
+        }
+
+        let theme = cx.theme();
+        let bw = px(body_width(page_width));
+        let focus = editor.read(cx).focus_handle(cx);
+
+        let byline_el = v_flex()
+            .w(GUTTER_WIDTH)
+            .flex_none()
+            .items_end()
+            .pt_5()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.muted_foreground)
+                    .child("Draft"),
+            );
+
+        h_flex()
+            .relative()
+            .w(page_width)
+            .py(POST_PAD_Y)
+            .justify_center()
+            .items_start()
+            .gap(GUTTER_GAP)
+            .pr(GUTTER_WIDTH / 2. + GUTTER_GAP)
+            // Clicking anywhere on the inline draft focuses its editor, whose
+            // Focus event re-activates it (floating composer).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_, _, window, cx| window.focus(&focus, cx)),
+            )
+            .child(byline_el)
+            .child(
+                div()
+                    .w(bw)
+                    .child(MarkdownEditor::new(&editor).style(prose_style(cx))),
+            )
+            .child(record_height(
+                self.layout.clone(),
+                node.id.clone(),
+                cx.entity().downgrade(),
+            ))
+            .into_any_element()
+    }
+
     /// The streaming reply body: a reasoning disclosure (clickable "Thinking…"
     /// header + the reasoning text when open) above the partial answer, rendered
     /// through the `streaming_body` editor (synced to the live content each
@@ -195,34 +267,43 @@ impl SpaceView {
         let plus_bg_hover = theme.background;
 
         let parent_id = node.id.clone();
-        // The draft/streaming overlay child is not a real branch the user can
-        // navigate to; count only persisted siblings for the dots.
-        let real_children: Vec<&TreeNode> = node
+        let info = theme.info;
+        // Dots are the navigable branches — persisted siblings *and* drafts
+        // (a draft is a branch you can navigate to). The streaming overlay isn't
+        // navigable, so it's excluded.
+        let dot_children: Vec<&TreeNode> = node
             .children
             .iter()
-            .filter(|c| matches!(c.src, NodeSrc::Msg(_)))
+            .filter(|c| !matches!(c.src, NodeSrc::Streaming))
             .collect();
-        let count = real_children.len();
+        let count = dot_children.len();
 
         let mut row = h_flex().items_center().gap_3();
         if count >= 2 {
             let active = self.active_child_index(&node.id, page_width, node.children.len());
             let dots = h_flex()
                 .gap_1()
-                .children(real_children.iter().enumerate().map(|(i, child)| {
-                    let color = if i == active {
-                        active_color
+                .children(dot_children.iter().enumerate().map(|(i, child)| {
+                    // A branch holding a draft is tinted `info`; the active one
+                    // is full-strength, the rest dimmed.
+                    let base = if super::model::subtree_has_draft(child) {
+                        info
                     } else {
-                        active_color.alpha(0.5)
+                        active_color
                     };
-                    let pid = parent_id.clone();
-                    // The branch scroller indexes *all* children (including the
-                    // overlay), so glide to this dot's position among them.
+                    // The branch scroller indexes *all* children, so glide to and
+                    // highlight this dot by its position among them.
                     let all_idx = node
                         .children
                         .iter()
                         .position(|c| c.id == child.id)
                         .unwrap_or(i);
+                    let color = if all_idx == active {
+                        base
+                    } else {
+                        base.alpha(0.5)
+                    };
+                    let pid = parent_id.clone();
                     div()
                         .id(SharedString::from(format!("space-dot-{parent_id}-{i}")))
                         .probe(
@@ -258,7 +339,7 @@ impl SpaceView {
                 .hover(move |s| s.bg(plus_bg_hover))
                 .child("+")
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.start_reply(add_id.clone(), window, cx);
+                    this.create_draft(Some(add_id.clone()), window, cx);
                 })),
         );
 

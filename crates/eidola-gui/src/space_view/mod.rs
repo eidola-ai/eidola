@@ -140,6 +140,24 @@ pub(crate) fn fmt_clock(ms: i64) -> String {
     format!("{h}:{m:02} {}", if am { "AM" } else { "PM" })
 }
 
+/// An unsent draft reply — a local UI node with its own editor. It renders
+/// inline like any post (a "Draft" byline + an editable body) when inactive,
+/// and floats as the composer when it is the [`SpaceView::active_draft`].
+/// Persists when deselected; a blank one is deleted on retire.
+pub(crate) struct Draft {
+    /// Unique, stable across frames (`draft-{seq}`) — the node id, editor key,
+    /// and horizontal-scroll key.
+    pub(crate) id: SharedString,
+    /// The persisted post this draft replies to (its `action_id`), or `None`
+    /// for a blank space's root draft. Becomes the new post's reply antecedent.
+    pub(crate) parent: Option<SharedString>,
+    /// This draft's editable editor (retains its content while deselected).
+    pub(crate) editor: Entity<MarkdownEditorState>,
+    /// Focus → activate; `PressEnter` → submit/post-only. Held so it outlives
+    /// the closure and is dropped with the draft.
+    pub(crate) _sub: Subscription,
+}
+
 pub struct SpaceView {
     /// The store bundle — held whole for model resolution (config default) and
     /// to open spaces through the `SpacesStore` registry.
@@ -163,17 +181,26 @@ pub struct SpaceView {
     /// One read-only markdown-editor state per persisted post, keyed by node id.
     /// Posts render `disabled` so they're pixel-identical to the composer.
     pub(crate) bodies: HashMap<SharedString, Entity<MarkdownEditorState>>,
-    /// The single live, editable composer.
-    pub(crate) composer: Entity<MarkdownEditorState>,
     /// A read-only editor synced to the live streaming partial each frame.
     pub(crate) streaming_body: Entity<MarkdownEditorState>,
     /// Last value pushed into `streaming_body`, to skip redundant re-parses.
     pub(crate) streaming_synced: String,
 
-    /// The post the composer currently replies to (`None` = the selected leaf,
-    /// i.e. continue the thread tail). Set by a band's "+" / reply affordance to
-    /// branch the thread there.
-    pub(crate) reply_to: Option<SharedString>,
+    /// The unsent **drafts** — local UI nodes (never in `posts` until sent),
+    /// each its own editor that persists when deselected. A draft attaches to
+    /// the persisted tree as a leaf of its `parent` (the post it replies to);
+    /// `None` parent is a blank space's root draft. The active one floats as the
+    /// composer; the rest render inline (see [`composer`](self)).
+    pub(crate) drafts: Vec<Draft>,
+    /// The focused draft, if any — the one that adopts the floating composer
+    /// behavior. `None` means no composer is open (the resting state of a space
+    /// with existing posts; you click a band's "+" to start one).
+    pub(crate) active_draft: Option<SharedString>,
+    /// Monotonic counter for minting unique draft ids.
+    pub(crate) next_draft_seq: usize,
+    /// A freshly-created draft to bring onto the selected path on the next
+    /// render (computed there against the real effective tree).
+    pub(crate) pending_select: Option<SharedString>,
     /// Internal scroll of the floating composer overlay.
     pub(crate) composer_scroll: ScrollHandle,
     pub(crate) composer_prev_off_y: f32,
@@ -233,15 +260,13 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer = cx.new(|cx| MarkdownEditorState::new(window, cx));
         let streaming_body = cx.new(|cx| MarkdownEditorState::new(window, cx));
         let focus_handle = cx.focus_handle();
 
-        // Focus the composer so the cursor lands in it on open (like a fresh
-        // journal page). The view's own `focus_handle` is still tracked on the
-        // root for action dispatch.
-        let composer_focus = composer.read(cx).focus_handle(cx);
-        window.focus(&composer_focus, cx);
+        // A brand-new (blank ⌘N) space opens with the composer ready — the
+        // cursor at the top of an empty notebook. A reopened space with history
+        // opens **without** a composer: you start one by clicking a band's "+".
+        let is_blank = space_id.is_none();
 
         // Get-or-create the shared `Space` through the registry (join-existing).
         let spaces = stores.spaces.clone();
@@ -257,9 +282,6 @@ impl SpaceView {
                 cx.notify();
             }),
             cx.subscribe_in(&space, window, Self::on_space_event),
-            // The composer reports its submit chords as outward `PressEnter`
-            // events; route them to the semantic submit/post-only commands.
-            cx.subscribe_in(&composer, window, Self::on_editor_event),
             cx.observe(&window_input, |_, _, cx| cx.notify()),
         ];
 
@@ -271,10 +293,12 @@ impl SpaceView {
             _subs,
             posts: Vec::new(),
             bodies: HashMap::new(),
-            composer,
             streaming_body,
             streaming_synced: String::new(),
-            reply_to: None,
+            drafts: Vec::new(),
+            active_draft: None,
+            next_draft_seq: 0,
+            pending_select: None,
             composer_scroll: ScrollHandle::new(),
             composer_prev_off_y: 0.0,
             composer_overlayed: Cell::new(false),
@@ -299,6 +323,13 @@ impl SpaceView {
             error: None,
         };
         this.rebuild(cx);
+        if is_blank {
+            // The blank notebook: a root draft, focused and ready.
+            this.create_draft(None, window, cx);
+        } else {
+            // No composer yet — focus the root so action dispatch still works.
+            window.focus(&this.focus_handle, cx);
+        }
         this
     }
 
@@ -314,10 +345,15 @@ impl SpaceView {
         &self.space
     }
 
-    /// The composer editor state (tests set its value directly).
+    /// The active draft's editor state (tests set its value directly). `None`
+    /// when no composer is open.
     #[doc(hidden)]
-    pub fn composer_state_for_test(&self) -> Entity<MarkdownEditorState> {
-        self.composer.clone()
+    pub fn composer_state_for_test(&self) -> Option<Entity<MarkdownEditorState>> {
+        let id = self.active_draft.as_ref()?;
+        self.drafts
+            .iter()
+            .find(|d| &d.id == id)
+            .map(|d| d.editor.clone())
     }
 
     /// The current per-row render snapshot length (tests assert tree shape).
@@ -326,10 +362,28 @@ impl SpaceView {
         self.posts.len()
     }
 
-    /// The current reply target, if the composer is branching (tests).
+    /// The number of unsent drafts (tests assert create/retire).
     #[doc(hidden)]
-    pub fn reply_to_for_test(&self) -> Option<String> {
-        self.reply_to.as_ref().map(|s| s.to_string())
+    pub fn draft_count_for_test(&self) -> usize {
+        self.drafts.len()
+    }
+
+    /// The active draft's parent (the post it replies to), if any.
+    #[doc(hidden)]
+    pub fn active_draft_parent_for_test(&self) -> Option<String> {
+        let id = self.active_draft.as_ref()?;
+        self.drafts
+            .iter()
+            .find(|d| &d.id == id)?
+            .parent
+            .as_ref()
+            .map(|s| s.to_string())
+    }
+
+    /// Whether a composer (active draft) is currently open.
+    #[doc(hidden)]
+    pub fn has_active_draft_for_test(&self) -> bool {
+        self.active_draft.is_some()
     }
 
     /// Whether the minimap is currently shown (tests assert scroll reveals it).
@@ -338,23 +392,31 @@ impl SpaceView {
         self.minimap_visible
     }
 
-    /// Drive the band "+" reply affordance (tests can't synthesize the click).
+    /// Open a draft (a band's "+" / blank-page composer); `None` parent is a
+    /// root draft. Tests can't synthesize the click.
     #[doc(hidden)]
-    pub fn start_reply_for_test(
+    pub fn create_draft_for_test(
         &mut self,
-        action_id: String,
+        parent: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.start_reply(action_id.into(), window, cx);
+        self.create_draft(parent.map(Into::into), window, cx);
+    }
+
+    /// Deactivate the active draft (Escape), for tests.
+    #[doc(hidden)]
+    pub fn deactivate_for_test(&mut self, cx: &mut Context<Self>) {
+        self.deactivate_active_draft(cx);
     }
 
     // -- Snapshot & model resolution --------------------------------------
 
     /// Rebuild the per-row render snapshot from the shared `Space`'s transcript.
     /// Called on every space change (cheap `SharedString` projection) and at
-    /// construction. Also drops a stale reply target whose post no longer
-    /// exists.
+    /// construction. Drafts are local UI state and are left untouched (an
+    /// orphaned draft whose parent vanished re-attaches as a root in
+    /// [`Self::effective_tree`]).
     pub(crate) fn rebuild(&mut self, cx: &mut Context<Self>) {
         let posts: Vec<PostData> = self
             .space
@@ -364,16 +426,6 @@ impl SpaceView {
             .map(post_data_from)
             .collect();
         self.posts = posts;
-        // Drop a reply target that's no longer present (e.g. transcript reload
-        // re-keyed ids); the composer falls back to the tail.
-        if let Some(target) = self.reply_to.clone()
-            && !self
-                .posts
-                .iter()
-                .any(|p| p.action_id.as_deref() == Some(target.as_str()))
-        {
-            self.reply_to = None;
-        }
     }
 
     /// Resolve the model for a send: space selection → config default →
@@ -448,8 +500,10 @@ impl SpaceView {
             }
         }
         self.bodies.retain(|id, _| live.contains(id));
+        // Keep height-cache entries for live posts, live drafts, and streaming.
+        let draft_ids: HashSet<SharedString> = self.drafts.iter().map(|d| d.id.clone()).collect();
         self.layout
-            .retain(&|id| live.contains(id) || id == model::DRAFT_ID || id == model::STREAMING_ID);
+            .retain(&|id| live.contains(id) || draft_ids.contains(id) || id == model::STREAMING_ID);
     }
 
     /// Ensure a horizontal `ScrollHandle` exists for every node that has
@@ -467,45 +521,32 @@ impl SpaceView {
         self.scrolls.retain(|id, _| live.contains(id));
     }
 
-    /// The effective render forest: the persisted post tree plus the streaming
-    /// reply (while streaming) or the composer draft (otherwise) attached as a
-    /// leaf of the reply target. Returns the forest and the overlay's parent id
-    /// (so the caller can ensure that scroller's handle).
-    fn effective_tree(
-        &self,
-        page_width: Pixels,
-        streaming: bool,
-    ) -> (Vec<TreeNode>, Option<SharedString>) {
+    /// The effective render forest: the persisted post tree, plus the streaming
+    /// reply (while streaming) attached at the selected leaf, plus every draft
+    /// attached as a leaf of its parent post (`None` parent → a root draft).
+    /// Drafts attach after a node's persisted children, in `self.drafts` order,
+    /// so a draft's branch index is deterministic.
+    fn effective_tree(&self, page_width: Pixels, streaming: bool) -> Vec<TreeNode> {
         let mut roots = model::build_tree(&self.posts);
-        let (overlay, target) = if streaming {
-            (
-                TreeNode::leaf(NodeSrc::Streaming, model::STREAMING_ID),
-                self.selected_leaf_id(&roots, page_width),
-            )
-        } else {
-            (
-                TreeNode::leaf(NodeSrc::Draft, model::DRAFT_ID),
-                self.reply_target_id(&roots, page_width),
-            )
-        };
-        match &target {
-            Some(t) if model::node_ref(&roots, t).is_some() => {
-                model::attach_overlay(&mut roots, t, overlay);
+        if streaming {
+            let overlay = TreeNode::leaf(NodeSrc::Streaming, model::STREAMING_ID);
+            match self.selected_leaf_id(&roots, page_width) {
+                Some(t) if model::node_ref(&roots, &t).is_some() => {
+                    model::attach_overlay(&mut roots, &t, overlay);
+                }
+                _ => roots.push(overlay),
             }
-            _ => roots.push(overlay),
         }
-        (roots, target)
-    }
-
-    /// The reply target for the composer: an explicit `reply_to` (a branch) when
-    /// its post still exists, else the selected leaf (continue the tail).
-    fn reply_target_id(&self, roots: &[TreeNode], page_width: Pixels) -> Option<SharedString> {
-        if let Some(t) = &self.reply_to
-            && model::node_ref(roots, t).is_some()
-        {
-            return Some(t.clone());
+        for d in &self.drafts {
+            let overlay = TreeNode::leaf(NodeSrc::Draft, d.id.clone());
+            match &d.parent {
+                Some(p) if model::node_ref(&roots, p).is_some() => {
+                    model::attach_overlay(&mut roots, p, overlay);
+                }
+                _ => roots.push(overlay),
+            }
         }
-        self.selected_leaf_id(roots, page_width)
+        roots
     }
 }
 
@@ -581,10 +622,17 @@ impl Render for SpaceView {
         self.sync_bodies(window, cx);
 
         let streaming = self.space.read(cx).is_streaming();
-        let (tree, overlay_parent) = self.effective_tree(page_width, streaming);
+        let tree = self.effective_tree(page_width, streaming);
         self.sync_scrolls(&tree);
-        if let Some(parent) = overlay_parent {
-            self.scrolls.entry(parent).or_default();
+
+        // A freshly-created draft selects its branch on the first frame it
+        // exists in the tree (computed here against the real effective tree),
+        // then docks the page so the composer lands at its "home" position.
+        if let Some(sel) = self.pending_select.take()
+            && model::node_ref(&tree, &sel).is_some()
+        {
+            self.select_path_to(&tree, &sel, page_width);
+            self.dock_active_draft(&tree, page_width, window_h);
         }
 
         // Sync the streaming editor to the live partial (skip if unchanged).
@@ -664,7 +712,7 @@ impl Render for SpaceView {
                 scroll.style().restrict_scroll_to_axis = Some(true);
                 scroll
             })
-            .child(self.render_active_draft(&tree, page_width, window_h, streaming, cx))
+            .child(self.render_active_draft(&tree, page_width, window_h, cx))
             .child(self.render_error_band(cx))
             .child(self.render_minimap(&tree, page_width, window_h, cx))
     }
@@ -715,9 +763,13 @@ impl SpaceView {
     ) -> gpui::Div {
         let mut column = v_flex().w(page_width);
 
-        // The post (or the draft's in-flow placeholder slot).
+        // The post, the draft's in-flow placeholder slot (when it's the active
+        // floating composer), or an inactive draft rendered inline.
         match node.src {
-            NodeSrc::Draft => {
+            NodeSrc::Draft if self.active_draft.as_deref() == Some(&node.id) => {
+                // Active draft: its editor floats in the overlay; the in-flow
+                // slot is an empty placeholder that reserves the runway and
+                // records the dock line + minimap bounds.
                 let slot_h = self.draft_slot_height(node, page_width, window_h);
                 column = column.child(
                     div()
@@ -726,6 +778,12 @@ impl SpaceView {
                         .flex_none()
                         .child(record_bounds(self.slot_bounds.clone(), node.id.clone())),
                 );
+            }
+            NodeSrc::Draft => {
+                // Inactive draft: render inline (an editable "Draft" post that
+                // takes real vertical space); clicking it re-activates it.
+                column =
+                    column.child(self.render_inactive_draft(node, doc_y, page_width, window_h, cx));
             }
             _ => {
                 column = column
