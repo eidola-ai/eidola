@@ -673,22 +673,40 @@ impl SpaceView {
         self.cancel_snap();
     }
 
-    /// The page scroll offset (`y`, ≤ 0) that docks `draft_id`'s editor *just*
-    /// at its "home" position — its top around the middle of the window. Assumes
-    /// the draft is already on the selected path. The draft's placeholder document
-    /// top is everything on the path above it (`reserve + whole-path height − the
-    /// draft's own height`, which cancels the draft's height out); the target puts
-    /// the composer's top (placeholder top + half_pad) at ~50% of the window.
-    fn home_offset_y(&self, draft_id: &'static str, page_width: Pixels, window_h: Pixels) -> f32 {
+    /// Document-space top of the active draft's in-flow placeholder: everything on
+    /// the selected path above it — `reserve + (whole-path height − the draft's own
+    /// height)`, the draft's height canceling out, so it depends only on the
+    /// (stable) heights of the posts above. Assumes `draft_id` is on the selected
+    /// path. Added to the *live* page scroll offset this gives the placeholder's
+    /// current screen top with no one-frame lag — unlike reading its recorded
+    /// bounds, which are written in paint and read a frame later.
+    fn placeholder_doc_top(
+        &self,
+        draft_id: &'static str,
+        page_width: Pixels,
+        window_h: Pixels,
+    ) -> f32 {
         let total = self.selected_subtree_height(&self.root, page_width, window_h);
         let draft_h = node_ref(&self.root, draft_id)
             .map(|n| self.selected_subtree_height(n, page_width, window_h))
             .unwrap_or(0.0);
-        let placeholder_doc_top = TITLE_BAR_RESERVE.as_f32() + total - draft_h;
+        TITLE_BAR_RESERVE.as_f32() + total - draft_h
+    }
+
+    /// The page scroll offset (`y`, ≤ 0) that docks `draft_id`'s editor *just*
+    /// at its "home" position — its top around the middle of the window. The
+    /// target puts the composer's top (placeholder top + half_pad) at ~50%.
+    fn home_offset_y(&self, draft_id: &'static str, page_width: Pixels, window_h: Pixels) -> f32 {
+        let doc_top = self.placeholder_doc_top(draft_id, page_width, window_h);
         let half_pad = POST_PAD_Y.as_f32() / 2.0;
-        let target_slot_top = 0.5 * window_h.as_f32() - half_pad;
+        // Aim the composer's top ~1px *inside* the dock threshold. A tall draft's
+        // `float_top` is itself 50%, so targeting exactly 50% lands `top_y` on the
+        // boundary, which `overlayed = top_y >= float_top - 0.5` still reads as
+        // floating — home would sit a hair shy of docked. The extra pixel clears
+        // that tolerance regardless of window size; the offset is imperceptible.
+        let target_slot_top = 0.5 * window_h.as_f32() - half_pad - 1.0;
         // screen = doc + offset ⇒ offset = target_screen − doc (clamped ≤ 0).
-        (target_slot_top - placeholder_doc_top).min(0.0)
+        (target_slot_top - doc_top).min(0.0)
     }
 
     /// "Return home": navigate to the active draft's branch and scroll the page so
@@ -915,7 +933,14 @@ impl SpaceView {
     /// *previous* frame (post + runway bounds, composer content height, viewport)
     /// so `render` can schedule exactly one catch-up frame when they change.
     fn minimap_signature(&self, viewport_h: Pixels) -> f32 {
-        let mut sig = viewport_h.as_f32() + self.composer_content_h.borrow().as_f32() * 5.0;
+        // The page scroll offset is set synchronously (manual wheel, or a one-shot
+        // `go_home` / `create_draft`) a frame before its effect lands in the
+        // recorded post bounds below; include it directly so a programmatic scroll
+        // still schedules the minimap's catch-up frame instead of waiting for some
+        // later external repaint.
+        let mut sig = viewport_h.as_f32()
+            + self.composer_content_h.borrow().as_f32() * 5.0
+            + self.page_scroll.offset().y.as_f32() * 19.0;
         for (id, b) in self.post_bounds.borrow().iter() {
             sig += id.len() as f32 + b.origin.y.as_f32() * 2.0 + b.size.height.as_f32() * 3.0;
         }
@@ -1479,13 +1504,16 @@ impl SpaceView {
         let float_bar_h = (chrome + content).min(COMPOSER_MAX_FRACTION * win);
         let float_top = win - float_bar_h;
         // Dock: if the active draft's placeholder top (plus the half-spacing gap)
-        // has risen above the floating top, follow it up (and grow). One-frame-
-        // lagged like the minimap. Off the selected branch we don't dock at all.
+        // has risen above the floating top, follow it up (and grow). Off the
+        // selected branch we don't dock at all. Computed from the *live* page
+        // scroll offset (not the placeholder's recorded bounds) so the dock/float
+        // threshold — and the drop shadow gated on it — track the scroll exactly,
+        // with no one-frame lag, and a programmatic scroll docks the same frame.
         let slot_top = if on_path {
-            self.slot_bounds
-                .borrow()
-                .get(draft_id)
-                .map(|b| b.origin.y.as_f32())
+            Some(
+                self.placeholder_doc_top(draft_id, page_width, window_h)
+                    + self.page_scroll.offset().y.as_f32(),
+            )
         } else {
             None
         };
