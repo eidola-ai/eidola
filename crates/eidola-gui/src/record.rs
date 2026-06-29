@@ -244,6 +244,7 @@ pub struct RecordView {
     detail_pending: Option<String>,
     error: Option<String>,
     focus_handle: FocusHandle,
+    drag_armed: crate::titlebar::DragArm,
 }
 
 impl RecordView {
@@ -261,6 +262,7 @@ impl RecordView {
             detail_pending: None,
             error: None,
             focus_handle,
+            drag_armed: crate::titlebar::drag_arm(),
         };
         this.fetch_page(RecordSection::Attestations, cx);
         this
@@ -636,7 +638,7 @@ impl RecordView {
             strip = strip.child(label);
         }
 
-        strip
+        let strip = strip
             .child(div().flex_1())
             .child(
                 div()
@@ -655,7 +657,12 @@ impl RecordView {
                     .italic()
                     .text_color(theme.muted_foreground)
                     .child("The Record"),
-            )
+            );
+
+        // The strip *is* the titlebar: make its empty areas (and gaps between
+        // the section tabs) drag the window. The tabs/refresh keep their own
+        // clicks — a plain click never arms a move.
+        crate::titlebar::make_draggable(strip.id("record-strip"), self.drag_armed.clone())
     }
 
     fn list_frame(&self) -> Div {

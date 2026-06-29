@@ -69,6 +69,7 @@ pub enum UpdatesDisplay {
 pub struct UpdatesView {
     update: Entity<UpdateStore>,
     focus_handle: FocusHandle,
+    drag_armed: crate::titlebar::DragArm,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -91,6 +92,7 @@ impl UpdatesView {
         Self {
             update,
             focus_handle,
+            drag_armed: crate::titlebar::drag_arm(),
             _subscriptions,
         }
     }
@@ -250,7 +252,10 @@ impl Render for UpdatesView {
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .child(div().h(TITLE_BAR_RESERVE).w_full())
+            .child(crate::titlebar::make_draggable(
+                div().id("updates-titlebar").h(TITLE_BAR_RESERVE).w_full(),
+                self.drag_armed.clone(),
+            ))
             .child(
                 div()
                     .id("updates-body")

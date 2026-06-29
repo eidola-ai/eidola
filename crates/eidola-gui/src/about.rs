@@ -29,13 +29,17 @@ const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 
 pub struct AboutView {
     focus_handle: FocusHandle,
+    drag_armed: crate::titlebar::DragArm,
 }
 
 impl AboutView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
-        Self { focus_handle }
+        Self {
+            focus_handle,
+            drag_armed: crate::titlebar::drag_arm(),
+        }
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
@@ -110,10 +114,16 @@ impl Render for AboutView {
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
             }))
+            .relative()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .pt(TITLE_BAR_RESERVE)
+            .child(crate::titlebar::drag_band(
+                "about-titlebar",
+                TITLE_BAR_RESERVE,
+                self.drag_armed.clone(),
+            ))
             // Centered column, capped at the prose measure.
             .child(
                 h_flex()

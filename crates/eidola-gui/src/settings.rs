@@ -64,6 +64,7 @@ pub struct SettingsView {
     /// to be in the dispatch path, so we `focus()` the handle on
     /// construction.
     focus_handle: FocusHandle,
+    drag_armed: crate::titlebar::DragArm,
 }
 
 impl SettingsView {
@@ -92,6 +93,7 @@ impl SettingsView {
             wallet,
             window_input,
             focus_handle,
+            drag_armed: crate::titlebar::drag_arm(),
         }
     }
 
@@ -186,6 +188,7 @@ impl Render for SettingsView {
                     wi.update_modifiers(event, cx);
                 });
             }))
+            .relative()
             .size_full()
             .items_start()
             .bg(theme.background)
@@ -222,5 +225,12 @@ impl Render for SettingsView {
                         .child(body),
                 ),
             )
+            // Drag band last so it paints atop the sidebar/body columns and
+            // wins hit-testing across the full-width traffic-light reserve.
+            .child(crate::titlebar::drag_band(
+                "settings-titlebar",
+                NAV_TOP_RESERVE,
+                self.drag_armed.clone(),
+            ))
     }
 }

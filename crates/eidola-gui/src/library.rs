@@ -64,6 +64,7 @@ pub struct LibraryView {
     /// does NOT also trigger the row's open (`open_space` itself defers a real
     /// window open that a behavior test can't easily count).
     open_space_requests: usize,
+    drag_armed: crate::titlebar::DragArm,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -84,6 +85,7 @@ impl LibraryView {
             focus_handle,
             scroll: UniformListScrollHandle::new(),
             open_space_requests: 0,
+            drag_armed: crate::titlebar::drag_arm(),
             _subscriptions,
         }
     }
@@ -438,10 +440,19 @@ impl Render for LibraryView {
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
             }))
+            .relative()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .pt(TITLE_BAR_RESERVE);
+            .pt(TITLE_BAR_RESERVE)
+            // Absolute drag band over the traffic-light reserve. It sits above
+            // the empty top padding, so both the empty and populated paths get
+            // a draggable titlebar without affecting flow layout.
+            .child(crate::titlebar::drag_band(
+                "library-titlebar",
+                TITLE_BAR_RESERVE,
+                self.drag_armed.clone(),
+            ));
 
         // Chapter-style heading: a small italic label between hairline
         // rules, echoing the chat's chapter delimiters so the library reads

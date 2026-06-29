@@ -17,6 +17,7 @@ pub mod space;
 pub mod space_view;
 pub mod stores;
 pub mod theme;
+pub mod titlebar;
 pub mod updates;
 pub mod wallet;
 pub mod window_input;

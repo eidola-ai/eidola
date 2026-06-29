@@ -40,6 +40,7 @@ use gpui::{
 use gpui_component::{ActiveTheme, InteractiveElementExt, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditorState, MarkdownStyle};
 
+use crate::actions::CloseWindow;
 use crate::space::{ChatMessageView, Space, SpaceEvent};
 use crate::stores::Stores;
 use crate::theme;
@@ -792,6 +793,9 @@ impl Render for SpaceView {
             .key_context("SpaceView")
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::post_only))
+            .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
+                window.remove_window();
+            }))
             .relative()
             .size_full()
             .bg(bg)

@@ -299,6 +299,8 @@ The chat transcript has *variable*-height rows (a one-line user turn vs a long m
 - **`settings::NAV_TOP_RESERVE`** (44px on macOS): the traffic lights sit over the sidebar nav band, so the band's first item starts below them.
 - **`record::STRIP_LEFT_PAD`** (80px on macOS): horizontal pad on the Record's section strip, which doubles as the title bar — the lights live to its left. 80px matches gpui-component's own `TITLE_BAR_LEFT_PADDING`.
 
+**Window dragging is wired explicitly** (`src/titlebar.rs`). With the transparent titlebar macOS no longer hands us a draggable strip, and gpui's `WindowControlArea::Drag` is a no-op there, so every window makes its reserve strip draggable in the gpui content view: arm on left mouse-down, call `Window::start_window_move()` on the first move while armed (so a plain click never starts a drag), and forward a double-click to `Window::titlebar_double_click()` for zoom parity. The armed flag is a `titlebar::DragArm` (`Rc<Cell<bool>>`) stored on the view — not a per-render cell — so it survives any re-render landing between the mouse-down and the first move. `titlebar::drag_band(id, height, armed)` builds a full-width transparent overlay band absolutely positioned over the reserve (used by About / Library / Settings, painted **last** so it wins hit-testing over the columns beneath); `titlebar::make_draggable(stateful_el, armed)` attaches the same gesture to an existing strip (Updates' top spacer, Record's section strip — whose tabs keep their own clicks since a plain click never arms). `space_view`'s own `render_title_bar` predates the helper and inlines the identical gesture with a gradient overlay.
+
 ## macOS UX — menus, keybindings, action dispatch
 
 All wired in `src/lib.rs::install_menus`, `install_keybindings`, `install_action_handlers`. **Order of those calls matters** — see [Ordering invariant](#ordering-invariant) below.
@@ -327,7 +329,7 @@ All wired in `src/lib.rs::install_menus`, `install_keybindings`, `install_action
 Most handlers are global (registered on `App`). Two notable patterns:
 
 - **Window-targeting handlers** (`Minimize`, `Zoom`) capture `cx.active_window()` and call `cx.defer` to invoke `window.minimize_window()` / `zoom_window()` *after* the current update completes. Without `defer`, a direct `handle.update(cx, …)` on the same window we were dispatched inside fails (its slot is already taken), `.ok()` swallows the Err, and nothing happens.
-- **`CloseWindow` is registered per-view**, not globally. Each view does `.on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))` on its root v_flex, and `track_focus`es a handle that's `focus()`ed in the view's constructor (so the dispatch path reaches the listener even before the user clicks anything). The intentional consequence: `is_action_available` returns true only when a window with the listener is alive, so macOS auto-disables the "Close Window" menu item (and ⌘W) when no window is open.
+- **`CloseWindow` is registered per-view**, not globally. Each view (the chat/space window included) does `.on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))` on its root, and `track_focus`es a handle that's `focus()`ed in the view's constructor (so the dispatch path reaches the listener even before the user clicks anything). The intentional consequence: `is_action_available` returns true only when a window with the listener is alive, so macOS auto-disables the "Close Window" menu item (and ⌘W) when no window is open.
 
 ### Lifecycle
 
