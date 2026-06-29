@@ -3268,6 +3268,33 @@ fn dispatch_space_action<A: gpui::Action>(
 }
 
 #[gpui::test]
+fn space_blank_composer_does_not_scroll(cx: &mut TestAppContext) {
+    // REGRESSION: a brand-new space (just the composer) reserved a phantom
+    // scroll range equal to the titlebar reserve. The document is laid out
+    // beneath a top reserve that holds the first post clear of the overlaid
+    // titlebar — but an empty notebook has no post above the composer, so that
+    // reserve was pure dead space (total = window + reserve). `doc_reserve` is
+    // now zero when there are no posts, so a sole composer fills the window
+    // exactly: no scroll until the content actually overflows. (Spaces *with*
+    // posts keep the reserve, so the docked composer still reaches the window
+    // top when scrolled to the bottom.)
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    view.read_with(cx, |v, _| assert!(v.has_active_draft_for_test()));
+
+    let vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let min_y = view.read_with(&vcx, |v, _| v.scroll_min_y_for_test());
+    assert!(
+        min_y > -1.0,
+        "a blank space's sole composer should not reserve scroll (min_y = {min_y}, \
+         expected ~0; the pre-fix bug parked it at -titlebar_reserve)"
+    );
+}
+
+#[gpui::test]
 fn space_blank_opens_with_composer_existing_does_not(cx: &mut TestAppContext) {
     // A brand-new (blank ⌘N) space opens with the composer ready.
     let stores = stub_stores_with_config(cx);

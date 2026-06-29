@@ -163,6 +163,23 @@ impl SpaceView {
         POST_PAD_Y.as_f32() / 2.0
     }
 
+    /// The document's top reserve: headroom that holds the first post clear of
+    /// the (transparent, overlaid) titlebar. It exists **only when there are
+    /// posts** — an empty notebook (just the composer) has nothing above to
+    /// clear, so it gets no reserve and the composer fills the whole window with
+    /// no phantom scroll. Every scrollable-document computation (the scroll
+    /// range, the forest origin, the minimap, the dock math) reads this single
+    /// value, so "what's interactive" and "what's visible" stay in lockstep. The
+    /// titlebar's own visual height (the gradient overlay in `render_title_bar`)
+    /// is unconditionally [`TITLE_BAR_RESERVE`] and independent of this.
+    pub(crate) fn doc_reserve(&self) -> f32 {
+        if self.posts.is_empty() {
+            0.0
+        } else {
+            TITLE_BAR_RESERVE.as_f32()
+        }
+    }
+
     /// A branch's trailing runway: at least a window tall (so the docked
     /// composer can stand alone), or as tall as the composer's content if more.
     pub(crate) fn runway_height(&self, window_h: Pixels) -> f32 {
@@ -305,7 +322,7 @@ impl SpaceView {
         page_width: Pixels,
         window_h: Pixels,
     ) -> Option<f32> {
-        let mut y = TITLE_BAR_RESERVE.as_f32();
+        let mut y = self.doc_reserve();
         for (i, (sibs, active)) in self
             .selected_levels(roots, page_width)
             .into_iter()
@@ -332,7 +349,7 @@ impl SpaceView {
         window_h: Pixels,
     ) -> f32 {
         let Some(root) = self.active_root(roots, page_width) else {
-            return TITLE_BAR_RESERVE.as_f32();
+            return self.doc_reserve();
         };
         let total = self.selected_subtree_height(root, page_width, window_h);
         // The leaf's own (slot) height.
@@ -341,7 +358,7 @@ impl SpaceView {
             .and_then(|id| super::model::node_ref(roots, &id).map(|n| (n, id)))
             .map(|(n, _)| self.node_height(n, page_width, window_h))
             .unwrap_or(0.0);
-        TITLE_BAR_RESERVE.as_f32() + total - leaf_h
+        self.doc_reserve() + total - leaf_h
     }
 
     /// The page scroll `y`, clamped to the content's real scrollable range

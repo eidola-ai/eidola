@@ -21,7 +21,6 @@ use crate::probe::Probe as _;
 use super::model::{NodeSrc, TreeNode};
 use super::{
     BAND_HEIGHT, MINIMAP_COL_GAP, MINIMAP_FADE, MINIMAP_HIDE_DELAY, MINIMAP_WIDTH, SpaceView,
-    TITLE_BAR_RESERVE,
 };
 
 impl SpaceView {
@@ -145,7 +144,10 @@ impl SpaceView {
             .w(MINIMAP_WIDTH);
 
         let levels = self.selected_levels(roots, page_width);
-        let reserve = TITLE_BAR_RESERVE.as_f32();
+        // The same top headroom the scrollable document uses (zero for an empty
+        // notebook), so the map's scale matches the real scroll range exactly —
+        // no phantom reserve band above a sole composer.
+        let reserve = self.doc_reserve();
         let selected_h = self.selected_total_height(roots, page_width, viewport_h);
         // A floating, off-branch draft pads the page bottom (item 4); fold it
         // into the denominator + a trailing spacer so the scroll indicator maps
@@ -162,15 +164,18 @@ impl SpaceView {
             let scale = viewport_h.as_f32() / total_h;
             let mut col = v_flex().w_full();
 
-            // The reserve scrolls off like content: dark at the very top.
-            let reserve_top = scroll_y;
-            col = col.child(selected_column(
-                Some((reserve_top, reserve)),
-                viewport_h.as_f32(),
-                px(reserve * scale),
-                dark,
-                medium,
-            ));
+            // The reserve scrolls off like content: dark at the very top. Absent
+            // entirely for an empty notebook (no headroom → no band).
+            if reserve > 0.0 {
+                let reserve_top = scroll_y;
+                col = col.child(selected_column(
+                    Some((reserve_top, reserve)),
+                    viewport_h.as_f32(),
+                    px(reserve * scale),
+                    dark,
+                    medium,
+                ));
+            }
 
             // Accumulate the document top of each level's selected node.
             let mut doc_y = reserve;

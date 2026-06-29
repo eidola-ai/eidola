@@ -413,6 +413,14 @@ impl SpaceView {
         self.minimap_visible
     }
 
+    /// The most-negative valid page scroll `y` for the last rendered frame —
+    /// `0.0` means the content exactly fits (nothing to scroll). Tests assert a
+    /// blank space's sole composer reserves no phantom scroll.
+    #[doc(hidden)]
+    pub fn scroll_min_y_for_test(&self) -> f32 {
+        self.scroll_min_y.get()
+    }
+
     /// Open a draft (a band's "+" / blank-page composer); `None` parent is a
     /// root draft. Tests can't synthesize the click.
     #[doc(hidden)]
@@ -713,9 +721,12 @@ impl Render for SpaceView {
         // `[scroll_min_y, 0]`) so the docked composer / posts / minimap don't
         // drift past the end and flicker. Set before any consumer below.
         let floating_pad = self.floating_pad(&tree, page_width, window_h, streaming);
-        let total_doc = TITLE_BAR_RESERVE.as_f32()
-            + self.selected_total_height(&tree, page_width, window_h)
-            + floating_pad;
+        // Top headroom for the first post (zero for an empty notebook); see
+        // `doc_reserve`. Used for the scroll range, the forest origin, and the
+        // content's top padding so all three agree.
+        let doc_reserve = self.doc_reserve();
+        let total_doc =
+            doc_reserve + self.selected_total_height(&tree, page_width, window_h) + floating_pad;
         self.scroll_min_y
             .set((window_h.as_f32() - total_doc).min(0.0));
 
@@ -731,14 +742,7 @@ impl Render for SpaceView {
         // Keep the composer's frozen-scroll baseline in step between gestures.
         self.composer_prev_off_y = self.composer_scroll.offset().y.as_f32();
 
-        let body = self.render_forest(
-            &tree,
-            TITLE_BAR_RESERVE.as_f32(),
-            page_width,
-            window_h,
-            streaming,
-            cx,
-        );
+        let body = self.render_forest(&tree, doc_reserve, page_width, window_h, streaming, cx);
 
         div()
             .track_focus(&self.focus_handle)
@@ -773,7 +777,7 @@ impl Render for SpaceView {
                     .child(
                         v_flex()
                             .w_full()
-                            .pt(TITLE_BAR_RESERVE)
+                            .pt(px(doc_reserve))
                             .pb(px(floating_pad))
                             .child(body),
                     );

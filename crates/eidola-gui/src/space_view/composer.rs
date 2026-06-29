@@ -31,7 +31,7 @@ use super::model::{self, TreeNode};
 use super::nav::ScrollOwner;
 use super::{
     COMPOSER_MAX_FRACTION, Draft, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y, PostOnly, Send, SpaceView,
-    TITLE_BAR_RESERVE, prose_style,
+    prose_style,
 };
 
 impl SpaceView {
@@ -279,7 +279,7 @@ impl SpaceView {
         let streaming = self.space.read(cx).is_streaming();
         let tree = self.effective_tree(viewport.width, streaming);
         let total = self.selected_total_height(&tree, viewport.width, viewport.height);
-        let doc = TITLE_BAR_RESERVE.as_f32() + total;
+        let doc = self.doc_reserve() + total;
         let y = (viewport.height.as_f32() - doc).min(0.0);
         let off = self.page_scroll.offset();
         self.page_scroll.set_offset(point(off.x, px(y)));
@@ -369,7 +369,7 @@ impl SpaceView {
 
         let full_h = (content + chrome).max(win);
         let bar_h = if docked {
-            let denom = (float_top - TITLE_BAR_RESERVE.as_f32()).max(1.0);
+            let denom = (float_top - self.doc_reserve()).max(1.0);
             let progress = ((float_top - top_y) / denom).clamp(0.0, 1.0);
             float_bar_h + progress * (full_h - float_bar_h)
         } else {
