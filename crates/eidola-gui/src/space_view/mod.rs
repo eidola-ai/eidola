@@ -245,6 +245,16 @@ pub struct SpaceView {
 
     /// The cached post-height layout (the virtualization core).
     pub(crate) layout: Layout,
+    /// Frames remaining to force every on-path post to render real (bypassing
+    /// viewport virtualization) so it measures into the layout cache. Armed
+    /// whenever an on-path post is unmeasured (cold open, width change that
+    /// emptied the cache, freshly added post). While warming, the document's
+    /// measured height is established up front, so an off-screen post later
+    /// measuring estimate→real can't shift the whole document below it — which
+    /// otherwise jumps the dock/float threshold (and the composer's drop shadow
+    /// gated on it) and resizes the minimap columns as you scroll toward them.
+    /// `Cell` so the `&self` render path can read it.
+    pub(crate) warm_remaining: Cell<u8>,
     /// Signature of the minimap's layout inputs, so a reflow/scroll schedules
     /// exactly one catch-up frame.
     pub(crate) minimap_sig: f32,
@@ -325,6 +335,7 @@ impl SpaceView {
             snap_pin: None,
             last_page_width: None,
             layout: Layout::new(),
+            warm_remaining: Cell::new(0),
             minimap_sig: f32::NAN,
             minimap_visible: false,
             minimap_gesturing: false,
@@ -419,6 +430,19 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn scroll_min_y_for_test(&self) -> f32 {
         self.scroll_min_y.get()
+    }
+
+    /// How many posts currently have a *measured* (not estimated) height in the
+    /// layout cache — equals the post count once the warm pass has run.
+    #[doc(hidden)]
+    pub fn measured_post_count_for_test(&self) -> usize {
+        (0..self.posts.len())
+            .filter(|&i| {
+                self.layout
+                    .measured(&model::node_id(&self.posts, i))
+                    .is_some()
+            })
+            .count()
     }
 
     /// Open a draft (a band's "+" / blank-page composer); `None` parent is a
@@ -689,6 +713,17 @@ impl Render for SpaceView {
         let tree = self.effective_tree(page_width, streaming);
         self.sync_scrolls(&tree);
 
+        // Warm the on-path posts: if any post the selected path renders is still
+        // unmeasured (a cold open, a width change that emptied the cache, or a
+        // freshly added post), force every post real for the next couple of
+        // frames so it measures into the cache up front. This holds the document
+        // height stable, so an off-screen post measuring lazily mid-scroll can't
+        // shift everything below it and jump the composer's dock shadow / resize
+        // the minimap. Self-terminating: once the path is fully measured it stops.
+        if self.warm_remaining.get() == 0 && self.path_has_unmeasured(&tree, page_width) {
+            self.warm_remaining.set(2);
+        }
+
         // A freshly-created draft selects its branch on the first frame it
         // exists in the tree (computed here against the real effective tree),
         // then docks the page so the composer lands at its "home" position.
@@ -740,6 +775,14 @@ impl Render for SpaceView {
         }
 
         // Keep the composer's frozen-scroll baseline in step between gestures.
+        // Tick down the warm window, scheduling the next frame so the forced
+        // real renders (and their measuring canvases) actually run.
+        if self.warm_remaining.get() > 0 {
+            self.warm_remaining.set(self.warm_remaining.get() - 1);
+            let entity = cx.entity();
+            window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
+        }
+
         self.composer_prev_off_y = self.composer_scroll.offset().y.as_f32();
 
         let body = self.render_forest(&tree, doc_reserve, page_width, window_h, streaming, cx);
@@ -786,7 +829,14 @@ impl Render for SpaceView {
             })
             .child(self.render_active_draft(&tree, page_width, window_h, cx))
             .child(self.render_error_band(cx))
-            .child(self.render_minimap(&tree, page_width, window_h, cx))
+            // Defer the minimap above the (also-deferred) composer: the composer
+            // floats at priority 0, so the minimap at priority 1 paints last and
+            // stays on top of it. A plain child would lose, since the deferred
+            // composer paints after the whole normal-pass tree.
+            .child(
+                gpui::deferred(self.render_minimap(&tree, page_width, window_h, cx))
+                    .with_priority(1),
+            )
     }
 }
 

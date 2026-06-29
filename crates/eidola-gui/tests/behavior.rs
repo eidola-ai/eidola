@@ -3268,6 +3268,105 @@ fn dispatch_space_action<A: gpui::Action>(
 }
 
 #[gpui::test]
+fn space_composer_dock_shadow_is_stable_cold(cx: &mut TestAppContext) {
+    // REGRESSION: opening a conversation parks the composer near the bottom with
+    // the posts above still *estimated* (unmeasured — the user hasn't scrolled
+    // through them). Scrolling up toward the float threshold, each post that
+    // crossed into view re-measured estimate→real, shifting the whole document
+    // below it; the composer's slot lurched across the dock threshold and its
+    // drop shadow flipped on/off — the "two thresholds 20px apart" jump. The
+    // warm pass now measures the on-path posts up front, so the document height
+    // is stable from a cold open and the float threshold is crossed exactly once
+    // as the page scrolls monotonically.
+    use eidola_app_core::{PostBlock, PostNode, PostParticipant};
+    let post = |aid: &str, parent: Option<&str>, role_user: bool, text: &str| PostNode {
+        action_id: aid.into(),
+        item_id: format!("item-{aid}"),
+        parent_action_id: parent.map(Into::into),
+        participant: PostParticipant {
+            kind: if role_user {
+                "human".into()
+            } else {
+                "agent".into()
+            },
+            label: if role_user {
+                "You".into()
+            } else {
+                "kimi".into()
+            },
+        },
+        action_type: if role_user {
+            "user_input".into()
+        } else {
+            "inference".into()
+        },
+        generation: 0,
+        generation_count: 1,
+        is_current: true,
+        model: None,
+        credits_consumed: None,
+        relation: parent.map(|_| "reply".to_string()),
+        depth: 0,
+        is_branch: false,
+        blocks: vec![PostBlock {
+            block_type: "text".into(),
+            text: Some(text.into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }],
+        references: Vec::new(),
+        created_at: 0,
+    };
+    let mut nodes = Vec::new();
+    for i in 0..12 {
+        let aid = format!("a{i}");
+        let parent = if i == 0 {
+            None
+        } else {
+            Some(format!("a{}", i - 1))
+        };
+        nodes.push(post(
+            &aid,
+            parent.as_deref(),
+            i % 2 == 0,
+            "A few sentences of body text so each post has a realistic measured height under \
+             the prose typography, tall enough that the transcript overflows the window.",
+        ));
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("warm".into()));
+    view.update(cx, |v, cx| {
+        v.space()
+            .update(cx, |s, cx| s.set_post_tree_for_test(nodes, cx));
+    });
+    cx.run_until_parked();
+    // Activate the tail composer (reply to the last post a11).
+    open_space_draft(&view, window, cx, Some("a11"));
+
+    let vcx = VisualTestContext::from_window(window, cx);
+    // Cold open at a window far smaller than the document: only a few posts are
+    // ever on screen. Do NOT scroll — just let the warm pass run.
+    vcx.simulate_resize(gpui::size(px(760.), px(620.)));
+    vcx.run_until_parked();
+
+    // The warm pass renders every on-path post real for a few frames, so all 12
+    // measure into the cache up front — even the off-screen ones. Without it,
+    // only the handful on screen would be measured, and the rest would lurch the
+    // document (and the dock shadow) as they measured during a later scroll.
+    let (measured, total) = view.read_with(&vcx, |v, _| {
+        (v.measured_post_count_for_test(), v.post_count_for_test())
+    });
+    assert_eq!(total, 12);
+    assert_eq!(
+        measured, total,
+        "cold open should warm every on-path post into the height cache \
+         (measured {measured} of {total}); unmeasured posts shift the layout when scrolled into view"
+    );
+}
+
+#[gpui::test]
 fn space_blank_composer_does_not_scroll(cx: &mut TestAppContext) {
     // REGRESSION: a brand-new space (just the composer) reserved a phantom
     // scroll range equal to the titlebar reserve. The document is laid out

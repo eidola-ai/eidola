@@ -501,7 +501,14 @@ impl SpaceView {
                 BoxShadow::new(px(0.), px(-3.), hsla(0., 0., 0., 0.12)).blur_radius(px(18.)),
             ]);
         }
-        composer.into_any_element()
+        // Float the whole composer in a deferred draw. gpui orders primitives by
+        // `(z_order, primitive_kind)` and draws the Shadow kind *before* Quad at a
+        // shared z-order, so an inline box-shadow renders *under* the page's
+        // separator-band / post-background quads it overlaps. Deferring paints the
+        // composer in the final pass, giving its shadow a z-order above the page
+        // quads — so it casts over the conversation as intended. Priority `0`: the
+        // minimap defers at a higher priority so it stays above the composer.
+        gpui::deferred(composer).with_priority(0).into_any_element()
     }
 }
 

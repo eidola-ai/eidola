@@ -312,6 +312,19 @@ impl SpaceView {
         levels
     }
 
+    /// Whether any **post** on the selected path lacks a measured height (still
+    /// using an estimate). Drives the warm pass (see `render`): off-path siblings
+    /// are intentionally ignored — they never render on the path, so they'd never
+    /// measure and would keep the warm armed forever.
+    pub(crate) fn path_has_unmeasured(&self, roots: &[TreeNode], page_width: Pixels) -> bool {
+        self.selected_levels(roots, page_width)
+            .into_iter()
+            .map(|(sibs, active)| sibs[active])
+            .any(|node| {
+                matches!(node.src, NodeSrc::Msg(_)) && self.layout.measured(&node.id).is_none()
+            })
+    }
+
     /// Document-space top of a node that is **on the selected path** (after
     /// `select_path_to`), by accumulating heights down the path. `None` if the
     /// node isn't on the selected path.

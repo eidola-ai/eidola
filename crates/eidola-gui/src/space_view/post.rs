@@ -35,7 +35,10 @@ impl SpaceView {
     ) -> AnyElement {
         let h = self.node_height(node, page_width, window_h);
         let screen_top = doc_y + self.clamped_scroll_y();
-        let visible = screen_top + h > -VIRT_MARGIN && screen_top < window_h.as_f32() + VIRT_MARGIN;
+        // While warming (see `warm_remaining`), render every post real so it
+        // measures into the cache up front, even off-screen.
+        let visible = self.warm_remaining.get() > 0
+            || (screen_top + h > -VIRT_MARGIN && screen_top < window_h.as_f32() + VIRT_MARGIN);
         if visible {
             self.render_post(node, page_width, cx).into_any_element()
         } else {
@@ -146,7 +149,8 @@ impl SpaceView {
     ) -> AnyElement {
         let h = self.node_height(node, page_width, window_h);
         let screen_top = doc_y + self.clamped_scroll_y();
-        let visible = screen_top + h > -VIRT_MARGIN && screen_top < window_h.as_f32() + VIRT_MARGIN;
+        let visible = self.warm_remaining.get() > 0
+            || (screen_top + h > -VIRT_MARGIN && screen_top < window_h.as_f32() + VIRT_MARGIN);
         let editor = self
             .drafts
             .iter()
