@@ -4,7 +4,7 @@ Guidance for AI coding agents working on the gpui macOS app. Cross-cutting works
 
 ## What this app is
 
-A native Rust client for Eidola, built on [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the immediate-mode UI framework Zed is built on) and [gpui-component](https://github.com/longbridge/gpui-component) (a shadcn-style widget library on top of gpui). The sole macOS GUI for the project; the CLI in `crates/eidola-cli/` shares the same `crates/eidola-app-core/` backend. macOS-only today; Linux is the next target.
+A native Rust client for Eidola, built on [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the immediate-mode UI framework Zed is built on) and [gpui-component](https://github.com/longbridge/gpui-component) (a shadcn-style widget library on top of gpui). The primary GUI for the project; the CLI in `crates/eidola-cli/` shares the same `crates/eidola-app-core/` backend. macOS is the primary target; Linux is supported for build/test (compiles, behavior tests pass) with no release packaging yet — see [Linux build/dev target](#linux-builddev-target).
 
 **State & async doctrine — read first.** All state ownership, async tasks, and cross-window synchronization follow `docs/architecture/state.md` (domain stores, `Loadable`, task-as-field with replace-cancels, the invalidation bus, `WindowInput`). Where existing code in this crate contradicts the doctrine, the doctrine wins — the migration is in progress; do not extend the old patterns (`Core::spawn`/busy flag, detached tasks, view-owned domain data).
 
@@ -348,4 +348,14 @@ Zed itself currently ships with AccessKit force-disabled after early teething (z
 
 ## Non-Rust dependencies
 
-System frameworks gpui already pulls in (Cocoa, AppKit, CoreFoundation, CoreGraphics, CoreText, CoreVideo, Metal, Foundation) — no GTK/Qt/node/python. Build deps require Xcode Command Line Tools (`xcode-select --install`).
+Native deps differ per platform, and gpui pulls them all — no GTK/Qt/node/python either way. **macOS:** system frameworks that ship with the OS (Cocoa, AppKit, CoreFoundation, CoreGraphics, CoreText, CoreVideo, Metal, Foundation); build deps require Xcode Command Line Tools (`xcode-select --install`). **Linux:** fontconfig, freetype, libxkbcommon, libxcb, libwayland, libGL/EGL, and the Vulkan loader for wgpu — see [Linux build/dev target](#linux-builddev-target) for the full apt list and the dev container.
+
+## Linux build/dev target
+
+macOS is the primary target; Linux is supported for **build + test** (it compiles and the behavior tier passes). No Linux release packaging exists yet — that's a later step (and inherently more than a binary; see the workspace notes on the stagex GUI pipeline).
+
+- **Cargo features.** `gpui_platform` is built with `x11`, `wayland`, and `font-kit` (plus `runtime_shaders` for macOS). `x11`/`wayland` are `cfg(target_os = ...)`-gated inside gpui, so enabling them universally is a no-op on macOS — no `[target.'cfg(...)']` split needed. Mirrored in `[dev-dependencies]` so tests/examples build on Linux too.
+- **The visual tier is macOS-only.** `tests/visual.rs` already compiles to a skip-stub `fn main()` on non-macOS (`VisualTestAppContext` instantiates `gpui_macos::MacPlatform` and `current_headless_renderer()` returns `None` off macOS). Behavior tests (`tests/behavior.rs`) are the cross-platform regression gate. A Linux headless renderer (`PlatformHeadlessRenderer` via wgpu offscreen render-to-texture + readback) is the natural follow-up that would let snapshots run in Docker.
+- **Dev container** (`oci/eidola-gui/Containerfile`). A Debian-based image (`rust:1.95-slim-bookworm` + the GUI apt deps + `mold`) used from a macOS host via `just gui-dev-image` / `just gui-dev-shell` (interactive) / `just gui-dev-run <cmd>` (one-shot). The workspace is bind-mounted at `/src`; cargo registry/git caches persist via named volumes. **`mold` is required** — GNU `ld` OOM-kills linking gpui's debug binary under Docker Desktop's default memory ceiling. Linux artifacts land in `./target-linux/` (`CARGO_TARGET_DIR` in the image, gitignored) so they never clobber the host's `./target/`.
+- **Deliberate stagex divergence.** The dev image starts from Debian, unlike the hermetic scratch-based `oci/eidola-{server,cli}` release images, because stagex does not yet package six GUI deps gpui needs — **fontconfig, freetype, libxkbcommon, xkeyboard-config, harfbuzz, pixman**. Upstreaming (or vendoring) those pallets is the prerequisite for a stagex-based GUI build; until then this image trades hermeticity for cargo iteration speed and ships no `package` stage.
+- **Not yet validated:** running the binary against a real Wayland/X11 display (only compile + behavior tests are confirmed), and the release binary size/packaging story.
