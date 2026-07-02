@@ -31,7 +31,11 @@ path = "src/main.rs"
 # MTLDevice library compile (~50ms). Zed's own Nix package makes the same
 # trade-off.
 gpui = { git = "https://github.com/zed-industries/zed", features = ["inspector"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders"] }
+# `x11` + `wayland` select gpui's Linux windowing backends. They're gated inside
+# gpui_platform by `cfg(target_os = ...)`, so enabling them universally is a
+# no-op on macOS/Windows — this mirrors the feature set gpui-component itself
+# uses and lets the crate build on Linux without a `[target.'cfg(...)']` split.
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders", "x11", "wayland"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "dadfca97fec7221acf3ce7047bccdc1eac0506b9", features = ["inspector"] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "dadfca97fec7221acf3ce7047bccdc1eac0506b9" }
 
@@ -51,7 +55,7 @@ tokio = { version = "1", features = ["sync"] }
 gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
 # The driver example's JSON-lines protocol.
 serde = { version = "1", features = ["derive"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support", "font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support", "font-kit", "x11", "wayland"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Store-level tests (tests/stores.rs) build a real `AppCore` over tempdirs and
 # install the crypto provider (mirrors app-core's own test setup).

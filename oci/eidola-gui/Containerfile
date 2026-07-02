@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1
+#
+# Linux DEV environment for the gpui app — used for running cargo against
+# Linux targets from a macOS host (via Docker) and for any future Linux CI
+# job that needs to build/test `eidola-gui`.
+#
+# This is a deliberate divergence from the release pipeline in this directory:
+# `oci/eidola-{server,cli}/Containerfile` and `oci/postgresql/Containerfile`
+# all build hermetic, scratch-based images from `stagex/pallet-rust` and
+# `stagex/{core,user}-*` packages. We can't follow that pattern here yet
+# because stagex does not currently package the GUI build deps gpui needs on
+# Linux — fontconfig, freetype, libxkbcommon, xkeyboard-config, harfbuzz,
+# pixman are all missing. Until those are upstreamed (or vendored), this
+# image starts from `rust:1.95-slim-bookworm` and apt-installs the deps. It
+# trades hermeticity for cargo iteration speed (apt, git, less etc.) and is
+# explicitly NOT a release/runtime image — there is no `package` stage.
+#
+# When stagex covers the missing pallets, swap the base to
+# `stagex/pallet-rust@sha256:...` and compose system libs in via the same
+# multi-stage `FROM stagex/user-<lib> AS pkg-<lib>` + `COPY --from=pkg-<lib>`
+# pattern used by the sibling Containerfiles.
+#
+# Architecture: docker pulls the host-native variant of `rust:bookworm-slim`,
+# so on Apple Silicon this image runs natively as arm64 (fast). Cargo's target
+# dir is NOT triple-suffixed unless `--target` is passed, so a plain
+# `cargo build` inside this container would otherwise overwrite the macOS
+# host's `target/debug/` artifacts through the bind mount. We set
+# `CARGO_TARGET_DIR=/src/target-linux` below so the Linux tree lands at
+# `./target-linux/` on the host and coexists cleanly with `./target/`.
+
+# `1.95-slim-bookworm` tracks the latest 1.95.x patch in Debian bookworm.
+# rust-toolchain.toml pins 1.95.0 specifically; rustup will fetch it on first
+# cargo invocation if the bundled rustc doesn't match.
+FROM rust:1.95-slim-bookworm AS dev
+
+# `gpui_platform`'s `x11` + `wayland` + `font-kit` features pull in:
+#   - fontconfig + freetype  (text shaping fallback chain)
+#   - xkbcommon (+ xkbcommon-x11)
+#   - libxcb (and a few extension subpackages)
+#   - libwayland (client + cursor + egl)
+#   - libGL/EGL (wgpu's GL backend)
+#   - vulkan loader (wgpu's preferred Linux backend)
+# Plus the usual build-essentials + a few dev quality-of-life tools.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        pkg-config \
+        build-essential \
+        clang \
+        mold \
+        git \
+        curl \
+        less \
+        libxcb1-dev \
+        libxcb-render0-dev \
+        libxcb-shape0-dev \
+        libxcb-xfixes0-dev \
+        libxkbcommon-dev \
+        libxkbcommon-x11-dev \
+        libwayland-dev \
+        libfontconfig1-dev \
+        libfreetype6-dev \
+        libgl1-mesa-dev \
+        libegl1-mesa-dev \
+        libvulkan-dev \
+        libvulkan1 \
+        mesa-vulkan-drivers \
+    && rm -rf /var/lib/apt/lists/*
+
+# Use mold instead of GNU ld for the link step. Linking gpui's debug binary
+# pulls in ~30 object files and several hundred MB of rlibs; GNU `ld` peaks
+# around 3-5 GB of RAM and gets OOM-killed (signal 9) inside Docker Desktop's
+# default memory ceiling on macOS. mold is dramatically faster and uses an
+# order of magnitude less RAM. Per-target so it doesn't affect other hosts
+# (e.g. macOS builds via the same workspace).
+RUN cat > /usr/local/cargo/config.toml <<'EOF'
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+EOF
+
+# Keep Linux build artifacts out of the macOS host's target dir. The workspace
+# is bind-mounted at /src, so without this a `cargo build` here would clobber
+# the host's `target/` (cargo only triple-suffixes when `--target` is passed,
+# which the plain recipes don't). /src/target-linux surfaces at ./target-linux
+# on the host (gitignored).
+ENV CARGO_TARGET_DIR=/src/target-linux
+
+# Persist cargo's registry + git caches across `--rm` runs by mounting these
+# subdirs from a named volume at run time. The rustup-managed toolchain and
+# config.toml stay baked into the image at /usr/local/cargo (not under these
+# paths).
+VOLUME ["/usr/local/cargo/registry", "/usr/local/cargo/git"]
+
+WORKDIR /src
