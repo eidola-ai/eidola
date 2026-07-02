@@ -5,8 +5,8 @@
 //! shape their text.
 
 use gpui::{
-    AnyElement, Context, Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity, canvas, div, px,
+    AnyElement, Context, Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, WeakEntity, canvas, div, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::MarkdownEditor;
@@ -103,7 +103,7 @@ impl SpaceView {
             .w(GUTTER_WIDTH)
             .flex_none()
             .items_end()
-            .pt_5()
+            .pt_4()
             .child(
                 div()
                     .text_sm()
@@ -167,12 +167,13 @@ impl SpaceView {
         let bw = px(body_width(page_width));
         let focus = editor.read(cx).focus_handle(cx);
         let id = node.id.clone();
+        let click_editor = editor.clone();
 
         let byline_el = v_flex()
             .w(GUTTER_WIDTH)
             .flex_none()
             .items_end()
-            .pt_5()
+            .pt_4()
             .child(
                 div()
                     .text_sm()
@@ -195,17 +196,28 @@ impl SpaceView {
             .items_start()
             .gap(GUTTER_GAP)
             .pr(GUTTER_WIDTH / 2. + GUTTER_GAP)
-            // Clicking anywhere on the inline draft re-activates it (floating
-            // composer) and focuses its editor. We activate directly rather than
-            // rely on the editor's Focus event, which wouldn't fire if the
-            // editor already held focus (e.g. just after Escape deactivated it).
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
-                    this.activate_draft(id.clone(), cx);
-                    window.focus(&focus, cx);
-                }),
-            )
+            .id(SharedString::from(format!(
+                "space-draft-inactive-{}",
+                node.id
+            )))
+            // Same "notes editor" affordance as the active composer: the I-beam
+            // advertises the whole runway as editable.
+            .cursor(gpui::CursorStyle::IBeam)
+            // Clicking the blank runway re-activates the draft (floating
+            // composer), focuses its editor, and drops the caret at the end. We
+            // activate directly rather than rely on the editor's Focus event,
+            // which wouldn't fire if the editor already held focus (e.g. just
+            // after Escape deactivated it). A click *on* the text stops
+            // propagation in the editor (placing the caret where clicked); the
+            // editor's Focus event handles activation on that path. This uses
+            // `on_click` (not `on_mouse_down`): focusing during mouse-down is
+            // undone by the down event's own focus pass (the runway isn't
+            // focusable), so the focus only sticks when applied on mouse-up.
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.activate_draft(id.clone(), cx);
+                window.focus(&focus, cx);
+                click_editor.update(cx, |e, cx| e.move_to_end(cx));
+            }))
             .child(byline_el)
             .child(
                 div()

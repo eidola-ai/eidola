@@ -302,6 +302,15 @@ impl MarkdownEditorState {
         self.state.selection.head()
     }
 
+    /// Collapse the cursor to the very end of the buffer (document end).
+    /// Part of the host API: a "notes editor" host makes the blank space
+    /// below the text a click target that focuses the editor and drops the
+    /// caret after the last character (rather than jumping it to wherever the
+    /// click landed). Emits no `Change` (selection-only).
+    pub fn move_to_end(&mut self, cx: &mut Context<Self>) {
+        self.dispatch(EditorEvent::MoveDocumentEnd, cx);
+    }
+
     fn dispatch(&mut self, event: EditorEvent, cx: &mut Context<Self>) {
         // Any non-vertical event invalidates the intended-x streak.
         // Vertical events (handled by `vertical_move` below) update

@@ -382,7 +382,7 @@ impl SpaceView {
             .w(GUTTER_WIDTH)
             .flex_none()
             .items_end()
-            .pt_5()
+            .pt_4()
             .child(
                 div()
                     .text_sm()
@@ -403,7 +403,10 @@ impl SpaceView {
                     .rounded_md()
                     .text_sm()
                     .text_color(home_fg)
+                    .top_neg_2()
                     .cursor_pointer()
+                    .text_align(gpui::TextAlign::Right)
+                    .pr_neg_0p5()
                     .hover(move |s| s.text_color(home_fg_hover).bg(home_bg_hover))
                     .child("See in context")
                     .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx))),
@@ -439,16 +442,39 @@ impl SpaceView {
                     }
                 }
             }))
-            .child(
-                div()
+            .child({
+                // "Notes editor" affordance over the whole body column. At
+                // least fill the scroll viewport so the blank runway below the
+                // text is part of this click target (when the text is taller
+                // than the viewport the column exceeds `body_h` and scrolls
+                // instead). The editor stops click propagation over its own
+                // text, so any click reaching this column landed in the blank
+                // space around/below the text — focus the composer and drop the
+                // caret at the very end, and show the I-beam so the whole runway
+                // reads as editable (this also covers the `pb` breath strip
+                // directly under the last line, which the editor doesn't own).
+                let click_editor = editor.clone();
+                v_flex()
+                    .id("space-composer-body-col")
                     .w_full()
-                    .pb(px(half_pad))
-                    .child(MarkdownEditor::new(&editor).style(prose_style(cx)))
-                    .child(record_height(
-                        self.composer_content_h.clone(),
-                        cx.entity().downgrade(),
-                    )),
-            );
+                    .min_h(px(body_h))
+                    .cursor(gpui::CursorStyle::IBeam)
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        let focus = click_editor.read(cx).focus_handle(cx);
+                        window.focus(&focus, cx);
+                        click_editor.update(cx, |e, cx| e.move_to_end(cx));
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .pb(px(half_pad))
+                            .child(MarkdownEditor::new(&editor).style(prose_style(cx)))
+                            .child(record_height(
+                                self.composer_content_h.clone(),
+                                cx.entity().downgrade(),
+                            )),
+                    )
+            });
         body.style().restrict_scroll_to_axis = Some(true);
 
         let mut composer = div()
