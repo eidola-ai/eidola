@@ -9,6 +9,17 @@
 //! KDE with the user's "force SSD" preference). macOS never reaches this
 //! module's rendering paths: [`ChromeRoot::wrap`] is an identity there.
 //!
+//! **This module is the single CSD authority.** `gpui_component::Root` ships
+//! its own Linux CSD layer (`window_border()`: 12px shadow padding, a 1px
+//! `theme.window_border` frame, resize hit zones, and an opaque
+//! `bg(theme.background)` across the whole window). Left active it stacks
+//! under ours: its background fills our shadow padding with an opaque cliff
+//! and its resize cursors land at the wrong edge. [`themed_root`] therefore
+//! constructs every window's `Root` with that layer neutralized
+//! (`window_shadow_size(0)` + transparent background), and the Circadian
+//! palettes pin `window_border` transparent so its unconditional 1px Client-
+//! mode frame never paints.
+//!
 //! The layer has three parts:
 //!
 //! - [`ChromeRoot`] — a wrapper view installed between `gpui_component::Root`
@@ -39,17 +50,27 @@
 #![cfg_attr(target_os = "macos", allow(unused))]
 
 use gpui::{
-    AnyView, App, AppContext, Bounds, Context, CursorStyle, Decorations, Div, Global, Hsla,
+    AnyView, App, AppContext, Bounds, Context, CursorStyle, Decorations, Div, Edges, Global, Hsla,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point, Render, ResizeEdge,
     Size, Stateful, StatefulInteractiveElement, Styled, Tiling, Window, canvas, div, point,
     prelude::FluentBuilder, px, size,
 };
-use gpui_component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex};
+use gpui_component::{ActiveTheme, Icon, IconName, Root, Sizable, StyledExt, h_flex};
 
 use crate::probe::Probe;
 
 /// Shadow / resize-border reach outside the visible frame, on untiled edges.
 pub(crate) const SHADOW_SIZE: Pixels = px(12.);
+
+/// Width of the visible frame's border (the `.border_*_1()` calls below).
+/// Part of [`content_insets`] so view-side geometry math lands exactly on the
+/// frame's content box.
+const FRAME_BORDER: Pixels = px(1.);
+
+/// How far the resize hit band reaches *inside* the visible frame edge, so
+/// the resize cursor is discoverable at the border itself, not only out in
+/// the (invisible once the shadow fades) margin.
+const RESIZE_INNER_REACH: Pixels = px(4.);
 
 /// Window corner radius when client-decorated and untiled. 12px matches the
 /// GNOME (Adwaita) window radius so the frame sits naturally among native
@@ -82,6 +103,74 @@ pub(crate) fn controls_reserve(window: &Window) -> Pixels {
         buttons += 1;
     }
     CONTROL_WIDTH * buttons as f32
+}
+
+/// Construct the `gpui_component::Root` for an Eidola window. On Linux,
+/// Root's built-in CSD layer is neutralized — zero `window_shadow_size` (no
+/// second ring of shadow padding, no competing resize hit zones at the wrong
+/// edge) and a transparent background (Root's default opaque
+/// `bg(theme.background)` would fill [`ChromeRoot`]'s shadow padding with a
+/// hard-edged cliff instead of letting the desktop show through). The
+/// background moves into the chrome layer: the client frame paints it inside
+/// the visible border, and the `Decorations::Server` arm paints it edge to
+/// edge. See the module docs.
+pub(crate) fn themed_root(view: AnyView, window: &mut Window, cx: &mut Context<Root>) -> Root {
+    let root = Root::new(view, window, cx);
+    if cfg!(target_os = "linux") {
+        root.window_shadow_size(px(0.))
+            .bg(gpui::transparent_black())
+    } else {
+        root
+    }
+}
+
+/// Per-side distance from the window surface's edge to the visible frame's
+/// content box: shadow padding + frame border on untiled edges when client-
+/// decorated, zero everywhere else (macOS, SSD, tests, tiled edges).
+pub(crate) fn content_insets(window: &Window) -> Edges<Pixels> {
+    if !cfg!(target_os = "linux") {
+        return Edges::default();
+    }
+    let Decorations::Client { tiling } = window.window_decorations() else {
+        return Edges::default();
+    };
+    let side = SHADOW_SIZE + FRAME_BORDER;
+    let inset = |tiled: bool| if tiled { px(0.) } else { side };
+    Edges {
+        top: inset(tiling.top),
+        bottom: inset(tiling.bottom),
+        left: inset(tiling.left),
+        right: inset(tiling.right),
+    }
+}
+
+/// The size of the window's *content box* — the viewport minus the chrome's
+/// shadow padding and frame border. Any view math that anchors to the window
+/// bottom/right (floating overlays, scroll ranges, dock positions) must use
+/// this instead of `window.viewport_size()`, or the result lands in the
+/// shadow band. Identical to the viewport when no chrome is drawn.
+pub(crate) fn content_size(window: &Window) -> Size<Pixels> {
+    let viewport = window.viewport_size();
+    let insets = content_insets(window);
+    size(
+        viewport.width - insets.left - insets.right,
+        viewport.height - insets.top - insets.bottom,
+    )
+}
+
+/// Whether a window-coordinate position falls in the resize hit band (the
+/// shadow margin plus [`RESIZE_INNER_REACH`] inside the frame). Drag bands
+/// check this on mouse-down so a press at the very edge starts a *resize*,
+/// never arms a window move.
+pub(crate) fn in_resize_band(window: &Window, pos: Point<Pixels>) -> bool {
+    let Decorations::Client { tiling } = window.window_decorations() else {
+        return false;
+    };
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let size = window.window_bounds().get_bounds().size;
+    resize_edge(pos, SHADOW_SIZE, size, tiling).is_some()
 }
 
 /// Round the *top* corners of a full-bleed surface to match the window's
@@ -155,12 +244,15 @@ impl Render for ChromeRoot {
             Decorations::Server => {
                 // A native (server-drawn) titlebar handles controls, drag,
                 // and resize — but the primary menu is *app* chrome, not
-                // window management, so it renders in both modes.
+                // window management, so it renders in both modes. The window
+                // background is painted here (edge to edge) because
+                // `themed_root` makes Root's own background transparent.
                 window.set_client_inset(px(0.));
                 div()
                     .id("window-chrome")
                     .relative()
                     .size_full()
+                    .bg(cx.theme().background)
                     .on_action(
                         cx.listener(|this, _: &TogglePrimaryMenu, _, cx| this.toggle_menu(cx)),
                     )
@@ -207,9 +299,13 @@ impl ChromeRoot {
                     cx.notify();
                 }
             }))
-            .on_mouse_down(MouseButton::Left, move |e, window, _| {
+            .on_mouse_down(MouseButton::Left, move |e, window, cx| {
                 let size = window.window_bounds().get_bounds().size;
                 if let Some(edge) = resize_edge(e.position, SHADOW_SIZE, size, tiling) {
+                    // Stop the bubble so Root's window_border (which keeps a
+                    // vestigial resize handler of its own) can't issue a
+                    // second, competing resize request.
+                    cx.stop_propagation();
                     window.start_window_resize(edge);
                 }
             })
@@ -568,7 +664,10 @@ fn control_button(
 }
 
 /// Which resize edge (if any) the position falls on, honoring tiled edges.
-/// Corner zones reach 1.5× the shadow size, mirroring zed.
+/// The straight-edge band spans the whole shadow margin plus
+/// [`RESIZE_INNER_REACH`] inside the visible frame (so the cursor flips to a
+/// resize arrow *at* the border, where the eye looks for it); corner zones
+/// reach 1.5× the shadow size, mirroring zed.
 fn resize_edge(
     pos: Point<Pixels>,
     shadow_size: Pixels,
@@ -579,6 +678,8 @@ fn resize_edge(
     if bounds.contains(&pos) {
         return None;
     }
+
+    let edge_reach = shadow_size + RESIZE_INNER_REACH;
 
     let corner_size = size(shadow_size * 1.5, shadow_size * 1.5);
     let top_left = Bounds::new(point(px(0.), px(0.)), corner_size);
@@ -610,15 +711,68 @@ fn resize_edge(
         return Some(ResizeEdge::BottomRight);
     }
 
-    if !tiling.top && pos.y < shadow_size {
+    if !tiling.top && pos.y < edge_reach {
         Some(ResizeEdge::Top)
-    } else if !tiling.bottom && pos.y > window_size.height - shadow_size {
+    } else if !tiling.bottom && pos.y > window_size.height - edge_reach {
         Some(ResizeEdge::Bottom)
-    } else if !tiling.left && pos.x < shadow_size {
+    } else if !tiling.left && pos.x < edge_reach {
         Some(ResizeEdge::Left)
-    } else if !tiling.right && pos.x > window_size.width - shadow_size {
+    } else if !tiling.right && pos.x > window_size.width - edge_reach {
         Some(ResizeEdge::Right)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn win() -> Size<Pixels> {
+        size(px(800.), px(600.))
+    }
+
+    fn edge_at(x: f32, y: f32) -> Option<ResizeEdge> {
+        resize_edge(point(px(x), px(y)), SHADOW_SIZE, win(), Tiling::default())
+    }
+
+    #[test]
+    fn band_spans_margin_and_inner_reach() {
+        // Whole shadow margin hits…
+        assert_eq!(edge_at(400., 2.), Some(ResizeEdge::Top));
+        assert_eq!(edge_at(400., 11.), Some(ResizeEdge::Top));
+        // …and so do the first few px inside the visible frame edge (12px).
+        assert_eq!(edge_at(400., 15.), Some(ResizeEdge::Top));
+        assert_eq!(edge_at(400., 585.), Some(ResizeEdge::Bottom));
+        assert_eq!(edge_at(15., 300.), Some(ResizeEdge::Left));
+        assert_eq!(edge_at(785., 300.), Some(ResizeEdge::Right));
+        // Deeper into content is not a resize.
+        assert_eq!(edge_at(400., 20.), None);
+        assert_eq!(edge_at(400., 300.), None);
+    }
+
+    #[test]
+    fn corners_take_precedence() {
+        assert_eq!(edge_at(10., 10.), Some(ResizeEdge::TopLeft));
+        assert_eq!(edge_at(790., 10.), Some(ResizeEdge::TopRight));
+        assert_eq!(edge_at(10., 590.), Some(ResizeEdge::BottomLeft));
+        assert_eq!(edge_at(790., 590.), Some(ResizeEdge::BottomRight));
+    }
+
+    #[test]
+    fn tiled_edges_do_not_resize() {
+        let tiling = Tiling {
+            top: true,
+            ..Tiling::default()
+        };
+        assert_eq!(
+            resize_edge(point(px(400.), px(2.)), SHADOW_SIZE, win(), tiling),
+            None
+        );
+        // The other edges keep working.
+        assert_eq!(
+            resize_edge(point(px(400.), px(585.)), SHADOW_SIZE, win(), tiling),
+            Some(ResizeEdge::Bottom)
+        );
     }
 }

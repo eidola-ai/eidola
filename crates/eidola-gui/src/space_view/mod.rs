@@ -893,7 +893,10 @@ impl Render for SpaceView {
         let bg = theme.background;
         let fg = theme.foreground;
         let font_family = theme.font_family.clone();
-        let viewport = window.viewport_size();
+        // The frame's content box, not the raw viewport: bottom-anchored
+        // overlays (floating composer, minimap) and the scroll range must not
+        // reach into the CSD shadow padding.
+        let viewport = crate::chrome::content_size(window);
         let page_width = viewport.width;
         let window_h = viewport.height;
 
