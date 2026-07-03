@@ -354,6 +354,7 @@ impl SpaceView {
         roots: &[TreeNode],
         page_width: gpui::Pixels,
         window_h: gpui::Pixels,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let Some(active) = self.active_draft.clone() else {
@@ -537,7 +538,13 @@ impl SpaceView {
             ));
         body.style().restrict_scroll_to_axis = Some(true);
 
-        let mut composer = div()
+        // The composer bar is the window's bottom-most opaque surface (the
+        // frame cannot clip children — see chrome.rs): round its bottom
+        // corners to match the window. Floating, its bottom sits exactly on
+        // the window bottom; docked, it either ends at the content bottom
+        // (short branches) or extends past the visible edge, where the
+        // rounding is simply out of view.
+        let mut composer = crate::chrome::round_bottom_client_corners(div(), window)
             .id("space-composer")
             .probe("space/composer", gpui::Role::TextInput, "Message composer")
             .absolute()

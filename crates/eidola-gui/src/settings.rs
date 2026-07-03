@@ -165,7 +165,7 @@ impl Render for SettingsView {
         };
 
         let wi = self.window_input.clone();
-        crate::chrome::round_top_client_corners(h_flex(), window)
+        crate::chrome::round_client_corners(h_flex(), window)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
@@ -189,19 +189,22 @@ impl Render for SettingsView {
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(
-                crate::chrome::round_tl_client_corner(v_flex(), window)
-                    .w(NAV_WIDTH)
-                    .h_full()
-                    .flex_none()
-                    .bg(theme.sidebar)
-                    .border_r_1()
-                    .border_color(theme.sidebar_border)
-                    .pt(NAV_TOP_RESERVE)
-                    .px_2()
-                    .gap_0p5()
-                    .child(self.nav_item(SettingsPane::General, cx))
-                    .child(self.nav_item(SettingsPane::Account, cx))
-                    .child(self.nav_item(SettingsPane::Wallet, cx)),
+                crate::chrome::round_bl_client_corner(
+                    crate::chrome::round_tl_client_corner(v_flex(), window),
+                    window,
+                )
+                .w(NAV_WIDTH)
+                .h_full()
+                .flex_none()
+                .bg(theme.sidebar)
+                .border_r_1()
+                .border_color(theme.sidebar_border)
+                .pt(NAV_TOP_RESERVE)
+                .px_2()
+                .gap_0p5()
+                .child(self.nav_item(SettingsPane::General, cx))
+                .child(self.nav_item(SettingsPane::Account, cx))
+                .child(self.nav_item(SettingsPane::Wallet, cx)),
             )
             // The scroll container needs the same width discipline as the
             // chat transcript (see the scroll-container invariant in
