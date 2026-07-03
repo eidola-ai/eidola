@@ -15,9 +15,10 @@
 //! (`PostOnly`) persists it without asking. Both consume the draft.
 
 use gpui::{
-    AnyElement, AppContext, BoxShadow, Context, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, ScrollWheelEvent, StatefulInteractiveElement, Styled, TouchPhase,
-    Window, div, hsla, linear_color_stop, linear_gradient, point, px,
+    AnyElement, App, AppContext, Bounds, BoxShadow, Context, Element, Focusable, GlobalElementId,
+    InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, ParentElement,
+    Pixels, ScrollWheelEvent, StatefulInteractiveElement, Styled, TouchPhase, Window, div, hsla,
+    linear_color_stop, linear_gradient, point, px, size,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorEvent, MarkdownEditorState};
@@ -28,6 +29,13 @@ use crate::loadable::Loadable;
 
 use super::layout::body_width;
 use super::model::{self, TreeNode};
+
+/// Vertical offset of the floating composer's drop shadow (negative = cast
+/// upward, over the conversation) and its blur radius. Named so the stacking
+/// layer that hosts the composer can dilate its bounds to match the shadow's
+/// visible reach — see the `layered(..)` call in `render_active_draft`.
+const SHADOW_OFFSET_Y: Pixels = px(-3.);
+const SHADOW_BLUR: Pixels = px(18.);
 use super::nav::ScrollOwner;
 use super::{
     COMPOSER_MAX_FRACTION, Draft, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y, PostOnly, Send, SpaceView,
@@ -513,17 +521,38 @@ impl SpaceView {
         }
         if overlayed {
             composer = composer.shadow(vec![
-                BoxShadow::new(px(0.), px(-3.), hsla(0., 0., 0., 0.12)).blur_radius(px(18.)),
+                BoxShadow::new(px(0.), SHADOW_OFFSET_Y, hsla(0., 0., 0., 0.12))
+                    .blur_radius(SHADOW_BLUR),
             ]);
         }
-        // Float the whole composer in a deferred draw. gpui orders primitives by
-        // `(z_order, primitive_kind)` and draws the Shadow kind *before* Quad at a
-        // shared z-order, so an inline box-shadow renders *under* the page's
-        // separator-band / post-background quads it overlaps. Deferring paints the
-        // composer in the final pass, giving its shadow a z-order above the page
-        // quads — so it casts over the conversation as intended. Priority `0`: the
-        // minimap defers at a higher priority so it stays above the composer.
-        gpui::deferred(composer).with_priority(0).into_any_element()
+        // Float the whole composer as its own stacking layer in a deferred draw.
+        //
+        // gpui assigns each primitive a draw `order` from a `BoundsTree` (order =
+        // 1 + max order of already-painted primitives whose *registered* bounds it
+        // overlaps), then batches by `(order, primitive_kind)`. A drop shadow's
+        // registered bounds are the element rect grown by its *spread* only — the
+        // blur reach is **not** included (`Window::paint_drop_shadows`). So in the
+        // ~20px window around the dock threshold, where the shadow's blur visually
+        // spills over the final separator band but the composer rect hasn't reached
+        // it yet, the shadow and band land in disjoint BoundsTree chains and the
+        // band (bumped by the high-order posts above it) sorts on top — the shadow
+        // renders *behind* the separator until you scroll far enough for the rects
+        // to overlap, then it "jumps" in front. Deferring alone doesn't fix this:
+        // the deferred pass still derives order from bounds overlap, not paint
+        // sequence.
+        //
+        // `layered` paints the composer inside a single `Window::paint_layer` whose
+        // bounds are dilated upward to cover the shadow's blur reach. Every composer
+        // primitive then shares one layer order, computed from bounds that *do*
+        // overlap the band — so the entire composer, shadow included, sits above the
+        // page for the whole transition (internal order is preserved: within the
+        // shared order, batching still draws Shadow-kind under Quad-kind under text).
+        // Priority `0`: the minimap defers at a higher priority and overlaps the
+        // composer on the right edge, so it stays above this layer.
+        let reach = px(SHADOW_BLUR.as_f32() - SHADOW_OFFSET_Y.as_f32() + 3.0);
+        gpui::deferred(layered(composer, reach))
+            .with_priority(0)
+            .into_any_element()
     }
 }
 
@@ -562,4 +591,87 @@ fn record_height(
     )
     .absolute()
     .size_full()
+}
+
+/// Paint `child` inside a single `Window::paint_layer` whose bounds are the
+/// child's layout bounds grown upward by `dilate_top`.
+///
+/// A gpui paint layer forces every primitive painted within it to share one
+/// draw `order`, derived from the layer bounds' overlap in the `BoundsTree`
+/// (rather than each primitive deriving its own order from its own bounds). By
+/// growing the layer upward to cover a drop shadow's blur reach — which gpui
+/// otherwise omits from the shadow's registered bounds — the whole child sits
+/// above the page content the shadow visually overlaps, with no z-order
+/// discontinuity as the child scrolls. See the call site for the full rationale.
+fn layered(child: impl IntoElement, dilate_top: Pixels) -> Layered {
+    Layered {
+        child: Some(child.into_any_element()),
+        dilate_top,
+    }
+}
+
+struct Layered {
+    child: Option<AnyElement>,
+    dilate_top: Pixels,
+}
+
+impl Element for Layered {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.child.as_mut().unwrap().request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _state: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.as_mut().unwrap().prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _state: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let layer = Bounds {
+            origin: point(bounds.origin.x, bounds.origin.y - self.dilate_top),
+            size: size(bounds.size.width, bounds.size.height + self.dilate_top),
+        };
+        let child = self.child.as_mut().unwrap();
+        window.paint_layer(layer, |window| child.paint(window, cx));
+    }
+}
+
+impl IntoElement for Layered {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
 }
