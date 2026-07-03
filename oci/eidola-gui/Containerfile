@@ -33,14 +33,22 @@
 # cargo invocation if the bundled rustc doesn't match.
 FROM rust:1.95-slim-bookworm AS dev
 
-# `gpui_platform`'s `x11` + `wayland` + `font-kit` features pull in:
+# `gpui_platform`'s `wayland` + `font-kit` features pull in (Wayland-only by
+# decision — no X11 backend packages; do not add them back):
 #   - fontconfig + freetype  (text shaping fallback chain)
-#   - xkbcommon (+ xkbcommon-x11)
-#   - libxcb (and a few extension subpackages)
+#   - xkbcommon (keyboard input — Wayland clients need it too)
 #   - libwayland (client + cursor + egl)
 #   - libGL/EGL (wgpu's GL backend)
 #   - vulkan loader (wgpu's preferred Linux backend)
 # Plus the usual build-essentials + a few dev quality-of-life tools.
+#
+# libxkbcommon-x11-dev is a link-time-only wart: upstream gpui_linux hardcodes
+# xkbcommon = { features = ["wayland", "x11"] } (not gated by its own
+# wayland/x11 backend features), so `-lxkbcommon-x11` is always on the link
+# line. No symbol is referenced from Wayland-only code, so `--as-needed`
+# drops it from the final binary's DT_NEEDED — the built app has no X11
+# runtime dependency (verified with readelf). Removable once zed gates the
+# dep feature (planned upstream PR).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         pkg-config \
@@ -50,10 +58,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         curl \
         less \
-        libxcb1-dev \
-        libxcb-render0-dev \
-        libxcb-shape0-dev \
-        libxcb-xfixes0-dev \
         libxkbcommon-dev \
         libxkbcommon-x11-dev \
         libwayland-dev \
