@@ -98,7 +98,7 @@ These invariants describe what you get when you install and run a **generally-av
 
 **7.1.** **[P]** All client code, server code, build configuration, and release tooling are published in a public monorepo.
 
-**7.2.** **[S]** Build environments are pinned and reproducible: StageX (source-bootstrapped) for Linux OCI images, Nix flake (hermetic, narHash-pinned) for the macOS universal-binary builds. Build-environment hashes flow into the artifact manifest.
+**7.2.** **[S]** Build environments are pinned and reproducible: StageX (source-bootstrapped) for the server/CLI Linux OCI images, Nix flake (hermetic, narHash-pinned) for the desktop binaries (the macOS universal CLI and GUI builds, and the Linux GUI). Build-environment hashes flow into the artifact manifest.
 
 **7.3.** **[S]** Source dependencies are pinned by version and hash. Updates are explicit commits.
 

@@ -6,7 +6,7 @@ A release is the *unit of trust*. When a user is running Eidola release N, what 
 
 A single release ships:
 
-- A **client binary** for each supported platform (macOS GUI app, CLI, etc.) with a trust root embedded at compile time.
+- A **client binary** for each supported platform (macOS and Linux GUI apps, CLI, etc.) with a trust root embedded at compile time.
 - A **server image** built reproducibly from the same source commit, whose confidential-compute measurement matches the value embedded in the client.
 - A signed **artifact manifest** (`artifact-manifest.json`) recording the digests of every artifact and the enclave measurement.
 - One or more **human attestations**, each signed under a pinned engineer's hardware-bound key, with their Sigstore Rekor inclusion proof.

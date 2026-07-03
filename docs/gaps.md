@@ -114,6 +114,7 @@ A user's chain of trust at the inference layer therefore ends at Tinfoil's relea
 **Current behavior.** Several components of the Eidola build chain are pinned by hash and used reproducibly, but are themselves not fully source-bootstrapped:
 
 - **macOS Nix builds.** Hermetic and reproducible (`narHash` pinning), but rely on the Apple SDK / Xcode toolchain as opaque inputs. Cross-compiling macOS binaries from Linux is not viable today, so macOS releases must be built on macOS.
+- **Linux GUI Nix build.** Hermetic and reproducible (`narHash` pinning) from the open nixpkgs toolchain, but not source-bootstrapped in the StageX sense. A desktop GUI must be a glibc dynamic binary to interoperate with the host GPU stack (the Vulkan loader dlopens glibc-built Mesa drivers), which the musl-by-design StageX pipeline cannot produce.
 - **`cvmimage` and OVMF firmware.** Pinned by hash, but their build chains do not match Eidola's source-bootstrapping discipline. Their contents are bound into the server's enclave measurement, so they cannot be changed silently — but the original build chain is more trusted than we ideally want.
 
 **What constrains it today.** Each of these has digest pinning and provenance verification at the import boundary (Sigstore provenance for `cvmimage`, narHash for Nix outputs, committed hashes for OVMF), so silent substitution is detectable. The gap is that the upstream *builders* of those artifacts are trusted to a degree we don't fully audit.

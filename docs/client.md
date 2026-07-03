@@ -57,7 +57,7 @@ Some operations stay local even when they could be moved to the server, because 
 
 ## Two surfaces: GUI and CLI, one core
 
-The Eidola client ships as a native macOS GUI app (gpui) and a cross-platform CLI binary, both built on the same shared core crate (`crates/eidola-app-core/`). The split exists for UX reasons, not trust reasons:
+The Eidola client ships as a native GUI app (gpui, on macOS and Linux/Wayland) and a cross-platform CLI binary, both built on the same shared core crate (`crates/eidola-app-core/`). The split exists for UX reasons, not trust reasons:
 
 - The GUI is the friendly surface — chat window, account, balance.
 - The CLI is the scriptable, headless surface for power users and CI integration.
@@ -66,6 +66,6 @@ Both surfaces run the same verifier code, against the same embedded trust root, 
 
 ## Configuration overrides
 
-A user can override the embedded `base_url` and trusted measurements via `~/Library/Application Support/eidola/config.toml`. This exists for development and for advanced users running their own server. The overrides do *not* lower verification rigor — the client still verifies the attestation against whatever measurement is configured.
+A user can override the embedded `base_url` and trusted measurements via `config.toml` in the platform config directory (`~/Library/Application Support/eidola/` on macOS, `~/.config/eidola/` on Linux). This exists for development and for advanced users running their own server. The overrides do *not* lower verification rigor — the client still verifies the attestation against whatever measurement is configured.
 
 In production use against Eidola's deployment, no overrides are needed; the embedded values are what's used.

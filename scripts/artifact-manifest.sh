@@ -8,6 +8,7 @@ Usage:
   scripts/artifact-manifest.sh print [--push] [(--metadata-file PATH [--targets "NAME ..."])...]
   scripts/artifact-manifest.sh verify [--push] [(--metadata-file PATH [--targets "NAME ..."])...] [--manifest PATH]
   scripts/artifact-manifest.sh build-macos [--output PATH]
+  scripts/artifact-manifest.sh build-linux-gui [--output PATH]
   scripts/artifact-manifest.sh measure [--config PATH] [--verify-attestations] [--server-enclave-output PATH]
   scripts/artifact-manifest.sh verify-full [--partial PATH ...] [--manifest PATH] [--config PATH] [--server-enclave PATH] [--output PATH] [--server-enclave-output PATH] [--verify-attestations]
   scripts/artifact-manifest.sh stamp-config [--metadata-file PATH] [--config PATH]
@@ -470,6 +471,78 @@ print_oci_manifest() {
   }'
 }
 
+# Map `uname -m` to the GOARCH-style arch names used in manifest platform
+# strings ("linux/amd64" etc., matching the OCI entries).
+manifest_arch() {
+  case "$(uname -m)" in
+    x86_64) echo "amd64" ;;
+    aarch64 | arm64) echo "arm64" ;;
+    *)
+      echo "error: unsupported architecture: $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# Build the Linux GUI via Nix (glibc dynamic binary; see flake.nix for why
+# the GUI can't be a static musl artifact like the server/cli).
+build_linux_gui_artifact() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "error: Linux GUI artifact builds require a Linux host" >&2
+    exit 1
+  fi
+
+  LINUX_GUI_PATH="$(
+    nix build \
+      '.#eidola-gui-linux' \
+      --no-link \
+      --print-out-paths \
+      --show-trace
+  )"
+}
+
+print_linux_gui_manifest() {
+  local gui_hash arch
+
+  if [[ -z "${LINUX_GUI_PATH:-}" ]]; then
+    echo "error: print_linux_gui_manifest called before build_linux_gui_artifact" >&2
+    return 1
+  fi
+
+  arch="$(manifest_arch)"
+  gui_hash="$(nix_nar_hash "$LINUX_GUI_PATH")"
+
+  jq -n \
+    --arg gui_hash "$gui_hash" \
+    --arg key "eidola-gui-linux-${arch}" \
+    --arg platform "linux/${arch}" \
+    '{
+      schema_version: 1,
+      artifacts: {
+        ($key): { type: "nix", platform: $platform, narHash: $gui_hash }
+      }
+    }'
+}
+
+# Extract a subset of artifact entries from the committed manifest as a
+# partial, for platforms the current host cannot build (e.g. the darwin
+# artifacts on a Linux host). Keys are matched by any of the given prefixes;
+# missing entries are silently absent (CI is the cross-platform authority
+# and will flag a manifest that is missing a required artifact).
+carry_over_partial() {
+  if [[ ! -f "$MANIFEST_FILE" ]]; then
+    jq -n '{ schema_version: 1, artifacts: {} }'
+    return
+  fi
+
+  jq -S '{
+    schema_version: 1,
+    artifacts: (.artifacts | with_entries(
+      select(.key as $k | $ARGS.positional | any(. as $p | $k | startswith($p)))
+    ))
+  }' "$MANIFEST_FILE" --args "$@"
+}
+
 build_macos_artifacts() {
   if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "error: macOS artifact builds require a Darwin host" >&2
@@ -669,18 +742,23 @@ verify_oci_manifest() {
 #            measurement, so they can be built first.
 #   Phase 2: stamp the new server digest into `tinfoil-config.yml`, recompute
 #            the enclave block, and write `releases/trust/server-enclave.json`.
-#   Phase 3: build the cli OCI image and the macOS universal CLI. Both
-#            consume the freshly-written `server-enclave.json` via
-#            `eidola-app-core/build.rs`, so they have to come after phase 2.
+#   Phase 3: build the cli OCI image plus the current host's native desktop
+#            artifacts — the macOS universal CLI + GUI .app on Darwin, the
+#            Linux GUI on Linux. All of these consume the freshly-written
+#            `server-enclave.json` via `eidola-app-core/build.rs`, so they
+#            have to come after phase 2. The *other* platform's desktop
+#            entries are carried over from the committed manifest (no single
+#            host can build both; CI's linux-gui + apple jobs are the
+#            cross-platform authority and verify the full set).
 #   Phase 4: compose `artifact-manifest.json` from all of the above.
 #
 # This breaks the previous self-reference (the cli build's OCI digest is
 # recorded in the very file the cli build was COPYing into its build context),
 # so `just update-manifest` converges in a single run.
 update_manifest() {
-  local server_oci_partial cli_oci_partial macos_partial actual_manifest
-  local server_oci_partial_file cli_oci_partial_file macos_partial_file
-  local server_metadata cli_metadata original_metadata original_targets
+  local server_oci_partial cli_oci_partial macos_partial linux_gui_partial actual_manifest
+  local server_oci_partial_file cli_oci_partial_file macos_partial_file linux_gui_partial_file
+  local server_metadata cli_metadata original_metadata original_targets host_os
 
   if [[ -z "$OUTPUT_FILE" ]]; then
     OUTPUT_FILE="$REPO_ROOT/artifact-manifest.json"
@@ -703,33 +781,45 @@ update_manifest() {
   echo "Updated $SERVER_ENCLAVE_FILE"
 
   # Nix flakes only see git-tracked paths under dirty working trees, so a
-  # brand-new `server-enclave.json` would be invisible to the macOS build
+  # brand-new `server-enclave.json` would be invisible to the Nix builds
   # below. Mark it intent-to-add (no content staged) so flakes pick it up
   # via the working tree without staging anything for the developer.
   if [[ -d "$REPO_ROOT/.git" ]] && ! git -C "$REPO_ROOT" ls-files --error-unmatch releases/trust/server-enclave.json >/dev/null 2>&1; then
     git -C "$REPO_ROOT" add --intent-to-add releases/trust/server-enclave.json
   fi
 
-  # ── Phase 3: build cli OCI + macOS universal ────────────────────────────
+  # ── Phase 3: build cli OCI + native desktop artifacts ───────────────────
   METADATA_FILE="$cli_metadata"
   TARGETS="cli"
   build_metadata
-  build_macos_artifacts
+
+  host_os="$(uname -s)"
+  if [[ "$host_os" == "Darwin" ]]; then
+    build_macos_artifacts
+    macos_partial="$(print_macos_manifest)"
+    linux_gui_partial="$(carry_over_partial "eidola-gui-linux-")"
+    echo "note: Linux GUI narHash carried over from committed manifest (not buildable on Darwin); CI verifies it" >&2
+  else
+    build_linux_gui_artifact
+    linux_gui_partial="$(print_linux_gui_manifest)"
+    macos_partial="$(carry_over_partial "eidola-cli-macos-" "eidola-gui-macos-")"
+    echo "note: darwin narHashes carried over from committed manifest (not buildable on Linux); CI verifies them" >&2
+  fi
 
   # ── Phase 4: compose final artifact-manifest.json ───────────────────────
   METADATA_FILE="$server_metadata"
   server_oci_partial="$(print_oci_partial_for_targets server postgres)"
   METADATA_FILE="$cli_metadata"
   cli_oci_partial="$(print_oci_partial_for_targets cli)"
-  macos_partial="$(print_macos_manifest)"
 
   server_oci_partial_file="$(write_temp_file "$server_oci_partial")"
   cli_oci_partial_file="$(write_temp_file "$cli_oci_partial")"
   macos_partial_file="$(write_temp_file "$macos_partial")"
-  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$macos_partial_file")
+  linux_gui_partial_file="$(write_temp_file "$linux_gui_partial")"
+  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file")
 
   actual_manifest="$(merge_partials)"
-  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$macos_partial_file"
+  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file"
 
   write_output "$actual_manifest"
   if [[ -n "$OUTPUT_FILE" ]]; then
@@ -754,6 +844,10 @@ case "$COMMAND" in
   build-macos)
     build_macos_artifacts
     write_output "$(print_macos_manifest)"
+    ;;
+  build-linux-gui)
+    build_linux_gui_artifact
+    write_output "$(print_linux_gui_manifest)"
     ;;
   measure)
     enclave_json="$(compute_measurements)"

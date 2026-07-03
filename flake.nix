@@ -362,6 +362,7 @@
             rustTarget,
             nixCrossSystem,
             extraCargoArgs ? "",
+            extraBuildArgs ? { },
           }:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
@@ -372,6 +373,7 @@
           cfg.craneLibTarget.buildDepsOnly (
             commonArgs
             // cfg.targetArgs
+            // extraBuildArgs
             // {
               src = filteredSrc;
               pname = "${pname}-deps";
@@ -396,6 +398,14 @@
             crateType ? null,
             extraCargoArgs ? "",
             doCheck ? true,
+            # Extra derivation attrs merged into both the deps-only and the
+            # package build (e.g. buildInputs for system libraries the crate
+            # links via pkg-config — used by the Linux GUI build).
+            extraBuildArgs ? { },
+            # Extra derivation attrs merged into the package build ONLY —
+            # for hooks like postFixup that reference $out/bin/<binary>,
+            # which doesn't exist in the deps-only derivation.
+            extraPackageArgs ? { },
           }:
           let
             cfg = mkTargetConfig rustTarget nixCrossSystem;
@@ -408,6 +418,7 @@
                 rustTarget
                 nixCrossSystem
                 extraCargoArgs
+                extraBuildArgs
                 ;
             };
             cratePath = cratePaths.${pname};
@@ -425,6 +436,8 @@
             commonArgs
             // cfg.targetArgs
             // crateTypeSetup
+            // extraBuildArgs
+            // extraPackageArgs
             // {
               src = filteredSrc;
               cargoArtifacts = packageCargoArtifacts;
@@ -654,6 +667,106 @@ with open(path, "wb") as f:
               };
             };
 
+        # Build the GUI for Linux (Linux only). Unlike the server/cli — static
+        # musl binaries — the GUI is a *glibc dynamic* binary by necessity:
+        # a desktop app must interoperate with the host GPU stack (the Vulkan
+        # loader dlopens Mesa ICDs, which every distro builds against glibc,
+        # and a musl binary cannot dlopen glibc libraries). The Nix closure
+        # supplies the full userland (wayland-client, libxkbcommon,
+        # fontconfig, freetype, vulkan-loader), so the runtime host surface
+        # is kernel + compositor socket + /dev/dri. Linux is Wayland-only by
+        # decision — see crates/eidola-gui/AGENTS.md — so no X11 libraries
+        # appear here. libxkbcommon *does* ship libxkbcommon-x11.so, which
+        # upstream gpui unconditionally puts on the link line (its xkbcommon
+        # crate features aren't gated by backend); --as-needed drops it from
+        # DT_NEEDED, so the built binary stays X11-free at runtime.
+        #
+        # The artifact recorded in artifact-manifest.json is the *wrapped*
+        # derivation below (eidolaGuiLinuxWrapped), which bundles Mesa; this
+        # unwrapped build is the bare binary + library RUNPATH. End-user
+        # packaging (AppImage/tarball/deb) is still a ship-time step on top.
+        #
+        # The library set below serves three roles: link-time inputs for the
+        # release build, the binary's RUNPATH closure (rustc's link step does
+        # not emit rpath entries for Nix store paths, and everything beyond
+        # libxkbcommon is dlopened by bare soname — wayland-client, the
+        # Vulkan loader, fontconfig, freetype — so without an explicit
+        # RUNPATH the artifact can't resolve its libraries on any host), and
+        # the `devShells.gui` link environment.
+        guiLinuxLibs = [
+          pkgs.wayland
+          pkgs.libxkbcommon
+          pkgs.fontconfig
+          pkgs.freetype
+          pkgs.vulkan-loader
+        ];
+
+        eidolaGuiLinux =
+          if !pkgs.stdenv.isLinux then
+            null
+          else
+            mkPackage {
+              pname = "eidola-gui";
+              rustTarget =
+                {
+                  "x86_64-linux" = "x86_64-unknown-linux-gnu";
+                  "aarch64-linux" = "aarch64-unknown-linux-gnu";
+                }
+                .${system};
+              nixCrossSystem = null;
+              # Parity with the macOS GUI build: integration tests that need a
+              # windowing/GPU environment can't run in the Nix sandbox; the
+              # workspace-wide `checks.tests` target covers the test suite.
+              doCheck = false;
+              extraBuildArgs = {
+                nativeBuildInputs = [
+                  pkgs.cmake
+                  pkgs.pkg-config
+                ];
+                buildInputs = guiLinuxLibs;
+              };
+              extraPackageArgs = {
+                nativeBuildInputs = [
+                  pkgs.cmake
+                  pkgs.pkg-config
+                  pkgs.patchelf
+                ];
+                # postFixup runs after fixupPhase's strip/shrink-rpath, so
+                # this RUNPATH is what ships. Deterministic: store paths are
+                # pure functions of the flake inputs.
+                postFixup = ''
+                  patchelf --set-rpath "${pkgs.lib.makeLibraryPath guiLinuxLibs}" $out/bin/eidola-gui
+                '';
+              };
+            };
+
+        # The shippable Linux GUI: the binary above plus bundled Mesa Vulkan
+        # drivers. The host's own ICD manifests are useless to a Nix binary —
+        # distros reference drivers by bare soname (`libvulkan_radeon.so`),
+        # which the loader resolves through the dynamic linker's search path,
+        # i.e. our RUNPATH, never /usr/lib; and dlopening host Mesa into a
+        # Nix glibc invites symbol-version mismatches. Bundling Mesa (whose
+        # Nix ICD manifests carry absolute store paths) makes the artifact's
+        # host surface kernel + compositor socket + /dev/dri, at the cost of
+        # Mesa's closure (~1 GB, LLVM for the llvmpipe fallback included).
+        # VK_ADD_DRIVER_FILES is *additive* and set only as a default, so a
+        # NixOS host's /run/opengl-driver drivers coexist and a user can
+        # override outright.
+        eidolaGuiLinuxWrapped =
+          if eidolaGuiLinux == null then
+            null
+          else
+            pkgs.runCommand "eidola-gui-linux"
+              {
+                nativeBuildInputs = [ pkgs.makeWrapper ];
+              }
+              ''
+                mkdir -p $out/bin
+                icds=$(ls ${pkgs.mesa}/share/vulkan/icd.d/*.json | tr '\n' ':')
+                makeWrapper ${eidolaGuiLinux}/bin/eidola-gui $out/bin/eidola-gui \
+                  --set-default VK_ADD_DRIVER_FILES "''${icds%:}"
+              '';
+
       in
       {
         packages = {
@@ -669,6 +782,10 @@ with open(path, "wb") as f:
         }
         // pkgs.lib.optionalAttrs (eidolaGuiMacosUniversal != null) {
           eidola-gui-macos-universal = eidolaGuiMacosUniversal;
+        }
+        // pkgs.lib.optionalAttrs (eidolaGuiLinux != null) {
+          eidola-gui-linux = eidolaGuiLinuxWrapped;
+          eidola-gui-linux-unwrapped = eidolaGuiLinux;
         };
 
         # Development shell (lightweight — daily Rust dev uses rustup)
@@ -677,6 +794,23 @@ with open(path, "wb") as f:
             # Pin GitHub actions
             pkgs.pinact
           ];
+        };
+
+        # GUI dev shell for Linux: provides the system libraries and
+        # pkg-config that `cargo build -p eidola-gui` needs to link (daily
+        # Rust dev still uses rustup — this shell only supplies the C-level
+        # build environment). The built binary runs against the host's own
+        # runtime libraries (wayland/vulkan/fontconfig are dlopened by
+        # name), so this is link-time-only tooling. On macOS the system
+        # frameworks cover everything and this shell is unnecessary.
+        devShells.gui = pkgs.mkShell {
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux (
+            [
+              pkgs.pkg-config
+              pkgs.cmake
+            ]
+            ++ guiLinuxLibs
+          );
         };
 
         # Checks (run with `nix flake check`)
