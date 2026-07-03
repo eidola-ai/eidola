@@ -18,7 +18,7 @@ use gpui::{
     AnyElement, App, AppContext, Bounds, BoxShadow, Context, Element, Focusable, GlobalElementId,
     InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, ParentElement,
     Pixels, ScrollWheelEvent, StatefulInteractiveElement, Styled, TouchPhase, Window, div, hsla,
-    linear_color_stop, linear_gradient, point, px, size,
+    linear_color_stop, linear_gradient, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::{ActiveTheme, h_flex};
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorEvent, MarkdownEditorState};
@@ -420,6 +420,19 @@ impl SpaceView {
         // Floating, `win - top_y == float_bar_h`, so this is an identity.
         let bar_h = bar_h.min(win - top_y);
         let body_h = (bar_h - chrome).max(0.0);
+        // The same containment at the *top*: when the draft's slot scrolls
+        // above the viewport, `top_y` goes negative and the docked bar covers
+        // the whole window — but a quad hanging above the window top shows
+        // its square mid-section in the top corner notches (its own corners
+        // are off-screen, so per-element rounding can't help). Split the
+        // visible quad from the virtual geometry: pin the quad's top at the
+        // window edge, hang the inner content at the virtual offset, and
+        // round the quad's top corners whenever it owns the window's top.
+        // For `top_y >= 0` all three are identities.
+        let bar_top = top_y.max(0.0);
+        let content_shift = top_y - bar_top; // ≤ 0: inner content overhang
+        let quad_h = bar_h + content_shift;
+        let covers_top = bar_top <= 0.5;
         // The composer scrolls internally only when floating *and* its content
         // exceeds the visible bar — i.e. it's capped at `COMPOSER_MAX_FRACTION`.
         // When it's floating at its natural height (content fits, incl. empty /
@@ -551,13 +564,16 @@ impl SpaceView {
         // (short branches) or extends past the visible edge, where the
         // rounding is simply out of view.
         let mut composer = crate::chrome::round_bottom_client_corners(div(), window)
+            .when(covers_top, |d| {
+                crate::chrome::round_top_client_corners(d, window)
+            })
             .id("space-composer")
             .probe("space/composer", gpui::Role::TextInput, "Message composer")
             .absolute()
             .left_0()
             .right_0()
-            .top(px(top_y))
-            .h(px(bar_h))
+            .top(px(bar_top))
+            .h(px(quad_h))
             .bg(theme.background)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
@@ -577,7 +593,8 @@ impl SpaceView {
             .child(
                 h_flex()
                     .w(page_width)
-                    .h_full()
+                    .mt(px(content_shift))
+                    .h(px(bar_h))
                     .pt(px(half_pad))
                     .justify_center()
                     .items_start()
