@@ -212,6 +212,13 @@ pub struct SpaceView {
     /// Whether the composer overlay is floating (vs docked), cached from the
     /// last render so the scroll handler can decide session ownership.
     pub(crate) composer_overlayed: Cell<bool>,
+    /// Whether the floating composer's content actually overflows its visible
+    /// bar (i.e. it's capped at [`COMPOSER_MAX_FRACTION`]), cached from the last
+    /// render. A floating composer only *owns* the scroll — and is only itself
+    /// scrollable — when this is true; when it's showing at its natural height
+    /// (content fits, incl. empty / one line) a wheel over it scrolls the page
+    /// underneath, so it can dock, instead of being trapped scrolling nothing.
+    pub(crate) composer_scrollable: Cell<bool>,
     /// The composer's natural (unclipped) content height, recorded each frame.
     pub(crate) composer_content_h: Rc<RefCell<Pixels>>,
     /// Painted bounds of the composer's in-flow placeholder slot, keyed by the
@@ -324,6 +331,7 @@ impl SpaceView {
             composer_scroll: ScrollHandle::new(),
             composer_prev_off_y: 0.0,
             composer_overlayed: Cell::new(false),
+            composer_scrollable: Cell::new(false),
             composer_content_h: Rc::new(RefCell::new(px(0.))),
             slot_bounds: Rc::new(RefCell::new(HashMap::new())),
             scroll_owner: None,

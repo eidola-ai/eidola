@@ -18,7 +18,7 @@ use gpui::{
     AnyElement, App, AppContext, Bounds, BoxShadow, Context, Element, Focusable, GlobalElementId,
     InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, ParentElement,
     Pixels, ScrollWheelEvent, StatefulInteractiveElement, Styled, TouchPhase, Window, div, hsla,
-    linear_color_stop, linear_gradient, point, px, size,
+    linear_color_stop, linear_gradient, point, prelude::FluentBuilder, px, size,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorEvent, MarkdownEditorState};
@@ -384,6 +384,15 @@ impl SpaceView {
             float_bar_h
         };
         let body_h = (bar_h - chrome).max(0.0);
+        // The composer scrolls internally only when floating *and* its content
+        // exceeds the visible bar — i.e. it's capped at `COMPOSER_MAX_FRACTION`.
+        // When it's floating at its natural height (content fits, incl. empty /
+        // one line) the editor's `min_height` fills the bar exactly, so there's
+        // nothing to scroll; letting the wheel fall through to the page (below)
+        // scrolls the conversation underneath instead of trapping it. When docked
+        // the page owns the scroll regardless.
+        let composer_scrollable = overlayed && (chrome + content > bar_h + 0.5);
+        self.composer_scrollable.set(composer_scrollable);
         let scrolled_down = self.composer_scroll.offset().y.as_f32() < -0.5;
 
         let mut byline = v_flex()
@@ -425,8 +434,9 @@ impl SpaceView {
             .id("space-composer-body")
             .w(bw)
             .h(px(body_h))
-            .overflow_y_scroll()
-            .track_scroll(&self.composer_scroll)
+            .when(composer_scrollable, |d| {
+                d.overflow_y_scroll().track_scroll(&self.composer_scroll)
+            })
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
                 if matches!(ev.touch_phase, TouchPhase::Started) {
                     this.scroll_owner = None;
@@ -435,12 +445,16 @@ impl SpaceView {
                 if delta_y == 0.0 {
                     return;
                 }
-                let floating = this.composer_overlayed.get();
-                let owner = *this.scroll_owner.get_or_insert(if floating {
-                    ScrollOwner::Composer
-                } else {
-                    ScrollOwner::Body
-                });
+                // The composer owns the scroll only when it has overflow to
+                // consume; otherwise the page does (so a floating fit-height
+                // composer scrolls the conversation, not itself).
+                let owner = *this
+                    .scroll_owner
+                    .get_or_insert(if this.composer_scrollable.get() {
+                        ScrollOwner::Composer
+                    } else {
+                        ScrollOwner::Body
+                    });
                 match owner {
                     ScrollOwner::Composer => cx.stop_propagation(),
                     ScrollOwner::Body => {
