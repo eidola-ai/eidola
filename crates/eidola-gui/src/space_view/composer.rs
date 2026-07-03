@@ -18,7 +18,7 @@ use gpui::{
     AnyElement, App, AppContext, Bounds, BoxShadow, Context, Element, Focusable, GlobalElementId,
     InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, ParentElement,
     Pixels, ScrollWheelEvent, StatefulInteractiveElement, Styled, TouchPhase, Window, div, hsla,
-    linear_color_stop, linear_gradient, point, prelude::FluentBuilder, px, size,
+    linear_color_stop, linear_gradient, point, px, size,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorEvent, MarkdownEditorState};
@@ -434,9 +434,19 @@ impl SpaceView {
             .id("space-composer-body")
             .w(bw)
             .h(px(body_h))
-            .when(composer_scrollable, |d| {
-                d.overflow_y_scroll().track_scroll(&self.composer_scroll)
-            })
+            // Scroll tracking stays on **unconditionally**, even when the composer
+            // owns no scroll session — this is what smooths the dock transition.
+            // As a scrolled floating composer docks, `bar_h` (and thus `body_h`,
+            // the scroll viewport) ramps up from the floating height toward the
+            // full content height, so gpui clamps the frozen internal offset toward
+            // 0: the scrolled content glides to the top and lands exactly there as
+            // it docks, instead of snapping. Keeping `track_scroll` off while
+            // docked (an earlier version) abandoned the offset and caused that snap.
+            // A fit-height composer can't scroll regardless (`scroll_max == 0` once
+            // the measuring canvas is pinned — see `record_height`), so always-on
+            // reintroduces no phantom scroll.
+            .overflow_y_scroll()
+            .track_scroll(&self.composer_scroll)
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
                 if matches!(ev.touch_phase, TouchPhase::Started) {
                     this.scroll_owner = None;
@@ -445,9 +455,11 @@ impl SpaceView {
                 if delta_y == 0.0 {
                     return;
                 }
-                // The composer owns the scroll only when it has overflow to
-                // consume; otherwise the page does (so a floating fit-height
-                // composer scrolls the conversation, not itself).
+                // The composer *owns* the wheel (internal scroll, page locked out)
+                // only when floating with real overflow; otherwise the page does —
+                // so a floating fit-height composer scrolls the conversation
+                // underneath (letting it dock), and a docked composer lets the page
+                // scroll while its frozen offset ramps to the top (above).
                 let owner = *this
                     .scroll_owner
                     .get_or_insert(if this.composer_scrollable.get() {
