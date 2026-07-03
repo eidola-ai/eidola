@@ -413,6 +413,12 @@ impl SpaceView {
         } else {
             float_bar_h
         };
+        // Never extend past the window bottom: everything below it was
+        // invisible anyway, and ending exactly there keeps the bar's rounded
+        // bottom corners aligned with the window's (a bar clipped mid-body by
+        // the chrome frame would show square corners in the corner notches).
+        // Floating, `win - top_y == float_bar_h`, so this is an identity.
+        let bar_h = bar_h.min(win - top_y);
         let body_h = (bar_h - chrome).max(0.0);
         // The composer scrolls internally only when floating *and* its content
         // exceeds the visible bar — i.e. it's capped at `COMPOSER_MAX_FRACTION`.

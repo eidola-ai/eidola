@@ -13,7 +13,7 @@
 use gpui::{
     Animation, AnimationExt, AnyElement, Context, Hsla, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, WeakEntity, div, point, px,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, point, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
@@ -199,6 +199,7 @@ impl SpaceView {
         roots: &[TreeNode],
         page_width: gpui::Pixels,
         viewport_h: gpui::Pixels,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let fg = cx.theme().scrollbar_thumb;
@@ -212,6 +213,11 @@ impl SpaceView {
         // overlay; a faded-out 36px strip must not steal clicks).
         let interactive = self.minimap_visible;
 
+        // Keep the strip's colored cells out of the window's rounded corner
+        // arcs (the chrome frame cannot clip to the curve — gpui masks are
+        // rectangular): inset both ends by the corner radius and scale the
+        // map into the reduced run. Zero inset when no corner is rounded.
+        let clearance = crate::chrome::corner_clearance(window);
         let mut container = div()
             .id("space-minimap")
             .probe("space/minimap", gpui::Role::Group, "Conversation map")
@@ -219,6 +225,8 @@ impl SpaceView {
             .top_0()
             .bottom_0()
             .right_0()
+            .pt(clearance)
+            .pb(clearance)
             .w(MINIMAP_WIDTH);
 
         let levels = self.selected_levels(roots, page_width);
@@ -238,8 +246,9 @@ impl SpaceView {
         // flickers back — see `clamped_scroll_y`.
         let scroll_y = self.clamped_scroll_y();
 
-        if total_h > 0.0 && viewport_h > px(0.) && !levels.is_empty() {
-            let scale = viewport_h.as_f32() / total_h;
+        let strip_h = viewport_h - clearance * 2.;
+        if total_h > 0.0 && strip_h > px(0.) && !levels.is_empty() {
+            let scale = strip_h.as_f32() / total_h;
             let mut col = v_flex().w_full();
 
             // The reserve scrolls off like content: dark at the very top. Absent

@@ -1068,7 +1068,7 @@ impl Render for SpaceView {
             // map on top of the floating bar. No `deferred` needed now that neither
             // defers; staying in the normal pass keeps both below late overlays
             // like the gpui dev inspector.
-            .child(self.render_minimap(&tree, page_width, window_h, cx))
+            .child(self.render_minimap(&tree, page_width, window_h, window, cx))
     }
 }
 
