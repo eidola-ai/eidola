@@ -238,6 +238,18 @@ pub struct SpaceView {
     pub(crate) scroll_min_y: Cell<f32>,
     /// One horizontal scroller per node that has children, keyed by node id.
     pub(crate) scrolls: HashMap<SharedString, ScrollHandle>,
+    /// Branch count per scroller id, refreshed each frame in [`Self::sync_scrolls`]
+    /// so the snap-on-release can size the target for whichever scroller *owns*
+    /// the gesture — not just the strip the cursor happens to be over at lift.
+    pub(crate) scroller_counts: HashMap<SharedString, usize>,
+    /// The branch scroller that owns the current *horizontal* gesture — decided
+    /// by the first strip to handle a horizontal step and held until the gesture
+    /// ends, mirroring the vertical [`ScrollOwner`]. Sibling branches differ in
+    /// height, so mid-slide the cursor can drift over a *nested* strip on the
+    /// incoming branch; without this lock that nested strip would steal the
+    /// gesture (halting the slide or scrolling a sub-branch). Instead the drifted
+    /// strip forwards its delta here.
+    pub(crate) h_scroll_owner: Option<SharedString>,
     /// The axis the current gesture is locked to (`None` between gestures).
     pub(crate) scroll_axis: Option<ScrollAxis>,
     /// The most recent non-zero horizontal step, used as the release velocity
@@ -338,6 +350,8 @@ impl SpaceView {
             page_scroll: ScrollHandle::new(),
             scroll_min_y: Cell::new(0.0),
             scrolls: HashMap::new(),
+            scroller_counts: HashMap::new(),
+            h_scroll_owner: None,
             scroll_axis: None,
             last_h_delta: px(0.),
             snap: None,
@@ -605,10 +619,13 @@ impl SpaceView {
     /// more than one root. Prune handles for scrollers that no longer exist.
     fn sync_scrolls(&mut self, roots: &[TreeNode]) {
         let mut live: HashSet<SharedString> = HashSet::new();
+        self.scroller_counts.clear();
         if roots.len() > 1 {
             live.insert(model::ROOT_SCROLLER_ID.into());
+            self.scroller_counts
+                .insert(model::ROOT_SCROLLER_ID.into(), roots.len());
         }
-        collect_scrollers(roots, &mut live);
+        collect_scrollers(roots, &mut live, &mut self.scroller_counts);
         for id in &live {
             self.scrolls.entry(id.clone()).or_default();
         }
@@ -659,12 +676,18 @@ fn post_data_from(m: &ChatMessageView) -> PostData {
     }
 }
 
-/// Collect the ids of every node that has children (a horizontal scroller).
-fn collect_scrollers(roots: &[TreeNode], out: &mut HashSet<SharedString>) {
+/// Collect the ids of every node that has children (a horizontal scroller),
+/// recording each scroller's branch count alongside.
+fn collect_scrollers(
+    roots: &[TreeNode],
+    out: &mut HashSet<SharedString>,
+    counts: &mut HashMap<SharedString, usize>,
+) {
     for node in roots {
         if !node.children.is_empty() {
             out.insert(node.id.clone());
-            collect_scrollers(&node.children, out);
+            counts.insert(node.id.clone(), node.children.len());
+            collect_scrollers(&node.children, out, counts);
         }
     }
 }
@@ -986,6 +1009,9 @@ impl SpaceView {
                         TouchPhase::Started => {
                             this.cancel_snap();
                             this.last_h_delta = px(0.);
+                            // New gesture — release the previous owner so the
+                            // first horizontal step below re-elects one.
+                            this.h_scroll_owner = None;
                         }
                         TouchPhase::Moved => {
                             if !delta.x.is_zero() {
@@ -998,7 +1024,33 @@ impl SpaceView {
                     match this.resolve_scroll_axis(ev.touch_phase, delta) {
                         ScrollAxis::Horizontal => {
                             cx.stop_propagation();
-                            this.reassert_horizontal(&node_id);
+                            // Elect the owner on the first horizontal step of the
+                            // gesture (the strip actually under the cursor then)
+                            // and hold it for the whole gesture.
+                            let owner = this
+                                .h_scroll_owner
+                                .get_or_insert_with(|| node_id.clone())
+                                .clone();
+                            if owner == node_id {
+                                // The owning strip: the built-in scroller already
+                                // applied this step; just reassert any glide/pin.
+                                this.reassert_horizontal(&node_id);
+                            } else {
+                                // A different strip drifted under the cursor as the
+                                // owner's branches slid (siblings differ in height).
+                                // Undo the step the built-in scroller applied to it
+                                // and forward the delta to the owner instead.
+                                if !delta.x.is_zero() {
+                                    if let Some(handle) = this.scrolls.get(&node_id) {
+                                        Self::undo_horizontal_nudge(handle, delta.x);
+                                    }
+                                    if let Some(handle) = this.scrolls.get(&owner) {
+                                        let off = handle.offset();
+                                        handle.set_offset(gpui::point(off.x + delta.x, off.y));
+                                    }
+                                }
+                                this.reassert_horizontal(&owner);
+                            }
                         }
                         ScrollAxis::Vertical => {
                             if !delta.x.is_zero()
@@ -1011,7 +1063,16 @@ impl SpaceView {
                     if matches!(ev.touch_phase, TouchPhase::Ended)
                         && locked == Some(ScrollAxis::Horizontal)
                     {
-                        this.start_snap(node_id.clone(), page_width, count, window, cx);
+                        // Snap the scroller that owned the gesture (which may not
+                        // be the strip the cursor rests over at lift), sized by its
+                        // own branch count.
+                        let owner = this
+                            .h_scroll_owner
+                            .clone()
+                            .unwrap_or_else(|| node_id.clone());
+                        let owner_count =
+                            this.scroller_counts.get(&owner).copied().unwrap_or(count);
+                        this.start_snap(owner, page_width, owner_count, window, cx);
                     }
                 }
             }));
