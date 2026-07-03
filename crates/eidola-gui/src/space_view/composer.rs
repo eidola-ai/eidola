@@ -539,7 +539,7 @@ impl SpaceView {
                     .blur_radius(SHADOW_BLUR),
             ]);
         }
-        // Float the whole composer as its own stacking layer in a deferred draw.
+        // Float the whole composer as its own stacking layer.
         //
         // gpui assigns each primitive a draw `order` from a `BoundsTree` (order =
         // 1 + max order of already-painted primitives whose *registered* bounds it
@@ -548,12 +548,10 @@ impl SpaceView {
         // blur reach is **not** included (`Window::paint_drop_shadows`). So in the
         // ~20px window around the dock threshold, where the shadow's blur visually
         // spills over the final separator band but the composer rect hasn't reached
-        // it yet, the shadow and band land in disjoint BoundsTree chains and the
-        // band (bumped by the high-order posts above it) sorts on top — the shadow
-        // renders *behind* the separator until you scroll far enough for the rects
-        // to overlap, then it "jumps" in front. Deferring alone doesn't fix this:
-        // the deferred pass still derives order from bounds overlap, not paint
-        // sequence.
+        // it yet, an inline shadow and the band land in disjoint BoundsTree chains
+        // and the band (bumped by the high-order posts above it) sorts on top — the
+        // shadow renders *behind* the separator, then "jumps" in front once the
+        // rects overlap.
         //
         // `layered` paints the composer inside a single `Window::paint_layer` whose
         // bounds are dilated upward to cover the shadow's blur reach. Every composer
@@ -561,12 +559,13 @@ impl SpaceView {
         // overlap the band — so the entire composer, shadow included, sits above the
         // page for the whole transition (internal order is preserved: within the
         // shared order, batching still draws Shadow-kind under Quad-kind under text).
-        // Priority `0`: the minimap defers at a higher priority and overlaps the
-        // composer on the right edge, so it stays above this layer.
+        // No `deferred` wrapper is needed: the composer is a later sibling than the
+        // scroll subtree, so it already paints after every post/band and its layer
+        // order lands above them; the minimap, a still-later sibling, paints above
+        // the composer in turn. Staying in the normal paint pass also keeps the
+        // composer *below* late overlays such as the gpui dev inspector.
         let reach = px(SHADOW_BLUR.as_f32() - SHADOW_OFFSET_Y.as_f32() + 3.0);
-        gpui::deferred(layered(composer, reach))
-            .with_priority(0)
-            .into_any_element()
+        layered(composer, reach).into_any_element()
     }
 }
 
@@ -581,6 +580,15 @@ use std::rc::Rc;
 /// so the editor's blocks have painted and updated their bounds this frame) —
 /// this is decoupled from the editor's own `min_height`, so growing the editor
 /// to fill the runway doesn't feed back into the height that sizes the runway.
+///
+/// **Pinned to the origin** (`top_0().left_0()`): it's a zero-visual measuring
+/// probe, but as an `absolute` child with no inset taffy places it at its
+/// *static* position — after the editor in flow — which folds its own height
+/// into the scroll container's `content_size` (`div.rs` unions **all** child
+/// bounds, absolute included). That inflated the composer body's scroll range by
+/// a full `body_h`, letting a scrolled composer push its editor entirely out of
+/// view. Pinning it at `(0,0)` keeps it inside the editor's extent so it adds
+/// nothing to the scrollable content.
 fn record_height(
     cell: Rc<RefCell<gpui::Pixels>>,
     editor: gpui::WeakEntity<MarkdownEditorState>,
@@ -604,6 +612,8 @@ fn record_height(
         },
     )
     .absolute()
+    .top_0()
+    .left_0()
     .size_full()
 }
 

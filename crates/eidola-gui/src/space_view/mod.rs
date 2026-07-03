@@ -841,14 +841,13 @@ impl Render for SpaceView {
             })
             .child(self.render_active_draft(&tree, page_width, window_h, cx))
             .child(self.render_error_band(cx))
-            // Defer the minimap above the (also-deferred) composer: the composer
-            // floats at priority 0, so the minimap at priority 1 paints last and
-            // stays on top of it. A plain child would lose, since the deferred
-            // composer paints after the whole normal-pass tree.
-            .child(
-                gpui::deferred(self.render_minimap(&tree, page_width, window_h, cx))
-                    .with_priority(1),
-            )
+            // The minimap is the last sibling, so it paints after the composer
+            // (an earlier sibling) and — overlapping it on the right edge — its
+            // BoundsTree order lands above the composer's layer, keeping the scroll
+            // map on top of the floating bar. No `deferred` needed now that neither
+            // defers; staying in the normal pass keeps both below late overlays
+            // like the gpui dev inspector.
+            .child(self.render_minimap(&tree, page_width, window_h, cx))
     }
 }
 
