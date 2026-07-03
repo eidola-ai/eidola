@@ -438,7 +438,9 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         let m = self.minimap_local_y(window_y);
-        let viewport = window.viewport_size();
+        // Content box, not the raw surface — on Linux CSD the surface includes
+        // the shadow padding, which must not enter the scroll/branch geometry.
+        let viewport = crate::chrome::content_size(window);
         let page_width = viewport.width;
         let window_h = viewport.height;
 

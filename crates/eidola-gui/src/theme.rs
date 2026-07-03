@@ -699,6 +699,13 @@ fn day_colors() -> ThemeConfigColors {
     c.info_foreground = some("#fefaf5");
 
     // Chrome
+    // gpui-component Root's built-in Linux CSD frame would paint a 1px
+    // `window_border` rectangle at the window surface's very edge (around
+    // our transparent shadow margin). Our chrome (`chrome.rs`) draws the
+    // real frame; pin this transparent so the vestigial one never shows.
+    // Belt-and-braces: `chrome::themed_root` also disables Root's border
+    // outright via `bordered(false)`.
+    c.window_border = some("#00000000");
     c.title_bar = some("#fafafa");
     c.title_bar_border = some("#e4e4e4");
     c.tab_bar = some("#fafafa");
@@ -802,6 +809,8 @@ fn night_colors() -> ThemeConfigColors {
     c.info_foreground = some("#15191e");
 
     // Chrome
+    // Transparent for the same reason as Day: our chrome owns the frame.
+    c.window_border = some("#00000000");
     c.title_bar = some("#15191e");
     c.title_bar_border = some("#2c343d");
     c.tab_bar = some("#15191e");

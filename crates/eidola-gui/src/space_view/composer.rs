@@ -303,7 +303,7 @@ impl SpaceView {
     /// Scroll the page so the bottom of the selected branch (the composer /
     /// streaming leaf) sits at the window bottom.
     fn scroll_to_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let viewport = window.viewport_size();
+        let viewport = crate::chrome::content_size(window);
         let streaming = self.space.read(cx).is_streaming();
         let tree = self.effective_tree(viewport.width, streaming);
         let total = self.selected_total_height(&tree, viewport.width, viewport.height);
@@ -330,7 +330,7 @@ impl SpaceView {
 
     /// "See in context": dock the active draft back at its place in the branch.
     pub(crate) fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let viewport = window.viewport_size();
+        let viewport = crate::chrome::content_size(window);
         let streaming = self.space.read(cx).is_streaming();
         let tree = self.effective_tree(viewport.width, streaming);
         if let Some(active) = self.active_draft.clone()
