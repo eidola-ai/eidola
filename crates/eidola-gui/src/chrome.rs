@@ -37,17 +37,19 @@
 //!   surfaces and [`controls_reserve`] for view layouts that keep their own
 //!   content clear of the cluster.
 //!
-//! **All four corners round; every corner-touching surface must round
-//! itself.** gpui content masks are strictly rectangular, so a rounded
-//! window frame cannot *clip* child surfaces — any full-bleed surface that
-//! touches a window corner must apply the matching helper
-//! ([`round_client_corners`] for window-root surfaces, the top/bottom/
-//! single-corner variants for bands that own only part of an edge — e.g.
-//! the Settings nav band rounds `tl` + `bl`). The helpers are no-ops on
-//! macOS / SSD / tiled edges, so views apply them unconditionally. Inset
-//! overlays (the error-band pill, the centered floating composer) don't
-//! touch corners and need nothing; transient overlays that brush a corner
-//! while visible (the minimap strip) are audited case by case.
+//! **Containment first, corner duty second.** The inner frame clips every
+//! descendant to its rect (`overflow_hidden`) — and gpui deferred draws
+//! re-apply the content mask captured at their tree position, so even the
+//! space view's deferred composer/minimap overlays cannot paint into the
+//! shadow band. What the clip *cannot* do is follow the curve: gpui content
+//! masks are strictly rectangular, so the rounded corner notches stay each
+//! corner-touching surface's own duty. All four corners round: window roots
+//! apply [`round_client_corners`]; bands that own part of an edge use the
+//! top/bottom/single-corner variants (Settings nav band: `tl` + `bl`; the
+//! space composer bar: bottom — its geometry is clamped so its bottom edge
+//! always coincides with the window's); full-height edge strips keep
+//! [`corner_clearance`] away from the arcs (the minimap). The helpers are
+//! no-ops on macOS / SSD / tiled edges, so views apply them unconditionally.
 
 #![cfg_attr(target_os = "macos", allow(unused))]
 
@@ -242,6 +244,20 @@ pub(crate) fn round_br_client_corner<E: Styled>(el: E, window: &Window) -> E {
     el.rounded_br(CORNER_RADIUS)
 }
 
+/// Vertical clearance a full-height *right-edge* overlay strip (the space
+/// view's minimap) needs at each end to stay out of the window's rounded
+/// corner arcs. Zero whenever the right-side corners aren't rounded
+/// (macOS, SSD, tests, tiled).
+pub(crate) fn corner_clearance(window: &Window) -> Pixels {
+    let Decorations::Client { tiling } = window.window_decorations() else {
+        return px(0.);
+    };
+    if !cfg!(target_os = "linux") || tiling.right || (tiling.top && tiling.bottom) {
+        return px(0.);
+    }
+    CORNER_RADIUS
+}
+
 /// The wrapper view between `gpui_component::Root` and a window's real view.
 /// On macOS [`ChromeRoot::wrap`] returns the view unchanged (the render tree
 /// is bit-identical to before this module existed); on Linux it interposes
@@ -343,6 +359,14 @@ impl ChromeRoot {
                     .size_full()
                     .cursor(CursorStyle::Arrow)
                     .map(|el| round_client_corners(el, window))
+                    // Containment, not convention: clip every descendant —
+                    // including deferred overlays, which re-apply the content
+                    // mask captured at their tree position — to the frame's
+                    // rect, so nothing can ever paint over the shadow band.
+                    // The mask is rectangular (gpui masks carry no radii), so
+                    // the rounded corner *notches* remain each corner-touching
+                    // surface's own duty — see the module docs.
+                    .overflow_hidden()
                     .bg(background)
                     .border_color(border)
                     .when(!tiling.top, |el| el.border_t_1())
