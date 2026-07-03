@@ -390,9 +390,9 @@ impl ChromeRoot {
                     })
                     .child(self.child.clone())
                     // Window chrome paints (and hit-tests) above everything
-                    // the view renders, including its own deferred layers
-                    // (the space view's floating composer at priority 0 and
-                    // minimap at priority 1).
+                    // the view renders: the deferred pass runs after the
+                    // whole normal-pass tree (and the space view's layered
+                    // composer/minimap stay in the normal pass).
                     .children(
                         window_controls(window, cx)
                             .map(|controls| gpui::deferred(controls).with_priority(100)),
