@@ -250,11 +250,10 @@ impl Render for AccountView {
             col = col.child(account_block);
         } else {
             col = col
-                .child(
-                    div()
-                        .text_color(theme.muted_foreground)
-                        .child("No account yet — a new space (⌘N) walks you through it."),
-                )
+                .child(div().text_color(theme.muted_foreground).child(format!(
+                    "No account yet — a new space ({}) walks you through it.",
+                    crate::actions::primary_chord("N")
+                )))
                 .child(
                     h_flex().child(
                         // Probed wrapper for the a11y role/label — shrink-wraps

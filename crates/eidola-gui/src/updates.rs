@@ -29,11 +29,9 @@ use crate::probe::Probe as _;
 use crate::stores::{Stores, UpdateStore};
 
 /// Vertical reserve under the transparent titlebar so the traffic lights
-/// don't land on content (same rationale as `space_view::TITLE_BAR_RESERVE`).
-#[cfg(target_os = "macos")]
+/// (macOS) / CSD window controls (Linux) don't land on content (same
+/// rationale as `space_view::TITLE_BAR_RESERVE`).
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
-#[cfg(not(target_os = "macos"))]
-const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(8.);
 
 /// What the window shows right now — derived from `Core`'s cached update
 /// state, never stored. Public so behavior tests assert the derivation
@@ -242,7 +240,7 @@ impl Render for UpdatesView {
                     SharedString::from(format!("Eidola {}", env!("CARGO_PKG_VERSION"))),
                 ));
 
-        v_flex()
+        crate::chrome::round_top_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();

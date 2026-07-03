@@ -31,13 +31,11 @@ use crate::stores::{SpacesStore, Stores};
 
 actions!(library, [CancelRename]);
 
-/// Vertical reserve under the macOS traffic lights — same pattern as
-/// `space_view::TITLE_BAR_RESERVE` (the window uses the shared transparent
-/// titlebar from `lib.rs::transparent_titlebar`).
-#[cfg(target_os = "macos")]
+/// Vertical reserve at the top of the window — under the macOS traffic
+/// lights, or hosting the Linux CSD window controls + drag strip (same
+/// pattern as `space_view::TITLE_BAR_RESERVE`; the window uses the shared
+/// transparent titlebar from `lib.rs::transparent_titlebar`).
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
-#[cfg(not(target_os = "macos"))]
-const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 
 /// Fixed row height for the virtualized listing. Rows are single-line by
 /// design (title + relative date), so `uniform_list`'s single-measure layout
@@ -437,7 +435,7 @@ impl Render for LibraryView {
         let theme = cx.theme();
         let count = self.spaces.read(cx).list().len();
 
-        let mut root = v_flex()
+        let mut root = crate::chrome::round_top_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
@@ -484,11 +482,10 @@ impl Render for LibraryView {
                     .w_full()
                     .justify_center()
                     .items_center()
-                    .child(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child("Nothing here yet — ⌘N starts a new space."),
-                    ),
+                    .child(div().text_color(theme.muted_foreground).child(format!(
+                        "Nothing here yet — {} starts a new space.",
+                        crate::actions::primary_chord("N")
+                    ))),
             );
         }
 

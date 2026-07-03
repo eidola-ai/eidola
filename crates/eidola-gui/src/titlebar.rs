@@ -31,6 +31,16 @@ use gpui_component::InteractiveElementExt;
 /// Attach the arm-on-down / move-on-first-move / double-click-to-zoom window
 /// drag gesture to an existing stateful element (e.g. a window's title strip).
 /// `key` scopes the element-owned armed flag — use the strip's element id.
+///
+/// The same gesture serves both platforms (`start_window_move` is wired on
+/// macOS and Wayland alike; the `WindowControlArea` hitbox path is a no-op on
+/// both). The double-click and right-click affordances differ:
+/// - macOS: double-click → `titlebar_double_click` (respects the user's
+///   zoom-vs-minimize preference). No right-click menu.
+/// - Linux CSD: double-click → `zoom_window` (maximize toggle, the desktop
+///   idiom), right-click → `show_window_menu` (the *compositor's* window menu:
+///   move / resize / workspace / always-on-top — the idiomatic window-scoped
+///   menu, maintained by the compositor, one call).
 pub(crate) fn make_draggable(
     el: Stateful<Div>,
     key: &'static str,
@@ -46,7 +56,14 @@ pub(crate) fn make_draggable(
     let on_up = armed.clone();
     el.on_mouse_down(
         MouseButton::Left,
-        move |_: &MouseDownEvent, _, cx: &mut App| {
+        move |ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+            // A press at the very window edge belongs to the CSD resize band
+            // (which reaches a few px inside the frame); arming a move there
+            // would race the resize the chrome backdrop is about to start.
+            // No-op off Linux (`in_resize_band` is always false there).
+            if crate::chrome::in_resize_band(window, ev.position) {
+                return;
+            }
             on_down.read(cx).set(true);
         },
     )
@@ -59,7 +76,20 @@ pub(crate) fn make_draggable(
             window.start_window_move();
         }
     })
-    .on_double_click(|_, window, _| window.titlebar_double_click())
+    .on_double_click(|_, window, _| {
+        if cfg!(target_os = "macos") {
+            window.titlebar_double_click();
+        } else {
+            window.zoom_window();
+        }
+    })
+    .on_mouse_down(
+        MouseButton::Right,
+        |ev: &MouseDownEvent, window: &mut Window, _| {
+            // No-op off Linux (the platform default impl does nothing).
+            window.show_window_menu(ev.position);
+        },
+    )
 }
 
 /// A full-width, transparent drag band absolutely positioned over a window's
