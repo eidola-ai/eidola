@@ -69,6 +69,7 @@
 //! | `enclave.cmdline` | `kernel command line (non-empty)` | manifest schema 1 — the cmdline binds the tinfoil-config hash into the measurement |
 //! | `artifacts.eidola-cli` | `oci (linux/amd64)` | [`EXPECTED_ARTIFACTS`] — the artifact set schema-1 manifests record |
 //! | `artifacts.eidola-cli-macos-universal` | `nix (darwin/universal)` | ditto |
+//! | `artifacts.eidola-gui-linux-amd64` | `nix (linux/amd64)` | ditto |
 //! | `artifacts.eidola-gui-macos-universal` | `nix (darwin/universal)` | ditto |
 //! | `artifacts.eidola-postgres` | `oci (linux/amd64)` | ditto |
 //! | `artifacts.eidola-server` | `oci (linux/amd64)` | ditto |
@@ -103,6 +104,7 @@ pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[1];
 pub const EXPECTED_ARTIFACTS: &[(&str, &str, &str)] = &[
     ("eidola-cli", "oci", "linux/amd64"),
     ("eidola-cli-macos-universal", "nix", "darwin/universal"),
+    ("eidola-gui-linux-amd64", "nix", "linux/amd64"),
     ("eidola-gui-macos-universal", "nix", "darwin/universal"),
     ("eidola-postgres", "oci", "linux/amd64"),
     ("eidola-server", "oci", "linux/amd64"),
@@ -835,6 +837,7 @@ mod tests {
             "artifacts": {
                 "eidola-cli": {"digest": "sha256:aa", "platform": "linux/amd64", "type": "oci"},
                 "eidola-cli-macos-universal": {"narHash": "sha256-aa", "platform": "darwin/universal", "type": "nix"},
+                "eidola-gui-linux-amd64": {"narHash": "sha256-cc", "platform": "linux/amd64", "type": "nix"},
                 "eidola-gui-macos-universal": {"narHash": "sha256-bb", "platform": "darwin/universal", "type": "nix"},
                 "eidola-postgres": {"digest": "sha256:bb", "platform": "linux/amd64", "type": "oci"},
                 "eidola-server": {"digest": "sha256:cc", "platform": "linux/amd64", "type": "oci"}
@@ -862,6 +865,7 @@ mod tests {
                 "enclave.cmdline",
                 "artifacts.eidola-cli",
                 "artifacts.eidola-cli-macos-universal",
+                "artifacts.eidola-gui-linux-amd64",
                 "artifacts.eidola-gui-macos-universal",
                 "artifacts.eidola-postgres",
                 "artifacts.eidola-server",

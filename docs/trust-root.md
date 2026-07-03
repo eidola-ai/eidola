@@ -45,7 +45,7 @@ Each document's shape is owned by the Rust `serde` types shared between the rele
 
 | Document | Shape (source of truth) | Notes |
 | --- | --- | --- |
-| `artifact-manifest.json` | format owned by `scripts/artifact-manifest.sh` | `schema_version: 1`. Records OCI digests, the macOS narHash, and a denormalized copy of the enclave block. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). |
+| `artifact-manifest.json` | format owned by `scripts/artifact-manifest.sh` | `schema_version: 1`. Records OCI digests, the Nix desktop-build narHashes (macOS universal CLI/GUI, Linux GUI), and a denormalized copy of the enclave block. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). |
 | `releases/trust/server-enclave.json` | format owned by `scripts/artifact-manifest.sh`, consumed as raw JSON in `eidola-app-core/build.rs` | `schema_version: 1`. Holds just the enclave block (snp/tdx measurement + cmdline) so the cli build doesn't drag its own digest into its build context. |
 | `releases/trust/tinfoil-enclaves.json` | format owned by `.github/workflows/update-measurements.yml`, consumed as raw JSON in `eidola-server/build.rs` | `schema_version: 1`. Allowed upstream Tinfoil inference-enclave measurements the server's outbound verifier accepts. One entry per Tinfoil release, with provenance metadata (built\_at, artifact digest, Rekor log index); the workflow keeps the most recent two for rolling deploys. |
 | `release.json` | `eidola_attestation::ReleaseIndex` — `crates/eidola-attestation/src/trust_shapes.rs` | Unsigned URL-only index; cross-checked via referenced documents (see caveat below) |
@@ -94,7 +94,7 @@ The protection that *doesn't* hold without a signed `release.json` is **first-in
 
 ## Where each piece lives
 
-Almost everything under `releases/` is a **build input** — pinned data the client and server compile against (the one exception is `trust/attestant-provenance/`, informational auditor-facing evidence that no build or client reads). `artifact-manifest.json` at the repo root is the **build output** — a record of what was actually produced, signed by CI. They live in different places on purpose: files under `releases/` are bulk-copied/filtered into builds as a unit, while `artifact-manifest.json` is deliberately kept out of every build context to prevent self-reference cycles (it records the eidola-cli OCI digest and macOS narHash that the cli build would otherwise see in its own input).
+Almost everything under `releases/` is a **build input** — pinned data the client and server compile against (the one exception is `trust/attestant-provenance/`, informational auditor-facing evidence that no build or client reads). `artifact-manifest.json` at the repo root is the **build output** — a record of what was actually produced, signed by CI. They live in different places on purpose: files under `releases/` are bulk-copied/filtered into builds as a unit, while `artifact-manifest.json` is deliberately kept out of every build context to prevent self-reference cycles (it records the eidola-cli OCI digest and desktop-build narHashes that the cli build would otherwise see in its own input).
 
 ```text
 releases/

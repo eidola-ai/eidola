@@ -1,24 +1,17 @@
 # syntax=docker/dockerfile:1
 #
 # Linux DEV environment for the gpui app — used for running cargo against
-# Linux targets from a macOS host (via Docker) and for any future Linux CI
-# job that needs to build/test `eidola-gui`.
+# Linux targets from a macOS host (via Docker). Fast-iteration only.
 #
-# This is a deliberate divergence from the release pipeline in this directory:
-# `oci/eidola-{server,cli}/Containerfile` and `oci/postgresql/Containerfile`
-# all build hermetic, scratch-based images from `stagex/pallet-rust` and
-# `stagex/{core,user}-*` packages. We can't follow that pattern here yet
-# because stagex does not currently package the GUI build deps gpui needs on
-# Linux — fontconfig, freetype, libxkbcommon, xkeyboard-config, harfbuzz,
-# pixman are all missing. Until those are upstreamed (or vendored), this
-# image starts from `rust:1.95-slim-bookworm` and apt-installs the deps. It
-# trades hermeticity for cargo iteration speed (apt, git, less etc.) and is
-# explicitly NOT a release/runtime image — there is no `package` stage.
-#
-# When stagex covers the missing pallets, swap the base to
-# `stagex/pallet-rust@sha256:...` and compose system libs in via the same
-# multi-stage `FROM stagex/user-<lib> AS pkg-<lib>` + `COPY --from=pkg-<lib>`
-# pattern used by the sibling Containerfiles.
+# This image is deliberately NOT the release pipeline. The GUI's Linux
+# release artifact is Nix-built (`nix build .#eidola-gui-linux`; see
+# flake.nix): a desktop app must be a glibc dynamic binary to interoperate
+# with the host GPU stack, which rules out the static-musl StageX pattern
+# the server/cli use (`oci/eidola-{server,cli}/Containerfile`) — stagex is
+# musl-by-design and doesn't package the graphics userland (mesa, libdrm).
+# This image starts from `rust:1.95-slim-bookworm` and apt-installs the
+# deps; it trades hermeticity for cargo iteration speed (apt, git, less
+# etc.) and has no `package` stage.
 #
 # Architecture: docker pulls the host-native variant of `rust:bookworm-slim`,
 # so on Apple Silicon this image runs natively as arm64 (fast). Cargo's target

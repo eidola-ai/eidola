@@ -101,15 +101,15 @@ Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install baco
 
 ### GUI
 
-Build, run, and test the gpui-based macOS app from the command line:
+Build, run, and test the gpui-based desktop app (macOS, or Linux under Wayland) from the command line:
 
 ```bash
 just build gui      # cargo build + package Eidola.app (on macOS)
-just run gui        # build and open Eidola.app
+just run gui        # build and open Eidola.app (macOS) / run the binary (Linux)
 just test           # cargo test
 ```
 
-`just build gui` produces `crates/eidola-gui/build/Eidola.app`. See `crates/eidola-gui/AGENTS.md` for the architecture details.
+On macOS, `just build gui` produces `crates/eidola-gui/build/Eidola.app`; on Linux, `just run gui` runs the binary directly (the Linux GUI is Wayland-only). See `crates/eidola-gui/AGENTS.md` for the architecture details.
 
 See more available commands:
 
@@ -121,10 +121,10 @@ just
 
 ```bash
 just update-openapi    # OpenAPI spec
-just update-manifest   # artifact-manifest.json (OCI images, macOS CLI, enclave measurements)
+just update-manifest   # artifact-manifest.json (OCI images, desktop binaries, enclave measurements)
 ```
 
-This uses the pinned amd64 BuildKit builder configuration for the OCI images, the local Nix macOS builds for the app and CLI, and the `measure-enclave` binary to compute SEV-SNP and TDX measurements from `tinfoil-config.yml`. It currently needs to run on macOS.
+This uses the pinned amd64 BuildKit builder configuration for the OCI images, the local Nix build for the host platform's desktop artifacts (the macOS universal CLI and GUI `.app` on macOS; the Linux GUI on Linux — the other platform's narHashes are carried over from the committed manifest, and CI verifies the full set), and the `measure-enclave` binary to compute SEV-SNP and TDX measurements from `tinfoil-config.yml`.
 
 To compute enclave measurements independently (without rebuilding images):
 
