@@ -1007,7 +1007,7 @@ impl Render for SpaceView {
 
         let body = self.render_forest(&tree, doc_reserve, page_width, window_h, streaming, cx);
 
-        crate::chrome::round_top_client_corners(div(), window)
+        crate::chrome::round_client_corners(div(), window)
             .track_focus(&self.focus_handle)
             .key_context("SpaceView")
             .on_action(cx.listener(Self::submit))
@@ -1059,7 +1059,7 @@ impl Render for SpaceView {
                 scroll.style().restrict_scroll_to_axis = Some(true);
                 scroll
             })
-            .child(self.render_active_draft(&tree, page_width, window_h, cx))
+            .child(self.render_active_draft(&tree, page_width, window_h, window, cx))
             .child(self.render_request_panel(page_width, window_h, cx))
             .child(self.render_error_band(cx))
             // The minimap is the last sibling, so it paints after the composer

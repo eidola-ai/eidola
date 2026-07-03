@@ -37,22 +37,24 @@
 //!   surfaces and [`controls_reserve`] for view layouts that keep their own
 //!   content clear of the cluster.
 //!
-//! **Top corners round; bottom corners stay square (settled).** gpui content
-//! masks are strictly rectangular, so a rounded window frame cannot *clip*
-//! child surfaces — every surface touching a rounded corner must round
-//! itself. The top of each window is chrome we own (strips, bands, empty
-//! reserve), so the audit is cheap; the bottom edge is live content (docked
-//! composer, error band, minimap tail) where the audit would be invasive.
-//! Square bottom corners are the same trade Chromium and VS Code ship on
-//! Wayland. Any new full-bleed surface that touches the window's top edge
-//! must apply [`round_top_client_corners`].
+//! **All four corners round; every corner-touching surface must round
+//! itself.** gpui content masks are strictly rectangular, so a rounded
+//! window frame cannot *clip* child surfaces — any full-bleed surface that
+//! touches a window corner must apply the matching helper
+//! ([`round_client_corners`] for window-root surfaces, the top/bottom/
+//! single-corner variants for bands that own only part of an edge — e.g.
+//! the Settings nav band rounds `tl` + `bl`). The helpers are no-ops on
+//! macOS / SSD / tiled edges, so views apply them unconditionally. Inset
+//! overlays (the error-band pill, the centered floating composer) don't
+//! touch corners and need nothing; transient overlays that brush a corner
+//! while visible (the minimap strip) are audited case by case.
 
 #![cfg_attr(target_os = "macos", allow(unused))]
 
 use gpui::{
-    AnyView, App, AppContext, Bounds, Context, CursorStyle, Decorations, Div, Edges, Global, Hsla,
+    AnyView, App, AppContext, Bounds, Context, CursorStyle, Decorations, Div, Edges, Hsla,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point, Render, ResizeEdge,
-    Size, Stateful, StatefulInteractiveElement, Styled, Tiling, Window, canvas, div, point,
+    Size, Stateful, StatefulInteractiveElement, Styled, Tiling, Window, div, point,
     prelude::FluentBuilder, px, size,
 };
 use gpui_component::{ActiveTheme, Icon, IconName, Root, Sizable, StyledExt, h_flex};
@@ -173,11 +175,24 @@ pub(crate) fn in_resize_band(window: &Window, pos: Point<Pixels>) -> bool {
     resize_edge(pos, SHADOW_SIZE, size, tiling).is_some()
 }
 
+/// Round all four corners of a full-bleed surface to match the window's
+/// client-side frame (no-op on macOS / SSD / tiled edges). Apply to any
+/// surface that spans the whole window (view roots) — see the module docs.
+pub(crate) fn round_client_corners<E: Styled>(el: E, window: &Window) -> E {
+    round_bottom_client_corners(round_top_client_corners(el, window), window)
+}
+
 /// Round the *top* corners of a full-bleed surface to match the window's
 /// client-side frame (no-op on macOS / SSD / tiled edges). Apply to any
-/// surface that touches the window's top edge — see the module docs.
+/// surface that owns the window's top edge but not its bottom (e.g. the
+/// space view's gradient title band) — see the module docs.
 pub(crate) fn round_top_client_corners<E: Styled>(el: E, window: &Window) -> E {
     round_tr_client_corner(round_tl_client_corner(el, window), window)
+}
+
+/// Round the *bottom* corners (see [`round_top_client_corners`]).
+pub(crate) fn round_bottom_client_corners<E: Styled>(el: E, window: &Window) -> E {
+    round_br_client_corner(round_bl_client_corner(el, window), window)
 }
 
 /// Round only the top-left window corner — for a surface that owns the
@@ -201,6 +216,30 @@ pub(crate) fn round_tr_client_corner<E: Styled>(el: E, window: &Window) -> E {
         return el;
     }
     el.rounded_tr(CORNER_RADIUS)
+}
+
+/// Round only the bottom-left window corner — for a surface that owns the
+/// window's bottom-left but not its bottom-right (e.g. the Settings nav
+/// band, which spans the window's full height on the left).
+pub(crate) fn round_bl_client_corner<E: Styled>(el: E, window: &Window) -> E {
+    let Decorations::Client { tiling } = window.window_decorations() else {
+        return el;
+    };
+    if !cfg!(target_os = "linux") || tiling.bottom || tiling.left {
+        return el;
+    }
+    el.rounded_bl(CORNER_RADIUS)
+}
+
+/// Round only the bottom-right window corner (see [`round_bl_client_corner`]).
+pub(crate) fn round_br_client_corner<E: Styled>(el: E, window: &Window) -> E {
+    let Decorations::Client { tiling } = window.window_decorations() else {
+        return el;
+    };
+    if !cfg!(target_os = "linux") || tiling.bottom || tiling.right {
+        return el;
+    }
+    el.rounded_br(CORNER_RADIUS)
 }
 
 /// The wrapper view between `gpui_component::Root` and a window's real view.
@@ -230,11 +269,6 @@ impl ChromeRoot {
 }
 
 gpui::actions!(chrome, [TogglePrimaryMenu]);
-
-/// The hovered resize edge, shared between the backdrop's mouse handling and
-/// the cursor canvas (zed's `GlobalResizeEdge` pattern).
-struct HoveredResizeEdge(ResizeEdge);
-impl Global for HoveredResizeEdge {}
 
 impl Render for ChromeRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -283,22 +317,12 @@ impl ChromeRoot {
         div()
             .id("window-backdrop")
             .size_full()
-            .map(|el| round_top_client_corners(el, window))
+            .map(|el| round_client_corners(el, window))
             .when(!tiling.top, |el| el.pt(SHADOW_SIZE))
             .when(!tiling.bottom, |el| el.pb(SHADOW_SIZE))
             .when(!tiling.left, |el| el.pl(SHADOW_SIZE))
             .when(!tiling.right, |el| el.pr(SHADOW_SIZE))
-            // Re-render when the hovered resize edge changes so the cursor
-            // canvas below sees fresh state; start an interactive resize on
-            // mouse-down in the border region.
-            .on_mouse_move(cx.listener(move |_, e: &gpui::MouseMoveEvent, window, cx| {
-                let size = window.window_bounds().get_bounds().size;
-                let new_edge = resize_edge(e.position, SHADOW_SIZE, size, tiling);
-                let old_edge = cx.try_global::<HoveredResizeEdge>().map(|e| e.0);
-                if new_edge != old_edge {
-                    cx.notify();
-                }
-            }))
+            // Start an interactive resize on mouse-down in the hit band.
             .on_mouse_down(MouseButton::Left, move |e, window, cx| {
                 let size = window.window_bounds().get_bounds().size;
                 if let Some(edge) = resize_edge(e.position, SHADOW_SIZE, size, tiling) {
@@ -318,7 +342,7 @@ impl ChromeRoot {
                     .relative()
                     .size_full()
                     .cursor(CursorStyle::Arrow)
-                    .map(|el| round_top_client_corners(el, window))
+                    .map(|el| round_client_corners(el, window))
                     .bg(background)
                     .border_color(border)
                     .when(!tiling.top, |el| el.border_t_1())
@@ -340,9 +364,6 @@ impl ChromeRoot {
                             .blur_radius(SHADOW_SIZE - px(4.)),
                         ])
                     })
-                    // Content mouse-moves are the content's business — don't
-                    // let them bubble to the backdrop's edge tracking.
-                    .on_mouse_move(|_, _, cx| cx.stop_propagation())
                     .child(self.child.clone())
                     // Window chrome paints (and hit-tests) above everything
                     // the view renders, including its own deferred layers
@@ -354,48 +375,131 @@ impl ChromeRoot {
                     )
                     .children(self.menu_layer(window, cx)),
             )
-            // Resize cursor: a paint-phase canvas that reads the hovered edge
-            // each frame and sets the cursor over the whole window while the
-            // pointer is in the shadow/border region.
-            .child(
-                canvas(
-                    |_, window, _| {
-                        window.insert_hitbox(
-                            Bounds::new(
-                                point(px(0.), px(0.)),
-                                window.window_bounds().get_bounds().size,
-                            ),
-                            gpui::HitboxBehavior::Normal,
-                        )
-                    },
-                    move |_, hitbox, window, cx| {
-                        let mouse = window.mouse_position();
-                        let size = window.window_bounds().get_bounds().size;
-                        let Some(edge) = resize_edge(mouse, SHADOW_SIZE, size, tiling) else {
-                            return;
-                        };
-                        cx.set_global(HoveredResizeEdge(edge));
-                        window.set_cursor_style(
-                            match edge {
-                                ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
-                                ResizeEdge::Left | ResizeEdge::Right => {
-                                    CursorStyle::ResizeLeftRight
-                                }
-                                ResizeEdge::TopLeft | ResizeEdge::BottomRight => {
-                                    CursorStyle::ResizeUpLeftDownRight
-                                }
-                                ResizeEdge::TopRight | ResizeEdge::BottomLeft => {
-                                    CursorStyle::ResizeUpRightDownLeft
-                                }
-                            },
-                            &hitbox,
-                        );
-                    },
-                )
-                .size_full()
-                .absolute(),
-            )
+            // Resize cursors: declarative zones over the hit band. Placed
+            // after the inner frame so they sit above content at the edges.
+            .children(resize_cursor_zones(tiling))
     }
+}
+
+/// Transparent, listener-less strips and corner squares covering the resize
+/// hit band, each carrying its `.cursor(...)`. gpui resolves the cursor per
+/// pointer move against painted hitboxes, so this needs no re-render
+/// choreography and cannot go stale the way an imperatively set cursor can
+/// (an earlier paint-phase-canvas version requested the cursor with a
+/// full-window hitbox, which outlived the pointer's stay in the band until
+/// the next repaint — the "stuck resize arrow"). The zones carry no
+/// listeners: the actual resize starts from the backdrop's mouse-down via
+/// [`resize_edge`], whose geometry these zones mirror (strips: the shadow
+/// margin plus [`RESIZE_INNER_REACH`] inside the frame edge; corners: 1.5×
+/// the shadow size, pushed after the strips so they win hit-testing).
+///
+/// Coordinates are relative to the backdrop's padded content box (the
+/// frame's outer edge), so the shadow margin is at negative offsets.
+fn resize_cursor_zones(tiling: Tiling) -> Vec<gpui::AnyElement> {
+    if tiling.top && tiling.bottom && tiling.left && tiling.right {
+        return Vec::new();
+    }
+
+    // Outer offset (into the shadow margin) and strip thickness.
+    let out = px(0.) - SHADOW_SIZE;
+    let strip = SHADOW_SIZE + RESIZE_INNER_REACH;
+    let corner = SHADOW_SIZE * 1.5;
+    let zone = || div().absolute();
+
+    let mut zones: Vec<gpui::AnyElement> = Vec::new();
+
+    if !tiling.top {
+        zones.push(
+            zone()
+                .top(out)
+                .left(if tiling.left { px(0.) } else { out })
+                .right(if tiling.right { px(0.) } else { out })
+                .h(strip)
+                .cursor(CursorStyle::ResizeUpDown)
+                .into_any_element(),
+        );
+    }
+    if !tiling.bottom {
+        zones.push(
+            zone()
+                .bottom(out)
+                .left(if tiling.left { px(0.) } else { out })
+                .right(if tiling.right { px(0.) } else { out })
+                .h(strip)
+                .cursor(CursorStyle::ResizeUpDown)
+                .into_any_element(),
+        );
+    }
+    if !tiling.left {
+        zones.push(
+            zone()
+                .left(out)
+                .top(if tiling.top { px(0.) } else { out })
+                .bottom(if tiling.bottom { px(0.) } else { out })
+                .w(strip)
+                .cursor(CursorStyle::ResizeLeftRight)
+                .into_any_element(),
+        );
+    }
+    if !tiling.right {
+        zones.push(
+            zone()
+                .right(out)
+                .top(if tiling.top { px(0.) } else { out })
+                .bottom(if tiling.bottom { px(0.) } else { out })
+                .w(strip)
+                .cursor(CursorStyle::ResizeLeftRight)
+                .into_any_element(),
+        );
+    }
+
+    // Corners after strips so their diagonal cursors win where they overlap.
+    if !tiling.top && !tiling.left {
+        zones.push(
+            zone()
+                .top(out)
+                .left(out)
+                .w(corner)
+                .h(corner)
+                .cursor(CursorStyle::ResizeUpLeftDownRight)
+                .into_any_element(),
+        );
+    }
+    if !tiling.top && !tiling.right {
+        zones.push(
+            zone()
+                .top(out)
+                .right(out)
+                .w(corner)
+                .h(corner)
+                .cursor(CursorStyle::ResizeUpRightDownLeft)
+                .into_any_element(),
+        );
+    }
+    if !tiling.bottom && !tiling.left {
+        zones.push(
+            zone()
+                .bottom(out)
+                .left(out)
+                .w(corner)
+                .h(corner)
+                .cursor(CursorStyle::ResizeUpRightDownLeft)
+                .into_any_element(),
+        );
+    }
+    if !tiling.bottom && !tiling.right {
+        zones.push(
+            zone()
+                .bottom(out)
+                .right(out)
+                .w(corner)
+                .h(corner)
+                .cursor(CursorStyle::ResizeUpLeftDownRight)
+                .into_any_element(),
+        );
+    }
+
+    zones
 }
 
 impl ChromeRoot {

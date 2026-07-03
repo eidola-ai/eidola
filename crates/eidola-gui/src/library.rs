@@ -435,7 +435,7 @@ impl Render for LibraryView {
         let theme = cx.theme();
         let count = self.spaces.read(cx).list().len();
 
-        let mut root = crate::chrome::round_top_client_corners(v_flex(), window)
+        let mut root = crate::chrome::round_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();

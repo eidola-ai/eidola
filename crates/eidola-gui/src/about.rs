@@ -105,7 +105,7 @@ impl Render for AboutView {
             }))
             .child("View on GitHub →");
 
-        crate::chrome::round_top_client_corners(v_flex(), window)
+        crate::chrome::round_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
