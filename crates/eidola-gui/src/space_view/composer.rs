@@ -442,39 +442,28 @@ impl SpaceView {
                     }
                 }
             }))
-            .child({
-                // "Notes editor" affordance over the whole body column. At
-                // least fill the scroll viewport so the blank runway below the
-                // text is part of this click target (when the text is taller
-                // than the viewport the column exceeds `body_h` and scrolls
-                // instead). The editor stops click propagation over its own
-                // text, so any click reaching this column landed in the blank
-                // space around/below the text — focus the composer and drop the
-                // caret at the very end, and show the I-beam so the whole runway
-                // reads as editable (this also covers the `pb` breath strip
-                // directly under the last line, which the editor doesn't own).
-                let click_editor = editor.clone();
-                v_flex()
-                    .id("space-composer-body-col")
-                    .w_full()
-                    .min_h(px(body_h))
-                    .cursor(gpui::CursorStyle::IBeam)
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        let focus = click_editor.read(cx).focus_handle(cx);
-                        window.focus(&focus, cx);
-                        click_editor.update(cx, |e, cx| e.move_to_end(cx));
-                    }))
-                    .child(
-                        div()
-                            .w_full()
-                            .pb(px(half_pad))
-                            .child(MarkdownEditor::new(&editor).style(prose_style(cx)))
-                            .child(record_height(
-                                self.composer_content_h.clone(),
-                                cx.entity().downgrade(),
-                            )),
-                    )
-            });
+            // "Notes editor" affordance owned by the editor itself: `min_height`
+            // grows it to fill the docked runway, and a click in the blank tail
+            // below the text resolves to document end inside the editor (see
+            // `MarkdownEditor::min_height` / `offset_for_position`). No overlay
+            // listener — a click on the text stays a normal caret placement.
+            // `body_h` already carries the half-pad breath (folded into
+            // `content` by `record_height` below), so the editor's excess starts
+            // right under the last line — no dead strip.
+            .child(
+                MarkdownEditor::new(&editor)
+                    .style(prose_style(cx))
+                    .min_height(px(body_h)),
+            )
+            // Measure the editor's *natural* text height (decoupled from the
+            // `min_height` floor) and fold in the half-pad breath, so the bar
+            // sizes to the content without a feedback loop against its own floor.
+            .child(record_height(
+                self.composer_content_h.clone(),
+                editor.downgrade(),
+                cx.entity().downgrade(),
+                half_pad,
+            ));
         body.style().restrict_scroll_to_axis = Some(true);
 
         let mut composer = div()
@@ -542,25 +531,34 @@ use crate::probe::Probe as _;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Record the composer's natural (unclipped) content height each frame,
-/// scheduling a catch-up frame when it changes so the bar resizes the same
-/// frame the content settles.
+/// Record the composer's natural content height (the editor's laid-out text
+/// height, `extra` folded in for the bottom breath) into `cell`, scheduling a
+/// catch-up frame when it changes so the bar resizes as the content settles.
+/// Reads the editor's `content_height` in the **paint** phase (a later sibling,
+/// so the editor's blocks have painted and updated their bounds this frame) —
+/// this is decoupled from the editor's own `min_height`, so growing the editor
+/// to fill the runway doesn't feed back into the height that sizes the runway.
 fn record_height(
     cell: Rc<RefCell<gpui::Pixels>>,
+    editor: gpui::WeakEntity<MarkdownEditorState>,
     view: gpui::WeakEntity<SpaceView>,
+    extra: f32,
 ) -> impl IntoElement {
     gpui::canvas(
-        move |bounds, window, _| {
-            let h = bounds.size.height;
-            if (cell.borrow().as_f32() - h.as_f32()).abs() > 0.5 {
-                *cell.borrow_mut() = h;
+        |_, _, _| {},
+        move |_, _, window, cx| {
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
+            let h = editor.read(cx).content_height().as_f32() + extra;
+            if (cell.borrow().as_f32() - h).abs() > 0.5 {
+                *cell.borrow_mut() = gpui::px(h);
                 let view = view.clone();
                 window.on_next_frame(move |_, cx| {
                     view.update(cx, |_, cx| cx.notify()).ok();
                 });
             }
         },
-        |_, _, _, _| {},
     )
     .absolute()
     .size_full()

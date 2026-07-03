@@ -302,13 +302,14 @@ impl MarkdownEditorState {
         self.state.selection.head()
     }
 
-    /// Collapse the cursor to the very end of the buffer (document end).
-    /// Part of the host API: a "notes editor" host makes the blank space
-    /// below the text a click target that focuses the editor and drops the
-    /// caret after the last character (rather than jumping it to wherever the
-    /// click landed). Emits no `Change` (selection-only).
-    pub fn move_to_end(&mut self, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::MoveDocumentEnd, cx);
+    /// The editor's natural content height — the vertical extent of the laid-out
+    /// text, independent of any `min_height` the element reserves below it (this
+    /// reads the union of painted block bounds, which sit at the top regardless
+    /// of the container floor). Zero until the first paint. Hosts that grow the
+    /// editor into a taller slot (the space composer's docked runway) read this
+    /// to size themselves without a feedback loop against their own floor.
+    pub fn content_height(&self) -> Pixels {
+        self.last_bounds.map(|b| b.size.height).unwrap_or(px(0.))
     }
 
     fn dispatch(&mut self, event: EditorEvent, cx: &mut Context<Self>) {
@@ -735,6 +736,19 @@ impl MarkdownEditorState {
             return 0;
         }
 
+        // Symmetric bottom case: a click below the last line's bottom is in the
+        // editor's blank tail (the excess a `min_height` reserves below the
+        // text) — collapse to document end so clicking the runway lands the
+        // caret after the last character, notes-editor style. This is distinct
+        // from a click in an inter-block *gap* (handled by the nearest-line pass
+        // below), which is always above the last line's bottom.
+        if let Some(last_key) = keys.last()
+            && let Some(last_line) = self.last_blocks[*last_key].lines.last()
+            && position.y >= last_line.origin.y + last_line.wrapped_height
+        {
+            return self.state.markdown.len();
+        }
+
         // First pass: direct hit. If `position.y` falls in any line's
         // vertical extent, hit-test inside that line.
         //
@@ -974,6 +988,7 @@ pub struct MarkdownEditor {
     state: Entity<MarkdownEditorState>,
     style: Option<MarkdownStyle>,
     disabled: bool,
+    min_height: Option<Pixels>,
 }
 
 impl MarkdownEditor {
@@ -983,6 +998,7 @@ impl MarkdownEditor {
             state: state.clone(),
             style: None,
             disabled: false,
+            min_height: None,
         }
     }
 
@@ -1001,6 +1017,18 @@ impl MarkdownEditor {
     /// or shift-navigation) and copied. Mirrors `Input::disabled`.
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Reserve at least `height` for the editor container, so it fills a slot
+    /// taller than its text. The extra space below the last line is part of the
+    /// editor's own click surface: a click there resolves (via
+    /// `offset_for_position`) to document end, giving a "notes editor" feel
+    /// without any host-side overlay listener. The natural text height is still
+    /// reported by [`MarkdownEditorState::content_height`], so a host can size a
+    /// container from the text without feeding its own floor back in.
+    pub fn min_height(mut self, height: Pixels) -> Self {
+        self.min_height = Some(height);
         self
     }
 }
@@ -1056,6 +1084,12 @@ impl RenderOnce for MarkdownEditor {
             .text_size(style.font_size)
             .text_color(style.text_color)
             .font_family(style.font_family.clone());
+
+        // Fill a taller slot when asked; the excess below the text is part of
+        // the editor's click surface (see `min_height`).
+        if let Some(mh) = self.min_height {
+            container = container.min_h(mh);
+        }
 
         // Selection / navigation / copy handlers are registered even when
         // disabled: a read-only editor still supports selecting text (mouse

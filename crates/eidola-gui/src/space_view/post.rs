@@ -167,7 +167,11 @@ impl SpaceView {
         let bw = px(body_width(page_width));
         let focus = editor.read(cx).focus_handle(cx);
         let id = node.id.clone();
-        let click_editor = editor.clone();
+        // The editor fills the inline runway (the frame reserves a full window,
+        // minus its top/bottom padding), so a click in the blank space below the
+        // text lands inside the editor and resolves to document end — the same
+        // notes-editor affordance as the active composer, owned by the editor.
+        let editor_fill = px((window_h.as_f32() - 2.0 * POST_PAD_Y.as_f32()).max(0.0));
 
         let byline_el = v_flex()
             .w(GUTTER_WIDTH)
@@ -200,29 +204,23 @@ impl SpaceView {
                 "space-draft-inactive-{}",
                 node.id
             )))
-            // Same "notes editor" affordance as the active composer: the I-beam
-            // advertises the whole runway as editable.
-            .cursor(gpui::CursorStyle::IBeam)
-            // Clicking the blank runway re-activates the draft (floating
-            // composer), focuses its editor, and drops the caret at the end. We
-            // activate directly rather than rely on the editor's Focus event,
-            // which wouldn't fire if the editor already held focus (e.g. just
-            // after Escape deactivated it). A click *on* the text stops
-            // propagation in the editor (placing the caret where clicked); the
-            // editor's Focus event handles activation on that path. This uses
-            // `on_click` (not `on_mouse_down`): focusing during mouse-down is
-            // undone by the down event's own focus pass (the runway isn't
-            // focusable), so the focus only sticks when applied on mouse-up.
+            // Re-activate on click (byline/gutter clicks that miss the editor);
+            // `on_click` (mouse-up) so the focus sticks — focusing during
+            // mouse-down is undone by that same event's focus pass. Clicking the
+            // editor itself activates via its `Focus` event; the editor also
+            // owns caret placement (text → clicked position, blank tail → end),
+            // so there's no cursor-resetting overlay here.
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.activate_draft(id.clone(), cx);
                 window.focus(&focus, cx);
-                click_editor.update(cx, |e, cx| e.move_to_end(cx));
             }))
             .child(byline_el)
             .child(
-                div()
-                    .w(bw)
-                    .child(MarkdownEditor::new(&editor).style(prose_style(cx))),
+                div().w(bw).child(
+                    MarkdownEditor::new(&editor)
+                        .style(prose_style(cx))
+                        .min_height(editor_fill),
+                ),
             )
             .child(record_height(
                 self.layout.clone(),
