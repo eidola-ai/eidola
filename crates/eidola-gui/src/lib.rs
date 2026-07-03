@@ -5,6 +5,7 @@ pub mod about;
 pub mod account;
 pub mod actions;
 pub mod bridge;
+pub mod chrome;
 pub mod general;
 pub mod library;
 pub mod loadable;
@@ -160,6 +161,18 @@ pub fn run() {
         // interacts with anything.
         cx.activate(true);
 
+        // Linux lifecycle: quit when the last window closes. There is no
+        // dock or menu-bar presence to keep a windowless app reachable
+        // (macOS keeps running and reopens via `on_reopen`); a lingering
+        // headless process is just a leak on Linux.
+        #[cfg(not(target_os = "macos"))]
+        cx.on_window_closed(|cx, _window_id| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+
         open_main_window(cx);
 
         // First-run onboarding: with no account configured, open the "Get
@@ -259,17 +272,19 @@ fn install_menus(cx: &mut App) {
 /// Public because the UI driver (`examples/driver.rs`) installs the same
 /// keymap as the real app so simulated keystrokes resolve identically.
 pub fn install_keybindings(cx: &mut App) {
+    // Chord-style commands bind with gpui's `secondary-` alias (⌘ on macOS,
+    // Ctrl on Linux/Windows) so one table serves both platforms: Ctrl+N /
+    // Ctrl+Q / Ctrl+, etc. are the Linux idiom. Window-management chords
+    // (Hide/Minimize) are macOS concepts — on Wayland the compositor owns
+    // window management (Super+H etc.), so they are bound only on macOS.
     cx.bind_keys([
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-n", NewSpace, None),
-        KeyBinding::new("cmd-l", OpenLibrary, None),
-        KeyBinding::new("cmd-shift-l", OpenRecord, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-h", Hide, None),
-        KeyBinding::new("alt-cmd-h", HideOthers, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("cmd-alt-i", ToggleInspector, None),
+        KeyBinding::new("secondary-,", OpenSettings, None),
+        KeyBinding::new("secondary-n", NewSpace, None),
+        KeyBinding::new("secondary-l", OpenLibrary, None),
+        KeyBinding::new("secondary-shift-l", OpenRecord, None),
+        KeyBinding::new("secondary-w", CloseWindow, None),
+        KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("secondary-alt-i", ToggleInspector, None),
         // ⌘↩ (post & ask) and ⌘⇧↩ (post only) are *not* bound here. The
         // composer owns those chords — `gpui_markdown_editor::init` binds them
         // in the `MarkdownEditor` context to `Enter { secondary: true, .. }`,
@@ -277,17 +292,36 @@ pub fn install_keybindings(cx: &mut App) {
         // `space_view::composer::create_draft_node`) routes that to
         // `Send`/`PostOnly`. Binding them here too would shadow the editor
         // (the composer is the inner focus) and break the inversion.
-        // ⌥⌘M — the space view's request panel (the handler no-ops without a
-        // composer to anchor to). Scoped to SpaceView so the distinct
-        // keystroke never competes with the global ⌘M (Minimize). Esc routes
-        // through the composer's own key handler (panel first, then draft
-        // deactivation), so no Esc binding here.
+        // ⌥⌘M / Ctrl+Alt+M — the space view's request panel (the handler
+        // no-ops without a composer to anchor to). Scoped to SpaceView so the
+        // distinct keystroke never competes with the macOS-global ⌘M
+        // (Minimize). Esc routes through the composer's own key handler (panel
+        // first, then draft deactivation), so no Esc binding here.
         KeyBinding::new(
-            "cmd-alt-m",
+            "secondary-alt-m",
             crate::actions::ToggleModelPicker,
             Some("SpaceView"),
         ),
     ]);
+
+    // macOS window/app management — no Linux analogue (hide is an AppKit
+    // concept; minimize belongs to the compositor on Wayland).
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("cmd-h", Hide, None),
+        KeyBinding::new("alt-cmd-h", HideOthers, None),
+        KeyBinding::new("cmd-m", Minimize, None),
+    ]);
+
+    // Linux: F10 toggles the primary menu (the desktop-standard key for the
+    // header-bar menu). Handled by `chrome::ChromeRoot`, an ancestor of
+    // every focused element, so a global binding always reaches it.
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([KeyBinding::new(
+        "f10",
+        crate::chrome::TogglePrimaryMenu,
+        None,
+    )]);
 
     // The composer's own keymap (motion, editing, clipboard, and the submit
     // chords) is self-contained in the editor crate, scoped to the
@@ -512,24 +546,46 @@ fn centered_window_bounds(cx: &mut App, w: f32, h: f32) -> Option<WindowBounds> 
     )))
 }
 
+/// The shared window options for every Eidola window: the transparent
+/// titlebar (macOS), and on Linux the client-side-decoration request plus a
+/// transparent surface (so the CSD shadow/rounded-corner padding drawn by
+/// `chrome::ChromeRoot` is actually see-through) and the Wayland `app_id`
+/// (matching the shipped `.desktop` file so the shell can associate windows
+/// with the app's identity and icon).
+fn base_window_options(bounds: Option<WindowBounds>, min_w: f32, min_h: f32) -> WindowOptions {
+    WindowOptions {
+        window_bounds: bounds,
+        titlebar: Some(transparent_titlebar()),
+        kind: WindowKind::Normal,
+        window_min_size: Some(size(px(min_w), px(min_h))),
+        #[cfg(not(target_os = "macos"))]
+        window_decorations: Some(gpui::WindowDecorations::Client),
+        #[cfg(not(target_os = "macos"))]
+        window_background: gpui::WindowBackgroundAppearance::Transparent,
+        #[cfg(not(target_os = "macos"))]
+        app_id: Some(APP_ID.into()),
+        ..Default::default()
+    }
+}
+
+/// Wayland application id — must equal the basename of the shipped
+/// `.desktop` file (`releases/linux/tech.m6i.Eidola.desktop`) for the shell
+/// to resolve the window to its launcher entry (name, icon, pinning).
+#[cfg(not(target_os = "macos"))]
+const APP_ID: &str = "tech.m6i.Eidola";
+
 /// Open the About window — a small singleton (~360×420). Shows the wordmark,
 /// version, a quiet purpose copy (echoing the welcome page's voice), the
 /// license note, and a "View on GitHub" link.
 fn open_about_window(cx: &mut App) {
     let bounds = centered_window_bounds(cx, 360., 420.);
-
-    let opts = WindowOptions {
-        window_bounds: bounds,
-        titlebar: Some(transparent_titlebar()),
-        kind: WindowKind::Normal,
-        window_min_size: Some(size(px(300.), px(340.))),
-        ..Default::default()
-    };
+    let opts = base_window_options(bounds, 300., 340.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
         let view = cx.new(|cx| AboutView::new(window, cx));
-        cx.new(|cx| Root::new(view, window, cx))
+        let view = chrome::ChromeRoot::wrap(view.into(), cx);
+        cx.new(|cx| chrome::themed_root(view, window, cx))
     });
 
     if let Ok(handle) = handle {
@@ -571,20 +627,14 @@ fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
     // Square chat window — a sheet of paper, not a wide chat pane.
     let side = writing_surface_side(cx);
     let bounds = centered_window_bounds(cx, side, side);
-
-    let opts = WindowOptions {
-        window_bounds: bounds,
-        titlebar: Some(transparent_titlebar()),
-        kind: WindowKind::Normal,
-        window_min_size: Some(size(px(480.), px(360.))),
-        ..Default::default()
-    };
+    let opts = base_window_options(bounds, 480., 360.);
 
     let _ = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
         let wi = WindowInput::new(cx);
         let view = cx.new(|cx| SpaceView::new(stores.clone(), space_id.clone(), wi, window, cx));
-        cx.new(|cx| Root::new(view, window, cx))
+        let view = chrome::ChromeRoot::wrap(view.into(), cx);
+        cx.new(|cx| chrome::themed_root(view, window, cx))
     });
 
     // Bring the app forward so the new window comes to the front, even when
@@ -600,19 +650,13 @@ fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
 fn open_library_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 520., 620.);
-
-    let opts = WindowOptions {
-        window_bounds: bounds,
-        titlebar: Some(transparent_titlebar()),
-        kind: WindowKind::Normal,
-        window_min_size: Some(size(px(380.), px(320.))),
-        ..Default::default()
-    };
+    let opts = base_window_options(bounds, 380., 320.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
         let view = cx.new(|cx| LibraryView::new(stores.clone(), window, cx));
-        cx.new(|cx| Root::new(view, window, cx))
+        let view = chrome::ChromeRoot::wrap(view.into(), cx);
+        cx.new(|cx| chrome::themed_root(view, window, cx))
     });
 
     if let Ok(handle) = handle {
@@ -626,19 +670,13 @@ fn open_library_window(cx: &mut App) {
 fn open_updates_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 480., 360.);
-
-    let opts = WindowOptions {
-        window_bounds: bounds,
-        titlebar: Some(transparent_titlebar()),
-        kind: WindowKind::Normal,
-        window_min_size: Some(size(px(420.), px(300.))),
-        ..Default::default()
-    };
+    let opts = base_window_options(bounds, 420., 300.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
         let view = cx.new(|cx| UpdatesView::new(stores.clone(), window, cx));
-        cx.new(|cx| Root::new(view, window, cx))
+        let view = chrome::ChromeRoot::wrap(view.into(), cx);
+        cx.new(|cx| chrome::themed_root(view, window, cx))
     });
 
     if let Ok(handle) = handle {
@@ -653,19 +691,13 @@ fn open_updates_window(cx: &mut App) {
 fn open_record_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 860., 640.);
-
-    let opts = WindowOptions {
-        window_bounds: bounds,
-        titlebar: Some(transparent_titlebar()),
-        kind: WindowKind::Normal,
-        window_min_size: Some(size(px(560.), px(400.))),
-        ..Default::default()
-    };
+    let opts = base_window_options(bounds, 560., 400.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
         let view = cx.new(|cx| RecordView::new(stores.clone(), window, cx));
-        cx.new(|cx| Root::new(view, window, cx))
+        let view = chrome::ChromeRoot::wrap(view.into(), cx);
+        cx.new(|cx| chrome::themed_root(view, window, cx))
     });
 
     if let Ok(handle) = handle {
@@ -681,19 +713,13 @@ fn open_onboarding_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let side = writing_surface_side(cx);
     let bounds = centered_window_bounds(cx, side, side);
-
-    let opts = WindowOptions {
-        window_bounds: bounds,
-        titlebar: Some(transparent_titlebar()),
-        kind: WindowKind::Normal,
-        window_min_size: Some(size(px(480.), px(360.))),
-        ..Default::default()
-    };
+    let opts = base_window_options(bounds, 480., 360.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
         let view = cx.new(|cx| OnboardingView::new(stores.clone(), window, cx));
-        cx.new(|cx| Root::new(view, window, cx))
+        let view = chrome::ChromeRoot::wrap(view.into(), cx);
+        cx.new(|cx| chrome::themed_root(view, window, cx))
     });
 
     if let Ok(handle) = handle {
@@ -705,20 +731,14 @@ fn open_onboarding_window(cx: &mut App) {
 fn open_settings_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
     let bounds = centered_window_bounds(cx, 620., 520.);
-
-    let opts = WindowOptions {
-        window_bounds: bounds,
-        titlebar: Some(transparent_titlebar()),
-        kind: WindowKind::Normal,
-        window_min_size: Some(size(px(420.), px(320.))),
-        ..Default::default()
-    };
+    let opts = base_window_options(bounds, 420., 320.);
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
         let wi = WindowInput::new(cx);
         let view = cx.new(|cx| SettingsView::new(stores.clone(), wi, window, cx));
-        cx.new(|cx| Root::new(view, window, cx))
+        let view = chrome::ChromeRoot::wrap(view.into(), cx);
+        cx.new(|cx| chrome::themed_root(view, window, cx))
     });
 
     if let Ok(handle) = handle {

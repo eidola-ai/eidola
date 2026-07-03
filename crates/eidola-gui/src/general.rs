@@ -520,7 +520,10 @@ impl Render for GeneralView {
                         h_flex().text_xs().text_color(theme.muted_foreground).child(
                             quiet_link(
                                 "open-record",
-                                "Inspect attestation evidence in the Record (⇧⌘L)",
+                                format!(
+                                    "Inspect attestation evidence in the Record ({})",
+                                    crate::actions::primary_shift_chord("L")
+                                ),
                                 cx,
                             )
                             .probe(
@@ -544,7 +547,10 @@ impl Render for GeneralView {
                     .text_xs()
                     .italic()
                     .text_color(theme.muted_foreground.opacity(0.8))
-                    .child("Hold ⌥ for advanced configuration."),
+                    .child(format!(
+                        "Hold {} for advanced configuration.",
+                        crate::actions::alt_name()
+                    )),
             );
         }
 
@@ -624,14 +630,18 @@ fn choice_chip(
 
 /// A quiet inline text link: muted, brightening on hover. The settings
 /// surface's only interaction affordance besides explicit buttons.
-fn quiet_link(id: &'static str, label: &'static str, cx: &gpui::App) -> gpui::Stateful<gpui::Div> {
+fn quiet_link(
+    id: &'static str,
+    label: impl Into<gpui::SharedString>,
+    cx: &gpui::App,
+) -> gpui::Stateful<gpui::Div> {
     let theme = cx.theme();
     div()
         .id(id)
         .cursor_pointer()
         .text_color(theme.link)
         .hover(|s| s.text_color(theme.link_hover))
-        .child(label)
+        .child(label.into())
 }
 
 fn error_banner(message: &str, cx: &gpui::App) -> impl IntoElement {

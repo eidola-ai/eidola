@@ -1,0 +1,18 @@
+# Desktop entry for the Linux GUI. The basename MUST equal the Wayland
+# app_id set in crates/eidola-gui/src/lib.rs (`APP_ID`) — that equality is
+# how GNOME/KDE associate our windows with this entry (name in Alt-Tab and
+# the shell, icon, dock pinning).
+#
+# The Icon key names a themed icon (`tech.m6i.Eidola.{svg,png}` under
+# share/icons/hicolor/...) that does not exist yet — shipping the reference
+# is harmless (shells fall back to a generic icon) and it lights up the
+# moment a real brand asset lands. See AGENTS.md → Linux.
+[Desktop Entry]
+Type=Application
+Name=Eidola
+Comment=A quiet page for thinking with a machine — private by construction
+Exec=eidola-gui %U
+Icon=tech.m6i.Eidola
+Terminal=false
+Categories=Utility;Network;
+Keywords=AI;chat;private;confidential;

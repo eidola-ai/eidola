@@ -761,10 +761,18 @@ with open(path, "wb") as f:
                 nativeBuildInputs = [ pkgs.makeWrapper ];
               }
               ''
-                mkdir -p $out/bin
+                mkdir -p $out/bin $out/share/applications
                 icds=$(ls ${pkgs.mesa}/share/vulkan/icd.d/*.json | tr '\n' ':')
                 makeWrapper ${eidolaGuiLinux}/bin/eidola-gui $out/bin/eidola-gui \
                   --set-default VK_ADD_DRIVER_FILES "''${icds%:}"
+                # Desktop entry — basename matches the Wayland app_id the
+                # binary sets (lib.rs APP_ID), which is what lets the shell
+                # resolve our windows to this entry. Strip the comment header
+                # (leading lines starting with '#'): desktop-file spec allows
+                # comments, but some validators are strict about the first
+                # line being the group header.
+                grep -v '^#' ${./releases/linux/tech.m6i.Eidola.desktop} \
+                  > $out/share/applications/tech.m6i.Eidola.desktop
               '';
 
       in
