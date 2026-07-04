@@ -3367,6 +3367,98 @@ fn space_composer_dock_shadow_is_stable_cold(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn space_resize_above_column_cap_does_not_churn_height_cache(cx: &mut TestAppContext) {
+    // REGRESSION (resize jitter): a post's measured height depends only on the
+    // reading column (`body_width`), which is capped at `BODY_MAX_WIDTH` above a
+    // ~836px window. So resizing a *wide* window does not reflow any post — yet
+    // the height cache used to be keyed on the raw window width, so every resize
+    // cleared it, dropped every post back to a rough estimate, and jittered the
+    // page (and minimap) as the near-viewport posts re-measured estimate→real.
+    // The cache is now keyed on `body_width`, so a resize that leaves the column
+    // unchanged does not invalidate it at all.
+    use eidola_app_core::{PostBlock, PostNode, PostParticipant};
+    let post = |aid: &str, parent: Option<&str>, text: &str| PostNode {
+        action_id: aid.into(),
+        item_id: format!("item-{aid}"),
+        parent_action_id: parent.map(Into::into),
+        participant: PostParticipant {
+            kind: "human".into(),
+            label: "You".into(),
+        },
+        action_type: "user_input".into(),
+        generation: 0,
+        generation_count: 1,
+        is_current: true,
+        model: None,
+        credits_consumed: None,
+        relation: parent.map(|_| "reply".to_string()),
+        depth: 0,
+        is_branch: false,
+        blocks: vec![PostBlock {
+            block_type: "text".into(),
+            text: Some(text.into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }],
+        references: Vec::new(),
+        created_at: 0,
+    };
+    let mut nodes = Vec::new();
+    for i in 0..12 {
+        let aid = format!("a{i}");
+        let parent = if i == 0 {
+            None
+        } else {
+            Some(format!("a{}", i - 1))
+        };
+        nodes.push(post(
+            &aid,
+            parent.as_deref(),
+            "A few sentences of body text so each post has a realistic height, tall enough \
+             that the transcript overflows the window several times over.",
+        ));
+    }
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("warm".into()));
+    view.update(cx, |v, cx| {
+        v.space()
+            .update(cx, |s, cx| s.set_post_tree_for_test(nodes, cx));
+    });
+    cx.run_until_parked();
+
+    let vcx = VisualTestContext::from_window(window, cx);
+    // Settle at 1200px (well above the ~836px column cap → body_width == 600).
+    vcx.simulate_resize(gpui::size(px(1200.), px(560.)));
+    vcx.run_until_parked();
+    let clears_start = view.read_with(&vcx, |v, _| v.layout_clears_for_test());
+
+    // Resize among several widths, all above the cap: the column never changes,
+    // so the cache must never be invalidated — no churn, no jitter.
+    for w in [1100., 1000., 950., 1400.] {
+        vcx.simulate_resize(gpui::size(px(w), px(560.)));
+        vcx.run_until_parked();
+    }
+    let clears_wide = view.read_with(&vcx, |v, _| v.layout_clears_for_test());
+    assert_eq!(
+        clears_wide, clears_start,
+        "resizing above the reading-column cap must not invalidate the height cache \
+         (started {clears_start}, ended {clears_wide}); a clear is what jittered the page"
+    );
+
+    // Sanity: a resize *below* the cap genuinely changes the column, so the cache
+    // must invalidate — proving the assertion above can actually observe a clear.
+    vcx.simulate_resize(gpui::size(px(600.), px(560.)));
+    vcx.run_until_parked();
+    let clears_narrow = view.read_with(&vcx, |v, _| v.layout_clears_for_test());
+    assert!(
+        clears_narrow > clears_wide,
+        "resizing below the column cap should invalidate the cache (the column really \
+         did change): clears {clears_wide} -> {clears_narrow}"
+    );
+}
+
+#[gpui::test]
 fn space_blank_composer_does_not_scroll(cx: &mut TestAppContext) {
     // REGRESSION: a brand-new space (just the composer) reserved a phantom
     // scroll range equal to the titlebar reserve. The document is laid out

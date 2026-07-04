@@ -31,10 +31,14 @@ use gpui::SharedString;
 /// only visible posts actually shape.
 #[derive(Clone, Default)]
 pub struct Layout {
-    /// The page width the cached heights were measured at.
+    /// The **reading-column** width (`body_width`) the cached heights were
+    /// measured at — a post's height depends only on this, not the window width.
     width: Rc<Cell<f32>>,
     /// Measured block height (byline + body, the full post element) by node id.
     heights: Rc<RefCell<HashMap<SharedString, f32>>>,
+    /// How many times the cache has been invalidated (a resize that leaves the
+    /// reading column unchanged must not bump this). Test-observable.
+    clears: Rc<Cell<u32>>,
 }
 
 impl Layout {
@@ -42,13 +46,22 @@ impl Layout {
         Self::default()
     }
 
-    /// Point the cache at `width`, clearing measurements if it changed. Call
-    /// once per frame before reading heights.
+    /// Point the cache at reading-column `width`, clearing measurements if it
+    /// changed. Call once per frame before reading heights. Because the width is
+    /// the *clamped* `body_width` (not the raw window width), resizes above the
+    /// column cap don't invalidate anything — the measured heights survive, so
+    /// the document height and scroll offset stay stable across the resize.
     pub fn ensure_width(&self, width: f32) {
         if (self.width.get() - width).abs() > 0.5 {
             self.width.set(width);
             self.heights.borrow_mut().clear();
+            self.clears.set(self.clears.get().wrapping_add(1));
         }
+    }
+
+    /// How many times the cache has been invalidated (test seam).
+    pub fn clears(&self) -> u32 {
+        self.clears.get()
     }
 
     /// Record a freshly-measured height for `id` (called from an on-screen

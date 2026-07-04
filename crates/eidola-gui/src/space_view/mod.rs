@@ -486,6 +486,14 @@ impl SpaceView {
         self.deactivate_active_draft(cx);
     }
 
+    /// How many times the layout height cache has been invalidated (cleared).
+    /// A resize that doesn't change the reading-column width must not bump this
+    /// — that's the resize-jitter fix (the cache is keyed on `body_width`).
+    #[doc(hidden)]
+    pub fn layout_clears_for_test(&self) -> u32 {
+        self.layout.clears()
+    }
+
     // -- Snapshot & model resolution --------------------------------------
 
     /// Rebuild the per-row render snapshot from the shared `Space`'s transcript.
@@ -733,9 +741,17 @@ impl Render for SpaceView {
         }
         self.last_page_width = Some(page_width);
 
-        // Point the height cache at the current width (clears on change) and
-        // make sure every post/scroller has its editor + scroll handle.
-        self.layout.ensure_width(page_width.as_f32());
+        // Point the height cache at the current **reading-column** width — the
+        // only thing a post's measured height depends on — not the raw window
+        // width. Above ~836px the column is capped at `BODY_MAX_WIDTH`, so a
+        // resize there leaves `body_width` unchanged and the cache is *not*
+        // invalidated: the (partially measured) heights survive, the document
+        // height stays put, and the scroll offset doesn't ratchet. Keying on the
+        // raw width instead cleared the whole cache on every resize, dropping
+        // every post back to a rough estimate and jittering the page (and the
+        // minimap) as the near-viewport posts re-measured estimate→real — even
+        // where no text reflows. See `layout::body_width`.
+        self.layout.ensure_width(layout::body_width(page_width));
         self.sync_bodies(window, cx);
         // Keep a docked tail draft at the end of every branch (the always-present
         // composer that replaces the leaf "+").
