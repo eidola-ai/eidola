@@ -118,7 +118,7 @@ jobs:
       - name: Cache CVM artifacts # zizmor: ignore[cache-poisoning]
         # Not gated on tags: CVM artifacts are content-addressed (kernel/initrd
         # hash-verified on fetch), so a restored entry cannot alter outputs.
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/eidola/cvm
           key: cvm-${{ hashFiles('tinfoil-config.yml') }}
@@ -422,7 +422,7 @@ jobs:
         # CVM kernel/initrd downloads are Sigstore-verified by the
         # --verify-attestations flag below, so a poisoned cache is rejected
         # at verification time.
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/eidola/cvm
           key: cvm-${{ hashFiles('tinfoil-config.yml') }}
