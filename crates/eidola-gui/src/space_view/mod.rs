@@ -321,6 +321,16 @@ pub struct SpaceView {
     pub(crate) minimap_hovered: bool,
     pub(crate) minimap_fade_gen: usize,
     pub(crate) minimap_hide_task: Option<Task<()>>,
+    /// The minimap container's absolute painted bounds, recorded each frame so a
+    /// mousedown/drag can convert a window-space y into a minimap-local y (the
+    /// container spans the full viewport height on the right edge).
+    pub(crate) minimap_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// An in-flight scrollbar-style minimap drag, if any. Set on a same-branch
+    /// (or handle) mousedown and cleared on mouse-up; while set, window-global
+    /// move/up listeners drag `page_scroll` (see [`minimap`]). Locked to the
+    /// selected branch for the drag's duration — the snapshotted `scale`/floor
+    /// stay valid because the branch (and thus the page height) is fixed.
+    pub(crate) minimap_drag: Option<minimap::MinimapDrag>,
 
     /// A minimal honest error band (e.g. a submit failing before onboarding
     /// exists). Full onboarding is a later, separate window.
@@ -407,6 +417,8 @@ impl SpaceView {
             minimap_hovered: false,
             minimap_fade_gen: 0,
             minimap_hide_task: None,
+            minimap_bounds: Rc::new(Cell::new(None)),
+            minimap_drag: None,
             error: None,
         };
         this.rebuild(cx);

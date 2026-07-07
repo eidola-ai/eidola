@@ -288,32 +288,6 @@ impl SpaceView {
         }
     }
 
-    /// Navigate the page to a node (a minimap column click): select the branch
-    /// leading to it, then scroll so its top sits comfortably in view.
-    pub(crate) fn navigate_to_node(
-        &mut self,
-        node_id: gpui::SharedString,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let viewport = window.viewport_size();
-        let streaming = self.space.read(cx).is_streaming();
-        let tree = self.effective_tree(viewport.width, streaming);
-        if super::model::node_ref(&tree, &node_id).is_none() {
-            return;
-        }
-        self.select_path_to(&tree, &node_id, viewport.width);
-        if let Some(doc_top) =
-            self.selected_path_doc_top(&tree, &node_id, viewport.width, viewport.height)
-        {
-            // Land the node's top ~28% down the window.
-            let y = (viewport.height.as_f32() * 0.28 - doc_top).min(0.0);
-            let off = self.page_scroll.offset();
-            self.page_scroll.set_offset(point(off.x, px(y)));
-        }
-        cx.notify();
-    }
-
     /// Select the branch leading to `target` at every level (set each ancestor's
     /// scroller to the child on the path). Used to bring an off-branch composer
     /// onto the selected path.

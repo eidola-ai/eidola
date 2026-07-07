@@ -12,7 +12,8 @@
 
 use gpui::{
     Animation, AnimationExt, AnyElement, Context, Hsla, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity, div, px,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, WeakEntity, div, point, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
@@ -22,6 +23,83 @@ use super::model::{NodeSrc, TreeNode};
 use super::{
     BAND_HEIGHT, MINIMAP_COL_GAP, MINIMAP_FADE, MINIMAP_HIDE_DELAY, MINIMAP_WIDTH, SpaceView,
 };
+
+// ---------------------------------------------------------------------------
+// The scrollbar-like minimap interaction — pure mapping math + drag state.
+//
+// The minimap column is a linear 1:1 image of the scrollable document: with
+// `scale = viewport_h / total_h`, a document position `doc` maps to minimap-local
+// y `doc * scale`, and inversely a minimap-local y `m` maps to document position
+// `m / scale`. A document element with doc-space top `doc_top` paints at screen y
+// `doc_top + scroll_y` (scroll sign convention: `scroll_y <= 0`, scrolling down
+// makes it more negative). The "handle" (the dark on-screen indicator) occupies
+// minimap y-range `[t0, t1]` with `t0 = (-scroll_y) * scale`, `t1 = t0 +
+// viewport_h * scale`.
+// ---------------------------------------------------------------------------
+
+/// An in-flight scrollbar-style minimap drag. Snapshotted at drag start: the
+/// selected branch is locked for the drag's duration, so `scale` and the scroll
+/// `floor` stay valid (the page height can't change without a branch switch,
+/// which a drag never does).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MinimapDrag {
+    /// The grabbed offset within the handle, in minimap-local y (px). On a handle
+    /// press this is `m - t0` (no jump); on a track press it's half the handle
+    /// height (the handle jumps to center on the cursor).
+    pub(crate) grab: f32,
+    /// `viewport_h / total_h` at drag start (stable while the branch is fixed).
+    pub(crate) scale: f32,
+    /// The most-negative valid `page_scroll` y for the locked branch (the floor).
+    pub(crate) floor: f32,
+}
+
+/// The document position under a press at minimap-local y `m`: `m / scale`.
+pub(crate) fn doc_at_minimap_y(m: f32, scale: f32) -> f32 {
+    if scale <= 0.0 { 0.0 } else { m / scale }
+}
+
+/// The vertical fraction (0..1) within a cell whose document range is
+/// `[doc_top, doc_top + height]`, for a press at minimap-local y `m`.
+pub(crate) fn cell_fraction(m: f32, scale: f32, doc_top: f32, height: f32) -> f32 {
+    if height <= 0.0 {
+        return 0.0;
+    }
+    ((doc_at_minimap_y(m, scale) - doc_top) / height).clamp(0.0, 1.0)
+}
+
+/// The `page_scroll` y that lands document point `doc_click` directly under a
+/// cursor at minimap-local y `m` (direct manipulation), clamped to `[floor, 0]`.
+pub(crate) fn scroll_for_press(m: f32, doc_click: f32, floor: f32) -> f32 {
+    (m - doc_click).clamp(floor, 0.0)
+}
+
+/// The handle's minimap y-range `[t0, t1]` for a given `scroll_y`.
+pub(crate) fn handle_range(scroll_y: f32, viewport_h: f32, scale: f32) -> (f32, f32) {
+    let t0 = -scroll_y * scale;
+    (t0, t0 + viewport_h * scale)
+}
+
+/// The grab offset for a press at minimap-local y `m`: pressing on the handle
+/// grabs at the press offset (`m - t0`, no jump); pressing the track outside it
+/// jumps the handle center to the cursor (`viewport_h * scale / 2`).
+pub(crate) fn drag_grab(m: f32, scroll_y: f32, viewport_h: f32, scale: f32) -> f32 {
+    let (t0, t1) = handle_range(scroll_y, viewport_h, scale);
+    if m >= t0 && m <= t1 {
+        m - t0
+    } else {
+        viewport_h * scale / 2.0
+    }
+}
+
+/// The `page_scroll` y during a drag, for a cursor at minimap-local y `m`:
+/// `t0' = m - grab`, `scroll_y = -t0' / scale`, clamped to `[floor, 0]`.
+pub(crate) fn drag_scroll(m: f32, grab: f32, scale: f32, floor: f32) -> f32 {
+    if scale <= 0.0 {
+        return 0.0;
+    }
+    let t0 = m - grab;
+    (-t0 / scale).clamp(floor, 0.0)
+}
 
 impl SpaceView {
     /// Record a scroll event for the minimap's show/hide. `moved` is whether the
@@ -204,8 +282,11 @@ impl SpaceView {
                         div().w_full().h_full().bg(flat)
                     };
 
-                    // Each column is a click-to-navigate entry in the map's
-                    // "table of contents" — a labelled, selectable button.
+                    // Each column is a selectable entry in the map's "table of
+                    // contents" — a labelled button that, on mousedown, either
+                    // navigates to a different branch (positioning by the click's
+                    // vertical offset within the item) or, on the selected branch,
+                    // begins a scrollbar-style drag (see `minimap_press`).
                     let sib_id = sib.id.clone();
                     let mut wrap = div()
                         .id(SharedString::from(format!("space-mm-{level}-{i}")))
@@ -219,11 +300,26 @@ impl SpaceView {
                         .h_full()
                         .child(cell);
                     if interactive {
-                        wrap = wrap.cursor_pointer().on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.navigate_to_node(sib_id.clone(), window, cx);
-                            },
-                        ));
+                        // Snapshot this cell's rendered geometry (its level's
+                        // document top and the row height, both shared across the
+                        // row's columns) so the handler can map the press.
+                        let cell_doc_top = doc_y;
+                        let cell_h = h;
+                        wrap = wrap.cursor_pointer().on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                this.minimap_press(
+                                    sib_id.clone(),
+                                    is_active,
+                                    cell_doc_top,
+                                    cell_h,
+                                    scale,
+                                    ev.position.y.as_f32(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        );
                     }
                     row = row.child(wrap);
                 }
@@ -235,6 +331,51 @@ impl SpaceView {
                 col = col.child(div().w_full().h(px(pad * scale)));
             }
             container = container.child(col);
+            // An invisible, hitbox-free overlay that (prepaint) records the
+            // container's absolute bounds — so a mousedown/drag can convert a
+            // window-space y into a minimap-local y — and (paint) registers the
+            // window-global move/up listeners a scrollbar-style drag needs to keep
+            // tracking after the cursor leaves the 36px strip. `on_mouse_event`
+            // listeners are cleared each frame, so they are re-registered every
+            // frame (mirroring `gpui_component::Scrollbar`); they no-op unless a
+            // drag is actually in flight, so registering unconditionally is cheap
+            // and avoids a first-move gap.
+            let bounds_cell = self.minimap_bounds.clone();
+            let weak = cx.entity().downgrade();
+            container = container.child(
+                gpui::canvas(
+                    move |bounds, _, _| bounds_cell.set(Some(bounds)),
+                    move |_bounds, _, window, _cx| {
+                        let move_weak = weak.clone();
+                        window.on_mouse_event(move |ev: &MouseMoveEvent, _phase, _window, cx| {
+                            let Some(this) = move_weak.upgrade() else {
+                                return;
+                            };
+                            this.update(cx, |this, cx| {
+                                if this.minimap_drag.is_none() {
+                                    return;
+                                }
+                                if !ev.dragging() {
+                                    // Button released without a delivered up event.
+                                    this.minimap_drag_end(cx);
+                                    return;
+                                }
+                                cx.stop_propagation();
+                                this.minimap_drag_move(ev.position.y.as_f32(), cx);
+                            });
+                        });
+                        let up_weak = weak.clone();
+                        window.on_mouse_event(move |_ev: &MouseUpEvent, _phase, _window, cx| {
+                            let Some(this) = up_weak.upgrade() else {
+                                return;
+                            };
+                            this.update(cx, |this, cx| this.minimap_drag_end(cx));
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            );
         }
 
         if self.minimap_visible {
@@ -255,6 +396,112 @@ impl SpaceView {
                     |el, delta| el.opacity(1.0 - delta),
                 )
                 .into_any_element()
+        }
+    }
+
+    /// Minimap-local y of a window-space y, using the container bounds recorded
+    /// last frame (the container spans the full viewport height, right-edge).
+    fn minimap_local_y(&self, window_y: f32) -> f32 {
+        let top = self
+            .minimap_bounds
+            .get()
+            .map(|b| b.origin.y.as_f32())
+            .unwrap_or(0.0);
+        window_y - top
+    }
+
+    /// Handle a mousedown on a minimap cell. A press on a **different** branch
+    /// (not the selected path) switches to it and positions by the click's
+    /// vertical offset within the item (direct manipulation), completing the
+    /// interaction — no drag follows, because switching branches changes the page
+    /// height. A press on the **selected** branch (or the on-screen handle) begins
+    /// a scrollbar-style drag locked to that branch (see [`MinimapDrag`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn minimap_press(
+        &mut self,
+        node_id: SharedString,
+        is_active: bool,
+        cell_doc_top: f32,
+        cell_height: f32,
+        scale: f32,
+        window_y: f32,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let m = self.minimap_local_y(window_y);
+        let viewport = window.viewport_size();
+        let page_width = viewport.width;
+        let window_h = viewport.height;
+
+        if !is_active {
+            // Different branch: navigate + complete. Position so the pressed
+            // document point lands under the cursor on the new page.
+            let fraction = cell_fraction(m, scale, cell_doc_top, cell_height);
+            let streaming = self.space.read(cx).is_streaming();
+            let tree = self.effective_tree(page_width, streaming);
+            if super::model::node_ref(&tree, &node_id).is_none() {
+                return;
+            }
+            // Order matters: switch the branch first, then read the new layout —
+            // the doc positions sum heights along the *selected* path.
+            self.select_path_to(&tree, &node_id, page_width);
+            if let Some(new_top) = self.selected_path_doc_top(&tree, &node_id, page_width, window_h)
+            {
+                let new_h = super::model::node_ref(&tree, &node_id)
+                    .map(|n| self.node_height(n, page_width, window_h))
+                    .unwrap_or(cell_height);
+                let doc_click = new_top + fraction * new_h;
+                // Clamp against the *new* branch's scroll range (its height
+                // changed with the switch).
+                let total = self.doc_reserve()
+                    + self.selected_total_height(&tree, page_width, window_h)
+                    + self.floating_pad(&tree, page_width, window_h, streaming);
+                let floor = (window_h.as_f32() - total).min(0.0);
+                let y = scroll_for_press(m, doc_click, floor);
+                let off = self.page_scroll.offset();
+                self.page_scroll.set_offset(point(off.x, px(y)));
+            }
+            self.minimap_visible = true;
+            self.arm_minimap_hide(cx);
+            cx.notify();
+            return;
+        }
+
+        // Same branch (or the handle): start a drag. Grab at the press offset on
+        // the handle (no jump), or jump the handle center to the cursor on the
+        // track — then apply once so the initial press already positions.
+        let scroll_y = self.clamped_scroll_y();
+        let grab = drag_grab(m, scroll_y, window_h.as_f32(), scale);
+        let floor = self.scroll_min_y.get();
+        let y = drag_scroll(m, grab, scale, floor);
+        let off = self.page_scroll.offset();
+        self.page_scroll.set_offset(point(off.x, px(y)));
+        self.minimap_drag = Some(MinimapDrag { grab, scale, floor });
+        self.minimap_visible = true;
+        self.arm_minimap_hide(cx);
+        cx.notify();
+    }
+
+    /// One frame of an active minimap drag: move `page_scroll` so the grabbed
+    /// handle point tracks the cursor at minimap-local y from `window_y`.
+    pub(crate) fn minimap_drag_move(&mut self, window_y: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.minimap_drag else {
+            return;
+        };
+        let m = self.minimap_local_y(window_y);
+        let y = drag_scroll(m, drag.grab, drag.scale, drag.floor);
+        let off = self.page_scroll.offset();
+        self.page_scroll.set_offset(point(off.x, px(y)));
+        self.minimap_visible = true;
+        self.arm_minimap_hide(cx);
+        cx.notify();
+    }
+
+    /// End an active minimap drag (mouse-up or button-release); a no-op if none.
+    pub(crate) fn minimap_drag_end(&mut self, cx: &mut Context<Self>) {
+        if self.minimap_drag.take().is_some() {
+            self.arm_minimap_hide(cx);
+            cx.notify();
         }
     }
 }
@@ -288,4 +535,108 @@ fn selected_column(
         .child(div().w_full().h(px(above)).bg(medium))
         .child(div().w_full().h(px(visible)).bg(dark))
         .child(div().w_full().h(px(below)).bg(medium))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A scene: viewport 500 tall over a 2000-tall document → scale 0.25. The
+    // minimap column is that document scaled by 0.25 (a 500px-tall strip).
+    const VIEWPORT_H: f32 = 500.0;
+    const TOTAL_H: f32 = 2000.0;
+    const SCALE: f32 = VIEWPORT_H / TOTAL_H; // 0.25
+    // Scroll floor: window_h - total = -1500 (most-negative valid page y).
+    const FLOOR: f32 = VIEWPORT_H - TOTAL_H; // -1500
+
+    #[test]
+    fn minimap_y_maps_linearly_to_document() {
+        // Minimap-local y m ↔ document m / scale.
+        assert!((doc_at_minimap_y(0.0, SCALE) - 0.0).abs() < 1e-4);
+        assert!((doc_at_minimap_y(125.0, SCALE) - 500.0).abs() < 1e-4);
+        // The whole 500px strip maps onto the whole 2000px document.
+        assert!((doc_at_minimap_y(VIEWPORT_H, SCALE) - TOTAL_H).abs() < 1e-4);
+        // Degenerate scale is safe.
+        assert_eq!(doc_at_minimap_y(100.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn cell_fraction_is_relative_position_within_the_item() {
+        // A cell spanning document [800, 1000] (height 200) → minimap [200, 250].
+        let (doc_top, height) = (800.0, 200.0);
+        // Press at the cell's minimap top → fraction 0.
+        assert!((cell_fraction(200.0, SCALE, doc_top, height) - 0.0).abs() < 1e-4);
+        // Press at the cell's minimap middle (225) → fraction 0.5.
+        assert!((cell_fraction(225.0, SCALE, doc_top, height) - 0.5).abs() < 1e-4);
+        // Press past the bottom clamps to 1.0; before the top clamps to 0.0.
+        assert!((cell_fraction(400.0, SCALE, doc_top, height) - 1.0).abs() < 1e-4);
+        assert!((cell_fraction(0.0, SCALE, doc_top, height) - 0.0).abs() < 1e-4);
+        // Zero-height cell is safe.
+        assert_eq!(cell_fraction(225.0, SCALE, doc_top, 0.0), 0.0);
+    }
+
+    #[test]
+    fn scroll_for_press_lands_the_pressed_point_under_the_cursor() {
+        // Pressing minimap y=225 (document 900) on an item; we want document 900
+        // to paint at screen y == m (225). scroll_y = m - doc_click = 225 - 900.
+        let y = scroll_for_press(225.0, 900.0, FLOOR);
+        assert!((y - (-675.0)).abs() < 1e-4);
+        // Verify the invariant: doc_click + scroll_y == m (cursor position).
+        assert!((900.0 + y - 225.0).abs() < 1e-4);
+        // Clamps to the floor when the requested scroll would exceed it.
+        assert_eq!(scroll_for_press(0.0, 5000.0, FLOOR), FLOOR);
+        // Never scrolls above the top.
+        assert_eq!(scroll_for_press(400.0, 100.0, FLOOR), 0.0);
+    }
+
+    #[test]
+    fn handle_range_tracks_the_visible_viewport() {
+        // At rest (scroll_y 0) the handle sits at the top, height viewport*scale.
+        let (t0, t1) = handle_range(0.0, VIEWPORT_H, SCALE);
+        assert!((t0 - 0.0).abs() < 1e-4);
+        assert!((t1 - 125.0).abs() < 1e-4);
+        // Scrolled to the floor (-1500) the handle sits at the bottom of the strip.
+        let (t0, t1) = handle_range(FLOOR, VIEWPORT_H, SCALE);
+        assert!((t0 - 375.0).abs() < 1e-4); // 1500 * 0.25
+        assert!((t1 - 500.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn drag_grab_distinguishes_handle_from_track() {
+        // At rest the handle is [0, 125]. Pressing inside it (y=40) grabs at the
+        // press offset (no jump).
+        assert!((drag_grab(40.0, 0.0, VIEWPORT_H, SCALE) - 40.0).abs() < 1e-4);
+        // Pressing the track outside the handle (y=300) jumps the handle center
+        // to the cursor → grab is half the handle height (125/2).
+        assert!((drag_grab(300.0, 0.0, VIEWPORT_H, SCALE) - 62.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn drag_scroll_grabbed_point_tracks_cursor_without_jump() {
+        // Grab the handle at rest (scroll 0) at its top (grab 0): a no-op press.
+        assert!((drag_scroll(0.0, 0.0, SCALE, FLOOR) - 0.0).abs() < 1e-4);
+        // Now drag the cursor down to y=125: the handle top follows to 125, so
+        // scroll_y = -125/scale = -500 (one viewport down).
+        assert!((drag_scroll(125.0, 0.0, SCALE, FLOOR) - (-500.0)).abs() < 1e-4);
+        // A handle grab preserves the offset: pressing at y=40 with grab=40
+        // (t0 stays 0) yields no movement.
+        assert!((drag_scroll(40.0, 40.0, SCALE, FLOOR) - 0.0).abs() < 1e-4);
+        // Clamps to the floor at the bottom.
+        assert_eq!(drag_scroll(10_000.0, 0.0, SCALE, FLOOR), FLOOR);
+        // Degenerate scale is safe.
+        assert_eq!(drag_scroll(100.0, 0.0, 0.0, FLOOR), 0.0);
+    }
+
+    #[test]
+    fn track_press_then_drag_is_continuous() {
+        // Press the track at y=300 (below the resting handle). The grab centers
+        // the handle on the cursor, and applying the drag at the same y lands the
+        // handle centered there — scroll = -(300 - 62.5)/0.25 = -950.
+        let grab = drag_grab(300.0, 0.0, VIEWPORT_H, SCALE);
+        let y0 = drag_scroll(300.0, grab, SCALE, FLOOR);
+        assert!((y0 - (-950.0)).abs() < 1e-4);
+        // Dragging further to y=310 moves smoothly by the same 1/scale factor.
+        let y1 = drag_scroll(310.0, grab, SCALE, FLOOR);
+        assert!((y1 - (y0 - 40.0)).abs() < 1e-4); // 10px * (1/0.25) = 40px
+    }
 }
