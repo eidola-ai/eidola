@@ -29,17 +29,13 @@ const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 
 pub struct AboutView {
     focus_handle: FocusHandle,
-    drag_armed: crate::titlebar::DragArm,
 }
 
 impl AboutView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
-        Self {
-            focus_handle,
-            drag_armed: crate::titlebar::drag_arm(),
-        }
+        Self { focus_handle }
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
@@ -48,7 +44,7 @@ impl AboutView {
 }
 
 impl Render for AboutView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
         // Wordmark block: large "Eidola" + a hairline rule underneath,
@@ -122,7 +118,8 @@ impl Render for AboutView {
             .child(crate::titlebar::drag_band(
                 "about-titlebar",
                 TITLE_BAR_RESERVE,
-                self.drag_armed.clone(),
+                window,
+                cx,
             ))
             // Centered column, capped at the prose measure.
             .child(

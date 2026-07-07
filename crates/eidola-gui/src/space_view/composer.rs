@@ -20,7 +20,7 @@ use gpui::{
     Pixels, ScrollWheelEvent, StatefulInteractiveElement, Styled, TouchPhase, Window, div, hsla,
     linear_color_stop, linear_gradient, point, px, size,
 };
-use gpui_component::{ActiveTheme, h_flex, v_flex};
+use gpui_component::{ActiveTheme, h_flex};
 use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorEvent, MarkdownEditorState};
 
 use std::collections::HashSet;
@@ -395,19 +395,8 @@ impl SpaceView {
         self.composer_scrollable.set(composer_scrollable);
         let scrolled_down = self.composer_scroll.offset().y.as_f32() < -0.5;
 
-        let mut byline = v_flex()
-            .w(GUTTER_WIDTH)
-            .flex_none()
-            .items_end()
-            .pt_4()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .opacity(0.85)
-                    .text_color(theme.info)
-                    .child("You"),
-            );
+        let mut byline =
+            super::post::byline_gutter("You", theme.info, Some(super::post::DRAFT_BYLINE_OPACITY));
         if overlayed {
             let home_fg = theme.muted_foreground;
             let home_fg_hover = theme.foreground;

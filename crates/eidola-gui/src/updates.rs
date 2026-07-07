@@ -69,7 +69,6 @@ pub enum UpdatesDisplay {
 pub struct UpdatesView {
     update: Entity<UpdateStore>,
     focus_handle: FocusHandle,
-    drag_armed: crate::titlebar::DragArm,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -92,7 +91,6 @@ impl UpdatesView {
         Self {
             update,
             focus_handle,
-            drag_armed: crate::titlebar::drag_arm(),
             _subscriptions,
         }
     }
@@ -182,7 +180,7 @@ pub fn relative_time(then_ms: i64, now_ms: i64) -> String {
 }
 
 impl Render for UpdatesView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let display = self.display(cx);
         let checking = self.update.read(cx).checking();
@@ -254,7 +252,9 @@ impl Render for UpdatesView {
             .text_color(theme.foreground)
             .child(crate::titlebar::make_draggable(
                 div().id("updates-titlebar").h(TITLE_BAR_RESERVE).w_full(),
-                self.drag_armed.clone(),
+                "updates-titlebar",
+                window,
+                cx,
             ))
             .child(
                 div()

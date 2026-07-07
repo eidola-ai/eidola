@@ -64,7 +64,6 @@ pub struct SettingsView {
     /// to be in the dispatch path, so we `focus()` the handle on
     /// construction.
     focus_handle: FocusHandle,
-    drag_armed: crate::titlebar::DragArm,
 }
 
 impl SettingsView {
@@ -93,7 +92,6 @@ impl SettingsView {
             wallet,
             window_input,
             focus_handle,
-            drag_armed: crate::titlebar::drag_arm(),
         }
     }
 
@@ -160,7 +158,7 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
         let body: gpui::AnyElement = match self.selected {
@@ -230,7 +228,8 @@ impl Render for SettingsView {
             .child(crate::titlebar::drag_band(
                 "settings-titlebar",
                 NAV_TOP_RESERVE,
-                self.drag_armed.clone(),
+                window,
+                cx,
             ))
     }
 }

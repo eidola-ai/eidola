@@ -64,7 +64,6 @@ pub struct LibraryView {
     /// does NOT also trigger the row's open (`open_space` itself defers a real
     /// window open that a behavior test can't easily count).
     open_space_requests: usize,
-    drag_armed: crate::titlebar::DragArm,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -85,7 +84,6 @@ impl LibraryView {
             focus_handle,
             scroll: UniformListScrollHandle::new(),
             open_space_requests: 0,
-            drag_armed: crate::titlebar::drag_arm(),
             _subscriptions,
         }
     }
@@ -431,7 +429,11 @@ impl LibraryView {
 }
 
 impl Render for LibraryView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Built ahead of the chain: `drag_band` needs `&mut cx` (element-owned
+        // arm state), which can't overlap the `theme` borrow below.
+        let drag_band =
+            crate::titlebar::drag_band("library-titlebar", TITLE_BAR_RESERVE, window, cx);
         let theme = cx.theme();
         let count = self.spaces.read(cx).list().len();
 
@@ -448,11 +450,7 @@ impl Render for LibraryView {
             // Absolute drag band over the traffic-light reserve. It sits above
             // the empty top padding, so both the empty and populated paths get
             // a draggable titlebar without affecting flow layout.
-            .child(crate::titlebar::drag_band(
-                "library-titlebar",
-                TITLE_BAR_RESERVE,
-                self.drag_armed.clone(),
-            ));
+            .child(drag_band);
 
         // Chapter-style heading: a small italic label between hairline
         // rules, echoing the chat's chapter delimiters so the library reads

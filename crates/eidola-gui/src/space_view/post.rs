@@ -99,24 +99,12 @@ impl SpaceView {
             ),
         };
 
-        let byline_el = v_flex()
-            .w(GUTTER_WIDTH)
-            .flex_none()
-            .items_end()
-            .pt_4()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.foreground)
-                    .child(byline),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(time),
-            );
+        let byline_el = byline_gutter(byline, theme.foreground, None).child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(time),
+        );
 
         h_flex()
             .relative()
@@ -173,19 +161,7 @@ impl SpaceView {
         // notes-editor affordance as the active composer, owned by the editor.
         let editor_fill = px((window_h.as_f32() - 2.0 * POST_PAD_Y.as_f32()).max(0.0));
 
-        let byline_el = v_flex()
-            .w(GUTTER_WIDTH)
-            .flex_none()
-            .items_end()
-            .pt_4()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::BOLD)
-                    .opacity(0.85)
-                    .text_color(theme.info)
-                    .child("You"),
-            );
+        let byline_el = byline_gutter("You", theme.info, Some(DRAFT_BYLINE_OPACITY));
 
         h_flex()
             .relative()
@@ -402,6 +378,37 @@ impl SpaceView {
             .justify_center()
             .child(row)
     }
+}
+
+/// The label opacity for a draft's "You" byline — softened relative to a
+/// committed post's byline so an unsent draft reads as tentative.
+pub(crate) const DRAFT_BYLINE_OPACITY: f32 = 0.85;
+
+/// The right-aligned byline gutter column that sits beside a reading column:
+/// the author label in small bold `color`, geometry shared by posts, inline
+/// drafts, and the floating composer — so the gutter (width, alignment, top
+/// padding) can't drift between them and activating a draft never shifts its
+/// byline. Callers append extras (the time line, "See in context") as further
+/// children.
+pub(crate) fn byline_gutter(
+    label: impl Into<SharedString>,
+    color: gpui::Hsla,
+    label_opacity: Option<f32>,
+) -> gpui::Div {
+    use gpui::prelude::FluentBuilder as _;
+    v_flex()
+        .w(GUTTER_WIDTH)
+        .flex_none()
+        .items_end()
+        .pt_4()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::BOLD)
+                .when_some(label_opacity, |d, o| d.opacity(o))
+                .text_color(color)
+                .child(label.into()),
+        )
 }
 
 /// An invisible, zero-layout-impact overlay that records its own painted height

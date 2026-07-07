@@ -55,7 +55,7 @@ use crate::plans;
 use crate::space_view::TITLE_BAR_RESERVE;
 use crate::space_view::nav::{ease_out_cubic, snap_duration, snap_target_index};
 use crate::stores::Stores;
-use crate::titlebar::{self, DragArm};
+use crate::titlebar;
 
 mod slides;
 
@@ -149,9 +149,6 @@ pub struct OnboardingView {
     /// A slide index to animate-scroll to on the next render (set when a slide
     /// is revealed; consumed in render where `window` is available).
     pending_scroll: Option<usize>,
-
-    /// Titlebar drag arming (see [`crate::titlebar`]).
-    drag_arm: DragArm,
 }
 
 impl OnboardingView {
@@ -192,7 +189,6 @@ impl OnboardingView {
             pinned_y: None,
             last_dy: px(0.),
             pending_scroll: None,
-            drag_arm: titlebar::drag_arm(),
         }
     }
 
@@ -556,7 +552,8 @@ impl Render for OnboardingView {
             .child(titlebar::drag_band(
                 "onboarding-titlebar",
                 TITLE_BAR_RESERVE,
-                self.drag_arm.clone(),
+                window,
+                cx,
             ))
     }
 }

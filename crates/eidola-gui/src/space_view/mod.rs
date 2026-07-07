@@ -33,11 +33,11 @@ use std::rc::Rc;
 use eidola_app_core::error::AppError;
 use gpui::{
     AnyElement, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, IsZero, MouseButton, Overflow, ParentElement, Pixels, Render, ScrollHandle,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    TouchPhase, Window, div, px, rems,
+    IntoElement, IsZero, Overflow, ParentElement, Pixels, Render, ScrollHandle, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TouchPhase, Window, div,
+    px, rems,
 };
-use gpui_component::{ActiveTheme, InteractiveElementExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditorState, MarkdownStyle};
 
 use crate::actions::CloseWindow;
@@ -284,10 +284,6 @@ pub struct SpaceView {
     pub(crate) minimap_fade_gen: usize,
     pub(crate) minimap_hide_task: Option<Task<()>>,
 
-    /// Armed on mouse-down in the title-bar band, consumed on the first move to
-    /// begin a native window drag.
-    pub(crate) should_move_window: bool,
-
     /// A minimal honest error band (e.g. a submit failing before onboarding
     /// exists). Full onboarding is a later, separate window.
     pub(crate) error: Option<String>,
@@ -365,7 +361,6 @@ impl SpaceView {
             minimap_hovered: false,
             minimap_fade_gen: 0,
             minimap_hide_task: None,
-            should_move_window: false,
             error: None,
         };
         this.rebuild(cx);
@@ -848,7 +843,7 @@ impl Render for SpaceView {
             .bg(bg)
             .font_family(font_family)
             .text_color(fg)
-            .child(self.render_title_bar(cx))
+            .child(self.render_title_bar(window, cx))
             .child({
                 let mut scroll = div()
                     .id("space-scroll")
@@ -1124,39 +1119,27 @@ impl SpaceView {
     }
 
     /// A draggable band across the top standing in for the (transparent)
-    /// titlebar. On macOS `WindowControlArea::Drag` is a no-op, so dragging is
-    /// wired explicitly: arm on mouse-down, then `start_window_move` on the
-    /// first move while armed.
-    fn render_title_bar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let bg = theme.background;
-        div()
-            .id("space-title-bar")
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(TITLE_BAR_RESERVE)
-            .bg(gpui::linear_gradient(
-                180.,
-                gpui::linear_color_stop(bg, 0.0),
-                gpui::linear_color_stop(bg.opacity(0.0), 1.0),
-            ))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.should_move_window = true),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.should_move_window = false),
-            )
-            .on_mouse_move(cx.listener(|this, _, window, _| {
-                if this.should_move_window {
-                    this.should_move_window = false;
-                    window.start_window_move();
-                }
-            }))
-            .on_double_click(|_, window, _| window.titlebar_double_click())
+    /// titlebar: the shared [`crate::titlebar`] gesture over a fade-out
+    /// gradient so posts scrolling under the band blend into the chrome.
+    fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let bg = cx.theme().background;
+        crate::titlebar::make_draggable(
+            div()
+                .id("space-title-bar")
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(TITLE_BAR_RESERVE)
+                .bg(gpui::linear_gradient(
+                    180.,
+                    gpui::linear_color_stop(bg, 0.0),
+                    gpui::linear_color_stop(bg.opacity(0.0), 1.0),
+                )),
+            "space-title-bar",
+            window,
+            cx,
+        )
     }
 
     /// A minimal honest error band pinned over the bottom (Phase 1 surface for a

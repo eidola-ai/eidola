@@ -244,7 +244,6 @@ pub struct RecordView {
     detail_pending: Option<String>,
     error: Option<String>,
     focus_handle: FocusHandle,
-    drag_armed: crate::titlebar::DragArm,
 }
 
 impl RecordView {
@@ -262,7 +261,6 @@ impl RecordView {
             detail_pending: None,
             error: None,
             focus_handle,
-            drag_armed: crate::titlebar::drag_arm(),
         };
         this.fetch_page(RecordSection::Attestations, cx);
         this
@@ -538,7 +536,7 @@ impl RecordView {
 // ---------------------------------------------------------------------------
 
 impl Render for RecordView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Copy the colors out (Hsla is Copy) so no shared borrow of `cx`
         // outlives the &mut reborrows the render helpers need.
         let (bg, fg, muted_fg) = {
@@ -579,7 +577,7 @@ impl Render for RecordView {
             .size_full()
             .bg(bg)
             .text_color(fg)
-            .child(self.render_strip(cx))
+            .child(self.render_strip(window, cx))
             .child(body)
     }
 }
@@ -597,7 +595,7 @@ fn scroll_wrap(content: impl IntoElement) -> gpui::Stateful<Div> {
 impl RecordView {
     /// The section strip doubles as the title bar — traffic lights to its
     /// left, quiet text sections, an italic wordmark on the right.
-    fn render_strip(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_strip(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let mut strip = h_flex()
             .w_full()
@@ -662,7 +660,7 @@ impl RecordView {
         // The strip *is* the titlebar: make its empty areas (and gaps between
         // the section tabs) drag the window. The tabs/refresh keep their own
         // clicks — a plain click never arms a move.
-        crate::titlebar::make_draggable(strip.id("record-strip"), self.drag_armed.clone())
+        crate::titlebar::make_draggable(strip.id("record-strip"), "record-strip", window, cx)
     }
 
     fn list_frame(&self) -> Div {
