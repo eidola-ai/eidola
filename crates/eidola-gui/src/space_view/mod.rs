@@ -274,6 +274,16 @@ pub struct SpaceView {
     /// never moves the docked composer / posts / minimap (the flicker fix,
     /// generalized).
     pub(crate) scroll_min_y: Cell<f32>,
+    /// Test-only record of the slot-relative offset the **docked**
+    /// `caret_into_view` branch folded into the caret's document position —
+    /// `page_slot_doc_top + editor_top_offset` (`caret_doc_bot - caret_bot`).
+    /// The final page-scroll target is gpui-clamped against a frame-lagged
+    /// content size and can lag under parallel test load, so tests assert this
+    /// frame-independent difference instead, to guard that the docked reveal
+    /// accounts for the editor's `POST_PAD_Y` content-top offset within the slot.
+    /// Written in `composer::caret_into_view`'s docked arm; read via
+    /// `docked_caret_slot_offset_for_test`.
+    pub(crate) docked_caret_slot_offset: Cell<f32>,
     /// One horizontal scroller per node that has children, keyed by node id.
     pub(crate) scrolls: HashMap<SharedString, ScrollHandle>,
     /// Branch count per scroller id, refreshed each frame in [`Self::sync_scrolls`]
@@ -401,6 +411,7 @@ impl SpaceView {
             composer_caret_scroll_pending: Cell::new(false),
             page_scroll: ScrollHandle::new(),
             scroll_min_y: Cell::new(0.0),
+            docked_caret_slot_offset: Cell::new(0.0),
             scrolls: HashMap::new(),
             scroller_counts: HashMap::new(),
             h_scroll_owner: None,
@@ -541,6 +552,14 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn scroll_min_y_for_test(&self) -> f32 {
         self.scroll_min_y.get()
+    }
+
+    /// The slot-relative offset the docked `caret_into_view` folded into the
+    /// caret's document position (`page_slot_doc_top + editor_top_offset`). See
+    /// [`Self::docked_caret_slot_offset`].
+    #[doc(hidden)]
+    pub fn docked_caret_slot_offset_for_test(&self) -> f32 {
+        self.docked_caret_slot_offset.get()
     }
 
     /// How many posts currently have a *measured* (not estimated) height in the

@@ -23,6 +23,12 @@ pub enum MarkdownEditorEvent {
     /// `set_value`/`clear`). Hosts that mirror or persist the buffer subscribe
     /// to this instead of polling `value()` each frame.
     Change,
+    /// The caret/selection moved without a buffer change — keyboard navigation
+    /// (arrows, Home/End, word moves). A host that scrolls the caret into view
+    /// listens to this too, since a pure navigation move produces no
+    /// [`Change`](Self::Change). Never emitted from edit/IME paths (those emit
+    /// `Change`).
+    SelectionChanged,
     /// A submit-intent key chord fired. `secondary` is true when the platform
     /// "primary" modifier (⌘ on macOS) was held; `shift` when Shift was held.
     /// The host maps the chord to its own semantics — e.g. `{secondary: true,

@@ -1364,6 +1364,111 @@ fn dispatch_space_action<A: gpui::Action>(
     cx.run_until_parked();
 }
 
+/// A long single paragraph that soft-wraps into many rows in the composer's
+/// **Newsreader** column exercises the display-line vertical navigation
+/// end-to-end. Regression for two coupled bugs that only surfaced a few rows
+/// into a wrapped paragraph (and only in the real prose font): a float-rounding
+/// row-boundary bug in `visual_move_caret` made Down **stall** once the drift
+/// between our `row_height` and gpui's internal line spacing crossed a row
+/// boundary — and the same drift made Home/End (and the caret render) act on the
+/// row *above*. The fix samples each target row's vertical center (`(row+0.5)·h`)
+/// so gpui's `(y/line_height) as usize` floor is exact. This must run through the
+/// real composer (`VisualTestContext`, Newsreader) — the default test font
+/// doesn't reproduce the drift.
+#[gpui::test]
+fn space_composer_vertical_nav_traverses_every_wrapped_row(cx: &mut TestAppContext) {
+    let text = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.";
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(700.)));
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("composer");
+    vcx.update(|_, cx| editor.update(cx, |e, cx| e.set_value(text, cx)));
+    vcx.run_until_parked();
+
+    let focus = editor.read_with(&vcx, |e, cx| e.focus_handle(cx));
+    let act = |vcx: &mut VisualTestContext, a: &dyn gpui::Action| {
+        vcx.update_window(window, |_, window, cx| {
+            window.focus(&focus, cx);
+            focus.dispatch_action(a, window, cx);
+        })
+        .unwrap();
+        vcx.run_until_parked();
+    };
+    // The caret's visual row via the (biased, so render-accurate) caret geometry.
+    let row_of = |vcx: &mut VisualTestContext| -> i32 {
+        editor.read_with(vcx, |e, _| {
+            let (top, bot) = e.caret_content_y().expect("laid-out caret");
+            let rh = (bot - top).as_f32();
+            if rh > 0. {
+                (top.as_f32() / rh).round() as i32
+            } else {
+                -1
+            }
+        })
+    };
+
+    // (1) Down from the top must traverse EVERY wrapped row with no mid-paragraph
+    // stall — before the fix it stopped a few rows in.
+    act(&mut vcx, &gpui_markdown_editor::DocumentStart);
+    let mut visited = std::collections::BTreeSet::new();
+    let mut prev = -1;
+    for _ in 0..40 {
+        let row = row_of(&mut vcx);
+        if row == prev {
+            break; // no advance — reached the last row
+        }
+        visited.insert(row);
+        prev = row;
+        act(&mut vcx, &gpui_markdown_editor::Down);
+    }
+    let max_row = *visited.iter().max().unwrap();
+    assert!(
+        max_row >= 6,
+        "the paragraph wraps into many rows; Down only reached row {max_row}"
+    );
+    assert_eq!(
+        visited.len() as i32,
+        max_row + 1,
+        "Down visited every row 0..={max_row} with no stall (visited {})",
+        visited.len()
+    );
+
+    // (2) On every row, Home and End keep the caret on that same display row —
+    // they must not snap to the row above.
+    for target in 0..=max_row {
+        act(&mut vcx, &gpui_markdown_editor::DocumentStart);
+        for _ in 0..target {
+            act(&mut vcx, &gpui_markdown_editor::Down);
+        }
+        assert_eq!(
+            row_of(&mut vcx),
+            target,
+            "Down×{target} lands on row {target}"
+        );
+        act(&mut vcx, &gpui_markdown_editor::Home);
+        assert_eq!(
+            row_of(&mut vcx),
+            target,
+            "Home stays on display row {target}"
+        );
+
+        act(&mut vcx, &gpui_markdown_editor::DocumentStart);
+        for _ in 0..target {
+            act(&mut vcx, &gpui_markdown_editor::Down);
+        }
+        act(&mut vcx, &gpui_markdown_editor::End);
+        assert_eq!(
+            row_of(&mut vcx),
+            target,
+            "End stays on display row {target}"
+        );
+    }
+}
+
 #[gpui::test]
 fn space_composer_dock_shadow_is_stable_cold(cx: &mut TestAppContext) {
     // REGRESSION: opening a conversation parks the composer near the bottom with
@@ -2109,6 +2214,28 @@ fn space_docked_composer_edit_scrolls_page_into_view(cx: &mut TestAppContext) {
             "the caret-into-view canvas consumed the pending flag"
         );
     });
+
+    // Full-reveal assertion (the off-by-one regression, Task C). The docked
+    // branch computes the caret's DOCUMENT position as `page_slot_doc_top +
+    // editor_top_offset + caret_content_bottom`, then scrolls the page to reveal
+    // it. The final page-scroll value is gpui-clamped against a frame-lagged
+    // content size (and races under parallel test load), so we assert the
+    // frame-independent piece the branch recorded: the slot-relative offset it
+    // folded in (`caret_doc_bottom − caret_content_bottom` = `page_slot_doc_top +
+    // editor_top_offset`). For a blank ⌘N space `page_slot_doc_top == 0` (no
+    // posts, the sole node is the draft leaf), so this must equal `POST_PAD_Y`
+    // (= 2·half_pad = 40px) — the editor's content-top offset within the slot.
+    // Before the fix it was 0, so the docked reveal aimed a pad-height too high
+    // and never fully revealed the line.
+    let slot_offset = view.read_with(&vcx, |v, _| v.docked_caret_slot_offset_for_test());
+    let post_pad_y = 40.0_f32;
+    assert!(
+        (slot_offset - post_pad_y).abs() < 1.0,
+        "the docked reveal must fold the editor's {post_pad_y}px content-top \
+         offset into the caret's document position (slot-relative offset was \
+         {slot_offset}; omitting it — a value near 0 — under-scrolls the line \
+         out of view)",
+    );
 }
 
 #[gpui::test]

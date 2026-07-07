@@ -130,6 +130,25 @@ actions!(
 /// (FIFO) once the stack exceeds this.
 const MAX_HISTORY: usize = 256;
 
+/// Which wrapped display row a caret sitting EXACTLY on a soft-wrap boundary
+/// belongs to. The same byte offset is both the end of one wrapped row and the
+/// start of the next; gpui's `position_for_index` always resolves it to the
+/// upper row's end. This transient signal records the caret's intended row so
+/// it renders — and vertical motion computes its current row — on the right
+/// visual row. Like `intended_x`, it's set by the command that placed the caret
+/// and reset on edits / plain moves. Only matters at a boundary; harmless
+/// elsewhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WrapAffinity {
+    /// Prefer the START of the lower row (Down/Home/Right onto a boundary, a
+    /// fresh caret, an edit). The default — the intuitive "beginning of the
+    /// next line".
+    Downstream,
+    /// Prefer the END of the upper row (End). Keeps the caret visually on the
+    /// row the command acted on.
+    Upstream,
+}
+
 /// Sentinel string tagged onto every `copy` / `cut` clipboard write via
 /// `ClipboardItem::new_string_with_metadata`. Paired with the metadata
 /// check in `paste` so an editor → editor round-trip can skip the
@@ -238,6 +257,12 @@ pub struct MarkdownEditorState {
     /// row. Reset to `None` on any non-vertical event in
     /// `dispatch_reset_intended_x_unless_vertical`.
     intended_x: Option<Pixels>,
+    /// Transient caret wrap-boundary affinity — see [`WrapAffinity`]. Set by the
+    /// command that placed the caret (Down/Home → `Downstream`, End →
+    /// `Upstream`, most others reset to `Downstream`) and read by the caret
+    /// renderer and vertical/line-bound motion so a caret exactly on a soft-wrap
+    /// boundary resolves to the intended visual row.
+    wrap_affinity: WrapAffinity,
     /// Undo history — a stack of pre-edit [`EditorState`] snapshots,
     /// oldest at the front. Every buffer-mutating edit pushes the state
     /// *before* the edit (unless it coalesces into the previous typing
@@ -294,6 +319,7 @@ impl MarkdownEditorState {
             marked_range: None,
             code_block_scrolls: HashMap::new(),
             intended_x: None,
+            wrap_affinity: WrapAffinity::Downstream,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             coalesce_anchor: None,
@@ -337,6 +363,7 @@ impl MarkdownEditorState {
         self.state = EditorState::with_markdown(markdown);
         self.marked_range = None;
         self.intended_x = None;
+        self.wrap_affinity = WrapAffinity::Downstream;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.coalesce_anchor = None;
@@ -389,6 +416,14 @@ impl MarkdownEditorState {
         self.state.selection.head()
     }
 
+    /// True when the caret's wrap-boundary affinity is [`WrapAffinity::Downstream`]
+    /// — the caret prefers the START of the lower wrapped row. The caret renderer
+    /// (`build_caret_and_selection`) reads this to place a boundary caret on the
+    /// intended visual row.
+    pub(crate) fn caret_downstream(&self) -> bool {
+        matches!(self.wrap_affinity, WrapAffinity::Downstream)
+    }
+
     /// The editor's natural content height — the vertical extent of the laid-out
     /// text, independent of any `min_height` the element reserves below it (this
     /// reads the union of painted block bounds, which sit at the top regardless
@@ -434,7 +469,8 @@ impl MarkdownEditorState {
         for k in keys {
             for line in &self.last_blocks[&k].lines {
                 if line.contains_source_offset(cursor) {
-                    let local = line.local_position_for_source_offset(cursor);
+                    let local = line
+                        .local_position_for_source_offset_biased(cursor, self.caret_downstream());
                     let top = line.origin.y + local.y - content_top;
                     return Some((top, top + line.row_height));
                 }
@@ -446,7 +482,7 @@ impl MarkdownEditorState {
             }
         }
         let line = fallback?;
-        let local = line.local_position_for_source_offset(cursor);
+        let local = line.local_position_for_source_offset_biased(cursor, self.caret_downstream());
         let top = line.origin.y + local.y - content_top;
         Some((top, top + line.row_height))
     }
@@ -456,6 +492,10 @@ impl MarkdownEditorState {
         // Vertical events (handled by `vertical_move` below) update
         // `intended_x` directly without going through this helper.
         self.intended_x = None;
+        // Left/Right/word moves/edits/etc. reset the caret to the default
+        // downstream affinity — a Right onto a soft-wrap boundary reads as the
+        // start of the next row, and an edit's caret prefers the lower row.
+        self.wrap_affinity = WrapAffinity::Downstream;
         let before = std::mem::take(&mut self.state);
         self.state = update::update(before.clone(), event);
         self.marked_range = None;
@@ -466,6 +506,11 @@ impl MarkdownEditorState {
         if self.state.markdown != before.markdown {
             self.record_history(before);
             cx.emit(MarkdownEditorEvent::Change);
+        } else if self.state.selection != before.selection {
+            // A pure caret/selection move (Left/Right/word/Move*/Extend*):
+            // no buffer change, so no `Change` — but a host that scrolls the
+            // caret into view still needs to know it moved.
+            cx.emit(MarkdownEditorEvent::SelectionChanged);
         }
         cx.notify();
     }
@@ -588,38 +633,39 @@ impl MarkdownEditorState {
         // via `WrappedLine::position_for_index`, so `local.y` is the
         // wrap-row's y inside the line and `local.x` is the visual x
         // within that wrap row.
-        let local = line.local_position_for_source_offset(cursor);
+        let local = line.local_position_for_source_offset_biased(
+            cursor,
+            matches!(self.wrap_affinity, WrapAffinity::Downstream),
+        );
         let global_x = line.origin.x + local.x;
         let target_x = self.intended_x.unwrap_or(global_x);
         let row_h = line.row_height;
         if row_h <= px(0.) {
             return None;
         }
-        // Step exactly one wrap-row vertically. `local.y` from
-        // `position_for_index` is already row-aligned (multiples of
-        // row_height); shifting by ±row_h lands at the next row.
-        let target_global_y = line.origin.y + local.y + row_h * (direction as f32);
+        // The caret's current wrap-row within its line. `local.y` is a whole
+        // multiple of `row_h` (position_for_index is passed `row_h`), so this
+        // `round` is exact — unlike a `floor`, which float-drift would spoil.
+        let cur_row = (local.y / row_h).round() as i32;
+        let line_rows = line.row_count() as i32;
+        let target_row = cur_row + direction;
 
+        // A coarse target y, only for picking the nearest line when the move
+        // leaves this logical line (the paragraph_gap-absorbing search below).
+        let target_global_y = line.origin.y + (target_row as f32) * row_h;
         let current_top = line.origin.y;
         let current_bot = current_top + line.wrapped_height;
 
-        // Intra-line wrap-row navigation: target_y still falls inside
-        // the current logical line's vertical extent. The line wraps,
-        // we're stepping between wrap rows of the same shaped text.
-        let target_line: &crate::element::LaidOutLine =
-            if target_global_y >= current_top && target_global_y < current_bot {
-                line
+        // Intra-line iff the target row stays within this line's rows;
+        // otherwise cross to the nearest line in the direction of motion and
+        // enter it at its edge row (first row going down, last going up).
+        let (target_line, target_row_in_line): (&crate::element::LaidOutLine, i32) =
+            if target_row >= 0 && target_row < line_rows {
+                (line, target_row)
             } else {
-                // Cross-line navigation: find the closest line in the
-                // direction of motion. The current line is filtered out
-                // (it's behind us), and lines on the *wrong* side of the
-                // motion are filtered out (so a Down doesn't backtrack to
-                // a line above the cursor when no line below exists, and
-                // vice-versa). Within the direction-filtered set, pick
-                // the line whose vertical bounds are closest to
-                // `target_global_y` — this absorbs the inter-block
-                // paragraph_gap by snapping the target into the nearest
-                // candidate row.
+                // The current line is filtered out (behind us) and lines on the
+                // wrong side of the motion are filtered out; among the rest pick
+                // the one whose vertical bounds are closest to `target_global_y`.
                 let mut best: Option<(&crate::element::LaidOutLine, Pixels)> = None;
                 for k in &keys {
                     let block = &self.last_blocks[k];
@@ -646,23 +692,37 @@ impl MarkdownEditorState {
                         }
                     }
                 }
-                best.map(|(l, _)| l)?
+                let best = best.map(|(l, _)| l)?;
+                let edge = if direction > 0 {
+                    0
+                } else {
+                    best.row_count() as i32 - 1
+                };
+                (best, edge)
             };
 
-        // Clamp y to the target line's extent so a target that fell
-        // in a paragraph_gap (no row owned it directly) still picks a
-        // sensible wrap-row inside the snapped-to line.
-        let top = target_line.origin.y;
-        let bot = top + target_line.wrapped_height;
-        let clamped_y = if target_global_y < top {
-            px(0.)
-        } else if target_global_y >= bot {
-            target_line.wrapped_height - px(1.)
-        } else {
-            target_global_y - top
-        };
-        let local_target = Point::new(target_x - target_line.origin.x, clamped_y);
+        // Sample the VERTICAL CENTER of the target row — never its top edge.
+        // gpui's `closest_index_for_position` floors `y / row_h`, and a top-edge
+        // sample `row * row_h` divided back float-rounds to `row - 1` (the
+        // "Down stalls after a few rows / Home lands a row up" bug — it takes a
+        // few rows for the drift between our `row_h` and gpui's internal line
+        // spacing to cross a boundary, which is why it always struck a specific
+        // mid-paragraph row). The half-row offset keeps the floor exact.
+        let sample_y = px((target_row_in_line as f32 + 0.5) * row_h.as_f32());
+        let local_target = Point::new(target_x - target_line.origin.x, sample_y);
         let new_offset = target_line.source_offset_for_local_point(local_target);
+
+        // Record where the caret landed relative to the boundary ambiguity: at
+        // the target row's START (a soft-wrap boundary whose upper-affinity row
+        // is the row above) it's `Downstream`, else `Upstream`. Lets the *next*
+        // vertical press compute the caret's current row correctly.
+        let up_row =
+            (target_line.local_position_for_source_offset(new_offset).y / row_h).round() as i32;
+        self.wrap_affinity = if up_row < target_row_in_line {
+            WrapAffinity::Downstream
+        } else {
+            WrapAffinity::Upstream
+        };
 
         // Persist the original visual x for the next press in this
         // streak.
@@ -687,6 +747,7 @@ impl MarkdownEditorState {
             Some(offset) => offset,
             None => {
                 self.intended_x = None;
+                self.wrap_affinity = WrapAffinity::Downstream;
                 let next = std::mem::take(&mut self.state);
                 self.state = update::update(next, fallback);
                 self.marked_range = None;
@@ -711,9 +772,15 @@ impl MarkdownEditorState {
         // and any post-pass still applies, but DON'T clear
         // `intended_x` (dispatch() does that). Hand-roll the update
         // call here to preserve the anchor.
+        let before_sel = self.state.selection;
         let next = std::mem::take(&mut self.state);
         self.state = update::update(next, EditorEvent::SetSelection(new_sel));
         self.marked_range = None;
+        // A vertical move changes the caret without touching the buffer — tell
+        // a host that scrolls the caret into view (no `Change` is emitted).
+        if self.state.selection != before_sel {
+            cx.emit(MarkdownEditorEvent::SelectionChanged);
+        }
         cx.notify();
     }
 
@@ -763,13 +830,26 @@ impl MarkdownEditorState {
         }
         let line = current?;
 
-        // The caret's wrap-row y inside this line. `x` picks the edge:
-        // 0 for the row's start, a large finite value for its end (the
-        // mapping clamps into the row, so a value past the right edge
-        // resolves to the last display index of that wrap row).
-        let local = line.local_position_for_source_offset(cursor);
+        // The caret's wrap-row inside this line. `x` picks the edge: 0 for the
+        // row's start, a large finite value for its end (the mapping clamps into
+        // the row, resolving to the last display index of that wrap row).
+        let local = line.local_position_for_source_offset_biased(
+            cursor,
+            matches!(self.wrap_affinity, WrapAffinity::Downstream),
+        );
+        let row_h = line.row_height;
+        if row_h <= px(0.) {
+            return None;
+        }
+        // Sample the row's VERTICAL CENTER, never its top edge: `local.y` is a
+        // whole multiple of `row_h`, and `closest_index_for_position` floors
+        // `y / row_h`, so a top-edge sample float-rounds down into the row above
+        // (Home/End would land a row too high). `round` is exact for the row
+        // index; the half-row offset keeps the floor exact.
+        let cur_row = (local.y / row_h).round();
+        let sample_y = px((cur_row + 0.5) * row_h.as_f32());
         let x = if to_end { px(1.0e6) } else { px(0.0) };
-        let target = Point::new(x, local.y);
+        let target = Point::new(x, sample_y);
         Some(line.source_offset_for_local_point(target))
     }
 
@@ -793,7 +873,19 @@ impl MarkdownEditorState {
         // caret's new column. (`dispatch` clears this for other events;
         // this path is hand-rolled, so clear it explicitly.)
         self.intended_x = None;
-        let new_head = match self.visual_line_bound(to_end) {
+        // Read the current caret's row (via `visual_line_bound`, which uses the
+        // *existing* affinity to disambiguate a boundary caret) BEFORE updating
+        // the affinity below — otherwise the read would be self-referential.
+        let bound = self.visual_line_bound(to_end);
+        // End keeps the caret on the row it acted on (`Upstream`); Home lands it
+        // at the row's start (`Downstream`). Set on both the layout-aware and the
+        // no-layout fallback paths.
+        self.wrap_affinity = if to_end {
+            WrapAffinity::Upstream
+        } else {
+            WrapAffinity::Downstream
+        };
+        let new_head = match bound {
             Some(offset) => offset,
             None => {
                 let next = std::mem::take(&mut self.state);
@@ -816,9 +908,15 @@ impl MarkdownEditorState {
         } else {
             Selection::Cursor(new_head)
         };
+        let before_sel = self.state.selection;
         let next = std::mem::take(&mut self.state);
         self.state = update::update(next, EditorEvent::SetSelection(new_sel));
         self.marked_range = None;
+        // Home/End move the caret without a buffer change — notify a
+        // caret-into-view host (no `Change` is emitted).
+        if self.state.selection != before_sel {
+            cx.emit(MarkdownEditorEvent::SelectionChanged);
+        }
         cx.notify();
     }
 
@@ -1254,6 +1352,10 @@ impl EntityInputHandler for MarkdownEditorState {
             range.start + new_text.len()
         };
         self.state.selection = Selection::Cursor(cursor);
+        // A typed / IME insertion places the caret fresh — default downstream
+        // affinity (a caret pushed onto a soft-wrap boundary reads as the start
+        // of the next row).
+        self.wrap_affinity = WrapAffinity::Downstream;
         if self.state.markdown != before.markdown {
             self.record_history(before);
         }

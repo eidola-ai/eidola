@@ -152,6 +152,52 @@ impl LaidOutLine {
         point(self.line.width(), y)
     }
 
+    /// Like [`Self::local_position_for_source_offset`], but when `downstream` is
+    /// true and `source_offset` sits exactly on a soft-wrap boundary (the start
+    /// of a wrap row after the first), returns that lower row's LEFT edge
+    /// `(0, row*h)` instead of the upper row's end. gpui's `position_for_index`
+    /// always resolves a boundary offset to the end of the upper row (upper
+    /// affinity); this biases it to the lower row's start so a caret placed by
+    /// Down/Home/Right renders — and vertical motion computes its row — where the
+    /// user expects. Non-boundary offsets are unaffected.
+    pub fn local_position_for_source_offset_biased(
+        &self,
+        source_offset: usize,
+        downstream: bool,
+    ) -> Point<Pixels> {
+        let upper = self.local_position_for_source_offset(source_offset);
+        if !downstream {
+            return upper;
+        }
+        let row_h = self.row_height;
+        if row_h <= px(0.) {
+            return upper;
+        }
+        let k = (upper.y / row_h).round() as i64; // upper-affinity row index
+        let last_row = self.line.wrap_boundaries().len() as i64; // rows are 0..=last_row
+        if k < 0 || k >= last_row {
+            return upper; // already on the last row
+        }
+        // Is `source_offset` exactly the boundary that STARTS row k+1? Probe the
+        // VERTICAL CENTER of row k+1 (`(k + 1.5) * row_h`), never its top edge:
+        // gpui's `closest_index_for_position` floors `y / line_height`, and a
+        // top-edge sample `(k + 1) * row_h` divided back by `row_h` float-rounds
+        // to `k + 0.999… → k` (the row above), so a top-edge probe would ask the
+        // wrong row. The half-row offset keeps the floor exact.
+        let display = self.display_offset_for_source(source_offset);
+        let next_row_start = match self
+            .line
+            .closest_index_for_position(point(px(0.0), row_h * ((k + 1) as f32 + 0.5)), row_h)
+        {
+            Ok(i) | Err(i) => i,
+        };
+        if next_row_start == display {
+            point(px(0.0), row_h * ((k + 1) as f32))
+        } else {
+            upper
+        }
+    }
+
     pub fn source_offset_for_local_point(&self, local: Point<Pixels>) -> usize {
         let mut p = local;
         if p.x < px(0.0) {
@@ -954,13 +1000,14 @@ impl Element for BlockElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let (selection, source, scroll_offset) = {
+        let (selection, source, scroll_offset, caret_downstream) = {
             let editor = self.editor.read(cx);
             let scroll = editor.code_block_scroll(self.block_index);
             (
                 editor.state.selection,
                 editor.state.markdown.clone(),
                 scroll,
+                editor.caret_downstream(),
             )
         };
 
@@ -1230,6 +1277,7 @@ impl Element for BlockElement {
             self.is_last_block,
             self.next_block_start,
             marker_caret,
+            caret_downstream,
         );
 
         if cursor_quad.is_none() && source.is_empty() && self.block_index == 0 {
@@ -3045,6 +3093,7 @@ struct TaggedQuad {
     is_delimiter: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_caret_and_selection(
     block: &LaidOutBlock,
     selection: Selection,
@@ -3052,6 +3101,7 @@ fn build_caret_and_selection(
     is_last_block: bool,
     next_block_start: Option<usize>,
     marker_overlay_caret: Option<TaggedQuad>,
+    caret_downstream: bool,
 ) -> (Option<TaggedQuad>, Vec<TaggedQuad>) {
     let cursor_offset = selection.head();
     let cursor_color = style.caret_color;
@@ -3078,7 +3128,8 @@ fn build_caret_and_selection(
             let strict = cursor_offset >= lo && cursor_offset < hi;
             let boundary = cursor_offset == hi && (is_last_block || hi == block.source_range.end);
             if strict || (boundary && boundary_fallback.is_none()) {
-                let local = line.local_position_for_source_offset(cursor_offset);
+                let local =
+                    line.local_position_for_source_offset_biased(cursor_offset, caret_downstream);
                 let x = line.origin.x + local.x;
                 let y = line.origin.y + local.y;
                 let quad = TaggedQuad {

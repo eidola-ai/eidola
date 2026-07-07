@@ -79,6 +79,15 @@ impl SpaceView {
                         this.composer_caret_scroll_pending.set(true);
                         cx.notify();
                     }
+                    // Keyboard caret movement with no buffer change (arrows,
+                    // Home/End, word moves) must scroll the caret into view too —
+                    // same arming as an edit, same active-draft guard.
+                    MarkdownEditorEvent::SelectionChanged
+                        if this.active_draft.as_ref() == Some(&sub_id) =>
+                    {
+                        this.composer_caret_scroll_pending.set(true);
+                        cx.notify();
+                    }
                     MarkdownEditorEvent::PressEnter {
                         secondary: true,
                         shift,
@@ -792,14 +801,27 @@ fn caret_into_view(
                 })
             } else if docked {
                 // Docked (incl. blank ⌘N): follow the caret with the page. The
-                // caret's document position is the slot's document top plus its
-                // content-local span; both are `page_scroll`-independent, so this
-                // converges. `scroll_max = -scroll_min_y` (the page's valid depth,
+                // caret's document position is the slot's document top, PLUS the
+                // editor content's offset within the slot, plus its content-local
+                // span; all `page_scroll`-independent, so this converges.
+                // `scroll_max = -scroll_min_y` (the page's valid depth,
                 // set each frame in `render`). The page wheel handler
                 // (`ScrollOwner::Body`) restores no frozen offset, so a following
                 // wheel won't fight this programmatic scroll — no bookkeeping.
-                let caret_doc_top = page_slot_doc_top + caret_top;
-                let caret_doc_bot = page_slot_doc_top + caret_bot;
+                //
+                // **The editor-top offset (`POST_PAD_Y`).** The composer's editor
+                // body does not begin at `page_slot_doc_top` (the slot block top):
+                // the docked composer's `top_y` sits `half_pad` below the slot top,
+                // and the composer's inner h_flex adds a `.pt(half_pad)` before the
+                // editor — so the editor content (where `caret_content_y` measures
+                // from y=0) starts `2·half_pad = POST_PAD_Y` below the slot top
+                // (exactly aligning with where a post's body sits under its
+                // `POST_PAD_Y` top pad). Omitting this term put every docked caret
+                // target one pad-height too high — scrolling down never fully
+                // revealed the line, scrolling up over-revealed it.
+                let editor_top_offset = POST_PAD_Y.as_f32();
+                let caret_doc_top = page_slot_doc_top + editor_top_offset + caret_top;
+                let caret_doc_bot = page_slot_doc_top + editor_top_offset + caret_bot;
                 // The page's scroll depth, computed from the editor's **fresh**
                 // content height rather than `scroll_min_y`. `scroll_min_y` is
                 // derived (in `render`) from `composer_content_h`, which
@@ -826,6 +848,12 @@ fn caret_into_view(
                         scroll_max,
                         CARET_SCROLL_MARGIN,
                     );
+                    // Record the slot-relative offset the branch folded into the
+                    // caret's document position (`page_slot_doc_top +
+                    // editor_top_offset`) so a test can assert the editor-top
+                    // offset is included — frame-independent, unlike the final
+                    // `next` (gpui-clamped) or a cross-frame content read (lags).
+                    this.docked_caret_slot_offset.set(caret_doc_bot - caret_bot);
                     if (next - cur).abs() > 0.5 {
                         let off = this.page_scroll.offset();
                         this.page_scroll.set_offset(point(off.x, px(next)));

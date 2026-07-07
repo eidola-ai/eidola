@@ -4327,7 +4327,6 @@ fn type_text(
     .unwrap();
     cx.run_until_parked();
 }
-
 // ---- Static deep-fixture chain shape -------------------------------------
 
 #[gpui::test]
@@ -8375,6 +8374,173 @@ fn down_from_first_wrap_row_lands_on_second_wrap_row_same_paragraph(cx: &mut Tes
             cursor > 5 && cursor < para_end,
             "Down from wrap row #1 should stay inside the long \
              paragraph, got cursor={cursor} (expected in (5, {para_end}))",
+        );
+    });
+}
+
+#[gpui::test]
+fn repeated_down_advances_through_every_wrap_row_to_the_last(cx: &mut TestAppContext) {
+    // Regression for bug #4 ("Down stalls"). In a soft-wrapped paragraph, a
+    // Down that lands the caret EXACTLY on a wrap boundary (a row start) used to
+    // freeze: the next Down computed the caret's current row from the
+    // upper-affinity `position_for_index`, targeting the same boundary row again,
+    // so the offset never changed. With the transient wrap-affinity signal, a
+    // Down onto a boundary is remembered as belonging to the lower row, so the
+    // next Down steps past it. Here every Down before the last visual row must
+    // strictly advance the caret, and the caret must reach the final row.
+    let para = "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do \
+                eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim \
+                ad minim veniam quis nostrud exercitation ullamco laboris nisi ut \
+                aliquip ex ea commodo consequat duis aute irure dolor in \
+                reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla \
+                pariatur excepteur sint occaecat cupidatat non proident sunt in \
+                culpa qui officia deserunt mollit anim id est laborum."
+        .to_string();
+    let initial = EditorState {
+        markdown: para,
+        selection: Selection::Cursor(1), // "L|orem" — the reported start
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    // Populate last_blocks with a paint pass.
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+    set_cursor(cx, handle, &editor, 1);
+
+    let (mut prev_off, mut prev_top) = editor.read_with(cx, |e, _| {
+        (
+            e.cursor_offset(),
+            e.caret_content_y().expect("caret row").0.as_f32(),
+        )
+    });
+    let mut reached_last_row = false;
+    let mut distinct_rows = 1usize; // the starting row
+    for step in 0..40 {
+        dispatch(cx, handle, &editor, Down);
+        let (off, top) = editor.read_with(cx, |e, _| {
+            (
+                e.cursor_offset(),
+                e.caret_content_y().expect("caret row").0.as_f32(),
+            )
+        });
+        if top > prev_top + 0.5 {
+            // The caret descended to a new visual row — moving to a new row must
+            // strictly advance the source offset (no stall). This is the #4 gate.
+            distinct_rows += 1;
+            assert!(
+                off > prev_off,
+                "Down reached a new row at step {step} without advancing the \
+                 offset (stuck at {off}) — a boundary caret stalled",
+            );
+        } else {
+            // The caret's row didn't descend: it's saturated on the last visual
+            // row. It must not have moved backward.
+            assert!(
+                off >= prev_off,
+                "Down moved the caret backward at step {step} ({prev_off} → {off})",
+            );
+            reached_last_row = true;
+            break;
+        }
+        prev_off = off;
+        prev_top = top;
+    }
+    assert!(
+        reached_last_row,
+        "repeated Down never reached the paragraph's last wrap row",
+    );
+    // Walking a genuinely multi-row paragraph, not stalling after ~3 rows.
+    assert!(
+        distinct_rows >= 6,
+        "Down visited only {distinct_rows} distinct rows — it should walk many \
+         wrap rows of the long paragraph, not stall early",
+    );
+}
+
+#[gpui::test]
+fn down_onto_wrap_boundary_renders_caret_on_lower_row(cx: &mut TestAppContext) {
+    // Bug #3 (render affinity). When a Down (or Home/Right) lands the caret
+    // exactly on a soft-wrap boundary, the caret must render at the START of the
+    // LOWER row — not the end of the upper row where gpui's `position_for_index`
+    // resolves the shared offset. We prove it by contrasting the render position
+    // of the SAME boundary offset under the two affinities: after a Down the
+    // affinity is Downstream (lower row); a fresh `set_cursor` to that offset
+    // resets it to Downstream too, so instead we compare against End on that row,
+    // which sets Upstream (upper row). The two must differ by one row height.
+    let para = "This is a fairly long paragraph that soft-wraps across several \
+                rows inside the narrow viewport configured by open_editor_narrow, \
+                giving us interior wrap boundaries to land a caret on."
+        .to_string();
+    let initial = EditorState {
+        markdown: para,
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+
+    // End on the first wrap row → lands on the boundary offset, Upstream
+    // affinity: renders on the UPPER row (row 0, y ≈ 0).
+    set_cursor(cx, handle, &editor, 2);
+    dispatch(cx, handle, &editor, End);
+    let (boundary_off, upper_y, row_h) = editor.read_with(cx, |e, _| {
+        let (t, b) = e.caret_content_y().expect("caret row");
+        (e.cursor_offset(), t.as_f32(), (b - t).as_f32())
+    });
+    assert!(
+        upper_y < row_h,
+        "End keeps Upstream affinity: the boundary caret renders on the upper \
+         row (y {upper_y} should be within the first row height {row_h})",
+    );
+
+    // The SAME offset, placed fresh (Downstream affinity), renders on the LOWER
+    // row (row 1, y ≈ row_h).
+    set_cursor(cx, handle, &editor, boundary_off);
+    let lower_y = editor.read_with(cx, |e, _| {
+        e.caret_content_y().expect("caret row").0.as_f32()
+    });
+    assert!(
+        lower_y >= upper_y + row_h - 1.0,
+        "a fresh (Downstream) caret on the same boundary offset renders on the \
+         lower row (y {lower_y} should be ~one row {row_h} below the upper y \
+         {upper_y})",
+    );
+}
+
+#[gpui::test]
+fn end_on_wrapped_row_stays_on_that_row(cx: &mut TestAppContext) {
+    // End on a wrapped row lands the caret at that row's last offset (the wrap
+    // boundary) and — via Upstream affinity — keeps the caret rendered at the
+    // END of that row, not the start of the next.
+    let para = "This is a fairly long paragraph that soft-wraps across several \
+                rows inside the narrow viewport configured by open_editor_narrow, \
+                giving us interior wrap boundaries to land a caret on."
+        .to_string();
+    let initial = EditorState {
+        markdown: para,
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+    set_cursor(cx, handle, &editor, 2);
+
+    let start_off = editor.read_with(cx, |e, _| e.cursor_offset());
+    dispatch(cx, handle, &editor, End);
+    editor.read_with(cx, |e, _| {
+        let end_off = e.cursor_offset();
+        assert!(
+            end_off > start_off,
+            "End moved the caret forward to the row's end ({start_off} → {end_off})",
+        );
+        // End sets Upstream affinity, so the caret renders at the END of the
+        // acted row (row 0) rather than dropping to the next row's start.
+        let (top, bot) = e.caret_content_y().expect("caret row");
+        let row_h = (bot - top).as_f32();
+        assert!(
+            top.as_f32() < row_h,
+            "End keeps the caret on the first wrap row (y {} within row height {})",
+            top.as_f32(),
+            row_h,
         );
     });
 }
