@@ -962,7 +962,7 @@ fn settings_appearance_choices_route_through_config_store(cx: &mut TestAppContex
     general.update(cx, |g, cx| {
         g.set_appearance(AppearanceSetting::Night, cx);
         g.set_time_of_day_tint(TimeOfDayTint::Off, cx);
-        g.set_light_character(eidola_app_core::config::LightCharacter::Orange, cx);
+        g.set_light_character(eidola_app_core::config::LightCharacter::Warm, cx);
     });
 
     stores.config.read_with(cx, |c, _| {

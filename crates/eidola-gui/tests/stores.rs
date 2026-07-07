@@ -223,13 +223,13 @@ fn config_store_circadian_settings_write_through(cx: &mut TestAppContext) {
     stores.config.update(cx, |c, cx| {
         c.set_appearance(AppearanceSetting::Auto, cx);
         c.set_time_of_day_tint(TimeOfDayTint::Off, cx);
-        c.set_light_character(LightCharacter::Orange, cx);
+        c.set_light_character(LightCharacter::Warm, cx);
     });
 
     stores.config.read_with(cx, |c, _| {
         let s = c.state().expect("snapshot re-read after write");
         assert_eq!(s.appearance, AppearanceSetting::Auto);
         assert_eq!(s.time_of_day_tint, TimeOfDayTint::Off);
-        assert_eq!(s.light_character, LightCharacter::Orange);
+        assert_eq!(s.light_character, LightCharacter::Warm);
     });
 }

@@ -4087,12 +4087,12 @@ mod tests {
             .unwrap();
         core.set_time_of_day_tint(config::TimeOfDayTint::Off)
             .unwrap();
-        core.set_light_character(config::LightCharacter::Bluish)
+        core.set_light_character(config::LightCharacter::Cool)
             .unwrap();
         let state = core.config_state();
         assert_eq!(state.appearance, config::AppearanceSetting::Auto);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);
-        assert_eq!(state.light_character, config::LightCharacter::Bluish);
+        assert_eq!(state.light_character, config::LightCharacter::Cool);
 
         // A fresh core over the same config dir sees the persisted values.
         let core2 = AppCore::new(config_dir, data_dir);

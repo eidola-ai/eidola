@@ -31,7 +31,7 @@
 //! {"cmd":"scroll","window":1,"target":"chat/transcript","dy":-300}
 //! {"cmd":"resize","window":1,"width":480,"height":700}
 //! {"cmd":"screenshot","window":1}                        // optional "path"
-//! {"cmd":"theme","mode":"night"}                         // or "day"; optional "character": bluish|neutral|orange
+//! {"cmd":"theme","mode":"night"}                         // or "day"; optional "character": cool|neutral|warm
 //! {"cmd":"settle","ms":250}                              // advance test clock + park
 //! {"cmd":"close","window":1}
 //! {"cmd":"quit"}
@@ -161,10 +161,10 @@ mod driver {
         },
         Theme {
             mode: String,
-            /// Optional circadian light character: `bluish` / `neutral`
-            /// (default) / `orange` — renders the tinted palette variants
+            /// Optional circadian light character: `cool` / `neutral`
+            /// (default) / `warm` — renders the tinted palette variants
             /// (Sunrise/Sunset/Dawn/Dusk) that production derives from the
-            /// clock.
+            /// sun.
             character: Option<String>,
         },
         Settle {
@@ -792,11 +792,11 @@ mod driver {
                     };
                     let character = match character.as_deref() {
                         None | Some("neutral") => eidola_gui::theme::LightCharacter::Neutral,
-                        Some("bluish") => eidola_gui::theme::LightCharacter::Bluish,
-                        Some("orange") => eidola_gui::theme::LightCharacter::Orange,
+                        Some("cool") => eidola_gui::theme::LightCharacter::Cool,
+                        Some("warm") => eidola_gui::theme::LightCharacter::Warm,
                         Some(other) => {
                             return Err(format!(
-                                "unknown theme character \"{other}\" (bluish|neutral|orange)"
+                                "unknown theme character \"{other}\" (cool|neutral|warm)"
                             ));
                         }
                     };

@@ -277,7 +277,7 @@ impl Render for GeneralView {
                         .text_xs()
                         .text_color(theme.muted_foreground.opacity(0.8))
                         .child(
-                            "Follows the sun's light — bluish around sunrise, neutral midday and \
+                            "Follows the sun's light — cool around sunrise, neutral midday and \
                              midnight, warm around sunset. Sunrise and sunset are approximated \
                              from your time zone.",
                         ),
@@ -289,10 +289,10 @@ impl Render for GeneralView {
                 let mut light_row = h_flex().gap_2();
                 for (value, id, probe_name, label) in [
                     (
-                        LightCharacter::Bluish,
-                        "light-character-bluish",
-                        "settings/general/light-character/bluish",
-                        "Bluish",
+                        LightCharacter::Cool,
+                        "light-character-cool",
+                        "settings/general/light-character/cool",
+                        "Cool",
                     ),
                     (
                         LightCharacter::Neutral,
@@ -301,9 +301,9 @@ impl Render for GeneralView {
                         "Neutral",
                     ),
                     (
-                        LightCharacter::Orange,
-                        "light-character-orange",
-                        "settings/general/light-character/orange",
+                        LightCharacter::Warm,
+                        "light-character-warm",
+                        "settings/general/light-character/warm",
                         "Warm",
                     ),
                 ] {

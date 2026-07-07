@@ -589,7 +589,7 @@ impl SpaceView {
         }
         if overlayed {
             composer = composer.shadow(vec![
-                BoxShadow::new(px(0.), SHADOW_OFFSET_Y, hsla(0., 0., 0., 0.12))
+                BoxShadow::new(px(0.), SHADOW_OFFSET_Y, theme.foreground.opacity(0.18))
                     .blur_radius(SHADOW_BLUR),
             ]);
         }

@@ -56,17 +56,20 @@ pub enum TimeOfDayTint {
 /// time-of-day axis animates when it is `On`, and the user's fixed choice
 /// (config key `light_character`) when it is `Off`. `Neutral` is the
 /// untinted anchor palette; the other two are derived from it by the GUI's
-/// tint machinery.
+/// tint machinery. The aliases accept the pre-rename values (`bluish` /
+/// `orange`) so an existing config file keeps parsing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LightCharacter {
     /// Dawn / sunrise — the cool blue cast of early light.
-    Bluish,
+    #[serde(alias = "bluish")]
+    Cool,
     /// Noon / midnight — the anchor palettes, no cast.
     #[default]
     Neutral,
     /// Sunset / dusk — the warm orange/red of low sun.
-    Orange,
+    #[serde(alias = "orange")]
+    Warm,
 }
 
 /// Returns the default config file path: `<config_dir>/eidola/config.toml`.
@@ -464,7 +467,7 @@ tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
         let original = Config {
             appearance_override: Some(AppearanceSetting::Auto),
             time_of_day_tint_override: Some(TimeOfDayTint::Off),
-            light_character_override: Some(LightCharacter::Orange),
+            light_character_override: Some(LightCharacter::Warm),
             ..Config::default()
         };
         let toml_text = toml::to_string_pretty(&original).expect("serialize");
@@ -477,13 +480,19 @@ tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
             "override must serialize under the public `time_of_day_tint` key: {toml_text}"
         );
         assert!(
-            toml_text.contains("light_character = \"orange\""),
+            toml_text.contains("light_character = \"warm\""),
             "override must serialize under the public `light_character` key: {toml_text}"
         );
         let parsed: Config = toml::from_str(&toml_text).expect("deserialize");
         assert_eq!(parsed.appearance(), AppearanceSetting::Auto);
         assert_eq!(parsed.time_of_day_tint(), TimeOfDayTint::Off);
-        assert_eq!(parsed.light_character(), LightCharacter::Orange);
+        assert_eq!(parsed.light_character(), LightCharacter::Warm);
+
+        // Pre-rename values keep parsing (a stale config must not reset).
+        let parsed: Config = toml::from_str("light_character = \"bluish\"").expect("alias parses");
+        assert_eq!(parsed.light_character(), LightCharacter::Cool);
+        let parsed: Config = toml::from_str("light_character = \"orange\"").expect("alias parses");
+        assert_eq!(parsed.light_character(), LightCharacter::Warm);
     }
 
     #[test]

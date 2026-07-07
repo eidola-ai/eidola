@@ -20,19 +20,19 @@
 //! time so actual sunrise lands at canonical 06:00 and sunset at 18:00,
 //! and the fixed slot table reads unchanged on the warped clock. The
 //! tinted slots hug the sun's events (±2 canonical hours — the transitions
-//! are brief in real light): Dawn (04–06, night+bluish), Sunrise (06–08,
-//! day+bluish), Day (08–16, long neutral), Sunset (16–18, day+orange),
-//! Dusk (18–20, night+orange), Night (20–04, long neutral) — six palettes
+//! are brief in real light): Dawn (04–06, night+cool), Sunrise (06–08,
+//! day+cool), Day (08–16, long neutral), Sunset (16–18, day+warm),
+//! Dusk (18–20, night+warm), Night (20–04, long neutral) — six palettes
 //! anchored to the real solar day, so December's sunset character arrives
-//! near 16:30 and June's near 20:30. Under the bluish day cast the warm
-//! chip/chrome family is additionally softened toward neutral
-//! ([`DAY_BLUISH_NEUTRALIZED`]) — warm cream under blue light reads muddy.
-//! Zones without coordinates (`UTC`, `Etc/*`) and polar no-event
-//! days degrade to the fixed clock schedule ([`DayPhases::Clock`]). The
-//! tinted variants are *derived*, not hand-authored: every color of the
-//! neutral palette is blended a few percent toward a per-family blue/ember
-//! anchor ([`tinted`]), so the palettes can't drift apart as colors are
-//! tuned.
+//! near 16:30 and June's near 20:30. Zones without coordinates (`UTC`,
+//! `Etc/*`) and polar no-event days degrade to the fixed clock schedule
+//! ([`DayPhases::Clock`]). The tinted variants are *derived*, not
+//! hand-authored: every color of the neutral palette is blended a few
+//! percent toward a per-family blue/ember anchor ([`tinted`]), so the
+//! palettes can't drift apart as colors are tuned — except that the day
+//! variants tint the near-white paper grounds at a reduced amount
+//! ([`DAY_PAPER_SOFT_TINT`]), keeping the sheet continuous with neutral
+//! day while the cast reads in the chrome and mid-tones.
 //!
 //! Wiring: [`install`] loads fonts and applies the *neutral* palettes (so
 //! tests and the driver stay deterministic); the production `run()` calls
@@ -182,19 +182,19 @@ pub fn canonical_hour(now_min: f32, phases: DayPhases) -> f32 {
 
 /// The light character of each canonical slot. The tinted windows are
 /// brief, as the real transitions are — two canonical hours to each side
-/// of the sun's events: dawn 04–06 + sunrise 06–08 are bluish, sunset
-/// 16–18 + dusk 18–20 are orange, and the long middles are neutral (day
+/// of the sun's events: dawn 04–06 + sunrise 06–08 are cool, sunset
+/// 16–18 + dusk 18–20 are warm, and the long middles are neutral (day
 /// 08–16, night 20–04). With solar [`DayPhases`] the canonical hour is
 /// anchored to the real sun, so "sunrise 06–08" means the first sixth of
 /// actual daylight.
 pub fn character_for_hour(hour: f32) -> LightCharacter {
     let h = hour.rem_euclid(24.0);
     if (4.0..8.0).contains(&h) {
-        LightCharacter::Bluish
+        LightCharacter::Cool
     } else if (8.0..16.0).contains(&h) {
         LightCharacter::Neutral
     } else if (16.0..20.0).contains(&h) {
-        LightCharacter::Orange
+        LightCharacter::Warm
     } else {
         LightCharacter::Neutral
     }
@@ -487,11 +487,11 @@ fn tint_spec(dark: bool, character: LightCharacter) -> Option<([u8; 3], f32)> {
     match (dark, character) {
         (_, LightCharacter::Neutral) => None,
         // Day: morning blue / low-sun ember over warm paper.
-        (false, LightCharacter::Bluish) => Some(([0x6d, 0x8f, 0xc0], 0.08)),
-        (false, LightCharacter::Orange) => Some(([0xd0, 0x79, 0x3a], 0.08)),
+        (false, LightCharacter::Cool) => Some(([0x6d, 0x8f, 0xc0], 0.08)),
+        (false, LightCharacter::Warm) => Some(([0xd0, 0x79, 0x3a], 0.08)),
         // Night: pre-dawn blue / dusk ember over the cool dark.
-        (true, LightCharacter::Bluish) => Some(([0x4a, 0x6f, 0xa5], 0.12)),
-        (true, LightCharacter::Orange) => Some(([0xa8, 0x5c, 0x33], 0.12)),
+        (true, LightCharacter::Cool) => Some(([0x4a, 0x6f, 0xa5], 0.12)),
+        (true, LightCharacter::Warm) => Some(([0xa8, 0x5c, 0x33], 0.12)),
     }
 }
 
@@ -548,73 +548,44 @@ fn tinted(colors: ThemeConfigColors, target: [u8; 3], amount: f32) -> ThemeConfi
     map_colors(colors, |_, hex| tint_hex(hex, target, amount))
 }
 
-/// The day palette's warm chip/chrome family (serde field names): the
-/// cream secondary/accent surfaces, the sidebar grounds, and their warm
-/// brown foregrounds. Under the bluish morning cast these are softened
-/// toward neutral first — warm cream under a blue light reads muddy and
-/// mutes the chip-vs-page contrast, where the night palette's counterparts
-/// are already neutral cool-greys and take the cast cleanly. The brand
-/// primary (the orange buttons/links) is deliberately *not* neutralized —
-/// the brand stays the brand under any light.
-const DAY_BLUISH_NEUTRALIZED: &[&str] = &[
-    "secondary.background",
-    "secondary.hover.background",
-    "secondary.active.background",
-    "secondary.foreground",
-    "accent.background",
-    "accent.foreground",
-    "sidebar.background",
-    "sidebar.accent.background",
-    "sidebar.accent.foreground",
-    "tab_bar.segmented.background",
-    "list.even.background",
-    "list.head.background",
-    "list.hover.background",
-    "group_box.background",
+/// The day palette's paper grounds (serde field names): the near-white
+/// page surfaces. In the day's tinted variants these take the cast at a
+/// reduced amount ([`DAY_PAPER_TINT_FACTOR`]) so the sheet itself stays
+/// close to neutral day's paper — the light's character reads in the
+/// chrome and mid-tones more than in the page, and moving between the
+/// three day palettes doesn't re-paper the whole window.
+const DAY_PAPER_SOFT_TINT: &[&str] = &[
+    "background",
+    "popover.background",
+    "accordion.background",
+    "title_bar.background",
+    "tab_bar.background",
+    "tab.background",
+    "tab.active.background",
+    "list.background",
+    "muted.background",
 ];
 
-/// How far the warm chrome is pulled toward neutral grey under the bluish
-/// day cast (0 = untouched, 1 = fully grey). A touch, not a redesign.
-const DAY_BLUISH_NEUTRALIZE_AMOUNT: f32 = 0.4;
-
-/// Desaturate one hex color toward its own (Rec. 709) luminance grey by
-/// `amount` — hue drains, perceived lightness stays, so contrast with
-/// neighbors is preserved. Alpha suffixes survive.
-fn neutralize_hex(hex: &str, amount: f32) -> Option<String> {
-    let raw = hex.strip_prefix('#')?;
-    if raw.len() != 6 && raw.len() != 8 || !raw.is_ascii() {
-        return None;
-    }
-    let byte = |i: usize| u8::from_str_radix(&raw[i..i + 2], 16).ok();
-    let (r, g, b) = (byte(0)?, byte(2)?, byte(4)?);
-    let grey = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
-    let blend = |c: u8| (f32::from(c) * (1.0 - amount) + grey * amount).round() as u8;
-    Some(format!(
-        "#{:02x}{:02x}{:02x}{}",
-        blend(r),
-        blend(g),
-        blend(b),
-        &raw[6..]
-    ))
-}
+/// The fraction of the day tint the paper grounds receive.
+const DAY_PAPER_TINT_FACTOR: f32 = 0.6;
 
 fn character_colors(
     neutral: ThemeConfigColors,
     dark: bool,
     ch: LightCharacter,
 ) -> ThemeConfigColors {
-    let mut colors = neutral;
-    if !dark && ch == LightCharacter::Bluish {
-        colors = map_colors(colors, |field, hex| {
-            DAY_BLUISH_NEUTRALIZED
-                .contains(&field)
-                .then(|| neutralize_hex(hex, DAY_BLUISH_NEUTRALIZE_AMOUNT))
-                .flatten()
-        });
-    }
     match tint_spec(dark, ch) {
-        Some((target, amount)) => tinted(colors, target, amount),
-        None => colors,
+        // Night tints uniformly; day softens the paper grounds.
+        Some((target, amount)) if dark => tinted(neutral, target, amount),
+        Some((target, amount)) => map_colors(neutral, |field, hex| {
+            let amount = if DAY_PAPER_SOFT_TINT.contains(&field) {
+                amount * DAY_PAPER_TINT_FACTOR
+            } else {
+                amount
+            };
+            tint_hex(hex, target, amount)
+        }),
+        None => neutral,
     }
 }
 
@@ -624,9 +595,9 @@ fn character_colors(
 
 fn circadian_day(character: LightCharacter) -> ThemeConfig {
     let name = match character {
-        LightCharacter::Bluish => "Circadian Sunrise",
+        LightCharacter::Cool => "Circadian Sunrise",
         LightCharacter::Neutral => "Circadian Day",
-        LightCharacter::Orange => "Circadian Sunset",
+        LightCharacter::Warm => "Circadian Sunset",
     };
     ThemeConfig {
         is_default: true,
@@ -651,40 +622,44 @@ fn circadian_day(character: LightCharacter) -> ThemeConfig {
 fn day_colors() -> ThemeConfigColors {
     let mut c = ThemeConfigColors::default();
 
-    // Surfaces — every neutral is the anchor's warm family, translated up
-    // in lightness so cards/chips/rules keep their relative depth on the
-    // brighter paper.
+    // Surfaces — the page grounds stay in the anchor's warm-paper family,
+    // translated up in lightness so cards/rules keep their relative depth
+    // on the brighter paper; the chip/chrome family below is neutral grey.
     c.background = some("#ffffff"); // anchor: warm paper
     c.foreground = some("#000000"); // warm ink
-    c.border = some("#e0d9cf"); // hairline rule
-    c.input = some("#ece5db"); // card-border
-    c.muted = some("#fbfbfb"); // code-bg (previously #fbf9f9)
-    c.muted_foreground = some("#696258"); // text-sub
-    c.popover = some("#fffefb"); // card
-    c.popover_foreground = some("#1e1c19");
-    c.accordion = some("#fffefb");
-    c.overlay = some("#1e1c1980");
+    c.border = some("#d8d8d8"); // hairline rule
+    c.input = some("#e4e4e4"); // card-border
+    c.muted = some("#fbfbfb"); // code-bg
+    c.muted_foreground = some("#586169"); // text-sub
+    c.popover = some("#fdfdfd"); // card
+    c.popover_foreground = some("#191c1e");
+    c.accordion = some("#fdfdfd");
+    c.overlay = some("#191c1e80");
 
-    // Brand / interaction
-    c.primary = some("#94522a"); // warm orange
-    c.primary_foreground = some("#fefaf5"); // bg, reads best on the warm orange
-    c.primary_hover = some("#824420"); // slightly deeper
-    c.primary_active = some("#6e3818");
-    c.ring = some("#94522a");
-    c.caret = some("#94522a");
-    c.selection = some("#94522a");
-    c.link = some("#78411e");
-    c.link_hover = some("#94522a");
+    // brand / interaction
+    c.primary = some("#566169");
+    c.primary_foreground = some("#fbfaf8");
+    c.primary_hover = some("#415461");
+    c.primary_active = some("#364350");
+    c.ring = some("#4c6372");
+    c.caret = some("#4c6372");
+    c.selection = some("#4c6372");
+    c.link = some("#1e5478");
+    c.link_hover = some("#2a6a94");
 
-    // Subtle / chip surfaces
-    c.secondary = some("#f2ebe1");
-    c.secondary_foreground = some("#69553c");
-    c.secondary_hover = some("#eae2d3");
-    c.secondary_active = some("#e0d6c3");
-    c.accent = some("#f2ebe1");
-    c.accent_foreground = some("#69553c");
+    // Subtle / chip surfaces — neutral greys (luminance-matched to the
+    // warm creams they replaced), in the family of the separator band
+    // (`muted`), with warm brown foregrounds — day's mirror of night's
+    // cool-chip / warm-text tension. The warmth of the page lives in the
+    // paper and the brand, not the chrome.
+    c.secondary = some("#ececec");
+    c.secondary_foreground = some("#66615b");
+    c.secondary_hover = some("#e3e3e3");
+    c.secondary_active = some("#d7d7d7");
+    c.accent = some("#ececec");
+    c.accent_foreground = some("#615344");
 
-    // Status — keep semantics distinct from the warm orange brand colour.
+    // Status — keep semantics distinct from the blue-grey brand colour.
     c.danger = some("#b3401a");
     c.danger_foreground = some("#fefaf5");
     c.success = some("#3f7d4a");
@@ -695,32 +670,32 @@ fn day_colors() -> ThemeConfigColors {
     c.info_foreground = some("#fefaf5");
 
     // Chrome
-    c.title_bar = some("#fefaf5");
-    c.title_bar_border = some("#ece5db");
-    c.tab_bar = some("#fefaf5");
-    c.tab_bar_segmented = some("#f2ebe1");
-    c.tab = some("#fefaf5");
-    c.tab_active = some("#fffefb");
-    c.tab_active_foreground = some("#1e1c19");
-    c.tab_foreground = some("#696258");
-    c.sidebar = some("#f6f1e9");
-    c.sidebar_border = some("#ece5db");
-    c.sidebar_foreground = some("#1e1c19");
-    c.sidebar_accent = some("#f2ebe1");
-    c.sidebar_accent_foreground = some("#69553c");
-    c.sidebar_primary = some("#94522a");
-    c.sidebar_primary_foreground = some("#fefaf5");
-    c.group_box = some("#f6f1e9");
-    c.group_box_foreground = some("#1e1c19");
+    c.title_bar = some("#fafafa");
+    c.title_bar_border = some("#e4e4e4");
+    c.tab_bar = some("#fafafa");
+    c.tab_bar_segmented = some("#ececec");
+    c.tab = some("#fafafa");
+    c.tab_active = some("#fdfdfd");
+    c.tab_active_foreground = some("#191c1e");
+    c.tab_foreground = some("#586169");
+    c.sidebar = some("#f1f1f1"); // neutral, like the chips
+    c.sidebar_border = some("#e4e4e4");
+    c.sidebar_foreground = some("#191c1e");
+    c.sidebar_accent = some("#ececec");
+    c.sidebar_accent_foreground = some("#3e454c");
+    c.sidebar_primary = some("#566169");
+    c.sidebar_primary_foreground = some("#fbfaf8");
+    c.group_box = some("#f1f1f1");
+    c.group_box_foreground = some("#191c1e");
 
-    // Lists / scroll
-    c.list = some("#fefaf5");
-    c.list_even = some("#f8f3ec");
-    c.list_head = some("#f6f1e9");
-    c.list_hover = some("#f2ebe1");
-    c.scrollbar = some("#fefaf500");
-    c.scrollbar_thumb = some("#e0d9cf");
-    c.scrollbar_thumb_hover = some("#a39a8a");
+    // lists / scroll
+    c.list = some("#fafafa");
+    c.list_even = some("#f4f4f4");
+    c.list_head = some("#f1f1f1");
+    c.list_hover = some("#ececec");
+    c.scrollbar = some("#fafafa00");
+    c.scrollbar_thumb = some("#d8d8d8");
+    c.scrollbar_thumb_hover = some("#989898");
     c
 }
 
@@ -730,9 +705,9 @@ fn day_colors() -> ThemeConfigColors {
 
 fn circadian_night(character: LightCharacter) -> ThemeConfig {
     let name = match character {
-        LightCharacter::Bluish => "Circadian Dawn",
+        LightCharacter::Cool => "Circadian Dawn",
         LightCharacter::Neutral => "Circadian Night",
-        LightCharacter::Orange => "Circadian Dusk",
+        LightCharacter::Warm => "Circadian Dusk",
     };
     ThemeConfig {
         is_default: true,
@@ -762,7 +737,7 @@ fn night_colors() -> ThemeConfigColors {
     c.border = some("#2c343d"); // rule
     c.input = some("#2c343d"); // card-border
     c.muted = some("#1b2026"); // code-bg, one step above the ground
-    c.muted_foreground = some("#8a8478");
+    c.muted_foreground = some("#9e9e9e");
     c.popover = some("#20262d"); // card
     c.popover_foreground = some("#d4d0c8");
     c.accordion = some("#20262d");
@@ -805,13 +780,13 @@ fn night_colors() -> ThemeConfigColors {
     c.tab = some("#15191e");
     c.tab_active = some("#20262d");
     c.tab_active_foreground = some("#d4d0c8");
-    c.tab_foreground = some("#8a8478");
+    c.tab_foreground = some("#9e9e9e");
     c.sidebar = some("#10141a"); // a step below the ground
     c.sidebar_border = some("#2c343d");
     c.sidebar_foreground = some("#d4d0c8");
     c.sidebar_accent = some("#262d35");
     c.sidebar_accent_foreground = some("#a89c88");
-    c.sidebar_primary = some("#c39669");
+    c.sidebar_primary = some("#cfbdab");
     c.sidebar_primary_foreground = some("#15191e");
     c.group_box = some("#1b2026");
     c.group_box_foreground = some("#d4d0c8");
@@ -821,9 +796,9 @@ fn night_colors() -> ThemeConfigColors {
     c.list_even = some("#1b2026");
     c.list_head = some("#20262d");
     c.list_hover = some("#262d35");
-    c.scrollbar = some("#15191e00");
-    c.scrollbar_thumb = some("#2c343d");
-    c.scrollbar_thumb_hover = some("#46505c");
+    c.scrollbar = some("#4e515500");
+    c.scrollbar_thumb = some("#4d5156");
+    c.scrollbar_thumb_hover = some("#5f6367");
 
     c
 }
@@ -841,7 +816,7 @@ mod tests {
     fn character_schedule_covers_the_six_slots() {
         // Dawn 04–06 and sunrise 06–08 are bluish (sunrise ±2h).
         for h in [4.0, 5.9, 6.0, 7.9] {
-            assert_eq!(character_for_hour(h), LightCharacter::Bluish, "hour {h}");
+            assert_eq!(character_for_hour(h), LightCharacter::Cool, "hour {h}");
         }
         // The long neutral day, 08–16.
         for h in [8.0, 12.0, 15.9] {
@@ -849,14 +824,14 @@ mod tests {
         }
         // Sunset 16–18 and dusk 18–20 are orange (sunset ±2h).
         for h in [16.0, 17.9, 18.0, 19.9] {
-            assert_eq!(character_for_hour(h), LightCharacter::Orange, "hour {h}");
+            assert_eq!(character_for_hour(h), LightCharacter::Warm, "hour {h}");
         }
         // The long neutral night, 20–04.
         for h in [20.0, 23.5, 0.0, 3.9] {
             assert_eq!(character_for_hour(h), LightCharacter::Neutral, "hour {h}");
         }
         // Out-of-range hours wrap instead of panicking.
-        assert_eq!(character_for_hour(28.0), LightCharacter::Bluish);
+        assert_eq!(character_for_hour(28.0), LightCharacter::Cool);
         assert_eq!(character_for_hour(-1.0), LightCharacter::Neutral);
     }
 
@@ -899,7 +874,7 @@ mod tests {
             (16.0..18.0).contains(&c),
             "16:00 on a short day is canonical sunset, got {c}"
         );
-        assert_eq!(character_for_hour(c), LightCharacter::Orange);
+        assert_eq!(character_for_hour(c), LightCharacter::Warm);
         // 20:00 is past dusk (18–20) on this short day — the long neutral
         // night has already begun.
         let c = canonical_hour(20.0 * 60.0, phases);
@@ -1026,11 +1001,11 @@ mod tests {
         let on = s(AppearanceSetting::System, TimeOfDayTint::On);
         assert_eq!(
             resolve(on, false, 7.0 * 60.0, DayPhases::Clock).1,
-            LightCharacter::Bluish
+            LightCharacter::Cool
         );
         assert_eq!(
             resolve(on, false, 16.0 * 60.0, DayPhases::Clock).1,
-            LightCharacter::Orange
+            LightCharacter::Warm
         );
         // On + geography: the character follows the warped (solar) hour —
         // 16:00 on a short winter day is already sunset-orange.
@@ -1040,19 +1015,19 @@ mod tests {
         };
         assert_eq!(
             resolve(on, false, 16.0 * 60.0, winter).1,
-            LightCharacter::Orange
+            LightCharacter::Warm
         );
         // Off: the user's fixed character wins, whatever the sun is doing.
         let mut fixed = s(AppearanceSetting::System, TimeOfDayTint::Off);
-        fixed.character = LightCharacter::Orange;
+        fixed.character = LightCharacter::Warm;
         assert_eq!(
             resolve(fixed, false, 7.0 * 60.0, winter).1,
-            LightCharacter::Orange
+            LightCharacter::Warm
         );
-        fixed.character = LightCharacter::Bluish;
+        fixed.character = LightCharacter::Cool;
         assert_eq!(
             resolve(fixed, false, 16.0 * 60.0, DayPhases::Clock).1,
-            LightCharacter::Bluish
+            LightCharacter::Cool
         );
     }
 
@@ -1081,7 +1056,7 @@ mod tests {
     #[test]
     fn tinted_palettes_shift_every_color_and_keep_the_untinted_shape() {
         let neutral = day_colors();
-        let sunrise = character_colors(day_colors(), false, LightCharacter::Bluish);
+        let sunrise = character_colors(day_colors(), false, LightCharacter::Cool);
         // The anchor background moved toward blue…
         assert_ne!(neutral.background, sunrise.background);
         // …but no color was dropped or invented by the serde round-trip.
@@ -1097,7 +1072,7 @@ mod tests {
         assert_eq!(noon.background, neutral.background);
         assert_eq!(noon.overlay, neutral.overlay);
         // The overlay's alpha suffix survives tinting.
-        let dusk = character_colors(night_colors(), true, LightCharacter::Orange);
+        let dusk = character_colors(night_colors(), true, LightCharacter::Warm);
         assert!(dusk.overlay.as_ref().unwrap().ends_with("a6"));
     }
 
@@ -1110,68 +1085,59 @@ mod tests {
     }
 
     #[test]
-    fn day_bluish_softens_the_warm_chrome() {
-        let plain_tint = tinted(day_colors(), [0x6d, 0x8f, 0xc0], 0.08);
-        let sunrise = character_colors(day_colors(), false, LightCharacter::Bluish);
-
-        // The warm chip/sidebar surfaces are pulled toward neutral relative
-        // to a uniform tint…
-        for (field, plain, softened) in [
-            (
-                "sidebar.accent",
-                &plain_tint.sidebar_accent,
-                &sunrise.sidebar_accent,
-            ),
-            ("sidebar", &plain_tint.sidebar, &sunrise.sidebar),
-            ("secondary", &plain_tint.secondary, &sunrise.secondary),
-            (
-                "secondary.foreground",
-                &plain_tint.secondary_foreground,
-                &sunrise.secondary_foreground,
-            ),
+    fn day_chrome_is_neutral_grey_with_warm_foregrounds() {
+        let day = day_colors();
+        // The chip/sidebar family is true grey — in the separator band's
+        // (`muted`) neutral family, not the paper's warm cream.
+        for (field, hex) in [
+            ("secondary", &day.secondary),
+            ("secondary_hover", &day.secondary_hover),
+            ("secondary_active", &day.secondary_active),
+            ("accent", &day.accent),
+            ("sidebar", &day.sidebar),
+            ("sidebar_accent", &day.sidebar_accent),
+            ("tab_bar_segmented", &day.tab_bar_segmented),
+            ("list_even", &day.list_even),
+            ("list_head", &day.list_head),
+            ("list_hover", &day.list_hover),
+            ("group_box", &day.group_box),
         ] {
-            assert!(
-                spread(softened) < spread(plain),
-                "{field}: expected the neutralize pass to drain warmth \
-                 (plain {plain:?} vs softened {softened:?})"
-            );
+            assert_eq!(spread(hex), 0, "{field} must be a neutral grey: {hex:?}");
         }
-
-        // …while unlisted colors match the uniform tint exactly, and the
-        // brand primary stays the brand.
-        assert_eq!(sunrise.background, plain_tint.background);
-        assert_eq!(sunrise.foreground, plain_tint.foreground);
-        assert_eq!(sunrise.primary, plain_tint.primary);
-
-        // The night-bluish (dawn) palette takes no neutralize pass — its
-        // chrome is already cool-neutral.
-        let dawn = character_colors(night_colors(), true, LightCharacter::Bluish);
-        let plain_dawn = tinted(night_colors(), [0x4a, 0x6f, 0xa5], 0.12);
-        assert_eq!(dawn.sidebar_accent, plain_dawn.sidebar_accent);
-        assert_eq!(dawn.secondary, plain_dawn.secondary);
+        // …while the foregrounds keep the warm brand tension (the mirror
+        // of night's cool chips / warm text).
+        assert!(spread(&day.secondary_foreground) > 0);
+        assert!(spread(&day.sidebar_accent_foreground) > 0);
+        // And the paper stays warm.
+        assert!(spread(&day.title_bar) > 0, "the page keeps its warm paper");
     }
 
     #[test]
-    fn neutralize_hex_drains_hue_and_keeps_alpha() {
-        // A pure grey is a fixed point.
-        assert_eq!(neutralize_hex("#808080", 0.4).as_deref(), Some("#808080"));
-        // Full amount lands on the luminance grey (all channels equal).
-        let full = neutralize_hex("#f2ebe1", 1.0).unwrap();
-        let raw = full.strip_prefix('#').unwrap();
-        assert_eq!(raw[0..2], raw[2..4]);
-        assert_eq!(raw[2..4], raw[4..6]);
-        // Alpha suffixes survive.
-        assert!(neutralize_hex("#f2ebe180", 0.4).unwrap().ends_with("80"));
-        assert_eq!(neutralize_hex("nope", 0.4), None);
+    fn day_paper_grounds_take_a_softer_tint() {
+        let target = [0x6d, 0x8f, 0xc0];
+        let sunrise = character_colors(day_colors(), false, LightCharacter::Cool);
+        // The page ground gets the reduced tint, not the full one…
+        let soft = tint_hex("#ffffff", target, 0.08 * DAY_PAPER_TINT_FACTOR).unwrap();
+        let full = tint_hex("#ffffff", target, 0.08).unwrap();
+        assert_eq!(sunrise.background.as_deref(), Some(soft.as_str()));
+        assert_ne!(sunrise.background.as_deref(), Some(full.as_str()));
+        // …while chrome fields take the full tint.
+        let full_chip = tint_hex("#ececec", target, 0.08).unwrap();
+        assert_eq!(sunrise.secondary.as_deref(), Some(full_chip.as_str()));
+        // Night tints uniformly — no soft list applies.
+        let dawn = character_colors(night_colors(), true, LightCharacter::Cool);
+        let uniform = tinted(night_colors(), [0x4a, 0x6f, 0xa5], 0.12);
+        assert_eq!(dawn.background, uniform.background);
+        assert_eq!(dawn.secondary, uniform.secondary);
     }
 
     #[test]
     fn six_palettes_are_distinct() {
         let mut backgrounds = vec![];
         for ch in [
-            LightCharacter::Bluish,
+            LightCharacter::Cool,
             LightCharacter::Neutral,
-            LightCharacter::Orange,
+            LightCharacter::Warm,
         ] {
             backgrounds.push(circadian_day(ch).colors.background.clone().unwrap());
             backgrounds.push(circadian_night(ch).colors.background.clone().unwrap());
