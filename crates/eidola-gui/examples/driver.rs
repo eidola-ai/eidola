@@ -31,7 +31,7 @@
 //! {"cmd":"scroll","window":1,"target":"chat/transcript","dy":-300}
 //! {"cmd":"resize","window":1,"width":480,"height":700}
 //! {"cmd":"screenshot","window":1}                        // optional "path"
-//! {"cmd":"theme","mode":"night"}                         // or "day"
+//! {"cmd":"theme","mode":"night"}                         // or "day"; optional "character": bluish|neutral|orange
 //! {"cmd":"settle","ms":250}                              // advance test clock + park
 //! {"cmd":"close","window":1}
 //! {"cmd":"quit"}
@@ -87,7 +87,7 @@ mod driver {
         AnyWindowHandle, App, AppContext, Capslock, Modifiers, ModifiersChangedEvent, Pixels,
         ScrollDelta, ScrollWheelEvent, Size, TouchPhase, VisualTestAppContext, point, px, size,
     };
-    use gpui_component::{Root, Theme, ThemeMode};
+    use gpui_component::{Root, ThemeMode};
     use gpui_component_assets::Assets;
     use serde::Deserialize;
     use serde_json::{Value, json};
@@ -161,6 +161,11 @@ mod driver {
         },
         Theme {
             mode: String,
+            /// Optional circadian light character: `bluish` / `neutral`
+            /// (default) / `orange` — renders the tinted palette variants
+            /// (Sunrise/Sunset/Dawn/Dusk) that production derives from the
+            /// clock.
+            character: Option<String>,
         },
         Settle {
             ms: Option<u64>,
@@ -348,6 +353,8 @@ mod driver {
             has_hardware_root_ca: false,
             has_hardware_intermediate_ca: false,
             attestation_url: None,
+            appearance: eidola_app_core::config::AppearanceSetting::System,
+            time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
         }
     }
 
@@ -776,13 +783,23 @@ mod driver {
                     }))
                 }
 
-                Cmd::Theme { mode } => {
+                Cmd::Theme { mode, character } => {
                     let mode = match mode.as_str() {
                         "day" | "light" => ThemeMode::Light,
                         "night" | "dark" => ThemeMode::Dark,
                         other => return Err(format!("unknown theme mode \"{other}\" (day|night)")),
                     };
-                    cx.update(|cx| Theme::change(mode, None, cx));
+                    let character = match character.as_deref() {
+                        None | Some("neutral") => eidola_gui::theme::LightCharacter::Neutral,
+                        Some("bluish") => eidola_gui::theme::LightCharacter::Bluish,
+                        Some("orange") => eidola_gui::theme::LightCharacter::Orange,
+                        Some(other) => {
+                            return Err(format!(
+                                "unknown theme character \"{other}\" (bluish|neutral|orange)"
+                            ));
+                        }
+                    };
+                    cx.update(|cx| eidola_gui::theme::apply_fixed(mode, character, cx));
                     for w in self.windows.values() {
                         cx.update_window(w.handle, |_, window, _| window.refresh())
                             .ok();

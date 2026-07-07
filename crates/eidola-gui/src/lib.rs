@@ -102,6 +102,12 @@ pub fn run() {
         // missed.
         stores::install_bus_bridge(&stores, cx);
 
+        // Point the Circadian theme at the persisted settings (day/night
+        // axis + time-of-day tint), re-applying on config changes and on
+        // the clock's ~4h slot boundaries. `theme::install` above applied
+        // the neutral defaults; this turns the circadian machinery on.
+        theme::wire_config(&stores.config, cx);
+
         // Startup refreshes — each in its own store task slot, no shared
         // busy flag, so none can starve another (the wave-2 launch-order
         // bug is fixed structurally: the model list refresh cannot be

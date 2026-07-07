@@ -102,6 +102,25 @@ impl ConfigStore {
         self.write(cx, |c| c.set_default_model(model));
     }
 
+    /// Circadian day/night axis (`appearance`). The theme reacts via its
+    /// config observation (`theme::wire_config`), not from here.
+    pub fn set_appearance(
+        &mut self,
+        appearance: eidola_app_core::config::AppearanceSetting,
+        cx: &mut Context<Self>,
+    ) {
+        self.write(cx, |c| c.set_appearance(appearance));
+    }
+
+    /// Circadian time-of-day axis (`time_of_day_tint`).
+    pub fn set_time_of_day_tint(
+        &mut self,
+        tint: eidola_app_core::config::TimeOfDayTint,
+        cx: &mut Context<Self>,
+    ) {
+        self.write(cx, |c| c.set_time_of_day_tint(tint));
+    }
+
     #[allow(dead_code)]
     pub fn set_attestation_url(&mut self, url: String, cx: &mut Context<Self>) {
         self.write(cx, |c| c.set_attestation_url(url));

@@ -128,6 +128,8 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
             has_hardware_root_ca: false,
             has_hardware_intermediate_ca: false,
             attestation_url: None,
+            appearance: eidola_app_core::config::AppearanceSetting::System,
+            time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
         });
         s.balances = Some(BalancesResult {
             available: 4_200_000,

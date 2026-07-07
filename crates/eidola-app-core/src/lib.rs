@@ -59,6 +59,12 @@ pub struct ConfigState {
     pub has_hardware_root_ca: bool,
     pub has_hardware_intermediate_ca: bool,
     pub attestation_url: Option<String>,
+    /// The resolved circadian day/night axis (`appearance` override if set,
+    /// otherwise `system`).
+    pub appearance: config::AppearanceSetting,
+    /// The resolved circadian time-of-day axis (`time_of_day_tint` override
+    /// if set, otherwise `on`).
+    pub time_of_day_tint: config::TimeOfDayTint,
 }
 
 #[derive(Clone, Debug)]
@@ -2490,6 +2496,8 @@ impl AppCore {
             has_hardware_root_ca: cfg.hardware_root_ca.is_some(),
             has_hardware_intermediate_ca: cfg.hardware_intermediate_ca.is_some(),
             attestation_url: cfg.attestation_url.clone(),
+            appearance: cfg.appearance(),
+            time_of_day_tint: cfg.time_of_day_tint(),
         }
     }
 
@@ -2513,6 +2521,28 @@ impl AppCore {
         }
         let mut cfg = self.inner.load_config();
         cfg.default_model_override = Some(model);
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
+    }
+
+    /// Persist the circadian day/night axis (the `appearance` config
+    /// override): `system` tracks the OS appearance, `day`/`night` pin one
+    /// palette family, `auto` switches on the system clock.
+    pub fn set_appearance(&self, appearance: config::AppearanceSetting) -> Result<(), AppError> {
+        let mut cfg = self.inner.load_config();
+        cfg.appearance_override = Some(appearance);
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
+    }
+
+    /// Persist the circadian time-of-day axis (the `time_of_day_tint`
+    /// config override): whether the palette takes on the character of the
+    /// light at the current hour, or stays on the neutral palettes.
+    pub fn set_time_of_day_tint(&self, tint: config::TimeOfDayTint) -> Result<(), AppError> {
+        let mut cfg = self.inner.load_config();
+        cfg.time_of_day_tint_override = Some(tint);
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
         Ok(())
@@ -4024,6 +4054,32 @@ mod tests {
         // Whitespace-only is rejected and leaves the config untouched.
         assert!(core2.set_default_model("   ".into()).is_err());
         assert_eq!(core2.config_state().default_model, "kimi-k2-6");
+    }
+
+    #[test]
+    fn set_circadian_settings_round_trip_through_config_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().to_path_buf();
+        let data_dir = dir.path().join("data");
+
+        let core = AppCore::new(config_dir.clone(), data_dir.clone());
+        let state = core.config_state();
+        assert_eq!(state.appearance, config::AppearanceSetting::System);
+        assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::On);
+
+        core.set_appearance(config::AppearanceSetting::Auto)
+            .unwrap();
+        core.set_time_of_day_tint(config::TimeOfDayTint::Off)
+            .unwrap();
+        let state = core.config_state();
+        assert_eq!(state.appearance, config::AppearanceSetting::Auto);
+        assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);
+
+        // A fresh core over the same config dir sees the persisted values.
+        let core2 = AppCore::new(config_dir, data_dir);
+        let state = core2.config_state();
+        assert_eq!(state.appearance, config::AppearanceSetting::Auto);
+        assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);
     }
 
     // --- Auto-provisioning decision logic ---------------------------------
