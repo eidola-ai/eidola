@@ -70,6 +70,15 @@ impl SpaceView {
                     MarkdownEditorEvent::Focus if this.active_draft.as_ref() != Some(&sub_id) => {
                         this.activate_draft(sub_id.clone(), cx);
                     }
+                    // A buffer edit in the active draft: arm the caret
+                    // scroll-into-view (consumed by the composer body's
+                    // `caret_into_view` canvas next paint, once the post-edit
+                    // layout is fresh). Only the active draft renders as the
+                    // scrollable composer, so ignore Changes from any other.
+                    MarkdownEditorEvent::Change if this.active_draft.as_ref() == Some(&sub_id) => {
+                        this.composer_caret_scroll_pending.set(true);
+                        cx.notify();
+                    }
                     MarkdownEditorEvent::PressEnter {
                         secondary: true,
                         shift,
@@ -357,6 +366,11 @@ impl SpaceView {
         let on_path = self.selected_leaf_id(roots, page_width).as_ref() == Some(&active);
 
         let win = window_h.as_f32();
+        // The composer slot's document top — everything on the selected path
+        // above it (independent of `page_scroll`). The docked caret-into-view
+        // path adds the editor's content-local caret span to this to get the
+        // caret's absolute document position and follows it with `page_scroll`.
+        let page_slot_doc_top = self.placeholder_doc_top(roots, page_width, window_h);
         let chrome = Self::composer_chrome();
         let content = self.composer_content_h.borrow().as_f32();
         let half_pad = POST_PAD_Y.as_f32() / 2.0;
@@ -492,6 +506,24 @@ impl SpaceView {
                 editor.downgrade(),
                 cx.entity().downgrade(),
                 half_pad,
+            ))
+            // Scroll the caret into view after an edit. Runs in the paint phase
+            // (a later sibling than the editor, so this frame's post-edit
+            // `last_blocks`/`last_bounds` are fresh — the same ordering
+            // `record_height` relies on), gated on the `composer_caret_scroll_pending`
+            // flag so it fires once per edit and never fights a manual scroll.
+            // Branches on the composer configuration: a floating-with-overflow
+            // composer owns `composer_scroll`; a **docked** composer (incl. the
+            // blank ⌘N notebook) has no internal scroll, so bringing its caret
+            // onto the window is a `page_scroll` concern — `page_slot_doc_top` is
+            // the slot's document top (independent of `page_scroll`, so following
+            // it converges without oscillation).
+            .child(caret_into_view(
+                cx.entity().downgrade(),
+                editor.downgrade(),
+                body_h,
+                page_slot_doc_top,
+                win,
             ));
         body.style().restrict_scroll_to_axis = Some(true);
 
@@ -630,6 +662,204 @@ fn record_height(
     .size_full()
 }
 
+/// Breathing room kept between the caret and the composer viewport edge when
+/// scrolling it into view, so the caret never lands flush against the fold.
+const CARET_SCROLL_MARGIN: f32 = 8.0;
+
+/// Given the caret's content-local vertical span (`caret_top`/`caret_bot`,
+/// relative to the scroll content's top), the scroll `viewport_h`, the current
+/// scroll offset `cur_off` (`<= 0`, more-negative = scrolled down), and the
+/// valid scroll depth `scroll_max` (`>= 0`, `content − viewport`), return the
+/// new scroll offset that brings the caret inside the viewport with
+/// [`CARET_SCROLL_MARGIN`] of breath. A no-op (returns `cur_off`) when the
+/// caret is already comfortably visible or when `scroll_max == 0` (a fit-height
+/// composer can't scroll — the phantom-scroll invariant). Pure so the geometry
+/// is unit-testable without a real render.
+fn caret_scroll_offset(
+    caret_top: f32,
+    caret_bot: f32,
+    viewport_h: f32,
+    cur_off: f32,
+    scroll_max: f32,
+    margin: f32,
+) -> f32 {
+    // Scroll-space top currently shown at the viewport's top edge.
+    let view_top = -cur_off;
+    let mut new_top = view_top;
+    if caret_top - margin < view_top {
+        // Caret is above the fold — reveal it near the top.
+        new_top = caret_top - margin;
+    } else if caret_bot + margin > view_top + viewport_h {
+        // Caret is below the fold — reveal it near the bottom.
+        new_top = caret_bot + margin - viewport_h;
+    }
+    new_top = new_top.clamp(0.0, scroll_max.max(0.0));
+    -new_top
+}
+
+/// A zero-visual paint probe that, when [`SpaceView::composer_caret_scroll_pending`]
+/// is armed (an edit just landed), scrolls the caret into view. Reads the
+/// editor's caret span + natural height in the **paint** phase — as a later
+/// sibling of the editor it sees this frame's post-edit layout — computes the
+/// target offset with [`caret_scroll_offset`], and writes it to the scroll
+/// handle that actually governs the caret's visibility, chosen by the composer's
+/// configuration this frame:
+///
+/// - **Floating with overflow** (`composer_scrollable`): the composer owns
+///   `composer_scroll`, so the caret is scrolled within the composer's own
+///   viewport (`body_h`). A fit-height composer has `scroll_max == 0`, so it's
+///   inherently a no-op there.
+/// - **Docked** (`!composer_overlayed` — incl. the blank ⌘N notebook, which
+///   expands and grows below the window): the composer has no internal scroll
+///   and sits at its slot, so bringing the caret onto the *window* is a
+///   `page_scroll` concern. The caret's document position is
+///   `page_slot_doc_top + caret_content_y` — both terms independent of
+///   `page_scroll` — so following it with `page_scroll` (viewport = `window_h`,
+///   `scroll_max = -scroll_min_y`) converges immediately (no oscillation as the
+///   dock ramp smooths `bar_h`).
+/// - **Floating at natural height** (overlayed but fits): the caret is already
+///   within the visible bar, which floats at the window bottom rather than at
+///   its slot, so neither scroll applies — just consume the flag.
+///
+/// One-shot per edit: it clears the flag, so a subsequent manual scroll isn't
+/// yanked back.
+fn caret_into_view(
+    view: gpui::WeakEntity<SpaceView>,
+    editor: gpui::WeakEntity<MarkdownEditorState>,
+    body_h: f32,
+    page_slot_doc_top: f32,
+    window_h: f32,
+) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| {},
+        move |_, _, window, cx| {
+            let (Some(view), Some(editor)) = (view.upgrade(), editor.upgrade()) else {
+                return;
+            };
+            if !view.read(cx).composer_caret_scroll_pending.get() {
+                return;
+            }
+            let ed = editor.read(cx);
+            let Some((top, bot)) = ed.caret_content_y() else {
+                // No layout yet (or caret off any line) — leave the flag armed
+                // so the next paint with a fresh layout can act.
+                return;
+            };
+            let natural = ed.content_height().as_f32();
+            let caret_top = top.as_f32();
+            let caret_bot = bot.as_f32();
+            // Docked vs floating is decided from the composer's **visible bar
+            // height** this frame (`body_h`, passed from the same render) — not the
+            // `composer_overlayed`/`composer_scrollable` cells, which derive from
+            // the frame-behind `composer_content_h` and read inconsistently under a
+            // repaint. A *floating* composer's bar is capped at
+            // `COMPOSER_MAX_FRACTION` of the window (it overlays the bottom), so its
+            // `body_h` never exceeds `COMPOSER_MAX_FRACTION * window_h`; a *docked*
+            // composer's bar is uncapped and ramps toward the full window, so its
+            // `body_h` grows past that line. The threshold thus cleanly separates
+            // them (a razor-thin ambiguity only at the dock/float transition point,
+            // where the two behaviors are continuous anyway). When docked, the page
+            // owns the caret's window visibility; when floating, `natural - body_h`
+            // (fresh measures) separates a real overflow (scroll the composer's own
+            // bar) from a fit-height bar (caret already visible — no-op).
+            let docked = body_h > COMPOSER_MAX_FRACTION * window_h;
+            let composer_scroll_max = (natural - body_h).max(0.0);
+            let changed = if !docked && composer_scroll_max > 0.5 {
+                // Floating-with-overflow: scroll the composer's own viewport.
+                let scroll_max = composer_scroll_max;
+                view.update(cx, |this, _cx| {
+                    this.composer_caret_scroll_pending.set(false);
+                    let cur = this.composer_scroll.offset().y.as_f32();
+                    let next = caret_scroll_offset(
+                        caret_top,
+                        caret_bot,
+                        body_h,
+                        cur,
+                        scroll_max,
+                        CARET_SCROLL_MARGIN,
+                    );
+                    if (next - cur).abs() > 0.5 {
+                        let off = this.composer_scroll.offset();
+                        this.composer_scroll.set_offset(point(off.x, px(next)));
+                        // Keep the wheel handler's frozen-offset bookkeeping in
+                        // sync so a following `ScrollOwner::Body` wheel doesn't
+                        // snap the composer back to its pre-edit offset.
+                        this.composer_prev_off_y = next;
+                        true
+                    } else {
+                        false
+                    }
+                })
+            } else if docked {
+                // Docked (incl. blank ⌘N): follow the caret with the page. The
+                // caret's document position is the slot's document top plus its
+                // content-local span; both are `page_scroll`-independent, so this
+                // converges. `scroll_max = -scroll_min_y` (the page's valid depth,
+                // set each frame in `render`). The page wheel handler
+                // (`ScrollOwner::Body`) restores no frozen offset, so a following
+                // wheel won't fight this programmatic scroll — no bookkeeping.
+                let caret_doc_top = page_slot_doc_top + caret_top;
+                let caret_doc_bot = page_slot_doc_top + caret_bot;
+                // The page's scroll depth, computed from the editor's **fresh**
+                // content height rather than `scroll_min_y`. `scroll_min_y` is
+                // derived (in `render`) from `composer_content_h`, which
+                // `record_height` records a frame *behind* — so on the edit frame
+                // it can still reflect the pre-edit height and clamp the caret
+                // target back to the current offset. The docked runway is
+                // `max(window, chrome + content + half_pad)` and the document ends
+                // at `page_slot_doc_top + runway` (the slot is the on-path leaf,
+                // no trailing band / floating pad), so this reproduces exactly the
+                // `scroll_min_y` the *next* frame will settle to — letting the
+                // scroll land in one frame, the way the floating branch uses the
+                // fresh `natural` height. See `runway_height` / `placeholder_doc_top`.
+                let half_pad = POST_PAD_Y.as_f32() / 2.0;
+                let runway = window_h.max(SpaceView::composer_chrome() + natural + half_pad);
+                let scroll_max = (page_slot_doc_top + runway - window_h).max(0.0);
+                view.update(cx, |this, _cx| {
+                    this.composer_caret_scroll_pending.set(false);
+                    let cur = this.page_scroll.offset().y.as_f32();
+                    let next = caret_scroll_offset(
+                        caret_doc_top,
+                        caret_doc_bot,
+                        window_h,
+                        cur,
+                        scroll_max,
+                        CARET_SCROLL_MARGIN,
+                    );
+                    if (next - cur).abs() > 0.5 {
+                        let off = this.page_scroll.offset();
+                        this.page_scroll.set_offset(point(off.x, px(next)));
+                        true
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                // Floating at natural height: the caret is already visible in the
+                // bar (which floats at the window bottom, not at its slot), so
+                // neither scroll applies — just consume the flag.
+                view.update(cx, |this, _cx| {
+                    this.composer_caret_scroll_pending.set(false);
+                    false
+                })
+            };
+            // The offset is consumed by the scroll container at layout time, so
+            // a value written during this frame's paint applies next frame —
+            // schedule a repaint (mirrors `record_height`).
+            if changed {
+                let view = view.downgrade();
+                window.on_next_frame(move |_, cx| {
+                    view.update(cx, |_, cx| cx.notify()).ok();
+                });
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
 /// Paint `child` inside a single `Window::paint_layer` whose bounds are the
 /// child's layout bounds grown upward by `dilate_top`.
 ///
@@ -710,5 +940,55 @@ impl IntoElement for Layered {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CARET_SCROLL_MARGIN, caret_scroll_offset};
+
+    const M: f32 = CARET_SCROLL_MARGIN;
+
+    #[test]
+    fn caret_already_visible_is_a_noop() {
+        // Viewport 100 tall, scrolled to top; caret at y=40..58 sits well
+        // inside with margin — offset unchanged.
+        assert_eq!(caret_scroll_offset(40.0, 58.0, 100.0, 0.0, 200.0, M), 0.0);
+    }
+
+    #[test]
+    fn fit_height_composer_never_scrolls() {
+        // scroll_max == 0 (content fits the viewport): even a caret past the
+        // bottom can't move the offset — the phantom-scroll invariant.
+        assert_eq!(caret_scroll_offset(90.0, 108.0, 100.0, 0.0, 0.0, M), 0.0);
+    }
+
+    #[test]
+    fn caret_below_fold_scrolls_down() {
+        // Caret bottom at 300 with a 100-tall viewport at top → reveal it near
+        // the bottom: new view_top = 300 + margin − 100, offset = −(that).
+        let off = caret_scroll_offset(282.0, 300.0, 100.0, 0.0, 400.0, M);
+        assert!((off - -(300.0 + M - 100.0)).abs() < 0.01, "off={off}");
+        // And the caret is now inside the viewport.
+        let view_top = -off;
+        assert!(view_top <= 282.0 && 300.0 <= view_top + 100.0);
+    }
+
+    #[test]
+    fn caret_above_fold_scrolls_up() {
+        // Scrolled down (offset −250, so view_top 250); caret at 120..138 is
+        // above the fold → reveal near the top: view_top = 120 − margin.
+        let off = caret_scroll_offset(120.0, 138.0, 100.0, -250.0, 400.0, M);
+        assert!((off - -(120.0 - M)).abs() < 0.01, "off={off}");
+    }
+
+    #[test]
+    fn target_is_clamped_into_valid_range() {
+        // A caret past content end still can't scroll beyond scroll_max.
+        let off = caret_scroll_offset(1000.0, 1018.0, 100.0, 0.0, 150.0, M);
+        assert_eq!(off, -150.0);
+        // Nor above the top (positive offset is impossible).
+        let off = caret_scroll_offset(-50.0, -32.0, 100.0, -80.0, 150.0, M);
+        assert_eq!(off, 0.0);
     }
 }

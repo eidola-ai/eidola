@@ -1951,6 +1951,167 @@ fn space_composer_cmd_enter_routes_through_press_enter_to_submit(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
+    // An edit that pushes the caret below the *floating* composer's visible
+    // fold must scroll the composer so the caret stays visible. The full path
+    // runs here: the active draft's `Change` arms the flag
+    // (`create_draft_node`), and the composer body's `caret_into_view` canvas —
+    // which paints under `TestAppContext`, reading the real laid-out caret
+    // geometry — moves `composer_scroll` on the next draw. (The pure offset
+    // math is additionally unit-tested by `composer::caret_scroll_offset`.)
+    //
+    // The composer only owns its own scroll when it *floats with overflow*
+    // (capped at COMPOSER_MAX_FRACTION); a docked / fit-height composer has
+    // `scroll_max == 0` and the page owns scrolling instead. So the scene is a
+    // tall conversation with the page scrolled to the top, which pushes the
+    // active tail draft's slot far below the fold and floats the composer.
+    use eidola_app_core::{PostBlock, PostNode, PostParticipant};
+    use gpui_markdown_editor::EditorEvent;
+    let post = |aid: &str, parent: Option<&str>, user: bool| PostNode {
+        action_id: aid.into(),
+        item_id: format!("item-{aid}"),
+        parent_action_id: parent.map(Into::into),
+        participant: PostParticipant {
+            kind: if user { "human".into() } else { "agent".into() },
+            label: if user { "You".into() } else { "kimi".into() },
+        },
+        action_type: if user {
+            "user_input".into()
+        } else {
+            "inference".into()
+        },
+        generation: 0,
+        generation_count: 1,
+        is_current: true,
+        model: None,
+        credits_consumed: None,
+        relation: parent.map(|_| "reply".to_string()),
+        depth: 0,
+        is_branch: false,
+        blocks: vec![PostBlock {
+            block_type: "text".into(),
+            text: Some(
+                "A few sentences of body text so each post has a realistic \
+                 measured height, tall enough that the transcript overflows."
+                    .into(),
+            ),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }],
+        references: Vec::new(),
+        created_at: 0,
+    };
+    let nodes: Vec<PostNode> = (0..8)
+        .map(|i| {
+            let parent = (i > 0).then(|| format!("a{}", i - 1));
+            post(&format!("a{i}"), parent.as_deref(), i % 2 == 0)
+        })
+        .collect();
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("caret".into()));
+    view.update(cx, |v, cx| {
+        v.space()
+            .update(cx, |s, cx| s.set_post_tree_for_test(nodes, cx));
+    });
+    cx.run_until_parked();
+    // Activate a tail draft replying to the last post (its slot is at the
+    // bottom of the tall document).
+    open_space_draft(&view, window, cx, Some("a7"));
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(620.)));
+    vcx.run_until_parked();
+
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the tail draft is the active composer");
+
+    // Type a draft far taller than the ~310px floating viewport. `InsertText`
+    // leaves the caret at the end of the inserted text — below the fold.
+    let long = "line of the draft that carries some words\n".repeat(40);
+    editor.update(&mut vcx, |e, cx| {
+        e.apply_event_for_test(EditorEvent::InsertText(long), cx)
+    });
+    // Scroll the page to the top so the composer's slot sits far below the fold
+    // and the composer floats (capped) rather than docking.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.composer_scroll_offset_y_for_test() < -1.0,
+            "the caret ran below the floating composer's fold, so it scrolled \
+             down to keep the caret visible (offset {} should be negative)",
+            v.composer_scroll_offset_y_for_test()
+        );
+        assert!(
+            !v.caret_scroll_pending_for_test(),
+            "the caret-into-view canvas consumed the pending flag"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_docked_composer_edit_scrolls_page_into_view(cx: &mut TestAppContext) {
+    // The docked/page counterpart of the floating test above. A blank ⌘N
+    // notebook's composer is **docked**: it owns no internal scroll and expands
+    // to full height, growing *below* the window. Typing a first message taller
+    // than the window runs the caret off the bottom, and bringing it back is a
+    // `page_scroll` concern, not `composer_scroll` — so the docked branch of
+    // `caret_into_view` follows the caret with the page.
+    use gpui_markdown_editor::EditorEvent;
+    let stores = stub_stores_with_config(cx);
+    // A blank (id-less) space opens with its root tail draft already the active,
+    // docked composer.
+    let (window, view) = open_space(cx, &stores, None);
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.has_active_draft_for_test(),
+            "a blank space opens with its (docked) composer"
+        );
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the blank space's root draft is the active composer");
+
+    // Type a first message far taller than the 560px window. `InsertText`
+    // leaves the caret at the end of the inserted text — below the window fold.
+    let long = "line of the first message in a blank notebook\n".repeat(40);
+    editor.update(&mut vcx, |e, cx| {
+        e.apply_event_for_test(EditorEvent::InsertText(long), cx)
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        // The docked composer never owns internal scroll: composer_scroll stays 0.
+        assert!(
+            v.composer_scroll_offset_y_for_test().abs() < 0.5,
+            "a docked composer owns no internal scroll (composer_scroll should \
+             stay 0, was {})",
+            v.composer_scroll_offset_y_for_test()
+        );
+        // Instead the whole page scrolled down to reveal the caret.
+        assert!(
+            v.page_scroll_offset_y_for_test() < -1.0,
+            "the caret ran below the window, so the PAGE scrolled down to keep it \
+             visible (page offset {} should be negative)",
+            v.page_scroll_offset_y_for_test()
+        );
+        assert!(
+            !v.caret_scroll_pending_for_test(),
+            "the caret-into-view canvas consumed the pending flag"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_stale_initial_load_does_not_replace_submitted_prompt(cx: &mut TestAppContext) {
     // The load-vs-submit race is serialized inside the `Space` entity: a
     // reopened space's initial load completing *after* a local submit is

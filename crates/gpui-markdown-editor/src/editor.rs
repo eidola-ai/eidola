@@ -399,6 +399,58 @@ impl MarkdownEditorState {
         self.last_bounds.map(|b| b.size.height).unwrap_or(px(0.))
     }
 
+    /// The caret's vertical span **relative to the editor's laid-out content
+    /// top** (content-top = y 0), returned as `(top, bottom)` in pixels;
+    /// `bottom - top` is the caret's row height. This is the read half of the
+    /// host-driven scroll-into-view contract: the editor has no internal
+    /// vertical scroll (it lays out to its full content height and the host
+    /// scrolls it), so a host that wraps the editor in its own scroll container
+    /// (the space composer) reads this on every [`MarkdownEditorEvent::Change`]
+    /// and adjusts *its* scroll offset to keep the caret visible.
+    ///
+    /// **Coordinate frame.** Derived from the previous frame's `last_blocks`
+    /// exactly like [`Self::bounds_for_range`], but re-based to content-local
+    /// coordinates: `last_blocks`/`last_bounds` are window-absolute, so
+    /// subtracting `last_bounds.origin.y` (the top of the painted content)
+    /// yields the y a scroll container measures from its own content top. The
+    /// value is independent of any `min_height` runway (the laid-out text sits
+    /// at the content top regardless). Returns `None` before the first paint
+    /// (no layout to consult) or when the caret's offset isn't covered by any
+    /// laid-out line.
+    pub fn caret_content_y(&self) -> Option<(Pixels, Pixels)> {
+        let content_top = self.last_bounds?.origin.y;
+        let cursor = self.state.selection.head();
+        // Sort keys so a caret sitting on a block boundary (claimed by two
+        // adjacent lines) resolves deterministically to the earlier block,
+        // rather than by `HashMap` iteration order.
+        let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
+        keys.sort_unstable();
+        // Fallback for a caret past every laid-out range — the document end
+        // after a trailing newline synthesizes an empty paragraph that isn't
+        // always laid out as a line, the same edge `bounds_for_range` hits. Keep
+        // the latest line whose range ends at or before the caret and clamp the
+        // caret onto it (its last row) rather than returning `None`.
+        let mut fallback: Option<&crate::element::LaidOutLine> = None;
+        for k in keys {
+            for line in &self.last_blocks[&k].lines {
+                if line.contains_source_offset(cursor) {
+                    let local = line.local_position_for_source_offset(cursor);
+                    let top = line.origin.y + local.y - content_top;
+                    return Some((top, top + line.row_height));
+                }
+                if line.source_range.end <= cursor
+                    && fallback.is_none_or(|f| line.source_range.end >= f.source_range.end)
+                {
+                    fallback = Some(line);
+                }
+            }
+        }
+        let line = fallback?;
+        let local = line.local_position_for_source_offset(cursor);
+        let top = line.origin.y + local.y - content_top;
+        Some((top, top + line.row_height))
+    }
+
     fn dispatch(&mut self, event: EditorEvent, cx: &mut Context<Self>) {
         // Any non-vertical event invalidates the intended-x streak.
         // Vertical events (handled by `vertical_move` below) update

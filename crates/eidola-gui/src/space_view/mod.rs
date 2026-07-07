@@ -257,6 +257,13 @@ pub struct SpaceView {
     /// The composer bar's top `y` as of the last `render_active_draft`, so the
     /// request panel (a later sibling) can anchor against it.
     pub(crate) composer_anchor_top: Cell<f32>,
+    /// Set when the active draft's editor emits a buffer [`Change`], consumed
+    /// by the composer body's `caret_into_view` canvas on the next paint to
+    /// scroll the new caret position into the composer's visible viewport
+    /// (`composer.rs`). A `Cell` so the paint-phase canvas can clear it without
+    /// an entity update; only ever set for the active draft, so an off-screen /
+    /// inline edit never triggers a composer scroll.
+    pub(crate) composer_caret_scroll_pending: Cell<bool>,
 
     /// Vertical scroll of the whole page.
     pub(crate) page_scroll: ScrollHandle,
@@ -381,6 +388,7 @@ impl SpaceView {
             hovered_post: None,
             editing: None,
             composer_anchor_top: Cell::new(0.0),
+            composer_caret_scroll_pending: Cell::new(false),
             page_scroll: ScrollHandle::new(),
             scroll_min_y: Cell::new(0.0),
             scrolls: HashMap::new(),
@@ -472,6 +480,41 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn has_active_draft_for_test(&self) -> bool {
         self.active_draft.is_some()
+    }
+
+    /// Whether an edit has armed the composer's caret scroll-into-view (the
+    /// `caret_into_view` canvas consumes this on the next paint). The geometry
+    /// itself is unit-tested via `caret_scroll_offset` in `composer.rs`.
+    #[doc(hidden)]
+    pub fn caret_scroll_pending_for_test(&self) -> bool {
+        self.composer_caret_scroll_pending.get()
+    }
+
+    /// The composer's internal vertical scroll offset (`<= 0`; more-negative =
+    /// scrolled further down). Tests assert an edit that pushes the caret below
+    /// the composer fold scrolls it into view (a negative offset).
+    #[doc(hidden)]
+    pub fn composer_scroll_offset_y_for_test(&self) -> f32 {
+        self.composer_scroll.offset().y.as_f32()
+    }
+
+    /// The whole-page vertical scroll offset (`<= 0`; more-negative = scrolled
+    /// further down). Tests assert that an edit in a **docked** composer (the
+    /// blank ⌘N notebook) whose caret runs below the window scrolls the *page*
+    /// to keep the caret visible.
+    #[doc(hidden)]
+    pub fn page_scroll_offset_y_for_test(&self) -> f32 {
+        self.page_scroll.offset().y.as_f32()
+    }
+
+    /// Scroll the whole page to the top. Tests use this to push an active tail
+    /// draft's in-flow slot far below the fold, so the composer *floats* (capped
+    /// at [`COMPOSER_MAX_FRACTION`]) rather than docking — the configuration in
+    /// which the composer owns its own scroll.
+    #[doc(hidden)]
+    pub fn scroll_page_to_top_for_test(&self) {
+        let off = self.page_scroll.offset();
+        self.page_scroll.set_offset(gpui::point(off.x, px(0.)));
     }
 
     /// Whether the minimap is currently shown (tests assert scroll reveals it).
