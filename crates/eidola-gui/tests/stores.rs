@@ -200,3 +200,33 @@ fn refresh_supersede_cancels_predecessor(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// The circadian appearance settings are synchronous config writes: the
+/// `ConfigStore` writes through `AppCore` (persisting `config.toml`) and
+/// re-reads the snapshot in the same update — no task, no bus round-trip
+/// needed for the writing window. (Other windows converge via
+/// `Change::Config`, exercised by `bus_bridge_dispatches_wallet_change`'s
+/// sibling routing table.)
+#[gpui::test]
+fn config_store_circadian_settings_write_through(cx: &mut TestAppContext) {
+    use eidola_app_core::config::{AppearanceSetting, TimeOfDayTint};
+
+    let (stores, _dir) = backed_stores(cx);
+
+    stores.config.read_with(cx, |c, _| {
+        let s = c.state().expect("backed store seeds a snapshot");
+        assert_eq!(s.appearance, AppearanceSetting::System, "default");
+        assert_eq!(s.time_of_day_tint, TimeOfDayTint::On, "default");
+    });
+
+    stores.config.update(cx, |c, cx| {
+        c.set_appearance(AppearanceSetting::Auto, cx);
+        c.set_time_of_day_tint(TimeOfDayTint::Off, cx);
+    });
+
+    stores.config.read_with(cx, |c, _| {
+        let s = c.state().expect("snapshot re-read after write");
+        assert_eq!(s.appearance, AppearanceSetting::Auto);
+        assert_eq!(s.time_of_day_tint, TimeOfDayTint::Off);
+    });
+}

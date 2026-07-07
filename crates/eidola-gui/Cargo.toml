@@ -37,6 +37,9 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 
 eidola-app-core = { path = "../eidola-app-core" }
 gpui-markdown-editor = { path = "../gpui-markdown-editor" }
+# Only for `localtime_r` (the circadian clock's local hour) — already in the
+# tree via gpui; the workspace avoids a chrono dependency.
+libc = "0.2"
 serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
 

@@ -15,6 +15,7 @@
 //! Base URL field on this pane) has focus. Measurement rows summarize and
 //! link to the Record window instead of dumping truncated hex.
 
+use eidola_app_core::config::{AppearanceSetting, TimeOfDayTint};
 use gpui::{
     AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
@@ -154,6 +155,21 @@ impl GeneralView {
         self.editing_base_url = false;
         cx.notify();
     }
+
+    /// Circadian day/night axis. Writes through the store; the theme
+    /// re-applies via its config observation (`theme::wire_config`).
+    pub fn set_appearance(&mut self, appearance: AppearanceSetting, cx: &mut Context<Self>) {
+        self.config
+            .update(cx, |c, cx| c.set_appearance(appearance, cx));
+        cx.notify();
+    }
+
+    /// Circadian time-of-day axis.
+    pub fn set_time_of_day_tint(&mut self, tint: TimeOfDayTint, cx: &mut Context<Self>) {
+        self.config
+            .update(cx, |c, cx| c.set_time_of_day_tint(tint, cx));
+        cx.notify();
+    }
 }
 
 impl Render for GeneralView {
@@ -168,7 +184,98 @@ impl Render for GeneralView {
         // module doc for why the listener lives on the `SettingsView` root.
         let mut col = v_flex().id("general-pane").px_6().py_5().gap_4().w_full();
 
-        col = col.child(section_header("Server", cx));
+        // --- Appearance: the circadian theme's two axes -----------------
+        col = col.child(section_header("Appearance", cx));
+
+        if let Some(s) = state.as_ref() {
+            let mut day_night = h_flex().gap_2();
+            for (value, id, probe_name, label) in [
+                (
+                    AppearanceSetting::System,
+                    "appearance-system",
+                    "settings/general/appearance/system",
+                    "System",
+                ),
+                (
+                    AppearanceSetting::Day,
+                    "appearance-day",
+                    "settings/general/appearance/day",
+                    "Day",
+                ),
+                (
+                    AppearanceSetting::Night,
+                    "appearance-night",
+                    "settings/general/appearance/night",
+                    "Night",
+                ),
+                (
+                    AppearanceSetting::Auto,
+                    "appearance-auto",
+                    "settings/general/appearance/auto",
+                    "Auto",
+                ),
+            ] {
+                let active = s.appearance == value;
+                day_night = day_night.child(
+                    choice_chip(id, label, active, cx)
+                        .probe(probe_name, gpui::Role::Button, label)
+                        .aria_selected(active)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_appearance(value, cx);
+                        })),
+                );
+            }
+            col = col.child(field_row(
+                "Day & night",
+                cx,
+                v_flex().gap_1().child(day_night).child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground.opacity(0.8))
+                        .child("System follows macOS. Auto follows the clock — day from 6:00 to 18:00."),
+                ),
+            ));
+
+            let mut tint_row = h_flex().gap_2();
+            for (value, id, probe_name, label) in [
+                (
+                    TimeOfDayTint::On,
+                    "time-of-day-on",
+                    "settings/general/time-of-day/on",
+                    "On",
+                ),
+                (
+                    TimeOfDayTint::Off,
+                    "time-of-day-off",
+                    "settings/general/time-of-day/off",
+                    "Off",
+                ),
+            ] {
+                let active = s.time_of_day_tint == value;
+                tint_row = tint_row.child(
+                    choice_chip(id, label, active, cx)
+                        .probe(probe_name, gpui::Role::Button, label)
+                        .aria_selected(active)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_time_of_day_tint(value, cx);
+                        })),
+                );
+            }
+            col = col.child(field_row(
+                "Time of day",
+                cx,
+                v_flex().gap_1().child(tint_row).child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground.opacity(0.8))
+                        .child(
+                            "Follows the hour's light — bluish mornings, neutral noon and midnight, warm evenings.",
+                        ),
+                ),
+            ));
+        }
+
+        col = col.child(div().pt_2().child(section_header("Server", cx)));
 
         // --- Base URL: honest about override vs pin --------------------
         let mut base_value = v_flex().flex_1().gap_1();
@@ -408,6 +515,32 @@ fn muted_text(text: impl Into<String>, cx: &gpui::App) -> impl IntoElement {
     div()
         .text_color(theme.muted_foreground)
         .child(SharedString::from(text))
+}
+
+/// One selectable option in a small chip row (the appearance settings).
+/// The active chip gets the sidebar-accent pill, matching the settings nav.
+fn choice_chip(
+    id: &'static str,
+    label: &'static str,
+    active: bool,
+    cx: &gpui::App,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = cx.theme();
+    let el = div()
+        .id(id)
+        .cursor_pointer()
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .text_sm();
+    let el = if active {
+        el.bg(theme.sidebar_accent)
+            .text_color(theme.sidebar_accent_foreground)
+    } else {
+        el.text_color(theme.muted_foreground)
+            .hover(|s| s.text_color(theme.foreground))
+    };
+    el.child(label)
 }
 
 /// A quiet inline text link: muted, brightening on hover. The settings

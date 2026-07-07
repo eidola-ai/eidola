@@ -944,6 +944,37 @@ fn settings_general_option_reveal_works_via_root_listener(cx: &mut TestAppContex
     });
 }
 
+/// The circadian appearance choices write through the `ConfigStore`; on a
+/// stub (no backend) the write stops at the store's backend guard, so the
+/// snapshot keeps the fixture values — the same honest no-op the other
+/// panes assert. The real write-through is covered at the store level in
+/// `tests/stores.rs` (`config_store_circadian_settings_write_through`).
+#[gpui::test]
+fn settings_appearance_choices_route_through_config_store(cx: &mut TestAppContext) {
+    use eidola_app_core::config::{AppearanceSetting, TimeOfDayTint};
+
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+    });
+
+    let general = view.read_with(cx, |v, _| v.general());
+    general.update(cx, |g, cx| {
+        g.set_appearance(AppearanceSetting::Night, cx);
+        g.set_time_of_day_tint(TimeOfDayTint::Off, cx);
+    });
+
+    stores.config.read_with(cx, |c, _| {
+        let s = c.state().expect("fixture config state");
+        assert_eq!(
+            s.appearance,
+            AppearanceSetting::System,
+            "stub write must stop at the backend guard"
+        );
+        assert_eq!(s.time_of_day_tint, TimeOfDayTint::On);
+    });
+}
+
 #[gpui::test]
 fn account_reset_requires_two_steps(cx: &mut TestAppContext) {
     let stores = stub_stores_with_config(cx);
@@ -1235,6 +1266,8 @@ fn config_state(has_account: bool) -> ConfigState {
         has_hardware_root_ca: false,
         has_hardware_intermediate_ca: false,
         attestation_url: None,
+        appearance: eidola_app_core::config::AppearanceSetting::System,
+        time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
     }
 }
 

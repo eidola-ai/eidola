@@ -21,6 +21,32 @@ pub const DEFAULT_ATTESTATION_REPO: &str = "eidola-ai/eidola";
 /// config (`default_model`) nor the caller specifies one.
 pub const DEFAULT_MODEL: &str = "gemma4-31b";
 
+/// The day/night axis of the circadian theme: which palette family is
+/// active. `System` tracks the OS light/dark appearance; `Day`/`Night` pin
+/// one family; `Auto` switches on the system clock (day ≈ 06:00–18:00).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppearanceSetting {
+    #[default]
+    System,
+    Day,
+    Night,
+    Auto,
+}
+
+/// The time-of-day axis of the circadian theme: whether the palette takes on
+/// the character of the light at the current hour (bluish mornings, neutral
+/// noon/midnight, warm evenings). `Off` stays on the neutral palettes.
+/// Values are strings (not a bool) so future variants — e.g. `geographical`
+/// vs `clock_only` — extend rather than break the config key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeOfDayTint {
+    #[default]
+    On,
+    Off,
+}
+
 /// Returns the default config file path: `<config_dir>/eidola/config.toml`.
 pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("eidola").join("config.toml"))
@@ -75,6 +101,20 @@ pub struct Config {
         skip_serializing_if = "Option::is_none"
     )]
     pub update_feed_override: Option<String>,
+    /// Circadian theme, day/night axis. `None` = the default (`system`).
+    #[serde(
+        rename = "appearance",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub appearance_override: Option<AppearanceSetting>,
+    /// Circadian theme, time-of-day axis. `None` = the default (`on`).
+    #[serde(
+        rename = "time_of_day_tint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub time_of_day_tint_override: Option<TimeOfDayTint>,
 }
 
 impl Config {
@@ -100,6 +140,18 @@ impl Config {
         self.default_model_override
             .as_deref()
             .unwrap_or(DEFAULT_MODEL)
+    }
+
+    /// The circadian day/night axis: the user's `appearance` override if
+    /// set, otherwise `system` (track the OS appearance).
+    pub fn appearance(&self) -> AppearanceSetting {
+        self.appearance_override.unwrap_or_default()
+    }
+
+    /// The circadian time-of-day axis: the user's `time_of_day_tint`
+    /// override if set, otherwise `on`.
+    pub fn time_of_day_tint(&self) -> TimeOfDayTint {
+        self.time_of_day_tint_override.unwrap_or_default()
     }
 
     /// The server URL to talk to: the user's `base_url` override if set,
@@ -363,6 +415,32 @@ tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
         let parsed: Config = toml::from_str("").expect("deserialize empty");
         assert!(parsed.default_model_override.is_none());
         assert_eq!(parsed.default_model(), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn circadian_settings_default_and_round_trip_via_toml() {
+        // Absent keys → the resolvers fall back to the defaults.
+        let cfg: Config = toml::from_str("").expect("deserialize empty");
+        assert_eq!(cfg.appearance(), AppearanceSetting::System);
+        assert_eq!(cfg.time_of_day_tint(), TimeOfDayTint::On);
+
+        let original = Config {
+            appearance_override: Some(AppearanceSetting::Auto),
+            time_of_day_tint_override: Some(TimeOfDayTint::Off),
+            ..Config::default()
+        };
+        let toml_text = toml::to_string_pretty(&original).expect("serialize");
+        assert!(
+            toml_text.contains("appearance = \"auto\""),
+            "override must serialize under the public `appearance` key: {toml_text}"
+        );
+        assert!(
+            toml_text.contains("time_of_day_tint = \"off\""),
+            "override must serialize under the public `time_of_day_tint` key: {toml_text}"
+        );
+        let parsed: Config = toml::from_str(&toml_text).expect("deserialize");
+        assert_eq!(parsed.appearance(), AppearanceSetting::Auto);
+        assert_eq!(parsed.time_of_day_tint(), TimeOfDayTint::Off);
     }
 
     #[test]
