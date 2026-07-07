@@ -17,8 +17,9 @@ use gpui::{
 use gpui_component::Root;
 use gpui_markdown_editor::editor::{
     Backspace, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward, DeleteWordForward,
-    DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Redo, Right, SelectAll, ShiftRight,
-    ShiftTab, ShiftWordLeft, ShiftWordRight, Tab, Undo, Up, WordLeft, WordRight,
+    DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Redo, Right, SelectAll, ShiftEnd,
+    ShiftHome, ShiftRight, ShiftTab, ShiftWordLeft, ShiftWordRight, Tab, Undo, Up, WordLeft,
+    WordRight,
 };
 use gpui_markdown_editor::{
     BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, MarkdownEditorState,
@@ -8440,6 +8441,179 @@ fn intended_x_reset_by_non_vertical_action(cx: &mut TestAppContext) {
             e.cursor_offset(),
             4,
             "intended_x should have been cleared by Left"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Display-line-aware Home / End / Shift+Home / Shift+End
+//
+// Like Up / Down, Home and End (and their Cmd+Left / Cmd+Right aliases)
+// follow the *rendered* wrapped row, not the source `\n`-delimited line.
+// Pressing Home on the second wrap row of a long paragraph lands on the
+// first character of that row, not the paragraph start. Verified via
+// `open_editor_narrow`, which forces soft wrapping; a paint pass
+// (Right + Left) populates `last_blocks` so the display-aware path
+// engages (with the source-line fallback covered by `home_end_doc_jump`
+// above, where no wrapping and pre-paint state exercise `MoveLineStart`).
+// ---------------------------------------------------------------------------
+
+/// Cursor near the end of a long wrapped paragraph (its last wrap row);
+/// Home lands at the *display-line* start of that row — strictly after
+/// the paragraph start (byte 0) and before the caret, which the
+/// source-line Home (byte 0) would never do.
+#[gpui::test]
+fn home_moves_to_display_line_start_of_wrapped_row(cx: &mut TestAppContext) {
+    let markdown = "This is a very long paragraph that wraps across several rows \
+                    inside the narrow viewport configured by open_editor_narrow here."
+        .to_string();
+    let cursor_at = markdown.len() - 6;
+    let initial = EditorState {
+        markdown,
+        selection: Selection::Cursor(cursor_at),
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    // Force a paint so last_blocks is populated before Home is handled.
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+    set_cursor(cx, handle, &editor, cursor_at);
+    dispatch(cx, handle, &editor, Home);
+    editor.read_with(cx, |e, _| {
+        let cursor = e.cursor_offset();
+        assert!(
+            cursor > 0 && cursor < cursor_at,
+            "display-line Home should land at the start of the caret's \
+             wrap row (after byte 0, before the caret), got {cursor} \
+             (caret was {cursor_at})",
+        );
+    });
+}
+
+/// Cursor near the start of a long wrapped paragraph (its first wrap
+/// row); End lands at the *display-line* end of that row — strictly
+/// before the paragraph end, which the source-line End would overshoot.
+#[gpui::test]
+fn end_moves_to_display_line_end_of_wrapped_row(cx: &mut TestAppContext) {
+    let markdown = "This is a very long paragraph that wraps across several rows \
+                    inside the narrow viewport configured by open_editor_narrow here."
+        .to_string();
+    let para_end = markdown.len();
+    let cursor_at = 5;
+    let initial = EditorState {
+        markdown,
+        selection: Selection::Cursor(cursor_at),
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+    set_cursor(cx, handle, &editor, cursor_at);
+    dispatch(cx, handle, &editor, End);
+    editor.read_with(cx, |e, _| {
+        let cursor = e.cursor_offset();
+        assert!(
+            cursor > cursor_at && cursor < para_end,
+            "display-line End should land at the end of the caret's \
+             wrap row (after the caret, before paragraph end {para_end}), \
+             got {cursor}",
+        );
+    });
+}
+
+/// Shift+Home from the last wrap row extends the selection back to the
+/// display-line start of that row (a Range whose head precedes the
+/// anchor), not all the way to the paragraph start.
+#[gpui::test]
+fn shift_home_extends_to_display_line_start(cx: &mut TestAppContext) {
+    let markdown = "This is a very long paragraph that wraps across several rows \
+                    inside the narrow viewport configured by open_editor_narrow here."
+        .to_string();
+    let cursor_at = markdown.len() - 6;
+    let initial = EditorState {
+        markdown,
+        selection: Selection::Cursor(cursor_at),
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+    set_cursor(cx, handle, &editor, cursor_at);
+    dispatch(cx, handle, &editor, ShiftHome);
+    editor.read_with(cx, |e, _| match e.selection() {
+        Selection::Range { anchor, head } => {
+            assert_eq!(anchor, cursor_at, "anchor stays where the caret was");
+            assert!(
+                head > 0 && head < cursor_at,
+                "Shift+Home head should be the wrap-row start (after byte \
+                 0, before the anchor), got head={head}",
+            );
+        }
+        other => panic!("expected a Range selection, got {other:?}"),
+    });
+}
+
+/// Shift+End from the first wrap row extends the selection forward to
+/// the display-line end of that row (a Range whose head follows the
+/// anchor), not to the paragraph end.
+#[gpui::test]
+fn shift_end_extends_to_display_line_end(cx: &mut TestAppContext) {
+    let markdown = "This is a very long paragraph that wraps across several rows \
+                    inside the narrow viewport configured by open_editor_narrow here."
+        .to_string();
+    let para_end = markdown.len();
+    let cursor_at = 5;
+    let initial = EditorState {
+        markdown,
+        selection: Selection::Cursor(cursor_at),
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+    set_cursor(cx, handle, &editor, cursor_at);
+    dispatch(cx, handle, &editor, ShiftEnd);
+    editor.read_with(cx, |e, _| match e.selection() {
+        Selection::Range { anchor, head } => {
+            assert_eq!(anchor, cursor_at, "anchor stays where the caret was");
+            assert!(
+                head > cursor_at && head < para_end,
+                "Shift+End head should be the wrap-row end (after the \
+                 anchor, before paragraph end {para_end}), got head={head}",
+            );
+        }
+        other => panic!("expected a Range selection, got {other:?}"),
+    });
+}
+
+/// Display-line Home is pure navigation: it changes only the selection,
+/// never the buffer, so it must not push an undo step. Type a character
+/// (one undoable edit), press Home, then Undo — the Undo reverts the
+/// typed character (not a phantom Home step), proving Home recorded no
+/// history.
+#[gpui::test]
+fn display_line_home_records_no_undo_step(cx: &mut TestAppContext) {
+    let markdown = "This is a very long paragraph that wraps across several rows \
+                    inside the narrow viewport configured by open_editor_narrow here."
+        .to_string();
+    let cursor_at = markdown.len();
+    let initial = EditorState {
+        markdown: markdown.clone(),
+        selection: Selection::Cursor(cursor_at),
+    };
+    let (handle, editor) = open_editor_narrow(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    dispatch(cx, handle, &editor, Left);
+    set_cursor(cx, handle, &editor, cursor_at);
+    type_text(cx, handle, &editor, "Z");
+    let typed = editor.read_with(cx, |e, _| e.value().to_string());
+    assert!(typed.ends_with('Z'), "precondition: 'Z' was typed");
+    // Pure navigation between the edit and the undo.
+    dispatch(cx, handle, &editor, Home);
+    dispatch(cx, handle, &editor, End);
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(
+            e.value(),
+            markdown,
+            "Undo after Home/End should revert the typed 'Z' — navigation \
+             must not record its own undo step",
         );
     });
 }

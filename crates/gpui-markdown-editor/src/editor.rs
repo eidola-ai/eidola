@@ -665,6 +665,111 @@ impl MarkdownEditorState {
         cx.notify();
     }
 
+    /// Source offset at the start (`to_end == false`) or end
+    /// (`to_end == true`) of the caret's current *display line* — the
+    /// soft-wrapped visual row it sits on, not the whole `\n`-delimited
+    /// source line. Consults the laid-out row geometry from the previous
+    /// frame in `last_blocks`. Returns `None` when there's no layout to
+    /// consult (pre-paint state, headless tests), so the caller can fall
+    /// back to the source-line `MoveLineStart` / `MoveLineEnd` event.
+    ///
+    /// Mirrors [`Self::visual_move_caret`]: it locates the `LaidOutLine`
+    /// containing the caret, reads the caret's wrap-row `y` via
+    /// `local_position_for_source_offset`, then maps a point at that
+    /// row's left edge (`x = 0`, Home) or far-right edge (`x = huge`,
+    /// End) back to a source offset with `source_offset_for_local_point`.
+    /// On the first wrap row of a blockquote / list line the shaped
+    /// display text already begins past the hidden chain prefix, so
+    /// display-line Home lands on the visible content edge for free; the
+    /// caller additionally routes the result through `SetSelection`,
+    /// whose `nearest_allowed_position` snap keeps the caret off any
+    /// forbidden position (the source path's `next_allowed_position`
+    /// chain-prefix skip, preserved).
+    fn visual_line_bound(&self, to_end: bool) -> Option<usize> {
+        if self.last_blocks.is_empty() {
+            return None;
+        }
+        let cursor = self.state.selection.head();
+        let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
+        keys.sort();
+
+        // Find the LaidOutLine containing the cursor (same disjoint-range
+        // search as `visual_move_caret`). A display line is always within
+        // a single logical line, so this is the only line we consult.
+        let mut current: Option<&crate::element::LaidOutLine> = None;
+        for k in &keys {
+            let block = &self.last_blocks[k];
+            for line in &block.lines {
+                if line.contains_source_offset(cursor) {
+                    current = Some(line);
+                    break;
+                }
+            }
+            if current.is_some() {
+                break;
+            }
+        }
+        let line = current?;
+
+        // The caret's wrap-row y inside this line. `x` picks the edge:
+        // 0 for the row's start, a large finite value for its end (the
+        // mapping clamps into the row, so a value past the right edge
+        // resolves to the last display index of that wrap row).
+        let local = line.local_position_for_source_offset(cursor);
+        let x = if to_end { px(1.0e6) } else { px(0.0) };
+        let target = Point::new(x, local.y);
+        Some(line.source_offset_for_local_point(target))
+    }
+
+    /// Dispatch path for Home / End / Shift+Home / Shift+End (and their
+    /// Cmd+Left / Cmd+Right / Cmd+Shift+Left / Cmd+Shift+Right aliases).
+    /// Tries the display-line-aware [`Self::visual_line_bound`] first; on
+    /// success builds the appropriate `Selection` and routes it through
+    /// `SetSelection` (which applies the forbidden-position snap). On
+    /// failure (no layout to consult) it falls back to the source-line
+    /// `MoveLineStart` / `MoveLineEnd` (or the `Extend*` variant) event
+    /// so headless tests and pre-paint state still move predictably.
+    fn line_bound_move(
+        &mut self,
+        to_end: bool,
+        extending: bool,
+        fallback: EditorEvent,
+        cx: &mut Context<Self>,
+    ) {
+        // Home / End are horizontal motions: they end any vertical
+        // intended-x streak, so the next Up / Down re-anchors from the
+        // caret's new column. (`dispatch` clears this for other events;
+        // this path is hand-rolled, so clear it explicitly.)
+        self.intended_x = None;
+        let new_head = match self.visual_line_bound(to_end) {
+            Some(offset) => offset,
+            None => {
+                let next = std::mem::take(&mut self.state);
+                self.state = update::update(next, fallback);
+                self.marked_range = None;
+                cx.notify();
+                return;
+            }
+        };
+        let new_sel = if extending {
+            let anchor = match self.state.selection {
+                Selection::Cursor(p) => p,
+                Selection::Range { anchor, .. } => anchor,
+            };
+            if anchor == new_head {
+                Selection::Cursor(new_head)
+            } else {
+                Selection::range(anchor, new_head)
+            }
+        } else {
+            Selection::Cursor(new_head)
+        };
+        let next = std::mem::take(&mut self.state);
+        self.state = update::update(next, EditorEvent::SetSelection(new_sel));
+        self.marked_range = None;
+        cx.notify();
+    }
+
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorEvent::DeleteBackward, cx);
     }
@@ -730,16 +835,16 @@ impl MarkdownEditorState {
         self.vertical_move(1, true, EditorEvent::ExtendDown, cx);
     }
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::MoveLineStart, cx);
+        self.line_bound_move(false, false, EditorEvent::MoveLineStart, cx);
     }
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::MoveLineEnd, cx);
+        self.line_bound_move(true, false, EditorEvent::MoveLineEnd, cx);
     }
     fn shift_home(&mut self, _: &ShiftHome, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::ExtendLineStart, cx);
+        self.line_bound_move(false, true, EditorEvent::ExtendLineStart, cx);
     }
     fn shift_end(&mut self, _: &ShiftEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::ExtendLineEnd, cx);
+        self.line_bound_move(true, true, EditorEvent::ExtendLineEnd, cx);
     }
     fn document_start(&mut self, _: &DocumentStart, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorEvent::MoveDocumentStart, cx);
