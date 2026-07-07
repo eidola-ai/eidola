@@ -65,6 +65,9 @@ pub struct ConfigState {
     /// The resolved circadian time-of-day axis (`time_of_day_tint` override
     /// if set, otherwise `on`).
     pub time_of_day_tint: config::TimeOfDayTint,
+    /// The resolved fixed light character used while `time_of_day_tint` is
+    /// `off` (`light_character` override if set, otherwise `neutral`).
+    pub light_character: config::LightCharacter,
 }
 
 #[derive(Clone, Debug)]
@@ -2498,6 +2501,7 @@ impl AppCore {
             attestation_url: cfg.attestation_url.clone(),
             appearance: cfg.appearance(),
             time_of_day_tint: cfg.time_of_day_tint(),
+            light_character: cfg.light_character(),
         }
     }
 
@@ -2543,6 +2547,17 @@ impl AppCore {
     pub fn set_time_of_day_tint(&self, tint: config::TimeOfDayTint) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.time_of_day_tint_override = Some(tint);
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
+    }
+
+    /// Persist the fixed light character (the `light_character` config
+    /// override) the palettes render under while the time-of-day axis is
+    /// `off`.
+    pub fn set_light_character(&self, character: config::LightCharacter) -> Result<(), AppError> {
+        let mut cfg = self.inner.load_config();
+        cfg.light_character_override = Some(character);
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
         Ok(())
@@ -4066,14 +4081,18 @@ mod tests {
         let state = core.config_state();
         assert_eq!(state.appearance, config::AppearanceSetting::System);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::On);
+        assert_eq!(state.light_character, config::LightCharacter::Neutral);
 
         core.set_appearance(config::AppearanceSetting::Auto)
             .unwrap();
         core.set_time_of_day_tint(config::TimeOfDayTint::Off)
             .unwrap();
+        core.set_light_character(config::LightCharacter::Bluish)
+            .unwrap();
         let state = core.config_state();
         assert_eq!(state.appearance, config::AppearanceSetting::Auto);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);
+        assert_eq!(state.light_character, config::LightCharacter::Bluish);
 
         // A fresh core over the same config dir sees the persisted values.
         let core2 = AppCore::new(config_dir, data_dir);

@@ -13,6 +13,7 @@ mod plans;
 pub mod probe;
 pub mod record;
 pub mod settings;
+pub mod solar;
 pub mod space;
 pub mod space_view;
 pub mod stores;

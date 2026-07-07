@@ -4,22 +4,35 @@
 //!
 //! - **Day/night** ([`AppearanceSetting`], config key `appearance`): which
 //!   palette family is active. `system` (default) tracks the OS light/dark
-//!   appearance; `day` / `night` pin one family; `auto` switches on the
-//!   system clock (day ≈ 06:00–18:00).
+//!   appearance; `day` / `night` pin one family; `auto` follows the sun —
+//!   day is between (timezone-approximated) sunrise and sunset, or the
+//!   fixed 06:00–18:00 window without geography.
 //! - **Time of day** ([`TimeOfDayTint`], config key `time_of_day_tint`):
-//!   whether the palette takes on the [`LightCharacter`] of the current
-//!   hour — bluish mornings (dawn/sunrise), neutral noon/midnight, warm
-//!   orange evenings (sunset/dusk). `off` stays on the neutral anchors.
+//!   `on` follows the sun — the palette takes on the [`LightCharacter`] of
+//!   the light right now: bluish around sunrise, neutral at solar
+//!   noon/midnight, warm orange around sunset. `off` pins the character to
+//!   the user's `light_character` config choice instead.
 //!
-//! Together they make six palettes that rotate every ~4 hours when both
-//! axes follow the clock: Dawn (02–06, night+bluish), Sunrise (06–10,
-//! day+bluish), Day (10–14, neutral noon), Sunset (14–18, day+orange),
-//! Dusk (18–22, night+orange), Night (22–02, neutral midnight). The tinted
-//! variants are *derived*, not hand-authored: every color of the neutral
-//! palette is blended a few percent toward a per-family blue/ember anchor
-//! ([`tinted`]), so the palettes can't drift apart as colors are tuned.
-//! No geographic awareness yet — the schedule is fixed clock slots (the
-//! setting names leave room for a future `geographical` variant).
+//! **Geography from the timezone** ([`crate::solar`]): the IANA zone name
+//! resolves to representative coordinates via the OS's own tzdb tables,
+//! and the sunrise equation turns those into today's [`DayPhases`] — no
+//! location permission, no network. [`canonical_hour`] then warps wall
+//! time so actual sunrise lands at canonical 06:00 and sunset at 18:00,
+//! and the fixed slot table reads unchanged on the warped clock. The
+//! tinted slots hug the sun's events (±2 canonical hours — the transitions
+//! are brief in real light): Dawn (04–06, night+bluish), Sunrise (06–08,
+//! day+bluish), Day (08–16, long neutral), Sunset (16–18, day+orange),
+//! Dusk (18–20, night+orange), Night (20–04, long neutral) — six palettes
+//! anchored to the real solar day, so December's sunset character arrives
+//! near 16:30 and June's near 20:30. Under the bluish day cast the warm
+//! chip/chrome family is additionally softened toward neutral
+//! ([`DAY_BLUISH_NEUTRALIZED`]) — warm cream under blue light reads muddy.
+//! Zones without coordinates (`UTC`, `Etc/*`) and polar no-event
+//! days degrade to the fixed clock schedule ([`DayPhases::Clock`]). The
+//! tinted variants are *derived*, not hand-authored: every color of the
+//! neutral palette is blended a few percent toward a per-family blue/ember
+//! anchor ([`tinted`]), so the palettes can't drift apart as colors are
+//! tuned.
 //!
 //! Wiring: [`install`] loads fonts and applies the *neutral* palettes (so
 //! tests and the driver stay deterministic); the production `run()` calls
@@ -66,6 +79,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use eidola_app_core::config::{AppearanceSetting, TimeOfDayTint};
+// Re-exported: the palette constructors and the driver's `theme` command
+// speak this type; it lives in app-core config because it is also the
+// persisted `light_character` setting.
+pub use eidola_app_core::config::LightCharacter;
 use gpui::{App, AsyncApp, Entity, Global, SharedString, Window};
 use gpui_component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 
@@ -96,62 +113,102 @@ const NEWSREADER_BOLD_ITALIC_TTF: &[u8] =
 // The two axes
 // ---------------------------------------------------------------------------
 
-/// The character of the light at a given hour — the time-of-day axis's
-/// three values. `Neutral` is the untinted anchor palette; the other two
-/// are derived from it by [`tinted`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LightCharacter {
-    /// Dawn / sunrise — the cool blue cast of early light.
-    Bluish,
-    /// Noon / midnight — the anchor palettes, no cast.
-    Neutral,
-    /// Sunset / dusk — the warm orange/red of low sun.
-    Orange,
-}
-
 /// Both circadian settings, as resolved from config. Held in a [`Global`]
 /// so [`apply`] can run from any context (config observer, clock task,
-/// per-window appearance observer).
+/// per-window appearance observer). `character` is the user's *fixed*
+/// choice, honored only while `tint` is `Off`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThemeSettings {
     pub appearance: AppearanceSetting,
     pub tint: TimeOfDayTint,
+    pub character: LightCharacter,
 }
 
-/// Theme state global: the current settings plus the (mode, character)
-/// pair last applied — the clock task compares against it to detect slot
-/// boundaries without re-deriving palettes every minute.
+/// Theme state global: the current settings, the (mode, character) pair
+/// last applied — the clock task compares against it to detect slot
+/// boundaries without re-deriving palettes every minute — and the
+/// per-zone-name memo of the tzdb coordinate lookup (the only part of the
+/// solar computation worth caching: it scans a file; the zone name re-check
+/// each tick is a cheap readlink, so travel is picked up automatically).
 struct ThemeState {
     settings: ThemeSettings,
     applied: Option<(ThemeMode, LightCharacter)>,
+    zone_cache: Option<(String, Option<(f64, f64)>)>,
 }
 
 impl Global for ThemeState {}
 
-/// The light character of each clock slot. Six ~4-hour slots: dawn 02–06
-/// and sunrise 06–10 are bluish, noon 10–14 neutral, sunset 14–18 and dusk
-/// 18–22 orange, midnight 22–02 neutral.
-pub fn character_for_hour(hour: u32) -> LightCharacter {
-    match hour % 24 {
-        2..=9 => LightCharacter::Bluish,
-        10..=13 => LightCharacter::Neutral,
-        14..=21 => LightCharacter::Orange,
-        _ => LightCharacter::Neutral,
+/// Where today's day and night actually fall — the geographic input to the
+/// schedule. Derived from the system timezone's tzdb coordinates when
+/// available ([`crate::solar`]), otherwise the fixed clock fallback.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DayPhases {
+    /// Sunrise/sunset in minutes since local midnight, from the timezone's
+    /// representative coordinates.
+    Solar { sunrise: f32, sunset: f32 },
+    /// The sun never sets today: clock-slot characters; `auto` is day.
+    PolarDay,
+    /// The sun never rises today: clock-slot characters; `auto` is night.
+    PolarNight,
+    /// No geographic signal (fixed-offset zone, unreadable tzdb): the
+    /// fixed clock schedule — sunrise 06:00, sunset 18:00.
+    Clock,
+}
+
+/// Warp wall-clock time onto the canonical solar day: actual sunrise maps
+/// to 06:00, sunset to 18:00, and the halves stretch/squeeze linearly, so
+/// solar noon/midnight land at 12:00/00:00 and the slot table below reads
+/// unchanged. Under [`DayPhases::Clock`] (and the polar cases, which have
+/// no events to anchor to) this is the identity. Cyclic-safe: events that
+/// straddle local midnight (pathological zones) still map continuously.
+pub fn canonical_hour(now_min: f32, phases: DayPhases) -> f32 {
+    let (sunrise, sunset) = match phases {
+        DayPhases::Solar { sunrise, sunset } => (sunrise, sunset),
+        _ => return (now_min / 60.0).rem_euclid(24.0),
+    };
+    let day_len = (sunset - sunrise).rem_euclid(1440.0);
+    if day_len <= 0.0 || day_len >= 1440.0 {
+        return (now_min / 60.0).rem_euclid(24.0);
+    }
+    let since_rise = (now_min - sunrise).rem_euclid(1440.0);
+    if since_rise < day_len {
+        6.0 + 12.0 * since_rise / day_len
+    } else {
+        let night_len = 1440.0 - day_len;
+        let since_set = since_rise - day_len;
+        (18.0 + 12.0 * since_set / night_len).rem_euclid(24.0)
     }
 }
 
-/// The `auto` appearance's day window: 06:00–18:00 is day.
-pub fn auto_is_day(hour: u32) -> bool {
-    (6..18).contains(&(hour % 24))
+/// The light character of each canonical slot. The tinted windows are
+/// brief, as the real transitions are — two canonical hours to each side
+/// of the sun's events: dawn 04–06 + sunrise 06–08 are bluish, sunset
+/// 16–18 + dusk 18–20 are orange, and the long middles are neutral (day
+/// 08–16, night 20–04). With solar [`DayPhases`] the canonical hour is
+/// anchored to the real sun, so "sunrise 06–08" means the first sixth of
+/// actual daylight.
+pub fn character_for_hour(hour: f32) -> LightCharacter {
+    let h = hour.rem_euclid(24.0);
+    if (4.0..8.0).contains(&h) {
+        LightCharacter::Bluish
+    } else if (8.0..16.0).contains(&h) {
+        LightCharacter::Neutral
+    } else if (16.0..20.0).contains(&h) {
+        LightCharacter::Orange
+    } else {
+        LightCharacter::Neutral
+    }
 }
 
 /// Resolve both axes to the (mode, character) to render. Pure — the
-/// impure inputs (OS appearance, wall clock) are parameters.
+/// impure inputs (OS appearance, wall clock, solar events) are parameters.
 pub fn resolve(
     settings: ThemeSettings,
     system_is_dark: bool,
-    hour: u32,
+    now_min: f32,
+    phases: DayPhases,
 ) -> (ThemeMode, LightCharacter) {
+    let canonical = canonical_hour(now_min, phases);
     let mode = match settings.appearance {
         AppearanceSetting::System => {
             if system_is_dark {
@@ -162,33 +219,80 @@ pub fn resolve(
         }
         AppearanceSetting::Day => ThemeMode::Light,
         AppearanceSetting::Night => ThemeMode::Dark,
-        AppearanceSetting::Auto => {
-            if auto_is_day(hour) {
-                ThemeMode::Light
-            } else {
-                ThemeMode::Dark
+        AppearanceSetting::Auto => match phases {
+            DayPhases::PolarDay => ThemeMode::Light,
+            DayPhases::PolarNight => ThemeMode::Dark,
+            // Canonical 06–18 is exactly "between sunrise and sunset"
+            // under Solar phases, and the fixed window under Clock.
+            _ => {
+                if (6.0..18.0).contains(&canonical) {
+                    ThemeMode::Light
+                } else {
+                    ThemeMode::Dark
+                }
             }
-        }
+        },
     };
     let character = match settings.tint {
-        TimeOfDayTint::On => character_for_hour(hour),
-        TimeOfDayTint::Off => LightCharacter::Neutral,
+        TimeOfDayTint::On => character_for_hour(canonical),
+        TimeOfDayTint::Off => settings.character,
     };
     (mode, character)
 }
 
-/// The local wall-clock hour (0–23). Local because the circadian schedule
-/// is about the user's day, not UTC; `libc::localtime_r` avoids a chrono
-/// dependency (the workspace's only other time formatting is UTC-only).
-fn local_hour() -> u32 {
-    let secs = std::time::SystemTime::now()
+/// A snapshot of local civil time, from `libc::localtime_r` (no chrono
+/// dependency; the circadian schedule is about the user's local day,
+/// unlike the Record's UTC timestamps).
+struct LocalNow {
+    /// Minutes since local midnight.
+    minutes: f32,
+    /// Unix seconds — the solar equation's time input.
+    unix: i64,
+    /// The current UTC offset, for mapping solar events into local time.
+    utc_offset_secs: i32,
+}
+
+fn local_now() -> LocalNow {
+    let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as libc::time_t;
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = unix as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // Safety: `secs` and `tm` are valid for the duration of the call.
     unsafe { libc::localtime_r(&secs, &mut tm) };
-    tm.tm_hour.clamp(0, 23) as u32
+    LocalNow {
+        minutes: (tm.tm_hour * 60 + tm.tm_min) as f32 + tm.tm_sec as f32 / 60.0,
+        unix,
+        utc_offset_secs: tm.tm_gmtoff as i32,
+    }
+}
+
+/// Today's [`DayPhases`] from the system timezone, memoizing the tzdb
+/// coordinate lookup per zone name in [`ThemeState`].
+fn current_phases(now: &LocalNow, cx: &mut App) -> DayPhases {
+    let Some(zone) = crate::solar::system_zone_name() else {
+        return DayPhases::Clock;
+    };
+    let state = cx.global_mut::<ThemeState>();
+    let coords = match &state.zone_cache {
+        Some((cached_zone, coords)) if *cached_zone == zone => *coords,
+        _ => {
+            let coords = crate::solar::zone_coordinates(&zone);
+            state.zone_cache = Some((zone, coords));
+            coords
+        }
+    };
+    let Some((lat, lon)) = coords else {
+        return DayPhases::Clock;
+    };
+    match crate::solar::solar_events(lat, lon, now.unix, now.utc_offset_secs) {
+        crate::solar::SolarEvents::Normal { sunrise, sunset } => {
+            DayPhases::Solar { sunrise, sunset }
+        }
+        crate::solar::SolarEvents::PolarDay => DayPhases::PolarDay,
+        crate::solar::SolarEvents::PolarNight => DayPhases::PolarNight,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,13 +311,15 @@ pub fn install(cx: &mut App) {
     if !cx.has_global::<ThemeState>() {
         cx.set_global(ThemeState {
             // Neutral defaults until `wire_config` reads the real config:
-            // `system` matches the config default, `Off` keeps un-wired
-            // contexts (tests, the driver) on the anchor palettes.
+            // `system` matches the config default, `Off` + `Neutral` keeps
+            // un-wired contexts (tests, the driver) on the anchor palettes.
             settings: ThemeSettings {
                 appearance: AppearanceSetting::System,
                 tint: TimeOfDayTint::Off,
+                character: LightCharacter::Neutral,
             },
             applied: None,
+            zone_cache: None,
         });
     }
     apply(None, cx);
@@ -231,7 +337,15 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
             .unwrap_or_else(|| cx.window_appearance()),
     )
     .is_dark();
-    let (mode, character) = resolve(settings, system_is_dark, local_hour());
+    let now = local_now();
+    let phases =
+        if settings.tint == TimeOfDayTint::On || settings.appearance == AppearanceSetting::Auto {
+            current_phases(&now, cx)
+        } else {
+            // Nothing reads the sun: skip the zone/tzdb work entirely.
+            DayPhases::Clock
+        };
+    let (mode, character) = resolve(settings, system_is_dark, now.minutes, phases);
 
     {
         let theme = Theme::global_mut(cx);
@@ -276,6 +390,7 @@ pub fn wire_config(config: &Entity<ConfigStore>, cx: &mut App) {
         store.state().map(|s| ThemeSettings {
             appearance: s.appearance,
             tint: s.time_of_day_tint,
+            character: s.light_character,
         })
     };
 
@@ -324,7 +439,9 @@ fn reapply_if_slot_changed(cx: &mut App) {
     let settings = state.settings;
     let applied = state.applied;
     let system_is_dark = ThemeMode::from(cx.window_appearance()).is_dark();
-    if applied != Some(resolve(settings, system_is_dark, local_hour())) {
+    let now = local_now();
+    let phases = current_phases(&now, cx);
+    if applied != Some(resolve(settings, system_is_dark, now.minutes, phases)) {
         apply(None, cx);
     }
 }
@@ -398,11 +515,14 @@ fn tint_hex(hex: &str, target: [u8; 3], amount: f32) -> Option<String> {
     ))
 }
 
-/// Blend every color of a palette toward `target` by `amount` — one light
-/// falling on the whole scene, so relative contrast is preserved. Uses a
-/// serde round-trip so new `ThemeConfigColors` fields are covered
-/// automatically instead of by a hand-maintained field list.
-fn tinted(colors: ThemeConfigColors, target: [u8; 3], amount: f32) -> ThemeConfigColors {
+/// Map every color field of a palette through `f(serde_field_name, hex)`;
+/// `None` keeps the original. The serde round-trip covers new
+/// `ThemeConfigColors` fields automatically instead of via a
+/// hand-maintained field list.
+fn map_colors(
+    colors: ThemeConfigColors,
+    f: impl Fn(&str, &str) -> Option<String>,
+) -> ThemeConfigColors {
     let Ok(serde_json::Value::Object(map)) = serde_json::to_value(&colors) else {
         return colors;
     };
@@ -411,8 +531,8 @@ fn tinted(colors: ThemeConfigColors, target: [u8; 3], amount: f32) -> ThemeConfi
         .map(|(k, v)| {
             let v = match v {
                 serde_json::Value::String(s) => {
-                    let tinted = tint_hex(&s, target, amount).unwrap_or_else(|| s.to_string());
-                    serde_json::Value::String(tinted)
+                    let mapped = f(&k, &s).unwrap_or_else(|| s.to_string());
+                    serde_json::Value::String(mapped)
                 }
                 other => other,
             };
@@ -422,14 +542,79 @@ fn tinted(colors: ThemeConfigColors, target: [u8; 3], amount: f32) -> ThemeConfi
     serde_json::from_value(serde_json::Value::Object(map)).unwrap_or(colors)
 }
 
+/// Blend every color of a palette toward `target` by `amount` — one light
+/// falling on the whole scene, so relative contrast is preserved.
+fn tinted(colors: ThemeConfigColors, target: [u8; 3], amount: f32) -> ThemeConfigColors {
+    map_colors(colors, |_, hex| tint_hex(hex, target, amount))
+}
+
+/// The day palette's warm chip/chrome family (serde field names): the
+/// cream secondary/accent surfaces, the sidebar grounds, and their warm
+/// brown foregrounds. Under the bluish morning cast these are softened
+/// toward neutral first — warm cream under a blue light reads muddy and
+/// mutes the chip-vs-page contrast, where the night palette's counterparts
+/// are already neutral cool-greys and take the cast cleanly. The brand
+/// primary (the orange buttons/links) is deliberately *not* neutralized —
+/// the brand stays the brand under any light.
+const DAY_BLUISH_NEUTRALIZED: &[&str] = &[
+    "secondary.background",
+    "secondary.hover.background",
+    "secondary.active.background",
+    "secondary.foreground",
+    "accent.background",
+    "accent.foreground",
+    "sidebar.background",
+    "sidebar.accent.background",
+    "sidebar.accent.foreground",
+    "tab_bar.segmented.background",
+    "list.even.background",
+    "list.head.background",
+    "list.hover.background",
+    "group_box.background",
+];
+
+/// How far the warm chrome is pulled toward neutral grey under the bluish
+/// day cast (0 = untouched, 1 = fully grey). A touch, not a redesign.
+const DAY_BLUISH_NEUTRALIZE_AMOUNT: f32 = 0.4;
+
+/// Desaturate one hex color toward its own (Rec. 709) luminance grey by
+/// `amount` — hue drains, perceived lightness stays, so contrast with
+/// neighbors is preserved. Alpha suffixes survive.
+fn neutralize_hex(hex: &str, amount: f32) -> Option<String> {
+    let raw = hex.strip_prefix('#')?;
+    if raw.len() != 6 && raw.len() != 8 || !raw.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&raw[i..i + 2], 16).ok();
+    let (r, g, b) = (byte(0)?, byte(2)?, byte(4)?);
+    let grey = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+    let blend = |c: u8| (f32::from(c) * (1.0 - amount) + grey * amount).round() as u8;
+    Some(format!(
+        "#{:02x}{:02x}{:02x}{}",
+        blend(r),
+        blend(g),
+        blend(b),
+        &raw[6..]
+    ))
+}
+
 fn character_colors(
     neutral: ThemeConfigColors,
     dark: bool,
     ch: LightCharacter,
 ) -> ThemeConfigColors {
+    let mut colors = neutral;
+    if !dark && ch == LightCharacter::Bluish {
+        colors = map_colors(colors, |field, hex| {
+            DAY_BLUISH_NEUTRALIZED
+                .contains(&field)
+                .then(|| neutralize_hex(hex, DAY_BLUISH_NEUTRALIZE_AMOUNT))
+                .flatten()
+        });
+    }
     match tint_spec(dark, ch) {
-        Some((target, amount)) => tinted(neutral, target, amount),
-        None => neutral,
+        Some((target, amount)) => tinted(colors, target, amount),
+        None => colors,
     }
 }
 
@@ -654,86 +839,220 @@ mod tests {
 
     #[test]
     fn character_schedule_covers_the_six_slots() {
-        // Dawn 02–06 and sunrise 06–10 are bluish.
-        for h in 2..10 {
+        // Dawn 04–06 and sunrise 06–08 are bluish (sunrise ±2h).
+        for h in [4.0, 5.9, 6.0, 7.9] {
             assert_eq!(character_for_hour(h), LightCharacter::Bluish, "hour {h}");
         }
-        // Noon 10–14 neutral.
-        for h in 10..14 {
+        // The long neutral day, 08–16.
+        for h in [8.0, 12.0, 15.9] {
             assert_eq!(character_for_hour(h), LightCharacter::Neutral, "hour {h}");
         }
-        // Sunset 14–18 and dusk 18–22 are orange.
-        for h in 14..22 {
+        // Sunset 16–18 and dusk 18–20 are orange (sunset ±2h).
+        for h in [16.0, 17.9, 18.0, 19.9] {
             assert_eq!(character_for_hour(h), LightCharacter::Orange, "hour {h}");
         }
-        // Midnight 22–02 neutral.
-        for h in [22, 23, 0, 1] {
+        // The long neutral night, 20–04.
+        for h in [20.0, 23.5, 0.0, 3.9] {
             assert_eq!(character_for_hour(h), LightCharacter::Neutral, "hour {h}");
         }
         // Out-of-range hours wrap instead of panicking.
-        assert_eq!(character_for_hour(26), LightCharacter::Bluish);
+        assert_eq!(character_for_hour(28.0), LightCharacter::Bluish);
+        assert_eq!(character_for_hour(-1.0), LightCharacter::Neutral);
+    }
+
+    #[test]
+    fn canonical_hour_is_identity_without_geography() {
+        for phases in [DayPhases::Clock, DayPhases::PolarDay, DayPhases::PolarNight] {
+            for min in [0.0, 361.0, 720.0, 1439.0] {
+                assert!(
+                    (canonical_hour(min, phases) - min / 60.0).abs() < 1e-4,
+                    "{phases:?} at {min}min"
+                );
+            }
+        }
+        // The fixed clock schedule *is* Solar{06:00, 18:00}.
+        let clockish = DayPhases::Solar {
+            sunrise: 360.0,
+            sunset: 1080.0,
+        };
+        for min in [0.0, 200.0, 700.0, 1200.0] {
+            assert!((canonical_hour(min, clockish) - min / 60.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn canonical_hour_warps_to_the_real_sun() {
+        // A winter day at mid-latitude: sunrise 08:00, sunset 16:30.
+        let phases = DayPhases::Solar {
+            sunrise: 8.0 * 60.0,
+            sunset: 16.5 * 60.0,
+        };
+        // Sunrise maps to canonical 06:00, sunset to 18:00.
+        assert!((canonical_hour(8.0 * 60.0, phases) - 6.0).abs() < 1e-4);
+        assert!((canonical_hour(16.5 * 60.0, phases) - 18.0).abs() < 1e-4);
+        // Solar noon (midpoint of daylight, 12:15) maps to canonical 12:00.
+        assert!((canonical_hour(12.25 * 60.0, phases) - 12.0).abs() < 1e-4);
+        // 16:00 wall time is late daylight — canonical sunset slot (16–18),
+        // so December's sunset character arrives before 16:30.
+        let c = canonical_hour(16.0 * 60.0, phases);
+        assert!(
+            (16.0..18.0).contains(&c),
+            "16:00 on a short day is canonical sunset, got {c}"
+        );
+        assert_eq!(character_for_hour(c), LightCharacter::Orange);
+        // 20:00 is past dusk (18–20) on this short day — the long neutral
+        // night has already begun.
+        let c = canonical_hour(20.0 * 60.0, phases);
+        assert!((20.0..24.0).contains(&c), "got {c}");
+        assert_eq!(character_for_hour(c), LightCharacter::Neutral);
+        // The night wraps continuously through midnight back to sunrise.
+        let just_before_rise = canonical_hour(7.9 * 60.0, phases);
+        assert!(
+            (5.9..6.0).contains(&just_before_rise),
+            "got {just_before_rise}"
+        );
+    }
+
+    fn s(appearance: AppearanceSetting, tint: TimeOfDayTint) -> ThemeSettings {
+        ThemeSettings {
+            appearance,
+            tint,
+            character: LightCharacter::Neutral,
+        }
     }
 
     #[test]
     fn resolve_maps_each_appearance_setting() {
-        let s = |appearance| ThemeSettings {
-            appearance,
-            tint: TimeOfDayTint::Off,
-        };
+        let off = |a| s(a, TimeOfDayTint::Off);
+        let noon = 12.0 * 60.0;
         // System follows the OS flag.
         assert_eq!(
-            resolve(s(AppearanceSetting::System), false, 12).0,
+            resolve(
+                off(AppearanceSetting::System),
+                false,
+                noon,
+                DayPhases::Clock
+            )
+            .0,
             ThemeMode::Light
         );
         assert_eq!(
-            resolve(s(AppearanceSetting::System), true, 12).0,
+            resolve(off(AppearanceSetting::System), true, noon, DayPhases::Clock).0,
             ThemeMode::Dark
         );
-        // Day/Night pin regardless of OS and clock.
+        // Day/Night pin regardless of OS, clock, and sun.
         assert_eq!(
-            resolve(s(AppearanceSetting::Day), true, 23).0,
+            resolve(
+                off(AppearanceSetting::Day),
+                true,
+                23.0 * 60.0,
+                DayPhases::PolarNight
+            )
+            .0,
             ThemeMode::Light
         );
         assert_eq!(
-            resolve(s(AppearanceSetting::Night), false, 12).0,
+            resolve(
+                off(AppearanceSetting::Night),
+                false,
+                noon,
+                DayPhases::PolarDay
+            )
+            .0,
             ThemeMode::Dark
         );
-        // Auto follows the clock (day 06:00–18:00), ignoring the OS flag.
+        // Auto follows the clock fallback (day 06:00–18:00) without
+        // geography, ignoring the OS flag.
         assert_eq!(
-            resolve(s(AppearanceSetting::Auto), true, 9).0,
+            resolve(
+                off(AppearanceSetting::Auto),
+                true,
+                9.0 * 60.0,
+                DayPhases::Clock
+            )
+            .0,
             ThemeMode::Light
         );
         assert_eq!(
-            resolve(s(AppearanceSetting::Auto), false, 5).0,
+            resolve(
+                off(AppearanceSetting::Auto),
+                false,
+                5.0 * 60.0,
+                DayPhases::Clock
+            )
+            .0,
             ThemeMode::Dark
         );
         assert_eq!(
-            resolve(s(AppearanceSetting::Auto), false, 18).0,
+            resolve(
+                off(AppearanceSetting::Auto),
+                false,
+                18.0 * 60.0,
+                DayPhases::Clock
+            )
+            .0,
             ThemeMode::Dark
+        );
+    }
+
+    #[test]
+    fn resolve_auto_follows_the_sun_when_it_has_one() {
+        let auto = s(AppearanceSetting::Auto, TimeOfDayTint::Off);
+        // Winter: sunrise 08:00, sunset 16:30 — 07:00 is still night and
+        // 16:00 still day, both opposite the fixed 06–18 window's answer.
+        let winter = DayPhases::Solar {
+            sunrise: 8.0 * 60.0,
+            sunset: 16.5 * 60.0,
+        };
+        assert_eq!(resolve(auto, false, 7.0 * 60.0, winter).0, ThemeMode::Dark);
+        assert_eq!(
+            resolve(auto, false, 16.0 * 60.0, winter).0,
+            ThemeMode::Light
+        );
+        assert_eq!(resolve(auto, false, 17.0 * 60.0, winter).0, ThemeMode::Dark);
+        // Polar days/nights force the mode outright.
+        assert_eq!(
+            resolve(auto, false, 12.0 * 60.0, DayPhases::PolarNight).0,
+            ThemeMode::Dark
+        );
+        assert_eq!(
+            resolve(auto, false, 0.0, DayPhases::PolarDay).0,
+            ThemeMode::Light
         );
     }
 
     #[test]
     fn resolve_tint_axis_gates_the_character() {
-        let s = |tint| ThemeSettings {
-            appearance: AppearanceSetting::System,
-            tint,
-        };
+        let on = s(AppearanceSetting::System, TimeOfDayTint::On);
         assert_eq!(
-            resolve(s(TimeOfDayTint::On), false, 7).1,
+            resolve(on, false, 7.0 * 60.0, DayPhases::Clock).1,
             LightCharacter::Bluish
         );
         assert_eq!(
-            resolve(s(TimeOfDayTint::On), false, 16).1,
+            resolve(on, false, 16.0 * 60.0, DayPhases::Clock).1,
             LightCharacter::Orange
         );
+        // On + geography: the character follows the warped (solar) hour —
+        // 16:00 on a short winter day is already sunset-orange.
+        let winter = DayPhases::Solar {
+            sunrise: 8.0 * 60.0,
+            sunset: 16.5 * 60.0,
+        };
         assert_eq!(
-            resolve(s(TimeOfDayTint::Off), false, 7).1,
-            LightCharacter::Neutral
+            resolve(on, false, 16.0 * 60.0, winter).1,
+            LightCharacter::Orange
         );
+        // Off: the user's fixed character wins, whatever the sun is doing.
+        let mut fixed = s(AppearanceSetting::System, TimeOfDayTint::Off);
+        fixed.character = LightCharacter::Orange;
         assert_eq!(
-            resolve(s(TimeOfDayTint::Off), false, 16).1,
-            LightCharacter::Neutral
+            resolve(fixed, false, 7.0 * 60.0, winter).1,
+            LightCharacter::Orange
+        );
+        fixed.character = LightCharacter::Bluish;
+        assert_eq!(
+            resolve(fixed, false, 16.0 * 60.0, DayPhases::Clock).1,
+            LightCharacter::Bluish
         );
     }
 
@@ -780,6 +1099,70 @@ mod tests {
         // The overlay's alpha suffix survives tinting.
         let dusk = character_colors(night_colors(), true, LightCharacter::Orange);
         assert!(dusk.overlay.as_ref().unwrap().ends_with("a6"));
+    }
+
+    /// Channel spread (max − min) — a cheap saturation proxy.
+    fn spread(hex: &Option<SharedString>) -> i32 {
+        let raw = hex.as_ref().unwrap().strip_prefix('#').unwrap();
+        let byte = |i: usize| i32::from_str_radix(&raw[i..i + 2], 16).unwrap();
+        let (r, g, b) = (byte(0), byte(2), byte(4));
+        r.max(g).max(b) - r.min(g).min(b)
+    }
+
+    #[test]
+    fn day_bluish_softens_the_warm_chrome() {
+        let plain_tint = tinted(day_colors(), [0x6d, 0x8f, 0xc0], 0.08);
+        let sunrise = character_colors(day_colors(), false, LightCharacter::Bluish);
+
+        // The warm chip/sidebar surfaces are pulled toward neutral relative
+        // to a uniform tint…
+        for (field, plain, softened) in [
+            (
+                "sidebar.accent",
+                &plain_tint.sidebar_accent,
+                &sunrise.sidebar_accent,
+            ),
+            ("sidebar", &plain_tint.sidebar, &sunrise.sidebar),
+            ("secondary", &plain_tint.secondary, &sunrise.secondary),
+            (
+                "secondary.foreground",
+                &plain_tint.secondary_foreground,
+                &sunrise.secondary_foreground,
+            ),
+        ] {
+            assert!(
+                spread(softened) < spread(plain),
+                "{field}: expected the neutralize pass to drain warmth \
+                 (plain {plain:?} vs softened {softened:?})"
+            );
+        }
+
+        // …while unlisted colors match the uniform tint exactly, and the
+        // brand primary stays the brand.
+        assert_eq!(sunrise.background, plain_tint.background);
+        assert_eq!(sunrise.foreground, plain_tint.foreground);
+        assert_eq!(sunrise.primary, plain_tint.primary);
+
+        // The night-bluish (dawn) palette takes no neutralize pass — its
+        // chrome is already cool-neutral.
+        let dawn = character_colors(night_colors(), true, LightCharacter::Bluish);
+        let plain_dawn = tinted(night_colors(), [0x4a, 0x6f, 0xa5], 0.12);
+        assert_eq!(dawn.sidebar_accent, plain_dawn.sidebar_accent);
+        assert_eq!(dawn.secondary, plain_dawn.secondary);
+    }
+
+    #[test]
+    fn neutralize_hex_drains_hue_and_keeps_alpha() {
+        // A pure grey is a fixed point.
+        assert_eq!(neutralize_hex("#808080", 0.4).as_deref(), Some("#808080"));
+        // Full amount lands on the luminance grey (all channels equal).
+        let full = neutralize_hex("#f2ebe1", 1.0).unwrap();
+        let raw = full.strip_prefix('#').unwrap();
+        assert_eq!(raw[0..2], raw[2..4]);
+        assert_eq!(raw[2..4], raw[4..6]);
+        // Alpha suffixes survive.
+        assert!(neutralize_hex("#f2ebe180", 0.4).unwrap().ends_with("80"));
+        assert_eq!(neutralize_hex("nope", 0.4), None);
     }
 
     #[test]

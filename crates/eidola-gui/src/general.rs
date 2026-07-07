@@ -15,7 +15,7 @@
 //! Base URL field on this pane) has focus. Measurement rows summarize and
 //! link to the Record window instead of dumping truncated hex.
 
-use eidola_app_core::config::{AppearanceSetting, TimeOfDayTint};
+use eidola_app_core::config::{AppearanceSetting, LightCharacter, TimeOfDayTint};
 use gpui::{
     AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
@@ -170,6 +170,14 @@ impl GeneralView {
             .update(cx, |c, cx| c.set_time_of_day_tint(tint, cx));
         cx.notify();
     }
+
+    /// Circadian fixed light character (shown only while the time-of-day
+    /// axis is off).
+    pub fn set_light_character(&mut self, character: LightCharacter, cx: &mut Context<Self>) {
+        self.config
+            .update(cx, |c, cx| c.set_light_character(character, cx));
+        cx.notify();
+    }
 }
 
 impl Render for GeneralView {
@@ -232,7 +240,7 @@ impl Render for GeneralView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground.opacity(0.8))
-                        .child("System follows macOS. Auto follows the clock — day from 6:00 to 18:00."),
+                        .child("System follows macOS. Auto follows the sun — day between sunrise and sunset."),
                 ),
             ));
 
@@ -269,10 +277,57 @@ impl Render for GeneralView {
                         .text_xs()
                         .text_color(theme.muted_foreground.opacity(0.8))
                         .child(
-                            "Follows the hour's light — bluish mornings, neutral noon and midnight, warm evenings.",
+                            "Follows the sun's light — bluish around sunrise, neutral midday and \
+                             midnight, warm around sunset. Sunrise and sunset are approximated \
+                             from your time zone.",
                         ),
                 ),
             ));
+
+            // With the sun turned off, the character becomes a fixed choice.
+            if s.time_of_day_tint == TimeOfDayTint::Off {
+                let mut light_row = h_flex().gap_2();
+                for (value, id, probe_name, label) in [
+                    (
+                        LightCharacter::Bluish,
+                        "light-character-bluish",
+                        "settings/general/light-character/bluish",
+                        "Bluish",
+                    ),
+                    (
+                        LightCharacter::Neutral,
+                        "light-character-neutral",
+                        "settings/general/light-character/neutral",
+                        "Neutral",
+                    ),
+                    (
+                        LightCharacter::Orange,
+                        "light-character-orange",
+                        "settings/general/light-character/orange",
+                        "Warm",
+                    ),
+                ] {
+                    let active = s.light_character == value;
+                    light_row = light_row.child(
+                        choice_chip(id, label, active, cx)
+                            .probe(probe_name, gpui::Role::Button, label)
+                            .aria_selected(active)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_light_character(value, cx);
+                            })),
+                    );
+                }
+                col = col.child(field_row(
+                    "Light",
+                    cx,
+                    v_flex().gap_1().child(light_row).child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground.opacity(0.8))
+                            .child("A fixed light character for the palette."),
+                    ),
+                ));
+            }
         }
 
         col = col.child(div().pt_2().child(section_header("Server", cx)));

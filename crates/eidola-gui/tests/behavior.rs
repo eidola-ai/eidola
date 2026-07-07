@@ -962,6 +962,7 @@ fn settings_appearance_choices_route_through_config_store(cx: &mut TestAppContex
     general.update(cx, |g, cx| {
         g.set_appearance(AppearanceSetting::Night, cx);
         g.set_time_of_day_tint(TimeOfDayTint::Off, cx);
+        g.set_light_character(eidola_app_core::config::LightCharacter::Orange, cx);
     });
 
     stores.config.read_with(cx, |c, _| {
@@ -972,6 +973,10 @@ fn settings_appearance_choices_route_through_config_store(cx: &mut TestAppContex
             "stub write must stop at the backend guard"
         );
         assert_eq!(s.time_of_day_tint, TimeOfDayTint::On);
+        assert_eq!(
+            s.light_character,
+            eidola_app_core::config::LightCharacter::Neutral
+        );
     });
 }
 
@@ -1268,6 +1273,7 @@ fn config_state(has_account: bool) -> ConfigState {
         attestation_url: None,
         appearance: eidola_app_core::config::AppearanceSetting::System,
         time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
+        light_character: eidola_app_core::config::LightCharacter::Neutral,
     }
 }
 

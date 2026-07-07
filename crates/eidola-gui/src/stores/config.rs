@@ -121,6 +121,16 @@ impl ConfigStore {
         self.write(cx, |c| c.set_time_of_day_tint(tint));
     }
 
+    /// Circadian fixed light character (`light_character`, used while the
+    /// time-of-day axis is off).
+    pub fn set_light_character(
+        &mut self,
+        character: eidola_app_core::config::LightCharacter,
+        cx: &mut Context<Self>,
+    ) {
+        self.write(cx, |c| c.set_light_character(character));
+    }
+
     #[allow(dead_code)]
     pub fn set_attestation_url(&mut self, url: String, cx: &mut Context<Self>) {
         self.write(cx, |c| c.set_attestation_url(url));
