@@ -125,8 +125,8 @@ struct CatalogEntry {
 /// `TINFOIL_PRICING_OVERRIDES`.
 const MODEL_CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
-        id: "glm-5-1",
-        name: "GLM-5.1",
+        id: "glm-5-2",
+        name: "GLM-5.2",
         description: "Advanced language model with strong reasoning and multilingual capabilities",
         context_length: 200_000,
         input_per_m: 1.5,
@@ -147,7 +147,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         name: "Gemma 4 31B",
         description: "Lightweight and efficient language model from Google for versatile use cases",
         context_length: 256_000,
-        input_per_m: 0.45,
+        input_per_m: 0.40,
         output_per_m: 1.0,
         per_request_usd: 0.0,
     },
@@ -165,8 +165,8 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         name: "GPT-OSS 120B",
         description: "Open-weight model designed for powerful reasoning, agentic tasks, and versatile use cases",
         context_length: 131_000,
-        input_per_m: 0.75,
-        output_per_m: 1.25,
+        input_per_m: 0.15,
+        output_per_m: 0.60,
         per_request_usd: 0.0,
     },
     CatalogEntry {
@@ -174,17 +174,8 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         name: "GPT-OSS Safeguard 120B",
         description: "Safety reasoning model for content classification and trust & safety applications",
         context_length: 131_000,
-        input_per_m: 0.50,
-        output_per_m: 1.0,
-        per_request_usd: 0.0,
-    },
-    CatalogEntry {
-        id: "qwen3-vl-30b",
-        name: "Qwen3-VL 30B",
-        description: "Advanced vision-language model for image understanding",
-        context_length: 256_000,
-        input_per_m: 1.25,
-        output_per_m: 4.0,
+        input_per_m: 0.15,
+        output_per_m: 0.60,
         per_request_usd: 0.0,
     },
     CatalogEntry {
@@ -568,8 +559,9 @@ mod tests {
         // scaled = 1.5 * 1.5 * 1_000_000 = 2_250_000
         assert_eq!(usd_per_m_to_scaled_credits(1.5, 1.5), 2_250_000);
 
-        // gpt-oss-120b input: $0.75/M with 1.5x markup
-        assert_eq!(usd_per_m_to_scaled_credits(0.75, 1.5), 1_125_000);
+        // gpt-oss-120b input: $0.15/M with 1.5x markup
+        // scaled = 0.15 * 1.5 * 1_000_000 = 225_000
+        assert_eq!(usd_per_m_to_scaled_credits(0.15, 1.5), 225_000);
 
         // Zero price
         assert_eq!(usd_per_m_to_scaled_credits(0.0, 1.5), 0);
