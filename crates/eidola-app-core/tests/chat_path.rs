@@ -436,9 +436,86 @@ fn regenerate_sends_only_upstream_context_at_current_versions() {
             "regenerate context = upstream only, most-recent versions"
         );
 
-        // Sanity: the second chat (a Reply) still saw the whole space.
+        // Sanity: the second chat (a Reply on the linear spine) saw the full
+        // thread — its target's inclusive ancestry is the whole conversation.
         let second_messages = bodies[1]["messages"].as_array().expect("messages").len();
-        assert_eq!(second_messages, 3, "reply mode keeps the whole-space view");
+        assert_eq!(second_messages, 3, "a linear reply sees the full thread");
+    });
+}
+
+#[test]
+fn branch_reply_sends_only_its_branch_context() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // A linear spine, streamed: u1 -> i1 -> u2 -> i2.
+        let (tx, _rx1) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let first = core
+            .runtime()
+            .block_on(core.chat_stream("How do tides work?".into(), MODEL.into(), None, tx))
+            .expect("first turn");
+        let (tx, _rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.chat_stream(
+                "And why two per day?".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+                tx,
+            ))
+            .expect("second turn");
+
+        // Branch off the FIRST answer (u2 already replies to i1, so this
+        // reply forks the thread there).
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        assert_eq!(tree.len(), 4, "u1, i1, u2, i2; got {tree:#?}");
+        assert_eq!(tree[1].action_type, "inference");
+        let i1 = tree[1].action_id.clone();
+
+        let (tx, _rx3) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.chat_stream_reply(
+                "What about spring tides?".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+                Some(i1),
+                tx,
+            ))
+            .expect("branch reply");
+
+        // The branch ask (third request) must see ONLY its own branch: the
+        // ancestry of the new post — never the sibling turn (u2/i2).
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3, "two spine turns + one branch reply");
+        let flat: Vec<(String, String)> = bodies[2]["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap_or_default().to_string(),
+                    m["content"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("user".to_string(), "How do tides work?".to_string()),
+                (
+                    "assistant".to_string(),
+                    "Hello from the stream.".to_string()
+                ),
+                ("user".to_string(), "What about spring tides?".to_string()),
+            ],
+            "branch reply context = the branch's ancestry only"
+        );
     });
 }
 

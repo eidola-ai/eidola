@@ -1666,15 +1666,20 @@ impl Inner {
             }
         };
 
-        // Assemble context from the space's CURRENT generations. A Reply sees
-        // the whole space (the posted user turn is already in that set); a
-        // Revise (regenerate) sees only its **upstream** thread — the reply
-        // ancestry of the generation being replaced, each item at its most
-        // recent version — never its own prior output, anything downstream of
-        // it, or sibling branches.
+        // Assemble the **upstream thread** of this turn, each item at its most
+        // recent version (`get_upstream_context`): a Reply walks from the post
+        // being answered *inclusive* — the whole conversation on a linear
+        // thread, exactly the target's branch on a branched space (sibling
+        // branches never leak into the context); a Revise (regenerate) walks
+        // from the generation being replaced *exclusive*, so the model never
+        // sees its own prior output or anything downstream of it.
         let context_rows: Vec<db::SpaceActionRow> = match mode {
-            ResponseMode::Reply => db::get_space_actions_for_context(&db_conn, &space_id).await?,
-            ResponseMode::Revise => db::get_upstream_context(&db_conn, target_action_id).await?,
+            ResponseMode::Reply => {
+                db::get_upstream_context(&db_conn, target_action_id, true).await?
+            }
+            ResponseMode::Revise => {
+                db::get_upstream_context(&db_conn, target_action_id, false).await?
+            }
         };
         let prior_messages = actions_to_messages(&context_rows);
 
@@ -2175,11 +2180,16 @@ impl Inner {
             }
         };
 
-        // Context per mode — same contract as `run_turn`: Reply sees the whole
-        // space; Revise sees only its upstream thread at most-recent versions.
+        // Context per mode — same contract as `run_turn`: the target's
+        // upstream thread at most-recent versions (Reply inclusive of the
+        // target, Revise exclusive).
         let context_rows: Vec<db::SpaceActionRow> = match mode {
-            ResponseMode::Reply => db::get_space_actions_for_context(&db_conn, &space_id).await?,
-            ResponseMode::Revise => db::get_upstream_context(&db_conn, target_action_id).await?,
+            ResponseMode::Reply => {
+                db::get_upstream_context(&db_conn, target_action_id, true).await?
+            }
+            ResponseMode::Revise => {
+                db::get_upstream_context(&db_conn, target_action_id, false).await?
+            }
         };
         let prior_messages = actions_to_messages(&context_rows);
 

@@ -962,8 +962,10 @@ pub struct SpaceActionRow {
     pub block_ordinal: Option<i64>,
 }
 
-/// Returns actions in a space with their text content blocks, suitable for
-/// building the OpenAI messages array. Filters to terminal statuses and to the
+/// Returns every current-generation action in a space with its text content
+/// blocks — the flat **whole-space** view backing `get_space_messages`. Turns
+/// no longer send this upstream (`get_upstream_context` assembles the
+/// branch-scoped thread instead). Filters to terminal statuses and to the
 /// *current* generation of each item (via item_current), so superseded
 /// generations never enter the context the model sees.
 pub async fn get_space_actions_for_context(
@@ -1014,12 +1016,16 @@ pub async fn get_space_actions_for_context(
 /// The **upstream** context of an action: its reply ancestry, root-first, each
 /// hop resolved to the antecedent **item's current tip** — an edited ancestor
 /// contributes its most recent version. Everything downstream of the action
-/// (replies to it, later turns) and every sibling branch is excluded: this is
-/// the context a regeneration (`ResponseMode::Revise`) sends upstream, where a
-/// fresh reply uses the whole-space view (`get_space_actions_for_context`).
+/// (replies to it, later turns) and every sibling branch is excluded. This is
+/// the thread a turn sends upstream: a regeneration (`ResponseMode::Revise`)
+/// walks from the generation being replaced *exclusive* (the model must not
+/// see its own prior output); a fresh reply (`ResponseMode::Reply`) walks from
+/// the post being answered *inclusive* — on a linear thread that is the whole
+/// conversation, and on a branched space it is exactly the target's branch.
 pub async fn get_upstream_context(
     conn: &Connection,
     target_action_id: &str,
+    include_target: bool,
 ) -> Result<Vec<SpaceActionRow>, AppError> {
     // Walk the reply chain upward (short, local — one query per hop). Each
     // tip carries its own reply edge (edits/regenerations replicate it).
@@ -1029,6 +1035,16 @@ pub async fn get_upstream_context(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     seen.insert(target_action_id.to_string());
     let mut cursor = target_action_id.to_string();
+    if include_target {
+        // The target itself reads at its item's current tip too (a reply to a
+        // since-edited post answers the latest text).
+        let tip = item_tip_of_action(conn, target_action_id)
+            .await?
+            .unwrap_or_else(|| target_action_id.to_string());
+        seen.insert(tip.clone());
+        chain.push(tip.clone());
+        cursor = tip;
+    }
     while let Some(parent_tip) = reply_antecedent_tip(conn, &cursor).await? {
         if !seen.insert(parent_tip.clone()) {
             break;
@@ -1069,6 +1085,33 @@ pub async fn get_upstream_context(
         }
     }
     Ok(results)
+}
+
+/// The current tip of `action_id`'s own item. `None` if the action doesn't
+/// exist.
+async fn item_tip_of_action(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ic.current_action_id \
+             FROM action a \
+             JOIN item_current ic \
+               ON ic.space_id = a.space_id AND ic.item_id = a.item_id \
+             WHERE a.id = ?1 \
+             LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
 }
 
 /// The current tip of the item that `action_id`'s reply antecedent belongs to
