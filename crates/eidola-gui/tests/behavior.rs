@@ -1502,6 +1502,36 @@ fn space_composer_vertical_nav_traverses_every_wrapped_row(cx: &mut TestAppConte
     }
 }
 
+/// The minimap records its container's true top (window-space) so a mousedown's
+/// window-y converts to a correct minimap-local y. Regression: the bounds-
+/// recording canvas had no explicit inset, so under `absolute` it took its
+/// static position — after the full-height `col` — and recorded the container's
+/// BOTTOM (≈ window height) as the origin. Every press then computed a negative
+/// minimap-local y, which read as a track press below the handle and clamped the
+/// page scroll to the very top ("mousedown anywhere jumps to the top").
+#[gpui::test]
+fn space_minimap_records_container_top_not_bottom(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(700.)));
+    vcx.run_until_parked();
+    // A non-empty draft keeps the minimap live (a selected path to map).
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("composer");
+    vcx.update(|_, cx| editor.update(cx, |e, cx| e.set_value("A draft.", cx)));
+    vcx.run_until_parked();
+    let top = view.read_with(&vcx, |v, _| v.minimap_bounds_top_for_test());
+    // The space view fills the window, so the minimap container sits at the very
+    // top (y ≈ 0) — NOT at the window's bottom edge (700), the pre-fix value.
+    assert!(
+        top.abs() < 1.0,
+        "minimap container top should be ~0 (its real top), was {top} (the \
+         bottom-of-rows bug makes every drag jump to the top)"
+    );
+}
+
 #[gpui::test]
 fn space_composer_dock_shadow_is_stable_cold(cx: &mut TestAppContext) {
     // REGRESSION: opening a conversation parks the composer near the bottom with

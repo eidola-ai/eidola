@@ -554,6 +554,19 @@ impl SpaceView {
         self.scroll_min_y.get()
     }
 
+    /// The recorded top (window-space y) of the minimap container — the origin a
+    /// mousedown's window-y is measured from to get a minimap-local y. Must be
+    /// the container's real top (≈ 0 for a window-filling space view), not the
+    /// bottom of the stacked rows. Tests guard against the drag jumping to the
+    /// top because a mis-recorded origin made every press read as a track press.
+    #[doc(hidden)]
+    pub fn minimap_bounds_top_for_test(&self) -> f32 {
+        self.minimap_bounds
+            .get()
+            .map(|b| b.origin.y.as_f32())
+            .unwrap_or(-1.0)
+    }
+
     /// The slot-relative offset the docked `caret_into_view` folded into the
     /// caret's document position (`page_slot_doc_top + editor_top_offset`). See
     /// [`Self::docked_caret_slot_offset`].

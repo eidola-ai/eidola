@@ -373,7 +373,16 @@ impl SpaceView {
                         });
                     },
                 )
+                // Pin to the container's top-left. Without an explicit inset an
+                // `absolute` element takes its *static* position — here, after
+                // `col` (which fills the container), so its recorded origin.y
+                // would be the container's BOTTOM (≈ window height), not its top.
+                // A mousedown's window-y minus that bogus origin is negative,
+                // which reads as below every handle range → every press became a
+                // track press that clamped the scroll to the very top.
                 .absolute()
+                .top_0()
+                .left_0()
                 .size_full(),
             );
         }
