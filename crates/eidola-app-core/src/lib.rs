@@ -830,10 +830,30 @@ impl Inner {
             })?;
 
         let expected_ds = cfg.domain_separator();
+        let now = now_ms();
+        // Every issuer key shares the same domain separator — rotation mints
+        // new keys, never new separators — so the separator alone does not
+        // identify a single key. `/v1/keys` lists all still-accepted keys
+        // oldest-first, which during a rotation grace window includes the
+        // just-rotated-out key whose accept window has not yet closed.
+        // Issuance always signs with the *current* key (the server's
+        // `get_current_issuer_key`, newest by `issue_from`), so we must verify
+        // against that same key: select the key whose issuing window covers
+        // now (`issue_from <= now < issue_until`), preferring the newest such
+        // key. Selecting the first separator match (the old behavior) grabbed
+        // the oldest accepted key and failed proof verification whenever an
+        // out-of-issuance-but-still-accepted key preceded the current one.
         let key = keys
             .data
             .iter()
-            .find(|k| k.domain_separator == expected_ds)
+            .filter(|k| k.domain_separator == expected_ds)
+            .filter_map(|k| {
+                let issue_from = iso_to_ms(&k.issue_from).ok()?;
+                let issue_until = iso_to_ms(&k.issue_until).ok()?;
+                (issue_from <= now && now < issue_until).then_some((issue_from, k))
+            })
+            .max_by_key(|(issue_from, _)| *issue_from)
+            .map(|(_, k)| k)
             .ok_or_else(|| {
                 let server_ds: Vec<&str> = keys
                     .data
@@ -842,7 +862,8 @@ impl Inner {
                     .collect();
                 AppError::Credential {
                     message: format!(
-                        "no issuer key matches expected domain separator \"{expected_ds}\"\n\
+                        "no issuer key currently valid for issuance matches expected \
+                         domain separator \"{expected_ds}\"\n\
                          server advertised: {server_ds:?}"
                     ),
                 }
@@ -867,7 +888,6 @@ impl Inner {
         let params_hash = blake3::hash(key.domain_separator.as_bytes())
             .to_hex()
             .to_string();
-        let now = now_ms();
         let expires_at = iso_to_ms(&key.issue_until)?;
 
         db::upsert_issuer_key(
@@ -3356,7 +3376,6 @@ struct IssuerKeyResponse {
     id: String,
     public_key: String,
     domain_separator: String,
-    #[allow(dead_code)]
     issue_from: String,
     issue_until: String,
     #[allow(dead_code)]

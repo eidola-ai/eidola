@@ -529,15 +529,38 @@ fn models_body() -> String {
 }
 
 fn keys_body(issuer: &Issuer) -> String {
+    let ds = format!("ACT-v1:{DS_ORG}:{DS_SERVICE}:{DS_DEPLOYMENT}:{DS_VERSION}");
+    // Reproduce the production `/v1/keys` shape during a rotation grace
+    // window: a just-retired key (out of its `issue_from..issue_until` issuing
+    // window but still within `accept_until`) sorts *ahead* of the current
+    // key. It carries a different public key, so a client that selected by
+    // domain separator alone — every key shares one — would pick the decoy and
+    // fail proof verification against the current issuer (the original bug).
+    // The client must skip the out-of-window decoy and choose the current key.
+    let decoy_pk = PrivateKey::random(OsRng)
+        .public()
+        .to_cbor()
+        .expect("encode decoy public key");
+    let decoy_key_hash: [u8; 32] = Sha256::digest(&decoy_pk).into();
     serde_json::json!({
-        "data": [{
-            "id": issuer.key_id_hex,
-            "public_key": issuer.public_key_b64(),
-            "domain_separator": format!("ACT-v1:{DS_ORG}:{DS_SERVICE}:{DS_DEPLOYMENT}:{DS_VERSION}"),
-            "issue_from": "2026-01-01T00:00:00Z",
-            "issue_until": "2030-01-01T00:00:00Z",
-            "accept_until": "2030-01-01T00:00:00Z",
-        }]
+        "data": [
+            {
+                "id": hex::encode(decoy_key_hash),
+                "public_key": URL_SAFE_NO_PAD.encode(&decoy_pk),
+                "domain_separator": ds,
+                "issue_from": "2026-01-01T00:00:00Z",
+                "issue_until": "2026-02-01T00:00:00Z",
+                "accept_until": "2030-01-01T00:00:00Z",
+            },
+            {
+                "id": issuer.key_id_hex,
+                "public_key": issuer.public_key_b64(),
+                "domain_separator": ds,
+                "issue_from": "2026-02-01T00:00:00Z",
+                "issue_until": "2030-01-01T00:00:00Z",
+                "accept_until": "2030-01-01T00:00:00Z",
+            }
+        ]
     })
     .to_string()
 }
