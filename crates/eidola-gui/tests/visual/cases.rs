@@ -15,6 +15,7 @@ use eidola_app_core::{
 use eidola_gui::about::AboutView;
 use eidola_gui::chat::{ChatView, StreamingResponse};
 use eidola_gui::library::LibraryView;
+use eidola_gui::onboarding::OnboardingView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
 use eidola_gui::space_view::SpaceView;
@@ -30,6 +31,7 @@ pub fn register(s: &mut Snapshots) {
     register_chat(s);
     register_space(s);
     register_onboarding(s);
+    register_onboarding_window(s);
     register_library(s);
     register_settings(s);
     register_updates(s);
@@ -203,6 +205,23 @@ fn register_updates(s: &mut Snapshots) {
 // ---------------------------------------------------------------------------
 // Onboarding (chat window empty states)
 // ---------------------------------------------------------------------------
+
+// The standalone onboarding window (wave-6): full-window slides. The first
+// slide (present at rest) shows the prose heading + intro vertically centered in
+// the reading column with the ghost-button CTA at the bottom.
+fn register_onboarding_window(s: &mut Snapshots) {
+    s.add(
+        "onboarding_window",
+        size(px(760.), px(760.)),
+        |window, cx| {
+            let stores = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(false));
+                s.prices = stub_prices();
+            });
+            cx.new(|cx| OnboardingView::new(stores, window, cx))
+        },
+    );
+}
 
 fn register_onboarding(s: &mut Snapshots) {
     // No account → the empty page is the welcome page.

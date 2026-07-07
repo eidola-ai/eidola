@@ -76,6 +76,7 @@ mod driver {
     };
     use eidola_gui::chat::ChatView;
     use eidola_gui::library::LibraryView;
+    use eidola_gui::onboarding::OnboardingView;
     use eidola_gui::probe;
     use eidola_gui::record::RecordView;
     use eidola_gui::settings::SettingsView;
@@ -300,6 +301,16 @@ mod driver {
                     space.update(cx, |s, cx| {
                         s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
                     });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "onboarding",
+                description: "Onboarding window: the first-run 'Get Started' slide flow (scroll-snap, branching CTAs)",
+                default_size: size(px(640.), px(760.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| OnboardingView::new(stores, window, cx));
                     root(view, window, cx)
                 },
             },

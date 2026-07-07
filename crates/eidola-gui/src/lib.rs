@@ -9,6 +9,7 @@ pub mod chat;
 pub mod general;
 pub mod library;
 pub mod loadable;
+pub mod onboarding;
 mod plans;
 pub mod probe;
 pub mod record;
@@ -31,12 +32,13 @@ use gpui_component_assets::Assets;
 
 use crate::about::AboutView;
 use crate::actions::{
-    About, CheckForUpdates, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenLibrary,
-    OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
+    About, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize, NewSpace,
+    OpenLibrary, OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
 };
 #[allow(unused_imports)]
 use crate::chat::ChatView;
 use crate::library::LibraryView;
+use crate::onboarding::OnboardingView;
 use crate::record::RecordView;
 use crate::settings::SettingsView;
 use crate::space_view::SpaceView;
@@ -66,6 +68,9 @@ struct AppGlobal {
     /// The single Record window, if open. Same singleton discipline as
     /// `settings_window`.
     record_window: Option<WindowHandle<Root>>,
+    /// The single onboarding ("Get Started") window, if open. Same singleton
+    /// discipline as `settings_window`.
+    onboarding_window: Option<WindowHandle<Root>>,
 }
 
 impl gpui::Global for AppGlobal {}
@@ -122,6 +127,7 @@ pub fn run() {
             library_window: None,
             updates_window: None,
             record_window: None,
+            onboarding_window: None,
         });
 
         // Verified update-notification polling: one check at launch, then
@@ -151,6 +157,20 @@ pub fn run() {
         cx.activate(true);
 
         open_main_window(cx);
+
+        // First-run onboarding: with no account configured, open the "Get
+        // Started" window on top of the main window. A configured account skips
+        // straight to the main window (onboarding is then only reachable via the
+        // Eidola menu). Read through the ConfigStore snapshot seeded at startup.
+        let needs_onboarding = stores
+            .config
+            .read(cx)
+            .state()
+            .map(|s| !s.has_account || !s.has_account_secret)
+            .unwrap_or(false);
+        if needs_onboarding {
+            open_onboarding_window(cx);
+        }
     });
 }
 
@@ -162,6 +182,7 @@ fn install_menus(cx: &mut App) {
                 MenuItem::action("About Eidola", About),
                 MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::Separator,
+                MenuItem::action("Get Started", GetStarted),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::Separator,
                 MenuItem::action("Hide Eidola", Hide),
@@ -326,6 +347,15 @@ fn install_action_handlers(cx: &mut App) {
         open_main_window(cx);
     });
 
+    cx.on_action(|_: &GetStarted, cx: &mut App| {
+        // Singleton, like Settings: raise the existing onboarding window if
+        // it's still alive, otherwise open a fresh one.
+        if try_focus_existing_onboarding(cx) {
+            return;
+        }
+        open_onboarding_window(cx);
+    });
+
     cx.on_action(|_: &OpenLibrary, cx: &mut App| {
         // The listing may be stale (exchanges happen while the singleton
         // stays open), so refresh it on every invocation — whether we're
@@ -460,6 +490,10 @@ fn try_focus_existing_record(cx: &mut App) -> bool {
     try_focus_existing_singleton(cx, |g| &mut g.record_window)
 }
 
+fn try_focus_existing_onboarding(cx: &mut App) -> bool {
+    try_focus_existing_singleton(cx, |g| &mut g.onboarding_window)
+}
+
 /// Edge-to-edge titlebar: macOS extends the content view under the
 /// traffic-light buttons and stops painting a separate titlebar background.
 /// Each view is responsible for leaving room at the top so the lights don't
@@ -525,21 +559,25 @@ pub fn open_space_window(cx: &mut App, stores: Stores, space_id: String) {
     open_chat_window(cx, stores, Some(space_id));
 }
 
-fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
-    // Square chat window. Side = 90% of the smaller display dimension,
-    // capped at 800px. A square frames the chat as a writing surface —
-    // a sheet of paper, not a wide chat pane — and the cap keeps the
-    // prose column from feeling lost in the middle of a 4K display. If
-    // there's no primary display (rare; offscreen render contexts), we
-    // fall back to the cap.
-    let side = match cx.primary_display() {
+/// The side length of the square "writing surface" windows — the space (chat)
+/// window and the onboarding window, which is sized to match. 90% of the
+/// smaller display dimension, capped at 840px so the prose column isn't lost in
+/// the middle of a 4K display; falls back to the cap with no primary display
+/// (rare; offscreen render contexts).
+fn writing_surface_side(cx: &mut App) -> f32 {
+    match cx.primary_display() {
         Some(d) => {
             let s = d.bounds().size;
             let smaller = f32::min(s.width.as_f32(), s.height.as_f32());
             (smaller * 0.9).min(840.0)
         }
         None => 820.0,
-    };
+    }
+}
+
+fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
+    // Square chat window — a sheet of paper, not a wide chat pane.
+    let side = writing_surface_side(cx);
     let bounds = centered_window_bounds(cx, side, side);
 
     let opts = WindowOptions {
@@ -640,6 +678,34 @@ fn open_record_window(cx: &mut App) {
 
     if let Ok(handle) = handle {
         cx.global_mut::<AppGlobal>().record_window = Some(handle);
+    }
+    cx.activate(true);
+}
+
+/// Open the onboarding window — the from-scratch "Get Started" flow, a
+/// singleton like Settings. Sized to match a new space window (the same square
+/// writing surface) so onboarding feels like the same page it leads into.
+fn open_onboarding_window(cx: &mut App) {
+    let stores = cx.global::<AppGlobal>().stores.clone();
+    let side = writing_surface_side(cx);
+    let bounds = centered_window_bounds(cx, side, side);
+
+    let opts = WindowOptions {
+        window_bounds: bounds,
+        titlebar: Some(transparent_titlebar()),
+        kind: WindowKind::Normal,
+        window_min_size: Some(size(px(480.), px(360.))),
+        ..Default::default()
+    };
+
+    let handle = cx.open_window(opts, |window, cx| {
+        theme::observe_window_appearance(window);
+        let view = cx.new(|cx| OnboardingView::new(stores.clone(), window, cx));
+        cx.new(|cx| Root::new(view, window, cx))
+    });
+
+    if let Ok(handle) = handle {
+        cx.global_mut::<AppGlobal>().onboarding_window = Some(handle);
     }
     cx.activate(true);
 }

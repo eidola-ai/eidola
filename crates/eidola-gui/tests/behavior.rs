@@ -26,6 +26,7 @@ use eidola_gui::chat::{
     Send, StreamingResponse, ToggleModelPicker,
 };
 use eidola_gui::library::LibraryView;
+use eidola_gui::onboarding::{OnboardingView, Slide};
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
 use eidola_gui::space_view::SpaceView;
@@ -3707,4 +3708,144 @@ fn space_joins_shared_entity_for_same_id(cx: &mut TestAppContext) {
     dispatch_space_action(&v1, w1, cx, Send);
     // The second window's snapshot reflects the shared space.
     v2.read_with(cx, |v, _| assert_eq!(v.post_count_for_test(), 1));
+}
+
+// ---------------------------------------------------------------------------
+// Onboarding window
+// ---------------------------------------------------------------------------
+
+fn open_onboarding(
+    cx: &mut TestAppContext,
+    stores: &Stores,
+) -> (AnyWindowHandle, Entity<OnboardingView>) {
+    let stores = stores.clone();
+    open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores.clone(), window, cx))
+    })
+}
+
+/// Advance the flow through several slides by driving `reveal` directly (the
+/// same call each CTA's click handler makes).
+fn reveal(view: &Entity<OnboardingView>, cx: &mut TestAppContext, after: Slide, next: Slide) {
+    view.update(cx, |v, cx| v.reveal(after, next, cx));
+}
+
+#[gpui::test]
+fn onboarding_starts_on_first_slide(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.revealed(), vec![Slide::Pause]);
+    });
+}
+
+#[gpui::test]
+fn onboarding_reveal_advances_and_is_idempotent(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+
+    reveal(&view, cx, Slide::Pause, Slide::Tool);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.revealed(), vec![Slide::Pause, Slide::Tool]);
+    });
+
+    // Re-revealing the same next slide must not duplicate it.
+    reveal(&view, cx, Slide::Pause, Slide::Tool);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.revealed(), vec![Slide::Pause, Slide::Tool]);
+    });
+}
+
+#[gpui::test]
+fn onboarding_rechoosing_branch_truncates_downstream(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+
+    // Walk to the branch point and down the new-account path.
+    reveal(&view, cx, Slide::Pause, Slide::Tool);
+    reveal(&view, cx, Slide::Tool, Slide::Control);
+    reveal(&view, cx, Slide::Control, Slide::Responsibility);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+    reveal(&view, cx, Slide::CreateAccount, Slide::NewAccount);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.revealed().last(), Some(&Slide::NewAccount));
+    });
+
+    // Re-choosing the *other* branch at "Get started" replaces the whole
+    // downstream tail with the existing-account slide.
+    reveal(&view, cx, Slide::GetStarted, Slide::ExistingAccount);
+    view.read_with(cx, |v, _| {
+        let revealed = v.revealed();
+        assert_eq!(
+            revealed,
+            vec![
+                Slide::Pause,
+                Slide::Tool,
+                Slide::Control,
+                Slide::Responsibility,
+                Slide::GetStarted,
+                Slide::ExistingAccount,
+            ],
+            "the new-account slides must be gone after re-choosing"
+        );
+    });
+}
+
+#[gpui::test]
+fn onboarding_verify_requires_both_fields(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+
+    // Both inputs blank: verification refuses with a message, no request.
+    view.update(cx, |v, cx| v.begin_verify(cx));
+    view.read_with(cx, |v, _| {
+        assert!(matches!(v.verify_result_for_test(), Some(Err(_))));
+    });
+}
+
+#[gpui::test]
+fn onboarding_verify_with_inputs_is_backend_gated_on_stub(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_onboarding(cx, &stores);
+
+    // Fill both credential inputs.
+    let (id_input, secret_input) = view.read_with(cx, |v, _| v.existing_inputs_for_test());
+    cx.update_window(window, |_, window, cx| {
+        id_input.update(cx, |s, cx| s.set_value("acct-123", window, cx));
+        secret_input.update(cx, |s, cx| s.set_value("shh", window, cx));
+    })
+    .unwrap();
+
+    // With no backend the request is a no-op past the local guard: no error
+    // message is produced (the empty-fields guard did not fire).
+    view.update(cx, |v, cx| v.begin_verify(cx));
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.verify_result_for_test().is_none(),
+            "a stub backend yields no verification result, and no field error"
+        );
+    });
+}
+
+#[gpui::test]
+fn onboarding_create_on_stub_is_safe_noop(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+
+    reveal(&view, cx, Slide::Pause, Slide::Tool);
+    reveal(&view, cx, Slide::Tool, Slide::Control);
+    reveal(&view, cx, Slide::Control, Slide::Responsibility);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+
+    // No backend: create marks in-flight and stops at the guard — it neither
+    // reveals the next slide nor produces credentials, and does not panic.
+    view.update(cx, |v, cx| v.begin_create(cx));
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.revealed().last(), Some(&Slide::CreateAccount));
+        assert!(v.created_for_test().is_none());
+    });
 }

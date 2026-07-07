@@ -29,6 +29,11 @@ actions!(
         Quit,
         /// Show the About panel.
         About,
+        /// Open the onboarding window — the from-scratch "Get Started" flow
+        /// (account creation / linking / adding credit). Lives in the Eidola
+        /// menu, and opens automatically at launch when no account is
+        /// configured. Singleton, like Settings.
+        GetStarted,
         /// Show the Updates window (singleton, like Settings) and run a
         /// manual update check. Lives in the Eidola menu directly under
         /// "About Eidola" — the standard macOS placement.

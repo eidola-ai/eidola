@@ -71,6 +71,10 @@ pub struct MeasurementInfo {
 #[derive(Clone, Debug)]
 pub struct AccountCreateResult {
     pub id: String,
+    /// The account secret, returned once at creation so the caller can present
+    /// it for the user to save. It is also persisted to the local config; there
+    /// is no other API to recover it (losing it means creating a new account).
+    pub secret: String,
     pub created_at: i64,
 }
 
@@ -673,12 +677,13 @@ impl Inner {
 
         let mut cfg = self.load_config();
         cfg.account_id = Some(created.account_id.to_string());
-        cfg.account_secret = Some(created.secret);
+        cfg.account_secret = Some(created.secret.clone());
         cfg.save_to(&self.config_path)?;
         self.bus.emit(Change::Config);
 
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
+            secret: created.secret,
             created_at: iso_to_ms(&created.created_at)?,
         })
     }

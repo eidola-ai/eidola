@@ -15,6 +15,7 @@ use eidola_app_core::{
 };
 use eidola_gui::chat::{ChatView, ToggleModelPicker};
 use eidola_gui::library::LibraryView;
+use eidola_gui::onboarding::{OnboardingView, Slide};
 use eidola_gui::probe;
 use eidola_gui::space_view::SpaceView;
 use eidola_gui::stores::{Stores, StoresStub};
@@ -369,5 +370,64 @@ fn probe_post(action_id: &str, text: &str) -> PostNode {
         }],
         references: Vec::new(),
         created_at: 0,
+    }
+}
+
+#[gpui::test]
+fn onboarding_probes_record_ctas_and_inputs(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    draw(cx, window);
+
+    // The first slide's call-to-action is probed for AT + the driver.
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"onboarding/cta/pause"),
+        "first-slide CTA probe missing; recorded: {names:?}"
+    );
+
+    // Walk to the existing-account branch, which reveals the credential inputs
+    // and the verify CTA.
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    for expected in [
+        "onboarding/input/account-id",
+        "onboarding/input/account-secret",
+        "onboarding/cta/verify",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "existing-account probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    // Re-choose the new-account branch: the create slide carries the required
+    // agreement checkbox and the (checkbox-gated) create CTA.
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    for expected in ["onboarding/agree", "onboarding/cta/create"] {
+        assert!(
+            names.contains(&expected),
+            "create-account probe {expected:?} missing; recorded: {names:?}"
+        );
     }
 }
