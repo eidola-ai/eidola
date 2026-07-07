@@ -53,5 +53,19 @@ actions!(
         /// `Cargo.toml`); the rich element/style editor UI comes from
         /// `gpui-component`'s inspector renderer, also feature-gated.
         ToggleInspector,
+        /// Post the composer's draft **and** request a response — the common
+        /// gesture. The composer's ⌘↩ reaches this via the editor's
+        /// `PressEnter` event; the action itself stays dispatchable (the Ask
+        /// affordance, tests, future menu items).
+        Send,
+        /// Post the composer's draft **without** requesting a response — the
+        /// save side of the save-vs-request split (⌘⇧↩ / the ⌥-revealed
+        /// Post affordance).
+        PostOnly,
+        /// Toggle the request panel anchored to the composer's action gutter
+        /// (model selection; the home of per-request config). Bound to ⌥⌘M
+        /// in the `SpaceView` key context; clicking the model chip is the
+        /// pointer path to the same state.
+        ToggleModelPicker,
     ]
 );

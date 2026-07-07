@@ -53,10 +53,9 @@ use layout::Layout;
 use model::{NodeSrc, PostData, TreeNode};
 use nav::{ScrollAxis, ScrollOwner, SnapAnim};
 
-// Re-export the chat actions so the composer routes the same semantic gestures
-// (⌘↩ post & ask / ⌘⇧↩ post only) the editor's `PressEnter` event carries,
-// and the shared ⌥⌘M request-panel toggle.
-pub use crate::chat::{PostOnly, Send, ToggleModelPicker};
+// Re-export the composer actions (⌘↩ post & ask / ⌘⇧↩ post only, routed via
+// the editor's `PressEnter` event) and the ⌥⌘M request-panel toggle.
+pub use crate::actions::{PostOnly, Send, ToggleModelPicker};
 
 // ---------------------------------------------------------------------------
 // Layout constants — the book typography + the tree-navigation geometry.
@@ -167,6 +166,22 @@ pub(crate) struct Draft {
     pub(crate) _sub: Subscription,
 }
 
+/// An in-progress inline edit of a persisted post: the post's own body editor
+/// is enabled in place, `⌘↩` commits a new generation via [`Space::edit`],
+/// Escape restores the original text. Window-local, like a draft.
+pub(crate) struct EditingPost {
+    /// The persisted action being edited (the commit target).
+    pub(crate) action_id: SharedString,
+    /// The tree node id keying [`SpaceView::bodies`] (the action id for
+    /// persisted posts).
+    pub(crate) node_id: SharedString,
+    /// The pre-edit markdown, restored on Escape.
+    pub(crate) original: String,
+    /// `PressEnter` (⌘↩) on the post's editor commits the edit. Held so it
+    /// dies with the edit session.
+    pub(crate) _sub: Subscription,
+}
+
 pub struct SpaceView {
     /// The store bundle — held whole for model resolution (config default) and
     /// to open spaces through the `SpacesStore` registry.
@@ -234,6 +249,11 @@ pub struct SpaceView {
     /// Whether the request panel (model selection; the future home of
     /// per-request config) is open, anchored to the composer's action gutter.
     pub(crate) request_panel_open: bool,
+    /// The post whose action gutter currently reveals its hover affordances
+    /// (Edit / Regenerate), by node id.
+    pub(crate) hovered_post: Option<SharedString>,
+    /// The post currently being edited in place, if any.
+    pub(crate) editing: Option<EditingPost>,
     /// The composer bar's top `y` as of the last `render_active_draft`, so the
     /// request panel (a later sibling) can anchor against it.
     pub(crate) composer_anchor_top: Cell<f32>,
@@ -358,6 +378,8 @@ impl SpaceView {
             slot_bounds: Rc::new(RefCell::new(HashMap::new())),
             scroll_owner: None,
             request_panel_open: false,
+            hovered_post: None,
+            editing: None,
             composer_anchor_top: Cell::new(0.0),
             page_scroll: ScrollHandle::new(),
             scroll_min_y: Cell::new(0.0),
@@ -504,6 +526,39 @@ impl SpaceView {
         self.window_input.read(cx).alt_held()
     }
 
+    /// The action id of the in-progress inline edit, if any.
+    #[doc(hidden)]
+    pub fn editing_action_id_for_test(&self) -> Option<String> {
+        self.editing.as_ref().map(|e| e.action_id.to_string())
+    }
+
+    /// A persisted post's body editor, by node (action) id.
+    #[doc(hidden)]
+    pub fn post_body_editor_for_test(&self, node_id: &str) -> Option<Entity<MarkdownEditorState>> {
+        self.bodies.get(node_id).cloned()
+    }
+
+    /// Drive the post-hover state (tests can't synthesize pointer moves).
+    #[doc(hidden)]
+    pub fn set_post_hover_for_test(&mut self, id: &str, hovering: bool, cx: &mut Context<Self>) {
+        self.set_post_hover(&SharedString::from(id.to_string()), hovering, cx);
+    }
+
+    /// The node id of the post whose hover affordances are revealed.
+    #[doc(hidden)]
+    pub fn hovered_post_for_test(&self) -> Option<String> {
+        self.hovered_post.as_ref().map(|s| s.to_string())
+    }
+
+    /// A post's `(reasoning, expanded)` from the render snapshot.
+    #[doc(hidden)]
+    pub fn post_reasoning_for_test(&self, i: usize) -> Option<(String, bool)> {
+        let post = self.posts.get(i)?;
+        post.reasoning
+            .as_ref()
+            .map(|r| (r.to_string(), post.reasoning_expanded))
+    }
+
     /// How many times the layout height cache has been invalidated (cleared).
     /// A resize that doesn't change the reading-column width must not bump this
     /// — that's the resize-jitter fix (the cache is keyed on `body_width`).
@@ -618,8 +673,12 @@ impl SpaceView {
             match self.bodies.get(&id) {
                 Some(editor) => {
                     // Keep an existing editor in sync if its content changed
-                    // (an edit/regenerate replaced the post in place).
-                    if editor.read(cx).value() != content.as_ref() {
+                    // (an edit/regenerate replaced the post in place) — but
+                    // never clobber the editor holding an in-progress inline
+                    // edit: its divergence from the persisted content *is* the
+                    // edit.
+                    let is_editing = self.editing.as_ref().map(|e| &e.node_id) == Some(&id);
+                    if !is_editing && editor.read(cx).value() != content.as_ref() {
                         editor.update(cx, |e, cx| e.set_value(content.to_string(), cx));
                     }
                 }
@@ -634,6 +693,13 @@ impl SpaceView {
             }
         }
         self.bodies.retain(|id, _| live.contains(id));
+        // An edit session whose post vanished (transcript reshaped under it)
+        // has nothing to commit into — drop it with the editor.
+        if let Some(ed) = &self.editing
+            && !live.contains(&ed.node_id)
+        {
+            self.editing = None;
+        }
         // Keep height-cache entries for live posts, live drafts, and streaming.
         let draft_ids: HashSet<SharedString> = self.drafts.iter().map(|d| d.id.clone()).collect();
         self.layout

@@ -32,7 +32,7 @@ use crate::stores::{SpacesStore, Stores};
 actions!(library, [CancelRename]);
 
 /// Vertical reserve under the macOS traffic lights — same pattern as
-/// `chat::TITLE_BAR_RESERVE` (the window uses the shared transparent
+/// `space_view::TITLE_BAR_RESERVE` (the window uses the shared transparent
 /// titlebar from `lib.rs::transparent_titlebar`).
 #[cfg(target_os = "macos")]
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);

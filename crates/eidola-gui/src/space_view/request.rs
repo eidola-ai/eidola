@@ -24,8 +24,9 @@ use gpui::{
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use gpui_markdown_editor::MarkdownEditorState;
 
-use crate::chat::model_info_line;
+use crate::plans::format_credits;
 use crate::probe::Probe as _;
+use eidola_app_core::ModelInfo;
 
 use super::layout::body_width;
 use super::{
@@ -380,4 +381,53 @@ impl SpaceView {
 /// A small muted keyboard hint beside a verb (shown while ⌥ is held).
 fn kbd_hint(text: &'static str, color: gpui::Hsla) -> gpui::Div {
     div().text_xs().text_color(color).child(text)
+}
+
+/// One honest line of per-model info for the panel, from the `/models`
+/// payload: context length plus the credit rates that will actually be
+/// charged. Per-request models show their flat rate; if the payload carried
+/// no pricing at all, only the context length is shown — we don't invent
+/// numbers.
+fn model_info_line(model: &ModelInfo) -> String {
+    // Per-request models (e.g. transcription) report no meaningful context
+    // length; showing "0-token context" would be noise, not honesty.
+    let ctx = (model.context_length > 0).then(|| {
+        format!(
+            "{}-token context",
+            format_credits(model.context_length as i64)
+        )
+    });
+    let price = if let Some(request) = model.request_credits {
+        Some(format!("{} credits per request", format_rate(request)))
+    } else if model.prompt_credits_per_token > 0.0 || model.completion_credits_per_token > 0.0 {
+        Some(format!(
+            "{} in / {} out credits per token",
+            format_rate(model.prompt_credits_per_token),
+            format_rate(model.completion_credits_per_token)
+        ))
+    } else {
+        None
+    };
+    match (ctx, price) {
+        (Some(ctx), Some(price)) => format!("{ctx} · {price}"),
+        (Some(ctx), None) => ctx,
+        (None, Some(price)) => price,
+        (None, None) => "no published details".to_string(),
+    }
+}
+
+/// Format a credit rate: whole thousands get separators ("9,000"),
+/// everything else shows up to three decimals with trailing zeros trimmed
+/// ("1.500" → "1.5", "0.530" → "0.53", "3.000" → "3").
+fn format_rate(rate: f64) -> String {
+    if rate >= 1000.0 && rate.fract() == 0.0 {
+        return format_credits(rate as i64);
+    }
+    let s = format!("{rate:.3}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }

@@ -240,9 +240,10 @@ pub struct PostNode {
     pub action_id: String,
     pub item_id: String,
     /// The structural (`reply`) parent post, if any. `None` for a thread root.
-    /// v1 threads by the **raw** reply antecedent; re-rooting a child onto its
-    /// parent item's current tip (once edits create non-tip parents) is a 5.4
-    /// addition — a no-op until then.
+    /// Threading follows **item identity**: a reply edge whose antecedent was
+    /// superseded (its item edited/regenerated) resolves to the item's current
+    /// tip, so this is always the id of a rendered post — never a dangling
+    /// superseded generation.
     pub parent_action_id: Option<String>,
     pub participant: PostParticipant,
     /// `user_input` | `inference` | … (the post's action type).
@@ -1665,15 +1666,16 @@ impl Inner {
             }
         };
 
-        // Assemble context from the space's CURRENT generations. For Revise,
-        // exclude the generation we're replacing so the model doesn't see its
-        // own prior output. The posted user turn is already in this set.
-        let context_rows: Vec<db::SpaceActionRow> =
-            db::get_space_actions_for_context(&db_conn, &space_id)
-                .await?
-                .into_iter()
-                .filter(|r| !(mode == ResponseMode::Revise && r.action_id == target_action_id))
-                .collect();
+        // Assemble context from the space's CURRENT generations. A Reply sees
+        // the whole space (the posted user turn is already in that set); a
+        // Revise (regenerate) sees only its **upstream** thread — the reply
+        // ancestry of the generation being replaced, each item at its most
+        // recent version — never its own prior output, anything downstream of
+        // it, or sibling branches.
+        let context_rows: Vec<db::SpaceActionRow> = match mode {
+            ResponseMode::Reply => db::get_space_actions_for_context(&db_conn, &space_id).await?,
+            ResponseMode::Revise => db::get_upstream_context(&db_conn, target_action_id).await?,
+        };
         let prior_messages = actions_to_messages(&context_rows);
 
         // Estimate the charge from the assembled context.
@@ -2173,12 +2175,12 @@ impl Inner {
             }
         };
 
-        let context_rows: Vec<db::SpaceActionRow> =
-            db::get_space_actions_for_context(&db_conn, &space_id)
-                .await?
-                .into_iter()
-                .filter(|r| !(mode == ResponseMode::Revise && r.action_id == target_action_id))
-                .collect();
+        // Context per mode — same contract as `run_turn`: Reply sees the whole
+        // space; Revise sees only its upstream thread at most-recent versions.
+        let context_rows: Vec<db::SpaceActionRow> = match mode {
+            ResponseMode::Reply => db::get_space_actions_for_context(&db_conn, &space_id).await?,
+            ResponseMode::Revise => db::get_upstream_context(&db_conn, target_action_id).await?,
+        };
         let prior_messages = actions_to_messages(&context_rows);
 
         let total_prompt_bytes: u128 = prior_messages.iter().map(|m| m.content.len() as u128).sum();
@@ -3635,11 +3637,22 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
     let mut references_by_action: HashMap<String, Vec<PostReference>> = HashMap::new();
     for e in edges {
         if e.relation == "reply" {
+            // Reply threading follows **item identity**, not the raw causal
+            // edge: the antecedent action may be a superseded generation (its
+            // item was edited/regenerated after the reply), in which case the
+            // reply threads under the item's *current tip* — the edited post
+            // stays in place with its replies attached. The raw action id
+            // stays on reference edges (causality is action ids; intended
+            // logical flow is item ids). A target whose tip isn't a
+            // renderable post (trace type, non-terminal status) still falls
+            // out of `in_set` and the reply renders as a root.
+            let target = e
+                .antecedent_current_action_id
+                .clone()
+                .unwrap_or_else(|| e.antecedent_action_id.clone());
             // Only the first reply edge is structural (schema enforces one).
-            if in_set.contains(e.antecedent_action_id.as_str()) {
-                reply_parent
-                    .entry(e.action_id)
-                    .or_insert(e.antecedent_action_id);
+            if in_set.contains(target.as_str()) {
+                reply_parent.entry(e.action_id).or_insert(target);
             }
         } else {
             references_by_action
@@ -4292,6 +4305,9 @@ mod tests {
         db::AntecedentEdgeRow {
             action_id: action_id.into(),
             antecedent_action_id: antecedent.into(),
+            // Tests default to an un-edited antecedent: its item's tip is the
+            // antecedent itself (what the SQL resolves for gen-0 targets).
+            antecedent_current_action_id: Some(antecedent.into()),
             ordinal: 0,
             relation: "reply".into(),
             range_start: None,
@@ -4487,6 +4503,7 @@ mod tests {
                 db::AntecedentEdgeRow {
                     action_id: "a".into(),
                     antecedent_action_id: "r".into(),
+                    antecedent_current_action_id: Some("r".into()),
                     ordinal: 1,
                     relation: "reference".into(),
                     range_start: Some(0),

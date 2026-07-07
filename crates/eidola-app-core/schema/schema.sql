@@ -168,6 +168,17 @@ CREATE TABLE space_participant (
 -- expression in action_resolved); the supersedes chain is the
 -- source of truth.
 --
+-- supersedes_item_id: denormalized item of the superseded
+-- generation — by invariant this row's own item (CHECKed), NULL
+-- exactly when supersedes_action_id is NULL. It exists so the
+-- compound FK (supersedes_action_id, supersedes_item_id) →
+-- action(id, item_id) can enforce declaratively that a
+-- generation chain never hops items. Causality is preserved
+-- through action ids (antecedent edges record which concrete
+-- generation was replied to / quoted); the *intended* logical
+-- flow is described by item ids (rendering and context assembly
+-- resolve through the item to its current tip).
+--
 -- The DAG stays acyclic by construction: actions are immutable,
 -- edges only ever point at already-existing (earlier) actions,
 -- and UUIDv7 ids are time-ordered — so no edge can point forward
@@ -181,7 +192,8 @@ CREATE TABLE action (
 
     -- generation identity (generation number is derived, not stored)
     item_id              TEXT NOT NULL,
-    supersedes_action_id TEXT REFERENCES action(id),
+    supersedes_action_id TEXT,
+    supersedes_item_id   TEXT,
 
     action_type     TEXT NOT NULL CHECK (action_type IN (
                         'user_input',
@@ -213,7 +225,15 @@ CREATE TABLE action (
     output_tokens   INTEGER,
     credits_consumed INTEGER,
 
-    created_at      INTEGER NOT NULL
+    created_at      INTEGER NOT NULL,
+
+    -- supersedes is item-scoped: both halves present together, the item
+    -- is this row's own, and the referenced (action, item) pair must
+    -- really exist — so a generation chain cannot hop items.
+    CHECK ((supersedes_action_id IS NULL) = (supersedes_item_id IS NULL)),
+    CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
+    FOREIGN KEY (supersedes_action_id, supersedes_item_id)
+        REFERENCES action (id, item_id)
 );
 
 CREATE INDEX idx_action_space ON action (space_id, created_at);
@@ -228,6 +248,9 @@ CREATE INDEX idx_action_status ON action (status)
 CREATE UNIQUE INDEX idx_one_successor_per_action
     ON action (supersedes_action_id)
     WHERE supersedes_action_id IS NOT NULL;
+
+-- Parent key for the compound supersedes FK.
+CREATE UNIQUE INDEX idx_action_id_item ON action (id, item_id);
 
 -- ============================================================
 -- Action antecedent: the causal graph (a DAG). Every edge points

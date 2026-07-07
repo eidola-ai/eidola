@@ -374,6 +374,74 @@ fn regenerate_replaces_answer_with_a_new_generation() {
     });
 }
 
+#[test]
+fn regenerate_sends_only_upstream_context_at_current_versions() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+
+        // Two full turns: u1 -> i1 -> u2 -> i2.
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        core.runtime()
+            .block_on(core.chat(
+                "And why two per day?".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+            ))
+            .expect("second chat");
+
+        // Locate the first user post and the FIRST inference via the tree.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        assert_eq!(tree.len(), 4, "u1, i1, u2, i2; got {tree:#?}");
+        let u1 = tree[0].action_id.clone();
+        assert_eq!(tree[1].action_type, "inference");
+        let i1 = tree[1].action_id.clone();
+
+        // Edit the upstream question, then regenerate the FIRST answer.
+        core.runtime()
+            .block_on(core.edit_post(u1, "How do tides work? Explain it for a sailor.".into()))
+            .expect("edit");
+        core.runtime()
+            .block_on(core.regenerate(i1, MODEL.into()))
+            .expect("regenerate");
+
+        // The regenerate call (third request) must see ONLY its upstream
+        // thread — the edited question at its most recent version — never the
+        // downstream turn (u2/i2) or its own prior output (i1).
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3, "two chats + one regenerate");
+        let flat: Vec<(String, String)> = bodies[2]["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap_or_default().to_string(),
+                    m["content"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            vec![(
+                "user".to_string(),
+                "How do tides work? Explain it for a sailor.".to_string()
+            )],
+            "regenerate context = upstream only, most-recent versions"
+        );
+
+        // Sanity: the second chat (a Reply) still saw the whole space.
+        let second_messages = bodies[1]["messages"].as_array().expect("messages").len();
+        assert_eq!(second_messages, 3, "reply mode keeps the whole-space view");
+    });
+}
+
 // Post-first contract (wave 5.2b): chat = post + run_turn. The post persists
 // the thought BEFORE the response request can fail on funding, so a NoAccount /
 // InsufficientBalance failure now leaves the saved post behind (and emits it),

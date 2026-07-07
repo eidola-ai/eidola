@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! {"cmd":"scenes"}
-//! {"cmd":"open","scene":"chat_conversation"}            // optional width/height
+//! {"cmd":"open","scene":"space_conversation"}           // optional width/height
 //! {"cmd":"windows"}
 //! {"cmd":"elements","window":1}                          // named probe targets
 //! {"cmd":"click","window":1,"target":"chat/model-label"} // or "x"/"y"; alt/command/shift bools
@@ -74,7 +74,6 @@ mod driver {
     use eidola_app_core::{
         BalancePoolInfo, BalancesResult, ConfigState, ModelInfo, PriceInfo, SpaceInfo, SpaceMessage,
     };
-    use eidola_gui::chat::ChatView;
     use eidola_gui::library::LibraryView;
     use eidola_gui::onboarding::OnboardingView;
     use eidola_gui::probe;
@@ -193,63 +192,6 @@ mod driver {
         }
 
         vec![
-            Scene {
-                name: "onboarding_welcome",
-                description: "Chat window, no account: the welcome page (Begin button)",
-                default_size: size(px(705.), px(705.)),
-                build: |window, cx| {
-                    let stores = stub_stores(cx, |s| {
-                        s.config_state = Some(config_state(false));
-                    });
-                    let view =
-                        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx));
-                    root(view, window, cx)
-                },
-            },
-            Scene {
-                name: "onboarding_plans",
-                description: "Chat window, account with zero balance: the plans page",
-                default_size: size(px(705.), px(705.)),
-                build: |window, cx| {
-                    let stores = stub_stores(cx, |s| {
-                        s.config_state = Some(config_state(true));
-                        s.balances = Some(BalancesResult {
-                            available: 0,
-                            pools: Vec::new(),
-                        });
-                        s.prices = prices();
-                    });
-                    let view =
-                        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx));
-                    root(view, window, cx)
-                },
-            },
-            Scene {
-                name: "chat_empty",
-                description: "Ready chat window with an empty page and live composer",
-                default_size: size(px(705.), px(705.)),
-                build: |window, cx| {
-                    let stores = ready_stores(cx);
-                    let view =
-                        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx));
-                    root(view, window, cx)
-                },
-            },
-            Scene {
-                name: "chat_conversation",
-                description: "Ready chat window with a four-turn transcript",
-                default_size: size(px(760.), px(620.)),
-                build: |window, cx| {
-                    let stores = ready_stores(cx);
-                    let view = cx.new(|cx| {
-                        let mut view =
-                            ChatView::new(stores, None, WindowInput::new(cx), window, cx);
-                        view.set_messages_for_test(conversation(), cx);
-                        view
-                    });
-                    root(view, window, cx)
-                },
-            },
             Scene {
                 name: "space_blank",
                 description: "Space view: a brand-new blank space (composer open at top)",

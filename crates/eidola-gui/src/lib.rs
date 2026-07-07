@@ -5,7 +5,6 @@ pub mod about;
 pub mod account;
 pub mod actions;
 pub mod bridge;
-pub mod chat;
 pub mod general;
 pub mod library;
 pub mod loadable;
@@ -35,8 +34,6 @@ use crate::actions::{
     About, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize, NewSpace,
     OpenLibrary, OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
 };
-#[allow(unused_imports)]
-use crate::chat::ChatView;
 use crate::library::LibraryView;
 use crate::onboarding::OnboardingView;
 use crate::record::RecordView;
@@ -269,39 +266,18 @@ pub fn install_keybindings(cx: &mut App) {
         // ⌘↩ (post & ask) and ⌘⇧↩ (post only) are *not* bound here. The
         // composer owns those chords — `gpui_markdown_editor::init` binds them
         // in the `MarkdownEditor` context to `Enter { secondary: true, .. }`,
-        // whose handler emits `PressEnter`; `ChatView::on_editor_event` routes
-        // that to `Send`/`PostOnly`. Binding them here too would shadow the
-        // editor (the composer is the inner focus) and break the inversion.
-        // ⌥⌘M — toggle the quiet model picker. Scoped to ChatView so the
-        // distinct keystroke never competes with the global ⌘M (Minimize).
+        // whose handler emits `PressEnter`; the draft's subscription (see
+        // `space_view::composer::create_draft_node`) routes that to
+        // `Send`/`PostOnly`. Binding them here too would shadow the editor
+        // (the composer is the inner focus) and break the inversion.
+        // ⌥⌘M — the space view's request panel (the handler no-ops without a
+        // composer to anchor to). Scoped to SpaceView so the distinct
+        // keystroke never competes with the global ⌘M (Minimize). Esc routes
+        // through the composer's own key handler (panel first, then draft
+        // deactivation), so no Esc binding here.
         KeyBinding::new(
             "cmd-alt-m",
-            crate::chat::ToggleModelPicker,
-            Some("ChatView"),
-        ),
-        // Picker keyboard navigation — all scoped to ChatView. The picker
-        // gate is the action handler itself (methods early-return when the
-        // picker is closed). `up`/`down`/`enter` are *also* bound in the more
-        // specific `MarkdownEditor` context (the always-focused composer), so
-        // while the editor holds focus those bindings would win and the picker
-        // would never see the keystrokes (the codex review finding on #177).
-        // `ChatView::toggle_model_picker` therefore parks focus on the
-        // ChatView root while the picker is open — taking the editor's context
-        // out of the focus chain so these bindings become the innermost match
-        // — and returns focus to the composer on close (`sync_picker_focus`).
-        // `escape` isn't bound by the editor, but routes through the same
-        // parking for uniformity.
-        KeyBinding::new("escape", crate::chat::DismissModelPicker, Some("ChatView")),
-        KeyBinding::new("up", crate::chat::PickerUp, Some("ChatView")),
-        KeyBinding::new("down", crate::chat::PickerDown, Some("ChatView")),
-        KeyBinding::new("enter", crate::chat::PickerConfirm, Some("ChatView")),
-        // ⌥⌘M — the space view's request panel (the same semantic gesture as
-        // ChatView's picker; the handler no-ops without a composer to anchor
-        // to). Esc routes through the composer's own key handler (panel
-        // first, then draft deactivation), so no Esc binding here.
-        KeyBinding::new(
-            "cmd-alt-m",
-            crate::chat::ToggleModelPicker,
+            crate::actions::ToggleModelPicker,
             Some("SpaceView"),
         ),
     ]);
@@ -441,7 +417,7 @@ fn install_action_handlers(cx: &mut App) {
 
     // `CloseWindow` is intentionally NOT registered as a global handler.
     // Each view registers its own listener via `.on_action(cx.listener(…))`
-    // (see `chat::ChatView` and `settings::SettingsView`). With per-view
+    // (see `space_view::SpaceView` and `settings::SettingsView`). With per-view
     // registration, `is_action_available` returns true only when a window
     // with the listener is alive — so macOS auto-greys "Close Window" in
     // the menu when no window is open, which is the correct behavior.
@@ -506,7 +482,7 @@ fn try_focus_existing_onboarding(cx: &mut App) -> bool {
 /// Edge-to-edge titlebar: macOS extends the content view under the
 /// traffic-light buttons and stops painting a separate titlebar background.
 /// Each view is responsible for leaving room at the top so the lights don't
-/// land on real UI — see `chat::TITLE_BAR_RESERVE` (vertical reserve + fade
+/// land on real UI — see `space_view::TITLE_BAR_RESERVE` (vertical reserve + fade
 /// gradient), `settings::NAV_TOP_RESERVE` (the lights sit over the nav
 /// band), and `record::STRIP_LEFT_PAD` (the section strip doubles as the
 /// title bar).

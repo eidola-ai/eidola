@@ -129,6 +129,10 @@ pub struct MockServer {
     pub base_url: String,
     /// Number of `POST /v1/chat/completions` requests received.
     chat_hits: Arc<AtomicU64>,
+    /// The parsed JSON body of every `POST /v1/chat/completions`, in arrival
+    /// order — lets tests assert exactly what context the client sent
+    /// upstream (e.g. regenerate's upstream-only thread).
+    chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     /// Number of `POST /v1/credentials/refund` requests received.
     refund_hits: Arc<AtomicU64>,
     _task: tokio::task::JoinHandle<()>,
@@ -140,6 +144,10 @@ impl MockServer {
     }
     pub fn refund_hits(&self) -> u64 {
         self.refund_hits.load(Ordering::SeqCst)
+    }
+    /// The recorded chat request bodies (see `chat_bodies`).
+    pub fn chat_bodies(&self) -> Vec<serde_json::Value> {
+        self.chat_bodies.lock().unwrap().clone()
     }
 }
 
@@ -235,11 +243,14 @@ pub async fn start(config: MockConfig) -> MockServer {
     let base_url = format!("http://{addr}");
 
     let chat_hits = Arc::new(AtomicU64::new(0));
+    let chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let refund_hits = Arc::new(AtomicU64::new(0));
 
     let task = {
         let issuer = issuer.clone();
         let chat_hits = chat_hits.clone();
+        let chat_bodies = chat_bodies.clone();
         let refund_hits = refund_hits.clone();
         tokio::spawn(async move {
             loop {
@@ -249,9 +260,12 @@ pub async fn start(config: MockConfig) -> MockServer {
                 let issuer = issuer.clone();
                 let config = config.clone();
                 let chat_hits = chat_hits.clone();
+                let chat_bodies = chat_bodies.clone();
                 let refund_hits = refund_hits.clone();
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, issuer, config, chat_hits, refund_hits).await;
+                    let _ =
+                        handle_conn(stream, issuer, config, chat_hits, chat_bodies, refund_hits)
+                            .await;
                 });
             }
         })
@@ -260,6 +274,7 @@ pub async fn start(config: MockConfig) -> MockServer {
     MockServer {
         base_url,
         chat_hits,
+        chat_bodies,
         refund_hits,
         _task: task,
     }
@@ -334,6 +349,7 @@ async fn handle_conn(
     issuer: Arc<Issuer>,
     config: MockConfig,
     chat_hits: Arc<AtomicU64>,
+    chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     refund_hits: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
     // Each connection serves at most one request (reqwest opens a fresh
@@ -386,6 +402,9 @@ async fn handle_conn(
         }
         ("POST", "/v1/chat/completions") => {
             chat_hits.fetch_add(1, Ordering::SeqCst);
+            if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) {
+                chat_bodies.lock().unwrap().push(body);
+            }
             handle_chat(&mut stream, &issuer, &config, req.auth.as_deref()).await?;
         }
         _ => {

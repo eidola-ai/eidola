@@ -56,7 +56,7 @@ where
 /// Streaming chat. Spawns the streaming call on the core's tokio runtime and
 /// returns an `mpsc` receiver of incremental deltas (closes when the stream
 /// ends) plus a `oneshot` receiver for the terminal `ChatResult`. Both are
-/// drained from gpui's main thread by `chat::ChatView::spawn_stream`. `reply_to`,
+/// drained from gpui's main thread by the `Space` entity's submit runner. `reply_to`,
 /// when set, branches the new turn off that post (vs the linear tail).
 pub fn chat_stream(
     core: Arc<AppCore>,

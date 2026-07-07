@@ -29,7 +29,7 @@ use crate::probe::Probe as _;
 use crate::stores::{Stores, UpdateStore};
 
 /// Vertical reserve under the transparent titlebar so the traffic lights
-/// don't land on content (same rationale as `chat::TITLE_BAR_RESERVE`).
+/// don't land on content (same rationale as `space_view::TITLE_BAR_RESERVE`).
 #[cfg(target_os = "macos")]
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
 #[cfg(not(target_os = "macos"))]

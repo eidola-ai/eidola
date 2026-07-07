@@ -13,7 +13,7 @@ use std::sync::{Mutex, MutexGuard};
 use eidola_app_core::{
     BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
 };
-use eidola_gui::chat::{ChatView, ToggleModelPicker};
+use eidola_gui::actions::ToggleModelPicker;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
 use eidola_gui::probe;
@@ -30,102 +30,6 @@ fn probes_on() -> MutexGuard<'static, ()> {
     let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     probe::set_probes_enabled(true);
     guard
-}
-
-#[gpui::test]
-fn chat_probes_record_names_roles_and_bounds(cx: &mut TestAppContext) {
-    let _guard = probes_on();
-
-    let stores = ready_stores(cx);
-    let (window, _view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx))
-    });
-    draw(cx, window);
-
-    let entries = probe::window_entries(window.window_id().as_u64());
-    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
-    assert!(
-        names.contains(&"chat/composer"),
-        "composer probe missing; recorded: {names:?}"
-    );
-    assert!(
-        names.contains(&"chat/transcript"),
-        "transcript probe missing; recorded: {names:?}"
-    );
-
-    let composer = &entries
-        .iter()
-        .find(|(n, _)| n == "chat/composer")
-        .unwrap()
-        .1;
-    assert_eq!(format!("{:?}", composer.role), "TextInput");
-    assert_eq!(composer.label.as_ref(), "Message composer");
-    assert!(
-        composer.bounds.size.width.as_f32() > 100.0 && composer.bounds.size.height.as_f32() > 10.0,
-        "composer bounds should be a real painted area, got {:?}",
-        composer.bounds
-    );
-
-    probe::set_probes_enabled(false);
-}
-
-#[gpui::test]
-fn picker_probes_appear_on_open_and_clear_on_dismiss(cx: &mut TestAppContext) {
-    let _guard = probes_on();
-
-    let stores = ready_stores(cx);
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx))
-    });
-    let id = window.window_id().as_u64();
-
-    // Closed picker: no listbox probes.
-    draw(cx, window);
-    let names = fresh_names(cx, window);
-    assert!(
-        !names.iter().any(|n| n.starts_with("chat/model-picker")),
-        "picker probes before opening: {names:?}"
-    );
-
-    // Open via the real action dispatch path.
-    let focus = view.read_with(cx, |v, _| v.focus_handle());
-    cx.update_window(window, |_, window, cx| {
-        focus.dispatch_action(&ToggleModelPicker, window, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
-    let names = fresh_names(cx, window);
-    assert!(
-        names.contains(&"chat/model-picker".to_string()),
-        "picker panel probe missing after open: {names:?}"
-    );
-    assert!(
-        names.contains(&"chat/model-picker/row/0".to_string())
-            && names.contains(&"chat/model-picker/row/2".to_string()),
-        "per-model row probes missing: {names:?}"
-    );
-
-    // Dismiss: the clear-then-redraw dance must drop the unmounted picker —
-    // stale entries would be ghost click targets for the driver.
-    cx.update_window(window, |_, window, cx| {
-        focus.dispatch_action(&ToggleModelPicker, window, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
-    let names = fresh_names(cx, window);
-    assert!(
-        !names.iter().any(|n| n.starts_with("chat/model-picker")),
-        "picker probes must clear after dismiss: {names:?}"
-    );
-    assert!(
-        names.contains(&"chat/composer".to_string()),
-        "still-mounted probes must survive the refresh: {names:?}"
-    );
-
-    let _ = id;
-    probe::set_probes_enabled(false);
 }
 
 #[gpui::test]
@@ -162,7 +66,7 @@ fn disabled_probes_record_nothing(cx: &mut TestAppContext) {
 
     let stores = ready_stores(cx);
     let (window, _view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx))
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
     });
     // Window ids restart per TestAppContext, so an earlier (enabled) test in
     // this process may have recorded under the same id — clear first, then
@@ -459,4 +363,60 @@ fn onboarding_probes_record_ctas_and_inputs(cx: &mut TestAppContext) {
             "create-account probe {expected:?} missing; recorded: {names:?}"
         );
     }
+}
+
+#[gpui::test]
+fn request_panel_probes_appear_on_open_and_clear_on_dismiss(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+
+    // Closed panel: no listbox probes.
+    draw(cx, window);
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.iter().any(|n| n.starts_with("space/request-panel")),
+        "panel probes before opening: {names:?}"
+    );
+
+    // Open via the real action dispatch path (the blank space's root draft
+    // anchors the panel).
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/request-panel".to_string()),
+        "panel probe missing after open: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/request-panel/row/0".to_string())
+            && names.contains(&"space/request-panel/row/2".to_string()),
+        "per-model row probes missing: {names:?}"
+    );
+
+    // Dismiss: the clear-then-redraw dance must drop the unmounted panel —
+    // stale entries would be ghost click targets for the driver.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.iter().any(|n| n.starts_with("space/request-panel")),
+        "panel probes must clear after dismiss: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/composer".to_string()),
+        "still-mounted probes must survive the refresh: {names:?}"
+    );
 }

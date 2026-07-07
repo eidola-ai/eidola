@@ -470,6 +470,60 @@ fn edit_post_appends_generation_replacing_default_view() {
 }
 
 #[test]
+fn edit_post_keeps_tree_position_and_rethreads_replies() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        // A question with a reply threaded onto it (post links to the tail).
+        let first = core
+            .runtime()
+            .block_on(core.post("original question".into(), None))
+            .unwrap();
+        let second = core
+            .runtime()
+            .block_on(core.post("a reply".into(), Some(first.space_id.clone())))
+            .unwrap();
+
+        // Edit the *first* post — a new generation of its item, created later
+        // than everything else in the space.
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(first.action_id.clone(), "edited question".into()))
+            .unwrap();
+
+        // The render tree: the edited post stays exactly where the item has
+        // always been (the root, first), and the reply re-threads under the
+        // edit via item identity — not dangling as a sibling root branch (the
+        // pre-fix rendering: the edit floated to the end as a new branch).
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .unwrap();
+        assert_eq!(tree.len(), 2, "two posts render; got {tree:#?}");
+        assert_eq!(tree[0].action_id, edited.action_id, "edit stays in place");
+        assert_eq!(tree[0].parent_action_id, None);
+        assert_eq!(tree[0].generation, 1);
+        assert_eq!(tree[0].blocks[0].text.as_deref(), Some("edited question"));
+        assert_eq!(tree[1].action_id, second.action_id);
+        assert_eq!(
+            tree[1].parent_action_id.as_deref(),
+            Some(edited.action_id.as_str()),
+            "the reply re-threads under the item's current tip"
+        );
+        assert_eq!(tree[1].depth, 0, "the spine stays flat — no branch");
+        assert!(!tree[1].is_branch);
+
+        // The upstream-context view keeps the item's position too — the model
+        // must see the edited text where the original stood, not appended.
+        let msgs = core
+            .runtime()
+            .block_on(core.get_space_messages(first.space_id.clone()))
+            .unwrap();
+        let contents: Vec<&str> = msgs.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["edited question", "a reply"]);
+    });
+}
+
+#[test]
 fn edit_post_on_unknown_action_errors_without_emit() {
     run_in_thread(|| {
         let (core, _dir) = make_core();
