@@ -11,14 +11,14 @@
 //! 3. Assert against the editor's public state with `read_with`.
 
 use gpui::{
-    AnyWindowHandle, AppContext, Bounds, Entity, TestAppContext, WindowBounds, WindowOptions,
-    point, px, size,
+    AnyWindowHandle, AppContext, Bounds, Entity, EntityInputHandler, TestAppContext, WindowBounds,
+    WindowOptions, point, px, size,
 };
 use gpui_component::Root;
 use gpui_markdown_editor::editor::{
     Backspace, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward, DeleteWordForward,
-    DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Right, SelectAll, ShiftRight,
-    ShiftTab, ShiftWordLeft, ShiftWordRight, Tab, Up, WordLeft, WordRight,
+    DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Redo, Right, SelectAll, ShiftRight,
+    ShiftTab, ShiftWordLeft, ShiftWordRight, Tab, Undo, Up, WordLeft, WordRight,
 };
 use gpui_markdown_editor::{
     BlockKind, Container, EditorState, ListItemKind, MarkdownEditor, MarkdownEditorState,
@@ -8613,4 +8613,216 @@ fn li_with_paragraph_then_nested_list_does_not_emit_synth(cx: &mut TestAppContex
         spec.blocks[0].source_range.end > 3,
         "first block should cover marker + paragraph content `one`",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Undo / redo
+// ---------------------------------------------------------------------------
+
+// Undo/redo tests reuse the crate-wide `type_text` helper (single
+// `InsertText` events through the production `dispatch` choke point).
+
+/// Drive the IME / typed-input bypass path (`replace_and_mark_text_in_range`),
+/// which mutates `self.state` directly rather than routing through
+/// `dispatch`/`update`.
+fn ime_insert(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    editor: &Entity<MarkdownEditorState>,
+    text: &str,
+) {
+    cx.update_window(handle, |_, window, cx| {
+        editor.update(cx, |e, cx| {
+            e.replace_and_mark_text_in_range(None, text, None, window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn undo_restores_buffer_and_selection(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "Hello".into(),
+        selection: Selection::Cursor(5),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "!");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "Hello!");
+        assert_eq!(e.cursor_offset(), 6);
+    });
+
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "Hello");
+        // Pre-edit selection is restored, not just the buffer.
+        assert_eq!(e.selection(), Selection::Cursor(5));
+    });
+
+    dispatch(cx, handle, &editor, Redo);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "Hello!");
+        assert_eq!(e.selection(), Selection::Cursor(6));
+    });
+}
+
+#[gpui::test]
+fn typing_coalesces_into_single_undo_step(cx: &mut TestAppContext) {
+    // Three contiguous single-character inserts collapse into one undo
+    // step: a single Undo reverts the whole run, and a single Redo
+    // re-applies it.
+    let (handle, editor) = open_editor(cx, EditorState::new());
+    type_text(cx, handle, &editor, "a");
+    type_text(cx, handle, &editor, "b");
+    type_text(cx, handle, &editor, "c");
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "abc"));
+
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "");
+        assert_eq!(e.cursor_offset(), 0);
+    });
+
+    dispatch(cx, handle, &editor, Redo);
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "abc"));
+}
+
+#[gpui::test]
+fn whitespace_breaks_the_coalescing_run(cx: &mut TestAppContext) {
+    // A space is a word boundary: it ends the current typing run so the
+    // characters before and after it undo independently.
+    let (handle, editor) = open_editor(cx, EditorState::new());
+    type_text(cx, handle, &editor, "a");
+    type_text(cx, handle, &editor, "b");
+    type_text(cx, handle, &editor, " ");
+    type_text(cx, handle, &editor, "c");
+    type_text(cx, handle, &editor, "d");
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "ab cd"));
+
+    // First undo drops the trailing "cd" run.
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "ab "));
+    // Second undo drops the space (its own step).
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "ab"));
+    // Third undo drops the leading "ab" run.
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), ""));
+}
+
+#[gpui::test]
+fn deletion_is_its_own_undo_step(cx: &mut TestAppContext) {
+    // A backspace must not fold into a preceding typing run.
+    let (handle, editor) = open_editor(cx, EditorState::new());
+    type_text(cx, handle, &editor, "a");
+    type_text(cx, handle, &editor, "b");
+    dispatch(cx, handle, &editor, Backspace); // "ab" -> "a"
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "a"));
+
+    // Undo the delete only — the typed "ab" is a separate, still-standing step.
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "ab"));
+    // Undo the typing run.
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), ""));
+}
+
+#[gpui::test]
+fn undo_captures_ime_typed_input(cx: &mut TestAppContext) {
+    // The IME path bypasses `dispatch`; undo must still capture it.
+    let initial = EditorState {
+        markdown: "abc".into(),
+        selection: Selection::Cursor(3),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    ime_insert(cx, handle, &editor, "X");
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "abcX");
+        assert_eq!(e.cursor_offset(), 4);
+    });
+
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "abc");
+        assert_eq!(e.selection(), Selection::Cursor(3));
+    });
+
+    dispatch(cx, handle, &editor, Redo);
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "abcX"));
+}
+
+#[gpui::test]
+fn fresh_edit_clears_redo_stack(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "Hi".into(),
+        selection: Selection::Cursor(2),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "!"); // "Hi!"
+    dispatch(cx, handle, &editor, Undo); // back to "Hi", redo holds "Hi!"
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "Hi"));
+
+    // A fresh edit discards the redo branch.
+    type_text(cx, handle, &editor, "?"); // "Hi?"
+    dispatch(cx, handle, &editor, Redo); // no-op: redo was cleared
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "Hi?"));
+}
+
+#[gpui::test]
+fn undo_redo_noop_on_empty_stacks(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "abc".into(),
+        selection: Selection::Cursor(1),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "abc");
+        assert_eq!(e.selection(), Selection::Cursor(1));
+    });
+    dispatch(cx, handle, &editor, Redo);
+    editor.read_with(cx, |e, _| assert_eq!(e.value(), "abc"));
+}
+
+#[gpui::test]
+fn selection_only_change_records_no_undo_step(cx: &mut TestAppContext) {
+    // Moving the caret is not an edit: Undo afterwards must be a no-op,
+    // not a selection reset.
+    let initial = EditorState {
+        markdown: "abc".into(),
+        selection: Selection::Cursor(0),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    dispatch(cx, handle, &editor, Right);
+    editor.read_with(cx, |e, _| assert_eq!(e.cursor_offset(), 1));
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.value(), "abc");
+        // Undo did nothing — the caret stays where the move left it.
+        assert_eq!(e.cursor_offset(), 1);
+    });
+}
+
+#[gpui::test]
+fn set_value_clears_history(cx: &mut TestAppContext) {
+    let initial = EditorState {
+        markdown: "a".into(),
+        selection: Selection::Cursor(1),
+    };
+    let (handle, editor) = open_editor(cx, initial);
+    type_text(cx, handle, &editor, "!"); // "a!"
+
+    // A programmatic whole-document swap is an undo boundary.
+    cx.update_window(handle, |_, _, cx| {
+        editor.update(cx, |e, cx| e.set_value("new document", cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    dispatch(cx, handle, &editor, Undo);
+    editor.read_with(cx, |e, _| {
+        // Undo cannot cross the set_value boundary.
+        assert_eq!(e.value(), "new document");
+    });
 }

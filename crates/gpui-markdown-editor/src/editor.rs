@@ -110,8 +110,25 @@ actions!(
         /// `cmd-shift-v`. The dual-keybinding convention matches what
         /// most editors do for "paste as plain text."
         PastePlain,
+        /// Revert the buffer to the state before the most recent
+        /// (coalesced) edit, restoring its markdown *and* selection.
+        /// No-op when the undo stack is empty. Default macOS
+        /// keybinding: `cmd-z`.
+        Undo,
+        /// Re-apply the most recently undone edit. Cleared the moment a
+        /// fresh edit is made. No-op when the redo stack is empty.
+        /// Default macOS keybinding: `cmd-shift-z`.
+        Redo,
     ]
 );
+
+/// Cap on the number of undo entries retained. Each entry is a full
+/// pre-edit [`EditorState`] snapshot (markdown + selection); the buffers
+/// this editor hosts (chat composer, inline posts) are small, so a few
+/// hundred whole-document snapshots is a negligible memory cost while
+/// still bounding a pathological session. The oldest entry is dropped
+/// (FIFO) once the stack exceeds this.
+const MAX_HISTORY: usize = 256;
 
 /// Sentinel string tagged onto every `copy` / `cut` clipboard write via
 /// `ClipboardItem::new_string_with_metadata`. Paired with the metadata
@@ -149,6 +166,43 @@ fn normalize_line_endings(text: &str) -> String {
     out
 }
 
+/// Decide whether the transition `before → after` is a *coalescible
+/// typing insert*: a single non-whitespace character spliced at a
+/// collapsed caret, leaving the caret immediately after it. Returns the
+/// post-insert caret offset when so (the anchor a following character
+/// must continue from to keep coalescing), else `None`.
+///
+/// Requiring a clean single-char insertion at a cursor is deliberately
+/// conservative: if `update` did anything structural (promoted a soft
+/// break, renumbered a list, closed a fence) the shape won't match and
+/// the edit falls out of the run — landing as its own, independently
+/// undoable step. Whitespace and newlines are excluded so a word break
+/// or Enter ends the current run, matching how editors segment undo.
+fn coalescible_type_end(before: &EditorState, after: &EditorState) -> Option<usize> {
+    let Selection::Cursor(start) = before.selection else {
+        return None;
+    };
+    let Selection::Cursor(end) = after.selection else {
+        return None;
+    };
+    if end <= start || after.markdown.len() != before.markdown.len() + (end - start) {
+        return None;
+    }
+    let bb = before.markdown.as_bytes();
+    let ab = after.markdown.as_bytes();
+    // after = before[..start] + inserted + before[start..]
+    if ab[..start] != bb[..start] || ab[end..] != bb[start..] {
+        return None;
+    }
+    let inserted = &after.markdown[start..end];
+    let mut chars = inserted.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || ch.is_whitespace() {
+        return None;
+    }
+    Some(end)
+}
+
 /// The editor's retained state — the Entity half of the gpui-component
 /// `InputState`/`Input` split. The host owns one of these (`cx.new(...)`),
 /// passes it into the [`MarkdownEditor`](crate::MarkdownEditor) element each
@@ -184,6 +238,26 @@ pub struct MarkdownEditorState {
     /// row. Reset to `None` on any non-vertical event in
     /// `dispatch_reset_intended_x_unless_vertical`.
     intended_x: Option<Pixels>,
+    /// Undo history — a stack of pre-edit [`EditorState`] snapshots,
+    /// oldest at the front. Every buffer-mutating edit pushes the state
+    /// *before* the edit (unless it coalesces into the previous typing
+    /// run — see [`coalesce_anchor`](Self::coalesce_anchor)). `undo`
+    /// pops the top back into `state`. Capped at [`MAX_HISTORY`].
+    undo_stack: Vec<EditorState>,
+    /// Redo history — states popped off `state` by `undo`, newest on
+    /// top. `redo` pops the top back into `state`. Cleared on any fresh
+    /// edit (the standard branch-discard behavior).
+    redo_stack: Vec<EditorState>,
+    /// Typing-coalescing anchor. `Some(offset)` when the previous
+    /// recorded edit was a single-character, non-whitespace insertion
+    /// whose caret ended at `offset`. A new single-character insert
+    /// whose *starting* caret sits exactly at this anchor extends the
+    /// same undo step instead of pushing a new one — so a run of typed
+    /// characters undoes as one unit. Any edit that isn't a contiguous
+    /// single-char insert (deletion, whitespace/newline, paste,
+    /// structural edit, a selection jump, or undo/redo itself) resets
+    /// the anchor to `None`, breaking the run.
+    coalesce_anchor: Option<usize>,
     /// Focus/blur observers that translate gpui focus transitions into
     /// outward [`MarkdownEditorEvent::Focus`]/[`Blur`](MarkdownEditorEvent::Blur).
     /// Held so they live as long as the entity.
@@ -220,6 +294,9 @@ impl MarkdownEditorState {
             marked_range: None,
             code_block_scrolls: HashMap::new(),
             intended_x: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            coalesce_anchor: None,
             _focus_subscriptions,
         }
     }
@@ -249,10 +326,20 @@ impl MarkdownEditorState {
 
     /// Replace the entire buffer and collapse the cursor to the start. The
     /// write half of the host seam; emits [`MarkdownEditorEvent::Change`].
+    ///
+    /// **Undo boundary.** A programmatic host replacement of the whole
+    /// document (loading a post to edit, clearing after submit, seeding a
+    /// draft) is *not* a user-undoable keystroke, so this clears both
+    /// history stacks: undo never crosses a `set_value`, and the user
+    /// can't `cmd-z` their way back into a document the host swapped out
+    /// from under them. Typed edits after the swap build a fresh history.
     pub fn set_value(&mut self, markdown: impl Into<String>, cx: &mut Context<Self>) {
         self.state = EditorState::with_markdown(markdown);
         self.marked_range = None;
         self.intended_x = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.coalesce_anchor = None;
         cx.emit(MarkdownEditorEvent::Change);
         cx.notify();
     }
@@ -317,16 +404,86 @@ impl MarkdownEditorState {
         // Vertical events (handled by `vertical_move` below) update
         // `intended_x` directly without going through this helper.
         self.intended_x = None;
-        let next = std::mem::take(&mut self.state);
-        // Compare the buffer across the update so selection-only events
-        // (Move*/Extend*/SetSelection) don't masquerade as content changes.
-        // The composer buffer is small, so the clone is negligible.
-        let before = next.markdown.clone();
-        self.state = update::update(next, event);
+        let before = std::mem::take(&mut self.state);
+        self.state = update::update(before.clone(), event);
         self.marked_range = None;
-        if self.state.markdown != before {
+        // Compare the buffer across the update so selection-only events
+        // (Move*/Extend*/SetSelection) don't push an undo step or count
+        // as a content change. The composer buffer is small, so the
+        // pre-edit clone is negligible.
+        if self.state.markdown != before.markdown {
+            self.record_history(before);
             cx.emit(MarkdownEditorEvent::Change);
         }
+        cx.notify();
+    }
+
+    /// Push the pre-edit `before` state onto the undo stack — the single
+    /// history-recording choke point shared by `dispatch` (action- and
+    /// paste-driven edits) and `replace_and_mark_text_in_range` (the IME
+    /// / typed-input path that mutates `self.state` directly). Callers
+    /// invoke it *after* `self.state` has been advanced to the post-edit
+    /// value, having confirmed the buffer actually changed.
+    ///
+    /// **Coalescing.** Consecutive single-character, non-whitespace
+    /// insertions that continue at the caret collapse into one undo
+    /// step, so a typed word undoes as a unit rather than
+    /// character-by-character. The run breaks (a new undo entry is
+    /// pushed) whenever the edit is anything else — a deletion, a
+    /// whitespace or newline insertion, a paste, a structural edit, or a
+    /// caret jump away from where the last insert ended. This is the
+    /// simpler clock-free heuristic: no time window, just contiguity +
+    /// "is it a plain typed character". Every fresh edit clears the redo
+    /// stack.
+    fn record_history(&mut self, before: EditorState) {
+        // Is this edit a coalescible single-char type, and where did its
+        // caret land? `None` for anything that should break the run.
+        let type_end = coalescible_type_end(&before, &self.state);
+        let coalesce = match (type_end, self.coalesce_anchor) {
+            // Continue the run only when the previous edit was also a
+            // coalescible type and *this* edit began exactly where it
+            // left off (contiguous typing, no caret jump between).
+            (Some(_), Some(anchor)) => before.selection == Selection::Cursor(anchor),
+            _ => false,
+        };
+        if !coalesce {
+            self.undo_stack.push(before);
+            if self.undo_stack.len() > MAX_HISTORY {
+                self.undo_stack.remove(0);
+            }
+        }
+        // A coalescing type extends the existing top entry (the snapshot
+        // from the start of the run) — we simply don't push a new one.
+        self.redo_stack.clear();
+        self.coalesce_anchor = type_end;
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(prev) = self.undo_stack.pop() else {
+            return;
+        };
+        let current = std::mem::replace(&mut self.state, prev);
+        self.redo_stack.push(current);
+        self.marked_range = None;
+        self.intended_x = None;
+        // An undo is a hard boundary: the next typed character starts a
+        // fresh coalescing run rather than folding into the step we just
+        // reverted.
+        self.coalesce_anchor = None;
+        cx.emit(MarkdownEditorEvent::Change);
+        cx.notify();
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(next) = self.redo_stack.pop() else {
+            return;
+        };
+        let current = std::mem::replace(&mut self.state, next);
+        self.undo_stack.push(current);
+        self.marked_range = None;
+        self.intended_x = None;
+        self.coalesce_anchor = None;
+        cx.emit(MarkdownEditorEvent::Change);
         cx.notify();
     }
 
@@ -914,6 +1071,11 @@ impl EntityInputHandler for MarkdownEditorState {
             .or_else(|| self.marked_range.clone())
             .unwrap_or_else(|| self.state.selection.selection_range());
 
+        // Snapshot the pre-edit state so this direct-mutation path (IME /
+        // typed input, which bypasses `dispatch`/`update`) records undo
+        // history through the same choke point as everything else.
+        let before = self.state.clone();
+
         let mut new_md = String::with_capacity(
             self.state.markdown.len() - (range.end - range.start) + new_text.len(),
         );
@@ -935,6 +1097,9 @@ impl EntityInputHandler for MarkdownEditorState {
             range.start + new_text.len()
         };
         self.state.selection = Selection::Cursor(cursor);
+        if self.state.markdown != before.markdown {
+            self.record_history(before);
+        }
         cx.emit(MarkdownEditorEvent::Change);
         cx.notify();
     }
@@ -1165,6 +1330,23 @@ impl RenderOnce for MarkdownEditor {
                 .on_action(window.listener_for(&state, MarkdownEditorState::cut))
                 .on_action(window.listener_for(&state, MarkdownEditorState::paste))
                 .on_action(window.listener_for(&state, MarkdownEditorState::paste_plain))
+                .on_action(window.listener_for(&state, MarkdownEditorState::undo))
+                .on_action(window.listener_for(&state, MarkdownEditorState::redo))
+                // Map the Edit-menu Undo/Redo action types
+                // (`gpui_component::input::{Undo,Redo}`) onto the editor's
+                // own implementations, so the macOS Edit menu's Undo/Redo
+                // items reach the composer when it has focus — the same
+                // bridge used above for Cut/Copy/Paste/Select All.
+                .on_action(
+                    window.listener_for(&state, |this, _: &gpui_component::input::Undo, w, cx| {
+                        this.undo(&Undo, w, cx)
+                    }),
+                )
+                .on_action(
+                    window.listener_for(&state, |this, _: &gpui_component::input::Redo, w, cx| {
+                        this.redo(&Redo, w, cx)
+                    }),
+                )
                 // Map the mutating Edit-menu action types
                 // (`gpui_component::input::{Cut,Paste}`) onto the editor's own
                 // implementations.
@@ -1303,5 +1485,9 @@ pub fn init(cx: &mut App) {
         gpui::KeyBinding::new("cmd-x", Cut, ctx),
         gpui::KeyBinding::new("cmd-v", Paste, ctx),
         gpui::KeyBinding::new("cmd-shift-v", PastePlain, ctx),
+        // Undo / redo — scoped to the editor context, so they coexist
+        // with `gpui_component::Input`'s own `Input`-context bindings.
+        gpui::KeyBinding::new("cmd-z", Undo, ctx),
+        gpui::KeyBinding::new("cmd-shift-z", Redo, ctx),
     ]);
 }

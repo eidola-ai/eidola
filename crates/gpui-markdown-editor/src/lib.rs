@@ -31,9 +31,9 @@ pub mod update;
 pub use editor::{
     Backspace, Copy, Cut, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward,
     DeleteWordForward, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, MarkdownEditor,
-    MarkdownEditorState, Paste, PastePlain, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart,
-    ShiftDown, ShiftEnd, ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft,
-    ShiftWordRight, Tab, Up, WordLeft, WordRight, init,
+    MarkdownEditorState, Paste, PastePlain, Redo, Right, SelectAll, ShiftDocumentEnd,
+    ShiftDocumentStart, ShiftDown, ShiftEnd, ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp,
+    ShiftWordLeft, ShiftWordRight, Tab, Undo, Up, WordLeft, WordRight, init,
 };
 pub use event::{EditorEvent, MarkdownEditorEvent};
 pub use parser::parse;
