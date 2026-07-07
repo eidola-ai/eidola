@@ -35,8 +35,6 @@ use crate::plans::{self, format_credits};
 use crate::probe::Probe as _;
 use crate::space_view::{TITLE_BAR_RESERVE, prose_style};
 
-use super::Slide;
-
 /// External links referenced by the slides.
 const REPO_URL: &str = "https://github.com/eidola-ai/eidola";
 const TERMS_URL: &str = "https://www.eidola.ai/legal/terms-of-use";
@@ -50,29 +48,11 @@ pub(super) type OnClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'stat
 /// A boxed checkbox-toggle callback prop.
 pub(super) type OnToggle = Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>;
 
-/// The heading + intro prose (markdown) for a slide. Each constant lives on
-/// its slide's component below; the parent uses this to seed the per-slide
-/// prose editor it caches.
-pub(super) fn markdown(slide: Slide) -> &'static str {
-    match slide {
-        Slide::Pause => Pause::MARKDOWN,
-        Slide::Tool => Tool::MARKDOWN,
-        Slide::Control => Control::MARKDOWN,
-        Slide::Responsibility => Responsibility::MARKDOWN,
-        Slide::GetStarted => GetStarted::MARKDOWN,
-        Slide::CreateAccount => CreateAccount::MARKDOWN,
-        Slide::NewAccount => NewAccount::MARKDOWN,
-        Slide::ExistingAccount => ExistingAccount::MARKDOWN,
-        Slide::Purchase => Purchase::MARKDOWN,
-    }
-}
-
 // -- Pause -----------------------------------------------------------------
 
 /// "Pause here" — Eidola is not the same as the hosted assistants.
 #[derive(IntoElement)]
 pub(super) struct Pause {
-    pub prose: Option<Entity<MarkdownEditorState>>,
     pub on_advance: OnClick,
 }
 
@@ -84,7 +64,8 @@ impl Pause {
 impl RenderOnce for Pause {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         slide_frame(
-            self.prose,
+            "pause",
+            Self::MARKDOWN,
             None,
             cta_button("pause", "OK, you have my attention.", self.on_advance).into_any_element(),
             window,
@@ -98,7 +79,6 @@ impl RenderOnce for Pause {
 /// "Eidola is your tool" — the CD-era sovereignty analogy.
 #[derive(IntoElement)]
 pub(super) struct Tool {
-    pub prose: Option<Entity<MarkdownEditorState>>,
     pub on_advance: OnClick,
 }
 
@@ -106,7 +86,7 @@ impl Tool {
     const MARKDOWN: &'static str = "## Eidola is *your* tool\n\nIn years past, an application was delivered to your \
          computer via a CD:\n\n- Its behavior *couldn't* spontaneously change without your \
          involvement.\n- Your files, plans, usage patterns, and insights were *yours alone*, \
-         undiscoverable by any third party.\n- The structure of the technology — *not* some \
+         undiscoverable by any third party.\n- The **structure** of the technology — *not* some \
          company's promises — enforced these properties.\n\nEidola approximates this \
          approach as closely as possible, structurally maximizing end-user sovereignty even \
          for workloads that are best run in a data center.";
@@ -115,7 +95,8 @@ impl Tool {
 impl RenderOnce for Tool {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         slide_frame(
-            self.prose,
+            "tool",
+            Self::MARKDOWN,
             None,
             cta_button("tool", "I understand.", self.on_advance).into_any_element(),
             window,
@@ -129,7 +110,6 @@ impl RenderOnce for Tool {
 /// "Your control" — nobody but you can see or update it. Links to the repo.
 #[derive(IntoElement)]
 pub(super) struct Control {
-    pub prose: Option<Entity<MarkdownEditorState>>,
     pub on_advance: OnClick,
 }
 
@@ -144,7 +124,8 @@ impl Control {
 impl RenderOnce for Control {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         slide_frame(
-            self.prose,
+            "control",
+            Self::MARKDOWN,
             Some(link_row("The Eidola code repository", REPO_URL, cx).into_any_element()),
             cta_button("control", "I understand.", self.on_advance).into_any_element(),
             window,
@@ -158,7 +139,6 @@ impl RenderOnce for Control {
 /// "Your responsibility" — models are fallible; effects are yours.
 #[derive(IntoElement)]
 pub(super) struct Responsibility {
-    pub prose: Option<Entity<MarkdownEditorState>>,
     pub on_advance: OnClick,
 }
 
@@ -180,7 +160,8 @@ impl Responsibility {
 impl RenderOnce for Responsibility {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         slide_frame(
-            self.prose,
+            "responsibility",
+            Self::MARKDOWN,
             None,
             cta_button("responsibility", "I understand.", self.on_advance).into_any_element(),
             window,
@@ -194,20 +175,20 @@ impl RenderOnce for Responsibility {
 /// "Get started" — the branch point (new vs. existing account).
 #[derive(IntoElement)]
 pub(super) struct GetStarted {
-    pub prose: Option<Entity<MarkdownEditorState>>,
     pub on_new_account: OnClick,
     pub on_existing_account: OnClick,
 }
 
 impl GetStarted {
     const MARKDOWN: &'static str = "## Get started\n\nYou'll need some credits to process queries.\n\nManaging your balance \
-         is the only time we see your identity, and cryptography [prevents us from associating your queries with your account](https://github.com/zed-industries/zed/blob/e7311d52ba1b7ec8f2c1651e32bd78e0da4cbca9/crates/gpui/src/window.rs#L3446-L3462).";
+         is the only time we see your identity, and [we are structurally unable to associate your queries with your account](https://github.com/eidola-ai/eidola/blob/main/docs/privacy-guarantees.md#1-identity-and-authorization).";
 }
 
 impl RenderOnce for GetStarted {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         slide_frame(
-            self.prose,
+            "get-started",
+            Self::MARKDOWN,
             None,
             v_flex()
                 .items_center()
@@ -236,7 +217,6 @@ impl RenderOnce for GetStarted {
 /// explicit, required consent step separate from the action.
 #[derive(IntoElement)]
 pub(super) struct CreateAccount {
-    pub prose: Option<Entity<MarkdownEditorState>>,
     /// Whether the terms/privacy agreement checkbox is checked.
     pub agreed: bool,
     /// Whether an account-create request is in flight.
@@ -296,7 +276,8 @@ impl RenderOnce for CreateAccount {
             );
 
         slide_frame(
-            self.prose,
+            "create-account",
+            Self::MARKDOWN,
             Some(extras.into_any_element()),
             cta.into_any_element(),
             window,
@@ -310,7 +291,6 @@ impl RenderOnce for CreateAccount {
 /// New-account branch: the freshly-minted id + secret to save.
 #[derive(IntoElement)]
 pub(super) struct NewAccount {
-    pub prose: Option<Entity<MarkdownEditorState>>,
     pub id: SharedString,
     pub secret: SharedString,
     pub on_saved: OnClick,
@@ -338,7 +318,8 @@ impl RenderOnce for NewAccount {
             );
 
         slide_frame(
-            self.prose,
+            "new-account",
+            Self::MARKDOWN,
             Some(extras.into_any_element()),
             cta_button("saved", "I've saved this somewhere.", self.on_saved).into_any_element(),
             window,
@@ -353,7 +334,6 @@ impl RenderOnce for NewAccount {
 /// account verifies, the verify CTA is replaced by purchase/done choices.
 #[derive(IntoElement)]
 pub(super) struct ExistingAccount {
-    pub prose: Option<Entity<MarkdownEditorState>>,
     pub id_input: Entity<InputState>,
     pub secret_input: Entity<InputState>,
     /// Whether a verification request is in flight.
@@ -424,7 +404,8 @@ impl RenderOnce for ExistingAccount {
         };
 
         slide_frame(
-            self.prose,
+            "existing-account",
+            Self::MARKDOWN,
             Some(extras.into_any_element()),
             ctas,
             window,
@@ -438,7 +419,6 @@ impl RenderOnce for ExistingAccount {
 /// Either branch: choose a plan / add credit via Stripe checkout.
 #[derive(IntoElement)]
 pub(super) struct Purchase {
-    pub prose: Option<Entity<MarkdownEditorState>>,
     pub prices: Vec<PriceInfo>,
     /// Whether the price list is still loading (empty-state copy).
     pub loading: bool,
@@ -487,7 +467,8 @@ impl RenderOnce for Purchase {
         };
 
         slide_frame(
-            self.prose,
+            "purchase",
+            Self::MARKDOWN,
             Some(extras),
             cta_button(
                 "purchase-later",
@@ -507,20 +488,34 @@ impl RenderOnce for Purchase {
 /// below it) vertically centered in a left-aligned reading column, and the
 /// CTA group centered on the window at the bottom.
 fn slide_frame(
-    prose: Option<Entity<MarkdownEditorState>>,
+    key: &'static str,
+    markdown: &'static str,
     extras: Option<AnyElement>,
     ctas: AnyElement,
-    window: &Window,
-    cx: &App,
+    window: &mut Window,
+    cx: &mut App,
 ) -> AnyElement {
-    let prose = prose
-        .map(|editor| {
-            MarkdownEditor::new(&editor)
-                .style(prose_style(cx))
-                .disabled(true)
-                .into_any_element()
-        })
-        .unwrap_or_else(|| div().into_any_element());
+    // The prose editor is element-owned state (the `useState` analogue):
+    // keyed per slide, initialized once, and evicted by the framework the
+    // frame after the slide stops rendering (a branch truncation) — the
+    // lifecycle the view's `bodies` map used to hand-roll. This is safe
+    // *only because* every revealed slide paints every frame (a plain
+    // v_flex stack, no virtualization); if the slides ever render
+    // conditionally or through `list()`, lift this state back onto the view
+    // (see `ChatView::text_states` for the failure mode and the pattern).
+    let prose_state = window.use_keyed_state(
+        SharedString::from(format!("onboarding-prose-{key}")),
+        cx,
+        |window, cx| {
+            let mut s = MarkdownEditorState::new(window, cx);
+            s.set_value(markdown.to_string(), cx);
+            s
+        },
+    );
+    let prose = MarkdownEditor::new(&prose_state)
+        .style(prose_style(cx))
+        .disabled(true)
+        .into_any_element();
     let column = v_flex()
         .w(COLUMN_WIDTH)
         .max_w_full()

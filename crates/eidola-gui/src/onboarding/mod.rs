@@ -49,7 +49,6 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
     v_flex,
 };
-use gpui_markdown_editor::MarkdownEditorState;
 
 use crate::actions::CloseWindow;
 use crate::plans;
@@ -63,7 +62,7 @@ mod slides;
 /// One page of the onboarding flow. The set that is *visible* is
 /// [`OnboardingView::revealed`]; conditional slides only appear once the
 /// upstream choice that leads to them is made.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Slide {
     /// "Pause here" — Eidola is not the same as the hosted assistants.
     Pause,
@@ -99,11 +98,11 @@ pub struct OnboardingView {
     focus_handle: FocusHandle,
     _subs: Vec<Subscription>,
 
-    /// Revealed slides, in order. Always starts as `[Slide::Pause]`.
+    /// Revealed slides, in order. Always starts as `[Slide::Pause]`. (Each
+    /// slide's prose editor is element-owned state inside its component —
+    /// see [`slides`] — so revealing/truncating slides needs no bookkeeping
+    /// here beyond this list.)
     revealed: Vec<Slide>,
-    /// One disabled prose editor per revealed slide (its heading + intro),
-    /// created lazily in render and pruned when a slide is truncated away.
-    bodies: std::collections::HashMap<Slide, Entity<MarkdownEditorState>>,
 
     // -- Account creation (new-account branch) ----------------------------
     /// Whether the terms/privacy agreement checkbox is checked (gates the
@@ -174,7 +173,6 @@ impl OnboardingView {
             focus_handle,
             _subs,
             revealed: vec![Slide::Pause],
-            bodies: std::collections::HashMap::new(),
             agreed: false,
             creating: false,
             created: None,
@@ -443,22 +441,6 @@ impl OnboardingView {
             });
         }));
     }
-
-    /// Ensure a prose editor exists for every revealed slide, and prune editors
-    /// for slides that have been truncated away.
-    fn sync_bodies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for &slide in &self.revealed.clone() {
-            self.bodies.entry(slide).or_insert_with(|| {
-                cx.new(|cx| {
-                    let mut s = MarkdownEditorState::new(window, cx);
-                    s.set_value(slides::markdown(slide).to_string(), cx);
-                    s
-                })
-            });
-        }
-        let live: std::collections::HashSet<Slide> = self.revealed.iter().copied().collect();
-        self.bodies.retain(|slide, _| live.contains(slide));
-    }
 }
 
 impl Focusable for OnboardingView {
@@ -473,8 +455,6 @@ impl Render for OnboardingView {
         let bg = theme.background;
         let fg = theme.foreground;
         let font_family = theme.font_family.clone();
-
-        self.sync_bodies(window, cx);
 
         // Kick off the animate-scroll to a freshly-revealed slide now that we
         // have `window` (the reveal itself just recorded the target index).
@@ -588,38 +568,32 @@ impl OnboardingView {
     /// structure is visible in one place; everything a slide *shows* lives on
     /// its component.
     fn render_slide(&self, slide: Slide, cx: &Context<Self>) -> AnyElement {
-        let prose = self.bodies.get(&slide).cloned();
         match slide {
             Slide::Pause => slides::Pause {
-                prose,
                 on_advance: Box::new(
                     cx.listener(|this, _, _, cx| this.reveal(Slide::Pause, Slide::Tool, cx)),
                 ),
             }
             .into_any_element(),
             Slide::Tool => slides::Tool {
-                prose,
                 on_advance: Box::new(
                     cx.listener(|this, _, _, cx| this.reveal(Slide::Tool, Slide::Control, cx)),
                 ),
             }
             .into_any_element(),
             Slide::Control => slides::Control {
-                prose,
                 on_advance: Box::new(cx.listener(|this, _, _, cx| {
                     this.reveal(Slide::Control, Slide::Responsibility, cx)
                 })),
             }
             .into_any_element(),
             Slide::Responsibility => slides::Responsibility {
-                prose,
                 on_advance: Box::new(cx.listener(|this, _, _, cx| {
                     this.reveal(Slide::Responsibility, Slide::GetStarted, cx)
                 })),
             }
             .into_any_element(),
             Slide::GetStarted => slides::GetStarted {
-                prose,
                 on_new_account: Box::new(cx.listener(|this, _, _, cx| {
                     this.reveal(Slide::GetStarted, Slide::CreateAccount, cx)
                 })),
@@ -629,7 +603,6 @@ impl OnboardingView {
             }
             .into_any_element(),
             Slide::CreateAccount => slides::CreateAccount {
-                prose,
                 agreed: self.agreed,
                 creating: self.creating,
                 error: self.create_error.clone(),
@@ -643,7 +616,6 @@ impl OnboardingView {
             Slide::NewAccount => {
                 let (id, secret) = self.created.clone().unwrap_or_default();
                 slides::NewAccount {
-                    prose,
                     id,
                     secret,
                     on_saved: Box::new(cx.listener(|this, _, _, cx| {
@@ -653,7 +625,6 @@ impl OnboardingView {
                 .into_any_element()
             }
             Slide::ExistingAccount => slides::ExistingAccount {
-                prose,
                 id_input: self.id_input.clone(),
                 secret_input: self.secret_input.clone(),
                 verifying: self.verifying,
@@ -672,7 +643,6 @@ impl OnboardingView {
                     let _ = weak.update(app, |this, cx| this.begin_checkout(price_id, cx));
                 });
                 slides::Purchase {
-                    prose,
                     prices: account.prices().value().cloned().unwrap_or_default(),
                     loading: account.is_loading(),
                     checkout_pending: self.checkout_pending.clone(),
