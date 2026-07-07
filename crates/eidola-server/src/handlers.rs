@@ -67,11 +67,41 @@ pub async fn list_models(
 // Billing helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the worst-case cost in credits for a request.
+/// Extract the shared pricing contract's inputs from a request and compute
+/// its chargeable prompt tokens.
 ///
-/// For per-request models (e.g., Whisper, TTS), returns the flat per-request price.
-/// For token-based models, uses 1-byte-per-token estimate for prompt size plus
-/// `max_completion_tokens` (or context_length) for completion.
+/// The inputs are the total UTF-8 content bytes across the `messages` array
+/// plus the entry count — exactly what the client computes for its hold, so
+/// [`eidola_common::chargeable_prompt_tokens`] yields the same value on both
+/// sides for the same request.
+fn chargeable_prompt_tokens_for(request: &ChatCompletionRequest) -> u64 {
+    let total_content_bytes: u64 = request
+        .messages
+        .iter()
+        .map(|m| m.content.byte_len() as u64)
+        .sum();
+    eidola_common::chargeable_prompt_tokens(total_content_bytes, request.messages.len() as u64)
+}
+
+/// The effective completion-token ceiling for a request: its
+/// `max_completion_tokens`, falling back to the model's context length.
+fn effective_max_completion(request: &ChatCompletionRequest, model: &Model) -> u64 {
+    request
+        .max_completion_tokens
+        .map(|t| t as u64)
+        .unwrap_or(model.context_length)
+}
+
+/// Compute the worst-case cost in credits for a request — the pre-flight
+/// minimum hold.
+///
+/// For per-request models (e.g., Whisper, TTS), returns the flat per-request
+/// price. For token-based models, the prompt side is the shared client/server
+/// pricing contract (`eidola_common::chargeable_prompt_tokens`: a content-byte
+/// term at the safe cost factor plus per-message and per-request constants),
+/// and the completion side uses `max_completion_tokens` (or context_length).
+/// The client sizes its hold with the identical function of the identical
+/// request, so the client and server go/no-go decisions agree bit-for-bit.
 fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> u128 {
     // Per-request pricing: flat cost regardless of token count.
     if let Some(ref per_req) = model.pricing.per_request {
@@ -80,33 +110,44 @@ fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> u128 {
 
     let sf = PRICING_SCALE_FACTOR as u128;
 
-    // Prompt: estimate 1 token per byte of message content.
-    let prompt_bytes: usize = request.messages.iter().map(|m| m.content.byte_len()).sum();
+    // Prompt: the shared contract formula.
     let prompt_rate = model.pricing.per_prompt_token.value as u128;
-    let prompt_credits = (prompt_bytes as u128 * prompt_rate).div_ceil(sf);
+    let prompt_credits = (chargeable_prompt_tokens_for(request) as u128 * prompt_rate).div_ceil(sf);
 
     // Completion: use max_completion_tokens or fall back to context_length.
-    let max_completion = request
-        .max_completion_tokens
-        .map(|t| t as u64)
-        .unwrap_or(model.context_length);
     let completion_rate = model.pricing.per_completion_token.value as u128;
-    let completion_credits = (max_completion as u128 * completion_rate).div_ceil(sf);
+    let completion_credits =
+        (effective_max_completion(request, model) as u128 * completion_rate).div_ceil(sf);
 
     prompt_credits + completion_credits
 }
 
-/// Compute the actual cost in credits from usage data.
-fn actual_cost(usage: &Usage, model: &Model) -> u128 {
+/// Compute the actual cost in credits from usage data, clamped to the
+/// pricing contract.
+///
+/// The prompt component charges `min(actual_prompt_tokens,
+/// chargeable_prompt_tokens(...))` — the contract's cap, which guarantees
+/// the charge never exceeds the hold both sides computed pre-flight. The
+/// completion component is bounded by the request's effective
+/// max-completion ceiling anyway (the model stops there), but is clamped
+/// defensively against a misbehaving upstream usage report.
+fn actual_cost(
+    usage: &Usage,
+    model: &Model,
+    chargeable_prompt_tokens: u64,
+    max_completion_tokens: u64,
+) -> u128 {
     // Per-request pricing: flat cost regardless of actual token usage.
     if let Some(ref per_req) = model.pricing.per_request {
         return (per_req.value as u128).div_ceil(per_req.scale_factor as u128);
     }
 
     let sf = PRICING_SCALE_FACTOR as u128;
-    let prompt_cost = usage.prompt_tokens as u128 * model.pricing.per_prompt_token.value as u128;
+    let charged_prompt = (usage.prompt_tokens as u64).min(chargeable_prompt_tokens);
+    let charged_completion = (usage.completion_tokens as u64).min(max_completion_tokens);
+    let prompt_cost = charged_prompt as u128 * model.pricing.per_prompt_token.value as u128;
     let completion_cost =
-        usage.completion_tokens as u128 * model.pricing.per_completion_token.value as u128;
+        charged_completion as u128 * model.pricing.per_completion_token.value as u128;
     // Ceiling division for each component, then sum
     let prompt_credits = prompt_cost.div_ceil(sf);
     let completion_credits = completion_cost.div_ceil(sf);
@@ -245,8 +286,22 @@ fn validate_request(
                 message: format!("unknown model: {}", request.model),
             })?;
 
-    // Check that the charge covers the worst-case cost.
-    let wc = worst_case_cost(request, &model);
+    // Pre-flight go/no-go: the presented charge must cover the worst-case
+    // cost (the shared contract's minimum hold).
+    check_sufficient_charge(charge_credits, request, &model)?;
+
+    Ok((model, charge_credits))
+}
+
+/// Pre-flight go/no-go: reject a spend that presents less than the
+/// worst-case cost — the same formula the client used to size its hold —
+/// before anything is sent upstream. Pure so it is directly unit-testable.
+fn check_sufficient_charge(
+    charge_credits: u128,
+    request: &ChatCompletionRequest,
+    model: &Model,
+) -> Result<(), ServerError> {
+    let wc = worst_case_cost(request, model);
     if charge_credits < wc {
         return Err(ServerError::PaymentRequired {
             message: format!(
@@ -256,8 +311,7 @@ fn validate_request(
             available: charge_credits as i64,
         });
     }
-
-    Ok((model, charge_credits))
+    Ok(())
 }
 
 /// Create a chat completion.
@@ -385,12 +439,14 @@ async fn handle_non_streaming_request(
         );
     }
 
-    // Compute actual cost and refund.
+    // Compute actual cost (clamped to the pricing contract) and refund.
+    let chargeable_prompt = chargeable_prompt_tokens_for(request);
+    let max_completion = effective_max_completion(request, model);
     let cost = backend_response
         .meta
         .usage
         .as_ref()
-        .map(|u| actual_cost(u, model))
+        .map(|u| actual_cost(u, model, chargeable_prompt, max_completion))
         .unwrap_or(charge_credits); // No usage → charge worst case
 
     let refund_credits = charge_credits.saturating_sub(cost);
@@ -482,7 +538,11 @@ async fn handle_streaming_request(
         }
     };
     let model_id = model.id.clone();
-    let model_pricing = model.pricing.clone();
+    let task_model = model.clone();
+    // Contract clamp inputs, computed from the request before the task takes
+    // over (the spawned task never sees the request itself).
+    let chargeable_prompt = chargeable_prompt_tokens_for(request);
+    let max_completion = effective_max_completion(request, model);
 
     tokio::spawn(async move {
         /// Re-parse the spend proof and issue a refund with the given amount.
@@ -582,17 +642,11 @@ async fn handle_streaming_request(
                     let privacy = build_privacy_metadata(&auth_context, is_tee, &meta.provider);
                     let verification = build_verification_metadata(None);
 
-                    // Compute refund based on usage.
+                    // Compute the refund from usage, with the charge clamped
+                    // to the pricing contract (same as the blocking path).
                     let cost = final_usage
                         .as_ref()
-                        .map(|u| {
-                            let sf = PRICING_SCALE_FACTOR as u128;
-                            let pc = u.prompt_tokens as u128
-                                * model_pricing.per_prompt_token.value as u128;
-                            let cc = u.completion_tokens as u128
-                                * model_pricing.per_completion_token.value as u128;
-                            pc.div_ceil(sf) + cc.div_ceil(sf)
-                        })
+                        .map(|u| actual_cost(u, &task_model, chargeable_prompt, max_completion))
                         .unwrap_or(charge_credits);
 
                     let refund_credits = charge_credits.saturating_sub(cost);
@@ -682,5 +736,175 @@ where
                 Err(rejection)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ModelPricing, ScaledPrice};
+
+    /// A token-priced model with easy integer math at `PRICING_SCALE_FACTOR`:
+    /// 1 credit per prompt token, 2 credits per completion token.
+    fn test_model() -> Model {
+        Model {
+            id: "test-model".to_string(),
+            name: "Test Model".to_string(),
+            description: String::new(),
+            context_length: 8192,
+            pricing: ModelPricing {
+                per_prompt_token: ScaledPrice {
+                    value: PRICING_SCALE_FACTOR,
+                    scale_factor: PRICING_SCALE_FACTOR,
+                },
+                per_completion_token: ScaledPrice {
+                    value: 2 * PRICING_SCALE_FACTOR,
+                    scale_factor: PRICING_SCALE_FACTOR,
+                },
+                per_request: None,
+            },
+        }
+    }
+
+    /// Parse a request from the exact JSON shape a client sends, so byte
+    /// counting exercises the real deserialization path.
+    fn request(contents: &[&str], max_completion_tokens: u32) -> ChatCompletionRequest {
+        let messages: Vec<serde_json::Value> = contents
+            .iter()
+            .map(|c| serde_json::json!({"role": "user", "content": c}))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": messages,
+            "max_completion_tokens": max_completion_tokens,
+        }))
+        .expect("valid request")
+    }
+
+    #[test]
+    fn worst_case_cost_uses_the_shared_contract() {
+        // One 12-byte message, max 100 completion tokens.
+        // chargeable prompt = ceil(12*2/3) + 8*1 + 32 = 8 + 8 + 32 = 48.
+        // wc = 48 * 1 credit + 100 * 2 credits = 248.
+        let req = request(&["hello world!"], 100);
+        assert_eq!(chargeable_prompt_tokens_for(&req), 48);
+        assert_eq!(worst_case_cost(&req, &test_model()), 248);
+    }
+
+    #[test]
+    fn preflight_rejects_hold_below_minimum() {
+        let req = request(&["hello world!"], 100);
+        let model = test_model();
+        let wc = worst_case_cost(&req, &model);
+
+        // One credit short → 402 PaymentRequired, before anything upstream.
+        let err = check_sufficient_charge(wc - 1, &req, &model)
+            .expect_err("hold below the minimum must be rejected");
+        assert!(
+            matches!(err, ServerError::PaymentRequired { .. }),
+            "got {err:?}"
+        );
+
+        // Exactly the minimum → accepted.
+        check_sufficient_charge(wc, &req, &model).expect("exact minimum hold is sufficient");
+    }
+
+    #[test]
+    fn preflight_rejects_old_bytes_as_tokens_hold_for_tiny_messages() {
+        // The defect the contract fixes: 40 one-byte messages have 40
+        // content bytes, but the chat template adds per-message tokens the
+        // old bytes-as-tokens hold never covered. The old-style hold
+        // (bytes × prompt_rate + max_completion × completion_rate = 240)
+        // must now fail pre-flight instead of under-funding the charge.
+        let contents: Vec<&str> = vec!["x"; 40];
+        let req = request(&contents, 100);
+        let model = test_model();
+        let old_style_hold = 40 + 100 * 2;
+        assert!(
+            check_sufficient_charge(old_style_hold, &req, &model).is_err(),
+            "bytes-as-tokens hold must be below the contract minimum"
+        );
+    }
+
+    #[test]
+    fn token_dense_usage_is_clamped_to_the_contract() {
+        // Same request as above: chargeable prompt = 48, max completion 100.
+        let req = request(&["hello world!"], 100);
+        let model = test_model();
+        let chargeable = chargeable_prompt_tokens_for(&req);
+        let max_completion = effective_max_completion(&req, &model);
+
+        // Upstream reports 1000 actual prompt tokens (> chargeable): the
+        // prompt component is charged at the clamp, not the actual count.
+        let usage = Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 50,
+            total_tokens: 1050,
+        };
+        let cost = actual_cost(&usage, &model, chargeable, max_completion);
+        assert_eq!(cost, 48 + 50 * 2, "prompt clamped to 48, completion real");
+
+        // And the refund reflects the clamped charge.
+        let wc = worst_case_cost(&req, &model);
+        assert_eq!(wc.saturating_sub(cost), 248 - 148);
+    }
+
+    #[test]
+    fn completion_usage_is_clamped_defensively() {
+        // The model already stops at max_completion_tokens; a usage report
+        // claiming more is clamped anyway.
+        let req = request(&["hello world!"], 100);
+        let model = test_model();
+        let usage = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 500,
+            total_tokens: 510,
+        };
+        let cost = actual_cost(
+            &usage,
+            &model,
+            chargeable_prompt_tokens_for(&req),
+            effective_max_completion(&req, &model),
+        );
+        assert_eq!(cost, 10 + 100 * 2);
+    }
+
+    #[test]
+    fn per_request_pricing_ignores_token_clamps() {
+        let mut model = test_model();
+        model.pricing.per_request = Some(ScaledPrice {
+            value: 5 * PRICING_SCALE_FACTOR,
+            scale_factor: PRICING_SCALE_FACTOR,
+        });
+        let req = request(&["hi"], 100);
+        assert_eq!(worst_case_cost(&req, &model), 5);
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 1_000_000,
+            total_tokens: 2_000_000,
+        };
+        assert_eq!(actual_cost(&usage, &model, 1, 1), 5);
+    }
+
+    /// Tripwire against client/server drift: the client sizes its hold from
+    /// the (role, content) string pairs it sends (summing `content.len()`
+    /// and counting messages — see `prepare_turn` in eidola-app-core); the
+    /// server recomputes from the parsed `ChatCompletionRequest`. Both must
+    /// feed identical inputs into the one shared formula.
+    #[test]
+    fn client_and_server_prompt_terms_agree() {
+        // Multi-byte UTF-8 included: byte length, not char count, is the input.
+        let contents = ["hello", "héllo wörld", "日本語のテキスト", ""];
+
+        // Client side: raw content strings, exactly as app-core computes.
+        let client_bytes: u64 = contents.iter().map(|c| c.len() as u64).sum();
+        let client_term =
+            eidola_common::chargeable_prompt_tokens(client_bytes, contents.len() as u64);
+
+        // Server side: the parsed request.
+        let req = request(&contents, 100);
+        let server_term = chargeable_prompt_tokens_for(&req);
+
+        assert_eq!(client_term, server_term);
     }
 }

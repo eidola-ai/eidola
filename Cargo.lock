@@ -2602,6 +2602,7 @@ dependencies = [
  "ecdsa",
  "ed25519-dalek",
  "eidola-attestation",
+ "eidola-common",
  "futures-util",
  "hex",
  "p256",
@@ -2650,6 +2651,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidola-common"
+version = "0.1.0"
+
+[[package]]
 name = "eidola-devtools"
 version = "0.1.0"
 dependencies = [
@@ -2687,6 +2692,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "deadpool-postgres",
+ "eidola-common",
  "futures-util",
  "hex",
  "hkdf 0.13.0",

@@ -402,7 +402,8 @@ pub struct SpendTrailEntry {
 /// `PRICING_SCALE_FACTOR` is 1e6 — `usd_per_M_tokens × markup` becomes
 /// credits-per-token directly, e.g. gemma4-31b output $1.00/M × 1.5 markup
 /// = 1.5 credits/token). A single chat turn's worst-case hold is
-/// `prompt_bytes × prompt_rate + 4096 × completion_rate`: ≈6,200 credits
+/// `chargeable_prompt_tokens(bytes, msgs) × prompt_rate + 4096 ×
+/// completion_rate` (the shared `eidola-common` contract): ≈6,200 credits
 /// for the default gemma4-31b, ≈32,000 for the most expensive catalog
 /// models (output 7.875 credits/token) — mostly refunded after the actual
 /// usage settles. 1,000,000 credits ($1.00 of balance) therefore covers
@@ -1684,12 +1685,23 @@ impl Inner {
         };
         let prior_messages = actions_to_messages(&context_rows);
 
-        // Estimate the charge from the assembled context.
-        let total_prompt_bytes: u128 = prior_messages.iter().map(|m| m.content.len() as u128).sum();
+        // Estimate the charge from the assembled context. The prompt side is
+        // the shared client/server pricing contract
+        // (`eidola_common::chargeable_prompt_tokens`): a content-byte term at
+        // the safe cost factor plus per-message and per-request constants.
+        // The server computes the identical function of the identical
+        // `messages` array as its pre-flight minimum and clamps its charged
+        // prompt tokens to it, so this hold covers the server's charge by
+        // construction.
+        let total_content_bytes: u64 = prior_messages.iter().map(|m| m.content.len() as u64).sum();
+        let chargeable_prompt = eidola_common::chargeable_prompt_tokens(
+            total_content_bytes,
+            prior_messages.len() as u64,
+        );
 
         let sf = model_entry.pricing.per_prompt_token.scale_factor as u128;
         let prompt_rate = model_entry.pricing.per_prompt_token.value as u128;
-        let prompt_credits = (total_prompt_bytes * prompt_rate).div_ceil(sf);
+        let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
         let completion_rate = model_entry.pricing.per_completion_token.value as u128;
         let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
         let charge_credits = prompt_credits + completion_credits;

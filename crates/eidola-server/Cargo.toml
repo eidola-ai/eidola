@@ -76,6 +76,9 @@ hmac = "0.13"
 sha2 = "0.11"
 subtle = "2"
 
+# Shared client/server contract logic (pricing formula)
+eidola-common = { path = "../eidola-common" }
+
 # Tinfoil attestation verification
 tinfoil-verifier = { path = "../tinfoil-verifier" }
 

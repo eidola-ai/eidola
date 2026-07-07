@@ -103,6 +103,37 @@ pub trait ChatBackend: Send + Sync {
 /// Default pricing markup factor.
 pub const DEFAULT_PRICING_MARKUP: f64 = 1.5;
 
+/// Validate that the pricing markup covers the contract's safe cost factor.
+///
+/// The shared client/server pricing contract (`eidola-common`) charges the
+/// prompt-side byte term at no less than `bytes / N`, where `N =
+/// SAFE_COST_FACTOR_NUM / SAFE_COST_FACTOR_DEN` — and since BPE tokenizers
+/// never produce more tokens than content bytes, the worst-case
+/// actual/charged token ratio on that term is exactly `N`. Break-even on
+/// dynamic costs therefore requires `PRICING_MARKUP >= N`; a markup below
+/// the factor silently opens a loss window, so startup refuses it outright.
+///
+/// Future refinement (out of scope for now): when the configured markup
+/// exceeds the factor, the server could publish a larger dynamic factor to
+/// clients via the `/models` payload instead of both sides relying on the
+/// compiled-in constants.
+pub fn validate_pricing_markup(markup: f64) -> Result<(), String> {
+    let floor =
+        eidola_common::SAFE_COST_FACTOR_NUM as f64 / eidola_common::SAFE_COST_FACTOR_DEN as f64;
+    // `is_nan` check: a NaN markup must fail too, and `<` alone lets it pass.
+    if markup.is_nan() || markup < floor {
+        return Err(format!(
+            "PRICING_MARKUP ({markup}) must be >= the safe cost factor \
+             {}/{} = {floor}: the pricing contract charges prompt bytes at \
+             1/{floor} of their worst-case token count, so a lower markup \
+             would sell tokens below cost",
+            eidola_common::SAFE_COST_FACTOR_NUM,
+            eidola_common::SAFE_COST_FACTOR_DEN,
+        ));
+    }
+    Ok(())
+}
+
 /// Fixed scale factor for pricing: credits per token = value / PRICING_SCALE_FACTOR.
 pub const PRICING_SCALE_FACTOR: u64 = 1_000_000;
 
@@ -551,6 +582,18 @@ fn extract_sse_data(buffer: &mut String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markup_below_safe_cost_factor_is_rejected() {
+        // The startup gate: a markup under the contract's safe cost factor
+        // (3/2 = 1.5) would sell prompt tokens below cost.
+        assert!(validate_pricing_markup(1.2).is_err());
+        assert!(validate_pricing_markup(0.0).is_err());
+        assert!(validate_pricing_markup(f64::NAN).is_err());
+        assert!(validate_pricing_markup(1.5).is_ok());
+        assert!(validate_pricing_markup(DEFAULT_PRICING_MARKUP).is_ok());
+        assert!(validate_pricing_markup(2.0).is_ok());
+    }
 
     #[test]
     fn test_usd_per_m_to_scaled_credits() {
