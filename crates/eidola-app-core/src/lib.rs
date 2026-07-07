@@ -1576,21 +1576,22 @@ impl Inner {
     /// inference + request rows, and reconciles the refund.
     ///
     /// `target_action_id` + `mode` decide how the response attaches:
-    /// `Reply` → a new child item replying to the target; `Revise` → a new
-    /// generation of the target's item (regenerate / agent edit). `budget`, if
-    /// set, caps the estimated charge for this turn — the spend ceiling a future
-    /// multi-inference agent loop will check per iteration.
-    ///
-    /// v1 drives a single inference, shaped as one turn so the tool loop slots
-    /// in later as additional actions in the same chain.
-    async fn run_turn(
+    /// The shared preparation of a turn — everything before the HTTP request
+    /// fires, identical for the blocking and streaming transports: attested
+    /// client + model catalog, space/participant validation, the thread
+    /// attach plan (`Reply` → a new child item replying to the target;
+    /// `Revise` → a new generation of the target's item), upstream-context
+    /// assembly, charge estimate + `budget` gate, credential provisioning +
+    /// spend proof (the `Wallet` "spending" emission happens here), and the
+    /// ACT auth header.
+    async fn prepare_turn(
         &self,
         space_id: &str,
         model: &str,
         target_action_id: &str,
         mode: ResponseMode,
         budget: Option<i64>,
-    ) -> Result<ChatResult, AppError> {
+    ) -> Result<TurnPrep, AppError> {
         let cfg = self.load_config();
         let base_url = cfg.base_url();
         let now = now_ms();
@@ -1610,7 +1611,7 @@ impl Inner {
         let client = self.build_client(&cfg, observer).await?;
 
         let models = fetch_models(&client, base_url).await?;
-        let mut connection_id =
+        let connection_id =
             flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?;
 
         let model_entry =
@@ -1770,24 +1771,71 @@ impl Inner {
 
         // Build the messages array from the assembled context. The posted user
         // turn is already part of it (post persisted it); the agent's response
-        // is appended below as a new action.
+        // is appended as a new action at persist time.
         let messages: Vec<serde_json::Value> = prior_messages
             .iter()
             .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
             .collect();
 
-        let request_body_json = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "max_completion_tokens": max_completion_tokens,
-        });
+        Ok(TurnPrep {
+            db_conn,
+            provider_id,
+            attestation_log,
+            client,
+            connection_id,
+            base_url: base_url.to_string(),
+            now,
+            space_id,
+            model: model.to_string(),
+            model_participant_id,
+            max_completion_tokens,
+            inf_item_id,
+            inf_supersedes,
+            inf_reply_to,
+            context_rows,
+            messages,
+            charge_credits,
+            cred,
+            public_key,
+            params,
+            spend_proof,
+            pre_refund,
+            pre_cred_id,
+            auth_value,
+        })
+    }
+
+    /// `Reply` → a new child item replying to the target; `Revise` → a new
+    /// generation of the target's item (regenerate / agent edit). `budget`, if
+    /// set, caps the estimated charge for this turn — the spend ceiling a future
+    /// multi-inference agent loop will check per iteration.
+    ///
+    /// v1 drives a single inference, shaped as one turn so the tool loop slots
+    /// in later as additional actions in the same chain. Preparation and
+    /// persistence are shared with the streaming twin (`prepare_turn` /
+    /// [`TurnPrep::persist_turn`]); this transport reads one JSON body and
+    /// takes the inline-refund fast path.
+    async fn run_turn(
+        &self,
+        space_id: &str,
+        model: &str,
+        target_action_id: &str,
+        mode: ResponseMode,
+        budget: Option<i64>,
+    ) -> Result<ChatResult, AppError> {
+        let mut prep = self
+            .prepare_turn(space_id, model, target_action_id, mode, budget)
+            .await?;
+
+        let request_body_json = prep.request_body(false);
         let request_at = now_ms();
 
         // Send the chat request. On failure, attempt refund recovery before
         // propagating the error so the credential isn't abandoned.
-        let chat_result = client
-            .post(format!("{base_url}/v1/chat/completions"))
-            .header("Authorization", &auth_value)
+        let chat_result = prep
+            .client
+            .post(format!("{}/v1/chat/completions", prep.base_url))
+            .header("Authorization", &prep.auth_value)
             .json(&request_body_json)
             .send()
             .await;
@@ -1799,20 +1847,17 @@ impl Inner {
         // re-emitted here — the listing changes (new space / auto-title) were
         // post's, and a failed request doesn't add an item. Call before any
         // error exit between here and the request-row insert.
+        let space_for_emit = prep.space_id.clone();
         let emit_user_turn = || {
-            self.bus.emit(Change::Space(space_id.clone()));
+            self.bus.emit(Change::Space(space_for_emit.clone()));
         };
 
         let (status, response_text, body) = match chat_result {
             Ok(resp) => {
-                if let Some(new_cid) =
-                    flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now)
-                        .await
-                        .inspect_err(|_| emit_user_turn())
-                        .map_err(wrap)?
-                {
-                    connection_id = Some(new_cid);
-                }
+                prep.flush_new_attestations()
+                    .await
+                    .inspect_err(|_| emit_user_turn())
+                    .map_err(|e| prep.wrap(e))?;
 
                 let status = resp.status();
                 let text = resp
@@ -1822,81 +1867,43 @@ impl Inner {
                         message: format!("failed to read response: {e}"),
                     })
                     .inspect_err(|_| emit_user_turn())
-                    .map_err(wrap)?;
+                    .map_err(|e| prep.wrap(e))?;
                 let parsed: serde_json::Value = serde_json::from_str(&text)
                     .map_err(|e| AppError::Network {
                         message: format!("failed to parse response JSON: {e}"),
                     })
                     .inspect_err(|_| emit_user_turn())
-                    .map_err(wrap)?;
+                    .map_err(|e| prep.wrap(e))?;
                 (status, text, parsed)
             }
             Err(e) => {
                 // Network error — the server may or may not have received the
-                // request. Try to recover the refund token.
+                // request. Try to recover the refund token; a written successor
+                // credential is a wallet change.
                 let original_err = AppError::from_request(e);
-                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
-                    && process_refund(
-                        &refund_obj,
-                        &params,
-                        &spend_proof,
-                        &pre_refund,
-                        &public_key,
-                        &db_conn,
-                        &pre_cred_id,
-                        cred.generation + 1,
-                        now,
-                    )
-                    .await
-                    .is_ok()
-                {
-                    // Successor credential written — wallet state updated.
+                if prep.try_refund_recovery().await {
                     self.bus.emit(Change::Wallet);
                 }
                 // The user turn (space row + user-message, auto-title) is
                 // already committed — emit it so other windows see the persisted
                 // turn, then wrap with the space id for blank-space adoption.
                 emit_user_turn();
-                return Err(wrap(original_err));
+                return Err(prep.wrap(original_err));
             }
         };
 
         // Process the refund token from the response. If none is present,
-        // attempt recovery from the server.
-        let mut refund_stored = false;
-        if let Some(refund_obj) = body.get("refund") {
-            process_refund(
-                refund_obj,
-                &params,
-                &spend_proof,
-                &pre_refund,
-                &public_key,
-                &db_conn,
-                &pre_cred_id,
-                cred.generation + 1,
-                now,
-            )
-            .await
-            .inspect_err(|_| emit_user_turn())
-            .map_err(wrap)?;
-            refund_stored = true;
-        }
-
-        if !refund_stored {
-            // No refund in the response — try the recovery endpoint.
-            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
-                let _ = process_refund(
-                    &refund_obj,
-                    &params,
-                    &spend_proof,
-                    &pre_refund,
-                    &public_key,
-                    &db_conn,
-                    &pre_cred_id,
-                    cred.generation + 1,
-                    now,
-                )
-                .await;
+        // attempt recovery from the server (best-effort — the final Wallet
+        // emission below covers a written successor).
+        match body.get("refund") {
+            Some(refund_obj) => {
+                prep.process_refund_obj(refund_obj)
+                    .await
+                    .inspect_err(|_| emit_user_turn())
+                    .map_err(|e| prep.wrap(e))?;
+            }
+            None => {
+                let _ = prep.try_refund_recovery().await;
             }
         }
 
@@ -1908,62 +1915,6 @@ impl Inner {
             .and_then(|u| u.get("completion_tokens"))
             .and_then(|v| v.as_i64());
 
-        // Attach per mode: Reply → a fresh item; Revise → a new generation of
-        // the target's item (supersedes it, replicates its reply edge).
-        let inference_action_id = Uuid::now_v7().to_string();
-        db::insert_action(
-            &db_conn,
-            &db::ActionEntry {
-                id: inference_action_id.clone(),
-                space_id: space_id.clone(),
-                participant_id: model_participant_id,
-                item_id: inf_item_id.clone(),
-                supersedes_action_id: inf_supersedes.clone(),
-                action_type: "inference".to_string(),
-                status: if status.is_success() {
-                    "complete"
-                } else {
-                    "error"
-                }
-                .to_string(),
-                intent: None,
-                model: Some(model.to_string()),
-                input_tokens,
-                output_tokens,
-                credits_consumed: Some(charge_credits as i64),
-                created_at: now_ms(),
-            },
-        )
-        .await?;
-        if let Some(ref ante) = inf_reply_to {
-            db::insert_action_antecedent(&db_conn, &inference_action_id, ante, 0, "reply").await?;
-        }
-
-        // Record context assembly: exactly the actions fed into this inference
-        // (the assembled context = current generations, Revise-excluded).
-        let context_assembly_id = Uuid::now_v7().to_string();
-        db::insert_context_assembly(
-            &db_conn,
-            &context_assembly_id,
-            &inference_action_id,
-            None,
-            input_tokens,
-            false,
-            now_ms(),
-        )
-        .await?;
-
-        let mut fed_ids: Vec<String> = Vec::new();
-        for r in &context_rows {
-            if !fed_ids.contains(&r.action_id) {
-                fed_ids.push(r.action_id.clone());
-            }
-        }
-        for (pos, aid) in fed_ids.iter().enumerate() {
-            db::insert_context_assembly_action(&db_conn, &context_assembly_id, aid, pos as i64)
-                .await?;
-        }
-
         let response_content = body
             .get("choices")
             .and_then(|c| c.as_array())
@@ -1974,47 +1925,29 @@ impl Inner {
             .unwrap_or("")
             .to_string();
 
-        if !response_content.is_empty() {
-            db::insert_text_content_block(
-                &db_conn,
-                &Uuid::now_v7().to_string(),
-                &inference_action_id,
-                0,
-                "text",
-                &response_content,
-            )
-            .await?;
-        }
-
-        db::insert_request(
-            &db_conn,
-            &db::Request {
-                id: Uuid::now_v7().to_string(),
-                connection_id,
-                action_id: Some(inference_action_id),
-                method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
-                request_headers: None,
-                request_body: Some(request_body_json.to_string().into_bytes()),
-                response_status: Some(status.as_u16() as i64),
-                response_headers: None,
-                response_body: Some(response_text.as_bytes().to_vec()),
-                request_at,
-                response_at: Some(response_at),
-                duration_ms: Some(response_at - request_at),
-                error: None,
-                credential_nonce: Some(cred.nonce.clone()),
-                created_at: now_ms(),
+        prep.persist_turn(
+            if status.is_success() {
+                "complete"
+            } else {
+                "error"
             },
+            input_tokens,
+            output_tokens,
+            &response_content,
+            &request_body_json,
+            request_at,
+            response_at,
+            status.as_u16(),
+            response_text.as_bytes().to_vec(),
         )
         .await?;
 
         if !status.is_success() {
             // Inference (error status) + request rows committed; Wallet was
             // emitted at spend start. post owns the user-turn SpaceIndex.
-            self.bus.emit(Change::Space(space_id.clone()));
+            self.bus.emit(Change::Space(prep.space_id.clone()));
             self.bus.emit(Change::Record);
-            return Err(wrap(AppError::Server {
+            return Err(prep.wrap(AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
             }));
@@ -2023,17 +1956,17 @@ impl Inner {
         // All durable writes succeeded — emit per affected domain. post owns the
         // SpaceIndex (new space / auto-title); a response doesn't change the
         // listing's identity.
-        self.bus.emit(Change::Space(space_id.clone()));
+        self.bus.emit(Change::Space(prep.space_id.clone()));
         self.bus.emit(Change::Wallet);
         self.bus.emit(Change::Record);
 
         Ok(ChatResult {
-            space_id,
+            space_id: prep.space_id,
             content: response_content,
-            model: model.to_string(),
+            model: prep.model,
             input_tokens,
             output_tokens,
-            credits_charged: charge_credits as i64,
+            credits_charged: prep.charge_credits as i64,
         })
     }
 
@@ -2077,11 +2010,10 @@ impl Inner {
             .await
     }
 
-    /// Streaming counterpart to `chat`. Mirrors the same setup (ACT token,
-    /// DB action insertion, prior-context assembly) and post-stream cleanup
-    /// (refund recovery, DB persistence of the inference action and content
-    /// blocks), but sends `stream: true` upstream and forwards each SSE chunk
-    /// to `sender` as it arrives.
+    /// Streaming counterpart to `run_turn` — same shared preparation and
+    /// persistence (`prepare_turn` / [`TurnPrep::persist_turn`]), but sends
+    /// `stream: true` upstream and forwards each SSE chunk to `sender` as it
+    /// arrives.
     ///
     /// Reasoning shape: we accept both `delta.reasoning_content` (OpenAI-style
     /// extension used by some providers) and `delta.reasoning` (vLLM's
@@ -2089,12 +2021,11 @@ impl Inner {
     /// fields are ignored — if Tinfoil's upstream uses a third spelling, the
     /// thinking section will simply stay empty until we adapt.
     ///
-    /// Refund handling differs from `chat` only in *where* the refund token
-    /// comes from: SSE responses have no inline body to carry it, so we
+    /// Refund handling differs from `run_turn` only in *where* the refund
+    /// token comes from: SSE responses have no inline body to carry it, so we
     /// always go through the `/v1/credentials/refund` recovery endpoint
     /// after the stream ends. The credential is left in `pre_credential`
-    /// state until that recovery completes, same as today's network-error
-    /// path.
+    /// state until that recovery completes, same as the network-error path.
     #[allow(clippy::too_many_arguments)]
     async fn run_turn_stream(
         &self,
@@ -2107,181 +2038,9 @@ impl Inner {
     ) -> Result<ChatResult, AppError> {
         use futures_util::StreamExt;
 
-        let cfg = self.load_config();
-        let base_url = cfg.base_url();
-        let now = now_ms();
-
-        let db_conn = self.db_conn().await?;
-        let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
-
-        let attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
-            Arc::new(Mutex::new(Vec::new()));
-        let log_clone = attestation_log.clone();
-        let observer: Option<tinfoil_verifier::AttestationObserver> = Some(Arc::new(
-            move |att: tinfoil_verifier::VerifiedAttestation| {
-                log_clone.lock().unwrap().push(att);
-            },
-        ));
-
-        let client = self.build_client(&cfg, observer).await?;
-
-        let models = fetch_models(&client, base_url).await?;
-        let mut connection_id =
-            flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?;
-
-        let model_entry =
-            models
-                .data
-                .iter()
-                .find(|m| m.id == model)
-                .ok_or_else(|| AppError::NotConfigured {
-                    message: format!("model not found: {model}"),
-                })?;
-
-        let max_completion_tokens = (model_entry.context_length).min(4096) as u32;
-
-        let model_participant_id =
-            db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
-
-        // The space already exists (post created it). Validate it and ensure the
-        // model participant is a member.
-        db::get_space(&db_conn, space_id)
-            .await?
-            .ok_or_else(|| AppError::NotConfigured {
-                message: format!("space not found: {space_id}"),
-            })?;
-        let _ =
-            db::insert_space_participant(&db_conn, space_id, &model_participant_id, "member", now)
-                .await; // ignore duplicate
-        let space_id = space_id.to_string();
-
-        let wrap = |source: AppError| AppError::ChatFailed {
-            space_id: space_id.clone(),
-            source: Box::new(source),
-        };
-
-        // Resolve how the inference attaches to the thread (mirrors run_turn).
-        let (inf_item_id, inf_supersedes, inf_reply_to) = match mode {
-            ResponseMode::Reply => (
-                Uuid::now_v7().to_string(),
-                None,
-                Some(target_action_id.to_string()),
-            ),
-            ResponseMode::Revise => {
-                let (item_id, _sp) = db::action_item_and_space(&db_conn, target_action_id)
-                    .await?
-                    .ok_or_else(|| {
-                        wrap(AppError::NotConfigured {
-                            message: format!("target action not found: {target_action_id}"),
-                        })
-                    })?;
-                let reply_to = db::reply_antecedent(&db_conn, target_action_id).await?;
-                (item_id, Some(target_action_id.to_string()), reply_to)
-            }
-        };
-
-        // Context per mode — same contract as `run_turn`: the target's
-        // upstream thread at most-recent versions (Reply inclusive of the
-        // target, Revise exclusive).
-        let context_rows: Vec<db::SpaceActionRow> = match mode {
-            ResponseMode::Reply => {
-                db::get_upstream_context(&db_conn, target_action_id, true).await?
-            }
-            ResponseMode::Revise => {
-                db::get_upstream_context(&db_conn, target_action_id, false).await?
-            }
-        };
-        let prior_messages = actions_to_messages(&context_rows);
-
-        let total_prompt_bytes: u128 = prior_messages.iter().map(|m| m.content.len() as u128).sum();
-
-        let sf = model_entry.pricing.per_prompt_token.scale_factor as u128;
-        let prompt_rate = model_entry.pricing.per_prompt_token.value as u128;
-        let prompt_credits = (total_prompt_bytes * prompt_rate).div_ceil(sf);
-        let completion_rate = model_entry.pricing.per_completion_token.value as u128;
-        let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
-        let charge_credits = prompt_credits + completion_credits;
-
-        if charge_credits == 0 {
-            return Err(wrap(AppError::Credential {
-                message: "computed charge is zero — model pricing may be missing".into(),
-            }));
-        }
-
-        if let Some(b) = budget
-            && charge_credits as i64 > b
-        {
-            return Err(wrap(AppError::Credential {
-                message: format!("estimated charge {charge_credits} exceeds the turn budget {b}"),
-            }));
-        }
-
-        let cred = self
-            .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
-            .await
-            .map_err(wrap)?;
-
-        let credit_token =
-            CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
-                message: format!("failed to decode credential: {e}"),
-            })?;
-        let public_key =
-            PublicKey::from_cbor(&cred.public_key_data).map_err(|e| AppError::Credential {
-                message: format!("failed to decode public key: {e}"),
-            })?;
-
-        let params = params_from_domain_separator(cfg.domain_separator())?;
-
-        let charge_scalar =
-            credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
-                message: format!("invalid charge amount: {e:?}"),
-            })?;
-        let (spend_proof, pre_refund) = credit_token
-            .prove_spend::<128>(&params, charge_scalar, OsRng)
-            .map_err(|e| AppError::Credential {
-                message: format!("failed to create spend proof: {e:?}"),
-            })?;
-
-        let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode pre_refund: {e}"),
-        })?;
-        let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode spend proof: {e}"),
-        })?;
-        let pre_cred_id = Uuid::now_v7().to_string();
-        db::insert_pre_credential_refund(
-            &db_conn,
-            &pre_cred_id,
-            &cred.nonce,
-            &cred.issuer_key_id,
-            &pre_refund_cbor,
-            charge_credits as i64,
-            &spend_proof_cbor,
-            now,
-        )
-        .await?;
-        // Credential flipped to "spending" — wallet state changed regardless of
-        // whether the rest of the operation succeeds.
-        self.bus.emit(Change::Wallet);
-
-        let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
-        let challenge_digest = compute_challenge_digest();
-
-        let mut token_bytes = Vec::new();
-        token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
-        token_bytes.extend_from_slice(&challenge_digest);
-        token_bytes.extend_from_slice(&issuer_key_hash);
-        token_bytes.extend_from_slice(&spend_proof_cbor);
-
-        let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
-        let auth_value = format!("PrivateToken token=\"{token_b64}\"");
-
-        // The posted user turn is already in the assembled context (post
-        // persisted it); the agent's response is appended below as a new action.
-        let messages: Vec<serde_json::Value> = prior_messages
-            .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
-            .collect();
+        let mut prep = self
+            .prepare_turn(space_id, model, target_action_id, mode, budget)
+            .await?;
 
         // No `stream_options` here — the server unconditionally sets
         // `include_usage: true` when forwarding the streaming request
@@ -2289,17 +2048,13 @@ impl Inner {
         // Sending it from the client is harmless (the server ignores
         // and overrides the value), but it's also unnecessary, so we
         // keep our outgoing request minimal.
-        let request_body_json = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "max_completion_tokens": max_completion_tokens,
-            "stream": true,
-        });
+        let request_body_json = prep.request_body(true);
         let request_at = now_ms();
 
-        let chat_result = client
-            .post(format!("{base_url}/v1/chat/completions"))
-            .header("Authorization", &auth_value)
+        let chat_result = prep
+            .client
+            .post(format!("{}/v1/chat/completions", prep.base_url))
+            .header("Authorization", &prep.auth_value)
             .header("Accept", "text/event-stream")
             .json(&request_body_json)
             .send()
@@ -2308,77 +2063,48 @@ impl Inner {
         // post already emitted the user turn's Space(id) + SpaceIndex; on a
         // run_turn_stream error exit we re-signal the space (idempotent
         // refresh). SpaceIndex is post's concern, not re-emitted here.
+        let space_for_emit = prep.space_id.clone();
         let emit_user_turn = || {
-            self.bus.emit(Change::Space(space_id.clone()));
+            self.bus.emit(Change::Space(space_for_emit.clone()));
         };
 
         let resp = match chat_result {
             Ok(resp) => {
-                if let Some(new_cid) =
-                    flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now)
-                        .await
-                        .inspect_err(|_| emit_user_turn())
-                        .map_err(wrap)?
-                {
-                    connection_id = Some(new_cid);
-                }
+                prep.flush_new_attestations()
+                    .await
+                    .inspect_err(|_| emit_user_turn())
+                    .map_err(|e| prep.wrap(e))?;
                 resp
             }
             Err(e) => {
                 let original_err = AppError::from_request(e);
-                if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
-                    && process_refund(
-                        &refund_obj,
-                        &params,
-                        &spend_proof,
-                        &pre_refund,
-                        &public_key,
-                        &db_conn,
-                        &pre_cred_id,
-                        cred.generation + 1,
-                        now,
-                    )
-                    .await
-                    .is_ok()
-                {
+                if prep.try_refund_recovery().await {
                     // Successor credential written — wallet state updated.
                     self.bus.emit(Change::Wallet);
                 }
                 // User turn is committed — emit it, then wrap with the space id.
                 emit_user_turn();
-                return Err(wrap(original_err));
+                return Err(prep.wrap(original_err));
             }
         };
 
         let status = resp.status();
 
         // Non-2xx: server returned an error body (typically JSON, not SSE).
-        // Read it normally so we can surface a useful message.
+        // Read it normally so we can surface a useful message. (Unlike the
+        // blocking twin there is no inference action to attach — the stream
+        // never produced one — so the request row stands alone.)
         if !status.is_success() {
             let response_text = resp.text().await.unwrap_or_default();
-            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
-                && process_refund(
-                    &refund_obj,
-                    &params,
-                    &spend_proof,
-                    &pre_refund,
-                    &public_key,
-                    &db_conn,
-                    &pre_cred_id,
-                    cred.generation + 1,
-                    now,
-                )
-                .await
-                .is_ok()
-            {
+            if prep.try_refund_recovery().await {
                 // Successor credential written — wallet state updated.
                 self.bus.emit(Change::Wallet);
             }
             db::insert_request(
-                &db_conn,
+                &prep.db_conn,
                 &db::Request {
                     id: Uuid::now_v7().to_string(),
-                    connection_id,
+                    connection_id: prep.connection_id.clone(),
                     action_id: None,
                     method: "POST".to_string(),
                     path: "/v1/chat/completions".to_string(),
@@ -2391,17 +2117,17 @@ impl Inner {
                     response_at: Some(now_ms()),
                     duration_ms: Some(now_ms() - request_at),
                     error: None,
-                    credential_nonce: Some(cred.nonce.clone()),
+                    credential_nonce: Some(prep.cred.nonce.clone()),
                     created_at: now_ms(),
                 },
             )
             .await?;
-            // Inference (error status) + request rows committed; Wallet was
-            // emitted at spend start (and again if refund recovery succeeded).
-            // post owns the user-turn SpaceIndex.
-            self.bus.emit(Change::Space(space_id.clone()));
+            // Request row committed; Wallet was emitted at spend start (and
+            // again if refund recovery succeeded). post owns the user-turn
+            // SpaceIndex.
+            self.bus.emit(Change::Space(prep.space_id.clone()));
             self.bus.emit(Change::Record);
-            return Err(wrap(AppError::Server {
+            return Err(prep.wrap(AppError::Server {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
             }));
@@ -2429,7 +2155,7 @@ impl Inner {
                 // request row is not yet) — emit the user turn so other windows
                 // see it, then wrap with the space id for blank-space adoption.
                 .inspect_err(|_| emit_user_turn())
-                .map_err(wrap)?;
+                .map_err(|e| prep.wrap(e))?;
             // Keep the raw bytes for the request log so we can debug
             // upstream behaviour the same way as the non-streaming path.
             response_buf.extend_from_slice(&bytes);
@@ -2507,118 +2233,36 @@ impl Inner {
         }
         let response_at = now_ms();
 
-        if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await {
-            let _ = process_refund(
-                &refund_obj,
-                &params,
-                &spend_proof,
-                &pre_refund,
-                &public_key,
-                &db_conn,
-                &pre_cred_id,
-                cred.generation + 1,
-                now,
-            )
-            .await;
-        }
+        // SSE carries no inline refund — always consult the recovery endpoint
+        // (best-effort; the final Wallet emission below covers a successor).
+        let _ = prep.try_refund_recovery().await;
 
-        // Attach per mode (mirrors run_turn): Reply → fresh item; Revise → a
-        // new generation of the target's item.
-        let inference_action_id = Uuid::now_v7().to_string();
-        db::insert_action(
-            &db_conn,
-            &db::ActionEntry {
-                id: inference_action_id.clone(),
-                space_id: space_id.clone(),
-                participant_id: model_participant_id,
-                item_id: inf_item_id.clone(),
-                supersedes_action_id: inf_supersedes.clone(),
-                action_type: "inference".to_string(),
-                status: "complete".to_string(),
-                intent: None,
-                model: Some(model.to_string()),
-                input_tokens,
-                output_tokens,
-                credits_consumed: Some(charge_credits as i64),
-                created_at: now_ms(),
-            },
-        )
-        .await?;
-        if let Some(ref ante) = inf_reply_to {
-            db::insert_action_antecedent(&db_conn, &inference_action_id, ante, 0, "reply").await?;
-        }
-
-        let context_assembly_id = Uuid::now_v7().to_string();
-        db::insert_context_assembly(
-            &db_conn,
-            &context_assembly_id,
-            &inference_action_id,
-            None,
+        prep.persist_turn(
+            "complete",
             input_tokens,
-            false,
-            now_ms(),
-        )
-        .await?;
-
-        let mut fed_ids: Vec<String> = Vec::new();
-        for r in &context_rows {
-            if !fed_ids.contains(&r.action_id) {
-                fed_ids.push(r.action_id.clone());
-            }
-        }
-        for (pos, aid) in fed_ids.iter().enumerate() {
-            db::insert_context_assembly_action(&db_conn, &context_assembly_id, aid, pos as i64)
-                .await?;
-        }
-
-        if !full_content.is_empty() {
-            db::insert_text_content_block(
-                &db_conn,
-                &Uuid::now_v7().to_string(),
-                &inference_action_id,
-                0,
-                "text",
-                &full_content,
-            )
-            .await?;
-        }
-
-        db::insert_request(
-            &db_conn,
-            &db::Request {
-                id: Uuid::now_v7().to_string(),
-                connection_id,
-                action_id: Some(inference_action_id),
-                method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
-                request_headers: None,
-                request_body: Some(request_body_json.to_string().into_bytes()),
-                response_status: Some(status.as_u16() as i64),
-                response_headers: None,
-                response_body: Some(response_buf),
-                request_at,
-                response_at: Some(response_at),
-                duration_ms: Some(response_at - request_at),
-                error: None,
-                credential_nonce: Some(cred.nonce.clone()),
-                created_at: now_ms(),
-            },
+            output_tokens,
+            &full_content,
+            &request_body_json,
+            request_at,
+            response_at,
+            status.as_u16(),
+            response_buf,
         )
         .await?;
 
         // All durable writes succeeded — emit per affected domain. post owns the
         // SpaceIndex (new space / auto-title).
-        self.bus.emit(Change::Space(space_id.clone()));
+        self.bus.emit(Change::Space(prep.space_id.clone()));
         self.bus.emit(Change::Wallet);
         self.bus.emit(Change::Record);
 
         Ok(ChatResult {
-            space_id,
+            space_id: prep.space_id,
             content: full_content,
-            model: model.to_string(),
+            model: prep.model,
             input_tokens,
             output_tokens,
-            credits_charged: charge_credits as i64,
+            credits_charged: prep.charge_credits as i64,
         })
     }
 
@@ -3452,6 +3096,231 @@ struct ModelListEntry {
 /// `refund_obj` is the `"refund"` value from a server response (either a chat
 /// completion or the recovery endpoint). Returns `true` if the credential was
 /// successfully stored.
+#[allow(clippy::too_many_arguments)]
+/// The shared preparation of a turn, built by [`Inner::prepare_turn`]:
+/// the attested client, the thread attach plan, the assembled upstream
+/// context, and the in-flight spend (proof + pending refund). The blocking
+/// and streaming transports differ only in how they carry the request and
+/// read the response; everything durable before and after the wire lives
+/// here.
+struct TurnPrep {
+    db_conn: turso::Connection,
+    provider_id: String,
+    attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>>,
+    client: reqwest::Client,
+    /// Connection row adopted from the most recent attestation flush; the
+    /// request row records it.
+    connection_id: Option<String>,
+    base_url: String,
+    /// The preparation timestamp — spend/refund rows key off it.
+    now: i64,
+    space_id: String,
+    model: String,
+    model_participant_id: String,
+    max_completion_tokens: u32,
+    /// The inference's attach plan (Reply → fresh item; Revise → a new
+    /// generation superseding the target).
+    inf_item_id: String,
+    inf_supersedes: Option<String>,
+    inf_reply_to: Option<String>,
+    /// The context rows fed upstream, recorded as the context assembly.
+    context_rows: Vec<db::SpaceActionRow>,
+    /// The OpenAI messages array built from `context_rows`.
+    messages: Vec<serde_json::Value>,
+    charge_credits: u128,
+    cred: db::SpendableCredential,
+    public_key: PublicKey,
+    params: Params,
+    spend_proof: SpendProof<128>,
+    pre_refund: PreRefund,
+    pre_cred_id: String,
+    auth_value: String,
+}
+
+impl TurnPrep {
+    /// Wrap an error with the (always-persisted) space id so a blank GUI
+    /// window can adopt it on failure.
+    fn wrap(&self, source: AppError) -> AppError {
+        AppError::ChatFailed {
+            space_id: self.space_id.clone(),
+            source: Box::new(source),
+        }
+    }
+
+    /// The chat request body for this turn.
+    fn request_body(&self, stream: bool) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": self.messages,
+            "max_completion_tokens": self.max_completion_tokens,
+        });
+        if stream {
+            body["stream"] = serde_json::Value::Bool(true);
+        }
+        body
+    }
+
+    /// Flush attestations captured since the last flush (a fresh handshake
+    /// during the request), adopting the new connection id if one was
+    /// recorded.
+    async fn flush_new_attestations(&mut self) -> Result<(), AppError> {
+        if let Some(new_cid) = flush_attestations(
+            &self.attestation_log,
+            &self.db_conn,
+            &self.provider_id,
+            &self.base_url,
+            self.now,
+        )
+        .await?
+        {
+            self.connection_id = Some(new_cid);
+        }
+        Ok(())
+    }
+
+    /// Apply a refund object (inline from a response body, or recovered) to
+    /// the pending spend — writes the successor credential.
+    async fn process_refund_obj(&self, refund_obj: &serde_json::Value) -> Result<(), AppError> {
+        process_refund(
+            refund_obj,
+            &self.params,
+            &self.spend_proof,
+            &self.pre_refund,
+            &self.public_key,
+            &self.db_conn,
+            &self.pre_cred_id,
+            self.cred.generation + 1,
+            self.now,
+        )
+        .await
+    }
+
+    /// Best-effort refund recovery via `/v1/credentials/refund`. Returns
+    /// whether a successor credential was written (the caller decides whether
+    /// that warrants an immediate `Wallet` emission).
+    async fn try_refund_recovery(&self) -> bool {
+        match recover_refund(&self.client, &self.base_url, &self.auth_value).await {
+            Ok(refund_obj) => self.process_refund_obj(&refund_obj).await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Persist the turn's durable rows — the inference action (per the attach
+    /// plan, with its reply edge), the context-assembly record (exactly the
+    /// actions fed upstream), the response content block, and the request row
+    /// — and return the inference action id. Emissions stay with the caller
+    /// (they differ per exit point; see the table in `tests/bus.rs`).
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_turn(
+        &self,
+        action_status: &str,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        content: &str,
+        request_body_json: &serde_json::Value,
+        request_at: i64,
+        response_at: i64,
+        http_status: u16,
+        response_body: Vec<u8>,
+    ) -> Result<String, AppError> {
+        let inference_action_id = Uuid::now_v7().to_string();
+        db::insert_action(
+            &self.db_conn,
+            &db::ActionEntry {
+                id: inference_action_id.clone(),
+                space_id: self.space_id.clone(),
+                participant_id: self.model_participant_id.clone(),
+                item_id: self.inf_item_id.clone(),
+                supersedes_action_id: self.inf_supersedes.clone(),
+                action_type: "inference".to_string(),
+                status: action_status.to_string(),
+                intent: None,
+                model: Some(self.model.clone()),
+                input_tokens,
+                output_tokens,
+                credits_consumed: Some(self.charge_credits as i64),
+                created_at: now_ms(),
+            },
+        )
+        .await?;
+        if let Some(ref ante) = self.inf_reply_to {
+            db::insert_action_antecedent(&self.db_conn, &inference_action_id, ante, 0, "reply")
+                .await?;
+        }
+
+        // Record context assembly: exactly the actions fed into this inference.
+        let context_assembly_id = Uuid::now_v7().to_string();
+        db::insert_context_assembly(
+            &self.db_conn,
+            &context_assembly_id,
+            &inference_action_id,
+            None,
+            input_tokens,
+            false,
+            now_ms(),
+        )
+        .await?;
+
+        let mut fed_ids: Vec<String> = Vec::new();
+        for r in &self.context_rows {
+            if !fed_ids.contains(&r.action_id) {
+                fed_ids.push(r.action_id.clone());
+            }
+        }
+        for (pos, aid) in fed_ids.iter().enumerate() {
+            db::insert_context_assembly_action(
+                &self.db_conn,
+                &context_assembly_id,
+                aid,
+                pos as i64,
+            )
+            .await?;
+        }
+
+        if !content.is_empty() {
+            db::insert_text_content_block(
+                &self.db_conn,
+                &Uuid::now_v7().to_string(),
+                &inference_action_id,
+                0,
+                "text",
+                content,
+            )
+            .await?;
+        }
+
+        db::insert_request(
+            &self.db_conn,
+            &db::Request {
+                id: Uuid::now_v7().to_string(),
+                connection_id: self.connection_id.clone(),
+                action_id: Some(inference_action_id.clone()),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                request_headers: None,
+                request_body: Some(request_body_json.to_string().into_bytes()),
+                response_status: Some(http_status as i64),
+                response_headers: None,
+                response_body: Some(response_body),
+                request_at,
+                response_at: Some(response_at),
+                duration_ms: Some(response_at - request_at),
+                error: None,
+                credential_nonce: Some(self.cred.nonce.clone()),
+                created_at: now_ms(),
+            },
+        )
+        .await?;
+
+        Ok(inference_action_id)
+    }
+}
+
+/// Apply a refund object to a pending spend: decode + verify the refund
+/// against the spend proof and write the successor credential. Called from
+/// `TurnPrep::process_refund_obj` (live turns) and from the startup wallet
+/// recovery (which reconstructs the spend materials from persisted rows —
+/// which is why this stays a free function taking them piecewise).
 #[allow(clippy::too_many_arguments)]
 async fn process_refund(
     refund_obj: &serde_json::Value,

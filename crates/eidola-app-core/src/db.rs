@@ -5,7 +5,7 @@ use turso::{Builder, Connection, Database, Value};
 use crate::error::AppError;
 
 const SCHEMA: &str = include_str!("../schema/schema.sql");
-const LATEST_VERSION: i64 = 2;
+const LATEST_VERSION: i64 = 3;
 
 /// Opens (or creates) the local database at `data_dir/eidola.db` and runs any
 /// pending migrations.
@@ -66,6 +66,15 @@ async fn migrate(conn: &Connection, current_version: i64) -> Result<(), AppError
                 message: format!("migration 2 failed: {e}"),
             })?;
         set_user_version(conn, 2).await?;
+    }
+
+    if current_version < 3 {
+        conn.execute_batch(MIGRATION_3)
+            .await
+            .map_err(|e| AppError::Database {
+                message: format!("migration 3 failed: {e}"),
+            })?;
+        set_user_version(conn, 3).await?;
     }
 
     Ok(())
@@ -1903,6 +1912,15 @@ CREATE UNIQUE INDEX idx_one_successor_per_action
 CREATE UNIQUE INDEX idx_action_id_item ON action (id, item_id);
 ";
 
+/// One gen-0 per item: together with `idx_one_successor_per_action`, an
+/// item's tip becomes provably unique (previously a convention only — a
+/// second gen-0 row would have given `item_current` two rows for one item).
+const MIGRATION_3: &str = "\
+CREATE UNIQUE INDEX idx_one_root_per_item
+    ON action (space_id, item_id)
+    WHERE supersedes_action_id IS NULL;
+";
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2303,6 +2321,51 @@ mod tests {
             refs[0].antecedent_current_action_id.as_deref(),
             Some("i1"),
             "an un-superseded target resolves to itself"
+        );
+    }
+
+    /// The one-root-per-item invariant is enforced by the database, not
+    /// convention: a second gen-0 action for an existing item must be
+    /// rejected (`idx_one_root_per_item`), so `item_current` can never yield
+    /// two tips for one item.
+    #[tokio::test]
+    async fn duplicate_item_root_is_rejected() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+
+        let p = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "space-r", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+
+        let entry = |id: &str, supersedes: Option<&str>| ActionEntry {
+            id: id.to_string(),
+            space_id: "space-r".to_string(),
+            participant_id: p.clone(),
+            item_id: "item-1".to_string(),
+            supersedes_action_id: supersedes.map(String::from),
+            action_type: "user_input".to_string(),
+            status: "complete".to_string(),
+            intent: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            credits_consumed: None,
+            created_at: 1_000,
+        };
+
+        insert_action(&conn, &entry("a1", None)).await.unwrap();
+        // A proper generation (supersedes the root) is fine…
+        insert_action(&conn, &entry("a2", Some("a1")))
+            .await
+            .unwrap();
+        // …but a second root for the same item must be rejected.
+        let dup = insert_action(&conn, &entry("a3", None)).await;
+        assert!(
+            dup.is_err(),
+            "a second gen-0 for one item must violate idx_one_root_per_item"
         );
     }
 

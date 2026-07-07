@@ -249,6 +249,14 @@ CREATE UNIQUE INDEX idx_one_successor_per_action
     ON action (supersedes_action_id)
     WHERE supersedes_action_id IS NOT NULL;
 
+-- One gen-0 per item: together with the one-successor index above,
+-- an item's tip is provably unique — item_current can never yield
+-- two rows for one item (which would duplicate posts in every
+-- resolved view and double edges in the item-tip threading joins).
+CREATE UNIQUE INDEX idx_one_root_per_item
+    ON action (space_id, item_id)
+    WHERE supersedes_action_id IS NULL;
+
 -- Parent key for the compound supersedes FK.
 CREATE UNIQUE INDEX idx_action_id_item ON action (id, item_id);
 
