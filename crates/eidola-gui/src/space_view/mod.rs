@@ -13,6 +13,8 @@
 //! - [`nav`] — snap physics + scroll-gesture bookkeeping.
 //! - [`post`] — render one post + its separator band.
 //! - [`composer`] — the floating/docking draft composer + submit routing.
+//! - [`request`] — the composer's action gutter (Ask / Post / model) + the
+//!   request panel (model selection; the home of future per-request config).
 //! - [`minimap`] — the topology minimap.
 //!
 //! Performance: only posts intersecting the viewport render the real
@@ -25,6 +27,7 @@ pub mod minimap;
 pub mod model;
 pub mod nav;
 pub mod post;
+pub mod request;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -51,8 +54,9 @@ use model::{NodeSrc, PostData, TreeNode};
 use nav::{ScrollAxis, ScrollOwner, SnapAnim};
 
 // Re-export the chat actions so the composer routes the same semantic gestures
-// (⌘↩ post & ask / ⌘⇧↩ post only) the editor's `PressEnter` event carries.
-pub use crate::chat::{PostOnly, Send};
+// (⌘↩ post & ask / ⌘⇧↩ post only) the editor's `PressEnter` event carries,
+// and the shared ⌥⌘M request-panel toggle.
+pub use crate::chat::{PostOnly, Send, ToggleModelPicker};
 
 // ---------------------------------------------------------------------------
 // Layout constants — the book typography + the tree-navigation geometry.
@@ -170,8 +174,9 @@ pub struct SpaceView {
     /// The shared per-conversation entity. The view is a window-local lens over
     /// it; two windows on one space share this entity.
     pub(crate) space: Entity<Space>,
-    /// Per-window modifier state (held for the deferred ⌥ model picker).
-    #[allow(dead_code)]
+    /// Per-window modifier state — the root registers the window's single
+    /// `on_modifiers_changed` listener and mirrors events here; the composer's
+    /// action gutter reads it for the ⌥ reveal (Post + keyboard hints).
     pub(crate) window_input: Entity<WindowInput>,
     /// The view's focus handle — `track_focus`ed on the root so behavior tests
     /// dispatch actions through it; production focus lives on the composer.
@@ -226,6 +231,12 @@ pub struct SpaceView {
     pub(crate) slot_bounds: Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>,
     /// Owner of the current vertical scroll session.
     pub(crate) scroll_owner: Option<ScrollOwner>,
+    /// Whether the request panel (model selection; the future home of
+    /// per-request config) is open, anchored to the composer's action gutter.
+    pub(crate) request_panel_open: bool,
+    /// The composer bar's top `y` as of the last `render_active_draft`, so the
+    /// request panel (a later sibling) can anchor against it.
+    pub(crate) composer_anchor_top: Cell<f32>,
 
     /// Vertical scroll of the whole page.
     pub(crate) page_scroll: ScrollHandle,
@@ -320,6 +331,9 @@ impl SpaceView {
             }),
             cx.subscribe_in(&space, window, Self::on_space_event),
             cx.observe(&window_input, |_, _, cx| cx.notify()),
+            // The request panel renders the model list + config default.
+            cx.observe(&stores.models, |_, _, cx| cx.notify()),
+            cx.observe(&stores.config, |_, _, cx| cx.notify()),
         ];
 
         let mut this = Self {
@@ -343,6 +357,8 @@ impl SpaceView {
             composer_content_h: Rc::new(RefCell::new(px(0.))),
             slot_bounds: Rc::new(RefCell::new(HashMap::new())),
             scroll_owner: None,
+            request_panel_open: false,
+            composer_anchor_top: Cell::new(0.0),
             page_scroll: ScrollHandle::new(),
             scroll_min_y: Cell::new(0.0),
             scrolls: HashMap::new(),
@@ -479,6 +495,13 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn deactivate_for_test(&mut self, cx: &mut Context<Self>) {
         self.deactivate_active_draft(cx);
+    }
+
+    /// Whether ⌥ is held per this window's `WindowInput` (tests assert the
+    /// root's modifiers listener actually reaches the shared entity).
+    #[doc(hidden)]
+    pub fn alt_held_for_test(&self, cx: &gpui::App) -> bool {
+        self.window_input.read(cx).alt_held()
     }
 
     /// How many times the layout height cache has been invalidated (cleared).
@@ -835,8 +858,17 @@ impl Render for SpaceView {
             .key_context("SpaceView")
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::post_only))
+            .on_action(cx.listener(Self::toggle_request_panel_action))
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
+            }))
+            // The window's single modifiers listener (see `WindowInput`): the
+            // root is an ancestor of the focused composer, so it sees every
+            // modifier transition and mirrors it into the shared entity for
+            // the action gutter's ⌥ reveal.
+            .on_modifiers_changed(cx.listener(|this, event, _, cx| {
+                this.window_input
+                    .update(cx, |wi, cx| wi.update_modifiers(event, cx));
             }))
             .relative()
             .size_full()
@@ -874,6 +906,7 @@ impl Render for SpaceView {
                 scroll
             })
             .child(self.render_active_draft(&tree, page_width, window_h, cx))
+            .child(self.render_request_panel(page_width, window_h, cx))
             .child(self.render_error_band(cx))
             // The minimap is the last sibling, so it paints after the composer
             // (an earlier sibling) and — overlapping it on the right edge — its

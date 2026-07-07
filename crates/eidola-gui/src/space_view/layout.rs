@@ -140,10 +140,11 @@ use super::{
 };
 use gpui::Pixels;
 
-/// The reading-column width for a post body at a given page width — the mockup's
-/// gutter-aware centered measure, capped at [`BODY_MAX_WIDTH`].
+/// The reading-column width for a post body at a given page width — the
+/// centered measure between the two symmetric gutters (byline on the left,
+/// actions on the right), capped at [`BODY_MAX_WIDTH`].
 pub(crate) fn body_width(page_width: Pixels) -> f32 {
-    (page_width - GUTTER_WIDTH * 1.5 - GUTTER_GAP * 2.)
+    (page_width - (GUTTER_WIDTH + GUTTER_GAP) * 2.)
         .min(BODY_MAX_WIDTH)
         .max(gpui::px(240.))
         .as_f32()

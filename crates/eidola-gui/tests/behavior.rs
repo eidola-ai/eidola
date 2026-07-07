@@ -3710,6 +3710,102 @@ fn space_joins_shared_entity_for_same_id(cx: &mut TestAppContext) {
     v2.read_with(cx, |v, _| assert_eq!(v.post_count_for_test(), 1));
 }
 
+#[gpui::test]
+fn space_request_panel_toggles_only_with_composer(cx: &mut TestAppContext) {
+    // ⌥⌘M anchors the request panel to the composer's action gutter, so it is
+    // meaningful only while a draft is active.
+    let stores = stub_stores_with_config(cx);
+
+    // An existing space opens with no active composer → the toggle no-ops.
+    let (w1, existing) = open_space(cx, &stores, Some("has-history".into()));
+    dispatch_space_action(&existing, w1, cx, ToggleModelPicker);
+    existing.read_with(cx, |v, _| {
+        assert!(
+            !v.request_panel_open(),
+            "no composer → no anchor → the panel must not open"
+        );
+    });
+
+    // A blank space opens with its root composer active → toggle round-trips.
+    let (w2, blank) = open_space(cx, &stores, None);
+    dispatch_space_action(&blank, w2, cx, ToggleModelPicker);
+    blank.read_with(cx, |v, _| assert!(v.request_panel_open()));
+    dispatch_space_action(&blank, w2, cx, ToggleModelPicker);
+    blank.read_with(cx, |v, _| assert!(!v.request_panel_open()));
+}
+
+#[gpui::test]
+fn space_select_model_applies_to_next_submit_and_closes_panel(cx: &mut TestAppContext) {
+    // Selecting a model in the request panel closes it and routes the next
+    // submit through that model (the per-space selection on the shared Space).
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+
+    dispatch_space_action(&view, window, cx, ToggleModelPicker);
+    view.read_with(cx, |v, _| assert!(v.request_panel_open()));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.select_model("gemma-test".into(), cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, cx| {
+        assert!(!v.request_panel_open(), "selection closes the panel");
+        assert_eq!(v.space().read(cx).selected_model(), Some("gemma-test"));
+    });
+
+    set_space_composer_text(&view, window, cx, "route me");
+    dispatch_space_action(&view, window, cx, Send);
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.space().read(cx).last_submitted_model(),
+            Some("gemma-test"),
+            "the submit resolves the space's selection"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_request_panel_closes_when_draft_deactivates(cx: &mut TestAppContext) {
+    // The panel is anchored to the composer; retiring the draft (Escape) must
+    // take the panel with it rather than leaving it floating unanchored.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    dispatch_space_action(&view, window, cx, ToggleModelPicker);
+    view.read_with(cx, |v, _| assert!(v.request_panel_open()));
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.deactivate_for_test(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(!v.request_panel_open(), "deactivating the draft closes it");
+        assert!(!v.has_active_draft_for_test());
+    });
+}
+
+#[gpui::test]
+fn space_alt_modifiers_reach_window_input(cx: &mut TestAppContext) {
+    // The root's single `on_modifiers_changed` listener mirrors platform
+    // modifier events into the shared `WindowInput` — the ⌥ reveal for the
+    // composer's action gutter (Post + keyboard hints) reads from it.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, None);
+    view.read_with(cx, |v, cx| assert!(!v.alt_held_for_test(cx)));
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_modifiers_change(Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    });
+    view.read_with(&vcx, |v, cx| {
+        assert!(
+            v.alt_held_for_test(cx),
+            "the root listener must mirror ⌥ into WindowInput"
+        );
+    });
+    vcx.simulate_modifiers_change(Modifiers::default());
+    view.read_with(&vcx, |v, cx| assert!(!v.alt_held_for_test(cx)));
+}
+
 // ---------------------------------------------------------------------------
 // Onboarding window
 // ---------------------------------------------------------------------------

@@ -38,8 +38,7 @@ const SHADOW_OFFSET_Y: Pixels = px(-3.);
 const SHADOW_BLUR: Pixels = px(18.);
 use super::nav::ScrollOwner;
 use super::{
-    COMPOSER_MAX_FRACTION, Draft, GUTTER_GAP, GUTTER_WIDTH, POST_PAD_Y, PostOnly, Send, SpaceView,
-    prose_style,
+    COMPOSER_MAX_FRACTION, Draft, GUTTER_GAP, POST_PAD_Y, PostOnly, Send, SpaceView, prose_style,
 };
 
 impl SpaceView {
@@ -195,6 +194,8 @@ impl SpaceView {
         let Some(id) = self.active_draft.take() else {
             return;
         };
+        // The request panel is anchored to the retiring composer.
+        self.request_panel_open = false;
         let Some(draft) = self.drafts.iter().find(|d| d.id == id) else {
             return;
         };
@@ -263,6 +264,7 @@ impl SpaceView {
         self.active_draft = None;
         self.delete_draft(&active);
         self.error = None;
+        self.request_panel_open = false;
 
         if post_only {
             self.space.update(cx, |s, cx| {
@@ -374,6 +376,10 @@ impl SpaceView {
         let overlayed = top_y >= float_top - 0.5;
         let docked = !overlayed;
         self.composer_overlayed.set(overlayed);
+        // The request panel anchors to the composer's action gutter; record
+        // where the bar sits this frame so the panel (a later sibling in
+        // `render`) can position itself against it.
+        self.composer_anchor_top.set(top_y);
 
         let full_h = (content + chrome).max(win);
         let bar_h = if docked {
@@ -500,11 +506,17 @@ impl SpaceView {
             .bg(theme.background)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
-                    // Deactivate (deleting it if empty) and move focus off the
-                    // editor to the view root, so a kept draft reads as exited
-                    // (no stray cursor) until it's clicked back into.
-                    this.deactivate_active_draft(cx);
-                    window.focus(&this.focus_handle, cx);
+                    // An open request panel absorbs the first Escape; the next
+                    // deactivates the draft (deleting it if an empty fork) and
+                    // moves focus off the editor to the view root, so a kept
+                    // draft reads as exited (no stray cursor) until it's
+                    // clicked back into.
+                    if this.request_panel_open {
+                        this.close_request_panel(cx);
+                    } else {
+                        this.deactivate_active_draft(cx);
+                        window.focus(&this.focus_handle, cx);
+                    }
                 }
             }))
             .child(
@@ -515,9 +527,9 @@ impl SpaceView {
                     .justify_center()
                     .items_start()
                     .gap(GUTTER_GAP)
-                    .pr(GUTTER_WIDTH / 2. + GUTTER_GAP)
                     .child(byline)
-                    .child(body),
+                    .child(body)
+                    .child(self.render_composer_actions(&editor, cx)),
             );
         if scrolled_down {
             composer = composer.child(

@@ -295,6 +295,15 @@ pub fn install_keybindings(cx: &mut App) {
         KeyBinding::new("up", crate::chat::PickerUp, Some("ChatView")),
         KeyBinding::new("down", crate::chat::PickerDown, Some("ChatView")),
         KeyBinding::new("enter", crate::chat::PickerConfirm, Some("ChatView")),
+        // ⌥⌘M — the space view's request panel (the same semantic gesture as
+        // ChatView's picker; the handler no-ops without a composer to anchor
+        // to). Esc routes through the composer's own key handler (panel
+        // first, then draft deactivation), so no Esc binding here.
+        KeyBinding::new(
+            "cmd-alt-m",
+            crate::chat::ToggleModelPicker,
+            Some("SpaceView"),
+        ),
     ]);
 
     // The composer's own keymap (motion, editing, clipboard, and the submit

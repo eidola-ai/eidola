@@ -113,9 +113,9 @@ impl SpaceView {
             .justify_center()
             .items_start()
             .gap(GUTTER_GAP)
-            .pr(GUTTER_WIDTH / 2. + GUTTER_GAP)
             .child(byline_el)
             .child(body)
+            .child(action_gutter())
             .child(record_height(
                 self.layout.clone(),
                 node.id.clone(),
@@ -175,7 +175,6 @@ impl SpaceView {
             .justify_center()
             .items_start()
             .gap(GUTTER_GAP)
-            .pr(GUTTER_WIDTH / 2. + GUTTER_GAP)
             .id(SharedString::from(format!(
                 "space-draft-inactive-{}",
                 node.id
@@ -198,6 +197,7 @@ impl SpaceView {
                         .min_height(editor_fill),
                 ),
             )
+            .child(action_gutter())
             .child(record_height(
                 self.layout.clone(),
                 node.id.clone(),
@@ -383,6 +383,15 @@ impl SpaceView {
 /// The label opacity for a draft's "You" byline — softened relative to a
 /// committed post's byline so an unsent draft reads as tentative.
 pub(crate) const DRAFT_BYLINE_OPACITY: f32 = 0.85;
+
+/// The right-hand **action gutter** column — the symmetric mirror of the
+/// byline gutter, left-aligned toward the reading column it acts on. Posts
+/// reserve it empty (keeping the reading column centered; per-post affordances
+/// are its future tenants); the active composer fills it with the request
+/// actions (see `request.rs`).
+pub(crate) fn action_gutter() -> gpui::Div {
+    v_flex().w(GUTTER_WIDTH).flex_none().items_start().pt_4()
+}
 
 /// The right-aligned byline gutter column that sits beside a reading column:
 /// the author label in small bold `color`, geometry shared by posts, inline

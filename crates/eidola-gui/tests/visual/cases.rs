@@ -66,6 +66,75 @@ fn register_space(s: &mut Snapshots) {
         let core = stub_stores_with_config(cx);
         cx.new(|cx| SpaceView::new(core, None, WindowInput::new(cx), window, cx))
     });
+
+    // A draft with content: the action gutter reveals the discoverable
+    // submit — Ask beside the draft, the model chip (the addressee) below it.
+    s.add(
+        "space_composer_actions",
+        size(px(900.), px(680.)),
+        |window, cx| {
+            let core = model_stores(cx);
+            cx.new(|cx| {
+                let view = SpaceView::new(core, None, WindowInput::new(cx), window, cx);
+                if let Some(editor) = view.composer_state_for_test() {
+                    editor.update(cx, |e, cx| {
+                        e.set_value(
+                            "What did Thrasymachus actually claim about justice?".to_string(),
+                            cx,
+                        )
+                    });
+                }
+                view
+            })
+        },
+    );
+
+    // ⌥ held: the Post (save-without-asking) verb and the keyboard hints join
+    // the action gutter — the "Option reveals power" expansion.
+    s.add(
+        "space_composer_alt",
+        size(px(900.), px(680.)),
+        |window, cx| {
+            let core = model_stores(cx);
+            let wi = WindowInput::new(cx);
+            wi.update(cx, |w, cx| w.set_alt_for_test(true, cx));
+            cx.new(|cx| {
+                let view = SpaceView::new(core, None, wi, window, cx);
+                if let Some(editor) = view.composer_state_for_test() {
+                    editor.update(cx, |e, cx| {
+                        e.set_value(
+                            "What did Thrasymachus actually claim about justice?".to_string(),
+                            cx,
+                        )
+                    });
+                }
+                view
+            })
+        },
+    );
+
+    // The request panel open under the model chip: the model list with honest
+    // per-model info, current + default markers.
+    s.add(
+        "space_request_panel",
+        size(px(900.), px(680.)),
+        |window, cx| {
+            let core = model_stores(cx);
+            cx.new(|cx| {
+                let mut view = SpaceView::new(core, None, WindowInput::new(cx), window, cx);
+                if let Some(editor) = view.composer_state_for_test() {
+                    editor.update(cx, |e, cx| {
+                        e.set_value(
+                            "What did Thrasymachus actually claim about justice?".to_string(),
+                            cx,
+                        )
+                    });
+                }
+                view.toggle_request_panel(cx);
+                view
+            })
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

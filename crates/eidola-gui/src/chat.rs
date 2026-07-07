@@ -3130,7 +3130,7 @@ impl ChatView {
 /// charged. Per-request models show their flat rate; if the payload carried
 /// no pricing at all, only the context length is shown — we don't invent
 /// numbers.
-fn model_info_line(model: &ModelInfo) -> String {
+pub(crate) fn model_info_line(model: &ModelInfo) -> String {
     // Per-request models (e.g. transcription) report no meaningful context
     // length; showing "0-token context" would be noise, not honesty.
     let ctx = (model.context_length > 0).then(|| {

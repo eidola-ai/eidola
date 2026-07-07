@@ -307,6 +307,15 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
             s.set_post_tree_for_test(vec![probe_post("a1", "a seeded root post"), a2], cx)
         });
     });
+    // Give the active draft content and open the request panel, so the action
+    // gutter (Ask / model chip) and the panel record their probes too.
+    let editor = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("blank space opens with the composer");
+    cx.update(|cx| {
+        editor.update(cx, |e, cx| e.set_value("a draft".to_string(), cx));
+        view.update(cx, |v, cx| v.toggle_request_panel(cx));
+    });
     draw(cx, window);
 
     let entries = probe::window_entries(window.window_id().as_u64());
@@ -318,6 +327,26 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
     assert!(
         names.contains(&"space/band/add"),
         "band reply affordance probe missing; recorded: {names:?}"
+    );
+    // The action gutter: Ask (the discoverable submit) and the model chip.
+    assert!(
+        names.contains(&"space/composer/ask"),
+        "Ask affordance probe missing; recorded: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/composer/model"),
+        "model chip probe missing; recorded: {names:?}"
+    );
+    // The request panel (opened above) with its model rows.
+    assert!(
+        names.contains(&"space/request-panel"),
+        "request panel probe missing; recorded: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.starts_with("space/request-panel/row/")),
+        "request panel model rows missing; recorded: {names:?}"
     );
     // The minimap is a navigable table of contents: a labelled Group of
     // per-node Buttons.
