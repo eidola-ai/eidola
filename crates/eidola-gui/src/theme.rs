@@ -476,11 +476,11 @@ fn load_fonts(cx: &App) {
 /// builder for each window we open. Routes through [`apply`], so a pinned
 /// `day`/`night`/`auto` appearance correctly ignores the OS flip.
 ///
-/// The theme flip is spawned onto the foreground executor rather than applied
-/// inline. On Linux/Wayland, gpui delivers appearance changes from inside the
-/// xdg-desktop-portal event callback, which holds the Wayland client's
+/// On Linux/Wayland the theme flip is spawned onto the foreground executor
+/// rather than applied inline: gpui delivers appearance changes from inside
+/// the xdg-desktop-portal event callback, which holds the Wayland client's
 /// `RefCell` mutably (`gpui_linux` `wayland/client.rs`, `XDPEvent::
-/// WindowAppearance`); applying the theme here would mark windows dirty and
+/// WindowAppearance`); applying the theme there would mark windows dirty and
 /// the surrounding `update`'s effect flush would repaint synchronously, and
 /// the glyph paint path (`is_subpixel_rendering_supported`) re-borrows that
 /// same `RefCell` — "RefCell already mutably borrowed", a startup panic on
@@ -489,18 +489,26 @@ fn load_fonts(cx: &App) {
 /// (`cx.defer` is NOT sufficient: deferred callbacks run in the same effect
 /// flush, still inside the borrow.) Upstream fix would be gpui dropping the
 /// client borrow before invoking window callbacks; until then this stays.
+/// macOS has no such reentrancy, so it applies inline (no one-tick lag on the
+/// Light/Dark flip).
 pub fn observe_window_appearance(window: &mut Window) {
     window
         .observe_window_appearance(|window, cx| {
-            let handle = window.window_handle();
-            cx.spawn(async move |cx| {
-                handle
-                    .update(cx, |_, window, cx| {
-                        apply(Some(window), cx);
-                    })
-                    .ok();
-            })
-            .detach();
+            #[cfg(target_os = "macos")]
+            apply(Some(window), cx);
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let handle = window.window_handle();
+                cx.spawn(async move |cx| {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            apply(Some(window), cx);
+                        })
+                        .ok();
+                })
+                .detach();
+            }
         })
         .detach();
 }

@@ -1,3 +1,0 @@
-# Machine-local (gitignored): user-local sysroot for building eidola-gui's
-# C deps on this no-sudo box. See ~/sysroot-gui/env.sh.
-source "$HOME/sysroot-gui/env.sh"

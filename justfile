@@ -107,35 +107,6 @@ render-snapshots *args:
 render-snapshots-update:
     UPDATE_SNAPSHOTS=1 cargo test -p eidola-gui --test visual
 
-# --- Linux dev environment (Docker) ---
-#
-# Build/test eidola-gui for Linux from a macOS host — the fast dev loop only.
-# The Linux *release* artifact is Nix-built (`nix build .#eidola-gui-linux`;
-# see flake.nix and oci/eidola-gui/Containerfile's header). Linux artifacts
-# land in ./target-linux/ (CARGO_TARGET_DIR in the image), coexisting with ./target/.
-
-# Build the eidola-gui-dev image (idempotent; Docker reuses cached layers).
-gui-dev-image:
-    docker build -f oci/eidola-gui/Containerfile -t eidola-gui-dev:latest .
-
-# Open a shell in the gui-dev container with the workspace bind-mounted.
-# Registry/git caches persist via named volumes.
-gui-dev-shell: gui-dev-image
-    docker run --rm -it \
-        -v "$(pwd):/src" \
-        -v eidola-gui-dev-cargo-registry:/usr/local/cargo/registry \
-        -v eidola-gui-dev-cargo-git:/usr/local/cargo/git \
-        eidola-gui-dev:latest /bin/bash
-
-# Run an arbitrary command inside the gui-dev container, e.g.
-#   `just gui-dev-run cargo test -p eidola-gui`
-gui-dev-run *cmd: gui-dev-image
-    docker run --rm \
-        -v "$(pwd):/src" \
-        -v eidola-gui-dev-cargo-registry:/usr/local/cargo/registry \
-        -v eidola-gui-dev-cargo-git:/usr/local/cargo/git \
-        eidola-gui-dev:latest {{ cmd }}
-
 # Interactive UI driver for agent-led QA: real offscreen-rendered windows
 # driven over a JSON-lines stdin/stdout protocol (open scenes, list named
 # elements, click, type, screenshot). Protocol docs in

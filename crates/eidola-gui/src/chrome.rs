@@ -66,7 +66,7 @@ use gpui_component::{ActiveTheme, Icon, IconName, Root, Sizable, StyledExt, h_fl
 use crate::probe::Probe;
 
 /// Shadow / resize-border reach outside the visible frame, on untiled edges.
-pub(crate) const SHADOW_SIZE: Pixels = px(12.);
+const SHADOW_SIZE: Pixels = px(12.);
 
 /// Width of the visible frame's border (the `.border_*_1()` calls below).
 /// Part of [`content_insets`] so view-side geometry math lands exactly on the
@@ -81,7 +81,7 @@ const RESIZE_INNER_REACH: Pixels = px(4.);
 /// Window corner radius when client-decorated and untiled. 12px matches the
 /// GNOME (Adwaita) window radius so the frame sits naturally among native
 /// windows.
-pub(crate) const CORNER_RADIUS: Pixels = px(12.);
+const CORNER_RADIUS: Pixels = px(12.);
 
 /// Height of the window-controls buttons (matches the 36px title strip).
 const CONTROL_HEIGHT: Pixels = px(36.);
@@ -134,7 +134,7 @@ pub(crate) fn themed_root(view: AnyView, window: &mut Window, cx: &mut Context<R
 /// Per-side distance from the window surface's edge to the visible frame's
 /// content box: shadow padding + frame border on untiled edges when client-
 /// decorated, zero everywhere else (macOS, SSD, tests, tiled edges).
-pub(crate) fn content_insets(window: &Window) -> Edges<Pixels> {
+fn content_insets(window: &Window) -> Edges<Pixels> {
     if !cfg!(target_os = "linux") {
         return Edges::default();
     }
@@ -170,12 +170,12 @@ pub(crate) fn content_size(window: &Window) -> Size<Pixels> {
 /// check this on mouse-down so a press at the very edge starts a *resize*,
 /// never arms a window move.
 pub(crate) fn in_resize_band(window: &Window, pos: Point<Pixels>) -> bool {
-    let Decorations::Client { tiling } = window.window_decorations() else {
-        return false;
-    };
     if !cfg!(target_os = "linux") {
         return false;
     }
+    let Decorations::Client { tiling } = window.window_decorations() else {
+        return false;
+    };
     let size = window.window_bounds().get_bounds().size;
     resize_edge(pos, SHADOW_SIZE, size, tiling).is_some()
 }

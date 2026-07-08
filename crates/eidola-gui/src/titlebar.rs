@@ -24,7 +24,7 @@ use std::cell::Cell;
 
 use gpui::{
     App, Div, InteractiveElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Stateful, Styled, Window, div,
+    Pixels, Stateful, Styled, Window, div, prelude::FluentBuilder,
 };
 use gpui_component::InteractiveElementExt;
 
@@ -83,13 +83,17 @@ pub(crate) fn make_draggable(
             window.zoom_window();
         }
     })
-    .on_mouse_down(
-        MouseButton::Right,
-        |ev: &MouseDownEvent, window: &mut Window, _| {
-            // No-op off Linux (the platform default impl does nothing).
-            window.show_window_menu(ev.position);
-        },
-    )
+    // Right-click → the compositor's window menu (move / resize / workspace).
+    // Linux-only: `show_window_menu` is a no-op on macOS, so we skip registering
+    // a dead right-click hitbox over the drag strip there.
+    .when(!cfg!(target_os = "macos"), |el| {
+        el.on_mouse_down(
+            MouseButton::Right,
+            |ev: &MouseDownEvent, window: &mut Window, _| {
+                window.show_window_menu(ev.position);
+            },
+        )
+    })
 }
 
 /// A full-width, transparent drag band absolutely positioned over a window's

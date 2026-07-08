@@ -1005,16 +1005,6 @@ impl Render for SpaceView {
 
         self.composer_prev_off_y = self.composer_scroll.offset().y.as_f32();
 
-        // Headless-QA hook: the sway/grim rig can inject text but not wheel
-        // events, so scrolled states (where several chrome/corner bugs live)
-        // would otherwise be unreachable there. `EIDOLA_DEBUG_SCROLL=<px>`
-        // pins the page scroll offset every frame; unset in normal use.
-        if let Ok(v) = std::env::var("EIDOLA_DEBUG_SCROLL")
-            && let Ok(y) = v.parse::<f32>()
-        {
-            self.page_scroll.set_offset(gpui::point(px(0.), px(y)));
-        }
-
         let body = self.render_forest(&tree, doc_reserve, page_width, window_h, streaming, cx);
 
         crate::chrome::round_client_corners(div(), window)
