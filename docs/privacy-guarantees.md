@@ -72,7 +72,7 @@ These invariants describe what you get when you install and run a **generally-av
 
 **5.3.** **[S]** Secrets that allow access to persisted state inside the enclave (`CREDENTIAL_MASTER_KEY`, `DATABASE_PASSWORD`) are injected as Tinfoil secrets bound to the enclave measurement. A different measurement cannot retrieve them; the server image itsle has no intrinsic ability to access its own persisted state outside the attested boot path.
 
-**5.4.** **[S]** The client trust root pins exactly one upstream- inference enclave-measurement set per release (`releases/trust/tinfoil-enclaves.json`, baked into the server binary at compile time). Updates go through PR review with Sigstore provenance verification before merge. (See [upstream.md](upstream.md#what-pins-the-upstream-measurement).)
+**5.4.** **[S]** The Eidola server resolves the upstream inference enclave-measurement set at runtime from the provider's latest release, verifying its Sigstore provenance (Fulcio chain + Rekor, against the expected repository identity and exact release tag) before trusting it. It refuses to connect to — or start against — any enclave whose measurement it has not resolved and verified this way. (See [upstream.md](upstream.md#what-pins-the-upstream-measurement).)
 
 **5.5.** **[S]** Hardware-attestation collateral that the operator could plausibly poison (AMD KDS CRLs for SEV-SNP, Intel PCS collateral — TCB info, QE identity, PCK CRLs — for TDX) is fetched by the verifier directly from the hardware vendor in production mode; the operator is never a relay for its own collateral.
 

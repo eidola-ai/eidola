@@ -47,7 +47,6 @@ Each document's shape is owned by the Rust `serde` types shared between the rele
 | --- | --- | --- |
 | `artifact-manifest.json` | format owned by `scripts/artifact-manifest.sh` | `schema_version: 1`. Records OCI digests, the Nix desktop-build narHashes (macOS universal CLI/GUI, Linux GUI), and a denormalized copy of the enclave block. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). |
 | `releases/trust/server-enclave.json` | format owned by `scripts/artifact-manifest.sh`, consumed as raw JSON in `eidola-app-core/build.rs` | `schema_version: 1`. Holds just the enclave block (snp/tdx measurement + cmdline) so the cli build doesn't drag its own digest into its build context. |
-| `releases/trust/tinfoil-enclaves.json` | format owned by `.github/workflows/update-measurements.yml`, consumed as raw JSON in `eidola-server/build.rs` | `schema_version: 1`. Allowed upstream Tinfoil inference-enclave measurements the server's outbound verifier accepts. One entry per Tinfoil release, with provenance metadata (built\_at, artifact digest, Rekor log index); the workflow keeps the most recent two for rolling deploys. |
 | `release.json` | `eidola_attestation::ReleaseIndex` — `crates/eidola-attestation/src/trust_shapes.rs` | Unsigned URL-only index; cross-checked via referenced documents (see caveat below) |
 | `attestation.json` | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via `cosign sign-blob` (local PEM, PKCS#11 URI, or any KMS URI cosign supports), logged to Rekor as a `hashedrekord` v0.0.1 entry with a PKIX SubjectPublicKeyInfo (ECDSA-P256/P384 or Ed25519) in `signature.publicKey.content` |
 | `trust-constants.json` | `eidola_attestation::TrustConstants` — `crates/eidola-attestation/src/trust_shapes.rs` | Pinned trust values baked into the verifier at build time |
@@ -103,17 +102,16 @@ releases/
     attestation-templates-v1.json       # pinned claim templates
   trust/
     trust-constants.json                # non-derivable trust values (input)
-    sigstore-trusted-root.json          # upstream Sigstore TrustedRoot snapshot (input)
+    sigstore-trusted-root.json          # upstream Sigstore TrustedRoot snapshot (input — both eidola-app-core (updater) and eidola-server (runtime upstream-measurement resolver) build.rs embed it)
     server-enclave.json                 # paired-server enclave measurement (input — projection of artifact-manifest.json's enclave block, materialized as its own file so the cli build context can COPY it without dragging the manifest in)
-    tinfoil-enclaves.json               # allowed upstream Tinfoil inference-enclave measurements (input — server's build.rs reads this)
     attestant-provenance/               # informational hardware-attestation evidence for pinned attestant keys (NOT a build input — no build.rs or client reads it; auditor-facing only)
 artifact-manifest.json                  # full deployment record (output, signed by CI)
 crates/eidola-app-core/
   build.rs                              # generator: server-enclave.json + trust-constants.json + … → trust_root.gen.rs
   src/trust_root.rs                     # exposes the generated constants
 crates/eidola-server/
-  build.rs                              # generator: tinfoil-enclaves.json → measurements.gen.rs
-  src/measurements.rs                   # exposes the generated ALLOWED static
+  build.rs                              # generator: sigstore-trusted-root.json → sigstore_root.gen.rs
+  src/upstream_trust/                   # runtime upstream-measurement resolver (embeds SIGSTORE_TRUSTED_ROOT_JSON; resolves + Sigstore-verifies Tinfoil's latest release at runtime — no static measurement pin)
 ```
 
 The generator (`build.rs`) reads `releases/trust/server-enclave.json` — never the per-artifact digests. The chain that invalidates the pin: server source changes → server image digest changes → `tinfoil-config.yml` changes → kernel cmdline changes → enclave measurement changes → `server-enclave.json` changes → client rebuilds with the new pin. Because the client build context never reads `artifact-manifest.json`, regenerating the manifest after a client build doesn't trigger another client rebuild, so `just update-manifest` reaches a fixed point in a single run.

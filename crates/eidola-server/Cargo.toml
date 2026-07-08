@@ -82,6 +82,26 @@ eidola-common = { path = "../eidola-common" }
 # Tinfoil attestation verification
 tinfoil-verifier = { path = "../tinfoil-verifier" }
 
+# Runtime upstream-measurement resolution (src/upstream_trust): verifies the
+# Sigstore DSSE/in-toto GitHub artifact attestation on Tinfoil's latest
+# confidential-model-router release so the allowed enclave measurements can
+# track upstream without a rebuild. Same pure-Rust crypto stack the client's
+# update verifier (`eidola-app-core::updater`) uses; versions kept in lockstep.
+# This whole subsystem is temporary — it goes away when we self-host inference
+# and revert to a statically pinned measurement set.
+const-oid = { version = "0.9", features = ["db"] }
+der = { version = "0.7", features = ["pem", "alloc"] }
+spki = { version = "0.7", features = ["pem"] }
+x509-cert = "0.2"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+signature = "2"
+regex = "1"
+# Hot-swap the attesting reqwest::Client when the allowed measurement set
+# changes, without touching tinfoil-verifier (its connector bakes the set in
+# at construction, so we rebuild the client and swap it atomically).
+arc-swap = "1"
+
 # Utilities
 futures-util = "0.3"
 bytes = "1"
