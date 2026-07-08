@@ -137,6 +137,30 @@ jobs:
             echo "markdown=$markdown"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Install Linux GUI build dependencies
+        # The eidola-gui crate builds gpui's Wayland backend on Linux (the
+        # `wayland` feature in its Cargo.toml), which links fontconfig,
+        # freetype, libxkbcommon, wayland, and the Vulkan loader via
+        # pkg-config — the same set `nix develop .#gui` / `guiLinuxLibs`
+        # supplies locally. Without them the cargo gates fail in the
+        # fontconfig-sys build script. `libxkbcommon-x11-dev` is required at
+        # link time even for the Wayland-only build (upstream gpui_linux
+        # hardcodes the xkbcommon `x11` crate feature — see the GUI AGENTS.md).
+        # Gated on the rust scope: only the cargo gates compile the workspace
+        # (the markdown step builds just rumdl, which needs none of these).
+        if: steps.scope.outputs.rust == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            cmake \
+            libfontconfig-dev \
+            libfreetype-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libvulkan-dev
+
       - name: Install Rust toolchain
         # Needed for the cargo gates and for building rumdl; skip only when
         # neither scope is active (e.g. a workflow- or scripts-only PR).
