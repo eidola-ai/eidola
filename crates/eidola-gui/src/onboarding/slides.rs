@@ -507,7 +507,8 @@ fn slide_frame(
     // *only because* every revealed slide paints every frame (a plain
     // v_flex stack, no virtualization); if the slides ever render
     // conditionally or through `list()`, lift this state back onto the view
-    // (see `ChatView::text_states` for the failure mode and the pattern).
+    // (the retired chat view's `text_states` map, which died with an
+    // unmounted `list()` item, was the lesson here).
     let prose_state = window.use_keyed_state(
         SharedString::from(format!("onboarding-prose-{key}")),
         cx,

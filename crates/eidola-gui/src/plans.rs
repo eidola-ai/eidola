@@ -1,6 +1,6 @@
 //! Shared plans-list presentation: hairline-rule rows (name · price, credits
-//! underneath), no cards. Used by both the chat window's onboarding plans
-//! page (`chat.rs`) and the Settings Account pane (`account.rs`) so the two
+//! underneath), no cards. Used by both the onboarding window's plans slide
+//! (`onboarding/`) and the Settings Account pane (`account.rs`) so the two
 //! surfaces stay pixel-identical instead of drifting apart.
 
 use std::rc::Rc;

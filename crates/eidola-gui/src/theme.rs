@@ -42,11 +42,18 @@
 //! boundary. Per-window OS-appearance observers re-apply too (only `system`
 //! mode actually follows them).
 //!
-//! The neutral palettes are anchored on two fixed backgrounds chosen for
-//! the product's "good paper at noon, reading lamp at midnight" feel:
+//! The base palettes are **neutral** — the light has no cool/warm character
+//! at solar noon or solar midnight. Character is applied *only* in the ±2h
+//! windows around sunrise and sunset (see `tinted` / `tint_spec`), where the
+//! palette shifts cool toward dawn and warm toward dusk. This is the theme's
+//! bid at "rootedness" — the chrome tracks the character of real light
+//! through the embodied day. The two anchors are fixed backgrounds chosen
+//! for the product's "good paper at noon, reading lamp at midnight" feel:
 //!
-//! - **Day**: `#fefaf5` (254,250,245) — warm paper. Every other day surface
-//!   is the same warm family, translated up to track the brighter ground.
+//! - **Day**: `#ffffff` — a neutral near-white paper. Warmth in the base
+//!   lives in a few accent *foregrounds* (warm-brown chip labels), never in
+//!   the page ground or the chrome; the ground only takes a cast under the
+//!   sunrise/sunset tint.
 //! - **Night**: `#15191e` (21,25,30) — a cool blue-grey dark. Night
 //!   *surfaces* (cards, chips, borders, rows) follow the blue-grey ramp of
 //!   the anchor, while *text* stays warm-grey and the brand stays warm
@@ -486,7 +493,7 @@ pub fn observe_window_appearance(window: &mut Window) {
 fn tint_spec(dark: bool, character: LightCharacter) -> Option<([u8; 3], f32)> {
     match (dark, character) {
         (_, LightCharacter::Neutral) => None,
-        // Day: morning blue / low-sun ember over warm paper.
+        // Day: morning blue / low-sun ember over the neutral paper.
         (false, LightCharacter::Cool) => Some(([0x6d, 0x8f, 0xc0], 0.08)),
         (false, LightCharacter::Warm) => Some(([0xd0, 0x79, 0x3a], 0.08)),
         // Night: pre-dawn blue / dusk ember over the cool dark.
@@ -622,11 +629,12 @@ fn circadian_day(character: LightCharacter) -> ThemeConfig {
 fn day_colors() -> ThemeConfigColors {
     let mut c = ThemeConfigColors::default();
 
-    // Surfaces — the page grounds stay in the anchor's warm-paper family,
-    // translated up in lightness so cards/rules keep their relative depth
-    // on the brighter paper; the chip/chrome family below is neutral grey.
-    c.background = some("#ffffff"); // anchor: warm paper
-    c.foreground = some("#000000"); // warm ink
+    // Surfaces — a neutral near-white paper. Cards/rules translate up in
+    // lightness so they keep their relative depth on the bright ground; the
+    // chip/chrome family below is neutral grey. The base carries no cast —
+    // the sunrise/sunset tint is what gives day its cool/warm character.
+    c.background = some("#ffffff"); // anchor: neutral paper
+    c.foreground = some("#000000"); // ink
     c.border = some("#d8d8d8"); // hairline rule
     c.input = some("#e4e4e4"); // card-border
     c.muted = some("#fbfbfb"); // code-bg
@@ -647,11 +655,10 @@ fn day_colors() -> ThemeConfigColors {
     c.link = some("#1e5478");
     c.link_hover = some("#2a6a94");
 
-    // Subtle / chip surfaces — neutral greys (luminance-matched to the
-    // warm creams they replaced), in the family of the separator band
-    // (`muted`), with warm brown foregrounds — day's mirror of night's
-    // cool-chip / warm-text tension. The warmth of the page lives in the
-    // paper and the brand, not the chrome.
+    // Subtle / chip surfaces — neutral greys in the family of the separator
+    // band (`muted`), with warm-brown foregrounds — day's mirror of night's
+    // cool-grounds / warm-text tension. The base grounds and chrome stay
+    // neutral; the day's cool/warm character arrives with the circadian tint.
     c.secondary = some("#ececec");
     c.secondary_foreground = some("#66615b");
     c.secondary_hover = some("#e3e3e3");
@@ -1087,9 +1094,14 @@ mod tests {
     #[test]
     fn day_chrome_is_neutral_grey_with_warm_foregrounds() {
         let day = day_colors();
-        // The chip/sidebar family is true grey — in the separator band's
-        // (`muted`) neutral family, not the paper's warm cream.
+        // The base is fully neutral — the paper ground and chrome carry no
+        // cast (the sunrise/sunset tint is what colors them). Every ground
+        // and chip surface is a true grey, in the separator band's (`muted`)
+        // neutral family.
         for (field, hex) in [
+            ("background", &day.background),
+            ("title_bar", &day.title_bar),
+            ("tab_bar", &day.tab_bar),
             ("secondary", &day.secondary),
             ("secondary_hover", &day.secondary_hover),
             ("secondary_active", &day.secondary_active),
@@ -1104,12 +1116,10 @@ mod tests {
         ] {
             assert_eq!(spread(hex), 0, "{field} must be a neutral grey: {hex:?}");
         }
-        // …while the foregrounds keep the warm brand tension (the mirror
-        // of night's cool chips / warm text).
+        // …while a few accent foregrounds keep the warm-brown tension (the
+        // mirror of night's cool grounds / warm text).
         assert!(spread(&day.secondary_foreground) > 0);
         assert!(spread(&day.sidebar_accent_foreground) > 0);
-        // And the paper stays warm.
-        assert!(spread(&day.title_bar) > 0, "the page keeps its warm paper");
     }
 
     #[test]
