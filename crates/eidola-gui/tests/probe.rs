@@ -11,14 +11,19 @@
 use std::sync::{Mutex, MutexGuard};
 
 use eidola_app_core::{
-    BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
+    AttestationInfo, BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
+    PriceInfo, RequestInfo, SpendTrailEntry,
 };
+use eidola_gui::account::AccountView;
 use eidola_gui::actions::ToggleModelPicker;
+use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::{OnboardingView, Slide};
 use eidola_gui::probe;
+use eidola_gui::record::{RecordSection, RecordView};
 use eidola_gui::space_view::SpaceView;
 use eidola_gui::stores::{Stores, StoresStub};
+use eidola_gui::wallet::WalletView;
 use eidola_gui::window_input::WindowInput;
 use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
 use gpui_component::Root;
@@ -157,6 +162,24 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
                 prompt_credits_per_token: 1.05,
                 completion_credits_per_token: 5.25,
                 request_credits: None,
+            },
+        ];
+        s.prices = vec![
+            PriceInfo {
+                id: "price_month".into(),
+                product_name: "Monthly".into(),
+                product_description: Some("Recurring top-up".into()),
+                amount_display: "$10".into(),
+                recurrence: "/mo".into(),
+                credits: 10_000_000,
+            },
+            PriceInfo {
+                id: "price_once".into(),
+                product_name: "One-time".into(),
+                product_description: None,
+                amount_display: "$5".into(),
+                recurrence: "".into(),
+                credits: 5_000_000,
             },
         ];
     })
@@ -366,6 +389,226 @@ fn onboarding_probes_record_ctas_and_inputs(cx: &mut TestAppContext) {
             "create-account probe {expected:?} missing; recorded: {names:?}"
         );
     }
+    // The Control slide's repository link is scoped per-label (the former
+    // shared `onboarding/link` name collided across every link).
+    assert!(
+        names
+            .iter()
+            .any(|n| n.starts_with("onboarding/link/") && n.contains("repository")),
+        "scoped repository link probe missing; recorded: {names:?}"
+    );
+
+    // Walk to the Purchase slide (via the existing-account branch) and assert
+    // the shared plans component annotates each row under the onboarding scope.
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+        v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"onboarding/plans"),
+        "onboarding plans listbox probe missing; recorded: {names:?}"
+    );
+    assert!(
+        names.contains(&"onboarding/plan/0"),
+        "onboarding plan-row probe missing; recorded: {names:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Record window — the raw local trail. Listing rows, section tabs, refresh,
+// and the load-more affordance are all probed (indexed row names so a driver
+// can address "the third attestation" precisely).
+// ---------------------------------------------------------------------------
+
+fn stub_attestation(hash: &str) -> AttestationInfo {
+    AttestationInfo {
+        hash: hash.into(),
+        pcr_digest: Some("pcr-abc".into()),
+        created_at: 1_000,
+        doc_bytes: 2_048,
+        connection_count: 3,
+    }
+}
+
+fn stub_request(id: &str) -> RequestInfo {
+    RequestInfo {
+        id: id.into(),
+        method: "POST".into(),
+        path: "/v1/chat/completions".into(),
+        response_status: Some(200),
+        duration_ms: Some(742),
+        request_at: 1_000,
+        error: None,
+        attempt_number: 1,
+        credential_nonce: Some("nonce-1".into()),
+        transport: Some("clearnet".into()),
+        base_url: Some("https://eidola.example".into()),
+        attestation_hash: Some("att-1".into()),
+    }
+}
+
+fn stub_spend(request_id: &str) -> SpendTrailEntry {
+    SpendTrailEntry {
+        credential_nonce: "nonce-1".into(),
+        spend_amount: Some(1_000),
+        credential_state: "spent".into(),
+        request_id: request_id.into(),
+        method: "POST".into(),
+        path: "/v1/chat/completions".into(),
+        request_at: 1_000,
+        duration_ms: Some(742),
+        attempt_number: 1,
+        action_id: Some("act-1".into()),
+        action_type: Some("inference".into()),
+        model: Some("gemma4-31b".into()),
+        credits_consumed: Some(950),
+        intent: Some("chat".into()),
+        space_id: Some("space-1".into()),
+        space_title: Some("A space".into()),
+        linkability: None,
+    }
+}
+
+#[gpui::test]
+fn record_probes_cover_rows_tabs_and_chrome(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+
+    // Attestations section: rows have `has_more` so the load-more affordance
+    // renders too.
+    view.update(cx, |v, _| {
+        v.set_attestations_for_test(vec![stub_attestation("att-hash-1")], true);
+    });
+    let names = fresh_names(cx, window);
+    for expected in [
+        "record/section/attestations",
+        "record/section/requests",
+        "record/section/spending",
+        "record/refresh",
+        "record/attestation/0",
+        "record/load-more",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "record probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    // Requests section.
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Requests, cx);
+        v.set_requests_for_test(vec![stub_request("req-1")], false);
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"record/request/0".to_string()),
+        "record request-row probe missing; recorded: {names:?}"
+    );
+
+    // Spending section.
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Spending, cx);
+        v.set_spending_for_test(vec![stub_spend("req-1")], false);
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"record/spend/0".to_string()),
+        "record spend-row probe missing; recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+// ---------------------------------------------------------------------------
+// Settings cluster — the Account and Wallet panes and General's affordances.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/account/reset",
+        "settings/account/refresh-balances",
+        // The shared plans component, scoped to the Account host.
+        "settings/account/plans",
+        "settings/account/plan/0",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "account pane probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn wallet_pane_probes_cover_refresh(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| WalletView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/wallet/refresh".to_string()),
+        "wallet refresh probe missing; recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn general_pane_probes_cover_change_and_advanced(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let window_input = cx.update(WindowInput::new);
+    let wi = window_input.clone();
+    let (window, _view) = open_view(cx, move |window, cx| {
+        cx.new(|cx| GeneralView::new(stores.config.clone(), wi, window, cx))
+    });
+
+    // At rest: the "Change…" affordance and the appearance chips are probed.
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/general/change",
+        "settings/general/appearance/system",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "general probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    // Holding ⌥ reveals the advanced rows, including the Record cross-link.
+    cx.update(|cx| {
+        window_input.update(cx, |wi, cx| wi.set_alt_for_test(true, cx));
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/general/open-record".to_string()),
+        "advanced open-record link probe missing under ⌥; recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
 }
 
 #[gpui::test]

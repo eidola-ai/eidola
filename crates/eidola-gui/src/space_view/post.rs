@@ -159,6 +159,16 @@ impl SpaceView {
                         "space-post-reasoning-{}",
                         node.id
                     )))
+                    .probe(
+                        format!("space/post/{i}/reasoning"),
+                        gpui::Role::Button,
+                        if post.reasoning_expanded {
+                            "Hide thinking"
+                        } else {
+                            "Show thinking"
+                        },
+                    )
+                    .aria_expanded(post.reasoning_expanded)
                     .text_sm()
                     .text_color(theme.muted_foreground)
                     .cursor_pointer()
@@ -466,6 +476,11 @@ impl SpaceView {
                 "space-draft-inactive-{}",
                 node.id
             )))
+            .probe(
+                "space/draft/inactive",
+                gpui::Role::Button,
+                "Draft — click to edit",
+            )
             // Re-activate on click (byline/gutter clicks that miss the editor);
             // `on_click` (mouse-up) so the focus sticks — focusing during
             // mouse-down is undone by that same event's focus pass. Clicking the
@@ -511,6 +526,16 @@ impl SpaceView {
             col = col.child(
                 div()
                     .id("space-reasoning-toggle")
+                    .probe(
+                        "space/reasoning/toggle",
+                        gpui::Role::Button,
+                        if streaming.expanded {
+                            "Hide thinking"
+                        } else {
+                            "Show thinking"
+                        },
+                    )
+                    .aria_expanded(streaming.expanded)
                     .text_sm()
                     .text_color(theme.muted_foreground)
                     .cursor_pointer()
@@ -612,7 +637,7 @@ impl SpaceView {
                     div()
                         .id(SharedString::from(format!("space-dot-{parent_id}-{i}")))
                         .probe(
-                            "space/branch-dot",
+                            format!("space/band/dot/{i}"),
                             gpui::Role::Button,
                             SharedString::from(format!("Branch {}", i + 1)),
                         )

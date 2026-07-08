@@ -834,6 +834,7 @@ impl RecordView {
         }
         div()
             .id("load-more")
+            .probe("record/load-more", gpui::Role::Button, "Load more")
             .w_full()
             .h(ROW_H)
             .flex()
@@ -863,6 +864,11 @@ impl RecordView {
             format_bytes(a.doc_bytes),
         );
         self.row_shell(("attestation", dix), dix, cx)
+            .probe(
+                format!("record/attestation/{dix}"),
+                gpui::Role::ListItem,
+                format!("Attestation {}", truncate_middle(&a.hash, 44)),
+            )
             .on_click(cx.listener(move |this, _, _, cx| this.open_attestation(hash.clone(), cx)))
             .child(
                 h_flex()
@@ -961,6 +967,11 @@ impl RecordView {
         sub_parts.push(fmt_utc(r.request_at, false));
 
         self.row_shell(("request", dix), dix, cx)
+            .probe(
+                format!("record/request/{dix}"),
+                gpui::Role::ListItem,
+                format!("{} {} — {}", r.method, r.path, status_text),
+            )
             .on_click(cx.listener(move |this, _, _, cx| this.open_request(id.clone(), cx)))
             .child(
                 h_flex()
@@ -1048,6 +1059,11 @@ impl RecordView {
                 "Attestation",
                 mono(12.)
                     .id("open-attestation")
+                    .probe(
+                        "record/detail/attestation-link",
+                        gpui::Role::Link,
+                        format!("Open attestation {}", truncate_middle(&hash, 44)),
+                    )
                     .cursor_pointer()
                     .text_color(theme.link)
                     .hover(|s| s.text_color(theme.link_hover))
@@ -1092,6 +1108,11 @@ impl RecordView {
                 "Space",
                 div()
                     .id("open-space")
+                    .probe(
+                        "record/detail/space-link",
+                        gpui::Role::Link,
+                        format!("Open space {}", space_label),
+                    )
                     .text_sm()
                     .cursor_pointer()
                     .text_color(theme.link)
@@ -1179,6 +1200,19 @@ impl RecordView {
 
         v_flex()
             .id(("spend", i))
+            .probe(
+                format!("record/spend/{i}"),
+                gpui::Role::ListItem,
+                format!(
+                    "{} {} — {}",
+                    e.method,
+                    e.path,
+                    match e.credits_consumed {
+                        Some(c) => format!("{} credits", crate::plans::format_credits(c)),
+                        None => "—".to_string(),
+                    }
+                ),
+            )
             .w_full()
             .h(ROW_H)
             .justify_center()
@@ -1251,6 +1285,11 @@ impl RecordView {
         h_flex().pb_2().child(
             div()
                 .id("back")
+                .probe(
+                    "record/detail/back",
+                    gpui::Role::Button,
+                    format!("Back to {label}"),
+                )
                 .text_sm()
                 .cursor_pointer()
                 .text_color(theme.muted_foreground)
@@ -1310,6 +1349,11 @@ fn raw_section(payload: &CachedPayload, cx: &Context<RecordView>) -> Div {
             .child(
                 div()
                     .id(SharedString::from(format!("copy-{}", payload.id)))
+                    .probe(
+                        format!("record/detail/copy/{}", payload.id),
+                        gpui::Role::Button,
+                        format!("Copy {}", payload.title),
+                    )
                     .text_xs()
                     .cursor_pointer()
                     .text_color(theme.muted_foreground)

@@ -371,12 +371,19 @@ impl Render for GeneralView {
                                 ),
                         )
                         .child(
-                            Button::new("cancel-base-url")
-                                .ghost()
-                                .small()
-                                .label("Cancel")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.cancel_edit_base_url(cx)),
+                            // Probed wrapper for the a11y role/label — shrink-wraps
+                            // the button so its bounds are an honest click target.
+                            div()
+                                .id("cancel-base-url-wrap")
+                                .probe("settings/general/cancel", gpui::Role::Button, "Cancel")
+                                .child(
+                                    Button::new("cancel-base-url")
+                                        .ghost()
+                                        .small()
+                                        .label("Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_edit_base_url(cx)
+                                        })),
                                 ),
                         ),
                 );
@@ -413,10 +420,17 @@ impl Render for GeneralView {
                         .on_click(cx.listener(|this, _, _, cx| this.revert_base_url(cx))),
                 );
             }
-            links =
-                links.child(quiet_link("edit-base-url", "Change…", cx).on_click(
-                    cx.listener(|this, _, window, cx| this.begin_edit_base_url(window, cx)),
-                ));
+            links = links.child(
+                quiet_link("edit-base-url", "Change…", cx)
+                    .probe(
+                        "settings/general/change",
+                        gpui::Role::Button,
+                        "Change base URL",
+                    )
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.begin_edit_base_url(window, cx)),
+                    ),
+            );
             base_value = base_value.child(links);
         }
         col = col.child(field_row("Base URL", cx, base_value));
@@ -509,6 +523,11 @@ impl Render for GeneralView {
                                 "Inspect attestation evidence in the Record (⇧⌘L)",
                                 cx,
                             )
+                            .probe(
+                                "settings/general/open-record",
+                                gpui::Role::Link,
+                                "Inspect attestation evidence in the Record",
+                            )
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(Box::new(OpenRecord), cx);
                             }),
@@ -530,7 +549,12 @@ impl Render for GeneralView {
         }
 
         if let Some(err) = error {
-            col = col.child(error_banner(&err, cx));
+            col = col.child(
+                div()
+                    .id("general-error")
+                    .probe("settings/general/error", gpui::Role::Alert, err.clone())
+                    .child(error_banner(&err, cx)),
+            );
         }
 
         col

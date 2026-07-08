@@ -433,6 +433,7 @@ impl SpaceView {
             byline = byline.child(
                 div()
                     .id("space-draft-home")
+                    .probe("space/composer/home", gpui::Role::Button, "See in context")
                     .mt_1()
                     .px_1()
                     .rounded_md()

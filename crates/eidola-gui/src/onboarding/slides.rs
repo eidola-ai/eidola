@@ -256,7 +256,9 @@ impl RenderOnce for CreateAccount {
                             .p_1(),
                     ),
             )
-            .when_some(self.error, |el, err| el.child(error_line(err, cx)));
+            .when_some(self.error, |el, err| {
+                el.child(error_line("create", err, cx))
+            });
 
         let label = if self.creating {
             "Creating your anonymous account…"
@@ -372,7 +374,7 @@ impl RenderOnce for ExistingAccount {
                     format_credits(*available)
                 )),
             )),
-            Some(Err(msg)) => extras.child(error_line(msg.clone(), cx)),
+            Some(Err(msg)) => extras.child(error_line("verify", msg.clone(), cx)),
             None => extras,
         };
 
@@ -460,9 +462,12 @@ impl RenderOnce for Purchase {
                     &self.prices,
                     self.checkout_pending.as_deref(),
                     self.on_select,
+                    "onboarding",
                     cx,
                 ))
-                .when_some(self.checkout_error, |el, err| el.child(error_line(err, cx)))
+                .when_some(self.checkout_error, |el, err| {
+                    el.child(error_line("checkout", err, cx))
+                })
                 .into_any_element()
         };
 
@@ -574,9 +579,18 @@ fn cta_button(
 /// A standalone clickable external link line ("Label ↗").
 fn link_row(label: &'static str, url: &'static str, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
+    let slug: String = label
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
     div()
         .id(SharedString::from(format!("onboarding-link-{label}")))
-        .probe("onboarding/link", Role::Link, label)
+        .probe(
+            SharedString::from(format!("onboarding/link/{slug}")),
+            Role::Link,
+            label,
+        )
         .w_full()
         .cursor_pointer()
         .text_color(theme.link)
@@ -651,10 +665,18 @@ fn labeled_input(
     )
 }
 
-/// A danger-colored inline error line.
-fn error_line(message: String, cx: &App) -> impl IntoElement {
+/// A danger-colored inline error line. `key` scopes the a11y/driver name so
+/// concurrently-revealed slides (create / verify / checkout) don't collide;
+/// the `Alert` role makes assistive technology announce the failure.
+fn error_line(key: &'static str, message: String, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     div()
+        .id(SharedString::from(format!("onboarding-error-{key}")))
+        .probe(
+            SharedString::from(format!("onboarding/error/{key}")),
+            Role::Alert,
+            SharedString::from(message.clone()),
+        )
         .text_sm()
         .text_color(theme.danger)
         .child(SharedString::from(message))

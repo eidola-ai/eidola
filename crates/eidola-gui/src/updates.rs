@@ -402,6 +402,15 @@ fn render_unverifiable(version: &str, reason: &str, cx: &gpui::App) -> impl Into
         .w_full()
         .child(
             v_flex()
+                .id("updates-security-warning")
+                .probe(
+                    "updates/security-warning",
+                    gpui::Role::Alert,
+                    format!(
+                        "Security warning: the release marked latest (v{version}) could not \
+                         be verified. {reason}"
+                    ),
+                )
                 .w_full()
                 .px_3()
                 .py_3()

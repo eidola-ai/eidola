@@ -54,6 +54,9 @@ impl Render for AboutView {
             .items_center()
             .child(
                 div()
+                    .id("about-title")
+                    .probe("about/title", gpui::Role::Heading, "Eidola")
+                    .aria_level(1)
                     .text_size(px(32.))
                     .line_height(relative(1.2))
                     .child("Eidola"),

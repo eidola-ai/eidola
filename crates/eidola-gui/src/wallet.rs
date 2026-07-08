@@ -154,7 +154,11 @@ impl Render for WalletView {
                 // button so its bounds are an honest click target.
                 div()
                     .id("recover-all-wrap")
-                    .probe("wallet/recover", gpui::Role::Button, "Recover in-flight")
+                    .probe(
+                        "settings/wallet/recover",
+                        gpui::Role::Button,
+                        "Recover in-flight",
+                    )
                     .child(
                         Button::new("recover-all")
                             .small()
@@ -167,13 +171,24 @@ impl Render for WalletView {
             );
         }
         actions = actions.child(
-            Button::new("refresh-credentials")
-                .ghost()
-                .small()
-                .label("Refresh")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.wallet.update(cx, |s, cx| s.refresh(cx));
-                })),
+            // Probed wrapper for the a11y role/label — shrink-wraps the
+            // button so its bounds are an honest click target.
+            div()
+                .id("refresh-credentials-wrap")
+                .probe(
+                    "settings/wallet/refresh",
+                    gpui::Role::Button,
+                    "Refresh credentials",
+                )
+                .child(
+                    Button::new("refresh-credentials")
+                        .ghost()
+                        .small()
+                        .label("Refresh")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.wallet.update(cx, |s, cx| s.refresh(cx));
+                        })),
+                ),
         );
         header = header.child(actions);
         col = col.child(header);

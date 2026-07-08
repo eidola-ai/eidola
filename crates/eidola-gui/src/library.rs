@@ -466,6 +466,9 @@ impl Render for LibraryView {
                 .child(div().h(px(1.)).flex_1().bg(theme.border))
                 .child(
                     div()
+                        .id("library-title")
+                        .probe("library/title", gpui::Role::Heading, "Library")
+                        .aria_level(1)
                         .text_sm()
                         .italic()
                         .text_color(theme.muted_foreground)
