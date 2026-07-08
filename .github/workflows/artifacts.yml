@@ -414,6 +414,25 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Free up disk space
+        # The Nix build compiles the full gpui tree from source on a cold
+        # Cachix cache and bundles Mesa's ~1 GB closure into /nix/store (on the
+        # root disk) — enough to exhaust the stock ubuntu runner's ~20 GB free
+        # (the same overflow that hit rust-checks). Reclaim the big preinstalled
+        # toolchains this job never uses (~25 GB), leaving
+        # /opt/hostedtoolcache/node for the node-based Nix/Cachix actions below.
+        # `rm -rf` ignores any path absent on a given image.
+        run: |
+          before=$(df --output=avail -BG / | tail -1)
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift
+          echo "Root disk avail: $before -> $(df --output=avail -BG / | tail -1)"
+
       - name: Install stamped tinfoil-config.yml + recomputed server-enclave.json
         env:
           STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}

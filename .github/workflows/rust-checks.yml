@@ -137,6 +137,27 @@ jobs:
             echo "markdown=$markdown"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Free up disk space
+        # gpui is a very large dep tree, and the debug + `--all-targets` build
+        # (with the `inspector` feature) plus the cargo registry/git and the
+        # restored rust-cache overflows the ~20 GB free on the stock ubuntu
+        # runner root disk — linking failed with "No space left on device".
+        # Reclaim the big preinstalled toolchains this job never uses (~25 GB).
+        # Deliberately does NOT touch /opt/hostedtoolcache/node — the
+        # node-based actions below (rust-cache) run from it. `rm -rf` ignores
+        # any path absent on a given image.
+        if: steps.scope.outputs.rust == 'true'
+        run: |
+          before=$(df --output=avail -BG / | tail -1)
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift
+          echo "Root disk avail: $before -> $(df --output=avail -BG / | tail -1)"
+
       - name: Install Linux GUI build dependencies
         # The eidola-gui crate builds gpui's Wayland backend on Linux (the
         # `wayland` feature in its Cargo.toml), which links fontconfig,
