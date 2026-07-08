@@ -158,7 +158,7 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
         let body: gpui::AnyElement = match self.selected {
@@ -186,6 +186,7 @@ impl Render for SettingsView {
                     wi.update_modifiers(event, cx);
                 });
             }))
+            .relative()
             .size_full()
             .items_start()
             .bg(theme.background)
@@ -222,5 +223,13 @@ impl Render for SettingsView {
                         .child(body),
                 ),
             )
+            // Drag band last so it paints atop the sidebar/body columns and
+            // wins hit-testing across the full-width traffic-light reserve.
+            .child(crate::titlebar::drag_band(
+                "settings-titlebar",
+                NAV_TOP_RESERVE,
+                window,
+                cx,
+            ))
     }
 }

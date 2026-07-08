@@ -164,6 +164,38 @@ impl AccountStore {
         Some(rx)
     }
 
+    /// Verify an *existing* account entered by the user: set its credentials,
+    /// then fetch its balance. On success the credentials stay configured (the
+    /// user has now linked their account); on failure they are rolled back so a
+    /// bad ID/secret attempt doesn't strand broken credentials in the config.
+    /// The caller (onboarding "existing account" slide) awaits the returned
+    /// receiver in its own task slot. `None` on a stub.
+    pub fn request_verify_account(
+        &self,
+        id: String,
+        secret: String,
+    ) -> Option<oneshot::Receiver<Result<BalancesResult, AppError>>> {
+        let core = self.app_core.clone()?;
+        let (tx, rx) = oneshot::channel();
+        core.runtime().handle().clone().spawn(async move {
+            let result = async {
+                core.set_account_credentials(id, secret)?;
+                match core.account_balances().await {
+                    Ok(balances) => Ok(balances),
+                    Err(e) => {
+                        // Undo the just-written credentials so the config is
+                        // unchanged after a failed verification attempt.
+                        let _ = core.reset_account();
+                        Err(e)
+                    }
+                }
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+        Some(rx)
+    }
+
     /// Fetch balances; the caller (checkout poll) awaits inside its own loop.
     /// `None` on a stub.
     pub fn request_balances(&self) -> Option<oneshot::Receiver<Result<BalancesResult, AppError>>> {

@@ -110,7 +110,17 @@ use crate::syntax::{ListKind, NodeKind, SyntaxNode};
 /// bug; we've fixed several of those by migrating to the canonical
 /// helpers.
 pub fn render(state: &EditorState, tree: &[SyntaxNode]) -> RenderSpec {
-    let cursor = CursorRange::from(&state.selection);
+    render_with_cursor(state, tree, CursorRange::from(&state.selection))
+}
+
+/// Render as **published** markdown — no live cursor, so every WYSIWYG
+/// delimiter is hidden and the content reads as finished prose. Used for a
+/// disabled (read-only) editor, where there is no caret to reveal syntax near.
+pub fn render_readonly(state: &EditorState, tree: &[SyntaxNode]) -> RenderSpec {
+    render_with_cursor(state, tree, CursorRange::nowhere())
+}
+
+fn render_with_cursor(state: &EditorState, tree: &[SyntaxNode], cursor: CursorRange) -> RenderSpec {
     let mut real_blocks = Vec::new();
     for node in tree {
         render_node(node, tree, &state.markdown, cursor, &[], &mut real_blocks);
@@ -384,6 +394,18 @@ impl CursorRange {
         Self {
             start: sel.lower_bound(),
             end: sel.upper_bound(),
+        }
+    }
+
+    /// A cursor that is *nowhere* — past every real offset, so it overlaps no
+    /// construct and every delimiter stays hidden (the read-only/published
+    /// render). `start == end` keeps it a collapsed cursor, but at `usize::MAX`
+    /// the boundary-equality clause in [`overlaps`](Self::overlaps) can never
+    /// match a real range either.
+    fn nowhere() -> Self {
+        Self {
+            start: usize::MAX,
+            end: usize::MAX,
         }
     }
 

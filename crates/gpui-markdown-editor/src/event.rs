@@ -1,7 +1,47 @@
-//! User actions that can mutate `EditorState`. Routed by `editor.rs` from
-//! gpui actions and IME callbacks; consumed by `update::update`.
+//! Two event vocabularies live here:
+//!
+//! - [`EditorEvent`] — the *internal* command enum: user actions that can
+//!   mutate `EditorState`. Routed by `editor.rs` from gpui actions and IME
+//!   callbacks; consumed by `update::update`. Never leaves the crate.
+//! - [`MarkdownEditorEvent`] — the *outward* `EventEmitter` surface that
+//!   `MarkdownEditorState` publishes to its host (the `Input`/`InputEvent`
+//!   idiom from gpui-component). The host `cx.subscribe`s to these instead of
+//!   reaching into the editor's fields; the editor emits *intent* (a key was
+//!   pressed, the text changed) and the host owns the *meaning* (submit vs
+//!   post, commit-edit vs new-post).
 
 use crate::state::Selection;
+
+/// Outward events published by `MarkdownEditorState` via `EventEmitter`.
+///
+/// Mirrors gpui-component's `InputEvent` so a host wires a markdown editor
+/// the same way it wires a `gpui_component::Input`. The editor reports what
+/// happened; the host decides what it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownEditorEvent {
+    /// The markdown text changed (typing, paste, IME commit, programmatic
+    /// `set_value`/`clear`). Hosts that mirror or persist the buffer subscribe
+    /// to this instead of polling `value()` each frame.
+    Change,
+    /// The caret/selection moved without a buffer change — keyboard navigation
+    /// (arrows, Home/End, word moves). A host that scrolls the caret into view
+    /// listens to this too, since a pure navigation move produces no
+    /// [`Change`](Self::Change). Never emitted from edit/IME paths (those emit
+    /// `Change`).
+    SelectionChanged,
+    /// A submit-intent key chord fired. `secondary` is true when the platform
+    /// "primary" modifier (⌘ on macOS) was held; `shift` when Shift was held.
+    /// The host maps the chord to its own semantics — e.g. `{secondary: true,
+    /// shift: false}` = ⌘↩ "post & ask", `{secondary: true, shift: true}` =
+    /// ⌘⇧↩ "post only". Plain Enter never emits this (it inserts a newline);
+    /// only the modified chords the host bound to a `Enter { secondary, .. }`
+    /// action do.
+    PressEnter { secondary: bool, shift: bool },
+    /// The editor gained keyboard focus.
+    Focus,
+    /// The editor lost keyboard focus.
+    Blur,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorEvent {

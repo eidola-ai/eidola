@@ -44,7 +44,7 @@ impl AboutView {
 }
 
 impl Render for AboutView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
         // Wordmark block: large "Eidola" + a hairline rule underneath,
@@ -54,6 +54,9 @@ impl Render for AboutView {
             .items_center()
             .child(
                 div()
+                    .id("about-title")
+                    .probe("about/title", gpui::Role::Heading, "Eidola")
+                    .aria_level(1)
                     .text_size(px(32.))
                     .line_height(relative(1.2))
                     .child("Eidola"),
@@ -110,10 +113,17 @@ impl Render for AboutView {
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
             }))
+            .relative()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .pt(TITLE_BAR_RESERVE)
+            .child(crate::titlebar::drag_band(
+                "about-titlebar",
+                TITLE_BAR_RESERVE,
+                window,
+                cx,
+            ))
             // Centered column, capped at the prose measure.
             .child(
                 h_flex()

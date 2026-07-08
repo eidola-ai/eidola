@@ -70,10 +70,10 @@ fn encrypt_private_key(
 
     let mut nonce_bytes = [0u8; 12];
     rand_core::OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| ServerError::Internal(format!("AES encryption failed: {}", e)))?;
 
     let mut out = Vec::with_capacity(12 + ciphertext.len());
@@ -95,10 +95,11 @@ fn decrypt_private_key(
     let aes_key = derive_key_encryption_key(master_key, key_id);
     let cipher = Aes256Gcm::new_from_slice(&aes_key)
         .map_err(|e| ServerError::Internal(format!("AES key init failed: {}", e)))?;
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes)
+        .map_err(|e| ServerError::Internal(format!("invalid nonce length: {}", e)))?;
 
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| ServerError::Internal(format!("AES decryption failed: {}", e)))
 }
 

@@ -10,29 +10,171 @@ use eidola_app_core::updates::{
 use eidola_app_core::{
     AttestationDetail, AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState,
     CredentialLifecycleInfo, MeasurementInfo, ModelInfo, PriceInfo, RequestDetail, RequestInfo,
-    SpaceInfo, SpaceMessage, SpendTrailEntry,
+    SpaceInfo, SpendTrailEntry,
 };
 use eidola_gui::about::AboutView;
-use eidola_gui::chat::{ChatView, StreamingResponse};
 use eidola_gui::library::LibraryView;
+use eidola_gui::onboarding::OnboardingView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
+use eidola_gui::space_view::SpaceView;
 use eidola_gui::stores::{Stores, StoresStub};
 use eidola_gui::updates::UpdatesView;
 use eidola_gui::window_input::WindowInput;
 use gpui::{App, AppContext, px, size};
-use gpui_markdown_editor::{EditorState, Selection};
 
+use super::fixtures::{fixture_post, kitchen_sink_posts};
 use super::harness::Snapshots;
 
 pub fn register(s: &mut Snapshots) {
-    register_chat(s);
-    register_onboarding(s);
+    register_space(s);
+    register_onboarding_window(s);
     register_library(s);
     register_settings(s);
     register_updates(s);
     register_record(s);
     register_about(s);
+}
+
+// ---------------------------------------------------------------------------
+// Space view — the tree-navigation conversation surface (wave-6)
+// ---------------------------------------------------------------------------
+
+fn register_space(s: &mut Snapshots) {
+    // An *existing* space (Some id → no composer at rest): the kitchen-sink post
+    // tree rendered through the new SpaceView — byline gutter, Newsreader prose
+    // posts (read-only `MarkdownEditor`, published — no delimiters), and
+    // separator bands with the "+" reply affordance. You click "+" to start a
+    // draft.
+    s.add("space_branches", size(px(900.), px(720.)), |window, cx| {
+        let core = stub_stores_with_config(cx);
+        cx.new(|cx| {
+            let view = SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+            view.space().update(cx, |sp, cx| {
+                sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
+            });
+            view
+        })
+    });
+
+    // A brand-new blank space: the composer open at the top of an empty page
+    // (the cursor in a fresh notebook).
+    s.add("space_blank", size(px(760.), px(680.)), |window, cx| {
+        let core = stub_stores_with_config(cx);
+        cx.new(|cx| SpaceView::new(core, None, WindowInput::new(cx), window, cx))
+    });
+
+    // A draft with content: the action gutter reveals the discoverable
+    // submit — Ask beside the draft, the model chip (the addressee) below it.
+    s.add(
+        "space_composer_actions",
+        size(px(900.), px(680.)),
+        |window, cx| {
+            let core = model_stores(cx);
+            cx.new(|cx| {
+                let view = SpaceView::new(core, None, WindowInput::new(cx), window, cx);
+                if let Some(editor) = view.composer_state_for_test() {
+                    editor.update(cx, |e, cx| {
+                        e.set_value(
+                            "What did Thrasymachus actually claim about justice?".to_string(),
+                            cx,
+                        )
+                    });
+                }
+                view
+            })
+        },
+    );
+
+    // ⌥ held: the Post (save-without-asking) verb and the keyboard hints join
+    // the action gutter — the "Option reveals power" expansion.
+    s.add(
+        "space_composer_alt",
+        size(px(900.), px(680.)),
+        |window, cx| {
+            let core = model_stores(cx);
+            let wi = WindowInput::new(cx);
+            wi.update(cx, |w, cx| w.set_alt_for_test(true, cx));
+            cx.new(|cx| {
+                let view = SpaceView::new(core, None, wi, window, cx);
+                if let Some(editor) = view.composer_state_for_test() {
+                    editor.update(cx, |e, cx| {
+                        e.set_value(
+                            "What did Thrasymachus actually claim about justice?".to_string(),
+                            cx,
+                        )
+                    });
+                }
+                view
+            })
+        },
+    );
+
+    // The request panel open under the model chip: the model list with honest
+    // per-model info, current + default markers.
+    s.add(
+        "space_request_panel",
+        size(px(900.), px(680.)),
+        |window, cx| {
+            let core = model_stores(cx);
+            cx.new(|cx| {
+                let mut view = SpaceView::new(core, None, WindowInput::new(cx), window, cx);
+                if let Some(editor) = view.composer_state_for_test() {
+                    editor.update(cx, |e, cx| {
+                        e.set_value(
+                            "What did Thrasymachus actually claim about justice?".to_string(),
+                            cx,
+                        )
+                    });
+                }
+                view.toggle_request_panel(cx);
+                view
+            })
+        },
+    );
+
+    // Per-post affordances: hovering the assistant reply reveals Regenerate in
+    // its action gutter, and the finalized post keeps its reasoning disclosure
+    // ("Thinking…") above the body.
+    s.add("space_post_actions", size(px(900.), px(680.)), |window, cx| {
+        let core = model_stores(cx);
+        cx.new(|cx| {
+            let mut view =
+                SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+            view.space().update(cx, |sp, cx| {
+                let q = fixture_post(
+                    "a1",
+                    "human",
+                    "user",
+                    "user_input",
+                    "What did Thrasymachus actually claim about justice?",
+                    0,
+                    false,
+                    1,
+                );
+                let mut a = fixture_post(
+                    "a2",
+                    "agent",
+                    "kimi-k2-6",
+                    "inference",
+                    "Three threads worth pulling apart: the position, the shepherd, and what the exchange is really about.",
+                    0,
+                    false,
+                    1,
+                );
+                a.parent_action_id = Some("a1".into());
+                sp.set_post_tree_for_test(vec![q, a], cx);
+                sp.set_reasoning_for_test(
+                    1,
+                    "The user is asking about Republic I. Anchor on 338c and 343b.".into(),
+                    false,
+                    cx,
+                );
+            });
+            view.set_post_hover_for_test("a2", true, cx);
+            view
+        })
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -173,86 +315,19 @@ fn register_updates(s: &mut Snapshots) {
 // Onboarding (chat window empty states)
 // ---------------------------------------------------------------------------
 
-fn register_onboarding(s: &mut Snapshots) {
-    // No account → the empty page is the welcome page.
+// The standalone onboarding window (wave-6): full-window slides. The first
+// slide (present at rest) shows the prose heading + intro vertically centered in
+// the reading column with the ghost-button CTA at the bottom.
+fn register_onboarding_window(s: &mut Snapshots) {
     s.add(
-        "onboarding_welcome",
-        size(px(705.), px(705.)),
+        "onboarding_window",
+        size(px(760.), px(760.)),
         |window, cx| {
             let stores = stub_stores(cx, |s| {
                 s.config_state = Some(stub_config_state(false));
-            });
-            cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx))
-        },
-    );
-
-    // Account just created, balance known-zero → the plans page.
-    s.add(
-        "onboarding_plans",
-        size(px(705.), px(705.)),
-        |window, cx| {
-            let stores = stub_stores(cx, |s| {
-                s.config_state = Some(stub_config_state(true));
-                s.balances = Some(BalancesResult {
-                    available: 0,
-                    pools: Vec::new(),
-                });
                 s.prices = stub_prices();
             });
-            cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx))
-        },
-    );
-
-    // Checkout URL opened — the balance poll is running.
-    s.add(
-        "onboarding_plans_waiting",
-        size(px(705.), px(705.)),
-        |window, cx| {
-            let stores = stub_stores(cx, |s| {
-                s.config_state = Some(stub_config_state(true));
-                s.balances = Some(BalancesResult {
-                    available: 0,
-                    pools: Vec::new(),
-                });
-                s.prices = stub_prices();
-            });
-            cx.new(|cx| {
-                let mut view = ChatView::new(stores, None, WindowInput::new(cx), window, cx);
-                view.onboarding_mut_for_test().awaiting_checkout = true;
-                view
-            })
-        },
-    );
-
-    // A later submit failed with InsufficientBalance: the plans surface
-    // below the transcript via the error band — not a modal.
-    s.add(
-        "chat_insufficient_balance_plans",
-        size(px(705.), px(705.)),
-        |window, cx| {
-            let stores = stub_stores(cx, |s| {
-                s.config_state = Some(stub_config_state(true));
-                s.balances = Some(BalancesResult {
-                    available: 100,
-                    pools: Vec::new(),
-                });
-                s.prices = stub_prices();
-            });
-            cx.new(|cx| {
-                let mut view = ChatView::new(stores, None, WindowInput::new(cx), window, cx);
-                view.set_messages_for_test(
-                    vec![SpaceMessage {
-                        role: "user".into(),
-                        content: "Can you summarize the attached design doc?".into(),
-                    }],
-                    cx,
-                );
-                view.set_error_for_test(Some(
-                    "insufficient balance: 6200 credits required, 100 available".into(),
-                ));
-                view.show_plans_after_error = true;
-                view
-            })
+            cx.new(|cx| OnboardingView::new(stores, window, cx))
         },
     );
 }
@@ -289,746 +364,6 @@ fn stub_prices() -> Vec<PriceInfo> {
 // ---------------------------------------------------------------------------
 // Chat
 // ---------------------------------------------------------------------------
-
-fn register_chat(s: &mut Snapshots) {
-    s.add("chat_empty", size(px(900.), px(640.)), |window, cx| {
-        let core = stub_stores_with_config(cx);
-        cx.new(|cx| ChatView::new(core, None, WindowInput::new(cx), window, cx))
-    });
-
-    // REGRESSION (wave-4 QA round 2, finding 1b): a space opened from the
-    // Library loads its transcript *after* the first paint. The window renders
-    // once with an empty transcript (just the composer), then the async load
-    // completes and the messages must all appear. Construct the ChatView on a
-    // space id (the real `open_space_window` path) so its transcript starts
-    // `NotLoaded`, paint, then drive the *real* load-completion (through
-    // `apply_loaded_transcript`, not a direct poke), paint again. Every message
-    // must be visible. This is a dynamic transition the static `chat_with_*`
-    // snapshots never exercised.
-    s.add_with_step(
-        "chat_library_load_completes",
-        size(px(760.), px(620.)),
-        |window, cx| {
-            let core = stub_stores_with_config(cx);
-            cx.new(|cx| {
-                // `Some(id)` joins the registry and (with a real backend) would
-                // kick the transcript load; with stub stores there is no
-                // backend, so the transcript rests `NotLoaded` — exactly the
-                // pre-load first-paint state.
-                ChatView::new(
-                    core,
-                    Some("space-lib".into()),
-                    WindowInput::new(cx),
-                    window,
-                    cx,
-                )
-            })
-        },
-        |cx, window, view| {
-            cx.update_window(window, |_, _, cx| {
-                view.update(cx, |v, cx| {
-                    v.apply_loaded_transcript_for_test(
-                        vec![
-                            SpaceMessage {
-                                role: "user".into(),
-                                content: "What did we decide about the enclave pin?".into(),
-                            },
-                            SpaceMessage {
-                                role: "assistant".into(),
-                                content: "We hold the zed pin at 969a67fc — deliberately behind \
-                                    main — until the upstream action-timing profiler race is \
-                                    fixed, because libtest runs the editor behavior tests in \
-                                    parallel."
-                                    .into(),
-                            },
-                            SpaceMessage {
-                                role: "user".into(),
-                                content: "And the cli trust root?".into(),
-                            },
-                            SpaceMessage {
-                                role: "assistant".into(),
-                                content: "The cli build COPYs releases/trust/server-enclave.json \
-                                    and embeds it as its trust root, so the enclave block is the \
-                                    single build-time input tying the cli to the server."
-                                    .into(),
-                            },
-                        ],
-                        cx,
-                    );
-                });
-            })
-            .ok();
-        },
-    );
-
-    // REGRESSION (wave-4 QA round 2, finding 1a): a longer conversation — later
-    // exchanges must not lose earlier messages. Drive three full
-    // submit→delta→StreamEnded cycles (the real transition shape), growing the
-    // transcript to six turns. Every turn must remain rendered after the third
-    // cycle. The static populated snapshots never drove these transitions.
-    s.add_with_step(
-        "chat_long_conversation_grows",
-        size(px(760.), px(620.)),
-        |window, cx| {
-            let core = stub_stores_with_config(cx);
-            cx.new(|cx| ChatView::new(core, None, WindowInput::new(cx), window, cx))
-        },
-        |cx, window, view| {
-            for turn in 1..=3u32 {
-                // Drive a *real* submit through the Send action so the runner's
-                // append + tail engagement happen exactly as in production.
-                let (focus, editor) =
-                    view.read_with(cx, |v, _| (v.focus_handle(), v.prompt_editor_for_test()));
-                cx.update_window(window, |_, _, cx| {
-                    editor.update(cx, |e, cx| {
-                        e.state = EditorState::with_markdown(format!(
-                            "Question number {turn}, please answer in detail."
-                        ));
-                        cx.notify();
-                    });
-                })
-                .ok();
-                cx.update_window(window, |_, window, cx| {
-                    focus.dispatch_action(&eidola_gui::chat::Send, window, cx);
-                })
-                .ok();
-                cx.run_until_parked();
-                // Stream ends: streaming clears and the assistant turn lands via
-                // the post-stream transcript reload (the StreamEnded reconcile).
-                cx.update_window(window, |_, _, cx| {
-                    view.update(cx, |v, cx| {
-                        let mut as_space: Vec<SpaceMessage> =
-                            v.messages(cx).into_iter().map(|m| m.message).collect();
-                        v.set_streaming_for_test(None, cx);
-                        as_space.push(SpaceMessage {
-                            role: "assistant".into(),
-                            content: format!(
-                                "This is the full answer to question {turn}, with enough text to \
-                                 occupy a couple of lines so the transcript actually grows."
-                            ),
-                        });
-                        v.set_messages_for_test(as_space, cx);
-                    });
-                })
-                .ok();
-                cx.run_until_parked();
-            }
-        },
-    );
-
-    // REGRESSION (wave-4 QA round 3): the disappearing transcript. The real
-    // mechanism (proven from gpui list.rs at the pin): `splice`/`reset`
-    // replace items with `Unmeasured { size_hint: None }`, whose summary
-    // height is 0px, and paint only measures from the scroll anchor DOWN —
-    // so a wholesale reset while the reader is at the tail collapses every
-    // item above the anchor to zero height, making them unreachable. The
-    // killer transition is a stream FINALIZING while the list follows the
-    // tail (exactly the user's flow: submit → response streams in → ends):
-    // the StreamEnded rebuild reshaped the items, the old reset-always
-    // reconcile wiped all measured heights, the at-tail re-pin anchored at
-    // the end, and everything above became a zero-height void — scrolling
-    // up "jumped" through it and the first message read as gone forever.
-    // This case replays that flow: walk to the bottom (measuring along the
-    // way), engage tail-follow the way submit does, drive a stream start +
-    // finalize reshape, then walk back up to the top and screenshot: the
-    // first message ("Why is the sky blue?") must be visible.
-    s.add_with_step(
-        "chat_scroll_roundtrip_first_message",
-        size(px(760.), px(560.)),
-        |window, cx| {
-            let core = stub_stores_with_config(cx);
-            cx.new(|cx| {
-                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view.set_messages_for_test(
-                    vec![
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "Why is the sky blue?".into(),
-                        },
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content: "Sunlight is a fairly even mix across the visible spectrum. \
-                                As it crosses the atmosphere it meets molecules far smaller than \
-                                its wavelength, and those scatter short (blue) wavelengths far \
-                                more strongly than long (red) ones — the intensity goes as one \
-                                over the fourth power of the wavelength.\n\nSo blue light is \
-                                flung in every direction and reaches your eye from all across the \
-                                dome of the sky, while reds and yellows travel a straighter path. \
-                                At midday that paints the whole sky a soft blue."
-                                .into(),
-                        },
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "And at sunset?".into(),
-                        },
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content:
-                                "Near sunset the light skims a long, slanted path through the \
-                                air, the blue is scattered away entirely, and what survives to \
-                                reach you is the warm red-orange of a low sun. The same physics, \
-                                a longer path — so the colour that wins is the one that is left \
-                                after most of the blue has been thrown sideways out of the beam \
-                                before it ever gets to you."
-                                    .into(),
-                        },
-                    ],
-                    cx,
-                );
-                view
-            })
-        },
-        |cx, window, view| {
-            // Walk down to the bottom in small wheel-sized steps (positive =
-            // toward the tail), re-parking (painting) after each so the list
-            // measures items as they enter.
-            for _ in 0..24 {
-                cx.update_window(window, |_, _, cx| {
-                    view.update(cx, |v, cx| v.scroll_transcript_by_for_test(90., cx));
-                })
-                .ok();
-                cx.run_until_parked();
-            }
-            // Engage tail-follow exactly as submit does, then drive a stream
-            // start + finalize — the reshape pair that wiped all measured
-            // heights under the old reset-always reconcile.
-            cx.update_window(window, |_, _, cx| {
-                view.update(cx, |v, cx| {
-                    v.follow_tail_for_test(cx);
-                    v.set_streaming_for_test(
-                        Some(StreamingResponse {
-                            content: "The horizon trick again: a long slanted path strips the \
-                                blue out before it reaches you."
-                                .into(),
-                            ..Default::default()
-                        }),
-                        cx,
-                    );
-                });
-            })
-            .ok();
-            cx.run_until_parked();
-            cx.update_window(window, |_, _, cx| {
-                view.update(cx, |v, cx| {
-                    v.append_message_for_test(
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content: "The horizon trick again: a long slanted path strips the \
-                                blue out before it reaches you."
-                                .into(),
-                        },
-                        cx,
-                    );
-                    v.set_streaming_for_test(None, cx);
-                });
-            })
-            .ok();
-            cx.run_until_parked();
-            // Walk back up to the top — through what was, pre-fix, a
-            // zero-height void where the earlier turns used to be.
-            for _ in 0..40 {
-                cx.update_window(window, |_, _, cx| {
-                    view.update(cx, |v, cx| v.scroll_transcript_by_for_test(-90., cx));
-                })
-                .ok();
-                cx.run_until_parked();
-            }
-        },
-    );
-
-    // Narrow window — guards that the chapter delimiter tracks the prose
-    // body's width edge-for-edge. Earlier the delim sized itself
-    // independently and rendered small + left-aligned when the window was
-    // narrower than the prose max-width cap. Snapshot here is wider than
-    // the rule's hairline so a regression would be obvious.
-    s.add(
-        "chat_with_messages_narrow",
-        size(px(480.), px(520.)),
-        |window, cx| {
-            let core = stub_stores_with_config(cx);
-            cx.new(|cx| {
-                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view_with_messages(
-                    view,
-                    vec![
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "Quick check?".into(),
-                        },
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content: "Yes — everything looks fine on the latest deploy.".into(),
-                        },
-                    ],
-                    cx,
-                )
-            })
-        },
-    );
-
-    // "Mid" width — wider than the prose max-width cap (640px) but well
-    // short of the original 900px reference. This is the size where the
-    // earlier flex-1-rules implementation collapsed: prose's max-w bound,
-    // but the inner h_flex's flex-1 rules had no definite parent width to
-    // grow into and rendered as a left-aligned label with no rules.
-    // 680px logical width — exactly the size where the user observed
-    // the delim outer container collapsing to content width in the live
-    // app (1360 physical at 2x DPR). The bug shows the outer `RED` debug
-    // border shrunk to wrap the absolute rule + label rather than
-    // stretching to the row width. Earlier we used a plain `div()` here
-    // and the offscreen renderer happened not to reproduce; switching
-    // the outer to `v_flex()` (matching the message row) made the live
-    // app and the test both stretch correctly.
-    s.add(
-        "chat_with_messages_breakpoint",
-        size(px(680.), px(640.)),
-        |window, cx| {
-            let core = stub_stores_with_config(cx);
-            cx.new(|cx| {
-                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view_with_messages(
-                    view,
-                    vec![
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "Breakpoint check.".into(),
-                        },
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content: "Delim outer should stretch to full row width regardless \
-                                of the prose column being narrower."
-                                .into(),
-                        },
-                    ],
-                    cx,
-                )
-            })
-        },
-    );
-
-    // Live-app width — mirrors the size where the user reported the
-    // delim breaking with rules visible only on the left side. If this
-    // reproduces locally, the bug is in our layout code; if it doesn't,
-    // there's something the offscreen renderer does differently from
-    // the live app harness.
-    s.add(
-        "chat_with_messages_live",
-        size(px(1400.), px(1000.)),
-        |window, cx| {
-            let core = stub_stores_with_config(cx);
-            cx.new(|cx| {
-                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view_with_messages(
-                    view,
-                    vec![
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "Live width check.".into(),
-                        },
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content: "If you can see this rule extending past the label on both \
-                                left and right, the layout is correct at the user's reported \
-                                window width."
-                                .into(),
-                        },
-                    ],
-                    cx,
-                )
-            })
-        },
-    );
-
-    s.add(
-        "chat_with_messages_mid",
-        size(px(820.), px(640.)),
-        |window, cx| {
-            let core = stub_stores_with_config(cx);
-            cx.new(|cx| {
-                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view_with_messages(
-                    view,
-                    vec![
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "Mid-width check.".into(),
-                        },
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content:
-                                "Hairline rule should span the full prose column width with the \
-                            label centered and masking the line behind it."
-                                    .into(),
-                        },
-                    ],
-                    cx,
-                )
-            })
-        },
-    );
-
-    s.add(
-        "chat_with_messages",
-        size(px(900.), px(640.)),
-        |window, cx| {
-            let core = stub_stores(cx, |s| {
-                s.config_state = Some(stub_config_state(true));
-            });
-            cx.new(|cx| {
-                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                // Push a few messages directly into the view's state so we can
-                // render the populated chat without driving any async work.
-                view_with_messages(
-                    view,
-                    vec![
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "What's the deployment status?".into(),
-                        },
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content: "Last release v0.0.93 was deployed at 14:02 UTC. The Tinfoil \
-                                  enclave verifier reports a fresh attestation chain."
-                                .into(),
-                        },
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "Any pending work?".into(),
-                        },
-                    ],
-                    cx,
-                )
-            })
-        },
-    );
-
-    s.add(
-        "chat_with_markdown",
-        size(px(900.), px(640.)),
-        |window, cx| {
-            let core = stub_stores(cx, |s| {
-                s.config_state = Some(stub_config_state(true));
-            });
-            cx.new(|cx| {
-                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view_with_messages(
-                    view,
-                    vec![
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "Show me how to register a tokio runtime in a small Rust \
-                                program, with a heading, a list, and a code fence."
-                                .into(),
-                        },
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content: "## Registering a runtime\n\nYou have two convenient \
-                                options:\n\n1. **Macro** — `#[tokio::main]` rewrites `main` for \
-                                you.\n2. **Manual** — build a `Runtime` and call `block_on`.\n\n\
-                                Manual setup, for when you need fine control:\n\n```rust\n\
-                                use tokio::runtime::Runtime;\n\nfn main() {\n    let rt = \
-                                Runtime::new().expect(\"build runtime\");\n    rt.block_on(async \
-                                {\n        println!(\"hello from tokio\");\n    });\n}\n```\n\n\
-                                The macro form is shorter, but the manual form makes the \
-                                runtime's *lifetime* explicit — useful when you want to share \
-                                one runtime across an FFI boundary."
-                                .into(),
-                        },
-                    ],
-                    cx,
-                )
-            })
-        },
-    );
-
-    // Composer (WYSIWYG markdown editor) populated with the constructs
-    // whose typography has to track the transcript: inline code inside a
-    // paragraph and inside list items, a tight list, and a code fence.
-    // This is the surface where inline-code sizing and list-item spacing
-    // are judged against the prose body under the real Circadian theme +
-    // Newsreader pairing (the editor crate's own snapshots render with
-    // the default system fonts, so they can't catch pairing problems).
-    s.add(
-        "chat_composer_markdown",
-        size(px(900.), px(640.)),
-        |window, cx| {
-            let core = stub_stores_with_config(cx);
-            let view = cx.new(|cx| {
-                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view_with_messages(
-                    view,
-                    vec![SpaceMessage {
-                        role: "user".into(),
-                        content: "Transcript turn above the composer, with `inline code` \
-                            for comparison."
-                            .into(),
-                    }],
-                    cx,
-                )
-            });
-            let editor = view.read(cx).prompt_editor_for_test();
-            editor.update(cx, |editor, cx| {
-                let markdown = "Drafting a reply that mixes `Runtime::new()` and plain \
-                    prose in one paragraph.\n\
-                    \n\
-                    - the macro rewrites `main` for you\n\
-                    - manual setup hands you a runtime to `block_on`\n\
-                    - both drive the same scheduler\n\
-                    \n\
-                    And a fence for comparison:\n\
-                    \n\
-                    ```rust\n\
-                    let rt = Runtime::new()?;\n\
-                    ```\n";
-                editor.state = EditorState {
-                    markdown: markdown.into(),
-                    selection: Selection::Cursor(0),
-                };
-                cx.notify();
-            });
-            view
-        },
-    );
-
-    // ⌥ held — the model label reveals right-aligned in the title-bar band,
-    // text_sm muted italic, matching the chapter-delim voice. The page
-    // content underneath must be identical to the resting state (the band
-    // is absolute chrome; the reveal cannot shift layout).
-    s.add(
-        "chat_model_reveal",
-        size(px(705.), px(705.)),
-        |window, cx| {
-            let core = model_stores(cx);
-            cx.new(|cx| {
-                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view.set_messages_for_test(
-                    vec![
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "What's the tide schedule for tomorrow?".into(),
-                        },
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content:
-                                "High tide lands at 06:41 and 19:12; lows at 00:55 and 13:03. \
-                        The morning high is the stronger of the two."
-                                    .into(),
-                        },
-                    ],
-                    cx,
-                );
-                view.set_alt_held_for_test(true, cx);
-                view
-            })
-        },
-    );
-
-    // Picker open (⌥⌘M or clicking the revealed label) — a quiet panel
-    // under the band's right edge listing Core.models with honest
-    // per-model info; current selection and config default marked, and
-    // the secondary "set as default" affordance in the footer.
-    s.add(
-        "chat_model_picker",
-        size(px(705.), px(705.)),
-        |window, cx| {
-            let core = model_stores(cx);
-            cx.new(|cx| {
-                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view.set_messages_for_test(
-                    vec![SpaceMessage {
-                        role: "user".into(),
-                        content: "Comparing models for a long document review.".into(),
-                    }],
-                    cx,
-                );
-                view.select_model("kimi-k2-6".into(), window, cx);
-                view.set_model_picker_open_for_test(true);
-                view.set_alt_held_for_test(true, cx);
-                view
-            })
-        },
-    );
-
-    // REGRESSION (wave-4 QA round 2, finding 2): pressing an arrow key in the
-    // open picker must HIGHLIGHT a row, not make the highlight vanish. Open the
-    // picker, then dispatch a real PickerDown through the focused action path
-    // (the same route a keystroke takes), re-park, and screenshot — the first
-    // row must show the highlight background. Driven through the real dispatch +
-    // paint path (not a direct state poke) so a regression in how the picker
-    // receives or repaints the highlight is caught.
-    s.add_with_step(
-        "chat_picker_keyboard_highlight",
-        size(px(705.), px(705.)),
-        |window, cx| {
-            let core = model_stores(cx);
-            cx.new(|cx| {
-                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view.set_alt_held_for_test(true, cx);
-                view
-            })
-        },
-        |cx, window, view| {
-            let focus = view.read_with(cx, |v, _| v.focus_handle());
-            cx.update_window(window, |_, window, cx| {
-                focus.dispatch_action(&eidola_gui::chat::ToggleModelPicker, window, cx);
-            })
-            .ok();
-            cx.run_until_parked();
-            cx.update_window(window, |_, window, cx| {
-                focus.dispatch_action(&eidola_gui::chat::PickerDown, window, cx);
-            })
-            .ok();
-            cx.run_until_parked();
-        },
-    );
-
-    // Persistent participant indicator — scrolled mid-assistant-message.
-    // The transcript is scrolled so the "Eidola" chapter delim (item 1's
-    // leading delim) is off the top of the viewport and the body fills the
-    // page; the title-bar band's LEFT side now carries the italic "Eidola"
-    // label so the reader still knows whose turn they're reading. The right
-    // side stays bare (⌥ not held). Day + night.
-    s.add_with_step(
-        "chat_participant_indicator_scrolled",
-        size(px(760.), px(560.)),
-        |window, cx| {
-            let core = stub_stores_with_config(cx);
-            cx.new(|cx| {
-                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view.set_messages_for_test(
-                    vec![
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "Walk me through how Rayleigh scattering tints the sky."
-                                .into(),
-                        },
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content: "Sunlight is white — a fairly even mix across the visible \
-                                spectrum. As it crosses the atmosphere it meets molecules far \
-                                smaller than its wavelength, and those molecules scatter short \
-                                (blue) wavelengths far more strongly than long (red) ones — the \
-                                intensity goes as one over the fourth power of the wavelength.\n\n\
-                                So blue light is flung in every direction and reaches your eye \
-                                from all across the dome of the sky, while the reds and yellows \
-                                travel a straighter path. At midday that paints the whole sky a \
-                                soft blue. Near sunset the light skims a long, slanted path \
-                                through the air, the blue is scattered away entirely, and what \
-                                survives to reach you is the warm red-orange of a low sun."
-                                .into(),
-                        },
-                    ],
-                    cx,
-                );
-                view
-            })
-        },
-        |cx, window, view| {
-            // After the first paint measured the items, scroll into the
-            // assistant turn well past its "Eidola" delim band so the delim is
-            // off the top and the persistent indicator takes over.
-            cx.update_window(window, |_, _, cx| {
-                view.update(cx, |v, cx| v.scroll_transcript_for_test(1, 180., cx));
-            })
-            .ok();
-        },
-    );
-
-    s.add("chat_thinking", size(px(900.), px(640.)), |window, cx| {
-        let core = stub_stores_with_config(cx);
-        cx.new(|cx| {
-            let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-            // Empty streaming response — renders the collapsed "Thinking…"
-            // header with no body yet, the moment after the user submits.
-            view_streaming(view, StreamingResponse::default(), cx)
-        })
-    });
-
-    s.add(
-        "chat_finalized_with_thinking",
-        size(px(900.), px(640.)),
-        |window, cx| {
-            // Reasoning persists past the stream end: a finalized
-            // assistant message exposes a "Thinking" disclosure that
-            // the user can re-open. Rendered here in the expanded
-            // state to verify the layout when the thinking body is
-            // visible alongside the answer.
-            let core = stub_stores_with_config(cx);
-            cx.new(|cx| {
-                let mut view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                view.set_messages_for_test(
-                    vec![
-                        SpaceMessage {
-                            role: "user".into(),
-                            content: "What's a Hilbert space, in one paragraph?".into(),
-                        },
-                        SpaceMessage {
-                            role: "assistant".into(),
-                            content: "A **Hilbert space** is a complete inner-product space — a \
-                            vector space equipped with an inner product whose induced norm \
-                            makes it a Banach space. The completeness lets you reason about \
-                            limits of Cauchy sequences (essential for things like Fourier \
-                            analysis), and the inner product gives you geometry: angles, \
-                            orthogonality, projections."
-                                .into(),
-                        },
-                    ],
-                    cx,
-                );
-                view.set_reasoning_for_test(
-                    1,
-                    "The user wants a one-paragraph definition. I should hit: vector space \
-                        + inner product, the induced norm, and completeness. Mention Fourier \
-                        as an application motivator. Skip the formal axioms — they're not \
-                        what 'in one paragraph' is asking for."
-                        .into(),
-                    true,
-                    cx,
-                );
-                view
-            })
-        },
-    );
-
-    s.add(
-        "chat_streaming_partial",
-        size(px(900.), px(640.)),
-        |window, cx| {
-            let core = stub_stores_with_config(cx);
-            cx.new(|cx| {
-                let view = ChatView::new(core, None, WindowInput::new(cx), window, cx);
-                let view = view_with_messages(
-                    view,
-                    vec![SpaceMessage {
-                        role: "user".into(),
-                        content: "Why is the sky blue?".into(),
-                    }],
-                    cx,
-                );
-                view_streaming(
-                    view,
-                    StreamingResponse {
-                        reasoning: "Let me think about Rayleigh scattering. Short \
-                            wavelengths interact more strongly with air molecules \
-                            than long wavelengths, so blue light gets scattered in \
-                            all directions while red passes through more directly.\n\n\
-                            I should mention the Sun's spectrum and human vision \
-                            response too — but keep it tight."
-                            .into(),
-                        content: "The sky looks blue because of **Rayleigh scattering**. \
-                            Sunlight is white, but as it passes through Earth's \
-                            atmosphere, shorter (blue) wavelengths scatter more strongly \
-                            than longer (red) ones, so blue light reaches your"
-                            .into(),
-                        expanded: true,
-                        error: None,
-                    },
-                    cx,
-                )
-            })
-        },
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Library
@@ -1585,23 +920,8 @@ fn stub_config_state(has_account: bool) -> ConfigState {
         has_hardware_root_ca: false,
         has_hardware_intermediate_ca: false,
         attestation_url: None,
+        appearance: eidola_app_core::config::AppearanceSetting::System,
+        time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
+        light_character: eidola_app_core::config::LightCharacter::Neutral,
     }
-}
-
-fn view_with_messages(
-    mut view: ChatView,
-    messages: Vec<SpaceMessage>,
-    cx: &mut gpui::Context<ChatView>,
-) -> ChatView {
-    view.set_messages_for_test(messages, cx);
-    view
-}
-
-fn view_streaming(
-    mut view: ChatView,
-    streaming: StreamingResponse,
-    cx: &mut gpui::Context<ChatView>,
-) -> ChatView {
-    view.set_streaming_for_test(Some(streaming), cx);
-    view
 }

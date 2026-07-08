@@ -1,17 +1,19 @@
 //! Shared plans-list presentation: hairline-rule rows (name · price, credits
-//! underneath), no cards. Used by both the chat window's onboarding plans
-//! page (`chat.rs`) and the Settings Account pane (`account.rs`) so the two
+//! underneath), no cards. Used by both the onboarding window's plans slide
+//! (`onboarding/`) and the Settings Account pane (`account.rs`) so the two
 //! surfaces stay pixel-identical instead of drifting apart.
 
 use std::rc::Rc;
 
 use gpui::{
-    App, ClickEvent, Div, InteractiveElement, ParentElement, SharedString,
+    App, ClickEvent, Div, InteractiveElement, ParentElement, Role, SharedString, Stateful,
     StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 use eidola_app_core::PriceInfo;
+
+use crate::probe::Probe;
 
 /// Handler invoked with the clicked plan's price id.
 pub type PlanSelectHandler = Rc<dyn Fn(String, &mut Window, &mut App)>;
@@ -25,10 +27,21 @@ pub fn plan_rows(
     prices: &[PriceInfo],
     pending: Option<&str>,
     on_select: PlanSelectHandler,
+    name_prefix: &str,
     cx: &App,
-) -> Div {
+) -> Stateful<Div> {
     let theme = cx.theme();
-    let mut list = v_flex().w_full();
+    // The plan list is a single-select listbox; each caller scopes its row
+    // probe names (`{prefix}/plan/{idx}`) so the same shared component is
+    // addressable in both the onboarding and Settings hosts.
+    let mut list = v_flex()
+        .id(SharedString::from(format!("{name_prefix}/plans")))
+        .probe(
+            format!("{name_prefix}/plans"),
+            Role::ListBox,
+            "Available plans",
+        )
+        .w_full();
 
     for (idx, price) in prices.iter().enumerate() {
         let price_line = if pending == Some(price.id.as_str()) {
@@ -42,10 +55,16 @@ pub fn plan_rows(
         }
         let price_id = price.id.clone();
         let on_select = on_select.clone();
+        let plan_aria = format!("{} — {}", price.product_name, price_line);
 
         list = list.child(
             v_flex()
                 .id(("plan", idx))
+                .probe(
+                    format!("{name_prefix}/plan/{idx}"),
+                    Role::ListBoxOption,
+                    plan_aria,
+                )
                 .w_full()
                 .py_3()
                 .gap_1()

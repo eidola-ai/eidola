@@ -313,38 +313,267 @@ fn auto_provisioning_empty_wallet_funded_account_succeeds() {
 // Typed failure: pre-space errors leave zero durable trace, emit nothing
 // ===========================================================================
 
+// ===========================================================================
+// Regenerate (Revise mode) — a new agent generation of an inference's item
+// ===========================================================================
+
 #[test]
-fn no_account_leaves_zero_trace_and_no_emissions() {
+fn regenerate_replaces_answer_with_a_new_generation() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+
+        // The inference action id is reachable via the Record (spend trail:
+        // credential → request → action).
+        let trail = core
+            .runtime()
+            .block_on(core.spend_trail(10, 0))
+            .expect("spend trail");
+        let inference_action_id = trail
+            .iter()
+            .find_map(|e| e.action_id.clone())
+            .expect("spend trail carries the inference action id");
+
+        // Regenerate: a new generation of the SAME inference item (Revise),
+        // a second real spend.
+        let regen = core
+            .runtime()
+            .block_on(core.regenerate(inference_action_id, MODEL.into()))
+            .expect("regenerate should succeed");
+        assert_eq!(regen.space_id, result.space_id);
+        assert!(regen.credits_charged > 0);
+
+        // The default view shows the regenerated answer in place — still two
+        // messages (user + current answer), not three: Revise replaces in the
+        // default view, where Reply would have appended a sibling.
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(result.space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.len(),
+            2,
+            "regenerate replaces the answer, not appends; got {messages:?}"
+        );
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+
+        // Two model calls → two inference requests recorded (each generation is
+        // its own costed inference).
+        assert_eq!(mock.chat_hits(), 2);
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        assert_eq!(requests.len(), 2, "two inference requests recorded");
+    });
+}
+
+#[test]
+fn regenerate_sends_only_upstream_context_at_current_versions() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+
+        // Two full turns: u1 -> i1 -> u2 -> i2.
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        core.runtime()
+            .block_on(core.chat(
+                "And why two per day?".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+            ))
+            .expect("second chat");
+
+        // Locate the first user post and the FIRST inference via the tree.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        assert_eq!(tree.len(), 4, "u1, i1, u2, i2; got {tree:#?}");
+        let u1 = tree[0].action_id.clone();
+        assert_eq!(tree[1].action_type, "inference");
+        let i1 = tree[1].action_id.clone();
+
+        // Edit the upstream question, then regenerate the FIRST answer.
+        core.runtime()
+            .block_on(core.edit_post(u1, "How do tides work? Explain it for a sailor.".into()))
+            .expect("edit");
+        core.runtime()
+            .block_on(core.regenerate(i1, MODEL.into()))
+            .expect("regenerate");
+
+        // The regenerate call (third request) must see ONLY its upstream
+        // thread — the edited question at its most recent version — never the
+        // downstream turn (u2/i2) or its own prior output (i1).
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3, "two chats + one regenerate");
+        let flat: Vec<(String, String)> = bodies[2]["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap_or_default().to_string(),
+                    m["content"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            vec![(
+                "user".to_string(),
+                "How do tides work? Explain it for a sailor.".to_string()
+            )],
+            "regenerate context = upstream only, most-recent versions"
+        );
+
+        // Sanity: the second chat (a Reply on the linear spine) saw the full
+        // thread — its target's inclusive ancestry is the whole conversation.
+        let second_messages = bodies[1]["messages"].as_array().expect("messages").len();
+        assert_eq!(second_messages, 3, "a linear reply sees the full thread");
+    });
+}
+
+#[test]
+fn branch_reply_sends_only_its_branch_context() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // A linear spine, streamed: u1 -> i1 -> u2 -> i2.
+        let (tx, _rx1) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let first = core
+            .runtime()
+            .block_on(core.chat_stream("How do tides work?".into(), MODEL.into(), None, tx))
+            .expect("first turn");
+        let (tx, _rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.chat_stream(
+                "And why two per day?".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+                tx,
+            ))
+            .expect("second turn");
+
+        // Branch off the FIRST answer (u2 already replies to i1, so this
+        // reply forks the thread there).
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        assert_eq!(tree.len(), 4, "u1, i1, u2, i2; got {tree:#?}");
+        assert_eq!(tree[1].action_type, "inference");
+        let i1 = tree[1].action_id.clone();
+
+        let (tx, _rx3) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.chat_stream_reply(
+                "What about spring tides?".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+                Some(i1),
+                tx,
+            ))
+            .expect("branch reply");
+
+        // The branch ask (third request) must see ONLY its own branch: the
+        // ancestry of the new post — never the sibling turn (u2/i2).
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3, "two spine turns + one branch reply");
+        let flat: Vec<(String, String)> = bodies[2]["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap_or_default().to_string(),
+                    m["content"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("user".to_string(), "How do tides work?".to_string()),
+                (
+                    "assistant".to_string(),
+                    "Hello from the stream.".to_string()
+                ),
+                ("user".to_string(), "What about spring tides?".to_string()),
+            ],
+            "branch reply context = the branch's ancestry only"
+        );
+    });
+}
+
+// Post-first contract (wave 5.2b): chat = post + run_turn. The post persists
+// the thought BEFORE the response request can fail on funding, so a NoAccount /
+// InsufficientBalance failure now leaves the saved post behind (and emits it),
+// while root() still routes onboarding. (Replaces the pre-inversion
+// "leaves_zero_trace" tests; decision #1 made concrete.)
+
+#[test]
+fn no_account_persists_post_then_fails_routing_to_onboarding() {
     run(|| {
         let (_mock, core, _dir) = setup(MockConfig::default());
-        // NO account configured and empty wallet → NoAccount before any space.
+        // No account, empty wallet: the post persists first, then the response
+        // request fails with NoAccount.
         let mut rx = core.subscribe_changes();
 
         let err = core
             .runtime()
             .block_on(core.chat("hi".into(), MODEL.into(), None))
             .expect_err("should fail with NoAccount");
+        // root() still routes onboarding; the error now carries the persisted
+        // space id (the post survived the funding failure).
         assert!(matches!(err.root(), AppError::NoAccount), "got {err:?}");
-        // Pre-space error stays unwrapped (no space id to adopt).
-        assert_eq!(err.chat_space_id(), None);
+        let space_id = err
+            .chat_space_id()
+            .expect("post persisted → space id carried")
+            .to_string();
 
+        // The saved thought is emitted (Space + SpaceIndex from post) and durable.
         let changes = drain(&mut rx);
         assert!(
-            changes.is_empty(),
-            "NoAccount must emit nothing; got {changes:?}"
+            changes.contains(&Change::Space(space_id.clone())),
+            "got {changes:?}"
+        );
+        assert!(changes.contains(&Change::SpaceIndex), "got {changes:?}");
+        assert!(
+            !changes.contains(&Change::Record),
+            "no Record before any request; got {changes:?}"
         );
 
-        // Zero durable trace: no space row was inserted.
         let spaces = core
             .runtime()
             .block_on(core.list_spaces(true))
             .expect("spaces");
-        assert!(spaces.is_empty(), "no orphan space; got {spaces:?}");
+        assert_eq!(spaces.len(), 1, "the post persisted; got {spaces:?}");
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "hi");
     });
 }
 
 #[test]
-fn insufficient_balance_leaves_zero_trace_and_no_emissions() {
+fn insufficient_balance_persists_post_then_fails_routing_to_plans() {
     run(|| {
         let (_mock, core, _dir) = setup(MockConfig {
             balance: 1, // cannot cover the charge
@@ -361,24 +590,33 @@ fn insufficient_balance_leaves_zero_trace_and_no_emissions() {
             matches!(err.root(), AppError::InsufficientBalance { .. }),
             "got {err:?}"
         );
-        assert_eq!(err.chat_space_id(), None);
+        let space_id = err
+            .chat_space_id()
+            .expect("post persisted → space id carried")
+            .to_string();
 
         let changes = drain(&mut rx);
-        // The balance fetch + allocate path does not commit anything; only the
-        // (failed) allocation could emit. No durable chat write happened, so no
-        // Space/Record. Account/Wallet are only emitted on a *successful*
-        // allocation.
+        // The post emitted Space + SpaceIndex; the request never spent, so no
+        // Record/Wallet.
+        assert!(
+            !space_changes(&changes).is_empty(),
+            "post should emit Space(id); got {changes:?}"
+        );
+        assert!(changes.contains(&Change::SpaceIndex), "got {changes:?}");
         assert!(
             !changes.contains(&Change::Record),
-            "no Record on pre-space failure; got {changes:?}"
+            "no Record on a pre-spend failure; got {changes:?}"
         );
-        assert!(space_changes(&changes).is_empty(), "got {changes:?}");
 
         let spaces = core
             .runtime()
             .block_on(core.list_spaces(true))
             .expect("spaces");
-        assert!(spaces.is_empty(), "no orphan space; got {spaces:?}");
+        assert_eq!(
+            spaces.len(),
+            1,
+            "the post persisted; got {space_id} {spaces:?}"
+        );
     });
 }
 

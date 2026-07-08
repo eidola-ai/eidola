@@ -10,11 +10,20 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use eidola_app_core::{BalancesResult, ConfigState, ModelInfo};
-use eidola_gui::chat::{ChatView, ToggleModelPicker};
+use eidola_app_core::{
+    AttestationInfo, BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
+    PriceInfo, RequestInfo, SpendTrailEntry,
+};
+use eidola_gui::account::AccountView;
+use eidola_gui::actions::ToggleModelPicker;
+use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
+use eidola_gui::onboarding::{OnboardingView, Slide};
 use eidola_gui::probe;
+use eidola_gui::record::{RecordSection, RecordView};
+use eidola_gui::space_view::SpaceView;
 use eidola_gui::stores::{Stores, StoresStub};
+use eidola_gui::wallet::WalletView;
 use eidola_gui::window_input::WindowInput;
 use gpui::{AnyWindowHandle, AppContext, Entity, TestAppContext, WindowOptions};
 use gpui_component::Root;
@@ -26,102 +35,6 @@ fn probes_on() -> MutexGuard<'static, ()> {
     let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     probe::set_probes_enabled(true);
     guard
-}
-
-#[gpui::test]
-fn chat_probes_record_names_roles_and_bounds(cx: &mut TestAppContext) {
-    let _guard = probes_on();
-
-    let stores = ready_stores(cx);
-    let (window, _view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx))
-    });
-    draw(cx, window);
-
-    let entries = probe::window_entries(window.window_id().as_u64());
-    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
-    assert!(
-        names.contains(&"chat/composer"),
-        "composer probe missing; recorded: {names:?}"
-    );
-    assert!(
-        names.contains(&"chat/transcript"),
-        "transcript probe missing; recorded: {names:?}"
-    );
-
-    let composer = &entries
-        .iter()
-        .find(|(n, _)| n == "chat/composer")
-        .unwrap()
-        .1;
-    assert_eq!(format!("{:?}", composer.role), "TextInput");
-    assert_eq!(composer.label.as_ref(), "Message composer");
-    assert!(
-        composer.bounds.size.width.as_f32() > 100.0 && composer.bounds.size.height.as_f32() > 10.0,
-        "composer bounds should be a real painted area, got {:?}",
-        composer.bounds
-    );
-
-    probe::set_probes_enabled(false);
-}
-
-#[gpui::test]
-fn picker_probes_appear_on_open_and_clear_on_dismiss(cx: &mut TestAppContext) {
-    let _guard = probes_on();
-
-    let stores = ready_stores(cx);
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx))
-    });
-    let id = window.window_id().as_u64();
-
-    // Closed picker: no listbox probes.
-    draw(cx, window);
-    let names = fresh_names(cx, window);
-    assert!(
-        !names.iter().any(|n| n.starts_with("chat/model-picker")),
-        "picker probes before opening: {names:?}"
-    );
-
-    // Open via the real action dispatch path.
-    let focus = view.read_with(cx, |v, _| v.focus_handle());
-    cx.update_window(window, |_, window, cx| {
-        focus.dispatch_action(&ToggleModelPicker, window, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
-    let names = fresh_names(cx, window);
-    assert!(
-        names.contains(&"chat/model-picker".to_string()),
-        "picker panel probe missing after open: {names:?}"
-    );
-    assert!(
-        names.contains(&"chat/model-picker/row/0".to_string())
-            && names.contains(&"chat/model-picker/row/2".to_string()),
-        "per-model row probes missing: {names:?}"
-    );
-
-    // Dismiss: the clear-then-redraw dance must drop the unmounted picker —
-    // stale entries would be ghost click targets for the driver.
-    cx.update_window(window, |_, window, cx| {
-        focus.dispatch_action(&ToggleModelPicker, window, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
-    let names = fresh_names(cx, window);
-    assert!(
-        !names.iter().any(|n| n.starts_with("chat/model-picker")),
-        "picker probes must clear after dismiss: {names:?}"
-    );
-    assert!(
-        names.contains(&"chat/composer".to_string()),
-        "still-mounted probes must survive the refresh: {names:?}"
-    );
-
-    let _ = id;
-    probe::set_probes_enabled(false);
 }
 
 #[gpui::test]
@@ -158,7 +71,7 @@ fn disabled_probes_record_nothing(cx: &mut TestAppContext) {
 
     let stores = ready_stores(cx);
     let (window, _view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx))
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
     });
     // Window ids restart per TestAppContext, so an earlier (enabled) test in
     // this process may have recorded under the same id — clear first, then
@@ -220,6 +133,9 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
             has_hardware_root_ca: false,
             has_hardware_intermediate_ca: false,
             attestation_url: None,
+            appearance: eidola_app_core::config::AppearanceSetting::System,
+            time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
+            light_character: eidola_app_core::config::LightCharacter::Neutral,
         });
         s.balances = Some(BalancesResult {
             available: 4_200_000,
@@ -246,6 +162,24 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
                 prompt_credits_per_token: 1.05,
                 completion_credits_per_token: 5.25,
                 request_credits: None,
+            },
+        ];
+        s.prices = vec![
+            PriceInfo {
+                id: "price_month".into(),
+                product_name: "Monthly".into(),
+                product_description: Some("Recurring top-up".into()),
+                amount_display: "$10".into(),
+                recurrence: "/mo".into(),
+                credits: 10_000_000,
+            },
+            PriceInfo {
+                id: "price_once".into(),
+                product_name: "One-time".into(),
+                product_description: None,
+                amount_display: "$5".into(),
+                recurrence: "".into(),
+                credits: 5_000_000,
             },
         ];
     })
@@ -282,4 +216,453 @@ fn open_view<V: gpui::Render + 'static>(
             .expect("open test window");
         (window.into(), inner.expect("build closure produced a view"))
     })
+}
+
+#[gpui::test]
+fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    // Seed a post with a committed reply (a1 → a2) so a1's band carries the
+    // fork "+" (a leaf has no "+" — its tail draft is the reply affordance). The
+    // blank space's active root draft provides the floating composer probe.
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = probe_post("a2", "a committed reply");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a seeded root post"), a2], cx)
+        });
+    });
+    // Give the active draft content and open the request panel, so the action
+    // gutter (Ask / model chip) and the panel record their probes too.
+    let editor = view
+        .read_with(cx, |v, _| v.composer_state_for_test())
+        .expect("blank space opens with the composer");
+    cx.update(|cx| {
+        editor.update(cx, |e, cx| e.set_value("a draft".to_string(), cx));
+        view.update(cx, |v, cx| v.toggle_request_panel(cx));
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"space/composer"),
+        "composer probe missing; recorded: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/band/add"),
+        "band reply affordance probe missing; recorded: {names:?}"
+    );
+    // The action gutter: Ask (the discoverable submit) and the model chip.
+    assert!(
+        names.contains(&"space/composer/ask"),
+        "Ask affordance probe missing; recorded: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/composer/model"),
+        "model chip probe missing; recorded: {names:?}"
+    );
+    // The request panel (opened above) with its model rows.
+    assert!(
+        names.contains(&"space/request-panel"),
+        "request panel probe missing; recorded: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.starts_with("space/request-panel/row/")),
+        "request panel model rows missing; recorded: {names:?}"
+    );
+    // The minimap is a navigable table of contents: a labelled Group of
+    // per-node Buttons.
+    assert!(
+        names.contains(&"space/minimap"),
+        "minimap group probe missing; recorded: {names:?}"
+    );
+    let map = entries.iter().find(|(n, _)| n == "space/minimap").unwrap();
+    assert_eq!(map.1.label.as_ref(), "Conversation map");
+    assert!(
+        names.iter().any(|n| n.starts_with("space/minimap/cell/")),
+        "minimap column probes missing; recorded: {names:?}"
+    );
+
+    let composer = &entries
+        .iter()
+        .find(|(n, _)| n == "space/composer")
+        .unwrap()
+        .1;
+    assert_eq!(format!("{:?}", composer.role), "TextInput");
+    assert_eq!(composer.label.as_ref(), "Message composer");
+
+    probe::set_probes_enabled(false);
+}
+
+fn probe_post(action_id: &str, text: &str) -> PostNode {
+    PostNode {
+        action_id: action_id.into(),
+        item_id: format!("item-{action_id}"),
+        parent_action_id: None,
+        participant: PostParticipant {
+            kind: "human".into(),
+            label: "user".into(),
+        },
+        action_type: "user_input".into(),
+        generation: 0,
+        generation_count: 1,
+        is_current: true,
+        model: None,
+        credits_consumed: None,
+        relation: None,
+        depth: 0,
+        is_branch: false,
+        blocks: vec![PostBlock {
+            block_type: "text".into(),
+            text: Some(text.into()),
+            tool_name: None,
+            tool_call_id: None,
+            data: None,
+        }],
+        references: Vec::new(),
+        created_at: 0,
+    }
+}
+
+#[gpui::test]
+fn onboarding_probes_record_ctas_and_inputs(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    draw(cx, window);
+
+    // The first slide's call-to-action is probed for AT + the driver.
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"onboarding/cta/pause"),
+        "first-slide CTA probe missing; recorded: {names:?}"
+    );
+
+    // Walk to the existing-account branch, which reveals the credential inputs
+    // and the verify CTA.
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    for expected in [
+        "onboarding/input/account-id",
+        "onboarding/input/account-secret",
+        "onboarding/cta/verify",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "existing-account probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    // Re-choose the new-account branch: the create slide carries the required
+    // agreement checkbox and the (checkbox-gated) create CTA.
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    for expected in ["onboarding/agree", "onboarding/cta/create"] {
+        assert!(
+            names.contains(&expected),
+            "create-account probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+    // The Control slide's repository link is scoped per-label (the former
+    // shared `onboarding/link` name collided across every link).
+    assert!(
+        names
+            .iter()
+            .any(|n| n.starts_with("onboarding/link/") && n.contains("repository")),
+        "scoped repository link probe missing; recorded: {names:?}"
+    );
+
+    // Walk to the Purchase slide (via the existing-account branch) and assert
+    // the shared plans component annotates each row under the onboarding scope.
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+        v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"onboarding/plans"),
+        "onboarding plans listbox probe missing; recorded: {names:?}"
+    );
+    assert!(
+        names.contains(&"onboarding/plan/0"),
+        "onboarding plan-row probe missing; recorded: {names:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Record window — the raw local trail. Listing rows, section tabs, refresh,
+// and the load-more affordance are all probed (indexed row names so a driver
+// can address "the third attestation" precisely).
+// ---------------------------------------------------------------------------
+
+fn stub_attestation(hash: &str) -> AttestationInfo {
+    AttestationInfo {
+        hash: hash.into(),
+        pcr_digest: Some("pcr-abc".into()),
+        created_at: 1_000,
+        doc_bytes: 2_048,
+        connection_count: 3,
+    }
+}
+
+fn stub_request(id: &str) -> RequestInfo {
+    RequestInfo {
+        id: id.into(),
+        method: "POST".into(),
+        path: "/v1/chat/completions".into(),
+        response_status: Some(200),
+        duration_ms: Some(742),
+        request_at: 1_000,
+        error: None,
+        attempt_number: 1,
+        credential_nonce: Some("nonce-1".into()),
+        transport: Some("clearnet".into()),
+        base_url: Some("https://eidola.example".into()),
+        attestation_hash: Some("att-1".into()),
+    }
+}
+
+fn stub_spend(request_id: &str) -> SpendTrailEntry {
+    SpendTrailEntry {
+        credential_nonce: "nonce-1".into(),
+        spend_amount: Some(1_000),
+        credential_state: "spent".into(),
+        request_id: request_id.into(),
+        method: "POST".into(),
+        path: "/v1/chat/completions".into(),
+        request_at: 1_000,
+        duration_ms: Some(742),
+        attempt_number: 1,
+        action_id: Some("act-1".into()),
+        action_type: Some("inference".into()),
+        model: Some("gemma4-31b".into()),
+        credits_consumed: Some(950),
+        intent: Some("chat".into()),
+        space_id: Some("space-1".into()),
+        space_title: Some("A space".into()),
+        linkability: None,
+    }
+}
+
+#[gpui::test]
+fn record_probes_cover_rows_tabs_and_chrome(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| RecordView::new(stores, window, cx))
+    });
+
+    // Attestations section: rows have `has_more` so the load-more affordance
+    // renders too.
+    view.update(cx, |v, _| {
+        v.set_attestations_for_test(vec![stub_attestation("att-hash-1")], true);
+    });
+    let names = fresh_names(cx, window);
+    for expected in [
+        "record/section/attestations",
+        "record/section/requests",
+        "record/section/spending",
+        "record/refresh",
+        "record/attestation/0",
+        "record/load-more",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "record probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    // Requests section.
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Requests, cx);
+        v.set_requests_for_test(vec![stub_request("req-1")], false);
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"record/request/0".to_string()),
+        "record request-row probe missing; recorded: {names:?}"
+    );
+
+    // Spending section.
+    view.update(cx, |v, cx| {
+        v.select_section(RecordSection::Spending, cx);
+        v.set_spending_for_test(vec![stub_spend("req-1")], false);
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"record/spend/0".to_string()),
+        "record spend-row probe missing; recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+// ---------------------------------------------------------------------------
+// Settings cluster — the Account and Wallet panes and General's affordances.
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/account/reset",
+        "settings/account/refresh-balances",
+        // The shared plans component, scoped to the Account host.
+        "settings/account/plans",
+        "settings/account/plan/0",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "account pane probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn wallet_pane_probes_cover_refresh(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| WalletView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/wallet/refresh".to_string()),
+        "wallet refresh probe missing; recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn general_pane_probes_cover_change_and_advanced(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let window_input = cx.update(WindowInput::new);
+    let wi = window_input.clone();
+    let (window, _view) = open_view(cx, move |window, cx| {
+        cx.new(|cx| GeneralView::new(stores.config.clone(), wi, window, cx))
+    });
+
+    // At rest: the "Change…" affordance and the appearance chips are probed.
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/general/change",
+        "settings/general/appearance/system",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "general probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    // Holding ⌥ reveals the advanced rows, including the Record cross-link.
+    cx.update(|cx| {
+        window_input.update(cx, |wi, cx| wi.set_alt_for_test(true, cx));
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/general/open-record".to_string()),
+        "advanced open-record link probe missing under ⌥; recorded: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn request_panel_probes_appear_on_open_and_clear_on_dismiss(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+
+    // Closed panel: no listbox probes.
+    draw(cx, window);
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.iter().any(|n| n.starts_with("space/request-panel")),
+        "panel probes before opening: {names:?}"
+    );
+
+    // Open via the real action dispatch path (the blank space's root draft
+    // anchors the panel).
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"space/request-panel".to_string()),
+        "panel probe missing after open: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/request-panel/row/0".to_string())
+            && names.contains(&"space/request-panel/row/2".to_string()),
+        "per-model row probes missing: {names:?}"
+    );
+
+    // Dismiss: the clear-then-redraw dance must drop the unmounted panel —
+    // stale entries would be ghost click targets for the driver.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.iter().any(|n| n.starts_with("space/request-panel")),
+        "panel probes must clear after dismiss: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/composer".to_string()),
+        "still-mounted probes must survive the refresh: {names:?}"
+    );
 }

@@ -5,17 +5,20 @@ pub mod about;
 pub mod account;
 pub mod actions;
 pub mod bridge;
-pub mod chat;
 pub mod general;
 pub mod library;
 pub mod loadable;
+pub mod onboarding;
 mod plans;
 pub mod probe;
 pub mod record;
 pub mod settings;
+pub mod solar;
 pub mod space;
+pub mod space_view;
 pub mod stores;
 pub mod theme;
+pub mod titlebar;
 pub mod updates;
 pub mod wallet;
 pub mod window_input;
@@ -29,13 +32,14 @@ use gpui_component_assets::Assets;
 
 use crate::about::AboutView;
 use crate::actions::{
-    About, CheckForUpdates, CloseWindow, Hide, HideOthers, Minimize, NewSpace, OpenLibrary,
-    OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
+    About, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize, NewSpace,
+    OpenLibrary, OpenRecord, OpenSettings, Quit, ShowAll, ToggleInspector, Zoom,
 };
-use crate::chat::ChatView;
 use crate::library::LibraryView;
+use crate::onboarding::OnboardingView;
 use crate::record::RecordView;
 use crate::settings::SettingsView;
+use crate::space_view::SpaceView;
 use crate::stores::Stores;
 use crate::updates::UpdatesView;
 use crate::window_input::WindowInput;
@@ -62,6 +66,9 @@ struct AppGlobal {
     /// The single Record window, if open. Same singleton discipline as
     /// `settings_window`.
     record_window: Option<WindowHandle<Root>>,
+    /// The single onboarding ("Get Started") window, if open. Same singleton
+    /// discipline as `settings_window`.
+    onboarding_window: Option<WindowHandle<Root>>,
 }
 
 impl gpui::Global for AppGlobal {}
@@ -96,6 +103,12 @@ pub fn run() {
         // missed.
         stores::install_bus_bridge(&stores, cx);
 
+        // Point the Circadian theme at the persisted settings (day/night
+        // axis + time-of-day tint), re-applying on config changes and on
+        // the clock's ~4h slot boundaries. `theme::install` above applied
+        // the neutral defaults; this turns the circadian machinery on.
+        theme::wire_config(&stores.config, cx);
+
         // Startup refreshes — each in its own store task slot, no shared
         // busy flag, so none can starve another (the wave-2 launch-order
         // bug is fixed structurally: the model list refresh cannot be
@@ -118,6 +131,7 @@ pub fn run() {
             library_window: None,
             updates_window: None,
             record_window: None,
+            onboarding_window: None,
         });
 
         // Verified update-notification polling: one check at launch, then
@@ -147,6 +161,20 @@ pub fn run() {
         cx.activate(true);
 
         open_main_window(cx);
+
+        // First-run onboarding: with no account configured, open the "Get
+        // Started" window on top of the main window. A configured account skips
+        // straight to the main window (onboarding is then only reachable via the
+        // Eidola menu). Read through the ConfigStore snapshot seeded at startup.
+        let needs_onboarding = stores
+            .config
+            .read(cx)
+            .state()
+            .map(|s| !s.has_account || !s.has_account_secret)
+            .unwrap_or(false);
+        if needs_onboarding {
+            open_onboarding_window(cx);
+        }
     });
 }
 
@@ -158,6 +186,7 @@ fn install_menus(cx: &mut App) {
                 MenuItem::action("About Eidola", About),
                 MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::Separator,
+                MenuItem::action("Get Started", GetStarted),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::Separator,
                 MenuItem::action("Hide Eidola", Hide),
@@ -241,110 +270,30 @@ pub fn install_keybindings(cx: &mut App) {
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-alt-i", ToggleInspector, None),
-        KeyBinding::new("cmd-enter", crate::chat::Send, Some("ChatView")),
-        // ⌥⌘M — toggle the quiet model picker. Scoped to ChatView so the
-        // distinct keystroke never competes with the global ⌘M (Minimize).
+        // ⌘↩ (post & ask) and ⌘⇧↩ (post only) are *not* bound here. The
+        // composer owns those chords — `gpui_markdown_editor::init` binds them
+        // in the `MarkdownEditor` context to `Enter { secondary: true, .. }`,
+        // whose handler emits `PressEnter`; the draft's subscription (see
+        // `space_view::composer::create_draft_node`) routes that to
+        // `Send`/`PostOnly`. Binding them here too would shadow the editor
+        // (the composer is the inner focus) and break the inversion.
+        // ⌥⌘M — the space view's request panel (the handler no-ops without a
+        // composer to anchor to). Scoped to SpaceView so the distinct
+        // keystroke never competes with the global ⌘M (Minimize). Esc routes
+        // through the composer's own key handler (panel first, then draft
+        // deactivation), so no Esc binding here.
         KeyBinding::new(
             "cmd-alt-m",
-            crate::chat::ToggleModelPicker,
-            Some("ChatView"),
+            crate::actions::ToggleModelPicker,
+            Some("SpaceView"),
         ),
-        // Picker keyboard navigation — all scoped to ChatView. The picker
-        // gate is the action handler itself (methods early-return when the
-        // picker is closed). `up`/`down`/`enter` are *also* bound in the more
-        // specific `MarkdownEditor` context (the always-focused composer), so
-        // while the editor holds focus those bindings would win and the picker
-        // would never see the keystrokes (the codex review finding on #177).
-        // `ChatView::toggle_model_picker` therefore parks focus on the
-        // ChatView root while the picker is open — taking the editor's context
-        // out of the focus chain so these bindings become the innermost match
-        // — and returns focus to the composer on close (`sync_picker_focus`).
-        // `escape` isn't bound by the editor, but routes through the same
-        // parking for uniformity.
-        KeyBinding::new("escape", crate::chat::DismissModelPicker, Some("ChatView")),
-        KeyBinding::new("up", crate::chat::PickerUp, Some("ChatView")),
-        KeyBinding::new("down", crate::chat::PickerDown, Some("ChatView")),
-        KeyBinding::new("enter", crate::chat::PickerConfirm, Some("ChatView")),
     ]);
 
-    install_markdown_editor_keybindings(cx);
-}
-
-/// Keybindings for the WYSIWYG markdown composer used in the chat view.
-///
-/// All bindings are scoped to the `MarkdownEditor` key context (the
-/// `key_context` set by `gpui_markdown_editor::MarkdownEditor::render`) so
-/// they only fire when the editor — or a descendant — is in the focus
-/// chain. That keeps them from competing with `gpui_component::Input`'s
-/// own `Input`-context bindings used by settings/account fields, and lets
-/// the ChatView-context `cmd-enter → Send` binding still win for submit
-/// because the editor itself does not bind `cmd-enter` to anything.
-///
-/// Mirrors the macOS defaults documented in `crates/eidola-gui/Cargo.toml`-adjacent
-/// `bin/demo.rs` in the editor crate, minus the global `cmd-up` /
-/// `cmd-down` shortcuts that the chat reserves for future scroll-to-end
-/// navigation.
-fn install_markdown_editor_keybindings(cx: &mut App) {
-    use gpui_markdown_editor::{
-        Backspace, Copy, Cut, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward,
-        DeleteWordForward, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, Paste,
-        PastePlain, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown, ShiftEnd,
-        ShiftEnter, ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft,
-        ShiftWordRight, Tab, Up, WordLeft, WordRight,
-    };
-
-    let ctx = Some("MarkdownEditor");
-    cx.bind_keys([
-        // Editing
-        KeyBinding::new("backspace", Backspace, ctx),
-        KeyBinding::new("delete", Delete, ctx),
-        KeyBinding::new("enter", Enter, ctx),
-        KeyBinding::new("shift-enter", ShiftEnter, ctx),
-        KeyBinding::new("tab", Tab, ctx),
-        KeyBinding::new("shift-tab", ShiftTab, ctx),
-        // Word / line delete (macOS standard: Option for word, Cmd for line).
-        KeyBinding::new("alt-backspace", DeleteWordBackward, ctx),
-        KeyBinding::new("alt-delete", DeleteWordForward, ctx),
-        KeyBinding::new("cmd-backspace", DeleteToLineStart, ctx),
-        KeyBinding::new("cmd-delete", DeleteToLineEnd, ctx),
-        // Caret motion
-        KeyBinding::new("left", Left, ctx),
-        KeyBinding::new("right", Right, ctx),
-        KeyBinding::new("up", Up, ctx),
-        KeyBinding::new("down", Down, ctx),
-        KeyBinding::new("shift-left", ShiftLeft, ctx),
-        KeyBinding::new("shift-right", ShiftRight, ctx),
-        KeyBinding::new("shift-up", ShiftUp, ctx),
-        KeyBinding::new("shift-down", ShiftDown, ctx),
-        KeyBinding::new("home", Home, ctx),
-        KeyBinding::new("end", End, ctx),
-        KeyBinding::new("cmd-left", Home, ctx),
-        KeyBinding::new("cmd-right", End, ctx),
-        KeyBinding::new("shift-home", ShiftHome, ctx),
-        KeyBinding::new("shift-end", ShiftEnd, ctx),
-        KeyBinding::new("cmd-shift-left", ShiftHome, ctx),
-        KeyBinding::new("cmd-shift-right", ShiftEnd, ctx),
-        KeyBinding::new("cmd-up", DocumentStart, ctx),
-        KeyBinding::new("cmd-down", DocumentEnd, ctx),
-        KeyBinding::new("cmd-shift-up", ShiftDocumentStart, ctx),
-        KeyBinding::new("cmd-shift-down", ShiftDocumentEnd, ctx),
-        // Word-granular motion (macOS standard: Option+arrows).
-        KeyBinding::new("alt-left", WordLeft, ctx),
-        KeyBinding::new("alt-right", WordRight, ctx),
-        KeyBinding::new("alt-shift-left", ShiftWordLeft, ctx),
-        KeyBinding::new("alt-shift-right", ShiftWordRight, ctx),
-        // Clipboard — scoped to the editor context so they coexist with
-        // `gpui_component::Input`'s `Input`-context bindings used by the
-        // settings/account fields. The Edit menu items remain wired to
-        // `gpui_component::input::*` actions for those inputs; menu-driven
-        // copy/cut from the composer is a known gap pending wiring of
-        // editor actions into the menu.
-        KeyBinding::new("cmd-a", SelectAll, ctx),
-        KeyBinding::new("cmd-c", Copy, ctx),
-        KeyBinding::new("cmd-x", Cut, ctx),
-        KeyBinding::new("cmd-v", Paste, ctx),
-        KeyBinding::new("cmd-shift-v", PastePlain, ctx),
-    ]);
+    // The composer's own keymap (motion, editing, clipboard, and the submit
+    // chords) is self-contained in the editor crate, scoped to the
+    // `MarkdownEditor` context — installed here like `gpui_component::init`
+    // installs the `Input` keymap.
+    gpui_markdown_editor::init(cx);
 }
 
 fn install_action_handlers(cx: &mut App) {
@@ -388,6 +337,15 @@ fn install_action_handlers(cx: &mut App) {
 
     cx.on_action(|_: &NewSpace, cx: &mut App| {
         open_main_window(cx);
+    });
+
+    cx.on_action(|_: &GetStarted, cx: &mut App| {
+        // Singleton, like Settings: raise the existing onboarding window if
+        // it's still alive, otherwise open a fresh one.
+        if try_focus_existing_onboarding(cx) {
+            return;
+        }
+        open_onboarding_window(cx);
     });
 
     cx.on_action(|_: &OpenLibrary, cx: &mut App| {
@@ -466,7 +424,7 @@ fn install_action_handlers(cx: &mut App) {
 
     // `CloseWindow` is intentionally NOT registered as a global handler.
     // Each view registers its own listener via `.on_action(cx.listener(…))`
-    // (see `chat::ChatView` and `settings::SettingsView`). With per-view
+    // (see `space_view::SpaceView` and `settings::SettingsView`). With per-view
     // registration, `is_action_available` returns true only when a window
     // with the listener is alive — so macOS auto-greys "Close Window" in
     // the menu when no window is open, which is the correct behavior.
@@ -524,10 +482,14 @@ fn try_focus_existing_record(cx: &mut App) -> bool {
     try_focus_existing_singleton(cx, |g| &mut g.record_window)
 }
 
+fn try_focus_existing_onboarding(cx: &mut App) -> bool {
+    try_focus_existing_singleton(cx, |g| &mut g.onboarding_window)
+}
+
 /// Edge-to-edge titlebar: macOS extends the content view under the
 /// traffic-light buttons and stops painting a separate titlebar background.
 /// Each view is responsible for leaving room at the top so the lights don't
-/// land on real UI — see `chat::TITLE_BAR_RESERVE` (vertical reserve + fade
+/// land on real UI — see `space_view::TITLE_BAR_RESERVE` (vertical reserve + fade
 /// gradient), `settings::NAV_TOP_RESERVE` (the lights sit over the nav
 /// band), and `record::STRIP_LEFT_PAD` (the section strip doubles as the
 /// title bar).
@@ -589,21 +551,25 @@ pub fn open_space_window(cx: &mut App, stores: Stores, space_id: String) {
     open_chat_window(cx, stores, Some(space_id));
 }
 
-fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
-    // Square chat window. Side = 90% of the smaller display dimension,
-    // capped at 800px. A square frames the chat as a writing surface —
-    // a sheet of paper, not a wide chat pane — and the cap keeps the
-    // prose column from feeling lost in the middle of a 4K display. If
-    // there's no primary display (rare; offscreen render contexts), we
-    // fall back to the cap.
-    let side = match cx.primary_display() {
+/// The side length of the square "writing surface" windows — the space (chat)
+/// window and the onboarding window, which is sized to match. 90% of the
+/// smaller display dimension, capped at 840px so the prose column isn't lost in
+/// the middle of a 4K display; falls back to the cap with no primary display
+/// (rare; offscreen render contexts).
+fn writing_surface_side(cx: &mut App) -> f32 {
+    match cx.primary_display() {
         Some(d) => {
             let s = d.bounds().size;
             let smaller = f32::min(s.width.as_f32(), s.height.as_f32());
-            (smaller * 0.9).min(705.0)
+            (smaller * 0.9).min(840.0)
         }
         None => 820.0,
-    };
+    }
+}
+
+fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
+    // Square chat window — a sheet of paper, not a wide chat pane.
+    let side = writing_surface_side(cx);
     let bounds = centered_window_bounds(cx, side, side);
 
     let opts = WindowOptions {
@@ -617,7 +583,7 @@ fn open_chat_window(cx: &mut App, stores: Stores, space_id: Option<String>) {
     let _ = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
         let wi = WindowInput::new(cx);
-        let view = cx.new(|cx| ChatView::new(stores.clone(), space_id.clone(), wi, window, cx));
+        let view = cx.new(|cx| SpaceView::new(stores.clone(), space_id.clone(), wi, window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
 
@@ -704,6 +670,34 @@ fn open_record_window(cx: &mut App) {
 
     if let Ok(handle) = handle {
         cx.global_mut::<AppGlobal>().record_window = Some(handle);
+    }
+    cx.activate(true);
+}
+
+/// Open the onboarding window — the from-scratch "Get Started" flow, a
+/// singleton like Settings. Sized to match a new space window (the same square
+/// writing surface) so onboarding feels like the same page it leads into.
+fn open_onboarding_window(cx: &mut App) {
+    let stores = cx.global::<AppGlobal>().stores.clone();
+    let side = writing_surface_side(cx);
+    let bounds = centered_window_bounds(cx, side, side);
+
+    let opts = WindowOptions {
+        window_bounds: bounds,
+        titlebar: Some(transparent_titlebar()),
+        kind: WindowKind::Normal,
+        window_min_size: Some(size(px(480.), px(360.))),
+        ..Default::default()
+    };
+
+    let handle = cx.open_window(opts, |window, cx| {
+        theme::observe_window_appearance(window);
+        let view = cx.new(|cx| OnboardingView::new(stores.clone(), window, cx));
+        cx.new(|cx| Root::new(view, window, cx))
+    });
+
+    if let Ok(handle) = handle {
+        cx.global_mut::<AppGlobal>().onboarding_window = Some(handle);
     }
     cx.activate(true);
 }

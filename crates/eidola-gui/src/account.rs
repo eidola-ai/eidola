@@ -282,7 +282,12 @@ impl Render for AccountView {
         // Account create/reset failure — rendered right under the Account
         // controls so a failed button click is never silent.
         if let Some(err) = account_op_error.as_deref() {
-            col = col.child(error_banner(err, cx));
+            col = col.child(
+                div()
+                    .id("account-error")
+                    .probe("settings/account/error", gpui::Role::Alert, err.to_string())
+                    .child(error_banner(err, cx)),
+            );
         }
 
         // --- Balance ------------------------------------------------------
@@ -333,6 +338,11 @@ impl Render for AccountView {
                 h_flex().text_xs().child(
                     div()
                         .id("refresh-balances")
+                        .probe(
+                            "settings/account/refresh-balances",
+                            gpui::Role::Button,
+                            "Refresh balances",
+                        )
                         .cursor_pointer()
                         .text_color(theme.muted_foreground)
                         .hover(|s| s.text_color(theme.foreground))
@@ -369,12 +379,19 @@ impl Render for AccountView {
                     &prices,
                     self.checkout_pending.as_deref(),
                     on_select,
+                    "settings/account",
                     cx,
                 ));
         }
         if let Some(err) = self.checkout_error.as_deref() {
             col = col.child(
                 div()
+                    .id("account-checkout-error")
+                    .probe(
+                        "settings/account/checkout-error",
+                        gpui::Role::Alert,
+                        err.to_string(),
+                    )
                     .text_sm()
                     .text_color(theme.danger)
                     .child(SharedString::from(err.to_string())),

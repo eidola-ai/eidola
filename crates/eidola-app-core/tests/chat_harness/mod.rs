@@ -129,6 +129,10 @@ pub struct MockServer {
     pub base_url: String,
     /// Number of `POST /v1/chat/completions` requests received.
     chat_hits: Arc<AtomicU64>,
+    /// The parsed JSON body of every `POST /v1/chat/completions`, in arrival
+    /// order — lets tests assert exactly what context the client sent
+    /// upstream (e.g. regenerate's upstream-only thread).
+    chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     /// Number of `POST /v1/credentials/refund` requests received.
     refund_hits: Arc<AtomicU64>,
     _task: tokio::task::JoinHandle<()>,
@@ -140,6 +144,10 @@ impl MockServer {
     }
     pub fn refund_hits(&self) -> u64 {
         self.refund_hits.load(Ordering::SeqCst)
+    }
+    /// The recorded chat request bodies (see `chat_bodies`).
+    pub fn chat_bodies(&self) -> Vec<serde_json::Value> {
+        self.chat_bodies.lock().unwrap().clone()
     }
 }
 
@@ -235,11 +243,14 @@ pub async fn start(config: MockConfig) -> MockServer {
     let base_url = format!("http://{addr}");
 
     let chat_hits = Arc::new(AtomicU64::new(0));
+    let chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let refund_hits = Arc::new(AtomicU64::new(0));
 
     let task = {
         let issuer = issuer.clone();
         let chat_hits = chat_hits.clone();
+        let chat_bodies = chat_bodies.clone();
         let refund_hits = refund_hits.clone();
         tokio::spawn(async move {
             loop {
@@ -249,9 +260,12 @@ pub async fn start(config: MockConfig) -> MockServer {
                 let issuer = issuer.clone();
                 let config = config.clone();
                 let chat_hits = chat_hits.clone();
+                let chat_bodies = chat_bodies.clone();
                 let refund_hits = refund_hits.clone();
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, issuer, config, chat_hits, refund_hits).await;
+                    let _ =
+                        handle_conn(stream, issuer, config, chat_hits, chat_bodies, refund_hits)
+                            .await;
                 });
             }
         })
@@ -260,6 +274,7 @@ pub async fn start(config: MockConfig) -> MockServer {
     MockServer {
         base_url,
         chat_hits,
+        chat_bodies,
         refund_hits,
         _task: task,
     }
@@ -334,6 +349,7 @@ async fn handle_conn(
     issuer: Arc<Issuer>,
     config: MockConfig,
     chat_hits: Arc<AtomicU64>,
+    chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     refund_hits: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
     // Each connection serves at most one request (reqwest opens a fresh
@@ -386,6 +402,9 @@ async fn handle_conn(
         }
         ("POST", "/v1/chat/completions") => {
             chat_hits.fetch_add(1, Ordering::SeqCst);
+            if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&req.body) {
+                chat_bodies.lock().unwrap().push(body);
+            }
             handle_chat(&mut stream, &issuer, &config, req.auth.as_deref()).await?;
         }
         _ => {
@@ -529,15 +548,38 @@ fn models_body() -> String {
 }
 
 fn keys_body(issuer: &Issuer) -> String {
+    let ds = format!("ACT-v1:{DS_ORG}:{DS_SERVICE}:{DS_DEPLOYMENT}:{DS_VERSION}");
+    // Reproduce the production `/v1/keys` shape during a rotation grace
+    // window: a just-retired key (out of its `issue_from..issue_until` issuing
+    // window but still within `accept_until`) sorts *ahead* of the current
+    // key. It carries a different public key, so a client that selected by
+    // domain separator alone — every key shares one — would pick the decoy and
+    // fail proof verification against the current issuer (the original bug).
+    // The client must skip the out-of-window decoy and choose the current key.
+    let decoy_pk = PrivateKey::random(OsRng)
+        .public()
+        .to_cbor()
+        .expect("encode decoy public key");
+    let decoy_key_hash: [u8; 32] = Sha256::digest(&decoy_pk).into();
     serde_json::json!({
-        "data": [{
-            "id": issuer.key_id_hex,
-            "public_key": issuer.public_key_b64(),
-            "domain_separator": format!("ACT-v1:{DS_ORG}:{DS_SERVICE}:{DS_DEPLOYMENT}:{DS_VERSION}"),
-            "issue_from": "2026-01-01T00:00:00Z",
-            "issue_until": "2030-01-01T00:00:00Z",
-            "accept_until": "2030-01-01T00:00:00Z",
-        }]
+        "data": [
+            {
+                "id": hex::encode(decoy_key_hash),
+                "public_key": URL_SAFE_NO_PAD.encode(&decoy_pk),
+                "domain_separator": ds,
+                "issue_from": "2026-01-01T00:00:00Z",
+                "issue_until": "2026-02-01T00:00:00Z",
+                "accept_until": "2030-01-01T00:00:00Z",
+            },
+            {
+                "id": issuer.key_id_hex,
+                "public_key": issuer.public_key_b64(),
+                "domain_separator": ds,
+                "issue_from": "2026-02-01T00:00:00Z",
+                "issue_until": "2030-01-01T00:00:00Z",
+                "accept_until": "2030-01-01T00:00:00Z",
+            }
+        ]
     })
     .to_string()
 }

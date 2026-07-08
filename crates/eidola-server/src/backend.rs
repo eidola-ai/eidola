@@ -103,6 +103,37 @@ pub trait ChatBackend: Send + Sync {
 /// Default pricing markup factor.
 pub const DEFAULT_PRICING_MARKUP: f64 = 1.5;
 
+/// Validate that the pricing markup covers the contract's safe cost factor.
+///
+/// The shared client/server pricing contract (`eidola-common`) charges the
+/// prompt-side byte term at no less than `bytes / N`, where `N =
+/// SAFE_COST_FACTOR_NUM / SAFE_COST_FACTOR_DEN` — and since BPE tokenizers
+/// never produce more tokens than content bytes, the worst-case
+/// actual/charged token ratio on that term is exactly `N`. Break-even on
+/// dynamic costs therefore requires `PRICING_MARKUP >= N`; a markup below
+/// the factor silently opens a loss window, so startup refuses it outright.
+///
+/// Future refinement (out of scope for now): when the configured markup
+/// exceeds the factor, the server could publish a larger dynamic factor to
+/// clients via the `/models` payload instead of both sides relying on the
+/// compiled-in constants.
+pub fn validate_pricing_markup(markup: f64) -> Result<(), String> {
+    let floor =
+        eidola_common::SAFE_COST_FACTOR_NUM as f64 / eidola_common::SAFE_COST_FACTOR_DEN as f64;
+    // `is_nan` check: a NaN markup must fail too, and `<` alone lets it pass.
+    if markup.is_nan() || markup < floor {
+        return Err(format!(
+            "PRICING_MARKUP ({markup}) must be >= the safe cost factor \
+             {}/{} = {floor}: the pricing contract charges prompt bytes at \
+             1/{floor} of their worst-case token count, so a lower markup \
+             would sell tokens below cost",
+            eidola_common::SAFE_COST_FACTOR_NUM,
+            eidola_common::SAFE_COST_FACTOR_DEN,
+        ));
+    }
+    Ok(())
+}
+
 /// Fixed scale factor for pricing: credits per token = value / PRICING_SCALE_FACTOR.
 pub const PRICING_SCALE_FACTOR: u64 = 1_000_000;
 
@@ -125,8 +156,8 @@ struct CatalogEntry {
 /// `TINFOIL_PRICING_OVERRIDES`.
 const MODEL_CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
-        id: "glm-5-1",
-        name: "GLM-5.1",
+        id: "glm-5-2",
+        name: "GLM-5.2",
         description: "Advanced language model with strong reasoning and multilingual capabilities",
         context_length: 200_000,
         input_per_m: 1.5,
@@ -147,7 +178,7 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         name: "Gemma 4 31B",
         description: "Lightweight and efficient language model from Google for versatile use cases",
         context_length: 256_000,
-        input_per_m: 0.45,
+        input_per_m: 0.40,
         output_per_m: 1.0,
         per_request_usd: 0.0,
     },
@@ -165,8 +196,8 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         name: "GPT-OSS 120B",
         description: "Open-weight model designed for powerful reasoning, agentic tasks, and versatile use cases",
         context_length: 131_000,
-        input_per_m: 0.75,
-        output_per_m: 1.25,
+        input_per_m: 0.15,
+        output_per_m: 0.60,
         per_request_usd: 0.0,
     },
     CatalogEntry {
@@ -174,17 +205,8 @@ const MODEL_CATALOG: &[CatalogEntry] = &[
         name: "GPT-OSS Safeguard 120B",
         description: "Safety reasoning model for content classification and trust & safety applications",
         context_length: 131_000,
-        input_per_m: 0.50,
-        output_per_m: 1.0,
-        per_request_usd: 0.0,
-    },
-    CatalogEntry {
-        id: "qwen3-vl-30b",
-        name: "Qwen3-VL 30B",
-        description: "Advanced vision-language model for image understanding",
-        context_length: 256_000,
-        input_per_m: 1.25,
-        output_per_m: 4.0,
+        input_per_m: 0.15,
+        output_per_m: 0.60,
         per_request_usd: 0.0,
     },
     CatalogEntry {
@@ -562,14 +584,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn markup_below_safe_cost_factor_is_rejected() {
+        // The startup gate: a markup under the contract's safe cost factor
+        // (3/2 = 1.5) would sell prompt tokens below cost.
+        assert!(validate_pricing_markup(1.2).is_err());
+        assert!(validate_pricing_markup(0.0).is_err());
+        assert!(validate_pricing_markup(f64::NAN).is_err());
+        assert!(validate_pricing_markup(1.5).is_ok());
+        assert!(validate_pricing_markup(DEFAULT_PRICING_MARKUP).is_ok());
+        assert!(validate_pricing_markup(2.0).is_ok());
+    }
+
+    #[test]
     fn test_usd_per_m_to_scaled_credits() {
         // kimi-k2-6 input: $1.5/M tokens with 1.5x markup
         // The 1e6 factors (USD→µ$ and /M→/token) cancel:
         // scaled = 1.5 * 1.5 * 1_000_000 = 2_250_000
         assert_eq!(usd_per_m_to_scaled_credits(1.5, 1.5), 2_250_000);
 
-        // gpt-oss-120b input: $0.75/M with 1.5x markup
-        assert_eq!(usd_per_m_to_scaled_credits(0.75, 1.5), 1_125_000);
+        // gpt-oss-120b input: $0.15/M with 1.5x markup
+        // scaled = 0.15 * 1.5 * 1_000_000 = 225_000
+        assert_eq!(usd_per_m_to_scaled_credits(0.15, 1.5), 225_000);
 
         // Zero price
         assert_eq!(usd_per_m_to_scaled_credits(0.0, 1.5), 0);

@@ -32,7 +32,7 @@ use crate::stores::{SpacesStore, Stores};
 actions!(library, [CancelRename]);
 
 /// Vertical reserve under the macOS traffic lights — same pattern as
-/// `chat::TITLE_BAR_RESERVE` (the window uses the shared transparent
+/// `space_view::TITLE_BAR_RESERVE` (the window uses the shared transparent
 /// titlebar from `lib.rs::transparent_titlebar`).
 #[cfg(target_os = "macos")]
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
@@ -429,7 +429,11 @@ impl LibraryView {
 }
 
 impl Render for LibraryView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Built ahead of the chain: `drag_band` needs `&mut cx` (element-owned
+        // arm state), which can't overlap the `theme` borrow below.
+        let drag_band =
+            crate::titlebar::drag_band("library-titlebar", TITLE_BAR_RESERVE, window, cx);
         let theme = cx.theme();
         let count = self.spaces.read(cx).list().len();
 
@@ -438,10 +442,15 @@ impl Render for LibraryView {
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
             }))
+            .relative()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .pt(TITLE_BAR_RESERVE);
+            .pt(TITLE_BAR_RESERVE)
+            // Absolute drag band over the traffic-light reserve. It sits above
+            // the empty top padding, so both the empty and populated paths get
+            // a draggable titlebar without affecting flow layout.
+            .child(drag_band);
 
         // Chapter-style heading: a small italic label between hairline
         // rules, echoing the chat's chapter delimiters so the library reads
@@ -457,6 +466,9 @@ impl Render for LibraryView {
                 .child(div().h(px(1.)).flex_1().bg(theme.border))
                 .child(
                     div()
+                        .id("library-title")
+                        .probe("library/title", gpui::Role::Heading, "Library")
+                        .aria_level(1)
                         .text_sm()
                         .italic()
                         .text_color(theme.muted_foreground)

@@ -5,7 +5,7 @@ use turso::{Builder, Connection, Database, Value};
 use crate::error::AppError;
 
 const SCHEMA: &str = include_str!("../schema/schema.sql");
-const LATEST_VERSION: i64 = 1;
+const LATEST_VERSION: i64 = 3;
 
 /// Opens (or creates) the local database at `data_dir/eidola.db` and runs any
 /// pending migrations.
@@ -57,6 +57,24 @@ async fn migrate(conn: &Connection, current_version: i64) -> Result<(), AppError
                 message: format!("migration 1 failed: {e}"),
             })?;
         set_user_version(conn, 1).await?;
+    }
+
+    if current_version < 2 {
+        conn.execute_batch(MIGRATION_2)
+            .await
+            .map_err(|e| AppError::Database {
+                message: format!("migration 2 failed: {e}"),
+            })?;
+        set_user_version(conn, 2).await?;
+    }
+
+    if current_version < 3 {
+        conn.execute_batch(MIGRATION_3)
+            .await
+            .map_err(|e| AppError::Database {
+                message: format!("migration 3 failed: {e}"),
+            })?;
+        set_user_version(conn, 3).await?;
     }
 
     Ok(())
@@ -631,6 +649,13 @@ pub struct ActionEntry {
     pub id: String,
     pub space_id: String,
     pub participant_id: String,
+    /// Stable identity shared by every generation of this item. For original
+    /// (gen-0) work, mint a fresh UUIDv7; an edit/regeneration reuses the
+    /// item_id of the action it supersedes.
+    pub item_id: String,
+    /// Prior generation this one replaces; `None` for gen 0. (The generation
+    /// *number* is derived from this chain, not stored.)
+    pub supersedes_action_id: Option<String>,
     pub action_type: String,
     pub status: String,
     pub intent: Option<String>,
@@ -643,13 +668,23 @@ pub struct ActionEntry {
 
 pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO action (id, space_id, participant_id, action_type, status, \
+        "INSERT INTO action (id, space_id, participant_id, item_id, \
+         supersedes_action_id, supersedes_item_id, action_type, status, \
          intent, model, input_tokens, output_tokens, credits_consumed, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         (
             Value::Text(entry.id.clone()),
             Value::Text(entry.space_id.clone()),
             Value::Text(entry.participant_id.clone()),
+            Value::Text(entry.item_id.clone()),
+            opt_text(&entry.supersedes_action_id),
+            // Denormalized supersedes item — always the row's own item (a
+            // generation chain never hops items; the schema CHECKs equality
+            // and the compound FK proves the referenced pair exists).
+            match entry.supersedes_action_id {
+                Some(_) => Value::Text(entry.item_id.clone()),
+                None => Value::Null,
+            },
             Value::Text(entry.action_type.clone()),
             Value::Text(entry.status.clone()),
             opt_text(&entry.intent),
@@ -681,14 +716,17 @@ pub async fn insert_action_antecedent(
     action_id: &str,
     antecedent_action_id: &str,
     ordinal: i64,
+    relation: &str,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO action_antecedent (action_id, antecedent_action_id, ordinal) \
-         VALUES (?1, ?2, ?3)",
+        "INSERT INTO action_antecedent \
+         (action_id, antecedent_action_id, ordinal, relation) \
+         VALUES (?1, ?2, ?3, ?4)",
         (
             Value::Text(action_id.to_string()),
             Value::Text(antecedent_action_id.to_string()),
             Value::Integer(ordinal),
+            Value::Text(relation.to_string()),
         ),
     )
     .await
@@ -820,9 +858,10 @@ pub struct SpaceRow {
 
 /// One row of the space listing, with the cheap activity signals the UI
 /// needs to render a meaningful entry. `last_activity_at` is the max
-/// `action.created_at` in the space (falling back to the space's own
-/// `created_at` for empty spaces); `message_count` counts terminal
-/// (`complete`/`cancelled`) actions.
+/// `action.created_at` over **current generations** in the space (falling back
+/// to the space's own `created_at` for empty spaces); `message_count` counts
+/// terminal (`complete`/`cancelled`) **current-generation** actions — editing
+/// an item appends a generation but does not inflate the count.
 pub struct SpaceListRow {
     pub id: String,
     pub title: Option<String>,
@@ -848,6 +887,9 @@ pub async fn list_spaces(
          FROM space s \
          LEFT JOIN action a ON a.space_id = s.id \
               AND a.status IN ('complete', 'cancelled') \
+              AND NOT EXISTS ( \
+                  SELECT 1 FROM action sup WHERE sup.supersedes_action_id = a.id \
+              ) \
          {filter}\
          GROUP BY s.id, s.title, s.created_at, s.archived_at \
          ORDER BY last_activity_at DESC"
@@ -868,8 +910,10 @@ pub async fn list_spaces(
     Ok(results)
 }
 
-/// First text content block of the first user_input action in a space —
-/// the raw source for the listing snippet shown for untitled spaces.
+/// First text content block of the first user_input *item* in a space, at its
+/// **current generation** — the raw source for the listing snippet shown for
+/// untitled spaces. Ordered by `item_id` (UUIDv7, ~item-creation order) so an
+/// edit to the first post updates the snippet rather than leaving the original.
 pub async fn first_user_text(
     conn: &Connection,
     space_id: &str,
@@ -881,7 +925,10 @@ pub async fn first_user_text(
              JOIN content_block cb ON cb.action_id = a.id \
              WHERE a.space_id = ?1 AND a.action_type = 'user_input' \
                AND cb.block_type = 'text' \
-             ORDER BY a.created_at ASC, cb.ordinal ASC \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM action sup WHERE sup.supersedes_action_id = a.id \
+               ) \
+             ORDER BY a.item_id ASC, cb.ordinal ASC \
              LIMIT 1",
         )
         .await
@@ -924,23 +971,36 @@ pub struct SpaceActionRow {
     pub block_ordinal: Option<i64>,
 }
 
-/// Returns actions in a space with their text content blocks, suitable for
-/// building the OpenAI messages array. Filters to terminal statuses and
-/// uses action_resolved to dereference origin references.
+/// Returns every current-generation action in a space with its text content
+/// blocks — the flat **whole-space** view backing `get_space_messages`. Turns
+/// no longer send this upstream (`get_upstream_context` assembles the
+/// branch-scoped thread instead). Filters to terminal statuses and to the
+/// *current* generation of each item (via item_current), so superseded
+/// generations never enter the context the model sees.
 pub async fn get_space_actions_for_context(
     conn: &Connection,
     space_id: &str,
 ) -> Result<Vec<SpaceActionRow>, AppError> {
+    // Ordered by the item's origin (first generation), not the tip's own
+    // created_at — an edited early post must occupy its original position in
+    // the model's context, not jump to the end (same rule as the render
+    // order in `get_space_tree_data`).
     let mut stmt = conn
         .prepare(
-            "SELECT ar.action_id, ar.action_type, p.kind, ar.status, \
+            "SELECT a.id, a.action_type, p.kind, a.status, \
                     cb.text_content, cb.ordinal \
-             FROM action_resolved ar \
-             JOIN participant p ON p.id = ar.participant_id \
-             LEFT JOIN content_block cb ON cb.action_id = ar.content_source_id \
-             WHERE ar.space_id = ?1 \
-               AND ar.status IN ('complete', 'cancelled') \
-             ORDER BY ar.created_at ASC, cb.ordinal ASC",
+             FROM action a \
+             JOIN item_current ic \
+               ON ic.current_action_id = a.id \
+             JOIN participant p ON p.id = a.participant_id \
+             JOIN (SELECT space_id, item_id, \
+                          MIN(created_at) AS born_at, MIN(id) AS first_action_id \
+                   FROM action GROUP BY space_id, item_id) origin \
+               ON origin.space_id = a.space_id AND origin.item_id = a.item_id \
+             LEFT JOIN content_block cb ON cb.action_id = a.id \
+             WHERE a.space_id = ?1 \
+               AND a.status IN ('complete', 'cancelled') \
+             ORDER BY origin.born_at ASC, origin.first_action_id ASC, cb.ordinal ASC",
         )
         .await
         .map_err(AppError::db)?;
@@ -962,6 +1022,330 @@ pub async fn get_space_actions_for_context(
     Ok(results)
 }
 
+/// The **upstream** context of an action: its reply ancestry, root-first, each
+/// hop resolved to the antecedent **item's current tip** — an edited ancestor
+/// contributes its most recent version. Everything downstream of the action
+/// (replies to it, later turns) and every sibling branch is excluded. This is
+/// the thread a turn sends upstream: a regeneration (`ResponseMode::Revise`)
+/// walks from the generation being replaced *exclusive* (the model must not
+/// see its own prior output); a fresh reply (`ResponseMode::Reply`) walks from
+/// the post being answered *inclusive* — on a linear thread that is the whole
+/// conversation, and on a branched space it is exactly the target's branch.
+pub async fn get_upstream_context(
+    conn: &Connection,
+    target_action_id: &str,
+    include_target: bool,
+) -> Result<Vec<SpaceActionRow>, AppError> {
+    // Walk the reply chain upward (short, local — one query per hop). Each
+    // tip carries its own reply edge (edits/regenerations replicate it).
+    // Item-tip re-rooting can create logical cycles in *resolved* space even
+    // though raw edges only point backward, so guard on revisit.
+    let mut chain: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(target_action_id.to_string());
+    let mut cursor = target_action_id.to_string();
+    if include_target {
+        // The target itself reads at its item's current tip too (a reply to a
+        // since-edited post answers the latest text).
+        let tip = item_tip_of_action(conn, target_action_id)
+            .await?
+            .unwrap_or_else(|| target_action_id.to_string());
+        seen.insert(tip.clone());
+        chain.push(tip.clone());
+        cursor = tip;
+    }
+    while let Some(parent_tip) = reply_antecedent_tip(conn, &cursor).await? {
+        if !seen.insert(parent_tip.clone()) {
+            break;
+        }
+        chain.push(parent_tip.clone());
+        cursor = parent_tip;
+    }
+    chain.reverse(); // root first — the order the model reads the thread
+
+    let mut results = Vec::new();
+    for id in &chain {
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.id, a.action_type, p.kind, a.status, \
+                        cb.text_content, cb.ordinal \
+                 FROM action a \
+                 JOIN participant p ON p.id = a.participant_id \
+                 LEFT JOIN content_block cb ON cb.action_id = a.id \
+                 WHERE a.id = ?1 \
+                   AND a.status IN ('complete', 'cancelled') \
+                 ORDER BY cb.ordinal ASC",
+            )
+            .await
+            .map_err(AppError::db)?;
+        let mut rows = stmt
+            .query([Value::Text(id.clone())])
+            .await
+            .map_err(AppError::db)?;
+        while let Some(row) = rows.next().await.map_err(AppError::db)? {
+            results.push(SpaceActionRow {
+                action_id: row.get::<String>(0).map_err(AppError::db)?,
+                action_type: row.get::<String>(1).map_err(AppError::db)?,
+                participant_kind: row.get::<String>(2).map_err(AppError::db)?,
+                status: row.get::<String>(3).map_err(AppError::db)?,
+                text_content: row.get::<Option<String>>(4).map_err(AppError::db)?,
+                block_ordinal: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+            });
+        }
+    }
+    Ok(results)
+}
+
+/// The current tip of `action_id`'s own item. `None` if the action doesn't
+/// exist.
+async fn item_tip_of_action(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ic.current_action_id \
+             FROM action a \
+             JOIN item_current ic \
+               ON ic.space_id = a.space_id AND ic.item_id = a.item_id \
+             WHERE a.id = ?1 \
+             LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// The current tip of the item that `action_id`'s reply antecedent belongs to
+/// — one upward hop of the item-identity thread walk. `None` for a root (no
+/// reply edge) or malformed data (no tip resolvable).
+async fn reply_antecedent_tip(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ic.current_action_id \
+             FROM action_antecedent aa \
+             JOIN action ant ON ant.id = aa.antecedent_action_id \
+             JOIN item_current ic \
+               ON ic.space_id = ant.space_id AND ic.item_id = ant.item_id \
+             WHERE aa.action_id = ?1 AND aa.relation = 'reply' \
+             LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Space tree — the materials for the threaded-post render (get_space_tree).
+//
+// Unlike get_space_actions_for_context (which flattens to OpenAI messages for
+// the model), this fetches each item's CURRENT generation (item tip) as a
+// renderable post, with its participant identity, derived generation number,
+// content blocks, and antecedent edges (structural `reply` parent + any
+// `reference` links). The Rust side (lib::build_post_tree) assembles these
+// into the flattened render-row list. Only post-bearing action types render;
+// trace types (request/tool/retrieval/…) are collapsed out here.
+// ---------------------------------------------------------------------------
+
+/// Action types that render as posts in the threaded view. Trace types are
+/// excluded so requests/tool plumbing don't appear as posts. (Widen this as
+/// tool_call/tool_result/error gain a post render.)
+pub const POST_ACTION_TYPES_SQL: &str = "'user_input', 'inference'";
+
+/// One renderable post — an item's current-generation action with its
+/// participant identity and derived generation number. Content blocks and
+/// antecedent edges come back separately (see [`SpaceTreeData`]).
+pub struct PostActionRow {
+    pub action_id: String,
+    pub item_id: String,
+    pub participant_kind: String,
+    pub participant_label: String,
+    pub action_type: String,
+    pub model: Option<String>,
+    pub credits_consumed: Option<i64>,
+    /// Derived 0-based generation number of this (tip) action. The item's total
+    /// generation count is `generation + 1`.
+    pub generation: i64,
+    pub created_at: i64,
+}
+
+/// One content block of a post, in `ordinal` order within its action.
+pub struct PostBlockRow {
+    pub action_id: String,
+    pub ordinal: i64,
+    pub block_type: String,
+    pub text_content: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub data: Option<String>,
+}
+
+/// One antecedent edge of a post (its `relation` distinguishes the structural
+/// `reply` parent from non-structural `reference` links).
+pub struct AntecedentEdgeRow {
+    pub action_id: String,
+    /// The concrete generation this edge points at — causality, immutable.
+    pub antecedent_action_id: String,
+    /// The current tip of that generation's *item* — the intended logical
+    /// target once edits/regenerations have moved the tip. Reply threading
+    /// follows this; `None` only for malformed data (no tip resolvable).
+    pub antecedent_current_action_id: Option<String>,
+    pub ordinal: i64,
+    pub relation: String,
+    pub range_start: Option<i64>,
+    pub range_end: Option<i64>,
+    pub annotation: Option<String>,
+}
+
+/// The raw materials for one space's threaded-post render.
+pub struct SpaceTreeData {
+    pub actions: Vec<PostActionRow>,
+    pub blocks: Vec<PostBlockRow>,
+    pub edges: Vec<AntecedentEdgeRow>,
+}
+
+/// Fetch the current-generation post actions of a space along with their
+/// content blocks and antecedent edges. Filters to terminal statuses, current
+/// generations (item tips via `is_current`), and post-bearing action types.
+pub async fn get_space_tree_data(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<SpaceTreeData, AppError> {
+    // Tip post actions, ordered by their **item's origin** (first generation),
+    // not the tip's own created_at — an edited post is a *newer action* of the
+    // same item and must stay exactly where the item has always been, both
+    // here (render order → sibling/root order in the tree) and in the
+    // upstream-context view (`get_space_actions_for_context`).
+    let action_sql = format!(
+        "SELECT ar.action_id, ar.item_id, p.kind, p.label, ar.action_type, \
+                ar.model, ar.credits_consumed, ar.generation, ar.created_at \
+         FROM action_resolved ar \
+         JOIN participant p ON p.id = ar.participant_id \
+         JOIN (SELECT space_id, item_id, \
+                      MIN(created_at) AS born_at, MIN(id) AS first_action_id \
+               FROM action GROUP BY space_id, item_id) origin \
+           ON origin.space_id = ar.space_id AND origin.item_id = ar.item_id \
+         WHERE ar.space_id = ?1 \
+           AND ar.is_current = 1 \
+           AND ar.status IN ('complete', 'cancelled') \
+           AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY origin.born_at ASC, origin.first_action_id ASC"
+    );
+    let mut stmt = conn.prepare(&action_sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut actions = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        actions.push(PostActionRow {
+            action_id: row.get::<String>(0).map_err(AppError::db)?,
+            item_id: row.get::<String>(1).map_err(AppError::db)?,
+            participant_kind: row.get::<String>(2).map_err(AppError::db)?,
+            participant_label: row.get::<String>(3).map_err(AppError::db)?,
+            action_type: row.get::<String>(4).map_err(AppError::db)?,
+            model: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            credits_consumed: row.get::<Option<i64>>(6).map_err(AppError::db)?,
+            generation: row.get::<i64>(7).map_err(AppError::db)?,
+            created_at: row.get::<i64>(8).map_err(AppError::db)?,
+        });
+    }
+
+    // Content blocks of those tip actions, in (action, ordinal) order.
+    let block_sql = format!(
+        "SELECT cb.action_id, cb.ordinal, cb.block_type, cb.text_content, \
+                cb.tool_name, cb.tool_call_id, cb.data \
+         FROM content_block cb \
+         JOIN action_resolved ar ON ar.action_id = cb.action_id \
+         WHERE ar.space_id = ?1 \
+           AND ar.is_current = 1 \
+           AND ar.status IN ('complete', 'cancelled') \
+           AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY cb.action_id ASC, cb.ordinal ASC"
+    );
+    let mut stmt = conn.prepare(&block_sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut blocks = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        blocks.push(PostBlockRow {
+            action_id: row.get::<String>(0).map_err(AppError::db)?,
+            ordinal: row.get::<i64>(1).map_err(AppError::db)?,
+            block_type: row.get::<String>(2).map_err(AppError::db)?,
+            text_content: row.get::<Option<String>>(3).map_err(AppError::db)?,
+            tool_name: row.get::<Option<String>>(4).map_err(AppError::db)?,
+            tool_call_id: row.get::<Option<String>>(5).map_err(AppError::db)?,
+            data: row.get::<Option<String>>(6).map_err(AppError::db)?,
+        });
+    }
+
+    // Antecedent edges of those tip actions (reply + reference). Each edge
+    // also carries the **current tip of the antecedent's item**: the raw
+    // antecedent action id records causality (which concrete generation was
+    // replied to), but the *intended* logical flow follows item identity — a
+    // reply to a since-edited post threads under the edit, not under a
+    // dangling superseded generation (`build_post_tree` uses the resolved id
+    // for reply threading; references keep the raw causal id).
+    let edge_sql = format!(
+        "SELECT aa.action_id, aa.antecedent_action_id, aa.ordinal, aa.relation, \
+                aa.range_start, aa.range_end, aa.annotation, \
+                ic.current_action_id \
+         FROM action_antecedent aa \
+         JOIN action_resolved ar ON ar.action_id = aa.action_id \
+         JOIN action ant ON ant.id = aa.antecedent_action_id \
+         LEFT JOIN item_current ic \
+           ON ic.space_id = ant.space_id AND ic.item_id = ant.item_id \
+         WHERE ar.space_id = ?1 \
+           AND ar.is_current = 1 \
+           AND ar.status IN ('complete', 'cancelled') \
+           AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         ORDER BY aa.action_id ASC, aa.ordinal ASC"
+    );
+    let mut stmt = conn.prepare(&edge_sql).await.map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    let mut edges = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        edges.push(AntecedentEdgeRow {
+            action_id: row.get::<String>(0).map_err(AppError::db)?,
+            antecedent_action_id: row.get::<String>(1).map_err(AppError::db)?,
+            ordinal: row.get::<i64>(2).map_err(AppError::db)?,
+            relation: row.get::<String>(3).map_err(AppError::db)?,
+            range_start: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+            range_end: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+            annotation: row.get::<Option<String>>(6).map_err(AppError::db)?,
+            antecedent_current_action_id: row.get::<Option<String>>(7).map_err(AppError::db)?,
+        });
+    }
+
+    Ok(SpaceTreeData {
+        actions,
+        blocks,
+        edges,
+    })
+}
+
 /// Returns the ID of the last terminal action in a space (for antecedent linking).
 pub async fn last_action_in_space(
     conn: &Connection,
@@ -977,6 +1361,80 @@ pub async fn last_action_in_space(
         .map_err(AppError::db)?;
     let mut rows = stmt
         .query([Value::Text(space_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// Returns `(item_id, space_id)` for an action, or `None` if it doesn't exist.
+/// Used by the generation paths (edit/regenerate) to locate the item an action
+/// belongs to.
+pub async fn action_item_and_space(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<(String, String)>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT item_id, space_id FROM action WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<String>(1).map_err(AppError::db)?,
+        ))),
+    }
+}
+
+/// Returns the current tip (the action no other action supersedes) of an item.
+pub async fn current_tip_of_item(
+    conn: &Connection,
+    space_id: &str,
+    item_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT current_action_id FROM item_current \
+             WHERE space_id = ?1 AND item_id = ?2",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([
+            Value::Text(space_id.to_string()),
+            Value::Text(item_id.to_string()),
+        ])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// Returns the `reply`-relation antecedent of an action (its structural thread
+/// parent), if any. A new generation replicates this so it keeps the item's
+/// place in the thread.
+pub async fn reply_antecedent(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT antecedent_action_id FROM action_antecedent \
+             WHERE action_id = ?1 AND relation = 'reply' LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
         .await
         .map_err(AppError::db)?;
     match rows.next().await.map_err(AppError::db)? {
@@ -1364,6 +1822,105 @@ pub async fn list_credential_lifecycle(
 
 const MIGRATION_1: &str = include_str!("../schema/schema.sql");
 
+/// Rebuild `action` to add the denormalized `supersedes_item_id` and the
+/// compound `(supersedes_action_id, supersedes_item_id)` FK. SQLite cannot add
+/// table constraints via `ALTER TABLE`, so: create the new shape, copy
+/// (backfilling the item from the row's own `item_id` — a generation chain
+/// never hops items, which is exactly the invariant the new FK enforces), swap,
+/// and recreate the indexes. The DDL must stay textually identical to
+/// `schema.sql`'s `action` table (the `migrations_match_schema` test compares
+/// them structurally).
+///
+/// Idempotent-safe: the copy's SELECT only names columns present in both the
+/// old and new shapes, so re-running against an already-new table is a no-op
+/// rebuild.
+const MIGRATION_2: &str = "\
+CREATE TABLE action_new (
+    id              TEXT PRIMARY KEY,          -- UUIDv7
+    space_id        TEXT NOT NULL REFERENCES space(id),
+    participant_id  TEXT NOT NULL REFERENCES participant(id),
+
+    -- generation identity (generation number is derived, not stored)
+    item_id              TEXT NOT NULL,
+    supersedes_action_id TEXT,
+    supersedes_item_id   TEXT,
+
+    action_type     TEXT NOT NULL CHECK (action_type IN (
+                        'user_input',
+                        'inference',
+                        'tool_call',
+                        'tool_result',
+                        'retrieval',
+                        'request',
+                        'checkpoint',
+                        'decision',
+                        'publish',
+                        'system',
+                        'error'
+                    )),
+
+    status          TEXT NOT NULL CHECK (status IN (
+                        'draft',
+                        'streaming',
+                        'complete',
+                        'cancelled',
+                        'error'
+                    )) DEFAULT 'complete',
+
+    intent          TEXT,
+    model           TEXT,
+
+    -- usage / cost
+    input_tokens    INTEGER,
+    output_tokens   INTEGER,
+    credits_consumed INTEGER,
+
+    created_at      INTEGER NOT NULL,
+
+    -- supersedes is item-scoped: both halves present together, the item
+    -- is this row's own, and the referenced (action, item) pair must
+    -- really exist — so a generation chain cannot hop items.
+    CHECK ((supersedes_action_id IS NULL) = (supersedes_item_id IS NULL)),
+    CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
+    FOREIGN KEY (supersedes_action_id, supersedes_item_id)
+        REFERENCES action (id, item_id)
+);
+
+INSERT INTO action_new (id, space_id, participant_id, item_id,
+    supersedes_action_id, supersedes_item_id, action_type, status, intent,
+    model, input_tokens, output_tokens, credits_consumed, created_at)
+SELECT id, space_id, participant_id, item_id, supersedes_action_id,
+       CASE WHEN supersedes_action_id IS NULL THEN NULL ELSE item_id END,
+       action_type, status, intent, model, input_tokens, output_tokens,
+       credits_consumed, created_at
+FROM action;
+
+DROP TABLE action;
+ALTER TABLE action_new RENAME TO action;
+
+CREATE INDEX idx_action_space ON action (space_id, created_at);
+CREATE INDEX idx_action_participant ON action (participant_id);
+CREATE INDEX idx_action_type ON action (action_type);
+CREATE INDEX idx_action_item ON action (space_id, item_id);
+CREATE INDEX idx_action_status ON action (status)
+    WHERE status != 'complete';
+
+CREATE UNIQUE INDEX idx_one_successor_per_action
+    ON action (supersedes_action_id)
+    WHERE supersedes_action_id IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_action_id_item ON action (id, item_id);
+";
+
+/// One gen-0 per item: together with `idx_one_successor_per_action`, an
+/// item's tip becomes provably unique (previously a convention only — a
+/// second gen-0 row would have given `item_current` two rows for one item).
+const MIGRATION_3: &str = "\
+CREATE UNIQUE INDEX idx_one_root_per_item
+    ON action (space_id, item_id)
+    WHERE supersedes_action_id IS NULL;
+";
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1504,6 +2061,8 @@ mod tests {
                 id: action_id.clone(),
                 space_id: space_id.to_string(),
                 participant_id: participant_id.to_string(),
+                item_id: uuid::Uuid::now_v7().to_string(),
+                supersedes_action_id: None,
                 action_type: "user_input".to_string(),
                 status: "complete".to_string(),
                 intent: None,
@@ -1600,6 +2159,274 @@ mod tests {
         assert_eq!(first_user_text(&conn, "space-c").await.unwrap(), None);
     }
 
+    #[tokio::test]
+    async fn get_space_tree_data_resolves_tips_filters_trace_and_returns_edges() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+
+        let user = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        let agent = ensure_participant(&conn, "agent", "kimi", None, 1_000)
+            .await
+            .unwrap();
+
+        insert_space(&conn, "space-t", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+
+        #[allow(clippy::too_many_arguments)]
+        async fn mk(
+            conn: &Connection,
+            id: &str,
+            participant: &str,
+            item: &str,
+            supersedes: Option<&str>,
+            ty: &str,
+            model: Option<&str>,
+            credits: Option<i64>,
+            at: i64,
+        ) {
+            insert_action(
+                conn,
+                &ActionEntry {
+                    id: id.to_string(),
+                    space_id: "space-t".to_string(),
+                    participant_id: participant.to_string(),
+                    item_id: item.to_string(),
+                    supersedes_action_id: supersedes.map(String::from),
+                    action_type: ty.to_string(),
+                    status: "complete".to_string(),
+                    intent: None,
+                    model: model.map(String::from),
+                    input_tokens: None,
+                    output_tokens: None,
+                    credits_consumed: credits,
+                    created_at: at,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // u1 (gen0) -> i1 (reply) -> then edit u1 to u1b (gen1, supersedes u1).
+        mk(&conn, "u1", &user, "iu1", None, "user_input", None, None, 1).await;
+        insert_text_content_block(&conn, "cb-u1", "u1", 0, "text", "first")
+            .await
+            .unwrap();
+        mk(
+            &conn,
+            "i1",
+            &agent,
+            "ii1",
+            None,
+            "inference",
+            Some("kimi"),
+            Some(700),
+            2,
+        )
+        .await;
+        insert_text_content_block(&conn, "cb-i1", "i1", 0, "text", "answer")
+            .await
+            .unwrap();
+        insert_action_antecedent(&conn, "i1", "u1", 0, "reply")
+            .await
+            .unwrap();
+        // Edit: u1b supersedes u1, replicating the (absent) reply edge.
+        mk(
+            &conn,
+            "u1b",
+            &user,
+            "iu1",
+            Some("u1"),
+            "user_input",
+            None,
+            None,
+            3,
+        )
+        .await;
+        insert_text_content_block(&conn, "cb-u1b", "u1b", 0, "text", "edited")
+            .await
+            .unwrap();
+        // A reference edge from the edited post.
+        conn.execute(
+            "INSERT INTO action_antecedent \
+             (action_id, antecedent_action_id, ordinal, relation, range_start, range_end, annotation) \
+             VALUES ('u1b', 'i1', 1, 'reference', 0, 6, 'quoting')",
+            (),
+        )
+        .await
+        .unwrap();
+        // A trace action (request) that must NOT render as a post.
+        mk(&conn, "req1", &user, "ireq", None, "request", None, None, 4).await;
+
+        let data = get_space_tree_data(&conn, "space-t").await.unwrap();
+
+        // Tips only: u1b (not the superseded u1) and i1. No trace action.
+        // Ordered by **item origin** (iu1 born at t=1, ii1 at t=2), not the
+        // tip's own created_at (u1b at t=3) — the edited post keeps its place.
+        let ids: Vec<&str> = data.actions.iter().map(|a| a.action_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["u1b", "i1"],
+            "edited item must keep its origin position, not jump to the end"
+        );
+
+        let u1b = data.actions.iter().find(|a| a.action_id == "u1b").unwrap();
+        assert_eq!(u1b.item_id, "iu1");
+        assert_eq!(
+            u1b.generation, 1,
+            "tip of a once-edited item is generation 1"
+        );
+        assert_eq!(u1b.participant_kind, "human");
+
+        let i1 = data.actions.iter().find(|a| a.action_id == "i1").unwrap();
+        assert_eq!(i1.generation, 0);
+        assert_eq!(i1.participant_kind, "agent");
+        assert_eq!(i1.model.as_deref(), Some("kimi"));
+        assert_eq!(i1.credits_consumed, Some(700));
+
+        // Blocks come back only for the tip actions.
+        let block_actions: Vec<&str> = data.blocks.iter().map(|b| b.action_id.as_str()).collect();
+        assert!(block_actions.contains(&"u1b"));
+        assert!(block_actions.contains(&"i1"));
+        assert!(!block_actions.contains(&"u1"), "superseded gen excluded");
+
+        // Edges: i1's reply -> u1 (raw, now non-tip), resolved through item
+        // identity to u1b (iu1's current tip) — causality keeps the concrete
+        // generation, threading follows the item. And u1b's reference -> i1.
+        let reply: Vec<_> = data
+            .edges
+            .iter()
+            .filter(|e| e.relation == "reply")
+            .collect();
+        assert_eq!(reply.len(), 1);
+        assert_eq!(reply[0].action_id, "i1");
+        assert_eq!(reply[0].antecedent_action_id, "u1");
+        assert_eq!(
+            reply[0].antecedent_current_action_id.as_deref(),
+            Some("u1b"),
+            "a reply to a superseded generation resolves to the item's tip"
+        );
+        let refs: Vec<_> = data
+            .edges
+            .iter()
+            .filter(|e| e.relation == "reference")
+            .collect();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].action_id, "u1b");
+        assert_eq!(refs[0].range_end, Some(6));
+        assert_eq!(refs[0].annotation.as_deref(), Some("quoting"));
+        assert_eq!(
+            refs[0].antecedent_current_action_id.as_deref(),
+            Some("i1"),
+            "an un-superseded target resolves to itself"
+        );
+    }
+
+    /// The one-root-per-item invariant is enforced by the database, not
+    /// convention: a second gen-0 action for an existing item must be
+    /// rejected (`idx_one_root_per_item`), so `item_current` can never yield
+    /// two tips for one item.
+    #[tokio::test]
+    async fn duplicate_item_root_is_rejected() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+
+        let p = ensure_participant(&conn, "human", "user", None, 1_000)
+            .await
+            .unwrap();
+        insert_space(&conn, "space-r", None, "unlinked", 1_000)
+            .await
+            .unwrap();
+
+        let entry = |id: &str, supersedes: Option<&str>| ActionEntry {
+            id: id.to_string(),
+            space_id: "space-r".to_string(),
+            participant_id: p.clone(),
+            item_id: "item-1".to_string(),
+            supersedes_action_id: supersedes.map(String::from),
+            action_type: "user_input".to_string(),
+            status: "complete".to_string(),
+            intent: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            credits_consumed: None,
+            created_at: 1_000,
+        };
+
+        insert_action(&conn, &entry("a1", None)).await.unwrap();
+        // A proper generation (supersedes the root) is fine…
+        insert_action(&conn, &entry("a2", Some("a1")))
+            .await
+            .unwrap();
+        // …but a second root for the same item must be rejected.
+        let dup = insert_action(&conn, &entry("a3", None)).await;
+        assert!(
+            dup.is_err(),
+            "a second gen-0 for one item must violate idx_one_root_per_item"
+        );
+    }
+
+    /// A genuine v1-shaped database (the pre-`supersedes_item_id` action DDL)
+    /// migrated by MIGRATION_2: the rebuild must backfill the denormalized
+    /// item from each row's own item_id and preserve every row.
+    #[tokio::test]
+    async fn migration_2_backfills_supersedes_item_id() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+
+        // The v1 `action` shape (no supersedes_item_id, inline FK).
+        conn.execute_batch(
+            "CREATE TABLE action (
+                id              TEXT PRIMARY KEY,
+                space_id        TEXT NOT NULL,
+                participant_id  TEXT NOT NULL,
+                item_id              TEXT NOT NULL,
+                supersedes_action_id TEXT REFERENCES action(id),
+                action_type     TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'complete',
+                intent          TEXT,
+                model           TEXT,
+                input_tokens    INTEGER,
+                output_tokens   INTEGER,
+                credits_consumed INTEGER,
+                created_at      INTEGER NOT NULL
+            );
+            INSERT INTO action (id, space_id, participant_id, item_id,
+                supersedes_action_id, action_type, status, created_at)
+            VALUES
+                ('u1',  's', 'p', 'iu1', NULL, 'user_input', 'complete', 1),
+                ('u1b', 's', 'p', 'iu1', 'u1', 'user_input', 'complete', 2);",
+        )
+        .await
+        .unwrap();
+
+        conn.execute_batch(MIGRATION_2).await.unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT id, supersedes_item_id FROM action ORDER BY id")
+            .await
+            .unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        let mut got = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            got.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<Option<String>>(1).unwrap(),
+            ));
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("u1".to_string(), None),
+                ("u1b".to_string(), Some("iu1".to_string())),
+            ],
+            "gen-0 stays NULL; a superseding generation backfills its own item"
+        );
+    }
+
     /// Seed a database with one connected story: two attestations, a
     /// connection, three requests (one carrying a credential + action into a
     /// space, one a retry, one errored), and a credential mid-spend. The
@@ -1665,6 +2492,8 @@ mod tests {
                 id: "act-1".into(),
                 space_id: "space-1".into(),
                 participant_id: agent,
+                item_id: "item-1".into(),
+                supersedes_action_id: None,
                 action_type: "inference".into(),
                 status: "complete".into(),
                 intent: Some("answer".into()),

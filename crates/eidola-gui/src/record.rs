@@ -606,7 +606,7 @@ impl RecordView {
 // ---------------------------------------------------------------------------
 
 impl Render for RecordView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Copy the colors out (Hsla is Copy) so no shared borrow of `cx`
         // outlives the &mut reborrows the render helpers need.
         let (bg, fg, muted_fg) = {
@@ -647,7 +647,7 @@ impl Render for RecordView {
             .size_full()
             .bg(bg)
             .text_color(fg)
-            .child(self.render_strip(cx))
+            .child(self.render_strip(window, cx))
             .child(body)
     }
 }
@@ -665,7 +665,7 @@ fn scroll_wrap(content: impl IntoElement) -> gpui::Stateful<Div> {
 impl RecordView {
     /// The section strip doubles as the title bar — traffic lights to its
     /// left, quiet text sections, an italic wordmark on the right.
-    fn render_strip(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_strip(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let mut strip = h_flex()
             .w_full()
@@ -715,7 +715,7 @@ impl RecordView {
         } else {
             ("Refresh", theme.muted_foreground, theme.foreground)
         };
-        strip
+        let strip = strip
             .child(div().flex_1())
             .child(
                 div()
@@ -734,7 +734,12 @@ impl RecordView {
                     .italic()
                     .text_color(theme.muted_foreground)
                     .child("The Record"),
-            )
+            );
+
+        // The strip *is* the titlebar: make its empty areas (and gaps between
+        // the section tabs) drag the window. The tabs/refresh keep their own
+        // clicks — a plain click never arms a move.
+        crate::titlebar::make_draggable(strip.id("record-strip"), "record-strip", window, cx)
     }
 
     fn list_frame(&self) -> Div {
@@ -908,6 +913,7 @@ impl RecordView {
         }
         div()
             .id("load-more")
+            .probe("record/load-more", gpui::Role::Button, "Load more")
             .w_full()
             .h(ROW_H)
             .flex()
@@ -937,6 +943,11 @@ impl RecordView {
             format_bytes(a.doc_bytes),
         );
         self.row_shell(("attestation", dix), dix, cx)
+            .probe(
+                format!("record/attestation/{dix}"),
+                gpui::Role::ListItem,
+                format!("Attestation {}", truncate_middle(&a.hash, 44)),
+            )
             .on_click(cx.listener(move |this, _, _, cx| this.open_attestation(hash.clone(), cx)))
             .child(
                 h_flex()
@@ -1035,6 +1046,11 @@ impl RecordView {
         sub_parts.push(fmt_utc(r.request_at, false));
 
         self.row_shell(("request", dix), dix, cx)
+            .probe(
+                format!("record/request/{dix}"),
+                gpui::Role::ListItem,
+                format!("{} {} — {}", r.method, r.path, status_text),
+            )
             .on_click(cx.listener(move |this, _, _, cx| this.open_request(id.clone(), cx)))
             .child(
                 h_flex()
@@ -1122,6 +1138,11 @@ impl RecordView {
                 "Attestation",
                 mono(12.)
                     .id("open-attestation")
+                    .probe(
+                        "record/detail/attestation-link",
+                        gpui::Role::Link,
+                        format!("Open attestation {}", truncate_middle(&hash, 44)),
+                    )
                     .cursor_pointer()
                     .text_color(theme.link)
                     .hover(|s| s.text_color(theme.link_hover))
@@ -1166,6 +1187,11 @@ impl RecordView {
                 "Space",
                 div()
                     .id("open-space")
+                    .probe(
+                        "record/detail/space-link",
+                        gpui::Role::Link,
+                        format!("Open space {}", space_label),
+                    )
                     .text_sm()
                     .cursor_pointer()
                     .text_color(theme.link)
@@ -1253,6 +1279,19 @@ impl RecordView {
 
         v_flex()
             .id(("spend", i))
+            .probe(
+                format!("record/spend/{i}"),
+                gpui::Role::ListItem,
+                format!(
+                    "{} {} — {}",
+                    e.method,
+                    e.path,
+                    match e.credits_consumed {
+                        Some(c) => format!("{} credits", crate::plans::format_credits(c)),
+                        None => "—".to_string(),
+                    }
+                ),
+            )
             .w_full()
             .h(ROW_H)
             .justify_center()
@@ -1325,6 +1364,11 @@ impl RecordView {
         h_flex().pb_2().child(
             div()
                 .id("back")
+                .probe(
+                    "record/detail/back",
+                    gpui::Role::Button,
+                    format!("Back to {label}"),
+                )
                 .text_sm()
                 .cursor_pointer()
                 .text_color(theme.muted_foreground)
@@ -1384,6 +1428,11 @@ fn raw_section(payload: &CachedPayload, cx: &Context<RecordView>) -> Div {
             .child(
                 div()
                     .id(SharedString::from(format!("copy-{}", payload.id)))
+                    .probe(
+                        format!("record/detail/copy/{}", payload.id),
+                        gpui::Role::Button,
+                        format!("Copy {}", payload.title),
+                    )
                     .text_xs()
                     .cursor_pointer()
                     .text_color(theme.muted_foreground)

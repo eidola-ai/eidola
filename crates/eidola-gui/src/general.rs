@@ -15,6 +15,7 @@
 //! Base URL field on this pane) has focus. Measurement rows summarize and
 //! link to the Record window instead of dumping truncated hex.
 
+use eidola_app_core::config::{AppearanceSetting, LightCharacter, TimeOfDayTint};
 use gpui::{
     AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
@@ -154,6 +155,29 @@ impl GeneralView {
         self.editing_base_url = false;
         cx.notify();
     }
+
+    /// Circadian day/night axis. Writes through the store; the theme
+    /// re-applies via its config observation (`theme::wire_config`).
+    pub fn set_appearance(&mut self, appearance: AppearanceSetting, cx: &mut Context<Self>) {
+        self.config
+            .update(cx, |c, cx| c.set_appearance(appearance, cx));
+        cx.notify();
+    }
+
+    /// Circadian time-of-day axis.
+    pub fn set_time_of_day_tint(&mut self, tint: TimeOfDayTint, cx: &mut Context<Self>) {
+        self.config
+            .update(cx, |c, cx| c.set_time_of_day_tint(tint, cx));
+        cx.notify();
+    }
+
+    /// Circadian fixed light character (shown only while the time-of-day
+    /// axis is off).
+    pub fn set_light_character(&mut self, character: LightCharacter, cx: &mut Context<Self>) {
+        self.config
+            .update(cx, |c, cx| c.set_light_character(character, cx));
+        cx.notify();
+    }
 }
 
 impl Render for GeneralView {
@@ -168,7 +192,145 @@ impl Render for GeneralView {
         // module doc for why the listener lives on the `SettingsView` root.
         let mut col = v_flex().id("general-pane").px_6().py_5().gap_4().w_full();
 
-        col = col.child(section_header("Server", cx));
+        // --- Appearance: the circadian theme's two axes -----------------
+        col = col.child(section_header("Appearance", cx));
+
+        if let Some(s) = state.as_ref() {
+            let mut day_night = h_flex().gap_2();
+            for (value, id, probe_name, label) in [
+                (
+                    AppearanceSetting::System,
+                    "appearance-system",
+                    "settings/general/appearance/system",
+                    "System",
+                ),
+                (
+                    AppearanceSetting::Day,
+                    "appearance-day",
+                    "settings/general/appearance/day",
+                    "Day",
+                ),
+                (
+                    AppearanceSetting::Night,
+                    "appearance-night",
+                    "settings/general/appearance/night",
+                    "Night",
+                ),
+                (
+                    AppearanceSetting::Auto,
+                    "appearance-auto",
+                    "settings/general/appearance/auto",
+                    "Auto",
+                ),
+            ] {
+                let active = s.appearance == value;
+                day_night = day_night.child(
+                    choice_chip(id, label, active, cx)
+                        .probe(probe_name, gpui::Role::Button, label)
+                        .aria_selected(active)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_appearance(value, cx);
+                        })),
+                );
+            }
+            col = col.child(field_row(
+                "Day & night",
+                cx,
+                v_flex().gap_1().child(day_night).child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground.opacity(0.8))
+                        .child("System follows macOS. Auto follows the sun — day between sunrise and sunset."),
+                ),
+            ));
+
+            let mut tint_row = h_flex().gap_2();
+            for (value, id, probe_name, label) in [
+                (
+                    TimeOfDayTint::On,
+                    "time-of-day-on",
+                    "settings/general/time-of-day/on",
+                    "On",
+                ),
+                (
+                    TimeOfDayTint::Off,
+                    "time-of-day-off",
+                    "settings/general/time-of-day/off",
+                    "Off",
+                ),
+            ] {
+                let active = s.time_of_day_tint == value;
+                tint_row = tint_row.child(
+                    choice_chip(id, label, active, cx)
+                        .probe(probe_name, gpui::Role::Button, label)
+                        .aria_selected(active)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_time_of_day_tint(value, cx);
+                        })),
+                );
+            }
+            col = col.child(field_row(
+                "Time of day",
+                cx,
+                v_flex().gap_1().child(tint_row).child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground.opacity(0.8))
+                        .child(
+                            "Follows the sun's light — cool around sunrise, neutral midday and \
+                             midnight, warm around sunset. Sunrise and sunset are approximated \
+                             from your time zone.",
+                        ),
+                ),
+            ));
+
+            // With the sun turned off, the character becomes a fixed choice.
+            if s.time_of_day_tint == TimeOfDayTint::Off {
+                let mut light_row = h_flex().gap_2();
+                for (value, id, probe_name, label) in [
+                    (
+                        LightCharacter::Cool,
+                        "light-character-cool",
+                        "settings/general/light-character/cool",
+                        "Cool",
+                    ),
+                    (
+                        LightCharacter::Neutral,
+                        "light-character-neutral",
+                        "settings/general/light-character/neutral",
+                        "Neutral",
+                    ),
+                    (
+                        LightCharacter::Warm,
+                        "light-character-warm",
+                        "settings/general/light-character/warm",
+                        "Warm",
+                    ),
+                ] {
+                    let active = s.light_character == value;
+                    light_row = light_row.child(
+                        choice_chip(id, label, active, cx)
+                            .probe(probe_name, gpui::Role::Button, label)
+                            .aria_selected(active)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_light_character(value, cx);
+                            })),
+                    );
+                }
+                col = col.child(field_row(
+                    "Light",
+                    cx,
+                    v_flex().gap_1().child(light_row).child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground.opacity(0.8))
+                            .child("A fixed light character for the palette."),
+                    ),
+                ));
+            }
+        }
+
+        col = col.child(div().pt_2().child(section_header("Server", cx)));
 
         // --- Base URL: honest about override vs pin --------------------
         let mut base_value = v_flex().flex_1().gap_1();
@@ -209,12 +371,19 @@ impl Render for GeneralView {
                                 ),
                         )
                         .child(
-                            Button::new("cancel-base-url")
-                                .ghost()
-                                .small()
-                                .label("Cancel")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.cancel_edit_base_url(cx)),
+                            // Probed wrapper for the a11y role/label — shrink-wraps
+                            // the button so its bounds are an honest click target.
+                            div()
+                                .id("cancel-base-url-wrap")
+                                .probe("settings/general/cancel", gpui::Role::Button, "Cancel")
+                                .child(
+                                    Button::new("cancel-base-url")
+                                        .ghost()
+                                        .small()
+                                        .label("Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_edit_base_url(cx)
+                                        })),
                                 ),
                         ),
                 );
@@ -251,10 +420,17 @@ impl Render for GeneralView {
                         .on_click(cx.listener(|this, _, _, cx| this.revert_base_url(cx))),
                 );
             }
-            links =
-                links.child(quiet_link("edit-base-url", "Change…", cx).on_click(
-                    cx.listener(|this, _, window, cx| this.begin_edit_base_url(window, cx)),
-                ));
+            links = links.child(
+                quiet_link("edit-base-url", "Change…", cx)
+                    .probe(
+                        "settings/general/change",
+                        gpui::Role::Button,
+                        "Change base URL",
+                    )
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.begin_edit_base_url(window, cx)),
+                    ),
+            );
             base_value = base_value.child(links);
         }
         col = col.child(field_row("Base URL", cx, base_value));
@@ -347,6 +523,11 @@ impl Render for GeneralView {
                                 "Inspect attestation evidence in the Record (⇧⌘L)",
                                 cx,
                             )
+                            .probe(
+                                "settings/general/open-record",
+                                gpui::Role::Link,
+                                "Inspect attestation evidence in the Record",
+                            )
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(Box::new(OpenRecord), cx);
                             }),
@@ -368,7 +549,12 @@ impl Render for GeneralView {
         }
 
         if let Some(err) = error {
-            col = col.child(error_banner(&err, cx));
+            col = col.child(
+                div()
+                    .id("general-error")
+                    .probe("settings/general/error", gpui::Role::Alert, err.clone())
+                    .child(error_banner(&err, cx)),
+            );
         }
 
         col
@@ -408,6 +594,32 @@ fn muted_text(text: impl Into<String>, cx: &gpui::App) -> impl IntoElement {
     div()
         .text_color(theme.muted_foreground)
         .child(SharedString::from(text))
+}
+
+/// One selectable option in a small chip row (the appearance settings).
+/// The active chip gets the sidebar-accent pill, matching the settings nav.
+fn choice_chip(
+    id: &'static str,
+    label: &'static str,
+    active: bool,
+    cx: &gpui::App,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = cx.theme();
+    let el = div()
+        .id(id)
+        .cursor_pointer()
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .text_sm();
+    let el = if active {
+        el.bg(theme.sidebar_accent)
+            .text_color(theme.sidebar_accent_foreground)
+    } else {
+        el.text_color(theme.muted_foreground)
+            .hover(|s| s.text_color(theme.foreground))
+    };
+    el.child(label)
 }
 
 /// A quiet inline text link: muted, brightening on hover. The settings

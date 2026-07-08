@@ -13,19 +13,13 @@
 
 use gpui::{
     App, AppContext, Bounds, Context, CursorStyle, Entity, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, MouseMoveEvent, ParentElement, Pixels, Render, SharedString,
+    MouseButton, MouseMoveEvent, ParentElement, Pixels, Render, SharedString,
     StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions, div,
     prelude::FluentBuilder, px, rems, size,
 };
 use gpui_component::{Root, Theme, h_flex, text::TextView, v_flex};
 use gpui_component_assets::Assets;
-use gpui_markdown_editor::{
-    Backspace, Copy, Cut, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward,
-    DeleteWordForward, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left, MarkdownEditor,
-    Paste, PastePlain, Right, SelectAll, ShiftDocumentEnd, ShiftDocumentStart, ShiftDown, ShiftEnd,
-    ShiftEnter, ShiftHome, ShiftLeft, ShiftRight, ShiftTab, ShiftUp, ShiftWordLeft, ShiftWordRight,
-    Tab, Up, WordLeft, WordRight, parse,
-};
+use gpui_markdown_editor::{MarkdownEditor, MarkdownEditorState, parse};
 
 const DEMO_DOCUMENT: &str = "\
 # gpui-markdown-editor
@@ -81,55 +75,6 @@ Click into the equation above to swap to edit mode and adjust the LaTeX directly
 
 ";
 
-fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        // Editing
-        KeyBinding::new("backspace", Backspace, None),
-        KeyBinding::new("delete", Delete, None),
-        KeyBinding::new("enter", Enter, None),
-        KeyBinding::new("shift-enter", ShiftEnter, None),
-        KeyBinding::new("tab", Tab, None),
-        KeyBinding::new("shift-tab", ShiftTab, None),
-        // Word / line delete (macOS standard: Option for word, Cmd for line).
-        KeyBinding::new("alt-backspace", DeleteWordBackward, None),
-        KeyBinding::new("alt-delete", DeleteWordForward, None),
-        KeyBinding::new("cmd-backspace", DeleteToLineStart, None),
-        KeyBinding::new("cmd-delete", DeleteToLineEnd, None),
-        // Caret motion
-        KeyBinding::new("left", Left, None),
-        KeyBinding::new("right", Right, None),
-        KeyBinding::new("up", Up, None),
-        KeyBinding::new("down", Down, None),
-        KeyBinding::new("shift-left", ShiftLeft, None),
-        KeyBinding::new("shift-right", ShiftRight, None),
-        KeyBinding::new("shift-up", ShiftUp, None),
-        KeyBinding::new("shift-down", ShiftDown, None),
-        KeyBinding::new("home", Home, None),
-        KeyBinding::new("end", End, None),
-        KeyBinding::new("cmd-left", Home, None),
-        KeyBinding::new("cmd-right", End, None),
-        KeyBinding::new("shift-home", ShiftHome, None),
-        KeyBinding::new("shift-end", ShiftEnd, None),
-        KeyBinding::new("cmd-shift-left", ShiftHome, None),
-        KeyBinding::new("cmd-shift-right", ShiftEnd, None),
-        KeyBinding::new("cmd-up", DocumentStart, None),
-        KeyBinding::new("cmd-down", DocumentEnd, None),
-        KeyBinding::new("cmd-shift-up", ShiftDocumentStart, None),
-        KeyBinding::new("cmd-shift-down", ShiftDocumentEnd, None),
-        // Word-granular motion (macOS standard: Option+arrows).
-        KeyBinding::new("alt-left", WordLeft, None),
-        KeyBinding::new("alt-right", WordRight, None),
-        KeyBinding::new("alt-shift-left", ShiftWordLeft, None),
-        KeyBinding::new("alt-shift-right", ShiftWordRight, None),
-        // Clipboard
-        KeyBinding::new("cmd-a", SelectAll, None),
-        KeyBinding::new("cmd-c", Copy, None),
-        KeyBinding::new("cmd-x", Cut, None),
-        KeyBinding::new("cmd-v", Paste, None),
-        KeyBinding::new("cmd-shift-v", PastePlain, None),
-    ]);
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DraggingPane {
     EditorSource,
@@ -139,7 +84,7 @@ enum DraggingPane {
 /// Top-level demo view. Owns the editor entity and observes it so the
 /// debug panes track edits.
 struct DemoApp {
-    editor: Entity<MarkdownEditor>,
+    editor_state: Entity<MarkdownEditorState>,
     source_width: Pixels,
     ast_width: Pixels,
     dragging: Option<DraggingPane>,
@@ -147,12 +92,13 @@ struct DemoApp {
 
 impl DemoApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let editor = cx.new(|cx| MarkdownEditor::new(DEMO_DOCUMENT, window, cx));
+        let editor_state =
+            cx.new(|cx| MarkdownEditorState::new(window, cx).default_value(DEMO_DOCUMENT));
         // Re-render this view whenever the editor's state changes — that's
         // how the source / AST panes track edits live.
-        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+        cx.observe(&editor_state, |_, _, cx| cx.notify()).detach();
         Self {
-            editor,
+            editor_state,
             source_width: px(360.),
             ast_width: px(360.),
             dragging: None,
@@ -163,9 +109,9 @@ impl DemoApp {
 impl Render for DemoApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::global(cx);
-        let editor = self.editor.read(cx);
-        let md = editor.state.markdown.clone();
-        let cursor_label = match editor.state.selection {
+        let editor = self.editor_state.read(cx);
+        let md = editor.value().to_string();
+        let cursor_label = match editor.selection() {
             gpui_markdown_editor::Selection::Cursor(p) => format!("cursor: {p}"),
             gpui_markdown_editor::Selection::Range { anchor, head } => {
                 format!("selection: anchor={anchor} head={head}")
@@ -277,7 +223,7 @@ impl Render for DemoApp {
                     .min_w_0()
                     .h_full()
                     .overflow_y_scroll()
-                    .child(self.editor.clone()),
+                    .child(MarkdownEditor::new(&self.editor_state)),
             )
             .child(divider_1)
             // Source pane.
@@ -375,7 +321,7 @@ fn main() {
             gpui_component::init(cx);
             Theme::sync_system_appearance(None, cx);
 
-            bind_keys(cx);
+            gpui_markdown_editor::init(cx);
 
             let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
             let window = cx
@@ -394,7 +340,7 @@ fn main() {
             window
                 .update(cx, |root, window, cx| {
                     if let Ok(demo) = root.view().clone().downcast::<DemoApp>() {
-                        let editor = demo.read(cx).editor.clone();
+                        let editor = demo.read(cx).editor_state.clone();
                         let focus = editor.read(cx).focus_handle.clone();
                         window.focus(&focus, cx);
                     }

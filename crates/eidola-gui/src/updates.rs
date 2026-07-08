@@ -29,7 +29,7 @@ use crate::probe::Probe as _;
 use crate::stores::{Stores, UpdateStore};
 
 /// Vertical reserve under the transparent titlebar so the traffic lights
-/// don't land on content (same rationale as `chat::TITLE_BAR_RESERVE`).
+/// don't land on content (same rationale as `space_view::TITLE_BAR_RESERVE`).
 #[cfg(target_os = "macos")]
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
 #[cfg(not(target_os = "macos"))]
@@ -180,7 +180,7 @@ pub fn relative_time(then_ms: i64, now_ms: i64) -> String {
 }
 
 impl Render for UpdatesView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let display = self.display(cx);
         let checking = self.update.read(cx).checking();
@@ -250,7 +250,12 @@ impl Render for UpdatesView {
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .child(div().h(TITLE_BAR_RESERVE).w_full())
+            .child(crate::titlebar::make_draggable(
+                div().id("updates-titlebar").h(TITLE_BAR_RESERVE).w_full(),
+                "updates-titlebar",
+                window,
+                cx,
+            ))
             .child(
                 div()
                     .id("updates-body")
@@ -397,6 +402,15 @@ fn render_unverifiable(version: &str, reason: &str, cx: &gpui::App) -> impl Into
         .w_full()
         .child(
             v_flex()
+                .id("updates-security-warning")
+                .probe(
+                    "updates/security-warning",
+                    gpui::Role::Alert,
+                    format!(
+                        "Security warning: the release marked latest (v{version}) could not \
+                         be verified. {reason}"
+                    ),
+                )
                 .w_full()
                 .px_3()
                 .py_3()

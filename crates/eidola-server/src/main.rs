@@ -78,6 +78,12 @@ impl Config {
                     .map_err(|_| "PRICING_MARKUP must be a valid number".to_string())
             })
             .transpose()?;
+        // Refuse to start with a markup below the pricing contract's safe
+        // cost factor — see `validate_pricing_markup` for the loss-window
+        // rationale (and the future dynamic-factor-via-/models note).
+        eidola_server::backend::validate_pricing_markup(
+            pricing_markup.unwrap_or(eidola_server::backend::DEFAULT_PRICING_MARKUP),
+        )?;
 
         let credential_master_key_hex = std::env::var("CREDENTIAL_MASTER_KEY")
             .map_err(|_| "CREDENTIAL_MASTER_KEY environment variable is required")?;

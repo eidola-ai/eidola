@@ -1,41 +1,59 @@
-//! `MarkdownEditor` — the gpui entity that owns editor state and routes user
-//! input through the pure `update::update` pipeline.
+//! The editor's state/element split (mirrors `gpui_component::Input`):
 //!
-//! Wiring is intentionally minimal:
+//! - [`MarkdownEditorState`] is the retained **state entity** — it owns the
+//!   `EditorState`, focus, the IME `EntityInputHandler`, the cross-frame
+//!   layout caches, and emits [`MarkdownEditorEvent`]s. It is not `Render`.
+//! - [`MarkdownEditor`] is the per-frame **element** (`RenderOnce`) built via
+//!   `MarkdownEditor::new(&state)`; it registers the action/IME handlers
+//!   (routing into the state via `window.listener_for`) and paints the blocks.
+//! - [`init`] installs the default keymap (scoped to the `MarkdownEditor` key
+//!   context) so the editor is a drop-in — the host calls it once, like
+//!   `gpui_component::init`, instead of hand-rolling bindings.
 //!
-//! - One `actions!` block declares every editor action (`Backspace`, `Left`,
-//!   `Enter`, …). The hosting application must `cx.bind_keys` them — see
-//!   `bin/demo.rs` for the standard macOS map.
-//! - Text input goes through `EntityInputHandler` so dead-key composition,
-//!   non-Latin layouts, and pasted text all work without a separate code
-//!   path.
+//! Input flows through the pure `update::update` pipeline; text input goes
+//! through `EntityInputHandler` so dead-key composition, non-Latin layouts,
+//! and pasted text all share one code path.
 
 use std::collections::HashMap;
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle,
-    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    UTF16Selection, Window, actions, div, prelude::*, px,
+    Action, App, Bounds, ClipboardItem, Context, CursorStyle, Entity, EntityInputHandler,
+    FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, RenderOnce, Subscription, UTF16Selection, Window, actions, div, prelude::*, px,
 };
 use gpui_component::Theme;
 
 use crate::element::{BlockElement, LaidOutBlock};
-use crate::event::EditorEvent;
+use crate::event::{EditorEvent, MarkdownEditorEvent};
 use crate::parser::parse;
-use crate::render::render;
+use crate::render::{render, render_readonly};
 use crate::render_spec::RenderSpec;
 use crate::state::{EditorState, Selection};
 use crate::style::MarkdownStyle;
 use crate::update;
+
+/// Submit-intent action carrying the modifier state at the time Enter was
+/// pressed (mirrors gpui-component's `input::Enter`). The host binds the
+/// modified chords — `cmd-enter`, `cmd-shift-enter` — to this with the
+/// matching `secondary`/`shift` flags; the handler emits
+/// [`MarkdownEditorEvent::PressEnter`] for the modified chords and inserts a
+/// newline / line break for the plain ones. `no_json` because these are
+/// keystroke-bound, never invoked from a serialized keymap value.
+#[derive(Action, Clone, PartialEq, Eq)]
+#[action(namespace = markdown_editor, no_json)]
+pub struct Enter {
+    /// True when the platform primary modifier (⌘ on macOS) was held.
+    pub secondary: bool,
+    /// True when Shift was held.
+    pub shift: bool,
+}
 
 actions!(
     markdown_editor,
     [
         Backspace,
         Delete,
-        Enter,
-        ShiftEnter,
         Tab,
         ShiftTab,
         Left,
@@ -92,8 +110,44 @@ actions!(
         /// `cmd-shift-v`. The dual-keybinding convention matches what
         /// most editors do for "paste as plain text."
         PastePlain,
+        /// Revert the buffer to the state before the most recent
+        /// (coalesced) edit, restoring its markdown *and* selection.
+        /// No-op when the undo stack is empty. Default macOS
+        /// keybinding: `cmd-z`.
+        Undo,
+        /// Re-apply the most recently undone edit. Cleared the moment a
+        /// fresh edit is made. No-op when the redo stack is empty.
+        /// Default macOS keybinding: `cmd-shift-z`.
+        Redo,
     ]
 );
+
+/// Cap on the number of undo entries retained. Each entry is a full
+/// pre-edit [`EditorState`] snapshot (markdown + selection); the buffers
+/// this editor hosts (chat composer, inline posts) are small, so a few
+/// hundred whole-document snapshots is a negligible memory cost while
+/// still bounding a pathological session. The oldest entry is dropped
+/// (FIFO) once the stack exceeds this.
+const MAX_HISTORY: usize = 256;
+
+/// Which wrapped display row a caret sitting EXACTLY on a soft-wrap boundary
+/// belongs to. The same byte offset is both the end of one wrapped row and the
+/// start of the next; gpui's `position_for_index` always resolves it to the
+/// upper row's end. This transient signal records the caret's intended row so
+/// it renders — and vertical motion computes its current row — on the right
+/// visual row. Like `intended_x`, it's set by the command that placed the caret
+/// and reset on edits / plain moves. Only matters at a boundary; harmless
+/// elsewhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WrapAffinity {
+    /// Prefer the START of the lower row (Down/Home/Right onto a boundary, a
+    /// fresh caret, an edit). The default — the intuitive "beginning of the
+    /// next line".
+    Downstream,
+    /// Prefer the END of the upper row (End). Keeps the caret visually on the
+    /// row the command acted on.
+    Upstream,
+}
 
 /// Sentinel string tagged onto every `copy` / `cut` clipboard write via
 /// `ClipboardItem::new_string_with_metadata`. Paired with the metadata
@@ -131,10 +185,59 @@ fn normalize_line_endings(text: &str) -> String {
     out
 }
 
-pub struct MarkdownEditor {
-    pub state: EditorState,
-    style: MarkdownStyle,
+/// Decide whether the transition `before → after` is a *coalescible
+/// typing insert*: a single non-whitespace character spliced at a
+/// collapsed caret, leaving the caret immediately after it. Returns the
+/// post-insert caret offset when so (the anchor a following character
+/// must continue from to keep coalescing), else `None`.
+///
+/// Requiring a clean single-char insertion at a cursor is deliberately
+/// conservative: if `update` did anything structural (promoted a soft
+/// break, renumbered a list, closed a fence) the shape won't match and
+/// the edit falls out of the run — landing as its own, independently
+/// undoable step. Whitespace and newlines are excluded so a word break
+/// or Enter ends the current run, matching how editors segment undo.
+fn coalescible_type_end(before: &EditorState, after: &EditorState) -> Option<usize> {
+    let Selection::Cursor(start) = before.selection else {
+        return None;
+    };
+    let Selection::Cursor(end) = after.selection else {
+        return None;
+    };
+    if end <= start || after.markdown.len() != before.markdown.len() + (end - start) {
+        return None;
+    }
+    let bb = before.markdown.as_bytes();
+    let ab = after.markdown.as_bytes();
+    // after = before[..start] + inserted + before[start..]
+    if ab[..start] != bb[..start] || ab[end..] != bb[start..] {
+        return None;
+    }
+    let inserted = &after.markdown[start..end];
+    let mut chars = inserted.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || ch.is_whitespace() {
+        return None;
+    }
+    Some(end)
+}
+
+/// The editor's retained state — the Entity half of the gpui-component
+/// `InputState`/`Input` split. The host owns one of these (`cx.new(...)`),
+/// passes it into the [`MarkdownEditor`](crate::MarkdownEditor) element each
+/// frame, mutates it through the setters (`set_value`/`clear`), and
+/// `cx.subscribe`s to its [`MarkdownEditorEvent`]s. It owns focus, the IME
+/// `EntityInputHandler`, and every cross-frame layout cache; it is *not*
+/// `Render` — the element renders it.
+pub struct MarkdownEditorState {
+    pub(crate) state: EditorState,
     pub focus_handle: FocusHandle,
+    /// When true, the element skips registering mutating key/IME handlers, the
+    /// `EntityInputHandler` text-mutation methods early-return, and the caret is
+    /// not painted — so the surface is read-only. Selection, navigation, copy,
+    /// and select-all handlers are still registered, so the text can be selected
+    /// and copied. Synced from the element's `.disabled(..)` prop each frame.
+    pub(crate) disabled: bool,
     is_selecting: bool,
     pub(crate) last_blocks: HashMap<usize, LaidOutBlock>,
     pub(crate) last_bounds: Option<Bounds<Pixels>>,
@@ -154,28 +257,61 @@ pub struct MarkdownEditor {
     /// row. Reset to `None` on any non-vertical event in
     /// `dispatch_reset_intended_x_unless_vertical`.
     intended_x: Option<Pixels>,
+    /// Transient caret wrap-boundary affinity — see [`WrapAffinity`]. Set by the
+    /// command that placed the caret (Down/Home → `Downstream`, End →
+    /// `Upstream`, most others reset to `Downstream`) and read by the caret
+    /// renderer and vertical/line-bound motion so a caret exactly on a soft-wrap
+    /// boundary resolves to the intended visual row.
+    wrap_affinity: WrapAffinity,
+    /// Undo history — a stack of pre-edit [`EditorState`] snapshots,
+    /// oldest at the front. Every buffer-mutating edit pushes the state
+    /// *before* the edit (unless it coalesces into the previous typing
+    /// run — see [`coalesce_anchor`](Self::coalesce_anchor)). `undo`
+    /// pops the top back into `state`. Capped at [`MAX_HISTORY`].
+    undo_stack: Vec<EditorState>,
+    /// Redo history — states popped off `state` by `undo`, newest on
+    /// top. `redo` pops the top back into `state`. Cleared on any fresh
+    /// edit (the standard branch-discard behavior).
+    redo_stack: Vec<EditorState>,
+    /// Typing-coalescing anchor. `Some(offset)` when the previous
+    /// recorded edit was a single-character, non-whitespace insertion
+    /// whose caret ended at `offset`. A new single-character insert
+    /// whose *starting* caret sits exactly at this anchor extends the
+    /// same undo step instead of pushing a new one — so a run of typed
+    /// characters undoes as one unit. Any edit that isn't a contiguous
+    /// single-char insert (deletion, whitespace/newline, paste,
+    /// structural edit, a selection jump, or undo/redo itself) resets
+    /// the anchor to `None`, breaking the run.
+    coalesce_anchor: Option<usize>,
+    /// Focus/blur observers that translate gpui focus transitions into
+    /// outward [`MarkdownEditorEvent::Focus`]/[`Blur`](MarkdownEditorEvent::Blur).
+    /// Held so they live as long as the entity.
+    _focus_subscriptions: Vec<Subscription>,
 }
 
-impl MarkdownEditor {
-    pub fn new(markdown: impl Into<String>, _: &mut Window, cx: &mut Context<Self>) -> Self {
-        let style = MarkdownStyle::from_theme(cx);
-        Self::with_state_and_style(EditorState::with_markdown(markdown), style, cx)
+impl MarkdownEditorState {
+    /// Create an empty editor state. Chain [`default_value`](Self::default_value)
+    /// to seed initial markdown — mirrors `InputState::new(window, cx)`.
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_state(EditorState::new(), window, cx)
     }
 
-    pub fn with_state(state: EditorState, _: &mut Window, cx: &mut Context<Self>) -> Self {
-        let style = MarkdownStyle::from_theme(cx);
-        Self::with_state_and_style(state, style, cx)
-    }
-
-    fn with_state_and_style(
-        state: EditorState,
-        style: MarkdownStyle,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn with_state(state: EditorState, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        // Translate focus transitions into outward events so a host can react
+        // semantically (e.g. commit an inline edit on blur) without polling.
+        let _focus_subscriptions = vec![
+            cx.on_focus(&focus_handle, window, |_, _, cx| {
+                cx.emit(MarkdownEditorEvent::Focus);
+            }),
+            cx.on_blur(&focus_handle, window, |_, _, cx| {
+                cx.emit(MarkdownEditorEvent::Blur);
+            }),
+        ];
         Self {
             state,
-            style,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
+            disabled: false,
             is_selecting: false,
             last_blocks: HashMap::new(),
             last_bounds: None,
@@ -183,7 +319,72 @@ impl MarkdownEditor {
             marked_range: None,
             code_block_scrolls: HashMap::new(),
             intended_x: None,
+            wrap_affinity: WrapAffinity::Downstream,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            coalesce_anchor: None,
+            _focus_subscriptions,
         }
+    }
+
+    /// Seed the initial markdown (builder form, used right after `new`).
+    pub fn default_value(mut self, markdown: impl Into<String>) -> Self {
+        self.state = EditorState::with_markdown(markdown);
+        self
+    }
+
+    /// The current markdown source. The read half of the host seam — replaces
+    /// reaching into a public `state` field.
+    pub fn value(&self) -> &str {
+        &self.state.markdown
+    }
+
+    /// The current selection.
+    pub fn selection(&self) -> Selection {
+        self.state.selection
+    }
+
+    /// True when the buffer is empty (after trimming) — the common host check
+    /// for "is there anything to submit?".
+    pub fn is_empty(&self) -> bool {
+        self.state.markdown.trim().is_empty()
+    }
+
+    /// Replace the entire buffer and collapse the cursor to the start. The
+    /// write half of the host seam; emits [`MarkdownEditorEvent::Change`].
+    ///
+    /// **Undo boundary.** A programmatic host replacement of the whole
+    /// document (loading a post to edit, clearing after submit, seeding a
+    /// draft) is *not* a user-undoable keystroke, so this clears both
+    /// history stacks: undo never crosses a `set_value`, and the user
+    /// can't `cmd-z` their way back into a document the host swapped out
+    /// from under them. Typed edits after the swap build a fresh history.
+    pub fn set_value(&mut self, markdown: impl Into<String>, cx: &mut Context<Self>) {
+        self.state = EditorState::with_markdown(markdown);
+        self.marked_range = None;
+        self.intended_x = None;
+        self.wrap_affinity = WrapAffinity::Downstream;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.coalesce_anchor = None;
+        cx.emit(MarkdownEditorEvent::Change);
+        cx.notify();
+    }
+
+    /// Clear the buffer. Convenience for `set_value("")`.
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.set_value("", cx);
+    }
+
+    /// Drive the internal update pipeline with a raw [`EditorEvent`], the way
+    /// a dispatched action or IME callback would. The crate's integration
+    /// tests (a separate crate, so they can't see the `pub(crate)` `state`
+    /// field) use this to script keypress sessions without synthesizing
+    /// platform events; not part of the host API — hosts mutate via
+    /// `set_value`/`clear` and key dispatch.
+    #[doc(hidden)]
+    pub fn apply_event_for_test(&mut self, event: EditorEvent, cx: &mut Context<Self>) {
+        self.dispatch(event, cx);
     }
 
     pub(crate) fn code_block_scroll(&self, block_index: usize) -> Pixels {
@@ -197,18 +398,93 @@ impl MarkdownEditor {
         self.code_block_scrolls.insert(block_index, offset);
     }
 
-    pub fn style(mut self, style: MarkdownStyle) -> Self {
-        self.style = style;
-        self
-    }
-
     pub fn render_spec(&self) -> RenderSpec {
         let tree = parse(&self.state.markdown);
-        render(&self.state, &tree)
+        // A disabled (read-only) editor renders as *published* markdown: there
+        // is no live cursor, so every WYSIWYG delimiter is hidden and the
+        // content reads as finished prose. This is what makes a read-only post
+        // pixel-identical to a clean rendered reply (used by the space view to
+        // render every transcript post through the same editor as the composer).
+        if self.disabled {
+            render_readonly(&self.state, &tree)
+        } else {
+            render(&self.state, &tree)
+        }
     }
 
     pub fn cursor_offset(&self) -> usize {
         self.state.selection.head()
+    }
+
+    /// True when the caret's wrap-boundary affinity is [`WrapAffinity::Downstream`]
+    /// — the caret prefers the START of the lower wrapped row. The caret renderer
+    /// (`build_caret_and_selection`) reads this to place a boundary caret on the
+    /// intended visual row.
+    pub(crate) fn caret_downstream(&self) -> bool {
+        matches!(self.wrap_affinity, WrapAffinity::Downstream)
+    }
+
+    /// The editor's natural content height — the vertical extent of the laid-out
+    /// text, independent of any `min_height` the element reserves below it (this
+    /// reads the union of painted block bounds, which sit at the top regardless
+    /// of the container floor). Zero until the first paint. Hosts that grow the
+    /// editor into a taller slot (the space composer's docked runway) read this
+    /// to size themselves without a feedback loop against their own floor.
+    pub fn content_height(&self) -> Pixels {
+        self.last_bounds.map(|b| b.size.height).unwrap_or(px(0.))
+    }
+
+    /// The caret's vertical span **relative to the editor's laid-out content
+    /// top** (content-top = y 0), returned as `(top, bottom)` in pixels;
+    /// `bottom - top` is the caret's row height. This is the read half of the
+    /// host-driven scroll-into-view contract: the editor has no internal
+    /// vertical scroll (it lays out to its full content height and the host
+    /// scrolls it), so a host that wraps the editor in its own scroll container
+    /// (the space composer) reads this on every [`MarkdownEditorEvent::Change`]
+    /// and adjusts *its* scroll offset to keep the caret visible.
+    ///
+    /// **Coordinate frame.** Derived from the previous frame's `last_blocks`
+    /// exactly like [`Self::bounds_for_range`], but re-based to content-local
+    /// coordinates: `last_blocks`/`last_bounds` are window-absolute, so
+    /// subtracting `last_bounds.origin.y` (the top of the painted content)
+    /// yields the y a scroll container measures from its own content top. The
+    /// value is independent of any `min_height` runway (the laid-out text sits
+    /// at the content top regardless). Returns `None` before the first paint
+    /// (no layout to consult) or when the caret's offset isn't covered by any
+    /// laid-out line.
+    pub fn caret_content_y(&self) -> Option<(Pixels, Pixels)> {
+        let content_top = self.last_bounds?.origin.y;
+        let cursor = self.state.selection.head();
+        // Sort keys so a caret sitting on a block boundary (claimed by two
+        // adjacent lines) resolves deterministically to the earlier block,
+        // rather than by `HashMap` iteration order.
+        let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
+        keys.sort_unstable();
+        // Fallback for a caret past every laid-out range — the document end
+        // after a trailing newline synthesizes an empty paragraph that isn't
+        // always laid out as a line, the same edge `bounds_for_range` hits. Keep
+        // the latest line whose range ends at or before the caret and clamp the
+        // caret onto it (its last row) rather than returning `None`.
+        let mut fallback: Option<&crate::element::LaidOutLine> = None;
+        for k in keys {
+            for line in &self.last_blocks[&k].lines {
+                if line.contains_source_offset(cursor) {
+                    let local = line
+                        .local_position_for_source_offset_biased(cursor, self.caret_downstream());
+                    let top = line.origin.y + local.y - content_top;
+                    return Some((top, top + line.row_height));
+                }
+                if line.source_range.end <= cursor
+                    && fallback.is_none_or(|f| line.source_range.end >= f.source_range.end)
+                {
+                    fallback = Some(line);
+                }
+            }
+        }
+        let line = fallback?;
+        let local = line.local_position_for_source_offset_biased(cursor, self.caret_downstream());
+        let top = line.origin.y + local.y - content_top;
+        Some((top, top + line.row_height))
     }
 
     fn dispatch(&mut self, event: EditorEvent, cx: &mut Context<Self>) {
@@ -216,9 +492,95 @@ impl MarkdownEditor {
         // Vertical events (handled by `vertical_move` below) update
         // `intended_x` directly without going through this helper.
         self.intended_x = None;
-        let next = std::mem::take(&mut self.state);
-        self.state = update::update(next, event);
+        // Left/Right/word moves/edits/etc. reset the caret to the default
+        // downstream affinity — a Right onto a soft-wrap boundary reads as the
+        // start of the next row, and an edit's caret prefers the lower row.
+        self.wrap_affinity = WrapAffinity::Downstream;
+        let before = std::mem::take(&mut self.state);
+        self.state = update::update(before.clone(), event);
         self.marked_range = None;
+        // Compare the buffer across the update so selection-only events
+        // (Move*/Extend*/SetSelection) don't push an undo step or count
+        // as a content change. The composer buffer is small, so the
+        // pre-edit clone is negligible.
+        if self.state.markdown != before.markdown {
+            self.record_history(before);
+            cx.emit(MarkdownEditorEvent::Change);
+        } else if self.state.selection != before.selection {
+            // A pure caret/selection move (Left/Right/word/Move*/Extend*):
+            // no buffer change, so no `Change` — but a host that scrolls the
+            // caret into view still needs to know it moved.
+            cx.emit(MarkdownEditorEvent::SelectionChanged);
+        }
+        cx.notify();
+    }
+
+    /// Push the pre-edit `before` state onto the undo stack — the single
+    /// history-recording choke point shared by `dispatch` (action- and
+    /// paste-driven edits) and `replace_and_mark_text_in_range` (the IME
+    /// / typed-input path that mutates `self.state` directly). Callers
+    /// invoke it *after* `self.state` has been advanced to the post-edit
+    /// value, having confirmed the buffer actually changed.
+    ///
+    /// **Coalescing.** Consecutive single-character, non-whitespace
+    /// insertions that continue at the caret collapse into one undo
+    /// step, so a typed word undoes as a unit rather than
+    /// character-by-character. The run breaks (a new undo entry is
+    /// pushed) whenever the edit is anything else — a deletion, a
+    /// whitespace or newline insertion, a paste, a structural edit, or a
+    /// caret jump away from where the last insert ended. This is the
+    /// simpler clock-free heuristic: no time window, just contiguity +
+    /// "is it a plain typed character". Every fresh edit clears the redo
+    /// stack.
+    fn record_history(&mut self, before: EditorState) {
+        // Is this edit a coalescible single-char type, and where did its
+        // caret land? `None` for anything that should break the run.
+        let type_end = coalescible_type_end(&before, &self.state);
+        let coalesce = match (type_end, self.coalesce_anchor) {
+            // Continue the run only when the previous edit was also a
+            // coalescible type and *this* edit began exactly where it
+            // left off (contiguous typing, no caret jump between).
+            (Some(_), Some(anchor)) => before.selection == Selection::Cursor(anchor),
+            _ => false,
+        };
+        if !coalesce {
+            self.undo_stack.push(before);
+            if self.undo_stack.len() > MAX_HISTORY {
+                self.undo_stack.remove(0);
+            }
+        }
+        // A coalescing type extends the existing top entry (the snapshot
+        // from the start of the run) — we simply don't push a new one.
+        self.redo_stack.clear();
+        self.coalesce_anchor = type_end;
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(prev) = self.undo_stack.pop() else {
+            return;
+        };
+        let current = std::mem::replace(&mut self.state, prev);
+        self.redo_stack.push(current);
+        self.marked_range = None;
+        self.intended_x = None;
+        // An undo is a hard boundary: the next typed character starts a
+        // fresh coalescing run rather than folding into the step we just
+        // reverted.
+        self.coalesce_anchor = None;
+        cx.emit(MarkdownEditorEvent::Change);
+        cx.notify();
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(next) = self.redo_stack.pop() else {
+            return;
+        };
+        let current = std::mem::replace(&mut self.state, next);
+        self.undo_stack.push(current);
+        self.marked_range = None;
+        self.intended_x = None;
+        self.coalesce_anchor = None;
+        cx.emit(MarkdownEditorEvent::Change);
         cx.notify();
     }
 
@@ -271,38 +633,39 @@ impl MarkdownEditor {
         // via `WrappedLine::position_for_index`, so `local.y` is the
         // wrap-row's y inside the line and `local.x` is the visual x
         // within that wrap row.
-        let local = line.local_position_for_source_offset(cursor);
+        let local = line.local_position_for_source_offset_biased(
+            cursor,
+            matches!(self.wrap_affinity, WrapAffinity::Downstream),
+        );
         let global_x = line.origin.x + local.x;
         let target_x = self.intended_x.unwrap_or(global_x);
         let row_h = line.row_height;
         if row_h <= px(0.) {
             return None;
         }
-        // Step exactly one wrap-row vertically. `local.y` from
-        // `position_for_index` is already row-aligned (multiples of
-        // row_height); shifting by ±row_h lands at the next row.
-        let target_global_y = line.origin.y + local.y + row_h * (direction as f32);
+        // The caret's current wrap-row within its line. `local.y` is a whole
+        // multiple of `row_h` (position_for_index is passed `row_h`), so this
+        // `round` is exact — unlike a `floor`, which float-drift would spoil.
+        let cur_row = (local.y / row_h).round() as i32;
+        let line_rows = line.row_count() as i32;
+        let target_row = cur_row + direction;
 
+        // A coarse target y, only for picking the nearest line when the move
+        // leaves this logical line (the paragraph_gap-absorbing search below).
+        let target_global_y = line.origin.y + (target_row as f32) * row_h;
         let current_top = line.origin.y;
         let current_bot = current_top + line.wrapped_height;
 
-        // Intra-line wrap-row navigation: target_y still falls inside
-        // the current logical line's vertical extent. The line wraps,
-        // we're stepping between wrap rows of the same shaped text.
-        let target_line: &crate::element::LaidOutLine =
-            if target_global_y >= current_top && target_global_y < current_bot {
-                line
+        // Intra-line iff the target row stays within this line's rows;
+        // otherwise cross to the nearest line in the direction of motion and
+        // enter it at its edge row (first row going down, last going up).
+        let (target_line, target_row_in_line): (&crate::element::LaidOutLine, i32) =
+            if target_row >= 0 && target_row < line_rows {
+                (line, target_row)
             } else {
-                // Cross-line navigation: find the closest line in the
-                // direction of motion. The current line is filtered out
-                // (it's behind us), and lines on the *wrong* side of the
-                // motion are filtered out (so a Down doesn't backtrack to
-                // a line above the cursor when no line below exists, and
-                // vice-versa). Within the direction-filtered set, pick
-                // the line whose vertical bounds are closest to
-                // `target_global_y` — this absorbs the inter-block
-                // paragraph_gap by snapping the target into the nearest
-                // candidate row.
+                // The current line is filtered out (behind us) and lines on the
+                // wrong side of the motion are filtered out; among the rest pick
+                // the one whose vertical bounds are closest to `target_global_y`.
                 let mut best: Option<(&crate::element::LaidOutLine, Pixels)> = None;
                 for k in &keys {
                     let block = &self.last_blocks[k];
@@ -329,23 +692,37 @@ impl MarkdownEditor {
                         }
                     }
                 }
-                best.map(|(l, _)| l)?
+                let best = best.map(|(l, _)| l)?;
+                let edge = if direction > 0 {
+                    0
+                } else {
+                    best.row_count() as i32 - 1
+                };
+                (best, edge)
             };
 
-        // Clamp y to the target line's extent so a target that fell
-        // in a paragraph_gap (no row owned it directly) still picks a
-        // sensible wrap-row inside the snapped-to line.
-        let top = target_line.origin.y;
-        let bot = top + target_line.wrapped_height;
-        let clamped_y = if target_global_y < top {
-            px(0.)
-        } else if target_global_y >= bot {
-            target_line.wrapped_height - px(1.)
-        } else {
-            target_global_y - top
-        };
-        let local_target = Point::new(target_x - target_line.origin.x, clamped_y);
+        // Sample the VERTICAL CENTER of the target row — never its top edge.
+        // gpui's `closest_index_for_position` floors `y / row_h`, and a top-edge
+        // sample `row * row_h` divided back float-rounds to `row - 1` (the
+        // "Down stalls after a few rows / Home lands a row up" bug — it takes a
+        // few rows for the drift between our `row_h` and gpui's internal line
+        // spacing to cross a boundary, which is why it always struck a specific
+        // mid-paragraph row). The half-row offset keeps the floor exact.
+        let sample_y = px((target_row_in_line as f32 + 0.5) * row_h.as_f32());
+        let local_target = Point::new(target_x - target_line.origin.x, sample_y);
         let new_offset = target_line.source_offset_for_local_point(local_target);
+
+        // Record where the caret landed relative to the boundary ambiguity: at
+        // the target row's START (a soft-wrap boundary whose upper-affinity row
+        // is the row above) it's `Downstream`, else `Upstream`. Lets the *next*
+        // vertical press compute the caret's current row correctly.
+        let up_row =
+            (target_line.local_position_for_source_offset(new_offset).y / row_h).round() as i32;
+        self.wrap_affinity = if up_row < target_row_in_line {
+            WrapAffinity::Downstream
+        } else {
+            WrapAffinity::Upstream
+        };
 
         // Persist the original visual x for the next press in this
         // streak.
@@ -370,6 +747,7 @@ impl MarkdownEditor {
             Some(offset) => offset,
             None => {
                 self.intended_x = None;
+                self.wrap_affinity = WrapAffinity::Downstream;
                 let next = std::mem::take(&mut self.state);
                 self.state = update::update(next, fallback);
                 self.marked_range = None;
@@ -394,9 +772,151 @@ impl MarkdownEditor {
         // and any post-pass still applies, but DON'T clear
         // `intended_x` (dispatch() does that). Hand-roll the update
         // call here to preserve the anchor.
+        let before_sel = self.state.selection;
         let next = std::mem::take(&mut self.state);
         self.state = update::update(next, EditorEvent::SetSelection(new_sel));
         self.marked_range = None;
+        // A vertical move changes the caret without touching the buffer — tell
+        // a host that scrolls the caret into view (no `Change` is emitted).
+        if self.state.selection != before_sel {
+            cx.emit(MarkdownEditorEvent::SelectionChanged);
+        }
+        cx.notify();
+    }
+
+    /// Source offset at the start (`to_end == false`) or end
+    /// (`to_end == true`) of the caret's current *display line* — the
+    /// soft-wrapped visual row it sits on, not the whole `\n`-delimited
+    /// source line. Consults the laid-out row geometry from the previous
+    /// frame in `last_blocks`. Returns `None` when there's no layout to
+    /// consult (pre-paint state, headless tests), so the caller can fall
+    /// back to the source-line `MoveLineStart` / `MoveLineEnd` event.
+    ///
+    /// Mirrors [`Self::visual_move_caret`]: it locates the `LaidOutLine`
+    /// containing the caret, reads the caret's wrap-row `y` via
+    /// `local_position_for_source_offset`, then maps a point at that
+    /// row's left edge (`x = 0`, Home) or far-right edge (`x = huge`,
+    /// End) back to a source offset with `source_offset_for_local_point`.
+    /// On the first wrap row of a blockquote / list line the shaped
+    /// display text already begins past the hidden chain prefix, so
+    /// display-line Home lands on the visible content edge for free; the
+    /// caller additionally routes the result through `SetSelection`,
+    /// whose `nearest_allowed_position` snap keeps the caret off any
+    /// forbidden position (the source path's `next_allowed_position`
+    /// chain-prefix skip, preserved).
+    fn visual_line_bound(&self, to_end: bool) -> Option<usize> {
+        if self.last_blocks.is_empty() {
+            return None;
+        }
+        let cursor = self.state.selection.head();
+        let mut keys: Vec<usize> = self.last_blocks.keys().copied().collect();
+        keys.sort();
+
+        // Find the LaidOutLine containing the cursor (same disjoint-range
+        // search as `visual_move_caret`). A display line is always within
+        // a single logical line, so this is the only line we consult.
+        let mut current: Option<&crate::element::LaidOutLine> = None;
+        for k in &keys {
+            let block = &self.last_blocks[k];
+            for line in &block.lines {
+                if line.contains_source_offset(cursor) {
+                    current = Some(line);
+                    break;
+                }
+            }
+            if current.is_some() {
+                break;
+            }
+        }
+        let line = current?;
+
+        // The caret's wrap-row inside this line. `x` picks the edge: 0 for the
+        // row's start, a large finite value for its end (the mapping clamps into
+        // the row, resolving to the last display index of that wrap row).
+        let local = line.local_position_for_source_offset_biased(
+            cursor,
+            matches!(self.wrap_affinity, WrapAffinity::Downstream),
+        );
+        let row_h = line.row_height;
+        if row_h <= px(0.) {
+            return None;
+        }
+        // Sample the row's VERTICAL CENTER, never its top edge: `local.y` is a
+        // whole multiple of `row_h`, and `closest_index_for_position` floors
+        // `y / row_h`, so a top-edge sample float-rounds down into the row above
+        // (Home/End would land a row too high). `round` is exact for the row
+        // index; the half-row offset keeps the floor exact.
+        let cur_row = (local.y / row_h).round();
+        let sample_y = px((cur_row + 0.5) * row_h.as_f32());
+        let x = if to_end { px(1.0e6) } else { px(0.0) };
+        let target = Point::new(x, sample_y);
+        Some(line.source_offset_for_local_point(target))
+    }
+
+    /// Dispatch path for Home / End / Shift+Home / Shift+End (and their
+    /// Cmd+Left / Cmd+Right / Cmd+Shift+Left / Cmd+Shift+Right aliases).
+    /// Tries the display-line-aware [`Self::visual_line_bound`] first; on
+    /// success builds the appropriate `Selection` and routes it through
+    /// `SetSelection` (which applies the forbidden-position snap). On
+    /// failure (no layout to consult) it falls back to the source-line
+    /// `MoveLineStart` / `MoveLineEnd` (or the `Extend*` variant) event
+    /// so headless tests and pre-paint state still move predictably.
+    fn line_bound_move(
+        &mut self,
+        to_end: bool,
+        extending: bool,
+        fallback: EditorEvent,
+        cx: &mut Context<Self>,
+    ) {
+        // Home / End are horizontal motions: they end any vertical
+        // intended-x streak, so the next Up / Down re-anchors from the
+        // caret's new column. (`dispatch` clears this for other events;
+        // this path is hand-rolled, so clear it explicitly.)
+        self.intended_x = None;
+        // Read the current caret's row (via `visual_line_bound`, which uses the
+        // *existing* affinity to disambiguate a boundary caret) BEFORE updating
+        // the affinity below — otherwise the read would be self-referential.
+        let bound = self.visual_line_bound(to_end);
+        // End keeps the caret on the row it acted on (`Upstream`); Home lands it
+        // at the row's start (`Downstream`). Set on both the layout-aware and the
+        // no-layout fallback paths.
+        self.wrap_affinity = if to_end {
+            WrapAffinity::Upstream
+        } else {
+            WrapAffinity::Downstream
+        };
+        let new_head = match bound {
+            Some(offset) => offset,
+            None => {
+                let next = std::mem::take(&mut self.state);
+                self.state = update::update(next, fallback);
+                self.marked_range = None;
+                cx.notify();
+                return;
+            }
+        };
+        let new_sel = if extending {
+            let anchor = match self.state.selection {
+                Selection::Cursor(p) => p,
+                Selection::Range { anchor, .. } => anchor,
+            };
+            if anchor == new_head {
+                Selection::Cursor(new_head)
+            } else {
+                Selection::range(anchor, new_head)
+            }
+        } else {
+            Selection::Cursor(new_head)
+        };
+        let before_sel = self.state.selection;
+        let next = std::mem::take(&mut self.state);
+        self.state = update::update(next, EditorEvent::SetSelection(new_sel));
+        self.marked_range = None;
+        // Home/End move the caret without a buffer change — notify a
+        // caret-into-view host (no `Change` is emitted).
+        if self.state.selection != before_sel {
+            cx.emit(MarkdownEditorEvent::SelectionChanged);
+        }
         cx.notify();
     }
 
@@ -406,16 +926,27 @@ impl MarkdownEditor {
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorEvent::DeleteForward, cx);
     }
-    fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
-        // Context-aware insertion (code-block: `\n`; blockquote at
-        // depth D: `\n[prefix]\n[prefix]`; top-level: `\n\n`) is
-        // resolved inside `update::insert_newline`. The shell stays
-        // a pure router so keyboard, IME, paste, and programmatic
-        // dispatch all share the same rule.
+    fn enter(&mut self, action: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        if action.secondary {
+            // ⌘↩ / ⌘⇧↩ — a submit-intent chord. The editor reports the chord
+            // and leaves the buffer untouched; the host's subscriber decides
+            // what it means (post & ask vs post-only, commit-edit, reply…).
+            cx.emit(MarkdownEditorEvent::PressEnter {
+                secondary: true,
+                shift: action.shift,
+            });
+            return;
+        }
+        if action.shift {
+            // ⇧↩ — a hard line break within the current block.
+            self.dispatch(EditorEvent::InsertLineBreak, cx);
+            return;
+        }
+        // Plain ↩ — context-aware insertion (code-block: `\n`; blockquote at
+        // depth D: `\n[prefix]\n[prefix]`; top-level: `\n\n`) is resolved
+        // inside `update::insert_newline`. The shell stays a pure router so
+        // keyboard, IME, paste, and programmatic dispatch share the rule.
         self.dispatch(EditorEvent::InsertNewline, cx);
-    }
-    fn shift_enter(&mut self, _: &ShiftEnter, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::InsertLineBreak, cx);
     }
     fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
         // Tab in a list item nests it under the previous sibling.
@@ -454,16 +985,16 @@ impl MarkdownEditor {
         self.vertical_move(1, true, EditorEvent::ExtendDown, cx);
     }
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::MoveLineStart, cx);
+        self.line_bound_move(false, false, EditorEvent::MoveLineStart, cx);
     }
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::MoveLineEnd, cx);
+        self.line_bound_move(true, false, EditorEvent::MoveLineEnd, cx);
     }
     fn shift_home(&mut self, _: &ShiftHome, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::ExtendLineStart, cx);
+        self.line_bound_move(false, true, EditorEvent::ExtendLineStart, cx);
     }
     fn shift_end(&mut self, _: &ShiftEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.dispatch(EditorEvent::ExtendLineEnd, cx);
+        self.line_bound_move(true, true, EditorEvent::ExtendLineEnd, cx);
     }
     fn document_start(&mut self, _: &DocumentStart, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorEvent::MoveDocumentStart, cx);
@@ -617,6 +1148,19 @@ impl MarkdownEditor {
             return 0;
         }
 
+        // Symmetric bottom case: a click below the last line's bottom is in the
+        // editor's blank tail (the excess a `min_height` reserves below the
+        // text) — collapse to document end so clicking the runway lands the
+        // caret after the last character, notes-editor style. This is distinct
+        // from a click in an inter-block *gap* (handled by the nearest-line pass
+        // below), which is always above the last line's bottom.
+        if let Some(last_key) = keys.last()
+            && let Some(last_line) = self.last_blocks[*last_key].lines.last()
+            && position.y >= last_line.origin.y + last_line.wrapped_height
+        {
+            return self.state.markdown.len();
+        }
+
         // First pass: direct hit. If `position.y` falls in any line's
         // vertical extent, hit-test inside that line.
         //
@@ -705,7 +1249,9 @@ impl MarkdownEditor {
     }
 }
 
-impl EntityInputHandler for MarkdownEditor {
+impl gpui::EventEmitter<MarkdownEditorEvent> for MarkdownEditorState {}
+
+impl EntityInputHandler for MarkdownEditorState {
     fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -746,6 +1292,9 @@ impl EntityInputHandler for MarkdownEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.disabled {
+            return;
+        }
         let target = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -768,11 +1317,19 @@ impl EntityInputHandler for MarkdownEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.disabled {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
             .or_else(|| self.marked_range.clone())
             .unwrap_or_else(|| self.state.selection.selection_range());
+
+        // Snapshot the pre-edit state so this direct-mutation path (IME /
+        // typed input, which bypasses `dispatch`/`update`) records undo
+        // history through the same choke point as everything else.
+        let before = self.state.clone();
 
         let mut new_md = String::with_capacity(
             self.state.markdown.len() - (range.end - range.start) + new_text.len(),
@@ -795,6 +1352,14 @@ impl EntityInputHandler for MarkdownEditor {
             range.start + new_text.len()
         };
         self.state.selection = Selection::Cursor(cursor);
+        // A typed / IME insertion places the caret fresh — default downstream
+        // affinity (a caret pushed onto a soft-wrap boundary reads as the start
+        // of the next row).
+        self.wrap_affinity = WrapAffinity::Downstream;
+        if self.state.markdown != before.markdown {
+            self.record_history(before);
+        }
+        cx.emit(MarkdownEditorEvent::Change);
         cx.notify();
     }
 
@@ -832,128 +1397,240 @@ impl EntityInputHandler for MarkdownEditor {
     }
 }
 
-impl Focusable for MarkdownEditor {
+impl Focusable for MarkdownEditorState {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for MarkdownEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Refresh the style each frame so theme-mode flips re-derive colors
-        // (cheap — the style struct is plain Arc / Hsla).
-        self.style = self.style.clone();
-        // ^ keep the caller's overrides; only refresh theme-derived fields
+/// The editor's render half — the ephemeral element built each frame from a
+/// `MarkdownEditorState`, mirroring gpui-component's `Input::new(&state)`.
+/// Carries the per-render props (style overrides, disabled); holds no state
+/// of its own. Construct it in the host's `render` and drop it into the tree.
+#[derive(IntoElement)]
+pub struct MarkdownEditor {
+    state: Entity<MarkdownEditorState>,
+    style: Option<MarkdownStyle>,
+    disabled: bool,
+    min_height: Option<Pixels>,
+}
+
+impl MarkdownEditor {
+    /// Build the element over a host-owned state entity.
+    pub fn new(state: &Entity<MarkdownEditorState>) -> Self {
+        Self {
+            state: state.clone(),
+            style: None,
+            disabled: false,
+            min_height: None,
+        }
+    }
+
+    /// Typographic / color overrides for this frame. Theme-derived color
+    /// fields are refreshed on top of these in `render`, so a caller only
+    /// needs to set the knobs it cares about (font size, leading, heading
+    /// scale, …) — see `MarkdownStyle::from_theme`.
+    pub fn style(mut self, style: MarkdownStyle) -> Self {
+        self.style = Some(style);
+        self
+    }
+
+    /// Render read-only: no mutating key/IME handlers are registered, the
+    /// `EntityInputHandler` text mutations early-return, and the caret is
+    /// hidden, so the surface rejects edits. Text can still be selected (mouse
+    /// or shift-navigation) and copied. Mirrors `Input::disabled`.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    /// Reserve at least `height` for the editor container, so it fills a slot
+    /// taller than its text. The extra space below the last line is part of the
+    /// editor's own click surface: a click there resolves (via
+    /// `offset_for_position`) to document end, giving a "notes editor" feel
+    /// without any host-side overlay listener. The natural text height is still
+    /// reported by [`MarkdownEditorState::content_height`], so a host can size a
+    /// container from the text without feeding its own floor back in.
+    pub fn min_height(mut self, height: Pixels) -> Self {
+        self.min_height = Some(height);
+        self
+    }
+}
+
+impl RenderOnce for MarkdownEditor {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // Per-frame reset + sync the disabled prop onto the state (so the
+        // IME handler can honor it). Block elements re-populate `last_blocks`
+        // during paint; `frame_input_handler_set` re-arms IME registration.
+        self.state.update(cx, |st, _| {
+            st.disabled = self.disabled;
+            st.last_blocks.clear();
+            st.frame_input_handler_set = false;
+            st.last_bounds = None;
+        });
+
+        // Final style = caller overrides (or the theme default) with the
+        // theme-derived color fields refreshed each frame, so a Circadian
+        // light/dark flip recolors live even if the caller built its style
+        // once. This is the old entity-render refresh, moved to the element.
+        let mut style = self
+            .style
+            .clone()
+            .unwrap_or_else(|| MarkdownStyle::from_theme(cx));
         let theme = Theme::global(cx);
-        self.style.text_color = theme.foreground;
-        self.style.delimiter_color = theme.muted_foreground;
-        self.style.background = theme.background;
-        self.style.caret_color = theme.caret;
-        self.style.selection_color = theme.selection;
-        self.style.link_color = theme.link;
-        self.style.blockquote_border_color = theme.border;
-        self.style.thematic_break_color = theme.border;
-        self.style.inline_code_background = theme.accent;
-        self.style.code_block_background = theme.muted;
-        self.style.code_block_content_background =
-            crate::style::shift_lightness(theme.muted, -0.04);
+        style.text_color = theme.foreground;
+        style.delimiter_color = theme.muted_foreground;
+        style.background = theme.background;
+        style.caret_color = theme.caret;
+        style.selection_color = theme.selection;
+        style.link_color = theme.link;
+        style.blockquote_border_color = theme.border;
+        style.thematic_break_color = theme.border;
+        style.inline_code_background = theme.accent;
+        style.code_block_background = theme.muted;
+        style.code_block_content_background = crate::style::shift_lightness(theme.muted, -0.04);
 
-        // Reset per-frame state. Block elements re-populate `last_blocks`
-        // during paint.
-        self.last_blocks.clear();
-        self.frame_input_handler_set = false;
+        let spec = self.state.read(cx).render_spec();
+        let state = self.state.clone();
+        let disabled = self.disabled;
 
-        let view: Entity<Self> = cx.entity();
-        let style = self.style.clone();
-        let spec = self.render_spec();
-
-        // Register the IME / EntityInputHandler at the container level so
-        // typed text and dead-key composition flow through
-        // `replace_text_in_range`.
-        self.last_bounds = None;
-
-        let block_count = spec.blocks.len();
         let mut container = div()
             .id("markdown-editor")
             .key_context("MarkdownEditor")
-            .track_focus(&self.focus_handle(cx))
+            .track_focus(&state.read(cx).focus_handle)
+            // The IBeam cursor shows even when disabled: a read-only editor
+            // still supports selecting text (for copy), so the affordance
+            // should advertise that.
             .cursor(CursorStyle::IBeam)
             .w_full()
             .flex()
             .flex_col()
-            .text_size(self.style.font_size)
-            .text_color(self.style.text_color)
-            .font_family(self.style.font_family.clone())
-            .on_action(cx.listener(Self::backspace))
-            .on_action(cx.listener(Self::delete))
-            .on_action(cx.listener(Self::enter))
-            .on_action(cx.listener(Self::shift_enter))
-            .on_action(cx.listener(Self::tab))
-            .on_action(cx.listener(Self::shift_tab))
-            .on_action(cx.listener(Self::left))
-            .on_action(cx.listener(Self::right))
-            .on_action(cx.listener(Self::up))
-            .on_action(cx.listener(Self::down))
-            .on_action(cx.listener(Self::shift_left))
-            .on_action(cx.listener(Self::shift_right))
-            .on_action(cx.listener(Self::shift_up))
-            .on_action(cx.listener(Self::shift_down))
-            .on_action(cx.listener(Self::home))
-            .on_action(cx.listener(Self::end))
-            .on_action(cx.listener(Self::shift_home))
-            .on_action(cx.listener(Self::shift_end))
-            .on_action(cx.listener(Self::document_start))
-            .on_action(cx.listener(Self::document_end))
-            .on_action(cx.listener(Self::shift_document_start))
-            .on_action(cx.listener(Self::shift_document_end))
-            .on_action(cx.listener(Self::word_left))
-            .on_action(cx.listener(Self::word_right))
-            .on_action(cx.listener(Self::shift_word_left))
-            .on_action(cx.listener(Self::shift_word_right))
-            .on_action(cx.listener(Self::delete_word_backward))
-            .on_action(cx.listener(Self::delete_word_forward))
-            .on_action(cx.listener(Self::delete_to_line_start))
-            .on_action(cx.listener(Self::delete_to_line_end))
-            .on_action(cx.listener(Self::select_all))
-            .on_action(cx.listener(Self::copy))
-            .on_action(cx.listener(Self::cut))
-            .on_action(cx.listener(Self::paste))
-            .on_action(cx.listener(Self::paste_plain))
-            // Map the Edit-menu action types (`gpui_component::input::*`)
-            // onto the editor's own implementations.  The OS routes the Edit
-            // menu through the responder chain via the `OsAction::*` selectors;
-            // those land as `gpui_component::input::{Cut,Copy,Paste,SelectAll}`
-            // dispatched to the focused element.  Without these handlers the
-            // actions fell through unhandled whenever the composer had focus.
-            .on_action(cx.listener(|this, _: &gpui_component::input::Cut, w, cx| {
-                this.cut(&Cut, w, cx);
-            }))
-            .on_action(cx.listener(|this, _: &gpui_component::input::Copy, w, cx| {
-                this.copy(&Copy, w, cx);
-            }))
-            .on_action(
-                cx.listener(|this, _: &gpui_component::input::Paste, w, cx| {
-                    this.paste(&Paste, w, cx);
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &gpui_component::input::SelectAll, w, cx| {
-                    this.select_all(&SelectAll, w, cx);
-                }),
-            )
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move));
+            .text_size(style.font_size)
+            .text_color(style.text_color)
+            .font_family(style.font_family.clone());
 
-        let block_starts: Vec<usize> = spec.blocks.iter().map(|b| b.source_range.start).collect();
-        // Snapshot each block's container chain *before* moving the
-        // blocks into elements so we can hand each `BlockElement` the
-        // chains of its immediate neighbors (used to add extra
-        // breathing room at container-boundary transitions).
+        // Fill a taller slot when asked; the excess below the text is part of
+        // the editor's click surface (see `min_height`).
+        if let Some(mh) = self.min_height {
+            container = container.min_h(mh);
+        }
+
+        // Selection / navigation / copy handlers are registered even when
+        // disabled: a read-only editor still supports selecting text (mouse
+        // drag, shift-navigation, select-all) and copying it. None of these
+        // mutate the document. Each routes the action into the *state* entity
+        // via `window.listener_for` (the element→state bridge), the
+        // gpui-component idiom.
+        container = container
+            .on_action(window.listener_for(&state, MarkdownEditorState::left))
+            .on_action(window.listener_for(&state, MarkdownEditorState::right))
+            .on_action(window.listener_for(&state, MarkdownEditorState::up))
+            .on_action(window.listener_for(&state, MarkdownEditorState::down))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_left))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_right))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_up))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_down))
+            .on_action(window.listener_for(&state, MarkdownEditorState::home))
+            .on_action(window.listener_for(&state, MarkdownEditorState::end))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_home))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_end))
+            .on_action(window.listener_for(&state, MarkdownEditorState::document_start))
+            .on_action(window.listener_for(&state, MarkdownEditorState::document_end))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_document_start))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_document_end))
+            .on_action(window.listener_for(&state, MarkdownEditorState::word_left))
+            .on_action(window.listener_for(&state, MarkdownEditorState::word_right))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_word_left))
+            .on_action(window.listener_for(&state, MarkdownEditorState::shift_word_right))
+            .on_action(window.listener_for(&state, MarkdownEditorState::select_all))
+            .on_action(window.listener_for(&state, MarkdownEditorState::copy))
+            // Map the read-only Edit-menu action types
+            // (`gpui_component::input::{Copy,SelectAll}`) onto the editor's own
+            // implementations. The OS routes the Edit menu through the
+            // responder chain via the `OsAction::*` selectors; those land as
+            // `gpui_component::input::*` dispatched to the focused element.
+            .on_action(
+                window.listener_for(&state, |this, _: &gpui_component::input::Copy, w, cx| {
+                    this.copy(&Copy, w, cx)
+                }),
+            )
+            .on_action(window.listener_for(
+                &state,
+                |this, _: &gpui_component::input::SelectAll, w, cx| {
+                    this.select_all(&SelectAll, w, cx)
+                },
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                window.listener_for(&state, MarkdownEditorState::on_mouse_down),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                window.listener_for(&state, MarkdownEditorState::on_mouse_up),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                window.listener_for(&state, MarkdownEditorState::on_mouse_up),
+            )
+            .on_mouse_move(window.listener_for(&state, MarkdownEditorState::on_mouse_move));
+
+        // Mutating handlers are registered only when editable.
+        if !disabled {
+            container = container
+                .on_action(window.listener_for(&state, MarkdownEditorState::backspace))
+                .on_action(window.listener_for(&state, MarkdownEditorState::delete))
+                .on_action(window.listener_for(&state, MarkdownEditorState::enter))
+                .on_action(window.listener_for(&state, MarkdownEditorState::tab))
+                .on_action(window.listener_for(&state, MarkdownEditorState::shift_tab))
+                .on_action(window.listener_for(&state, MarkdownEditorState::delete_word_backward))
+                .on_action(window.listener_for(&state, MarkdownEditorState::delete_word_forward))
+                .on_action(window.listener_for(&state, MarkdownEditorState::delete_to_line_start))
+                .on_action(window.listener_for(&state, MarkdownEditorState::delete_to_line_end))
+                .on_action(window.listener_for(&state, MarkdownEditorState::cut))
+                .on_action(window.listener_for(&state, MarkdownEditorState::paste))
+                .on_action(window.listener_for(&state, MarkdownEditorState::paste_plain))
+                .on_action(window.listener_for(&state, MarkdownEditorState::undo))
+                .on_action(window.listener_for(&state, MarkdownEditorState::redo))
+                // Map the Edit-menu Undo/Redo action types
+                // (`gpui_component::input::{Undo,Redo}`) onto the editor's
+                // own implementations, so the macOS Edit menu's Undo/Redo
+                // items reach the composer when it has focus — the same
+                // bridge used above for Cut/Copy/Paste/Select All.
+                .on_action(
+                    window.listener_for(&state, |this, _: &gpui_component::input::Undo, w, cx| {
+                        this.undo(&Undo, w, cx)
+                    }),
+                )
+                .on_action(
+                    window.listener_for(&state, |this, _: &gpui_component::input::Redo, w, cx| {
+                        this.redo(&Redo, w, cx)
+                    }),
+                )
+                // Map the mutating Edit-menu action types
+                // (`gpui_component::input::{Cut,Paste}`) onto the editor's own
+                // implementations.
+                .on_action(
+                    window.listener_for(&state, |this, _: &gpui_component::input::Cut, w, cx| {
+                        this.cut(&Cut, w, cx)
+                    }),
+                )
+                .on_action(
+                    window.listener_for(&state, |this, _: &gpui_component::input::Paste, w, cx| {
+                        this.paste(&Paste, w, cx)
+                    }),
+                );
+        }
+
+        let spec_blocks = spec.blocks;
+        let block_count = spec_blocks.len();
+        let block_starts: Vec<usize> = spec_blocks.iter().map(|b| b.source_range.start).collect();
+        // Snapshot each block's container chain *before* moving the blocks
+        // into elements so we can hand each `BlockElement` the chains of its
+        // immediate neighbors (used to add breathing room at container
+        // boundaries).
         let containers_per_block: Vec<Vec<crate::render_spec::Container>> =
-            spec.blocks.iter().map(|b| b.containers.clone()).collect();
-        for (idx, block) in spec.blocks.into_iter().enumerate() {
+            spec_blocks.iter().map(|b| b.containers.clone()).collect();
+        for (idx, block) in spec_blocks.into_iter().enumerate() {
             let is_last = idx + 1 == block_count;
             let next_block_start = block_starts.get(idx + 1).copied();
             let prev_containers = idx
@@ -967,15 +1644,109 @@ impl Render for MarkdownEditor {
                 next_block_start,
                 prev_containers,
                 next_containers,
-                view.clone(),
+                state.clone(),
                 style.clone(),
             ));
         }
 
         // The first `BlockElement::paint` of the frame registers the
-        // `EntityInputHandler` (so IME / typed text routes through
-        // `replace_text_in_range`). The guard flag is reset above on each
-        // render.
+        // `EntityInputHandler` (IME / typed text → `replace_text_in_range`),
+        // unless `disabled`.
         container
     }
+}
+
+/// Install the editor's default macOS keymap, scoped to the `MarkdownEditor`
+/// key context. Self-contained so the editor is a drop-in like
+/// `gpui_component::Input` (whose keymap `gpui_component::init` installs) —
+/// the host calls this once at startup instead of hand-rolling the bindings.
+///
+/// The submit chords (`cmd-enter`, `cmd-shift-enter`) bind the `Enter` action
+/// with `secondary: true`; the handler emits
+/// [`MarkdownEditorEvent::PressEnter`] rather than inserting, so the host
+/// subscribes for submit instead of binding the chords itself.
+pub fn init(cx: &mut App) {
+    let ctx = Some("MarkdownEditor");
+    cx.bind_keys([
+        // Enter chords — plain/shift insert; cmd-variants emit PressEnter.
+        gpui::KeyBinding::new(
+            "enter",
+            Enter {
+                secondary: false,
+                shift: false,
+            },
+            ctx,
+        ),
+        gpui::KeyBinding::new(
+            "shift-enter",
+            Enter {
+                secondary: false,
+                shift: true,
+            },
+            ctx,
+        ),
+        gpui::KeyBinding::new(
+            "cmd-enter",
+            Enter {
+                secondary: true,
+                shift: false,
+            },
+            ctx,
+        ),
+        gpui::KeyBinding::new(
+            "cmd-shift-enter",
+            Enter {
+                secondary: true,
+                shift: true,
+            },
+            ctx,
+        ),
+        // Editing
+        gpui::KeyBinding::new("backspace", Backspace, ctx),
+        gpui::KeyBinding::new("delete", Delete, ctx),
+        gpui::KeyBinding::new("tab", Tab, ctx),
+        gpui::KeyBinding::new("shift-tab", ShiftTab, ctx),
+        // Word / line delete (macOS standard: Option for word, Cmd for line).
+        gpui::KeyBinding::new("alt-backspace", DeleteWordBackward, ctx),
+        gpui::KeyBinding::new("alt-delete", DeleteWordForward, ctx),
+        gpui::KeyBinding::new("cmd-backspace", DeleteToLineStart, ctx),
+        gpui::KeyBinding::new("cmd-delete", DeleteToLineEnd, ctx),
+        // Caret motion
+        gpui::KeyBinding::new("left", Left, ctx),
+        gpui::KeyBinding::new("right", Right, ctx),
+        gpui::KeyBinding::new("up", Up, ctx),
+        gpui::KeyBinding::new("down", Down, ctx),
+        gpui::KeyBinding::new("shift-left", ShiftLeft, ctx),
+        gpui::KeyBinding::new("shift-right", ShiftRight, ctx),
+        gpui::KeyBinding::new("shift-up", ShiftUp, ctx),
+        gpui::KeyBinding::new("shift-down", ShiftDown, ctx),
+        gpui::KeyBinding::new("home", Home, ctx),
+        gpui::KeyBinding::new("end", End, ctx),
+        gpui::KeyBinding::new("cmd-left", Home, ctx),
+        gpui::KeyBinding::new("cmd-right", End, ctx),
+        gpui::KeyBinding::new("shift-home", ShiftHome, ctx),
+        gpui::KeyBinding::new("shift-end", ShiftEnd, ctx),
+        gpui::KeyBinding::new("cmd-shift-left", ShiftHome, ctx),
+        gpui::KeyBinding::new("cmd-shift-right", ShiftEnd, ctx),
+        gpui::KeyBinding::new("cmd-up", DocumentStart, ctx),
+        gpui::KeyBinding::new("cmd-down", DocumentEnd, ctx),
+        gpui::KeyBinding::new("cmd-shift-up", ShiftDocumentStart, ctx),
+        gpui::KeyBinding::new("cmd-shift-down", ShiftDocumentEnd, ctx),
+        // Word-granular motion (macOS standard: Option+arrows).
+        gpui::KeyBinding::new("alt-left", WordLeft, ctx),
+        gpui::KeyBinding::new("alt-right", WordRight, ctx),
+        gpui::KeyBinding::new("alt-shift-left", ShiftWordLeft, ctx),
+        gpui::KeyBinding::new("alt-shift-right", ShiftWordRight, ctx),
+        // Clipboard — scoped to the editor context so they coexist with
+        // `gpui_component::Input`'s own `Input`-context bindings.
+        gpui::KeyBinding::new("cmd-a", SelectAll, ctx),
+        gpui::KeyBinding::new("cmd-c", Copy, ctx),
+        gpui::KeyBinding::new("cmd-x", Cut, ctx),
+        gpui::KeyBinding::new("cmd-v", Paste, ctx),
+        gpui::KeyBinding::new("cmd-shift-v", PastePlain, ctx),
+        // Undo / redo — scoped to the editor context, so they coexist
+        // with `gpui_component::Input`'s own `Input`-context bindings.
+        gpui::KeyBinding::new("cmd-z", Undo, ctx),
+        gpui::KeyBinding::new("cmd-shift-z", Redo, ctx),
+    ]);
 }

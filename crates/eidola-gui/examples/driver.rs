@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! {"cmd":"scenes"}
-//! {"cmd":"open","scene":"chat_conversation"}            // optional width/height
+//! {"cmd":"open","scene":"space_conversation"}           // optional width/height
 //! {"cmd":"windows"}
 //! {"cmd":"elements","window":1}                          // named probe targets
 //! {"cmd":"click","window":1,"target":"chat/model-label"} // or "x"/"y"; alt/command/shift bools
@@ -31,7 +31,7 @@
 //! {"cmd":"scroll","window":1,"target":"chat/transcript","dy":-300}
 //! {"cmd":"resize","window":1,"width":480,"height":700}
 //! {"cmd":"screenshot","window":1}                        // optional "path"
-//! {"cmd":"theme","mode":"night"}                         // or "day"
+//! {"cmd":"theme","mode":"night"}                         // or "day"; optional "character": cool|neutral|warm
 //! {"cmd":"settle","ms":250}                              // advance test clock + park
 //! {"cmd":"close","window":1}
 //! {"cmd":"quit"}
@@ -52,7 +52,17 @@
 // `VisualTestAppContext` wraps the real Mac platform (offscreen Metal
 // rendering), so the driver is macOS-only — same gate as `tests/visual.rs`.
 #[cfg(target_os = "macos")]
+// The shared, backend-free post fixtures (also used by the visual snapshot
+// cases) — a branched `PostNode` tree to exercise the space view. Declared at
+// the file's top level so its `#[path]` resolves against `examples/` (a real
+// directory) rather than the inline `driver` module's virtual subdir.
+#[cfg(target_os = "macos")]
+#[path = "../tests/visual/fixtures.rs"]
+mod fixtures;
+
+#[cfg(target_os = "macos")]
 mod driver {
+    use super::fixtures;
     use std::collections::HashMap;
     use std::io::{BufRead, Write as _};
     use std::path::PathBuf;
@@ -64,11 +74,12 @@ mod driver {
     use eidola_app_core::{
         BalancePoolInfo, BalancesResult, ConfigState, ModelInfo, PriceInfo, SpaceInfo, SpaceMessage,
     };
-    use eidola_gui::chat::ChatView;
     use eidola_gui::library::LibraryView;
+    use eidola_gui::onboarding::OnboardingView;
     use eidola_gui::probe;
     use eidola_gui::record::RecordView;
     use eidola_gui::settings::SettingsView;
+    use eidola_gui::space_view::SpaceView;
     use eidola_gui::stores::{Stores, StoresStub};
     use eidola_gui::updates::UpdatesView;
     use eidola_gui::window_input::WindowInput;
@@ -76,7 +87,7 @@ mod driver {
         AnyWindowHandle, App, AppContext, Capslock, Modifiers, ModifiersChangedEvent, Pixels,
         ScrollDelta, ScrollWheelEvent, Size, TouchPhase, VisualTestAppContext, point, px, size,
     };
-    use gpui_component::{Root, Theme, ThemeMode};
+    use gpui_component::{Root, ThemeMode};
     use gpui_component_assets::Assets;
     use serde::Deserialize;
     use serde_json::{Value, json};
@@ -150,6 +161,11 @@ mod driver {
         },
         Theme {
             mode: String,
+            /// Optional circadian light character: `cool` / `neutral`
+            /// (default) / `warm` — renders the tinted palette variants
+            /// (Sunrise/Sunset/Dawn/Dusk) that production derives from the
+            /// sun.
+            character: Option<String>,
         },
         Settle {
             ms: Option<u64>,
@@ -182,59 +198,66 @@ mod driver {
 
         vec![
             Scene {
-                name: "onboarding_welcome",
-                description: "Chat window, no account: the welcome page (Begin button)",
-                default_size: size(px(705.), px(705.)),
-                build: |window, cx| {
-                    let stores = stub_stores(cx, |s| {
-                        s.config_state = Some(config_state(false));
-                    });
-                    let view =
-                        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx));
-                    root(view, window, cx)
-                },
-            },
-            Scene {
-                name: "onboarding_plans",
-                description: "Chat window, account with zero balance: the plans page",
-                default_size: size(px(705.), px(705.)),
-                build: |window, cx| {
-                    let stores = stub_stores(cx, |s| {
-                        s.config_state = Some(config_state(true));
-                        s.balances = Some(BalancesResult {
-                            available: 0,
-                            pools: Vec::new(),
-                        });
-                        s.prices = prices();
-                    });
-                    let view =
-                        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx));
-                    root(view, window, cx)
-                },
-            },
-            Scene {
-                name: "chat_empty",
-                description: "Ready chat window with an empty page and live composer",
-                default_size: size(px(705.), px(705.)),
+                name: "space_blank",
+                description: "Space view: a brand-new blank space (composer open at top)",
+                default_size: size(px(760.), px(680.)),
                 build: |window, cx| {
                     let stores = ready_stores(cx);
                     let view =
-                        cx.new(|cx| ChatView::new(stores, None, WindowInput::new(cx), window, cx));
+                        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx));
                     root(view, window, cx)
                 },
             },
             Scene {
-                name: "chat_conversation",
-                description: "Ready chat window with a four-turn transcript",
-                default_size: size(px(760.), px(620.)),
+                name: "space_conversation",
+                description: "Space view: an existing conversation with a docked tail composer at the branch end",
+                default_size: size(px(760.), px(680.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    // An *existing* space (Some id) opens without a composer.
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| s.set_messages_for_test(conversation(), cx));
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_branches",
+                description: "Space view: a branched post tree with docked tail drafts (kitchen-sink fixture)",
+                default_size: size(px(900.), px(700.)),
                 build: |window, cx| {
                     let stores = ready_stores(cx);
                     let view = cx.new(|cx| {
-                        let mut view =
-                            ChatView::new(stores, None, WindowInput::new(cx), window, cx);
-                        view.set_messages_for_test(conversation(), cx);
-                        view
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
                     });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "onboarding",
+                description: "Onboarding window: the first-run 'Get Started' slide flow (scroll-snap, branching CTAs)",
+                default_size: size(px(640.), px(760.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| OnboardingView::new(stores, window, cx));
                     root(view, window, cx)
                 },
             },
@@ -330,6 +353,9 @@ mod driver {
             has_hardware_root_ca: false,
             has_hardware_intermediate_ca: false,
             attestation_url: None,
+            appearance: eidola_app_core::config::AppearanceSetting::System,
+            time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
+            light_character: eidola_app_core::config::LightCharacter::Neutral,
         }
     }
 
@@ -758,13 +784,23 @@ mod driver {
                     }))
                 }
 
-                Cmd::Theme { mode } => {
+                Cmd::Theme { mode, character } => {
                     let mode = match mode.as_str() {
                         "day" | "light" => ThemeMode::Light,
                         "night" | "dark" => ThemeMode::Dark,
                         other => return Err(format!("unknown theme mode \"{other}\" (day|night)")),
                     };
-                    cx.update(|cx| Theme::change(mode, None, cx));
+                    let character = match character.as_deref() {
+                        None | Some("neutral") => eidola_gui::theme::LightCharacter::Neutral,
+                        Some("cool") => eidola_gui::theme::LightCharacter::Cool,
+                        Some("warm") => eidola_gui::theme::LightCharacter::Warm,
+                        Some(other) => {
+                            return Err(format!(
+                                "unknown theme character \"{other}\" (cool|neutral|warm)"
+                            ));
+                        }
+                    };
+                    cx.update(|cx| eidola_gui::theme::apply_fixed(mode, character, cx));
                     for w in self.windows.values() {
                         cx.update_window(w.handle, |_, window, _| window.refresh())
                             .ok();

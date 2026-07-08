@@ -149,23 +149,51 @@ CREATE TABLE space_participant (
 );
 
 -- ============================================================
--- Action: the fundamental unit
+-- Action: the fundamental unit (immutable, append-only)
 --
--- origin_action_id: nullable FK to an action in another space.
--- When set, this action is a *reference* — a lightweight
--- pointer created during an edit-and-fork operation. It carries
--- no content_blocks of its own (follow the FK) and no cost
--- attribution. It exists so the forked space has a self-
--- contained history and so that action_antecedent edges within
--- the new space can reference local IDs.
+-- item_id: the stable identity shared by every generation of a
+-- logical item (a post / code project / image / tool result —
+-- anything an action is a version of). An edit or regeneration
+-- appends a NEW action with the same (space_id, item_id);
+-- nothing is ever mutated in place. item_id is an independent
+-- UUIDv7 (NOT the gen-0 action id) so a future item(space_id,
+-- id, …) table is a pure additive FK. An item is space-scoped:
+-- all of its generations live in one space.
 --
--- Origin references are created mechanically. Original work
--- has origin_action_id = NULL. Cost queries filter on this.
+-- supersedes_action_id: the prior generation (NULL for gen 0).
+-- The chain is linear (idx_one_successor_per_action), so an
+-- item's "current" generation is the unique tip — the action no
+-- other action supersedes (see the item_current view). The
+-- generation *number* is derived, not stored (see the generation
+-- expression in action_resolved); the supersedes chain is the
+-- source of truth.
+--
+-- supersedes_item_id: denormalized item of the superseded
+-- generation — by invariant this row's own item (CHECKed), NULL
+-- exactly when supersedes_action_id is NULL. It exists so the
+-- compound FK (supersedes_action_id, supersedes_item_id) →
+-- action(id, item_id) can enforce declaratively that a
+-- generation chain never hops items. Causality is preserved
+-- through action ids (antecedent edges record which concrete
+-- generation was replied to / quoted); the *intended* logical
+-- flow is described by item ids (rendering and context assembly
+-- resolve through the item to its current tip).
+--
+-- The DAG stays acyclic by construction: actions are immutable,
+-- edges only ever point at already-existing (earlier) actions,
+-- and UUIDv7 ids are time-ordered — so no edge can point forward
+-- and no cycle can form. (Generation re-rooting in the resolved
+-- view is the one logical-cycle case; consumers guard it there.)
 -- ============================================================
 CREATE TABLE action (
     id              TEXT PRIMARY KEY,          -- UUIDv7
     space_id        TEXT NOT NULL REFERENCES space(id),
     participant_id  TEXT NOT NULL REFERENCES participant(id),
+
+    -- generation identity (generation number is derived, not stored)
+    item_id              TEXT NOT NULL,
+    supersedes_action_id TEXT,
+    supersedes_item_id   TEXT,
 
     action_type     TEXT NOT NULL CHECK (action_type IN (
                         'user_input',
@@ -192,49 +220,84 @@ CREATE TABLE action (
     intent          TEXT,
     model           TEXT,
 
-    -- usage / cost (NULL for origin references)
+    -- usage / cost
     input_tokens    INTEGER,
     output_tokens   INTEGER,
     credits_consumed INTEGER,
 
-    -- edit-and-fork: points to the original action this
-    -- references. NULL for original work.
-    origin_action_id TEXT REFERENCES action(id),
-
     created_at      INTEGER NOT NULL,
 
-    -- origin references must not carry their own costs
-    CHECK (
-        origin_action_id IS NULL
-        OR (input_tokens IS NULL
-            AND output_tokens IS NULL
-            AND credits_consumed IS NULL)
-    )
+    -- supersedes is item-scoped: both halves present together, the item
+    -- is this row's own, and the referenced (action, item) pair must
+    -- really exist — so a generation chain cannot hop items.
+    CHECK ((supersedes_action_id IS NULL) = (supersedes_item_id IS NULL)),
+    CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
+    FOREIGN KEY (supersedes_action_id, supersedes_item_id)
+        REFERENCES action (id, item_id)
 );
 
 CREATE INDEX idx_action_space ON action (space_id, created_at);
 CREATE INDEX idx_action_participant ON action (participant_id);
 CREATE INDEX idx_action_type ON action (action_type);
-CREATE INDEX idx_action_origin ON action (origin_action_id)
-    WHERE origin_action_id IS NOT NULL;
+CREATE INDEX idx_action_item ON action (space_id, item_id);
 CREATE INDEX idx_action_status ON action (status)
     WHERE status != 'complete';
 
+-- Linear generation chain: each generation has at most one
+-- successor, so an item's tip (current generation) is unique.
+CREATE UNIQUE INDEX idx_one_successor_per_action
+    ON action (supersedes_action_id)
+    WHERE supersedes_action_id IS NOT NULL;
+
+-- One gen-0 per item: together with the one-successor index above,
+-- an item's tip is provably unique — item_current can never yield
+-- two rows for one item (which would duplicate posts in every
+-- resolved view and double edges in the item-tip threading joins).
+CREATE UNIQUE INDEX idx_one_root_per_item
+    ON action (space_id, item_id)
+    WHERE supersedes_action_id IS NULL;
+
+-- Parent key for the compound supersedes FK.
+CREATE UNIQUE INDEX idx_action_id_item ON action (id, item_id);
+
 -- ============================================================
--- Action antecedent: the causal graph
+-- Action antecedent: the causal graph (a DAG). Every edge points
+-- at a temporally prior, already-existing action (its
+-- antecedent) — directed and backward, the dual of consequent_tree.
+--
+-- relation classifies the edge — deliberately minimal, just the
+-- structural distinction:
+--   reply       structural thread parent (indentation). At most
+--               ONE per action (idx_one_reply_parent); roots have
+--               none. This is the tree-render key.
+--   reference   any non-structural link: a plain backlink, an
+--               inline quote (carries range_start/range_end), or
+--               an embed (carries content_block_id). The
+--               specializer columns disambiguate the kind, so the
+--               schema needs no separate quote/transclude values.
+--               (Re-expand the enum if a kind ever gains a
+--               ramification outside the referring action's content.)
+--
+-- PK is (action_id, ordinal) — NOT (action_id, antecedent) — so
+-- one action may reference the same antecedent multiple times
+-- with different ranges/annotations (multi-passage quote).
+-- ordinal is the stable order of an action's outgoing edges.
 -- ============================================================
 CREATE TABLE action_antecedent (
     action_id               TEXT NOT NULL REFERENCES action(id),
-    antecedent_action_id     TEXT NOT NULL REFERENCES action(id),
+    antecedent_action_id    TEXT NOT NULL REFERENCES action(id),
     ordinal                 INTEGER NOT NULL,
+
+    relation                TEXT NOT NULL CHECK (relation IN (
+                                'reply', 'reference'
+                            )) DEFAULT 'reply',
 
     content_block_id        TEXT REFERENCES content_block(id),
     range_start             INTEGER,
     range_end               INTEGER,
     annotation              TEXT,
 
-    PRIMARY KEY (action_id, antecedent_action_id),
-    UNIQUE (action_id, ordinal),
+    PRIMARY KEY (action_id, ordinal),
 
     CHECK (action_id != antecedent_action_id),
     CHECK (
@@ -248,11 +311,13 @@ CREATE TABLE action_antecedent (
 CREATE INDEX idx_action_antecedent_reverse
     ON action_antecedent (antecedent_action_id);
 
+-- At most one structural thread parent per action.
+CREATE UNIQUE INDEX idx_one_reply_parent
+    ON action_antecedent (action_id)
+    WHERE relation = 'reply';
+
 -- ============================================================
--- Content block: the typed payload of an action
---
--- Origin-reference actions have no content_blocks; their
--- content is accessed via action.origin_action_id.
+-- Content block: the typed payload of an action.
 -- ============================================================
 CREATE TABLE content_block (
     id              TEXT PRIMARY KEY,          -- UUIDv7
@@ -433,9 +498,26 @@ LEFT JOIN credential c_next
     ON  c_next.pre_credential_id = pc_spend.id;
 
 -- ============================================================
--- Action resolved: dereferences origin pointers, so queries
--- always see content regardless of whether an action is
--- original or a reference.
+-- Item current: the tip (current generation) of each item —
+-- the action no other action supersedes.
+-- ============================================================
+CREATE VIEW item_current AS
+SELECT
+    a.space_id,
+    a.item_id,
+    a.id          AS current_action_id
+FROM action a
+WHERE NOT EXISTS (
+    SELECT 1 FROM action s WHERE s.supersedes_action_id = a.id
+);
+
+-- ============================================================
+-- Action resolved: annotates each action with its generation
+-- state. (Origin-dereferencing is gone — content and cost now
+-- always live on the action itself.) is_current = 1 iff this
+-- action is its item's tip generation. generation is *derived*
+-- (count of earlier generations in the same item), not stored;
+-- the supersedes chain is the source of truth.
 -- ============================================================
 CREATE VIEW action_resolved AS
 SELECT
@@ -445,20 +527,22 @@ SELECT
     a.action_type,
     a.status,
     a.intent,
-    a.origin_action_id,
-    -- costs come from original, not reference
-    COALESCE(orig.model, a.model)                AS model,
-    COALESCE(orig.input_tokens, a.input_tokens)  AS input_tokens,
-    COALESCE(orig.output_tokens, a.output_tokens) AS output_tokens,
-    COALESCE(orig.credits_consumed, a.credits_consumed) AS credits_consumed,
-    -- content source: which action_id to query content_blocks against
-    COALESCE(a.origin_action_id, a.id)           AS content_source_id,
+    a.item_id,
+    a.supersedes_action_id,
+    a.model,
+    a.input_tokens,
+    a.output_tokens,
+    a.credits_consumed,
     a.created_at,
-    CASE WHEN a.origin_action_id IS NOT NULL
-         THEN 1 ELSE 0
-    END AS is_reference
-FROM action a
-LEFT JOIN action orig ON orig.id = a.origin_action_id;
+    (SELECT COUNT(*) FROM action b
+     WHERE b.item_id = a.item_id
+       AND (b.created_at < a.created_at
+            OR (b.created_at = a.created_at AND b.id < a.id))
+    ) AS generation,
+    CASE WHEN NOT EXISTS (
+        SELECT 1 FROM action s WHERE s.supersedes_action_id = a.id
+    ) THEN 1 ELSE 0 END AS is_current
+FROM action a;
 
 -- ============================================================
 -- Action detail: resolved action + content blocks, flattened
@@ -475,7 +559,9 @@ SELECT
     ar.intent,
     ar.model,
     ar.credits_consumed,
-    ar.is_reference,
+    ar.item_id,
+    ar.generation,
+    ar.is_current,
     ar.created_at,
     cb.ordinal          AS block_ordinal,
     cb.block_type,
@@ -485,14 +571,15 @@ SELECT
     cb.tool_call_id
 FROM action_resolved ar
 JOIN participant p ON p.id = ar.participant_id
-LEFT JOIN content_block cb ON cb.action_id = ar.content_source_id
+LEFT JOIN content_block cb ON cb.action_id = ar.action_id
 ORDER BY ar.created_at, cb.ordinal;
 
 -- ============================================================
 -- Space history: actions in a space, with drafts filtered out.
--- No lineage walking — spaces are self-contained.
--- For forked spaces, origin-reference actions provide the
--- inherited history.
+-- No lineage walking — spaces are self-contained. Includes all
+-- generations; consumers resolve to the current tip per item
+-- (item_current) for the default view, and join action_resolved
+-- if they need the derived generation number.
 -- ============================================================
 CREATE VIEW space_history AS
 SELECT
@@ -502,7 +589,7 @@ SELECT
     a.action_type,
     a.status,
     a.intent,
-    a.origin_action_id,
+    a.item_id,
     a.created_at
 FROM action a
 WHERE a.status IN ('complete', 'cancelled')
@@ -537,7 +624,6 @@ WHERE d.depth > 0;
 
 -- ============================================================
 -- Spend trail: credential -> request -> action -> space
--- Only counts original work (not origin references).
 -- ============================================================
 CREATE VIEW spend_trail AS
 SELECT
@@ -562,5 +648,4 @@ FROM credential_lifecycle cl
 JOIN request r        ON r.credential_nonce = cl.nonce
 LEFT JOIN action a    ON a.id = r.action_id
 LEFT JOIN space s     ON s.id = a.space_id
-WHERE cl.state IN ('spending', 'spent')
-  AND (a.origin_action_id IS NULL);  -- exclude references
+WHERE cl.state IN ('spending', 'spent');

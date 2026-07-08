@@ -21,6 +21,57 @@ pub const DEFAULT_ATTESTATION_REPO: &str = "eidola-ai/eidola";
 /// config (`default_model`) nor the caller specifies one.
 pub const DEFAULT_MODEL: &str = "gemma4-31b";
 
+/// The day/night axis of the circadian theme: which palette family is
+/// active. `System` tracks the OS light/dark appearance; `Day`/`Night` pin
+/// one family; `Auto` switches on the sun — between (timezone-approximated)
+/// sunrise and sunset is day, falling back to a fixed 06:00–18:00 window
+/// when the timezone yields no coordinates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppearanceSetting {
+    #[default]
+    System,
+    Day,
+    Night,
+    Auto,
+}
+
+/// The time-of-day axis of the circadian theme. `On` follows the sun: the
+/// palette takes on the character of the light at the current hour — bluish
+/// around sunrise, neutral at solar noon/midnight, warm orange around
+/// sunset — with sunrise/sunset approximated from the system timezone's
+/// tzdb coordinates (clock-only fallback when the zone has none). `Off`
+/// pins the character to the user's [`LightCharacter`] choice instead.
+/// Values are strings (not a bool) so future variants extend rather than
+/// break the config key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeOfDayTint {
+    #[default]
+    On,
+    Off,
+}
+
+/// The character of the light the palettes render under — the value the
+/// time-of-day axis animates when it is `On`, and the user's fixed choice
+/// (config key `light_character`) when it is `Off`. `Neutral` is the
+/// untinted anchor palette; the other two are derived from it by the GUI's
+/// tint machinery. The aliases accept the pre-rename values (`bluish` /
+/// `orange`) so an existing config file keeps parsing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightCharacter {
+    /// Dawn / sunrise — the cool blue cast of early light.
+    #[serde(alias = "bluish")]
+    Cool,
+    /// Noon / midnight — the anchor palettes, no cast.
+    #[default]
+    Neutral,
+    /// Sunset / dusk — the warm orange/red of low sun.
+    #[serde(alias = "orange")]
+    Warm,
+}
+
 /// Returns the default config file path: `<config_dir>/eidola/config.toml`.
 pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("eidola").join("config.toml"))
@@ -75,6 +126,28 @@ pub struct Config {
         skip_serializing_if = "Option::is_none"
     )]
     pub update_feed_override: Option<String>,
+    /// Circadian theme, day/night axis. `None` = the default (`system`).
+    #[serde(
+        rename = "appearance",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub appearance_override: Option<AppearanceSetting>,
+    /// Circadian theme, time-of-day axis. `None` = the default (`on`).
+    #[serde(
+        rename = "time_of_day_tint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub time_of_day_tint_override: Option<TimeOfDayTint>,
+    /// Circadian theme, fixed light character (used when the time-of-day
+    /// axis is `off`). `None` = the default (`neutral`).
+    #[serde(
+        rename = "light_character",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub light_character_override: Option<LightCharacter>,
 }
 
 impl Config {
@@ -100,6 +173,24 @@ impl Config {
         self.default_model_override
             .as_deref()
             .unwrap_or(DEFAULT_MODEL)
+    }
+
+    /// The circadian day/night axis: the user's `appearance` override if
+    /// set, otherwise `system` (track the OS appearance).
+    pub fn appearance(&self) -> AppearanceSetting {
+        self.appearance_override.unwrap_or_default()
+    }
+
+    /// The circadian time-of-day axis: the user's `time_of_day_tint`
+    /// override if set, otherwise `on`.
+    pub fn time_of_day_tint(&self) -> TimeOfDayTint {
+        self.time_of_day_tint_override.unwrap_or_default()
+    }
+
+    /// The fixed light character used while the time-of-day axis is `off`:
+    /// the user's `light_character` override if set, otherwise `neutral`.
+    pub fn light_character(&self) -> LightCharacter {
+        self.light_character_override.unwrap_or_default()
     }
 
     /// The server URL to talk to: the user's `base_url` override if set,
@@ -363,6 +454,45 @@ tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
         let parsed: Config = toml::from_str("").expect("deserialize empty");
         assert!(parsed.default_model_override.is_none());
         assert_eq!(parsed.default_model(), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn circadian_settings_default_and_round_trip_via_toml() {
+        // Absent keys → the resolvers fall back to the defaults.
+        let cfg: Config = toml::from_str("").expect("deserialize empty");
+        assert_eq!(cfg.appearance(), AppearanceSetting::System);
+        assert_eq!(cfg.time_of_day_tint(), TimeOfDayTint::On);
+        assert_eq!(cfg.light_character(), LightCharacter::Neutral);
+
+        let original = Config {
+            appearance_override: Some(AppearanceSetting::Auto),
+            time_of_day_tint_override: Some(TimeOfDayTint::Off),
+            light_character_override: Some(LightCharacter::Warm),
+            ..Config::default()
+        };
+        let toml_text = toml::to_string_pretty(&original).expect("serialize");
+        assert!(
+            toml_text.contains("appearance = \"auto\""),
+            "override must serialize under the public `appearance` key: {toml_text}"
+        );
+        assert!(
+            toml_text.contains("time_of_day_tint = \"off\""),
+            "override must serialize under the public `time_of_day_tint` key: {toml_text}"
+        );
+        assert!(
+            toml_text.contains("light_character = \"warm\""),
+            "override must serialize under the public `light_character` key: {toml_text}"
+        );
+        let parsed: Config = toml::from_str(&toml_text).expect("deserialize");
+        assert_eq!(parsed.appearance(), AppearanceSetting::Auto);
+        assert_eq!(parsed.time_of_day_tint(), TimeOfDayTint::Off);
+        assert_eq!(parsed.light_character(), LightCharacter::Warm);
+
+        // Pre-rename values keep parsing (a stale config must not reset).
+        let parsed: Config = toml::from_str("light_character = \"bluish\"").expect("alias parses");
+        assert_eq!(parsed.light_character(), LightCharacter::Cool);
+        let parsed: Config = toml::from_str("light_character = \"orange\"").expect("alias parses");
+        assert_eq!(parsed.light_character(), LightCharacter::Warm);
     }
 
     #[test]

@@ -4,9 +4,47 @@
 //! selection.
 
 use gpui::{AppContext, Entity, px, size};
-use gpui_markdown_editor::{EditorState, MarkdownEditor, Selection};
+use gpui_markdown_editor::{EditorState, MarkdownEditor, MarkdownEditorState, Selection};
 
 use super::harness::Snapshots;
+
+/// Snapshot host: holds the editor state entity and renders the
+/// `MarkdownEditor` element, mirroring a real host. The state entity is not
+/// `Render`, so snapshots wrap it in this. Its `new`/`with_state` shadow the
+/// old entity constructors so the cases read unchanged.
+struct EditorHarness {
+    state: Entity<MarkdownEditorState>,
+}
+
+impl EditorHarness {
+    fn new(
+        markdown: impl Into<String>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Self {
+        let state = cx.new(|cx| MarkdownEditorState::new(window, cx).default_value(markdown));
+        Self { state }
+    }
+
+    fn with_state(
+        state: EditorState,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Self {
+        let state = cx.new(|cx| MarkdownEditorState::with_state(state, window, cx));
+        Self { state }
+    }
+}
+
+impl gpui::Render for EditorHarness {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        MarkdownEditor::new(&self.state)
+    }
+}
 
 const KITCHEN_SINK: &str = "\
 # Markdown editor
@@ -27,11 +65,11 @@ pub fn register(s: &mut Snapshots) {
     let win = size(px(720.), px(480.));
 
     s.add("empty_document", win, |window, cx| {
-        cx.new(|cx| MarkdownEditor::new("", window, cx))
+        cx.new(|cx| EditorHarness::new("", window, cx))
     });
 
     s.add("plain_paragraph", win, |window, cx| {
-        cx.new(|cx| MarkdownEditor::new("just a body paragraph.", window, cx))
+        cx.new(|cx| EditorHarness::new("just a body paragraph.", window, cx))
     });
 
     // Heading: cursor outside (delimiters hidden).
@@ -100,7 +138,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "before **bold** after".into(),
                 selection: Selection::range(0, 21),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -114,7 +152,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "paragraph 1\n\n\n\n\n\nparagraph 2".into(),
                 selection: Selection::Cursor(0),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -128,7 +166,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "paragraph 1\n\n\n\n\n\nparagraph 2".into(),
                 selection: Selection::Cursor(14),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -142,7 +180,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "paragraph 1\n\n".into(),
                 selection: Selection::Cursor(13),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -154,7 +192,7 @@ pub fn register(s: &mut Snapshots) {
                 // Cursor in trailing prose.
                 selection: Selection::Cursor(60),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -166,7 +204,7 @@ pub fn register(s: &mut Snapshots) {
                 // Inside content.
                 selection: Selection::Cursor(20),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -180,7 +218,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: md,
                 selection: Selection::Cursor(0),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -193,7 +231,7 @@ pub fn register(s: &mut Snapshots) {
                 // Cursor in trailing prose.
                 selection: Selection::Cursor(34),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -205,7 +243,7 @@ pub fn register(s: &mut Snapshots) {
                 // Cursor inside "quote".
                 selection: Selection::Cursor(8),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -217,7 +255,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "Intro.\n\n> > Deep wisdom here.\n\nBody.".into(),
                 selection: Selection::Cursor(33),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -245,7 +283,7 @@ pub fn register(s: &mut Snapshots) {
                 .into(),
                 selection: Selection::Cursor(0),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -257,7 +295,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "> # Quoted heading\n\nBody.".into(),
                 selection: Selection::Cursor(22),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -271,7 +309,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "paragraph\n\n> ".into(),
                 selection: Selection::Cursor(13),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -283,7 +321,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "> hello\n> \n> ".into(),
                 selection: Selection::Cursor(13),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -294,7 +332,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "> > deep\n> > \n> > ".into(),
                 selection: Selection::Cursor(18),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -306,7 +344,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "> hello  \n> ".into(),
                 selection: Selection::Cursor(12),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -318,7 +356,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "> ```rust\n> let x = 1;\n> ```\n\nBody.".into(),
                 selection: Selection::Cursor(31),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -333,7 +371,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "paragraph 1  \n".into(),
                 selection: Selection::Cursor(14),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -348,7 +386,7 @@ pub fn register(s: &mut Snapshots) {
                 // Cursor outside the list.
                 selection: Selection::Cursor(20),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -361,7 +399,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "- foo\n- bar\n- baz".into(),
                 selection: Selection::Cursor(8),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -391,7 +429,7 @@ pub fn register(s: &mut Snapshots) {
                 // markers paint as their digit form).
                 selection: Selection::Cursor(0),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -404,7 +442,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "- outer\n  - inner one\n  - inner two\n- outer two".into(),
                 selection: Selection::Cursor(0),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -416,7 +454,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "- a\n  - b\n    - c".into(),
                 selection: Selection::Cursor(0),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -429,7 +467,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "- first paragraph\n\n  second paragraph at the same column\n".into(),
                 selection: Selection::Cursor(0),
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -440,7 +478,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "Intro paragraph.\n\n$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n$$\n\nOutro paragraph.".into(),
                 selection: Selection::Cursor(0), // Cursor at start of document (outside the math block).
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -451,7 +489,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "Intro paragraph.\n\n$$\n\\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n$$\n\nOutro paragraph.".into(),
                 selection: Selection::Cursor(25), // Cursor inside the math block.
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -462,7 +500,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "> $$\n> \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n> $$\n\nBody paragraph.".into(),
                 selection: Selection::Cursor(65), // Cursor on "Body paragraph" (outside blockquote and math).
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -473,7 +511,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "> $$\n> \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n> $$\n\nBody paragraph.".into(),
                 selection: Selection::Cursor(25), // Cursor inside the math block.
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -484,7 +522,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "- Item one\n  $$\n  \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n  $$\n- Item two".into(),
                 selection: Selection::Cursor(0), // Cursor at start (outside the math block).
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -495,7 +533,7 @@ pub fn register(s: &mut Snapshots) {
                 markdown: "- Item one\n  $$\n  \\frac{1}{1 - x} = \\sum_{n=0}^{\\infty} x^n\n  $$\n- Item two".into(),
                 selection: Selection::Cursor(35), // Cursor inside the math block.
             };
-            MarkdownEditor::with_state(state, window, cx)
+            EditorHarness::with_state(state, window, cx)
         })
     });
 
@@ -513,7 +551,7 @@ pub fn register(s: &mut Snapshots) {
                     markdown: "1. One\n2. \n   1. Two, One".into(),
                     selection: Selection::Cursor(0),
                 };
-                MarkdownEditor::with_state(state, window, cx)
+                EditorHarness::with_state(state, window, cx)
             })
         },
     );
@@ -530,7 +568,7 @@ pub fn register(s: &mut Snapshots) {
                     markdown: "1. One\n2. \n   1. Two, One".into(),
                     selection: Selection::Cursor(10), // `\n` ending the `2. ` row
                 };
-                MarkdownEditor::with_state(state, window, cx)
+                EditorHarness::with_state(state, window, cx)
             })
         },
     );
@@ -543,7 +581,7 @@ fn editor_with_cursor(
     cx: &mut gpui::App,
     markdown: &'static str,
     needle: &'static str,
-) -> Entity<MarkdownEditor> {
+) -> Entity<EditorHarness> {
     let cursor = markdown
         .find(needle)
         .map(|i| i + 3.min(needle.len()))
@@ -552,5 +590,5 @@ fn editor_with_cursor(
         markdown: markdown.into(),
         selection: Selection::Cursor(cursor),
     };
-    cx.new(|cx| MarkdownEditor::with_state(state, window, cx))
+    cx.new(|cx| EditorHarness::with_state(state, window, cx))
 }
