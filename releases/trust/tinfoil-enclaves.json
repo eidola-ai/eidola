@@ -3,14 +3,14 @@
   "source_repo": "tinfoilsh/confidential-model-router",
   "allowed": [
     {
-      "git_tag": "v0.0.110",
+      "git_tag": "v0.0.113",
       "built_at": "2026-06-05T15:54:28Z",
-      "artifact_digest": "sha256:59239f442bcc5814c5981c1d424e25ab190784c6d3162b76fa90bbce88a4e4c9",
-      "rekor_log_index": 1932011338,
-      "snp_measurement": "7adcb574b1e22ab579f3c883da3e5b6e632ef06775dd13fdb16850640135a5f63c7eb8741fe340c672edaf241bd1ed7c",
+      "artifact_digest": "sha256:cf37a228902310984e55acc347ac6d5a8898d0b8e56004b3dd1ba1996567fba6",
+      "rekor_log_index": 2108817243,
+      "snp_measurement": "bf8b7752e473138cce43f4ed0f4f977354e0e6ada1a60aec2ae06094201067b07199d642daaccd55bfa6e7f5c1e82f83",
       "tdx_measurement": {
         "rtmr1": "46658ae5655794d3ea0130e2d425aa002f224c7a47c1eb1792f656d79f808aac6006ce84d71ee24d97c3eea42c867e51",
-        "rtmr2": "daf6e3af4a25aa93e38bf07f0055f5bf7ff742f490c463c4cbe85822317c76233ff6d3583c8c507ef9fd9ce6994e33ec"
+        "rtmr2": "757b3cb99ee0e575dde7206aafc671c382728375d9610caf427198c893eb6fd46250b968bbd59b4f12242910adde8634"
       }
     }
   ]
