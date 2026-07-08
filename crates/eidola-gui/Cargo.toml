@@ -37,8 +37,8 @@ gpui = { git = "https://github.com/zed-industries/zed", features = ["inspector"]
 # Wayland-only by decision (see AGENTS.md — cleaner all-open-source story,
 # narrower deployment surface); do not add the `x11` feature back.
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders", "wayland"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "dadfca97fec7221acf3ce7047bccdc1eac0506b9", features = ["inspector"] }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "dadfca97fec7221acf3ce7047bccdc1eac0506b9" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "3229ac92c47a5942de41a91181bce88e1a0af32e", features = ["inspector"] }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "3229ac92c47a5942de41a91181bce88e1a0af32e" }
 
 eidola-app-core = { path = "../eidola-app-core" }
 gpui-markdown-editor = { path = "../gpui-markdown-editor" }
