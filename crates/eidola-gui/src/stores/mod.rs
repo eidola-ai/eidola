@@ -22,6 +22,7 @@
 pub mod account;
 pub mod config;
 pub mod models;
+pub mod record;
 pub mod spaces;
 pub mod update;
 pub mod wallet;
@@ -35,6 +36,7 @@ use gpui::{App, AppContext, AsyncApp, Entity};
 pub use account::AccountStore;
 pub use config::ConfigStore;
 pub use models::ModelsStore;
+pub use record::RecordStore;
 pub use spaces::SpacesStore;
 pub use update::UpdateStore;
 pub use wallet::WalletStore;
@@ -57,6 +59,10 @@ pub struct Stores {
     pub wallet: Entity<WalletStore>,
     pub spaces: Entity<SpacesStore>,
     pub update: Entity<UpdateStore>,
+    /// Bus-relay only — owns no rows. Record listings live in window-scoped
+    /// reader entities (`RecordView`), which observe this store to learn
+    /// that the local trail grew (see `stores/record.rs`).
+    pub record: Entity<RecordStore>,
 }
 
 impl Stores {
@@ -93,6 +99,7 @@ impl Stores {
             cx.new(|_| WalletStore::stub(fixture.credential_lifecycle, fixture.credentials));
         let spaces = cx.new(|_| SpacesStore::stub(fixture.spaces));
         let update = cx.new(|_| UpdateStore::stub(fixture.update_check, fixture.update_checking));
+        let record = cx.new(|_| RecordStore::new());
         Self {
             app_core: None,
             config,
@@ -101,6 +108,7 @@ impl Stores {
             wallet,
             spaces,
             update,
+            record,
         }
     }
 
@@ -119,6 +127,7 @@ impl Stores {
         let wallet = cx.new(|_| WalletStore::new(app_core.clone()));
         let spaces = cx.new(|_| SpacesStore::new(app_core.clone()));
         let update = cx.new(|_| UpdateStore::new(app_core.clone()));
+        let record = cx.new(|_| RecordStore::new());
         Self {
             app_core,
             config,
@@ -127,6 +136,7 @@ impl Stores {
             wallet,
             spaces,
             update,
+            record,
         }
     }
 
@@ -254,9 +264,13 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
                 .spaces
                 .update(cx, |s, cx| s.notify_space_changed(&id, cx));
         }
-        // Record listings are window-scoped reader entities (step 3); they
-        // subscribe to mark themselves stale. No global store owns them.
-        Change::Record => {}
+        // Record listings are window-scoped reader entities; no global store
+        // owns their rows. The RecordStore is the bus seam those readers
+        // observe: bumping its epoch lets every open Record window mark
+        // itself stale and surface the "new entries — refresh" affordance.
+        Change::Record => {
+            stores.record.update(cx, |s, cx| s.notify_changed(cx));
+        }
         Change::UpdateState => {
             stores.update.update(cx, |s, cx| s.refresh(cx));
         }
@@ -275,4 +289,7 @@ fn refresh_everything(stores: &Stores, cx: &mut App) {
     stores.wallet.update(cx, |s, cx| s.refresh(cx));
     stores.spaces.update(cx, |s, cx| s.refresh(cx));
     stores.update.update(cx, |s, cx| s.refresh(cx));
+    // A dropped change may have been a Record write — let open Record
+    // windows mark themselves stale.
+    stores.record.update(cx, |s, cx| s.notify_changed(cx));
 }

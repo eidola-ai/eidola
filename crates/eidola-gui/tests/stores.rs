@@ -131,6 +131,35 @@ fn bus_bridge_dispatches_wallet_change(cx: &mut TestAppContext) {
         .read_with(cx, |m, _| assert!(m.models().is_loading()));
 }
 
+/// A `Change::Record` must reach open Record windows. No global store owns
+/// the Record's rows (they are window-scoped reader state), so the bridge
+/// routes the change to the `RecordStore` relay — bumping its epoch, which
+/// observing Record windows compare against to mark themselves stale. The
+/// bug this guards: the dispatch silently dropped `Change::Record`, so an
+/// open Record window never learned the trail grew (codex finding, PR #179).
+#[gpui::test]
+fn bus_bridge_routes_record_change_to_record_store(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+
+    assert_eq!(stores.record.read_with(cx, |r, _| r.epoch()), 0);
+
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Record), cx));
+    assert_eq!(
+        stores.record.read_with(cx, |r, _| r.epoch()),
+        1,
+        "a Change::Record must bump the RecordStore epoch"
+    );
+
+    // A `Lagged` (refresh-everything) may have dropped a Record change, so
+    // it must bump too.
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, None, cx));
+    assert_eq!(
+        stores.record.read_with(cx, |r, _| r.epoch()),
+        2,
+        "a Lagged signal must also reach the RecordStore"
+    );
+}
+
 /// The space-entity registry's join-existing semantics: two `open` calls for
 /// the same id return the *same* `Space` entity (so two windows on one space
 /// share one transcript + streaming buffer — wave-2 bug 4), while a different
