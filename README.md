@@ -124,7 +124,7 @@ just update-openapi    # OpenAPI spec
 just update-manifest   # artifact-manifest.json (OCI images, desktop binaries, enclave measurements)
 ```
 
-This uses the pinned amd64 BuildKit builder configuration for the OCI images, the local Nix build for the host platform's desktop artifacts (the macOS universal CLI and GUI `.app` on macOS; the Linux GUI on Linux — the other platform's narHashes are carried over from the committed manifest, and CI verifies the full set), and the `measure-enclave` binary to compute SEV-SNP and TDX measurements from `tinfoil-config.yml`.
+This uses the pinned amd64 BuildKit builder configuration for the OCI images, the local Nix build for the host platform's native desktop artifacts (the macOS universal CLI and GUI `.app` on macOS; the Linux GUI on Linux), and the `measure-enclave` binary to compute SEV-SNP and TDX measurements from `tinfoil-config.yml`. The Linux GUI narHash is always regenerated: natively on Linux, and on macOS by reproducing CI's native `x86_64-linux` build inside a pinned `linux/amd64` Nix container (`docker` required — the same assumption the StageX pipeline already makes). Only the macOS narHashes are host-exclusive (they can't be cross-built from Linux), so on a Linux host they're carried over from the committed manifest; CI verifies the full set on both platforms.
 
 To compute enclave measurements independently (without rebuilding images):
 
