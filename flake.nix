@@ -731,11 +731,18 @@ with open(path, "wb") as f:
                   pkgs.pkg-config
                   pkgs.patchelf
                 ];
-                # postFixup runs after fixupPhase's strip/shrink-rpath, so
-                # this RUNPATH is what ships. Deterministic: store paths are
-                # pure functions of the flake inputs.
+                # postFixup runs after fixupPhase's strip/shrink-rpath. That
+                # pass keeps the RUNPATH entries for the binary's direct NEEDED
+                # libs (glibc's libc/libm, libgcc_s, libxkbcommon) and drops the
+                # dlopen-only ones (wayland, the Vulkan loader, fontconfig,
+                # freetype), since nothing NEEDED resolves through them. *Append*
+                # those back rather than `--set-rpath` overwriting: overwriting
+                # would strip the compiler/runtime closure the linker recorded
+                # (libc/libm/libgcc), so the artifact would hash fine but fail to
+                # start once launched from the store. Deterministic: store paths
+                # are pure functions of the flake inputs.
                 postFixup = ''
-                  patchelf --set-rpath "${pkgs.lib.makeLibraryPath guiLinuxLibs}" $out/bin/eidola-gui
+                  patchelf --add-rpath "${pkgs.lib.makeLibraryPath guiLinuxLibs}" $out/bin/eidola-gui
                 '';
               };
             };

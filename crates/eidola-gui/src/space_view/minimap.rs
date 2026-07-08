@@ -350,10 +350,22 @@ impl SpaceView {
             // drag is actually in flight, so registering unconditionally is cheap
             // and avoids a first-move gap.
             let bounds_cell = self.minimap_bounds.clone();
+            let strip_clearance = clearance;
             let weak = cx.entity().downgrade();
             container = container.child(
                 gpui::canvas(
-                    move |bounds, _, _| bounds_cell.set(Some(bounds)),
+                    move |mut bounds, _, _| {
+                        // The interactive strip starts `clearance` below the
+                        // container's padding-box top (the `.pt(clearance)`
+                        // corner inset on Linux CSD). Record the *strip* top, not
+                        // the container top, so `minimap_local_y` yields a
+                        // strip-relative y — the origin the scrollbar mapping
+                        // math (`handle_range`, `drag_grab`, …) is measured from
+                        // (0 = first cell). Zero off Linux CSD, so macOS/tests
+                        // are unchanged.
+                        bounds.origin.y += strip_clearance;
+                        bounds_cell.set(Some(bounds));
+                    },
                     move |_bounds, _, window, _cx| {
                         let move_weak = weak.clone();
                         window.on_mouse_event(move |ev: &MouseMoveEvent, _phase, _window, cx| {
@@ -417,8 +429,9 @@ impl SpaceView {
         }
     }
 
-    /// Minimap-local y of a window-space y, using the container bounds recorded
-    /// last frame (the container spans the full viewport height, right-edge).
+    /// Minimap-local y of a window-space y, using the strip top recorded last
+    /// frame (the container's padding-box top plus the CSD corner clearance, so
+    /// 0 is the first cell — the origin the scrollbar mapping math expects).
     fn minimap_local_y(&self, window_y: f32) -> f32 {
         let top = self
             .minimap_bounds
