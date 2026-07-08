@@ -531,7 +531,12 @@ fn slide_frame(
 
     v_flex()
         .w_full()
-        .h(window.viewport_size().height)
+        // The content box, not the raw surface: on Linux CSD `viewport_size`
+        // includes the shadow padding, and the reveal/snap stride is measured
+        // as `chrome::content_size().height` (see `glide_to_index`), so each
+        // slide must be exactly that tall or snaps land between slides. Equal
+        // to `viewport_size` off Linux CSD, so macOS/tests are unchanged.
+        .h(crate::chrome::content_size(window).height)
         .child(
             // The prose region: fills the space above the CTAs, centering
             // the reading column vertically; horizontally centered as a unit.

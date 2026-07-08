@@ -31,9 +31,14 @@ path = "src/main.rs"
 # MTLDevice library compile (~50ms). Zed's own Nix package makes the same
 # trade-off.
 gpui = { git = "https://github.com/zed-industries/zed", features = ["inspector"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "dadfca97fec7221acf3ce7047bccdc1eac0506b9", features = ["inspector"] }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "dadfca97fec7221acf3ce7047bccdc1eac0506b9" }
+# `wayland` selects gpui's Linux windowing backend. It's gated inside
+# gpui_platform by `cfg(target_os = ...)`, so enabling it universally is a
+# no-op on macOS/Windows — no `[target.'cfg(...)']` split needed. Linux is
+# Wayland-only by decision (see AGENTS.md — cleaner all-open-source story,
+# narrower deployment surface); do not add the `x11` feature back.
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "runtime_shaders", "wayland"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "3229ac92c47a5942de41a91181bce88e1a0af32e", features = ["inspector"] }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "3229ac92c47a5942de41a91181bce88e1a0af32e" }
 
 eidola-app-core = { path = "../eidola-app-core" }
 gpui-markdown-editor = { path = "../gpui-markdown-editor" }
@@ -51,7 +56,7 @@ tokio = { version = "1", features = ["sync"] }
 gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
 # The driver example's JSON-lines protocol.
 serde = { version = "1", features = ["derive"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support", "font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support", "font-kit", "wayland"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Store-level tests (tests/stores.rs) build a real `AppCore` over tempdirs and
 # install the crypto provider (mirrors app-core's own test setup).

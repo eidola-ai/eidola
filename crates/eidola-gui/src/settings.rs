@@ -23,12 +23,9 @@ use crate::wallet::WalletView;
 use crate::window_input::WindowInput;
 
 /// Vertical reserve at the top of the nav band so the macOS traffic lights
-/// (at `point(14, 11)` per `lib.rs::transparent_titlebar`) sit on empty
-/// sidebar rather than over the first nav item.
-#[cfg(target_os = "macos")]
+/// (at `point(14, 11)` per `lib.rs::transparent_titlebar`) / the Linux CSD
+/// window controls sit on empty chrome rather than over the first nav item.
 const NAV_TOP_RESERVE: gpui::Pixels = gpui::px(44.);
-#[cfg(not(target_os = "macos"))]
-const NAV_TOP_RESERVE: gpui::Pixels = gpui::px(12.);
 
 /// Width of the nav band. Narrow on purpose — three words, not a sidebar.
 const NAV_WIDTH: gpui::Pixels = gpui::px(132.);
@@ -168,7 +165,7 @@ impl Render for SettingsView {
         };
 
         let wi = self.window_input.clone();
-        h_flex()
+        crate::chrome::round_client_corners(h_flex(), window)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
@@ -192,19 +189,22 @@ impl Render for SettingsView {
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(
-                v_flex()
-                    .w(NAV_WIDTH)
-                    .h_full()
-                    .flex_none()
-                    .bg(theme.sidebar)
-                    .border_r_1()
-                    .border_color(theme.sidebar_border)
-                    .pt(NAV_TOP_RESERVE)
-                    .px_2()
-                    .gap_0p5()
-                    .child(self.nav_item(SettingsPane::General, cx))
-                    .child(self.nav_item(SettingsPane::Account, cx))
-                    .child(self.nav_item(SettingsPane::Wallet, cx)),
+                crate::chrome::round_bl_client_corner(
+                    crate::chrome::round_tl_client_corner(v_flex(), window),
+                    window,
+                )
+                .w(NAV_WIDTH)
+                .h_full()
+                .flex_none()
+                .bg(theme.sidebar)
+                .border_r_1()
+                .border_color(theme.sidebar_border)
+                .pt(NAV_TOP_RESERVE)
+                .px_2()
+                .gap_0p5()
+                .child(self.nav_item(SettingsPane::General, cx))
+                .child(self.nav_item(SettingsPane::Account, cx))
+                .child(self.nav_item(SettingsPane::Wallet, cx)),
             )
             // The scroll container needs the same width discipline as the
             // chat transcript (see the scroll-container invariant in

@@ -20,12 +20,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// GitHub repository URL shown as the "View on GitHub" link.
 const REPO_URL: &str = "https://github.com/eidola-ai/eidola";
 
-/// Vertical reserve for the macOS traffic lights (same pattern as all
-/// other windows with `transparent_titlebar`).
-#[cfg(target_os = "macos")]
+/// Vertical reserve for the macOS traffic lights / Linux CSD window
+/// controls (same pattern as all other windows with `transparent_titlebar`).
 const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(36.);
-#[cfg(not(target_os = "macos"))]
-const TITLE_BAR_RESERVE: gpui::Pixels = gpui::px(0.);
 
 pub struct AboutView {
     focus_handle: FocusHandle,
@@ -108,7 +105,7 @@ impl Render for AboutView {
             }))
             .child("View on GitHub →");
 
-        v_flex()
+        crate::chrome::round_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();

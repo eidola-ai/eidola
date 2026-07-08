@@ -139,9 +139,12 @@ measure:
     ./scripts/artifact-manifest.sh measure
 
 # Update artifact-manifest.json with current build digests and measurements.
-# Builds the OCI images plus the CLI macOS universal binary, then records
-# their digests. Also stamps image digests into tinfoil-config.yml and
-# computes enclave measurements. Requires macOS for the Nix-built CLI.
+# Builds the OCI images plus the current host's Nix-built desktop artifacts
+# (macOS universal CLI + GUI .app on Darwin; the Linux GUI on Linux), then
+# records their digests/narHashes. Also stamps image digests into
+# tinfoil-config.yml and computes enclave measurements. The *other*
+# platform's desktop entries are carried over from the committed manifest —
+# no single host builds both; CI's apple + linux-gui jobs verify the full set.
 update-manifest:
     ./scripts/artifact-manifest.sh update --ensure-builder
 

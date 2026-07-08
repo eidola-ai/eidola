@@ -475,10 +475,40 @@ fn load_fonts(cx: &App) {
 /// system level are picked up live. Call from inside the `cx.open_window`
 /// builder for each window we open. Routes through [`apply`], so a pinned
 /// `day`/`night`/`auto` appearance correctly ignores the OS flip.
+///
+/// On Linux/Wayland the theme flip is spawned onto the foreground executor
+/// rather than applied inline: gpui delivers appearance changes from inside
+/// the xdg-desktop-portal event callback, which holds the Wayland client's
+/// `RefCell` mutably (`gpui_linux` `wayland/client.rs`, `XDPEvent::
+/// WindowAppearance`); applying the theme there would mark windows dirty and
+/// the surrounding `update`'s effect flush would repaint synchronously, and
+/// the glyph paint path (`is_subpixel_rendering_supported`) re-borrows that
+/// same `RefCell` — "RefCell already mutably borrowed", a startup panic on
+/// GNOME, which pushes an initial color-scheme event on every launch. A
+/// spawned task runs on the next executor tick, outside the portal dispatch.
+/// (`cx.defer` is NOT sufficient: deferred callbacks run in the same effect
+/// flush, still inside the borrow.) Upstream fix would be gpui dropping the
+/// client borrow before invoking window callbacks; until then this stays.
+/// macOS has no such reentrancy, so it applies inline (no one-tick lag on the
+/// Light/Dark flip).
 pub fn observe_window_appearance(window: &mut Window) {
     window
         .observe_window_appearance(|window, cx| {
+            #[cfg(target_os = "macos")]
             apply(Some(window), cx);
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let handle = window.window_handle();
+                cx.spawn(async move |cx| {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            apply(Some(window), cx);
+                        })
+                        .ok();
+                })
+                .detach();
+            }
         })
         .detach();
 }
@@ -677,6 +707,13 @@ fn day_colors() -> ThemeConfigColors {
     c.info_foreground = some("#fefaf5");
 
     // Chrome
+    // gpui-component Root's built-in Linux CSD frame would paint a 1px
+    // `window_border` rectangle at the window surface's very edge (around
+    // our transparent shadow margin). Our chrome (`chrome.rs`) draws the
+    // real frame; pin this transparent so the vestigial one never shows.
+    // Belt-and-braces: `chrome::themed_root` also disables Root's border
+    // outright via `bordered(false)`.
+    c.window_border = some("#00000000");
     c.title_bar = some("#fafafa");
     c.title_bar_border = some("#e4e4e4");
     c.tab_bar = some("#fafafa");
@@ -780,6 +817,8 @@ fn night_colors() -> ThemeConfigColors {
     c.info_foreground = some("#15191e");
 
     // Chrome
+    // Transparent for the same reason as Day: our chrome owns the frame.
+    c.window_border = some("#00000000");
     c.title_bar = some("#15191e");
     c.title_bar_border = some("#2c343d");
     c.tab_bar = some("#15191e");

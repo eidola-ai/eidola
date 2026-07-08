@@ -5,8 +5,9 @@
 result
 result-*
 
-# direnv
+# direnv (.envrc.local is the machine-local hook sourced by .envrc)
 .direnv
+.envrc.local
 
 ### Rust
 debug/

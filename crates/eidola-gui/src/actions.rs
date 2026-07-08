@@ -69,3 +69,32 @@ actions!(
         ToggleModelPicker,
     ]
 );
+
+/// Platform-aware chord labels for user-visible copy (empty states, hints,
+/// menu items). macOS uses the symbol register (⌘N, ⇧⌘L, ⌥); Linux spells
+/// the chords out (Ctrl+N, Ctrl+Shift+L, Alt) — the desktop convention.
+pub(crate) fn primary_chord(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⌘{key}")
+    } else {
+        format!("Ctrl+{key}")
+    }
+}
+
+/// The primary+shift chord label: ⇧⌘L on macOS, Ctrl+Shift+L elsewhere.
+pub(crate) fn primary_shift_chord(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⇧⌘{key}")
+    } else {
+        format!("Ctrl+Shift+{key}")
+    }
+}
+
+/// The display name of the Option/Alt modifier.
+pub(crate) fn alt_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌥"
+    } else {
+        "Alt"
+    }
+}

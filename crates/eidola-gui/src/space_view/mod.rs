@@ -61,11 +61,9 @@ pub use crate::actions::{PostOnly, Send, ToggleModelPicker};
 // Layout constants — the book typography + the tree-navigation geometry.
 // ---------------------------------------------------------------------------
 
-/// Height reserved at the top of the window for the (transparent) titlebar.
-#[cfg(target_os = "macos")]
+/// Height reserved at the top of the window for the (transparent) titlebar —
+/// the macOS traffic-light band / the Linux CSD controls + drag strip.
 pub(crate) const TITLE_BAR_RESERVE: Pixels = px(36.);
-#[cfg(not(target_os = "macos"))]
-pub(crate) const TITLE_BAR_RESERVE: Pixels = px(0.);
 
 /// Prose typography for narrative content — Newsreader at a book size/leading,
 /// distinct from the system UI font the theme uses for chrome. Matches the
@@ -895,7 +893,10 @@ impl Render for SpaceView {
         let bg = theme.background;
         let fg = theme.foreground;
         let font_family = theme.font_family.clone();
-        let viewport = window.viewport_size();
+        // The frame's content box, not the raw viewport: bottom-anchored
+        // overlays (floating composer, minimap) and the scroll range must not
+        // reach into the CSD shadow padding.
+        let viewport = crate::chrome::content_size(window);
         let page_width = viewport.width;
         let window_h = viewport.height;
 
@@ -1006,7 +1007,7 @@ impl Render for SpaceView {
 
         let body = self.render_forest(&tree, doc_reserve, page_width, window_h, streaming, cx);
 
-        div()
+        crate::chrome::round_client_corners(div(), window)
             .track_focus(&self.focus_handle)
             .key_context("SpaceView")
             .on_action(cx.listener(Self::submit))
@@ -1058,7 +1059,7 @@ impl Render for SpaceView {
                 scroll.style().restrict_scroll_to_axis = Some(true);
                 scroll
             })
-            .child(self.render_active_draft(&tree, page_width, window_h, cx))
+            .child(self.render_active_draft(&tree, page_width, window_h, window, cx))
             .child(self.render_request_panel(page_width, window_h, cx))
             .child(self.render_error_band(cx))
             // The minimap is the last sibling, so it paints after the composer
@@ -1067,7 +1068,7 @@ impl Render for SpaceView {
             // map on top of the floating bar. No `deferred` needed now that neither
             // defers; staying in the normal pass keeps both below late overlays
             // like the gpui dev inspector.
-            .child(self.render_minimap(&tree, page_width, window_h, cx))
+            .child(self.render_minimap(&tree, page_width, window_h, window, cx))
     }
 }
 
@@ -1305,27 +1306,28 @@ impl SpaceView {
     }
 
     /// A draggable band across the top standing in for the (transparent)
-    /// titlebar: the shared [`crate::titlebar`] gesture over a fade-out
-    /// gradient so posts scrolling under the band blend into the chrome.
+    /// titlebar: the shared [`crate::titlebar`] gesture (drag-to-move,
+    /// double-click zoom, and — on Linux CSD — the right-click compositor
+    /// window menu) over a fade-out gradient so posts scrolling under the
+    /// band blend into the chrome. The band's top corners round with the CSD
+    /// frame so it doesn't poke past the Adwaita arcs.
     fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = cx.theme().background;
-        crate::titlebar::make_draggable(
-            div()
-                .id("space-title-bar")
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .h(TITLE_BAR_RESERVE)
-                .bg(gpui::linear_gradient(
-                    180.,
-                    gpui::linear_color_stop(bg, 0.0),
-                    gpui::linear_color_stop(bg.opacity(0.0), 1.0),
-                )),
-            "space-title-bar",
-            window,
-            cx,
-        )
+        // Built before the `make_draggable` call so the shared `&Window`
+        // borrow it takes doesn't overlap the `&mut Window` the gesture needs.
+        let band = crate::chrome::round_top_client_corners(div(), window)
+            .id("space-title-bar")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(TITLE_BAR_RESERVE)
+            .bg(gpui::linear_gradient(
+                180.,
+                gpui::linear_color_stop(bg, 0.0),
+                gpui::linear_color_stop(bg.opacity(0.0), 1.0),
+            ));
+        crate::titlebar::make_draggable(band, "space-title-bar", window, cx)
     }
 
     /// A minimal honest error band pinned over the bottom (Phase 1 surface for a

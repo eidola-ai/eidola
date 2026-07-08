@@ -13,7 +13,7 @@
 use gpui::{
     Animation, AnimationExt, AnyElement, Context, Hsla, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, WeakEntity, div, point, px,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, point, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
@@ -199,6 +199,7 @@ impl SpaceView {
         roots: &[TreeNode],
         page_width: gpui::Pixels,
         viewport_h: gpui::Pixels,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let fg = cx.theme().scrollbar_thumb;
@@ -212,6 +213,11 @@ impl SpaceView {
         // overlay; a faded-out 36px strip must not steal clicks).
         let interactive = self.minimap_visible;
 
+        // Keep the strip's colored cells out of the window's rounded corner
+        // arcs (the chrome frame cannot clip to the curve — gpui masks are
+        // rectangular): inset both ends by the corner radius and scale the
+        // map into the reduced run. Zero inset when no corner is rounded.
+        let clearance = crate::chrome::corner_clearance(window);
         let mut container = div()
             .id("space-minimap")
             .probe("space/minimap", gpui::Role::Group, "Conversation map")
@@ -219,6 +225,8 @@ impl SpaceView {
             .top_0()
             .bottom_0()
             .right_0()
+            .pt(clearance)
+            .pb(clearance)
             .w(MINIMAP_WIDTH);
 
         let levels = self.selected_levels(roots, page_width);
@@ -238,8 +246,9 @@ impl SpaceView {
         // flickers back — see `clamped_scroll_y`.
         let scroll_y = self.clamped_scroll_y();
 
-        if total_h > 0.0 && viewport_h > px(0.) && !levels.is_empty() {
-            let scale = viewport_h.as_f32() / total_h;
+        let strip_h = viewport_h - clearance * 2.;
+        if total_h > 0.0 && strip_h > px(0.) && !levels.is_empty() {
+            let scale = strip_h.as_f32() / total_h;
             let mut col = v_flex().w_full();
 
             // The reserve scrolls off like content: dark at the very top. Absent
@@ -341,10 +350,22 @@ impl SpaceView {
             // drag is actually in flight, so registering unconditionally is cheap
             // and avoids a first-move gap.
             let bounds_cell = self.minimap_bounds.clone();
+            let strip_clearance = clearance;
             let weak = cx.entity().downgrade();
             container = container.child(
                 gpui::canvas(
-                    move |bounds, _, _| bounds_cell.set(Some(bounds)),
+                    move |mut bounds, _, _| {
+                        // The interactive strip starts `clearance` below the
+                        // container's padding-box top (the `.pt(clearance)`
+                        // corner inset on Linux CSD). Record the *strip* top, not
+                        // the container top, so `minimap_local_y` yields a
+                        // strip-relative y — the origin the scrollbar mapping
+                        // math (`handle_range`, `drag_grab`, …) is measured from
+                        // (0 = first cell). Zero off Linux CSD, so macOS/tests
+                        // are unchanged.
+                        bounds.origin.y += strip_clearance;
+                        bounds_cell.set(Some(bounds));
+                    },
                     move |_bounds, _, window, _cx| {
                         let move_weak = weak.clone();
                         window.on_mouse_event(move |ev: &MouseMoveEvent, _phase, _window, cx| {
@@ -408,8 +429,9 @@ impl SpaceView {
         }
     }
 
-    /// Minimap-local y of a window-space y, using the container bounds recorded
-    /// last frame (the container spans the full viewport height, right-edge).
+    /// Minimap-local y of a window-space y, using the strip top recorded last
+    /// frame (the container's padding-box top plus the CSD corner clearance, so
+    /// 0 is the first cell — the origin the scrollbar mapping math expects).
     fn minimap_local_y(&self, window_y: f32) -> f32 {
         let top = self
             .minimap_bounds
@@ -438,7 +460,9 @@ impl SpaceView {
         cx: &mut Context<Self>,
     ) {
         let m = self.minimap_local_y(window_y);
-        let viewport = window.viewport_size();
+        // Content box, not the raw surface — on Linux CSD the surface includes
+        // the shadow padding, which must not enter the scroll/branch geometry.
+        let viewport = crate::chrome::content_size(window);
         let page_width = viewport.width;
         let window_h = viewport.height;
 

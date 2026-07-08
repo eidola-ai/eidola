@@ -666,3 +666,179 @@ fn request_panel_probes_appear_on_open_and_clear_on_dismiss(cx: &mut TestAppCont
         "still-mounted probes must survive the refresh: {names:?}"
     );
 }
+
+/// Linux window chrome: `ChromeRoot` wraps every production window and hosts
+/// the primary menu (the macOS app/File-menu replacement). The wordmark
+/// affordance must probe at rest; toggling the menu (the F10 action path)
+/// must mount the panel + item probes; toggling again must clear them (no
+/// ghost targets). macOS is excluded because `ChromeRoot::wrap` is an
+/// identity there — there is no chrome layer to probe.
+#[cfg(not(target_os = "macos"))]
+#[gpui::test]
+fn chrome_menu_probes_and_toggle(cx: &mut TestAppContext) {
+    use eidola_gui::chrome::{ChromeRoot, TogglePrimaryMenu};
+
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let mut inner: Option<Entity<SpaceView>> = None;
+    let window: AnyWindowHandle = cx.update(|cx| {
+        gpui_component::init(cx);
+        eidola_gui::theme::install(cx);
+        cx.open_window(WindowOptions::default(), |window, cx| {
+            let view =
+                cx.new(|cx| SpaceView::new(stores.clone(), None, WindowInput::new(cx), window, cx));
+            inner = Some(view.clone());
+            let chrome = ChromeRoot::wrap(view.into(), cx);
+            cx.new(|cx| Root::new(chrome, window, cx))
+        })
+        .expect("open test window")
+        .into()
+    });
+    let view = inner.expect("built view");
+
+    // At rest: the wordmark affordance probes; the panel does not.
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"chrome/menu".to_string()),
+        "menu wordmark probe missing: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("chrome/menu/")),
+        "menu panel probes before opening: {names:?}"
+    );
+
+    // Toggle open via the real action dispatch path (what F10 does). The
+    // handler lives on ChromeRoot's wrapper div — an ancestor of the focused
+    // view — so dispatching through the view's focus handle exercises the
+    // production dispatch route.
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&TogglePrimaryMenu, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"chrome/menu/panel".to_string()),
+        "menu panel probe missing after toggle: {names:?}"
+    );
+    for item in [
+        "chrome/menu/new-space",
+        "chrome/menu/library",
+        "chrome/menu/record",
+        "chrome/menu/settings",
+        "chrome/menu/updates",
+        "chrome/menu/about",
+        "chrome/menu/quit",
+    ] {
+        assert!(
+            names.contains(&item.to_string()),
+            "menu item probe {item} missing: {names:?}"
+        );
+    }
+
+    // Toggle closed: panel probes must clear.
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&TogglePrimaryMenu, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.iter().any(|n| n.starts_with("chrome/menu/")),
+        "menu panel probes must clear after dismiss: {names:?}"
+    );
+}
+
+/// The F10 *keystroke* (not just the action) must open the primary menu:
+/// exercises the global `f10 → TogglePrimaryMenu` binding through the real
+/// keymap + dispatch path with the composer focused, as a user would hit it.
+#[cfg(not(target_os = "macos"))]
+#[gpui::test]
+fn chrome_menu_opens_on_f10_keystroke(cx: &mut TestAppContext) {
+    use eidola_gui::chrome::ChromeRoot;
+
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let window: AnyWindowHandle = cx.update(|cx| {
+        gpui_component::init(cx);
+        eidola_gui::theme::install(cx);
+        eidola_gui::install_keybindings(cx);
+        cx.open_window(WindowOptions::default(), |window, cx| {
+            let view =
+                cx.new(|cx| SpaceView::new(stores.clone(), None, WindowInput::new(cx), window, cx));
+            let chrome = ChromeRoot::wrap(view.into(), cx);
+            cx.new(|cx| Root::new(chrome, window, cx))
+        })
+        .expect("open test window")
+        .into()
+    });
+    draw(cx, window);
+
+    cx.simulate_keystrokes(window, "f10");
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"chrome/menu/panel".to_string()),
+        "F10 keystroke must open the primary menu: {names:?}"
+    );
+}
+
+/// A real pointer click on the wordmark (down+up at its painted bounds) must
+/// toggle the primary menu — guards the deferred-hitbox + press-swallow
+/// interplay that action-level dispatch can't see.
+#[cfg(not(target_os = "macos"))]
+#[gpui::test]
+fn chrome_menu_opens_on_wordmark_click(cx: &mut TestAppContext) {
+    use eidola_gui::chrome::ChromeRoot;
+    use gpui::{Modifiers, VisualTestContext, px};
+
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let window: AnyWindowHandle = cx.update(|cx| {
+        gpui_component::init(cx);
+        eidola_gui::theme::install(cx);
+        cx.open_window(WindowOptions::default(), |window, cx| {
+            let view =
+                cx.new(|cx| SpaceView::new(stores.clone(), None, WindowInput::new(cx), window, cx));
+            let chrome = ChromeRoot::wrap(view.into(), cx);
+            cx.new(|cx| Root::new(chrome, window, cx))
+        })
+        .expect("open test window")
+        .into()
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(800.), px(600.)));
+    vcx.run_until_parked();
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let (_, wordmark) = entries
+        .iter()
+        .find(|(n, _)| n == "chrome/menu")
+        .expect("wordmark probe painted");
+    let center = wordmark.bounds.center();
+
+    vcx.simulate_click(center, Modifiers::default());
+    vcx.run_until_parked();
+
+    let names: Vec<String> = {
+        probe::clear_window(window.window_id().as_u64());
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    };
+    assert!(
+        names.contains(&"chrome/menu/panel".to_string()),
+        "clicking the wordmark must open the primary menu: {names:?}"
+    );
+}

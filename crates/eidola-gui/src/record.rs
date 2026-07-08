@@ -47,7 +47,7 @@ use crate::stores::Stores;
 #[cfg(target_os = "macos")]
 const STRIP_LEFT_PAD: gpui::Pixels = gpui::px(80.);
 #[cfg(not(target_os = "macos"))]
-const STRIP_LEFT_PAD: gpui::Pixels = gpui::px(12.);
+const STRIP_LEFT_PAD: gpui::Pixels = gpui::px(86.); // clears the chrome "Eidola" menu wordmark
 
 /// Rows fetched per page. The fetch asks for `PAGE + 1` to learn whether a
 /// further page exists without a COUNT query.
@@ -639,7 +639,7 @@ impl Render for RecordView {
             self.render_listing(cx)
         };
 
-        v_flex()
+        crate::chrome::round_client_corners(v_flex(), window)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
                 window.remove_window();
@@ -664,7 +664,8 @@ fn scroll_wrap(content: impl IntoElement) -> gpui::Stateful<Div> {
 
 impl RecordView {
     /// The section strip doubles as the title bar — traffic lights to its
-    /// left, quiet text sections, an italic wordmark on the right.
+    /// left (macOS) or the CSD window controls at its right (Linux), quiet
+    /// text sections, an italic wordmark on the right.
     fn render_strip(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let mut strip = h_flex()
@@ -674,7 +675,7 @@ impl RecordView {
             .items_center()
             .gap_5()
             .pl(STRIP_LEFT_PAD)
-            .pr_4()
+            .pr(px(16.) + crate::chrome::controls_reserve(window))
             .border_b_1()
             .border_color(theme.border);
 

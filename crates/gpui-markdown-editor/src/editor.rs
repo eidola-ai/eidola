@@ -1656,19 +1656,28 @@ impl RenderOnce for MarkdownEditor {
     }
 }
 
-/// Install the editor's default macOS keymap, scoped to the `MarkdownEditor`
+/// Install the editor's default keymap, scoped to the `MarkdownEditor`
 /// key context. Self-contained so the editor is a drop-in like
 /// `gpui_component::Input` (whose keymap `gpui_component::init` installs) —
 /// the host calls this once at startup instead of hand-rolling the bindings.
 ///
-/// The submit chords (`cmd-enter`, `cmd-shift-enter`) bind the `Enter` action
-/// with `secondary: true`; the handler emits
+/// Chord-style commands (clipboard, select-all, the submit chords) bind with
+/// gpui's `secondary-` modifier alias — ⌘ on macOS, Ctrl elsewhere — so one
+/// binding serves both platforms. Motion and word/line deletion differ
+/// *structurally* between the platforms (macOS: ⌥ = word, ⌘ = line/document;
+/// Linux/Windows: Ctrl = word, Home/End = line, Ctrl+Home/End = document), so
+/// those get per-platform tables rather than the alias — a blanket alias
+/// would make Ctrl+← "line start" on Linux, which no Linux user expects.
+///
+/// The submit chords (`secondary-enter`, `secondary-shift-enter`) bind the
+/// `Enter` action with `secondary: true`; the handler emits
 /// [`MarkdownEditorEvent::PressEnter`] rather than inserting, so the host
 /// subscribes for submit instead of binding the chords itself.
 pub fn init(cx: &mut App) {
     let ctx = Some("MarkdownEditor");
-    cx.bind_keys([
-        // Enter chords — plain/shift insert; cmd-variants emit PressEnter.
+    let mut bindings = vec![
+        // Enter chords — plain/shift insert; secondary variants emit
+        // PressEnter (⌘↩/⌘⇧↩ on macOS, Ctrl+↩/Ctrl+⇧↩ elsewhere).
         gpui::KeyBinding::new(
             "enter",
             Enter {
@@ -1686,7 +1695,7 @@ pub fn init(cx: &mut App) {
             ctx,
         ),
         gpui::KeyBinding::new(
-            "cmd-enter",
+            "secondary-enter",
             Enter {
                 secondary: true,
                 shift: false,
@@ -1694,7 +1703,7 @@ pub fn init(cx: &mut App) {
             ctx,
         ),
         gpui::KeyBinding::new(
-            "cmd-shift-enter",
+            "secondary-shift-enter",
             Enter {
                 secondary: true,
                 shift: true,
@@ -1706,12 +1715,7 @@ pub fn init(cx: &mut App) {
         gpui::KeyBinding::new("delete", Delete, ctx),
         gpui::KeyBinding::new("tab", Tab, ctx),
         gpui::KeyBinding::new("shift-tab", ShiftTab, ctx),
-        // Word / line delete (macOS standard: Option for word, Cmd for line).
-        gpui::KeyBinding::new("alt-backspace", DeleteWordBackward, ctx),
-        gpui::KeyBinding::new("alt-delete", DeleteWordForward, ctx),
-        gpui::KeyBinding::new("cmd-backspace", DeleteToLineStart, ctx),
-        gpui::KeyBinding::new("cmd-delete", DeleteToLineEnd, ctx),
-        // Caret motion
+        // Caret motion (platform-neutral)
         gpui::KeyBinding::new("left", Left, ctx),
         gpui::KeyBinding::new("right", Right, ctx),
         gpui::KeyBinding::new("up", Up, ctx),
@@ -1722,31 +1726,60 @@ pub fn init(cx: &mut App) {
         gpui::KeyBinding::new("shift-down", ShiftDown, ctx),
         gpui::KeyBinding::new("home", Home, ctx),
         gpui::KeyBinding::new("end", End, ctx),
-        gpui::KeyBinding::new("cmd-left", Home, ctx),
-        gpui::KeyBinding::new("cmd-right", End, ctx),
         gpui::KeyBinding::new("shift-home", ShiftHome, ctx),
         gpui::KeyBinding::new("shift-end", ShiftEnd, ctx),
+        // Clipboard — the `secondary-` alias, scoped to the editor context so
+        // they coexist with `gpui_component::Input`'s own `Input`-context
+        // bindings (which are per-platform upstream).
+        gpui::KeyBinding::new("secondary-a", SelectAll, ctx),
+        gpui::KeyBinding::new("secondary-c", Copy, ctx),
+        gpui::KeyBinding::new("secondary-x", Cut, ctx),
+        gpui::KeyBinding::new("secondary-v", Paste, ctx),
+        gpui::KeyBinding::new("secondary-shift-v", PastePlain, ctx),
+        // Undo / redo — the `secondary-` alias, scoped to the editor context
+        // so they coexist with `gpui_component::Input`'s own bindings.
+        gpui::KeyBinding::new("secondary-z", Undo, ctx),
+        gpui::KeyBinding::new("secondary-shift-z", Redo, ctx),
+    ];
+
+    // macOS motion/deletion idiom: ⌥ = word, ⌘ = line (arrows) / document
+    // (up/down), ⌥⌫/⌘⌫ delete by the same granularity.
+    #[cfg(target_os = "macos")]
+    bindings.extend([
+        gpui::KeyBinding::new("alt-backspace", DeleteWordBackward, ctx),
+        gpui::KeyBinding::new("alt-delete", DeleteWordForward, ctx),
+        gpui::KeyBinding::new("cmd-backspace", DeleteToLineStart, ctx),
+        gpui::KeyBinding::new("cmd-delete", DeleteToLineEnd, ctx),
+        gpui::KeyBinding::new("cmd-left", Home, ctx),
+        gpui::KeyBinding::new("cmd-right", End, ctx),
         gpui::KeyBinding::new("cmd-shift-left", ShiftHome, ctx),
         gpui::KeyBinding::new("cmd-shift-right", ShiftEnd, ctx),
         gpui::KeyBinding::new("cmd-up", DocumentStart, ctx),
         gpui::KeyBinding::new("cmd-down", DocumentEnd, ctx),
         gpui::KeyBinding::new("cmd-shift-up", ShiftDocumentStart, ctx),
         gpui::KeyBinding::new("cmd-shift-down", ShiftDocumentEnd, ctx),
-        // Word-granular motion (macOS standard: Option+arrows).
         gpui::KeyBinding::new("alt-left", WordLeft, ctx),
         gpui::KeyBinding::new("alt-right", WordRight, ctx),
         gpui::KeyBinding::new("alt-shift-left", ShiftWordLeft, ctx),
         gpui::KeyBinding::new("alt-shift-right", ShiftWordRight, ctx),
-        // Clipboard — scoped to the editor context so they coexist with
-        // `gpui_component::Input`'s own `Input`-context bindings.
-        gpui::KeyBinding::new("cmd-a", SelectAll, ctx),
-        gpui::KeyBinding::new("cmd-c", Copy, ctx),
-        gpui::KeyBinding::new("cmd-x", Cut, ctx),
-        gpui::KeyBinding::new("cmd-v", Paste, ctx),
-        gpui::KeyBinding::new("cmd-shift-v", PastePlain, ctx),
-        // Undo / redo — scoped to the editor context, so they coexist
-        // with `gpui_component::Input`'s own `Input`-context bindings.
-        gpui::KeyBinding::new("cmd-z", Undo, ctx),
-        gpui::KeyBinding::new("cmd-shift-z", Redo, ctx),
     ]);
+
+    // Linux/Windows motion/deletion idiom: Ctrl = word (arrows + ⌫/Del),
+    // Home/End = line (bound platform-neutrally above), Ctrl+Home/End =
+    // document.
+    #[cfg(not(target_os = "macos"))]
+    bindings.extend([
+        gpui::KeyBinding::new("ctrl-backspace", DeleteWordBackward, ctx),
+        gpui::KeyBinding::new("ctrl-delete", DeleteWordForward, ctx),
+        gpui::KeyBinding::new("ctrl-left", WordLeft, ctx),
+        gpui::KeyBinding::new("ctrl-right", WordRight, ctx),
+        gpui::KeyBinding::new("ctrl-shift-left", ShiftWordLeft, ctx),
+        gpui::KeyBinding::new("ctrl-shift-right", ShiftWordRight, ctx),
+        gpui::KeyBinding::new("ctrl-home", DocumentStart, ctx),
+        gpui::KeyBinding::new("ctrl-end", DocumentEnd, ctx),
+        gpui::KeyBinding::new("ctrl-shift-home", ShiftDocumentStart, ctx),
+        gpui::KeyBinding::new("ctrl-shift-end", ShiftDocumentEnd, ctx),
+    ]);
+
+    cx.bind_keys(bindings);
 }
