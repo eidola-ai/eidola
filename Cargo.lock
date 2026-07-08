@@ -251,15 +251,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ansi_term"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d52a9bb7ec0cf484c551830a7ce27bd20d67eac647e1befb56b0be4ee39a55d2"
-dependencies = [
- "winapi",
-]
-
-[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1076,6 +1067,7 @@ dependencies = [
  "cpufeatures 0.3.0",
  "memmap2",
  "rayon-core",
+ "serde",
 ]
 
 [[package]]
@@ -1504,9 +1496,9 @@ dependencies = [
 
 [[package]]
 name = "clap_complete"
-version = "4.6.4"
+version = "4.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3e962dae2b1e5007fe9e3db363ddc43a8bf25546d279f7a8a4401204690e80c"
+checksum = "e0a7a9bfdb35811f9e59832f0f05975114d2251b415fb534108e6f34060fd772"
 dependencies = [
  "clap",
  "clap_lex",
@@ -2456,6 +2448,15 @@ dependencies = [
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
+]
+
+[[package]]
+name = "digest-io"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2de63d600bc7fab91180bc17385f29b342468dc8ef2af09dceba450a293de3da"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -4934,11 +4935,10 @@ dependencies = [
 
 [[package]]
 name = "just"
-version = "1.51.0"
+version = "1.55.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15a50b98e53d838090b26dd0f5181a8e03c32c4734d6bb7261fde60406e91cb8"
+checksum = "d86eb29a321a67d6218867fa1fb0ddf5fabef64801b7d8a7a619fd218fc047d4"
 dependencies = [
- "ansi_term",
  "blake3",
  "camino",
  "chrono",
@@ -4946,21 +4946,25 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "ctrlc",
+ "digest-io",
  "dirs",
  "dotenvy",
  "heck 0.5.0",
+ "hex",
  "is_executable",
  "lexiclean",
  "libc",
  "nix",
+ "nu-ansi-term",
  "num_cpus",
  "percent-encoding",
+ "pulldown-cmark 0.13.4",
  "rand 0.10.2",
  "regex",
  "semver",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "shellexpand",
  "similar",
  "snafu",
@@ -7832,9 +7836,9 @@ dependencies = [
 
 [[package]]
 name = "rumdl"
-version = "0.2.6"
+version = "0.2.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0353744c8a3f489199ff3ffbe021579a70bf7e9d61639d41fc05390bf30d5303"
+checksum = "19210b12598c55f46c584e24d44b813569c6dee6392f26afef2b8d6534ae371a"
 dependencies = [
  "anyhow",
  "blake3",
