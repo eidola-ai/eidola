@@ -15,10 +15,12 @@
 //! `bg(theme.background)` across the whole window). Left active it stacks
 //! under ours: its background fills our shadow padding with an opaque cliff
 //! and its resize cursors land at the wrong edge. [`themed_root`] therefore
-//! constructs every window's `Root` with that layer neutralized
-//! (`window_shadow_size(0)` + transparent background), and the Circadian
-//! palettes pin `window_border` transparent so its unconditional 1px Client-
-//! mode frame never paints.
+//! constructs every window's `Root` with that layer disabled outright via
+//! `Root::bordered(false)` (upstream gpui-component `#2466`: `render` returns
+//! the inner content directly, skipping the `window_border()` wrapper
+//! entirely) plus a transparent background. Belt-and-braces, the Circadian
+//! palettes also pin `window_border` transparent so a vestigial frame could
+//! never paint even if the flag regressed.
 //!
 //! The layer has three parts:
 //!
@@ -110,9 +112,11 @@ pub(crate) fn controls_reserve(window: &Window) -> Pixels {
 }
 
 /// Construct the `gpui_component::Root` for an Eidola window. On Linux,
-/// Root's built-in CSD layer is neutralized — zero `window_shadow_size` (no
-/// second ring of shadow padding, no competing resize hit zones at the wrong
-/// edge) and a transparent background (Root's default opaque
+/// Root's built-in CSD layer is disabled outright — `bordered(false)` makes
+/// `Root::render` return its inner content directly instead of wrapping it in
+/// `window_border()`, so there is no second ring of shadow padding, no
+/// competing resize hit zones at the wrong edge, and no vestigial 1px frame.
+/// The background is made transparent (Root's default opaque
 /// `bg(theme.background)` would fill [`ChromeRoot`]'s shadow padding with a
 /// hard-edged cliff instead of letting the desktop show through). The
 /// background moves into the chrome layer: the client frame paints it inside
@@ -121,8 +125,7 @@ pub(crate) fn controls_reserve(window: &Window) -> Pixels {
 pub(crate) fn themed_root(view: AnyView, window: &mut Window, cx: &mut Context<Root>) -> Root {
     let root = Root::new(view, window, cx);
     if cfg!(target_os = "linux") {
-        root.window_shadow_size(px(0.))
-            .bg(gpui::transparent_black())
+        root.bordered(false).bg(gpui::transparent_black())
     } else {
         root
     }
