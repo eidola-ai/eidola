@@ -249,7 +249,7 @@ impl OnboardingView {
     /// offset, and start the ease-out. Used both for a reveal and for the
     /// finger-lift settle.
     fn glide_to_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let stride = window.viewport_size().height.as_f32();
+        let stride = crate::chrome::content_size(window).height.as_f32();
         if stride <= 0.0 {
             return;
         }
@@ -465,7 +465,9 @@ impl Render for OnboardingView {
                 .map(|slide| self.render_slide(slide, cx)),
         );
 
-        div()
+        // Round all four corners to the CSD frame on Linux (no-op on
+        // macOS/SSD) — the same treatment every other window root gets.
+        crate::chrome::round_client_corners(div(), window)
             .track_focus(&self.focus_handle)
             .key_context("OnboardingView")
             .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
@@ -516,7 +518,7 @@ impl Render for OnboardingView {
                                 // release velocity (nearest, or ±1 on a flick)
                                 // and glide there, owning the scroll so the OS
                                 // momentum that follows is suppressed.
-                                let stride = window.viewport_size().height.as_f32();
+                                let stride = crate::chrome::content_size(window).height.as_f32();
                                 if stride > 0.0 {
                                     let from_y = this.page_scroll.offset().y.as_f32();
                                     let target = snap_target_index(
