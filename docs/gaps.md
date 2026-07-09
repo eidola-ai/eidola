@@ -2,7 +2,7 @@
 
 Every piece of the Eidola trust chain that is intentionally deferred is catalogued here. Each gap closes a specific class of attack that is already constrained by other parts of the chain — but they are real and worth understanding. Reading this page is the fastest way to see what Eidola does not yet defend against.
 
-The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app-core/src/updater/ci_sigstore/mod.rs`](../crates/eidola-app-core/src/updater/ci_sigstore/mod.rs) and `rekor.rs`, and the install-side gap is at the `TODO (step 5)` marker on `verify_each_artifact_hash` in [`crates/eidola-app-core/src/updater/mod.rs`](../crates/eidola-app-core/src/updater/mod.rs).
+The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app-core/src/updater/ci_sigstore/mod.rs`](../crates/eidola-app-core/src/updater/ci_sigstore/mod.rs) and `rekor.rs`, and the install-side gap is at the `TODO (step 5)` marker on `verify_each_artifact_hash` in [`crates/eidola-app-core/src/updater/mod.rs`](../crates/eidola-app-core/src/updater/mod.rs). The same two cryptographic-verifier gaps apply to the server-side runtime upstream-measurement resolver ([`crates/eidola-server/src/upstream_trust/sigstore.rs`](../crates/eidola-server/src/upstream_trust/sigstore.rs)), which reuses the same Fulcio/Rekor primitives.
 
 ## Cryptographic verifier
 
@@ -94,16 +94,32 @@ There are really two distinct gaps here that share infrastructure but answer dif
 
 ## Inference upstream
 
+Inference does not run in the Eidola server enclave. `inference.tinfoil.sh` is a *router* enclave operated by the upstream provider (currently Tinfoil) that reverse-proxies each request to a **separate per-model GPU enclave**. That structure shapes the two gaps below.
+
+### The inference code is trusted at the provider's bar, not reviewed or pinned by Eidola
+
+**Current behavior.** The Eidola server attests the *router* enclave on every handshake — genuine confidential-compute hardware, running a measurement that corresponds to a Sigstore-signed release of the expected repository at the expected tag. But two things sit outside Eidola's own review:
+
+- **The downstream fan-out is not chained.** The router's attestation covers only the router; it does not fold in the attestations of the per-model enclaves it forwards to. The router trusts each model enclave via "the latest Sigstore-signed release of that model's repo" (the same trust model as `tinfoilsh/tinfoil-go` / `tinfoil-rs`), and Eidola does not independently attest those enclaves. So the code *actually running inference* — which necessarily sees cleartext prompts and completions — is trusted at the provider's release-signing bar, not re-derived by Eidola.
+- **Eidola tracks the latest signed release rather than a reviewed pin.** The server resolves the router measurement at runtime and adopts any new release whose Sigstore provenance verifies (see [upstream.md](upstream.md#what-pins-the-upstream-measurement)) — there is no human-review gate the way there is for Eidola's *own* releases. This is deliberate, not an oversight: pinning-and-reviewing the router measurement bought little rigor while the downstream model enclaves (which also see cleartext) remain trust-latest regardless, so Eidola matches the provider's actual model here instead of performing review theater. Eidola previously carried a pinned-and-PR-reviewed router measurement; that path was removed for this reason.
+
+**What constrains it today.** The model enclaves are themselves confidential-compute enclaves, so a genuine one seals cleartext against its own operator exactly as Eidola's does; every measurement the router or Eidola trusts must still correspond to a Sigstore-signed release of the expected repository; and Eidola's per-handshake, nonce-fresh verifier still runs on the connection it opens. The residual gap is specifically that Eidola does not itself review or pin the inference code — it trusts the provider's release-signing not to ship a malicious model build — and that while retroactive transparency and auditability are preserved, the system does not "fail closed" and a malicious version could be published, deployed, and exploited without an opportunity for the end user to prevent it.
+
 ### Upstream-provider trust-discipline mismatch
 
-**Current behavior.** Inference runs in a separately-attested enclave operated by the upstream provider (currently Tinfoil). Tinfoil's release pipeline is robust — signed measurements, Sigstore provenance, public source — but it does not yet match the discipline applied to Eidola's own releases. Specifically:
+**Current behavior.** Even for the code Eidola *does* verify (the router) and the model code the provider signs, the upstream release pipeline does not match the discipline applied to Eidola's own releases:
 
 - Tinfoil's builds are **not source-bootstrapped reproducible** in the StageX sense. They are hermetic and provenance-attested through GitHub's CI attestation, which is rigorous, but shaped differently than Eidola's.
 - Tinfoil does **not yet ship per-release human attestations under named legal identities** the way Eidola releases do.
 
 A user's chain of trust at the inference layer therefore ends at Tinfoil's release discipline, which is non-trivially different from Eidola's.
 
-**Future.** Bring the inference pipeline into this repo (still running on Tinfoil's infrastructure), so the same source-bootstrapping + human-attestation discipline applies end-to-end. The inference enclave would then be built and released through Eidola's own release flow rather than trust-bridged through a separate pipeline.
+**Future.** The intent is to close both gaps by ending the inference-layer trust chain where the rest of Eidola's does. There are two paths, and either one suffices:
+
+- **Primary — self-host inference.** Run the models on hardware Eidola controls, such as GPU-enabled Tinfoil containers, built and released through Eidola's own source-bootstrapped, human-attested flow, so Eidola owns the inference measurement, can *statically pin* it, and reviews the downstream code directly. This is the long-term goal regardless, since it also brings reproducibility and human attestation to the inference layer. Its cost is high fixed GPU spend that is hard to justify before there is meaningful demand — so it is not the immediate move.
+- **Alternative — the provider adopts static-pinned upstreams.** If Tinfoil itself moves its router from "trust the latest signed release" to *statically pinning* the specific model-enclave measurements it will forward to, then the downstream-review gap closes without Eidola self-hosting: Eidola would simply keep using Tinfoil's inference and pin the reviewed set. This is the cheaper outcome, and if it materializes it is the preferred long-term solution.
+
+In the meantime, the runtime-resolution scheme above is the honest interim: it claims exactly the assurance the provider's own model provides, and no more.
 
 ## Build chain opacity
 

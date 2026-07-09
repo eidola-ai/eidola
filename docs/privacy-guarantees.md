@@ -44,7 +44,7 @@ These invariants describe what you get when you install and run a **generally-av
 
 **3.4.** **[S]** Eidola service handlers do not persist or emit client IP addresses, user-agent strings, TLS fingerprints, or other network-layer identifiers. Network infrastructure outside the enclave (CDNs, load balancers, ISPs, the user's own network path) may log such identifiers and is out of scope for this invariant; the application-level promise is that Eidola code does not re-introduce them into its own observability or persistence surfaces.
 
-**3.5.** **[S]** Inference content is never cleartext on the wire. It is decrypted only in the ephemeral memory of (a) the Eidola server enclave, while being routed to the upstream, and (b) the upstream inference enclave, whose attestation the Eidola server verifies per-handshake. Every link between client, server enclave, and upstream enclave is TLS terminated inside the respective enclave; no operator, host, orchestrator, or network observer has cleartext access at any point. (See [upstream.md](upstream.md).)
+**3.5.** **[S]** Inference content is never cleartext on the wire. It is decrypted only in the ephemeral memory of confidential-compute enclaves: (a) the Eidola server enclave, while being routed to the upstream, and (b) the upstream provider's inference enclaves — the router the Eidola server connects to (whose attestation it verifies per-handshake) and the per-model enclave that router forwards to. Every link is TLS terminated inside the respective enclave, so no host, orchestrator, or network observer has cleartext access in transit. The bounded part (§8.9): Eidola independently attests only the enclave it connects to; the per-model enclave's confidential-compute guarantee rests on the provider's own attestation of it, which Eidola does not re-derive. (See [upstream.md](upstream.md) and [gaps.md § Inference upstream](gaps.md#inference-upstream).)
 
 **3.6.** **[P]** The Eidola server is request-based: on the inference path, there is no cross-connection cache persisted outside ephemeral enclave memory, and no per-account learned state. There is no operator-facing interface for inspecting, reviewing, approving, flagging, or replaying inference traffic.
 
@@ -127,6 +127,8 @@ These invariants describe what you get when you install and run a **generally-av
 **8.7.** Eidola does not promise defense against coordinated legal compulsion of *every* pinned attestant simultaneously, under credible secrecy. The mitigation is multi-jurisdiction attestant distribution, named in [gaps.md](gaps.md#multi-jurisdiction-attestant-distribution).
 
 **8.8.** Eidola does not promise that confidential-compute hardware vendors (AMD, Intel, NVIDIA) cannot issue fraudulent attestations. That is residual trust we currently accept; see [gaps.md](gaps.md#trust-in-confidential-compute-vendors).
+
+**8.9.** Eidola does not promise that the code performing inference has been reviewed, reproduced, or measurement-pinned by Eidola. Inference runs at a separate upstream provider (currently Tinfoil) whose router forwards to per-model enclaves trusted at the provider's own latest-signed-release bar. Eidola verifies per-handshake that the upstream it connects to is genuine confidential-compute hardware running a Sigstore-signed release of the expected repository, but does not itself re-derive or pin the downstream inference code. The long-term mitigations — self-hosting inference, or the provider adopting static-pinned upstreams — are named in [gaps.md § Inference upstream](gaps.md#inference-upstream).
 
 ---
 
