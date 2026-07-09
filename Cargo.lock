@@ -2718,6 +2718,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidola-inference"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "hex",
+ "reqwest 0.13.4",
+ "rustls",
+ "rustls-rustcrypto",
+ "sha2 0.11.0",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots",
+]
+
+[[package]]
 name = "eidola-server"
 version = "0.1.0"
 dependencies = [

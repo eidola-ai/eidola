@@ -13,15 +13,16 @@ These docs describe how Eidola works, what it commits to, and what it doesn't ye
 4. **[The client](client.md)** — Fail-safe by design, embedded trust root, per-handshake attestation.
 5. **[The server](server.md)** — Linked vs. unlinked surfaces, anonymous credentials, what runs in confidential compute.
 6. **[Inference upstream](upstream.md)** — Where models actually run, and how that layer is verified.
+7. **[Self-hosted inference](self-hosted-inference.md)** — The model served from inside the Eidola enclave itself: reproducible engine build, measured weight hashes, and the path to GPU confidential compute.
 
 ## Release flow
 
-7. **[Releases](releases.md)** — How a new client+server bundle becomes trustable. CI signature plus human attestation, both on the same transparency log.
-8. **[Trust root: technical specification](trust-root.md)** — What's pinned at compile time, how schema versions work, how the verifier walks the chain.
+8. **[Releases](releases.md)** — How a new client+server bundle becomes trustable. CI signature plus human attestation, both on the same transparency log.
+9. **[Trust root: technical specification](trust-root.md)** — What's pinned at compile time, how schema versions work, how the verifier walks the chain.
 
 ## What's missing
 
-9. **[Known gaps](gaps.md)** — Every piece of the trust chain that is intentionally deferred, with what it would catch and what constrains it today.
+10. **[Known gaps](gaps.md)** — Every piece of the trust chain that is intentionally deferred, with what it would catch and what constrains it today.
 
 ## For contributors
 

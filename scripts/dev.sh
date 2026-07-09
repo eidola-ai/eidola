@@ -2,7 +2,7 @@
 # Bring up the local dev stack.
 #
 # Usage:
-#   scripts/dev.sh [--container|--host]
+#   scripts/dev.sh [--container|--host] [--inference]
 #
 # Modes:
 #   --container  (default)  eidola-server runs inside docker. Shim forwards
@@ -12,6 +12,13 @@
 #                           writes `.env.local` with BIND_ADDR (and the
 #                           captured Stripe webhook secret) for the host
 #                           server to source.
+#
+# Options:
+#   --inference             Also run the self-hosted eidola-inference
+#                           container (llama.cpp serving the dev Gemma model;
+#                           first start downloads + hash-verifies ~3.3 GiB of
+#                           weights into the `models` volume) and point the
+#                           server at it via EIDOLA_INFERENCE_URL.
 #
 # In both modes the script:
 #   - builds the images it needs
@@ -29,19 +36,23 @@ cd "$(dirname "$0")/.."
 # ── Parse args ───────────────────────────────────────────────────────────────
 
 MODE="container"
-case "${1:-}" in
-    --container | "") MODE="container" ;;
-    --host) MODE="host" ;;
-    -h | --help)
-        sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
-        exit 0
-        ;;
-    *)
-        echo "ERROR: unknown argument: $1" >&2
-        echo "Usage: $0 [--container|--host]" >&2
-        exit 1
-        ;;
-esac
+INFERENCE=0
+for arg in "$@"; do
+    case "$arg" in
+        --container) MODE="container" ;;
+        --host) MODE="host" ;;
+        --inference) INFERENCE=1 ;;
+        -h | --help)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $arg" >&2
+            echo "Usage: $0 [--container|--host] [--inference]" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # ── Build images ─────────────────────────────────────────────────────────────
 #
@@ -52,6 +63,9 @@ esac
 BAKE_TARGETS=(postgres shim)
 if [ "$MODE" = "container" ]; then
     BAKE_TARGETS+=(server)
+fi
+if [ "$INFERENCE" = "1" ]; then
+    BAKE_TARGETS+=(inference)
 fi
 if [ -n "${STRIPE_API_KEY:-}" ]; then
     BAKE_TARGETS+=(stripe-cli)
@@ -110,12 +124,27 @@ fi
 
 UP_SERVICES=(shim)
 UP_PROFILES=()
+EIDOLA_INFERENCE_URL=""
 if [ "$MODE" = "container" ]; then
     SHIM_UPSTREAM_URL="http://server:8080"
     UP_SERVICES+=(server)
     UP_PROFILES+=(--profile server)
+    if [ "$INFERENCE" = "1" ]; then
+        # In-network address; the containerized server reaches the inference
+        # service by compose DNS name.
+        EIDOLA_INFERENCE_URL="http://inference:8081/v1"
+    fi
 else
     SHIM_UPSTREAM_URL="http://host.docker.internal:8080"
+    if [ "$INFERENCE" = "1" ]; then
+        # The host-mode server reaches the inference container through its
+        # published port.
+        EIDOLA_INFERENCE_URL="http://localhost:8081/v1"
+    fi
+fi
+if [ "$INFERENCE" = "1" ]; then
+    UP_SERVICES+=(inference)
+    UP_PROFILES+=(--profile inference)
 fi
 if [ -n "$STRIPE_WEBHOOK_SECRET" ]; then
     UP_SERVICES+=(stripe-cli)
@@ -127,6 +156,7 @@ fi
 echo "==> Starting ${UP_SERVICES[*]} (mode: $MODE, detached)..."
 SHIM_UPSTREAM_URL="$SHIM_UPSTREAM_URL" \
 STRIPE_WEBHOOK_SECRET="$STRIPE_WEBHOOK_SECRET" \
+EIDOLA_INFERENCE_URL="$EIDOLA_INFERENCE_URL" \
     docker compose ${UP_PROFILES[@]+"${UP_PROFILES[@]}"} up -d "${UP_SERVICES[@]}"
 
 # ── Host-mode finalization: write .env.local for cargo ───────────────────────
@@ -138,6 +168,12 @@ if [ "$MODE" = "host" ]; then
         echo "BIND_ADDR=0.0.0.0:8080"
         if [ -n "$STRIPE_WEBHOOK_SECRET" ]; then
             echo "STRIPE_WEBHOOK_SECRET=$STRIPE_WEBHOOK_SECRET"
+        fi
+        if [ -n "$EIDOLA_INFERENCE_URL" ]; then
+            echo "EIDOLA_INFERENCE_URL=$EIDOLA_INFERENCE_URL"
+            echo "EIDOLA_INFERENCE_MODEL=gemma4-e2b"
+            echo "EIDOLA_INFERENCE_MODEL_NAME=Gemma 4 E2B"
+            echo "EIDOLA_INFERENCE_CONTEXT_LENGTH=8192"
         fi
     } > .env.local
 fi
@@ -152,6 +188,7 @@ cat <<EOF
     shim     : https://localhost:8443  (-> $SHIM_UPSTREAM_URL)
 EOF
 [ "$MODE" = "container" ] && echo "    server   : http://localhost:8080  (in docker)"
+[ "$INFERENCE" = "1" ] && echo "    inference: http://localhost:8081  (llama-server; first boot fetches + verifies weights)"
 [ -n "$STRIPE_WEBHOOK_SECRET" ] && echo "    stripe-cli: forwarding to https://shim:8443/v1/webhooks/stripe"
 echo ""
 

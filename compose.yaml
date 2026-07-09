@@ -34,12 +34,43 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
       BIND_ADDR: 0.0.0.0:8080
+      # Self-hosted inference upstream — set by scripts/dev.sh --inference
+      # (empty disables the self-hosted model).
+      EIDOLA_INFERENCE_URL: ${EIDOLA_INFERENCE_URL:-}
+      EIDOLA_INFERENCE_MODEL: ${EIDOLA_INFERENCE_MODEL:-gemma4-e2b}
+      EIDOLA_INFERENCE_MODEL_NAME: ${EIDOLA_INFERENCE_MODEL_NAME:-Gemma 4 E2B}
+      EIDOLA_INFERENCE_CONTEXT_LENGTH: ${EIDOLA_INFERENCE_CONTEXT_LENGTH:-8192}
     ports:
       - "8080:8080"
     profiles: ["server"]
     depends_on:
       postgres:
         condition: service_healthy
+
+  inference:
+    image: eidola-inference:dev
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: oci/eidola-inference/Containerfile
+    environment:
+      # Dev default: the official Google QAT q4_0 GGUF of Gemma 4 E2B —
+      # small enough (~3.3 GiB) to fetch once and run on an emulated CPU.
+      # Pinned by revision URL + SHA-256; the supervisor refuses to start
+      # the engine if the on-disk hash differs. Override via .env to test
+      # other models.
+      MODEL_URL: ${EIDOLA_INFERENCE_MODEL_URL:-https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/1894d1fc0a19d86697abd40483f5983c867df03f/gemma-4-E2B_q4_0-it.gguf}
+      MODEL_SHA256: ${EIDOLA_INFERENCE_MODEL_SHA256:-3646b4c147cd235a44d91df1546d3b7d8e29b547dbe4e1f80856419aa455e6fd}
+      # --alias must match the server's EIDOLA_INFERENCE_MODEL so the model
+      # id clients select routes to what the engine serves.
+      INFERENCE_EXTRA_ARGS: ${EIDOLA_INFERENCE_EXTRA_ARGS:---alias gemma4-e2b -c 8192}
+    ports:
+      - "8081:8081"
+    profiles: ["inference"]
+    volumes:
+      # Cache verified weights across restarts; the supervisor re-verifies
+      # the hash on every boot and re-fetches on mismatch.
+      - models:/models
 
   shim:
     image: tinfoil-shim-mock:dev
@@ -82,3 +113,4 @@ services:
 
 volumes:
   pgdata:
+  models:

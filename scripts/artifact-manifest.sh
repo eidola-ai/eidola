@@ -265,17 +265,19 @@ fetch_cvm_artifacts() {
 
 # ── Enclave measurement ──────────────────────────────────────────────────────
 
-# Update the eidola-server image digest in tinfoil-config.yml from build
-# metadata. (Only the server runs inside the enclave; the database is
-# hosted externally, so eidola-postgres's digest doesn't feed the
-# measurement.)
+# Update the eidola-server and eidola-inference image digests in
+# tinfoil-config.yml from build metadata. (Both run inside the enclave; the
+# database is hosted externally, so eidola-postgres's digest doesn't feed
+# the measurement.)
 stamp_config_digests() {
-  local server_digest
+  local server_digest inference_digest
 
   server_digest="$(metadata_digest "$METADATA_FILE" "$(target_key server)")"
+  inference_digest="$(metadata_digest "$METADATA_FILE" "$(target_key inference)")"
 
   sed -i.bak \
     -e "s|ghcr.io/eidola-ai/eidola-server@sha256:[a-f0-9]*|ghcr.io/eidola-ai/eidola-server@${server_digest}|" \
+    -e "s|ghcr.io/eidola-ai/eidola-inference@sha256:[a-f0-9]*|ghcr.io/eidola-ai/eidola-inference@${inference_digest}|" \
     "$CONFIG_FILE"
   rm -f "${CONFIG_FILE}.bak"
 }
@@ -377,8 +379,8 @@ build_metadata() {
   # --push.
   if [[ "$PUSH_MODE" -eq 1 ]]; then
     case "$TARGETS" in
-      all)    bake_targets=(ci-server ci-cli ci-postgres) ;;
-      server) bake_targets=(ci-server ci-postgres) ;;
+      all)    bake_targets=(ci-server ci-cli ci-postgres ci-inference) ;;
+      server) bake_targets=(ci-server ci-postgres ci-inference) ;;
       cli)    bake_targets=(ci-cli) ;;
       *)
         echo "error: unknown --targets value: $TARGETS (expected: all, server, cli)" >&2
@@ -387,8 +389,8 @@ build_metadata() {
     esac
   else
     case "$TARGETS" in
-      all)    bake_targets=(server cli postgres) ;;
-      server) bake_targets=(server postgres) ;;
+      all)    bake_targets=(server cli postgres inference) ;;
+      server) bake_targets=(server postgres inference) ;;
       cli)    bake_targets=(cli) ;;
       *)
         echo "error: unknown --targets value: $TARGETS (expected: all, server, cli)" >&2
@@ -430,18 +432,18 @@ print_oci_partial_for_targets() {
 }
 
 print_oci_manifest() {
-  # Default behavior (no explicit pairs): emit server+cli+postgres digests
-  # from the single legacy METADATA_FILE. Preserves backward compat with the
+  # Default behavior (no explicit pairs): emit all OCI digests from the
+  # single legacy METADATA_FILE. Preserves backward compat with the
   # one-shot oci bake.
   if [[ "${#PRINT_METADATA_FILES[@]}" -eq 0 && "${#PRINT_TARGETS_LIST[@]}" -eq 0 ]]; then
-    print_oci_partial_for_targets server cli postgres
+    print_oci_partial_for_targets server cli postgres inference
     return
   fi
 
   # Single --metadata-file with no --targets: same legacy default but allow
   # the caller to point at a non-default metadata file.
   if [[ "${#PRINT_METADATA_FILES[@]}" -eq 1 && "${#PRINT_TARGETS_LIST[@]}" -eq 0 ]]; then
-    print_oci_partial_for_targets server cli postgres
+    print_oci_partial_for_targets server cli postgres inference
     return
   fi
 
@@ -713,7 +715,8 @@ verify_oci_manifest() {
       artifacts: {
         "eidola-server": .artifacts["eidola-server"],
         "eidola-cli": .artifacts["eidola-cli"],
-        "eidola-postgres": .artifacts["eidola-postgres"]
+        "eidola-postgres": .artifacts["eidola-postgres"],
+        "eidola-inference": .artifacts["eidola-inference"]
       }
     }
   ' "$MANIFEST_FILE")"
@@ -738,10 +741,11 @@ verify_oci_manifest() {
 
 # Two-phase build:
 #
-#   Phase 1: build {server, postgres}. Neither image consumes the enclave
-#            measurement, so they can be built first.
-#   Phase 2: stamp the new server digest into `tinfoil-config.yml`, recompute
-#            the enclave block, and write `releases/trust/server-enclave.json`.
+#   Phase 1: build {server, postgres, inference}. None of these images
+#            consume the enclave measurement, so they can be built first.
+#   Phase 2: stamp the new server + inference digests into
+#            `tinfoil-config.yml`, recompute the enclave block, and write
+#            `releases/trust/server-enclave.json`.
 #   Phase 3: build the cli OCI image plus the current host's native desktop
 #            artifacts — the macOS universal CLI + GUI .app on Darwin, the
 #            Linux GUI on Linux. All of these consume the freshly-written
@@ -808,7 +812,7 @@ update_manifest() {
 
   # ── Phase 4: compose final artifact-manifest.json ───────────────────────
   METADATA_FILE="$server_metadata"
-  server_oci_partial="$(print_oci_partial_for_targets server postgres)"
+  server_oci_partial="$(print_oci_partial_for_targets server postgres inference)"
   METADATA_FILE="$cli_metadata"
   cli_oci_partial="$(print_oci_partial_for_targets cli)"
 

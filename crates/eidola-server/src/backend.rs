@@ -1,8 +1,20 @@
-//! Chat completion backend trait and Tinfoil implementation.
+//! Chat completion backend trait and the dual-upstream implementation.
 //!
-//! All Tinfoil models run inside confidential enclaves (AMD SEV-SNP / Intel TDX
-//! / NVIDIA CC). The model catalog is hardcoded — only pricing can be overridden
-//! at runtime via `TINFOIL_PRICING_OVERRIDES`.
+//! `InferenceBackend` routes each request by model id to one of two upstreams:
+//!
+//! - **Tinfoil** (`MODEL_CATALOG`): models served by the upstream provider's
+//!   confidential enclaves (AMD SEV-SNP / Intel TDX / NVIDIA CC), reached
+//!   through the hot-swappable attesting client (see `src/upstream_trust`).
+//!   The catalog is hardcoded — only pricing can be overridden at runtime via
+//!   `TINFOIL_PRICING_OVERRIDES`.
+//! - **Self-hosted** (optional): a model served by the eidola-inference
+//!   container running *inside this same enclave* (see
+//!   `docs/self-hosted-inference.md`). Its identity comes from
+//!   `EIDOLA_INFERENCE_*` env vars, which in production are declared in
+//!   `tinfoil-config.yml` and therefore bound into the enclave measurement —
+//!   the same measurement that pins the model-weight hash. Reached over
+//!   plain HTTP on the enclave-internal loopback; no attestation applies
+//!   because there is no trust boundary to cross.
 
 use std::collections::HashMap;
 
@@ -27,6 +39,9 @@ use crate::types::{
 pub enum TeeType {
     /// Tinfoil confidential enclave (AMD SEV-SNP / Intel TDX / NVIDIA CC).
     TinfoilEnclave,
+    /// The Eidola enclave itself — the self-hosted inference container
+    /// co-located with this server inside one measured CVM.
+    EidolaEnclave,
 }
 
 /// Metadata about a backend's execution of a request.
@@ -276,14 +291,58 @@ struct PricingOverride {
 }
 
 // ---------------------------------------------------------------------------
-// Tinfoil backend
+// Inference backend (Tinfoil + optional self-hosted upstream)
 // ---------------------------------------------------------------------------
 
-/// Tinfoil inference backend.
-///
-/// Sends OpenAI-format requests to Tinfoil's API. All Tinfoil models run
-/// inside confidential enclaves with attestation-verified TLS.
-pub struct TinfoilBackend {
+/// Default self-hosted pricing in USD per million tokens (before markup),
+/// used when `TINFOIL_PRICING_OVERRIDES` doesn't name the self-hosted model.
+/// Matches the catalog's Gemma tier; self-hosted cost is fixed infrastructure
+/// rather than a per-token upstream invoice, so this is a placeholder policy
+/// until real utilization data exists.
+pub const SELF_HOSTED_DEFAULT_INPUT_PER_M: f64 = 0.40;
+pub const SELF_HOSTED_DEFAULT_OUTPUT_PER_M: f64 = 1.0;
+
+/// Configuration for the optional self-hosted inference upstream, parsed
+/// from `EIDOLA_INFERENCE_*` env vars in `main.rs`. In production these are
+/// declared in `tinfoil-config.yml`, so the model identity a client sees is
+/// bound into the same enclave measurement as the weight hash it refers to.
+#[derive(Debug, Clone)]
+pub struct SelfHostedConfig {
+    /// Base URL of the co-located inference container, e.g.
+    /// `http://127.0.0.1:8081/v1`.
+    pub base_url: String,
+    /// Model id served (must match the engine's `--alias`).
+    pub model_id: String,
+    /// Human-readable display name.
+    pub model_name: String,
+    /// Short capability description.
+    pub description: String,
+    /// Context window size in tokens (what the engine is configured for,
+    /// which may be smaller than the model's architectural maximum).
+    pub context_length: u64,
+}
+
+/// The self-hosted upstream: a plain HTTP client for the enclave-internal
+/// inference container plus the catalog entry it serves.
+struct SelfHostedUpstream {
+    client: reqwest::Client,
+    base_url: String,
+    model: Model,
+}
+
+/// Per-request routing target resolved from the request's model id.
+struct Route {
+    client: reqwest::Client,
+    url: String,
+    /// Bearer token; the self-hosted upstream is unauthenticated (loopback
+    /// inside the measured enclave), the Tinfoil upstream is not.
+    api_key: Option<String>,
+    provider: &'static str,
+    tee_type: TeeType,
+}
+
+/// Inference backend routing between Tinfoil and the self-hosted upstream.
+pub struct InferenceBackend {
     /// The attesting upstream client, held in a swappable cell so the
     /// `upstream_trust` refresh task can hot-swap in a client built over a
     /// new allowed-measurement set without rebuilding the backend. Each
@@ -292,26 +351,110 @@ pub struct TinfoilBackend {
     client: std::sync::Arc<arc_swap::ArcSwap<reqwest::Client>>,
     api_key: String,
     base_url: String,
-    /// Static model list built from `MODEL_CATALOG` with optional pricing overrides.
+    /// Optional co-located self-hosted upstream (see module docs).
+    self_hosted: Option<SelfHostedUpstream>,
+    /// Model list: `MODEL_CATALOG` plus the self-hosted entry, with pricing
+    /// overrides and markup applied.
     models: Vec<Model>,
 }
 
-impl TinfoilBackend {
+impl InferenceBackend {
     pub fn new(
         client: std::sync::Arc<arc_swap::ArcSwap<reqwest::Client>>,
         api_key: String,
         base_url: Option<String>,
         pricing_markup: Option<f64>,
+        self_hosted: Option<SelfHostedConfig>,
     ) -> Self {
         let markup = pricing_markup.unwrap_or(DEFAULT_PRICING_MARKUP);
         let overrides = Self::parse_pricing_overrides();
-        let models = Self::build_model_list(markup, &overrides);
+        let mut models = Self::build_model_list(markup, &overrides);
+
+        let self_hosted = self_hosted.map(|config| {
+            let model = Self::build_self_hosted_model(&config, markup, &overrides);
+            models.push(model.clone());
+            SelfHostedUpstream {
+                // Plain client: the upstream is a loopback peer inside the
+                // same measured enclave, so there is no handshake to attest
+                // and the URL is http. reqwest still initializes a TLS
+                // backend at build time, and its default builder loads
+                // *system* certificates — which don't exist in this
+                // FROM-scratch image — so supply the bundled webpki roots
+                // explicitly even though no TLS connection is ever made.
+                client: reqwest::Client::builder()
+                    .use_preconfigured_tls(crate::tls_config())
+                    .build()
+                    .expect("failed to build self-hosted upstream HTTP client"),
+                base_url: config.base_url,
+                model,
+            }
+        });
 
         Self {
             client,
             api_key,
             base_url: base_url.unwrap_or_else(|| "https://inference.tinfoil.sh/v1".to_string()),
+            self_hosted,
             models,
+        }
+    }
+
+    /// Build the catalog entry for the self-hosted model, honoring the same
+    /// pricing-override mechanism as the static catalog.
+    fn build_self_hosted_model(
+        config: &SelfHostedConfig,
+        markup: f64,
+        overrides: &HashMap<String, PricingOverride>,
+    ) -> Model {
+        let ovr = overrides.get(&config.model_id);
+        let input = ovr
+            .and_then(|o| o.input)
+            .unwrap_or(SELF_HOSTED_DEFAULT_INPUT_PER_M);
+        let output = ovr
+            .and_then(|o| o.output)
+            .unwrap_or(SELF_HOSTED_DEFAULT_OUTPUT_PER_M);
+
+        Model {
+            id: config.model_id.clone(),
+            name: config.model_name.clone(),
+            description: config.description.clone(),
+            context_length: config.context_length,
+            pricing: ModelPricing {
+                per_prompt_token: ScaledPrice {
+                    value: usd_per_m_to_scaled_credits(input, markup),
+                    scale_factor: PRICING_SCALE_FACTOR,
+                },
+                per_completion_token: ScaledPrice {
+                    value: usd_per_m_to_scaled_credits(output, markup),
+                    scale_factor: PRICING_SCALE_FACTOR,
+                },
+                per_request: None,
+            },
+        }
+    }
+
+    /// Resolve the upstream for a model id. Unknown ids fall through to
+    /// Tinfoil, which rejects them with its own model-not-found error (the
+    /// handler has already validated the model against the catalog for
+    /// pricing, so this arm is defensive).
+    fn route(&self, model: &str) -> Route {
+        if let Some(sh) = &self.self_hosted
+            && sh.model.id == model
+        {
+            return Route {
+                client: sh.client.clone(),
+                url: format!("{}/chat/completions", sh.base_url),
+                api_key: None,
+                provider: "eidola",
+                tee_type: TeeType::EidolaEnclave,
+            };
+        }
+        Route {
+            client: reqwest::Client::clone(&self.client.load()),
+            url: format!("{}/chat/completions", self.base_url),
+            api_key: Some(self.api_key.clone()),
+            provider: "tinfoil",
+            tee_type: TeeType::TinfoilEnclave,
         }
     }
 
@@ -386,7 +529,7 @@ impl TinfoilBackend {
     }
 }
 
-impl ChatBackend for TinfoilBackend {
+impl ChatBackend for InferenceBackend {
     async fn list_models(&self) -> Result<ModelsResponse, ServerError> {
         Ok(ModelsResponse {
             data: self.models.clone(),
@@ -394,15 +537,17 @@ impl ChatBackend for TinfoilBackend {
     }
 
     async fn send(&self, request: &ChatCompletionRequest) -> Result<BackendResponse, ServerError> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let route = self.route(&request.model);
 
-        let response = self
+        let mut builder = route
             .client
-            .load()
-            .post(&url)
-            .header("authorization", format!("Bearer {}", self.api_key))
+            .post(&route.url)
             .header("content-type", "application/json")
-            .json(request)
+            .json(request);
+        if let Some(key) = &route.api_key {
+            builder = builder.header("authorization", format!("Bearer {key}"));
+        }
+        let response = builder
             .send()
             .await
             .map_err(|e| ServerError::Network(e.to_string()))?;
@@ -435,10 +580,10 @@ impl ChatBackend for TinfoilBackend {
         })?;
 
         let meta = BackendMeta {
-            provider: "tinfoil".to_string(),
+            provider: route.provider.to_string(),
             chat_id: Some(completion.id.clone()),
             backend_model: completion.model.clone(),
-            tee_type: Some(TeeType::TinfoilEnclave),
+            tee_type: Some(route.tee_type),
             usage: completion.usage.clone(),
         };
 
@@ -452,7 +597,7 @@ impl ChatBackend for TinfoilBackend {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<mpsc::Receiver<Result<BackendStreamEvent, ServerError>>, ServerError> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let route = self.route(&request.model);
 
         // Ensure stream=true in the forwarded request, and force
         // include_usage on so the upstream emits a final usage chunk.
@@ -467,13 +612,15 @@ impl ChatBackend for TinfoilBackend {
             include_usage: true,
         });
 
-        let response = self
+        let mut builder = route
             .client
-            .load()
-            .post(&url)
-            .header("authorization", format!("Bearer {}", self.api_key))
+            .post(&route.url)
             .header("content-type", "application/json")
-            .json(&stream_request)
+            .json(&stream_request);
+        if let Some(key) = &route.api_key {
+            builder = builder.header("authorization", format!("Bearer {key}"));
+        }
+        let response = builder
             .send()
             .await
             .map_err(|e| ServerError::Network(e.to_string()))?;
@@ -501,6 +648,8 @@ impl ChatBackend for TinfoilBackend {
 
         let (tx, rx) = mpsc::channel(32);
         let model = request.model.clone();
+        let provider = route.provider;
+        let tee_type = route.tee_type;
 
         tokio::spawn(async move {
             let stream = response.bytes_stream();
@@ -559,10 +708,10 @@ impl ChatBackend for TinfoilBackend {
 
             // Send final Done event with metadata
             let meta = BackendMeta {
-                provider: "tinfoil".to_string(),
+                provider: provider.to_string(),
                 chat_id,
                 backend_model,
-                tee_type: Some(TeeType::TinfoilEnclave),
+                tee_type: Some(tee_type),
                 usage: final_usage,
             };
             let _ = tx.send(Ok(BackendStreamEvent::Done(meta))).await;
@@ -637,7 +786,7 @@ mod tests {
     #[test]
     fn test_model_catalog_completeness() {
         let overrides = HashMap::new();
-        let models = TinfoilBackend::build_model_list(1.5, &overrides);
+        let models = InferenceBackend::build_model_list(1.5, &overrides);
         assert_eq!(models.len(), MODEL_CATALOG.len());
 
         // Verify all models have non-empty fields
@@ -660,7 +809,7 @@ mod tests {
             },
         );
 
-        let models = TinfoilBackend::build_model_list(1.0, &overrides);
+        let models = InferenceBackend::build_model_list(1.0, &overrides);
         let kimi = models.iter().find(|m| m.id == "kimi-k2-6").unwrap();
 
         // With 1.0x markup and $2.0/M input override
@@ -672,7 +821,7 @@ mod tests {
     #[test]
     fn test_per_request_model_pricing() {
         let overrides = HashMap::new();
-        let models = TinfoilBackend::build_model_list(1.0, &overrides);
+        let models = InferenceBackend::build_model_list(1.0, &overrides);
 
         let whisper = models
             .iter()
@@ -701,7 +850,7 @@ mod tests {
             },
         );
 
-        let models = TinfoilBackend::build_model_list(1.0, &overrides);
+        let models = InferenceBackend::build_model_list(1.0, &overrides);
         let whisper = models
             .iter()
             .find(|m| m.id == "whisper-large-v3-turbo")
@@ -717,15 +866,88 @@ mod tests {
     #[test]
     fn test_lookup_model() {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
-        let backend = TinfoilBackend::new(
+        let backend = InferenceBackend::new(
             std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(reqwest::Client::new())),
             String::new(),
             None,
             Some(1.5),
+            None,
         );
 
         assert!(backend.lookup_model("kimi-k2-6").is_some());
         assert!(backend.lookup_model("nonexistent").is_none());
+    }
+
+    #[test]
+    fn self_hosted_model_joins_catalog_and_routes() {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let backend = InferenceBackend::new(
+            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(reqwest::Client::new())),
+            String::new(),
+            None,
+            Some(1.5),
+            Some(SelfHostedConfig {
+                base_url: "http://127.0.0.1:8081/v1".to_string(),
+                model_id: "gemma4-26b-a4b".to_string(),
+                model_name: "Gemma 4 26B A4B".to_string(),
+                description: "Self-hosted Gemma 4 MoE".to_string(),
+                context_length: 32_768,
+            }),
+        );
+
+        // Appears in the catalog with default self-hosted pricing + markup.
+        let model = backend.lookup_model("gemma4-26b-a4b").expect("in catalog");
+        assert_eq!(
+            model.pricing.per_prompt_token.value,
+            usd_per_m_to_scaled_credits(SELF_HOSTED_DEFAULT_INPUT_PER_M, 1.5)
+        );
+        assert_eq!(
+            model.pricing.per_completion_token.value,
+            usd_per_m_to_scaled_credits(SELF_HOSTED_DEFAULT_OUTPUT_PER_M, 1.5)
+        );
+
+        // Routes to the self-hosted upstream, unauthenticated, as the
+        // eidola provider inside the Eidola enclave.
+        let route = backend.route("gemma4-26b-a4b");
+        assert_eq!(route.url, "http://127.0.0.1:8081/v1/chat/completions");
+        assert!(route.api_key.is_none());
+        assert_eq!(route.provider, "eidola");
+        assert!(matches!(route.tee_type, TeeType::EidolaEnclave));
+
+        // Catalog models still route to Tinfoil with the API key attached.
+        let route = backend.route("kimi-k2-6");
+        assert_eq!(
+            route.url,
+            "https://inference.tinfoil.sh/v1/chat/completions"
+        );
+        assert!(route.api_key.is_some());
+        assert_eq!(route.provider, "tinfoil");
+        assert!(matches!(route.tee_type, TeeType::TinfoilEnclave));
+    }
+
+    #[test]
+    fn self_hosted_pricing_respects_overrides() {
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "gemma4-26b-a4b".to_string(),
+            PricingOverride {
+                input: Some(0.2),
+                output: Some(0.5),
+                request: None,
+            },
+        );
+        let config = SelfHostedConfig {
+            base_url: "http://127.0.0.1:8081/v1".to_string(),
+            model_id: "gemma4-26b-a4b".to_string(),
+            model_name: "Gemma 4 26B A4B".to_string(),
+            description: "Self-hosted Gemma 4 MoE".to_string(),
+            context_length: 32_768,
+        };
+
+        let model = InferenceBackend::build_self_hosted_model(&config, 1.0, &overrides);
+        assert_eq!(model.pricing.per_prompt_token.value, 200_000);
+        assert_eq!(model.pricing.per_completion_token.value, 500_000);
+        assert!(model.pricing.per_request.is_none());
     }
 
     #[test]

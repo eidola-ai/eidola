@@ -78,7 +78,7 @@ The same boundary applies to stdout logging.
 
 ## Inference is proxied, not performed
 
-The Eidola server is **not** the inference engine. Models run in a separate confidential-compute deployment operated by the upstream inference provider (currently Tinfoil), with its own attestation. The Eidola server's role on the inference path is:
+The Eidola server is **not** the inference engine. Most models run in a separate confidential-compute deployment operated by the upstream inference provider (currently Tinfoil), with its own attestation. One model is instead served by the self-hosted inference container co-located in the server's own enclave — same measurement, no separate attestation chain; see [self-hosted-inference.md](self-hosted-inference.md). For the Tinfoil-hosted models, the Eidola server's role on the inference path is:
 
 1. Verify the anonymous credential.
 2. Open an attested HTTPS connection to the inference upstream.

@@ -6,17 +6,17 @@ default:
 
 # --- Development ---
 
-# Run the full server stack with the server in a container (detached).
-dev:
-    ./scripts/dev.sh --container
+# Run the full server stack with the server in a container (detached). Pass --inference to include the self-hosted inference container.
+dev *args:
+    ./scripts/dev.sh --container {{ args }}
 
-# Run backing services for host-mode dev — server runs on host with cargo; writes .env.local with BIND_ADDR + STRIPE_WEBHOOK_SECRET to source.
-services:
-    ./scripts/dev.sh --host
+# Run backing services for host-mode dev — server runs on host with cargo; writes .env.local with BIND_ADDR + STRIPE_WEBHOOK_SECRET to source. Pass --inference to include the self-hosted inference container.
+services *args:
+    ./scripts/dev.sh --host {{ args }}
 
 # Stop everything started by `just dev` or `just services`.
 down:
-    docker compose --profile server --profile stripe down --remove-orphans
+    docker compose --profile server --profile stripe --profile inference down --remove-orphans
 
 # Drop and recreate the eidola database, then apply schema.sql
 db-reset:

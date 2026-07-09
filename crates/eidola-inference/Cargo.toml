@@ -1,0 +1,32 @@
+[package]
+name = "eidola-inference"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "eidola-inference"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime (fetch streaming + timeouts)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+
+# HTTPS client for fetching model weights (pure-Rust TLS, same stack as the server)
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "1"
+
+# Weight verification
+sha2 = "0.11"
+hex = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+futures-util = "0.3"

@@ -44,6 +44,8 @@ docker compose logs -f       # follow logs
 just down                    # stop everything
 ```
 
+Add `--inference` to either mode (`just dev --inference` / `just services --inference`) to also run the self-hosted inference container: llama.cpp serving Gemma 4 E2B locally, with the weights fetched once (~3.3 GiB) into a docker volume and SHA-256-verified on every boot. The server then serves model id `gemma4-e2b` from it — see [`docs/self-hosted-inference.md`](docs/self-hosted-inference.md).
+
 **2. Host-mode server** — postgres, the tinfoil shim mock, and stripe-cli run in containers; the server runs on the host with cargo. The shim is configured to forward to `host.docker.internal:8080`, so requests from the shim and Stripe webhooks all flow into the cargo-built server. This is the recommended inner loop while iterating on `eidola-server`:
 
 ```bash

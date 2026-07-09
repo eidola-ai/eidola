@@ -1,0 +1,187 @@
+# syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
+
+# eidola-inference — self-hosted inference engine image.
+#
+# Two artifacts, one image:
+#
+#   1. `llama-server` — llama.cpp's OpenAI-compatible HTTP server, compiled
+#      from a hash-pinned source tarball with the StageX C/C++ toolchain into
+#      a static musl binary (CPU backend; the CUDA/NVIDIA-CC build is a
+#      follow-up — see docs/self-hosted-inference.md).
+#   2. `eidola-inference` — the Rust boot supervisor (PID 1). It fetches the
+#      model weights named by MODEL_URL, verifies their on-disk SHA-256
+#      against MODEL_SHA256 (both measured via tinfoil-config.yml), and only
+#      then execs llama-server. No verified weights, no inference.
+#
+# The build follows the same base/fetch/build/install/package phase layout as
+# the other StageX images. The engine is intentionally pinned by source
+# tarball checksum (ADD --checksum), not by upstream's release binaries, so
+# the artifact is reproducible from source through the same toolchain trust
+# chain as everything else.
+
+# ── base ───────────────────────────────────────────────────────────────────────
+# Pinned StageX toolchain + runtime packages.
+
+FROM stagex/pallet-rust:sx2026.05.0@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS rust-base
+FROM stagex/core-busybox:sx2026.03.0@sha256:4f3e3849acb54972e7c4f1d08c320526e0f8b314130bda68f83f821b02b4890b AS pkg-busybox
+FROM stagex/core-musl:sx2026.03.0@sha256:fe241a40ee103f34e8e2bc5054de9bf67ffe00593d7412b6d61e6d2795425f7c AS pkg-musl
+FROM stagex/core-linux-headers:sx2026.03.0@sha256:7917e48ecc5f1639a04ed8aa071ffa5a047821b3a57c3fd8cfbe5c76867451ba AS pkg-linux-headers
+FROM stagex/core-binutils:sx2026.03.0@sha256:72e606de19add996ddff23946d2b2d8349d34530a668a5d0d4a5706741e197c8 AS pkg-binutils
+FROM stagex/core-gcc:sx2026.03.0@sha256:2a12ad577ed0cbc63b3bffa89f17aa21fbedc2ec4f4e239b6fa194930f0f674b AS pkg-gcc
+# Runtime deps of gcc's cc1/cc1plus (arithmetic + compression libraries).
+FROM stagex/core-gmp:sx2026.03.0@sha256:2ec32c41b02d95e56fae567be0df7fdea89a579f99073a6f80976a9916aac51b AS pkg-gmp
+FROM stagex/core-mpfr:sx2026.03.0@sha256:0c5b432c00904064ec44d8a14dd13726cae7b99117e14695d8a0276c14e7e335 AS pkg-mpfr
+FROM stagex/core-mpc:sx2026.03.0@sha256:e08c21fdae21cf93a80650aceae302a61d7be257c33012a134a25868c5d5a8fc AS pkg-mpc
+FROM stagex/core-isl:sx2026.03.0@sha256:15fc3408751aefed10a40627cc829f9c6bfb5e9d10c81ba595b1ec9da96182f2 AS pkg-isl
+FROM stagex/core-libzstd:sx2026.03.0@sha256:c6ff15d1b2cf240d68c42c0614b675b60b9a0943b92ac326d3866d87af7d18fb AS pkg-libzstd
+FROM stagex/core-make:sx2026.03.0@sha256:45523d7f448c58a2a1159b578a0c838010dac9b9a59bdd02f1e4dc533e618de6 AS pkg-make
+FROM stagex/core-cmake:sx2026.03.0@sha256:64d057d580f26d096603e13d1714619a4eb105a09023f26ce77ec90679bdb5be AS pkg-cmake
+# Runtime deps of the StageX cmake binary itself (dynamically linked against
+# LLVM libc++ + OpenSSL + zlib) — build-stage only, nothing here reaches the
+# final image.
+FROM stagex/core-zlib:sx2026.03.0@sha256:130afab57ac8e9a9eb1e0c6e2c91758a67f731634d3cdb45ae04ea0534cc3930 AS pkg-zlib
+FROM stagex/core-openssl:sx2026.03.0@sha256:decacae13674bebbeaef3ce79c5d1159ae8495f272f8fa7e5db660c84ab37d1d AS pkg-openssl
+FROM stagex/core-libcxx:sx2026.03.0@sha256:733ddf3bf6a47ba39578bec31d30804db134fa72482e8dbf4fcf288788d8a5b4 AS pkg-libcxx
+FROM stagex/core-libcxxabi:sx2026.03.0@sha256:88e66348a0eb2b1c0a321aaac138aef4ccc4bbd13a16ffd1de0231d5506f66b3 AS pkg-libcxxabi
+FROM stagex/core-libunwind:sx2026.03.0@sha256:c76fcc66148b19230247b7cdba06040dbe2f47aa19d7a4be4d430db15d47e4b8 AS pkg-libunwind
+
+# ── fetch ──────────────────────────────────────────────────────────────────────
+# Engine source, pinned by checksum. BuildKit fetches and verifies this
+# client-side, so a changed upstream tarball fails the build rather than
+# building different code.
+
+FROM scratch AS engine-src
+ADD --checksum=sha256:8c465cf7ca99a948d2186552eb14cf4565a55fac38d7462754653f2594b96e36 \
+    https://github.com/ggml-org/llama.cpp/archive/refs/tags/b9940.tar.gz /llama-cpp.tar.gz
+
+# Rust supervisor: manifests + stubs first so the dependency layer only
+# invalidates when dependencies change (same pattern as eidola-server).
+FROM rust-base AS supervisor-fetch
+
+ARG CARGO_PROFILE=release
+
+ENV TARGET=x86_64-unknown-linux-musl
+ENV SOURCE_DATE_EPOCH=0
+ENV CARGO_INCREMENTAL=0
+ENV ZERO_AR_DATE=1
+ENV RUSTFLAGS="-C target-feature=+crt-static -C debuginfo=0 -C target-cpu=generic"
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY --parents crates/*/Cargo.toml ./
+
+RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do \
+      dir="$(dirname "$manifest")/src"; mkdir -p "$dir"; \
+      touch "$dir/lib.rs"; \
+      if grep -q '^\[\[bin\]\]' "$manifest"; then echo 'fn main(){}' > "$dir/main.rs"; fi; \
+    done
+
+RUN cargo fetch --locked --target ${TARGET}
+
+RUN --network=none \
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-inference
+
+# ── build ──────────────────────────────────────────────────────────────────────
+
+# Engine: static musl llama-server from the pinned tarball.
+FROM scratch AS engine-toolchain
+
+COPY --from=pkg-busybox . /
+COPY --from=pkg-musl . /
+COPY --from=pkg-linux-headers . /
+COPY --from=pkg-zlib . /
+COPY --from=pkg-openssl . /
+COPY --from=pkg-libunwind . /
+COPY --from=pkg-libcxxabi . /
+COPY --from=pkg-libcxx . /
+COPY --from=pkg-gmp . /
+COPY --from=pkg-mpfr . /
+COPY --from=pkg-mpc . /
+COPY --from=pkg-isl . /
+COPY --from=pkg-libzstd . /
+COPY --from=pkg-binutils . /
+COPY --from=pkg-gcc . /
+COPY --from=pkg-make . /
+COPY --from=pkg-cmake . /
+
+FROM engine-toolchain AS engine-build
+
+ENV SOURCE_DATE_EPOCH=0
+
+WORKDIR /build
+COPY --from=engine-src /llama-cpp.tar.gz /build/llama-cpp.tar.gz
+RUN tar -xzf llama-cpp.tar.gz --strip-components=1 && rm llama-cpp.tar.gz
+
+# CPU baseline is fixed at x86-64-v3 (AVX2/FMA/F16C, no AVX-512): a single
+# deterministic code path that covers the EPYC hosts Tinfoil runs on and
+# Rosetta 2 (macOS 15+) for local dev, instead of GGML_NATIVE's
+# build-machine-dependent output or GGML_BACKEND_DL's dlopen dispatch (which
+# a static binary can't do). -ffile-prefix-map keeps build paths out of
+# asserts for reproducibility; OpenMP is off in favor of ggml's own
+# threadpool so no libgomp enters the link.
+RUN --network=none \
+    cmake -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DCMAKE_EXE_LINKER_FLAGS="-static" \
+      -DCMAKE_C_FLAGS="-ffile-prefix-map=/build=." \
+      -DCMAKE_CXX_FLAGS="-ffile-prefix-map=/build=." \
+      -DGGML_NATIVE=OFF \
+      -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+      -DGGML_OPENMP=OFF \
+      -DLLAMA_CURL=OFF \
+      -DLLAMA_OPENSSL=OFF \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DLLAMA_BUILD_TOOLS=ON \
+      -DLLAMA_BUILD_SERVER=ON \
+      -DLLAMA_BUILD_UI=OFF \
+    && cmake --build build --target llama-server -j "$(nproc)" \
+    && install -D build/bin/llama-server /out/llama-server \
+    && strip /out/llama-server
+
+# Supervisor: real source over the stubs.
+FROM supervisor-fetch AS supervisor-build
+
+ARG CARGO_PROFILE=release
+
+COPY crates/ ./crates/
+
+RUN find crates/ -name '*.rs' -exec touch {} +
+
+RUN --network=none \
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-inference \
+    && install -D target/${TARGET}/${CARGO_PROFILE}/eidola-inference /out/eidola-inference
+
+# ── install ────────────────────────────────────────────────────────────────────
+
+FROM scratch AS install
+
+COPY --from=engine-build /out/llama-server /rootfs/llama-server
+COPY --from=supervisor-build /out/eidola-inference /rootfs/eidola-inference
+
+# Writable weight directory owned by the runtime uid, created in a
+# disposable stage and COPYed in (RUN in the final image would capture
+# host-specific overlayfs noise — see oci/postgresql/Containerfile).
+FROM engine-toolchain AS dirs
+
+RUN --network=none mkdir -p /dirs/models && chown -R 65534:65534 /dirs
+
+# ── package ────────────────────────────────────────────────────────────────────
+
+FROM scratch AS package
+
+COPY --from=install /rootfs/ /
+COPY --from=dirs /dirs/ /
+
+ENV MODEL_PATH=/models/model.gguf
+EXPOSE 8081
+USER 65534:65534
+ENTRYPOINT ["/eidola-inference", "--", \
+    "/llama-server", \
+    "--model", "{model}", \
+    "--host", "0.0.0.0", \
+    "--port", "8081", \
+    "--no-webui", \
+    "--jinja"]

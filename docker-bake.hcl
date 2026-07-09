@@ -64,6 +64,11 @@ target "_cache_postgres" {
   cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:postgres,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
 }
 
+target "_cache_inference" {
+  cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:inference"] : []
+  cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:inference,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
+}
+
 # ── Local dev targets (compose.yaml overlay) ──────────────────────────────────
 # context and dockerfile come from compose.yaml; not repeated here.
 # For reproducible builds, use a docker-container builder with OCI output and
@@ -87,6 +92,11 @@ target "postgres" {
   tags     = ["eidola-postgres:dev"]
 }
 
+target "inference" {
+  inherits = ["_common", "_cache_inference"]
+  tags     = ["eidola-inference:dev"]
+}
+
 target "shim" {
   inherits = ["_common"]
   tags     = ["tinfoil-shim-mock:dev"]
@@ -102,7 +112,7 @@ target "stripe-cli" {
 }
 
 group "default" {
-  targets = ["server", "cli", "postgres", "shim"]
+  targets = ["server", "cli", "postgres", "inference", "shim"]
 }
 
 # ── CI targets (registry push) ────────────────────────────────────────────────
@@ -135,4 +145,11 @@ target "ci-postgres" {
   context    = "."
   dockerfile = "oci/postgresql/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-postgres:${t}"]
+}
+
+target "ci-inference" {
+  inherits   = ["_ci", "_cache_inference"]
+  context    = "."
+  dockerfile = "oci/eidola-inference/Containerfile"
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-inference:${t}"]
 }

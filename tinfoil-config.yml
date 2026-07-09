@@ -12,9 +12,12 @@
 #   cargo run -p hash-secret -- "<secret>"
 # and verified at server startup via verify_measured_secrets().
 
+# Resources cover both containers: the inference container fetches its
+# weights (~14.4 GiB) into RAM-backed container storage at boot and mmaps
+# them from there, so memory must hold weights + KV cache + both processes.
 cvm-version: 0.7.3
-cpus: 2
-memory: 8192
+cpus: 16
+memory: 24576
 
 containers:
   - name: "eidola-server"
@@ -33,6 +36,16 @@ containers:
       - OTEL_EXPORTER_OTLP_ENDPOINT: "https://otlp-gateway-prod-us-west-0.grafana.net/otlp"
       - DATABASE_URL: "postgresql://gateway@ep-little-bar-akwznszs.c-3.us-west-2.aws.neon.tech/eidola?sslmode=require&channel_binding=disable"
 
+      # Self-hosted inference upstream: the eidola-inference container below,
+      # reached over the CVM-internal loopback. The model identity clients
+      # see in /models is declared here, in the measured config, alongside
+      # the weight hash it corresponds to.
+      - EIDOLA_INFERENCE_URL: "http://127.0.0.1:8081/v1"
+      - EIDOLA_INFERENCE_MODEL: "gemma4-26b-a4b"
+      - EIDOLA_INFERENCE_MODEL_NAME: "Gemma 4 26B A4B"
+      - EIDOLA_INFERENCE_MODEL_DESCRIPTION: "Mixture-of-experts Gemma 4 (4B active parameters) served from the Eidola enclave itself"
+      - EIDOLA_INFERENCE_CONTEXT_LENGTH: "32768"
+
       # Measured secret hashes — Argon2id hashes of the actual secrets.
       - CREDENTIAL_MASTER_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$QA6ZPLR29CAPeushQ+ujFA$cOkF1JJdZoKDDzei5pyDrcsfiDBCuqUDoJaYwXG1G5k"
       - DATABASE_PASSWORD_HASH: "$argon2id$v=19$m=19456,t=2,p=1$cysXhP6SVPuB83IC4iD4yw$ygvRvdmSVfH5zq5+8P/Fgnyz6q93VwCuiZxU0GfjtLs"
@@ -40,6 +53,23 @@ containers:
       - STRIPE_API_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$qucRiGbS8rYcqJINDlHDcw$qdu/tD4Ymq1by0uPVawIFFneCq757OzZ3/5EPeyFQ4Q"
       - STRIPE_WEBHOOK_SECRET_HASH: "$argon2id$v=19$m=19456,t=2,p=1$4j33RHeU39z3dQiVU/k2rw$NryykMC9uwJGIQYLG5WeYkP3FHD/Sb8uPlAS2qzsLDc"
       - TINFOIL_API_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$d8t7z4mWAjPzjoANx9fJFQ$+kN/8qNToSPgq7GIknW7PTCF38asH6vs1v9eegE1RbQ"
+
+  # Self-hosted inference: llama.cpp behind the eidola-inference boot
+  # supervisor, co-located in this measured CVM. The supervisor fetches
+  # MODEL_URL at boot, verifies the on-disk SHA-256 against MODEL_SHA256
+  # (both bound into the enclave measurement via this file's hash), and only
+  # then execs llama-server. Weights: the official Google QAT q4_0 GGUF of
+  # Gemma 4 26B A4B, pinned by revision URL + LFS content hash. Never
+  # exposed through the shim — only the eidola-server reaches it, over the
+  # CVM-internal loopback.
+  - name: "eidola-inference"
+    image: "ghcr.io/eidola-ai/eidola-inference@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    env:
+      - MODEL_URL: "https://huggingface.co/google/gemma-4-26B-A4B-it-qat-q4_0-gguf/resolve/dfc00409adc70be497fee9c90bfe76b3ee130f2e/gemma-4-26B_q4_0-it.gguf"
+      - MODEL_SHA256: "4c856523d61d77922dbc0b26753a6bf6208e5d69d80db0c04dcd776832d054c5"
+      # --alias must match EIDOLA_INFERENCE_MODEL above; -np 4 serves four
+      # concurrent slots within the 32K context budget.
+      - INFERENCE_EXTRA_ARGS: "--alias gemma4-26b-a4b -c 32768 -np 4"
 
 shim:
   upstream-port: 8080

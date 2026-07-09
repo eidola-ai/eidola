@@ -1,6 +1,8 @@
 # Inference Upstream
 
-The model itself does not run inside the Eidola server. It runs in a separate confidential-compute deployment operated by an inference provider (currently [Tinfoil](https://tinfoil.sh)), with its own attestation chain that the Eidola server verifies on every outbound connection.
+Most models do not run inside the Eidola server. They run in a separate confidential-compute deployment operated by an inference provider (currently [Tinfoil](https://tinfoil.sh)), with its own attestation chain that the Eidola server verifies on every outbound connection.
+
+**The exception is the self-hosted model**: one model is served by an inference container co-located *inside the Eidola server enclave itself*, whose engine build and weight hash are bound into the same enclave measurement the client already pins — no separate upstream, no separate attestation chain. That path is documented in [self-hosted-inference.md](self-hosted-inference.md); the rest of this page covers the Tinfoil-hosted models.
 
 This page explains what runs where, what the user is trusting at this layer, and how the trust is anchored.
 

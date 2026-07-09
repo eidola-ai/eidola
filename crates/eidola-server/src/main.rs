@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use eidola_server::AppState;
-use eidola_server::backend::TinfoilBackend;
+use eidola_server::backend::{InferenceBackend, SelfHostedConfig};
 use eidola_server::credentials;
 use eidola_server::helpers::EpochConfig;
 use eidola_server::stripe::StripeClient;
@@ -30,6 +30,7 @@ struct Config {
     stripe_webhook_secret: Option<String>,
     credential_master_key: [u8; 32],
     pricing_markup: Option<f64>,
+    self_hosted: Option<SelfHostedConfig>,
 }
 
 impl Config {
@@ -84,6 +85,51 @@ impl Config {
             pricing_markup.unwrap_or(eidola_server::backend::DEFAULT_PRICING_MARKUP),
         )?;
 
+        // Self-hosted inference upstream (the eidola-inference container
+        // co-located in this enclave — see docs/self-hosted-inference.md).
+        // EIDOLA_INFERENCE_URL gates the feature; the model identity fields
+        // are declared in tinfoil-config.yml in production, binding what
+        // clients see in /models to the same enclave measurement that pins
+        // the model-weight hash the inference container verifies at boot.
+        let self_hosted = match std::env::var("EIDOLA_INFERENCE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(base_url) => {
+                let model_id = std::env::var("EIDOLA_INFERENCE_MODEL").map_err(
+                    |_| "EIDOLA_INFERENCE_MODEL is required when EIDOLA_INFERENCE_URL is set",
+                )?;
+                let model_name = std::env::var("EIDOLA_INFERENCE_MODEL_NAME")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| model_id.clone());
+                let description = std::env::var("EIDOLA_INFERENCE_MODEL_DESCRIPTION")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        "Self-hosted model served from the Eidola enclave".to_string()
+                    });
+                let context_length = std::env::var("EIDOLA_INFERENCE_CONTEXT_LENGTH")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        s.parse::<u64>().map_err(|_| {
+                            "EIDOLA_INFERENCE_CONTEXT_LENGTH must be a positive integer".to_string()
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(32_768);
+                Some(SelfHostedConfig {
+                    base_url: base_url.trim_end_matches('/').to_string(),
+                    model_id,
+                    model_name,
+                    description,
+                    context_length,
+                })
+            }
+            None => None,
+        };
+
         let credential_master_key_hex = std::env::var("CREDENTIAL_MASTER_KEY")
             .map_err(|_| "CREDENTIAL_MASTER_KEY environment variable is required")?;
         let key_bytes = hex::decode(&credential_master_key_hex)
@@ -122,6 +168,7 @@ impl Config {
             stripe_webhook_secret,
             credential_master_key,
             pricing_markup,
+            self_hosted,
         })
     }
 }
@@ -331,13 +378,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })?;
     info!("Tinfoil attestation smoke test succeeded");
 
+    // The self-hosted upstream gets no fail-fast smoke test, deliberately:
+    // it boots concurrently with this server and spends its first minutes
+    // fetching + hash-verifying model weights, so "not ready yet" is its
+    // normal boot state. Requests routed to it fail with an ordinary
+    // upstream error until it comes up.
+    if let Some(sh) = &config.self_hosted {
+        info!(
+            "Self-hosted inference upstream configured: {} serving {}",
+            sh.base_url, sh.model_id
+        );
+    }
+
     // Create shared state
     let state = AppState::new(
-        TinfoilBackend::new(
+        InferenceBackend::new(
             client_cell,
             config.tinfoil_api_key.clone(),
             config.tinfoil_base_url.clone(),
             config.pricing_markup,
+            config.self_hosted.clone(),
         ),
         db_pool,
         stripe,

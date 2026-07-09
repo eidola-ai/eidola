@@ -281,7 +281,7 @@ jobs:
           {
             echo 'actual<<__EIDOLA_EOF__'
             ./scripts/artifact-manifest.sh print ${PUSH_FLAG} \
-              --metadata-file "${SERVER_BAKE_METADATA_FILE}" --targets "server postgres" \
+              --metadata-file "${SERVER_BAKE_METADATA_FILE}" --targets "server postgres inference" \
               --metadata-file "${CLI_BAKE_METADATA_FILE}" --targets cli
             echo '__EIDOLA_EOF__'
           } >> "$GITHUB_OUTPUT"
@@ -296,7 +296,7 @@ jobs:
             PUSH_FLAG="--push"
           fi
           if ./scripts/artifact-manifest.sh verify ${PUSH_FLAG} \
-            --metadata-file "${SERVER_BAKE_METADATA_FILE}" --targets "server postgres" \
+            --metadata-file "${SERVER_BAKE_METADATA_FILE}" --targets "server postgres inference" \
             --metadata-file "${CLI_BAKE_METADATA_FILE}" --targets cli \
             --manifest artifact-manifest.json; then
             echo "match=true" >> "$GITHUB_OUTPUT"

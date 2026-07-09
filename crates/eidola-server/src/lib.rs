@@ -43,7 +43,7 @@ pub struct AppState {
 }
 
 pub struct AppStateInner {
-    pub backend: backend::TinfoilBackend,
+    pub backend: backend::InferenceBackend,
     pub db_pool: deadpool_postgres::Pool,
     pub stripe: Option<stripe::StripeClient>,
     pub stripe_webhook_secret: Option<String>,
@@ -55,7 +55,7 @@ pub struct AppStateInner {
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        backend: backend::TinfoilBackend,
+        backend: backend::InferenceBackend,
         db_pool: deadpool_postgres::Pool,
         stripe: Option<stripe::StripeClient>,
         stripe_webhook_secret: Option<String>,

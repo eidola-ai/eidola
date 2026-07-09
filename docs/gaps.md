@@ -94,7 +94,7 @@ There are really two distinct gaps here that share infrastructure but answer dif
 
 ## Inference upstream
 
-Inference does not run in the Eidola server enclave. `inference.tinfoil.sh` is a *router* enclave operated by the upstream provider (currently Tinfoil) that reverse-proxies each request to a **separate per-model GPU enclave**. That structure shapes the two gaps below.
+Most inference does not run in the Eidola server enclave. `inference.tinfoil.sh` is a *router* enclave operated by the upstream provider (currently Tinfoil) that reverse-proxies each request to a **separate per-model GPU enclave**. That structure shapes the two gaps below. (The exception is the self-hosted model, which runs *inside* the Eidola server enclave and is outside both gaps — see [self-hosted-inference.md](self-hosted-inference.md).)
 
 ### The inference code is trusted at the provider's bar, not reviewed or pinned by Eidola
 
@@ -116,10 +116,10 @@ A user's chain of trust at the inference layer therefore ends at Tinfoil's relea
 
 **Future.** The intent is to close both gaps by ending the inference-layer trust chain where the rest of Eidola's does. There are two paths, and either one suffices:
 
-- **Primary — self-host inference.** Run the models on hardware Eidola controls, such as GPU-enabled Tinfoil containers, built and released through Eidola's own source-bootstrapped, human-attested flow, so Eidola owns the inference measurement, can *statically pin* it, and reviews the downstream code directly. This is the long-term goal regardless, since it also brings reproducibility and human attestation to the inference layer. Its cost is high fixed GPU spend that is hard to justify before there is meaningful demand — so it is not the immediate move.
-- **Alternative — the provider adopts static-pinned upstreams.** If Tinfoil itself moves its router from "trust the latest signed release" to *statically pinning* the specific model-enclave measurements it will forward to, then the downstream-review gap closes without Eidola self-hosting: Eidola would simply keep using Tinfoil's inference and pin the reviewed set. This is the cheaper outcome, and if it materializes it is the preferred long-term solution.
+- **Primary — self-host inference.** Run the models on hardware Eidola controls, such as GPU-enabled Tinfoil containers, built and released through Eidola's own source-bootstrapped, human-attested flow, so Eidola owns the inference measurement, can *statically pin* it, and reviews the downstream code directly. This is the long-term goal regardless, since it also brings reproducibility and human attestation to the inference layer. Its cost is high fixed GPU spend that is hard to justify before there is meaningful demand — so full migration is not the immediate move. **A first increment of this path now exists:** one self-hosted model served by a reproducible StageX llama.cpp container co-located inside the eidola-server enclave, its engine *and weight hash* bound into the same measurement clients already pin — see [self-hosted-inference.md](self-hosted-inference.md). Models Eidola hosts this way are entirely outside the two gaps above; models still served via Tinfoil remain inside them.
+- **Alternative — the provider adopts static-pinned upstreams.** If Tinfoil itself moves its router from "trust the latest signed release" to *statically pinning* the specific model-enclave measurements it will forward to, then the downstream-review gap closes without Eidola self-hosting: Eidola would simply keep using Tinfoil's inference and pin the reviewed set. This is the cheaper outcome for the Tinfoil-hosted catalog, and if it materializes it remains the preferred solution for models Eidola doesn't host.
 
-In the meantime, the runtime-resolution scheme above is the honest interim: it claims exactly the assurance the provider's own model provides, and no more.
+In the meantime, the runtime-resolution scheme above is the honest interim for the Tinfoil-hosted models: it claims exactly the assurance the provider's own model provides, and no more.
 
 ## Build chain opacity
 
