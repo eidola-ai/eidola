@@ -26,6 +26,13 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          # reviewdog (inside pinact-action) computes the PR diff to place its
+          # review comments. A shallow clone lacks the base commit, so it falls
+          # back to `git fetch`, which races on the shallow file
+          # ("fatal: shallow file has changed since we read it") and fails the
+          # job even when pinact finds nothing. Full history lets reviewdog diff
+          # locally without fetching.
+          fetch-depth: 0
 
       - name: Suggest action pins
         uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0

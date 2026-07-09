@@ -50,6 +50,13 @@ fi
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 BUILDKIT_IMAGE="moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b"
 
+# Pinned Nix runner image for cross-host Linux GUI builds (see
+# build_linux_gui_via_docker). This is a deliberately *different* mechanism
+# from the StageX buildx builder: a plain `docker run` against nixos/nix, not
+# the `eidola` BuildKit builder. Pinned by the multi-arch index digest so
+# `--platform linux/amd64` selects the amd64 variant on any host.
+NIX_IMAGE="nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894"
+
 # CVM image artifacts for enclave measurement computation.
 # The OVMF firmware version is pinned to match tinfoilsh/measure-image-action.
 CVM_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/eidola/cvm"
@@ -485,32 +492,106 @@ manifest_arch() {
 }
 
 # Build the Linux GUI via Nix (glibc dynamic binary; see flake.nix for why
-# the GUI can't be a static musl artifact like the server/cli).
+# the GUI can't be a static musl artifact like the server/cli). On a Linux
+# host this runs Nix natively (sets LINUX_GUI_PATH). On any other host (e.g.
+# Darwin) it reproduces CI's native x86_64-linux build inside a pinned
+# linux/amd64 Nix container (sets LINUX_GUI_NARHASH), so `just update-manifest`
+# can compose the *full* manifest from a Mac instead of carrying the Linux GUI
+# entry over stale.
 build_linux_gui_artifact() {
-  if [[ "$(uname -s)" != "Linux" ]]; then
-    echo "error: Linux GUI artifact builds require a Linux host" >&2
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    LINUX_GUI_PATH="$(
+      nix build \
+        '.#eidola-gui-linux' \
+        --no-link \
+        --print-out-paths \
+        --show-trace
+    )"
+  else
+    build_linux_gui_via_docker
+  fi
+}
+
+# Cross-host Linux GUI build: run `nix build .#eidola-gui-linux` inside a
+# pinned linux/amd64 Nix container and capture the output's narHash into
+# LINUX_GUI_NARHASH. The store path only exists inside the container, so the
+# narHash is computed there via `nix hash path --sri` (byte-identical to
+# `nix path-info`'s narHash — verified against the same store path).
+#
+# Correctness rests on the same determinism CI's linux-gui job trusts: a
+# pinned, sandboxed, reproducible derivation yields an identical narHash
+# whether built natively on CI's x86_64 runner or emulated under linux/amd64
+# on an arm64 Mac — the same emulation determinism the StageX OCI digests
+# already depend on. The build reads the *working tree* (dirty or not) exactly
+# as CI does — CI writes the stamped tinfoil-config.yml + server-enclave.json
+# into its checkout before building — so the freshly stamped files from the
+# earlier phases are what get built.
+#
+# Nix flags mirror CI (sandbox on; fail rather than silently fall back to an
+# unsandboxed build) with one emulation concession: `filter-syscalls = false`
+# disables the seccomp BPF hardening filter, which qemu can't load under
+# emulation ("unable to load seccomp BPF program"). That filter only blocks
+# setuid-type syscalls a Rust/gpui build never makes, so its absence cannot
+# change the output.
+#
+# A persistent /nix volume keyed to the image digest keeps the expensive
+# gpui/Mesa closure warm across runs (Docker auto-populates the fresh volume
+# from the image's own /nix on first use); only the first run is a cold,
+# emulated build. Bumping NIX_IMAGE keys a new volume so the store is never
+# stale relative to the pinned Nix.
+build_linux_gui_via_docker() {
+  local nix_store_volume digest
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "error: building the Linux GUI on a non-Linux host requires docker" >&2
     exit 1
   fi
 
-  LINUX_GUI_PATH="$(
-    nix build \
-      '.#eidola-gui-linux' \
-      --no-link \
-      --print-out-paths \
-      --show-trace
+  digest="${NIX_IMAGE##*@sha256:}"
+  nix_store_volume="eidola-nix-store-${digest:0:16}"
+
+  echo "Building Linux GUI in a linux/amd64 Nix container (first run is a cold, emulated build — this is slow)..." >&2
+
+  LINUX_GUI_NARHASH="$(
+    docker run --rm --platform linux/amd64 \
+      --privileged \
+      -v "$REPO_ROOT":/repo \
+      -v "${nix_store_volume}:/nix" \
+      -w /repo \
+      "$NIX_IMAGE" \
+      sh -euc '
+        export NIX_CONFIG="experimental-features = nix-command flakes
+sandbox = true
+sandbox-fallback = false
+filter-syscalls = false"
+        git config --global --add safe.directory /repo
+        out="$(nix build .#eidola-gui-linux --no-link --print-out-paths --show-trace)"
+        nix hash path --sri "$out"
+      '
   )"
+
+  if [[ -z "$LINUX_GUI_NARHASH" ]]; then
+    echo "error: Linux GUI docker build produced no narHash" >&2
+    exit 1
+  fi
 }
 
 print_linux_gui_manifest() {
   local gui_hash arch
 
-  if [[ -z "${LINUX_GUI_PATH:-}" ]]; then
+  if [[ -n "${LINUX_GUI_NARHASH:-}" ]]; then
+    # Cross-host docker path: the container always builds linux/amd64
+    # (matching CI), regardless of the host's own arch — so the key/platform
+    # are fixed to amd64 rather than derived from `uname -m`.
+    gui_hash="$LINUX_GUI_NARHASH"
+    arch="amd64"
+  elif [[ -n "${LINUX_GUI_PATH:-}" ]]; then
+    gui_hash="$(nix_nar_hash "$LINUX_GUI_PATH")"
+    arch="$(manifest_arch)"
+  else
     echo "error: print_linux_gui_manifest called before build_linux_gui_artifact" >&2
     return 1
   fi
-
-  arch="$(manifest_arch)"
-  gui_hash="$(nix_nar_hash "$LINUX_GUI_PATH")"
 
   jq -n \
     --arg gui_hash "$gui_hash" \
@@ -797,8 +878,11 @@ update_manifest() {
   if [[ "$host_os" == "Darwin" ]]; then
     build_macos_artifacts
     macos_partial="$(print_macos_manifest)"
-    linux_gui_partial="$(carry_over_partial "eidola-gui-linux-")"
-    echo "note: Linux GUI narHash carried over from committed manifest (not buildable on Darwin); CI verifies it" >&2
+    # The Linux GUI is built natively-for-linux inside a linux/amd64 Nix
+    # container (build_linux_gui_via_docker), so Darwin now composes the full
+    # manifest. Only the darwin artifacts remain host-exclusive.
+    build_linux_gui_artifact
+    linux_gui_partial="$(print_linux_gui_manifest)"
   else
     build_linux_gui_artifact
     linux_gui_partial="$(print_linux_gui_manifest)"
