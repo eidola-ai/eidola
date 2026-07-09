@@ -73,8 +73,12 @@ pub fn init() -> Option<OtelGuard> {
 
 /// Create OTel providers for traces, metrics, and logs via OTLP/HTTP.
 fn init_otel_providers() -> Option<OtelGuard> {
-    // Only enable when an endpoint is configured.
-    std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
+    // Only enable when an endpoint is configured. Set-but-empty counts as
+    // unset — compose passes `OTEL_EXPORTER_OTLP_ENDPOINT: ${...:-}`, so the
+    // container env var always exists even when telemetry is off.
+    std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())?;
 
     let service_name =
         std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "eidola-server".to_string());

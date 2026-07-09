@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// A chat completion request.
+///
+/// Optional fields carry `skip_serializing_if` so an absent parameter is
+/// *absent* in the forwarded upstream request rather than `null` — strict
+/// upstreams (llama-server among them) reject explicit nulls that looser
+/// gateways tolerate.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
@@ -18,15 +23,15 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<Message>,
 
     /// The maximum number of completion tokens to generate.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
 
     /// Sampling temperature between 0 and 2.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
 
     /// Nucleus sampling parameter.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
     /// Whether to stream partial responses.
@@ -43,7 +48,7 @@ pub struct ChatCompletionRequest {
     pub stream_options: Option<StreamOptions>,
 
     /// Up to 4 sequences where the API will stop generating.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<StopSequence>,
 }
 

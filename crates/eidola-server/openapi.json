@@ -833,7 +833,7 @@
       },
       "ChatCompletionRequest": {
         "type": "object",
-        "description": "A chat completion request.",
+        "description": "A chat completion request.\n\nOptional fields carry `skip_serializing_if` so an absent parameter is\n*absent* in the forwarded upstream request rather than `null` — strict\nupstreams (llama-server among them) reject explicit nulls that looser\ngateways tolerate.",
         "required": [
           "model",
           "messages"
