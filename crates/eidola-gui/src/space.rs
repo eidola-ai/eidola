@@ -411,18 +411,20 @@ impl Space {
     /// prior snapshot via `Loadable::Failed { prior }`.
     ///
     /// **The load-vs-submit race is serialized here**, which retires the old
-    /// `transcript_generation` counter: if a submit has moved the transcript
-    /// ahead since this load started (`streaming.is_some()`), the load result
-    /// is *stale* and dropped — the submit's own post-stream reload is the
-    /// authoritative truth and would clobber the just-appended user turn.
-    /// Returns whether the load was applied.
+    /// `transcript_generation` counter: if a mutation has moved the transcript
+    /// ahead since this load started (`streaming` or the runner slot is
+    /// occupied), the load result is *stale* and dropped — the mutation's own
+    /// post-commit reload is the authoritative truth and would clobber the
+    /// just-appended user turn. (Every mutation also cancels the load task via
+    /// [`Self::supersede_load_for_mutation`], so this guard is defense in
+    /// depth.) Returns whether the load was applied.
     fn apply_loaded_transcript(
         &mut self,
         result: Result<Vec<ChatMessageView>, AppError>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.streaming.is_some() {
-            // A submit raced ahead of this load; its reload wins.
+        if self.streaming.is_some() || self.submit_runner.is_some() {
+            // A mutation raced ahead of this load; its reload wins.
             return false;
         }
         match result {
@@ -472,6 +474,25 @@ impl Space {
 
     // -- Submit ------------------------------------------------------------
 
+    /// Prologue shared by every transcript-mutating operation (submit /
+    /// post-only / edit / regenerate), called at the moment the operation is
+    /// accepted: cancel any in-flight transcript load by dropping its task.
+    /// The mutation's own post-commit reload is now the authoritative truth,
+    /// and a superseded load must never land late around it — the same
+    /// stale-fetch class as the Record listing race from PR #179; the fix is
+    /// the same replace-cancels idiom (`docs/architecture/state.md` →
+    /// "Concurrency patterns"). If the cancelled load was an *initial* one
+    /// (`Loading`, nothing kept visible), the cell steps back to `NotLoaded`
+    /// so no spinner outlives its task ("every spinner maps to a live task");
+    /// a re-fetch over data stays `Loaded { stale: true }` until the
+    /// mutation's reload resolves it.
+    fn supersede_load_for_mutation(&mut self) {
+        self.load_task = None;
+        if self.transcript.is_loading() {
+            self.transcript = Loadable::NotLoaded;
+        }
+    }
+
     /// Submit a prompt with an explicitly-resolved model. The model is
     /// resolved by the caller (window selection → config default → fallback)
     /// because the config snapshot lives in `ConfigStore`, which the view
@@ -501,12 +522,11 @@ impl Space {
         // value app-core persists on the action row.
         self.last_submitted_model = Some(model.clone());
 
-        // Cancel any in-flight initial transcript load: the submit's own
-        // post-stream reload is now the authoritative truth, and a late load
-        // result must not clobber the user turn we're about to append (the
-        // `apply_loaded_transcript` streaming guard also enforces this, but
-        // dropping the task frees the slot eagerly).
-        self.load_task = None;
+        // Cancel any in-flight transcript load: the submit's own post-stream
+        // reload is now the authoritative truth (the `apply_loaded_transcript`
+        // guard also enforces this, but dropping the task frees the slot
+        // eagerly).
+        self.supersede_load_for_mutation();
 
         // Append the user's turn locally and enter the streaming state. This
         // mutation is what a submit-vs-load race must not clobber; since the
@@ -553,7 +573,7 @@ impl Space {
             return false;
         }
 
-        self.load_task = None;
+        self.supersede_load_for_mutation();
 
         // Optimistically append the user's turn (no streaming state — this path
         // requests nothing).
@@ -639,6 +659,7 @@ impl Space {
         if new_prompt.is_empty() {
             return false;
         }
+        self.supersede_load_for_mutation();
         let Some(app_core) = self.app_core.clone() else {
             return true; // stub: no backend
         };
@@ -666,6 +687,7 @@ impl Space {
             return false;
         }
         self.last_submitted_model = Some(model.clone());
+        self.supersede_load_for_mutation();
         let Some(app_core) = self.app_core.clone() else {
             return true; // stub: no backend
         };
@@ -886,6 +908,22 @@ impl Space {
             cx.emit(SpaceEvent::StreamDelta);
             cx.notify();
         }
+    }
+
+    /// Test-only: arm a never-completing task in the load slot, standing in
+    /// for an in-flight transcript load on a stub space (where
+    /// `load_transcript` early-returns without a backend). Drives the
+    /// mutation-supersedes-load replay tests.
+    #[doc(hidden)]
+    pub fn arm_load_for_test(&mut self, cx: &mut Context<Self>) {
+        self.load_task = Some(cx.spawn(async move |_, _| std::future::pending::<()>().await));
+    }
+
+    /// Test-only: whether a transcript load is in flight (the load slot is
+    /// occupied).
+    #[doc(hidden)]
+    pub fn has_pending_load_for_test(&self) -> bool {
+        self.load_task.is_some()
     }
 
     /// Test-only: simulate completion of a transcript load (the race-replay
