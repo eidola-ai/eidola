@@ -14,7 +14,6 @@ use eidola_server::AppState;
 use eidola_server::backend::TinfoilBackend;
 use eidola_server::credentials;
 use eidola_server::helpers::EpochConfig;
-use eidola_server::measurements;
 use eidola_server::stripe::StripeClient;
 use eidola_server::telemetry;
 
@@ -255,29 +254,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tls_roots = rustls::RootCertStore::empty();
     tls_roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let attesting_client =
-        tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: measurements::ALLOWED.as_slice(),
-            inference_base_url,
-            atc_url: None,
-            enclave_repo: Some(&config.tinfoil_repo),
-            trusted_ark_der: None,
-            trusted_ask_der: None,
-            tdx_advisory_allowlist: None,
-            tdx_observer: Some(tdx_observer),
-            snp_min_tcb: None,
-            snp_observer: Some(snp_observer),
-            attestation_observer: None,
-            tls_roots,
+    // The allowed upstream measurements are resolved at *runtime* from
+    // Tinfoil's latest router release (see `src/upstream_trust` for why).
+    // This factory rebuilds the attesting client whenever that set changes;
+    // all the `attesting_client` wiring (TLS roots, ATC, enclave repo, TCB
+    // policy, telemetry observers) lives here so `upstream_trust` stays
+    // free of a telemetry dependency. `attesting_client` does no network
+    // I/O, so rebuilding is cheap.
+    let client_factory: eidola_server::upstream_trust::AttestingClientFactory = {
+        let inference_base_url = inference_base_url.to_string();
+        let enclave_repo = config.tinfoil_repo.clone();
+        std::sync::Arc::new(move |allowed: Vec<tinfoil_verifier::EnclaveMeasurement>| {
+            let inference_base_url = inference_base_url.clone();
+            let enclave_repo = enclave_repo.clone();
+            let tls_roots = tls_roots.clone();
+            let tdx_observer = tdx_observer.clone();
+            let snp_observer = snp_observer.clone();
+            Box::pin(async move {
+                tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
+                    allowed_measurements: allowed.as_slice(),
+                    inference_base_url: &inference_base_url,
+                    atc_url: None,
+                    enclave_repo: Some(&enclave_repo),
+                    trusted_ark_der: None,
+                    trusted_ask_der: None,
+                    tdx_advisory_allowlist: None,
+                    tdx_observer: Some(tdx_observer),
+                    snp_min_tcb: None,
+                    snp_observer: Some(snp_observer),
+                    attestation_observer: None,
+                    tls_roots,
+                })
+                .await
+                .map_err(|e| e.to_string())
+            })
         })
-        .await
-        .map_err(|e| {
-            error!("Tinfoil attesting client build failed: {e}");
-            e
-        })?;
+    };
 
+    // Bootstrap the runtime trust: resolve + verify the latest release's
+    // measurement, build the initial attesting client, and start the periodic
+    // refresh task. There is no static fallback — if the measurement can't be
+    // resolved and verified at boot, the server refuses to start.
+    info!("Resolving Tinfoil upstream measurement and building attesting client...");
+    let upstream = eidola_server::upstream_trust::UpstreamTrust::bootstrap(
+        config.tinfoil_repo.clone(),
+        client_factory,
+    )
+    .await
+    .map_err(|e| {
+        error!("Upstream trust bootstrap failed: {e}");
+        e
+    })?;
+    let client_cell = upstream.client_cell();
+    std::sync::Arc::clone(&upstream).spawn_refresh();
+
+    // Readiness: attest the enclave once through the current client, failing
+    // fast at startup if the upstream is misconfigured or attestation fails.
     info!("Smoke-testing Tinfoil enclave attestation via {inference_base_url}/models...");
-    attesting_client
+    client_cell
+        .load()
         .get(format!("{inference_base_url}/models"))
         .header(
             "authorization",
@@ -299,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create shared state
     let state = AppState::new(
         TinfoilBackend::new(
-            attesting_client,
+            client_cell,
             config.tinfoil_api_key.clone(),
             config.tinfoil_base_url.clone(),
             config.pricing_markup,

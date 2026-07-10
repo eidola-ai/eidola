@@ -12,9 +12,8 @@ This file is for contributors who need to *modify* something here.
 | --- | --- | --- |
 | `schema/attestation-templates-v1.json` | Pinned claim templates for human release attestations. Schema-versioned; the verifier re-renders each claim from these templates and rejects attestations whose claim text does not match | `crates/eidola-app-core/build.rs` |
 | `trust/trust-constants.json` | Non-derivable trust values: pinned attestant fingerprints, CI identity pattern, minimum-attestation count, supported schema versions, update-discovery URL | `crates/eidola-app-core/build.rs` |
-| `trust/sigstore-trusted-root.json` | Snapshot of the upstream Sigstore `TrustedRoot` (Fulcio CAs, Rekor public keys, CT log keys, TSAs) | `crates/eidola-app-core/build.rs` |
+| `trust/sigstore-trusted-root.json` | Snapshot of the upstream Sigstore `TrustedRoot` (Fulcio CAs, Rekor public keys, CT log keys, TSAs) | `crates/eidola-app-core/build.rs` (updater) and `crates/eidola-server/build.rs` (runtime upstream-measurement resolver) |
 | `trust/server-enclave.json` | The paired server enclave measurement (SEV-SNP launch digest, TDX RTMR1/RTMR2, kernel cmdline). Materialized as its own file so the cli build can COPY it without dragging the full manifest into its build context | `crates/eidola-app-core/build.rs` |
-| `trust/tinfoil-enclaves.json` | Allowed upstream Tinfoil inference-enclave measurements (one entry per Tinfoil release, with provenance metadata; the workflow keeps the most recent two for rolling deploys) | `crates/eidola-server/build.rs` |
 | `trust/attestant-provenance/` | **Informational only** — optional hardware-attestation evidence (e.g. YubiKey-PIV certs) that a pinned attestant fingerprint is a real on-device, policy-constrained key. See its [`README.md`](trust/attestant-provenance/README.md) | nothing — auditor-facing |
 
 Most files here are **build inputs**. The corresponding **build output** — `artifact-manifest.json` at the repo root — is signed by CI and records the digests of what was actually produced. The two are kept separate to prevent build-context self-reference (see [`docs/trust-root.md`](../docs/trust-root.md#why-the-enclave-block-lives-in-its-own-file)).
@@ -74,12 +73,6 @@ This is the mechanism that prevents a coerced release from silently weakening a 
 2. Update `trust-constants.json`.
 3. Cut a release. The new client embeds the new URL, which the server deployment must serve under (configure Tinfoil's container DNS accordingly before publishing the release).
 
-## Updating the upstream inference enclave list
+## Upstream inference enclave measurements
 
-`trust/tinfoil-enclaves.json` is updated by the `.github/workflows/update-measurements.yml` workflow, which:
-
-1. Pulls the latest measurements from the upstream's published release feed.
-2. Verifies the provenance via Sigstore (`gh attestation verify --deny-self-hosted-runners`) against the expected repository identity.
-3. Opens a PR that adds the new measurement and removes any measurements older than the rolling-deploy window (currently keeping the most recent two).
-
-A new upstream measurement does not silently become trusted: it goes through the same review-and-merge process as any other source change, and the resulting Eidola server build embeds the new list.
+There is no pinned upstream-measurement file here anymore. The Eidola server resolves the allowed upstream inference-enclave measurement **at runtime** from the provider's latest release and verifies its Sigstore provenance (against `sigstore-trusted-root.json`) before trusting it — see `crates/eidola-server/src/upstream_trust` and [`docs/upstream.md`](../docs/upstream.md#what-pins-the-upstream-measurement). Nothing to rotate in this directory for upstream measurements; keep `sigstore-trusted-root.json` current (below) so that verification keeps working.

@@ -55,13 +55,15 @@ ARG CARGO_PROFILE=release
 
 COPY crates/ ./crates/
 
-# Trust-root build input: `eidola-server/build.rs` reads this file to
-# generate the allowed Tinfoil inference-enclave measurements. We
-# deliberately COPY only this one path rather than `releases/` wholesale
-# — other files in `releases/trust/` (notably `server-enclave.json`) are
-# functions of our own server image's digest and would create a
-# circular cache dependency if pulled in here.
-COPY releases/trust/tinfoil-enclaves.json ./releases/trust/tinfoil-enclaves.json
+# Trust-root build input: `eidola-server/build.rs` embeds the pinned Sigstore
+# trusted root (sigstore-trusted-root.json) that the runtime measurement
+# resolver (`src/upstream_trust`) verifies Tinfoil release attestations
+# against. We deliberately COPY only this one path rather than `releases/`
+# wholesale — other files in `releases/trust/` (notably `server-enclave.json`)
+# are functions of our own server image's digest and would create a circular
+# cache dependency if pulled in here. This file is external Sigstore public
+# material, so it introduces no such cycle.
+COPY releases/trust/sigstore-trusted-root.json ./releases/trust/sigstore-trusted-root.json
 
 # Ensure Cargo detects source changes over the fetch-stage stubs.
 # SOURCE_DATE_EPOCH=0 clamps COPY timestamps to epoch 0, matching the

@@ -85,7 +85,7 @@ The Eidola server is **not** the inference engine. Models run in a separate conf
 3. Stream the request through, stream the response back.
 4. Record the per-request token counts for accounting.
 
-This means **two layers of confidential compute** protect the inference content: the Eidola server enclave (which sees the content only in transit, never logged) and the inference upstream enclave (which actually performs the inference). The client verifies the attestation of the Eidola server directly on every handshake. For the upstream layer, see [upstream.md](upstream.md).
+This means **two layers of confidential compute** protect the inference content: the Eidola server enclave (which sees the content only in transit, never logged) and the upstream provider's confidential-compute enclaves that perform the inference. The upstream is itself a *router* enclave that forwards to a separate per-model enclave; the Eidola server attests the router it connects to on every handshake, and how far that verification reaches (and where it stops) is detailed in [upstream.md](upstream.md) and [gaps.md § Inference upstream](gaps.md#inference-upstream). The client verifies the attestation of the Eidola server directly on every handshake.
 
 ## Where to read the code
 

@@ -284,7 +284,12 @@ struct PricingOverride {
 /// Sends OpenAI-format requests to Tinfoil's API. All Tinfoil models run
 /// inside confidential enclaves with attestation-verified TLS.
 pub struct TinfoilBackend {
-    client: reqwest::Client,
+    /// The attesting upstream client, held in a swappable cell so the
+    /// `upstream_trust` refresh task can hot-swap in a client built over a
+    /// new allowed-measurement set without rebuilding the backend. Each
+    /// request reads the current client lock-free via `load()`. See
+    /// `src/upstream_trust`.
+    client: std::sync::Arc<arc_swap::ArcSwap<reqwest::Client>>,
     api_key: String,
     base_url: String,
     /// Static model list built from `MODEL_CATALOG` with optional pricing overrides.
@@ -293,7 +298,7 @@ pub struct TinfoilBackend {
 
 impl TinfoilBackend {
     pub fn new(
-        client: reqwest::Client,
+        client: std::sync::Arc<arc_swap::ArcSwap<reqwest::Client>>,
         api_key: String,
         base_url: Option<String>,
         pricing_markup: Option<f64>,
@@ -393,6 +398,7 @@ impl ChatBackend for TinfoilBackend {
 
         let response = self
             .client
+            .load()
             .post(&url)
             .header("authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
@@ -463,6 +469,7 @@ impl ChatBackend for TinfoilBackend {
 
         let response = self
             .client
+            .load()
             .post(&url)
             .header("authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
@@ -710,7 +717,12 @@ mod tests {
     #[test]
     fn test_lookup_model() {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
-        let backend = TinfoilBackend::new(reqwest::Client::new(), String::new(), None, Some(1.5));
+        let backend = TinfoilBackend::new(
+            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(reqwest::Client::new())),
+            String::new(),
+            None,
+            Some(1.5),
+        );
 
         assert!(backend.lookup_model("kimi-k2-6").is_some());
         assert!(backend.lookup_model("nonexistent").is_none());

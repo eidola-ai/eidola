@@ -2723,11 +2723,14 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm 0.11.0",
  "anonymous-credit-tokens",
+ "arc-swap",
  "argon2",
  "axum",
  "base64 0.22.1",
  "bytes",
+ "const-oid 0.9.6",
  "deadpool-postgres",
+ "der",
  "eidola-common",
  "futures-util",
  "hex",
@@ -2737,7 +2740,10 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "p256",
+ "p384",
  "rand_core 0.6.4",
+ "regex",
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "rustls",
@@ -2746,6 +2752,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "signature",
+ "spki",
  "subtle",
  "tinfoil-verifier",
  "tokio",
@@ -2759,6 +2767,7 @@ dependencies = [
  "utoipa-axum",
  "uuid",
  "webpki-roots",
+ "x509-cert",
 ]
 
 [[package]]

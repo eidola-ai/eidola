@@ -167,8 +167,9 @@
                   # consume pinned trust data from `releases/`:
                   #   * eidola-app-core → all of `releases/trust/*.json` +
                   #     `releases/schema/*.json` (client trust root)
-                  #   * eidola-server → just `releases/trust/tinfoil-enclaves.json`
-                  #     (allowed upstream Tinfoil inference-enclave measurements)
+                  #   * eidola-server → just `releases/trust/sigstore-trusted-root.json`
+                  #     (pinned Sigstore root; the runtime measurement resolver
+                  #     verifies Tinfoil release attestations against it)
                   # Include `releases/` when either crate is in the set, but
                   # only for those crates — unrelated crates shouldn't
                   # cache-bust on every manifest regeneration.
