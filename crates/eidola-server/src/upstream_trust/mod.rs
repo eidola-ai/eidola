@@ -27,10 +27,13 @@
 //!
 //! # Failure posture
 //!
-//! - **Boot:** one synchronous resolution acts as the readiness gate. There
-//!   is no static fallback — if the measurement can't be resolved and
-//!   verified at boot (GitHub unreachable, bad signature, …) the server
-//!   refuses to start.
+//! - **Boot:** one synchronous resolution of the *latest* release acts as the
+//!   readiness gate. There is no static fallback — if that measurement can't
+//!   be resolved and verified at boot (GitHub unreachable, bad signature, …)
+//!   the server refuses to start. The initial allowed set also folds in the
+//!   *previous* published release (best-effort, non-fatal) so a cold start
+//!   during a rolling deploy still attests the draining old enclave —
+//!   matching the refresh path's rolling window of 2.
 //! - **Refresh:** a resolution or client-rebuild failure keeps the current
 //!   set — we never clear trust or widen it on error. A new measurement is
 //!   only adopted after the replacement client is built successfully.
@@ -94,8 +97,19 @@ struct ResolverState {
 
 impl UpstreamTrust {
     /// Resolve + verify the latest release's measurement and build the
-    /// initial attesting client. There is no fallback: if resolution fails,
-    /// this returns `Err` and the server refuses to start.
+    /// initial attesting client. There is no fallback: if the *latest*
+    /// measurement can't be resolved, this returns `Err` and the server
+    /// refuses to start.
+    ///
+    /// The initial allowed set is a rolling window of 2 — the latest release
+    /// plus the immediately-previous published release — mirroring the
+    /// refresh path (`refresh_once`). Without the previous entry, a cold
+    /// start that lands mid rolling-deploy (when the still-draining previous
+    /// router enclave may answer the readiness probe) would fail attestation
+    /// and abort startup. The previous entry is *best-effort*: unlike the
+    /// latest (the readiness gate), a missing or unverifiable previous
+    /// release does not fail boot — we start with the single latest
+    /// measurement and the next successful refresh re-establishes the window.
     pub async fn bootstrap(
         repo: String,
         factory: AttestingClientFactory,
@@ -103,16 +117,46 @@ impl UpstreamTrust {
         let github = build_github_client()?;
         let trust = sigstore::load_trusted_root().map_err(|e| e.to_string())?;
 
-        let latest = resolve_latest(&github, &repo, &trust)
+        let latest_tag = latest_tag(&github, &repo)
+            .await
+            .map_err(|e| format!("resolving latest upstream release tag at boot: {e}"))?;
+        let latest = resolve_tag(&github, &repo, &latest_tag, &trust)
             .await
             .map_err(|e| format!("resolving upstream measurement at boot: {e}"))?;
         info!(
+            tag = %latest_tag,
             tag_identity = %latest.ci_identity,
             rekor_log_index = latest.rekor_log_index,
             "Resolved Tinfoil upstream measurement from latest release attestation"
         );
 
-        let client = (factory)(vec![to_enclave(&latest)])
+        // Fold in the previous published release so the readiness probe (and
+        // early requests) still attest against a router enclave that hasn't
+        // finished draining. Best-effort — see the doc comment.
+        let mut allowed = vec![to_enclave(&latest)];
+        match resolve_previous(&github, &repo, &latest_tag, &trust).await {
+            Ok(Some((prev_tag, prev))) => {
+                info!(
+                    tag = %prev_tag,
+                    tag_identity = %prev.ci_identity,
+                    "Including previous release measurement in initial allowed set (rolling-deploy overlap)"
+                );
+                allowed.push(to_enclave(&prev));
+            }
+            Ok(None) => {
+                info!(
+                    "No previous published release to include; starting with latest measurement only"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Could not resolve previous release measurement at boot; starting with latest only"
+                );
+            }
+        }
+
+        let client = (factory)(allowed)
             .await
             .map_err(|e| format!("building initial attesting client: {e}"))?;
 
@@ -238,9 +282,16 @@ async fn resolve_latest(
     repo: &str,
     trust: &TrustedRoot,
 ) -> std::result::Result<VerifiedMeasurement, TrustError> {
-    let trust_err = |m: String| TrustError(m);
+    let tag = latest_tag(github, repo).await?;
+    resolve_tag(github, repo, &tag, trust).await
+}
 
-    // 1. Latest release tag.
+/// GitHub's "latest" published (non-draft, non-prerelease) release tag.
+async fn latest_tag(
+    github: &reqwest::Client,
+    repo: &str,
+) -> std::result::Result<String, TrustError> {
+    let trust_err = |m: String| TrustError(m);
     let release: serde_json::Value = github
         .get(format!(
             "https://api.github.com/repos/{repo}/releases/latest"
@@ -254,10 +305,83 @@ async fn resolve_latest(
         .json()
         .await
         .map_err(|e| trust_err(format!("parsing latest release JSON: {e}")))?;
-    let tag = release
+    release
         .get("tag_name")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| trust_err("latest release JSON has no tag_name".into()))?;
+        .map(|s| s.to_string())
+        .ok_or_else(|| trust_err("latest release JSON has no tag_name".into()))
+}
+
+/// The most recent published release whose tag precedes `latest_tag` — i.e.
+/// the release that was serving before the latest one, and which may still be
+/// draining during a rolling deploy. Returns its resolved + verified
+/// measurement, or `None` if the repo has only a single published release.
+///
+/// GitHub's `GET /releases` list is ordered newest-first by `created_at`;
+/// after dropping drafts/prereleases (which `releases/latest` also ignores)
+/// and the `latest_tag` entry itself, the first remaining release is the
+/// previous one.
+async fn resolve_previous(
+    github: &reqwest::Client,
+    repo: &str,
+    latest_tag: &str,
+    trust: &TrustedRoot,
+) -> std::result::Result<Option<(String, VerifiedMeasurement)>, TrustError> {
+    let trust_err = |m: String| TrustError(m);
+    let releases: serde_json::Value = github
+        .get(format!(
+            "https://api.github.com/repos/{repo}/releases?per_page=10"
+        ))
+        .header("accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| trust_err(format!("listing releases: {e}")))?
+        .error_for_status()
+        .map_err(|e| trust_err(format!("releases list request returned error: {e}")))?
+        .json()
+        .await
+        .map_err(|e| trust_err(format!("parsing releases list JSON: {e}")))?;
+    let list = releases
+        .as_array()
+        .ok_or_else(|| trust_err("releases list JSON is not an array".into()))?;
+
+    let Some(previous_tag) = select_previous_tag(list, latest_tag) else {
+        return Ok(None);
+    };
+    let previous_tag = previous_tag.to_string();
+    let measurement = resolve_tag(github, repo, &previous_tag, trust).await?;
+    Ok(Some((previous_tag, measurement)))
+}
+
+/// Pick the previous published release tag from a newest-first GitHub
+/// `/releases` list: the first release that is neither a draft nor a
+/// prerelease and whose tag isn't `latest_tag`. Pure (no I/O) so the
+/// filtering rules are unit-testable.
+fn select_previous_tag<'a>(releases: &'a [serde_json::Value], latest_tag: &str) -> Option<&'a str> {
+    releases
+        .iter()
+        .filter(|r| {
+            !r.get("draft").and_then(|v| v.as_bool()).unwrap_or(false)
+                && !r
+                    .get("prerelease")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+        })
+        .filter_map(|r| r.get("tag_name").and_then(|v| v.as_str()))
+        .find(|tag| *tag != latest_tag)
+}
+
+/// Resolve and verify a specific release tag's measurement:
+/// `tinfoil.hash` digest → attestation bundle → full Sigstore DSSE
+/// verification (pinned to `repo` + `tag`) → measurement from the signed
+/// in-toto predicate.
+async fn resolve_tag(
+    github: &reqwest::Client,
+    repo: &str,
+    tag: &str,
+    trust: &TrustedRoot,
+) -> std::result::Result<VerifiedMeasurement, TrustError> {
+    let trust_err = |m: String| TrustError(m);
 
     // 2. `tinfoil.hash` — the sha256 of tinfoil-deployment.json (the
     //    attestation subject). We look up the attestation by this digest and
@@ -322,4 +446,53 @@ async fn resolve_latest(
         }
     }
     Err(last_err.unwrap_or_else(|| trust_err("no verifiable attestation bundle found".into())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_previous_tag;
+    use serde_json::json;
+
+    #[test]
+    fn picks_the_second_published_release() {
+        let list = vec![
+            json!({ "tag_name": "v0.0.115" }),
+            json!({ "tag_name": "v0.0.114" }),
+            json!({ "tag_name": "v0.0.113" }),
+        ];
+        assert_eq!(select_previous_tag(&list, "v0.0.115"), Some("v0.0.114"));
+    }
+
+    #[test]
+    fn skips_drafts_and_prereleases_ahead_of_the_previous() {
+        // Newest-first list where the entries between latest and the real
+        // previous are a draft and a prerelease — both must be skipped.
+        let list = vec![
+            json!({ "tag_name": "v0.0.116", "draft": true }),
+            json!({ "tag_name": "v0.0.115" }),
+            json!({ "tag_name": "v0.0.115-rc1", "prerelease": true }),
+            json!({ "tag_name": "v0.0.114" }),
+        ];
+        assert_eq!(select_previous_tag(&list, "v0.0.115"), Some("v0.0.114"));
+    }
+
+    #[test]
+    fn returns_none_for_a_single_published_release() {
+        let list = vec![json!({ "tag_name": "v0.0.115" })];
+        assert_eq!(select_previous_tag(&list, "v0.0.115"), None);
+    }
+
+    #[test]
+    fn returns_none_when_only_prereleases_precede_latest() {
+        let list = vec![
+            json!({ "tag_name": "v0.0.115" }),
+            json!({ "tag_name": "v0.0.114-rc1", "prerelease": true }),
+        ];
+        assert_eq!(select_previous_tag(&list, "v0.0.115"), None);
+    }
+
+    #[test]
+    fn empty_list_yields_none() {
+        assert_eq!(select_previous_tag(&[], "v0.0.115"), None);
+    }
 }
