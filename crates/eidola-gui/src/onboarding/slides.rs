@@ -176,11 +176,13 @@ impl RenderOnce for Responsibility {
 
 // -- GetStarted --------------------------------------------------------------
 
-/// "Get started" — the branch point (new vs. existing account).
+/// "Get started" — the branch point (new vs. existing account), plus the
+/// quiet third way: no account at all (on-device inference only).
 #[derive(IntoElement)]
 pub(super) struct GetStarted {
     pub on_new_account: OnClick,
     pub on_existing_account: OnClick,
+    pub on_skip_account: OnClick,
 }
 
 impl GetStarted {
@@ -191,6 +193,8 @@ impl GetStarted {
 
 impl RenderOnce for GetStarted {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let fg = cx.theme().muted_foreground;
+        let fg_hover = cx.theme().foreground;
         slide_frame(
             "get-started",
             Self::MARKDOWN,
@@ -208,6 +212,26 @@ impl RenderOnce for GetStarted {
                     "I already have an account.",
                     self.on_existing_account,
                 ))
+                // The account-free path: quiet by design — a real choice,
+                // not a promoted one. It disables the Eidola backend, so
+                // asks route only to on-device (and self-configured)
+                // backends and onboarding stops auto-opening.
+                .child(
+                    div()
+                        .id("onboarding-skip-account")
+                        .probe(
+                            "onboarding/cta/skip-account",
+                            Role::Button,
+                            "Continue without an account — on-device models only",
+                        )
+                        .mt_2()
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(fg)
+                        .hover(move |s| s.text_color(fg_hover))
+                        .child("Continue without an account — on-device models only.")
+                        .on_click(self.on_skip_account),
+                )
                 .into_any_element(),
             window,
             cx,

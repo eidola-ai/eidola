@@ -109,7 +109,20 @@ cargo run -p eidola-cli -- model download gemma-4-e2b   # or any .gguf / Hugging
 cargo run -p eidola-cli -- chat "hello" --model local/gemma-4-E2B_q4_0-it
 ```
 
-Local models are identified as `local/<file-stem>` and stored under the app data directory (`~/Library/Application Support/eidola/models/` on macOS). In the GUI, **Settings → Models** manages downloads and engine load/unload, and loaded models appear at the top of the model picker under "On this device".
+Local models are identified as `local/<file-stem>` and stored under the app data directory (`~/Library/Application Support/eidola/models/` on macOS). In the GUI, **Settings → Backends** manages downloads and engine load/unload, and loaded models appear at the top of the model picker under "On this device".
+
+### Backends
+
+Where an ask can be routed is configurable. Besides the built-in **Eidola** (confidential service) and **local** (managed on-device models) backends, you can add any OpenAI-compatible server — a self-hosted vLLM/Ollama box, or a conventional provider you choose to trust without confidential-computing guarantees — or point Eidola at a llama.cpp models directory you manage yourself (Eidola starts/stops the engines, never touches the files):
+
+```bash
+cargo run -p eidola-cli -- backend add openai my-vllm --url http://192.168.1.20:8000 --api-key sk-…
+cargo run -p eidola-cli -- backend add llamacpp my-box --models-dir ~/models
+cargo run -p eidola-cli -- chat "hello" --model "qwen3-8b@my-vllm"
+cargo run -p eidola-cli -- backend disable eidola   # no-account, on-device-only mode
+```
+
+Models on a configured backend are addressed as `<model>@<backend-id>`. Because not every "OpenAI-compatible" server implements `GET /v1/models`, a backend's model list can be pinned manually (`--models a,b`). In the GUI, **Settings → Backends** manages all of this, and the model picker groups models per backend with per-backend retry/refresh.
 
 ### GUI
 

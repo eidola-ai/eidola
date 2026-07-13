@@ -1123,11 +1123,11 @@ fn request_panel_offline_shows_local_models_and_retry(cx: &mut TestAppContext) {
     );
     // ...and the remote list offers a retry, not silent nothing.
     assert!(
-        names.contains(&"space/request-panel/retry".to_string()),
-        "retry affordance missing on a failed remote fetch: {names:?}"
+        names.contains(&"space/request-panel/eidola/retry".to_string()),
+        "per-backend retry affordance missing on a failed eidola fetch: {names:?}"
     );
     assert!(
-        !names.contains(&"space/request-panel/refresh".to_string()),
+        !names.contains(&"space/request-panel/eidola/refresh".to_string()),
         "a failed fetch shows retry, not refresh: {names:?}"
     );
 
@@ -1163,12 +1163,115 @@ fn request_panel_shows_refresh_when_remote_loaded(cx: &mut TestAppContext) {
     let names = fresh_names(cx, window);
     // A refresh is offered even over a *successful* remote list.
     assert!(
-        names.contains(&"space/request-panel/refresh".to_string()),
-        "refresh affordance must be available over a good remote list: {names:?}"
+        names.contains(&"space/request-panel/eidola/refresh".to_string()),
+        "per-backend refresh affordance must be available over a good list: {names:?}"
     );
     assert!(
-        !names.contains(&"space/request-panel/retry".to_string()),
+        !names.contains(&"space/request-panel/eidola/retry".to_string()),
         "a good fetch shows refresh, not retry: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn request_panel_groups_per_backend_with_independent_health(cx: &mut TestAppContext) {
+    use eidola_gui::loadable::Loadable;
+    use eidola_gui::stores::BackendCatalog;
+
+    let _guard = probes_on();
+
+    // A full multi-backend scene: the local singleton with a loaded engine,
+    // a llamacpp backend with a loaded engine, a healthy eidola catalog,
+    // and an openai backend whose fetch failed.
+    let mut external_fixture = local_models_fixture();
+    if let Some(m) = external_fixture
+        .external
+        .get_mut(0)
+        .and_then(|b| b.models.get_mut(0))
+    {
+        m.status = eidola_app_core::LocalModelStatus::Loaded {
+            port: 4243,
+            context_tokens: 8192,
+        };
+    }
+    let stores = stub_stores(cx, |s| {
+        s.config_state = None;
+        s.backends = backends_fixture();
+        s.local_models = Some(external_fixture);
+        s.backend_catalogs = Some(vec![
+            BackendCatalog {
+                backend: eidola_app_core::BackendInfo {
+                    id: "eidola".into(),
+                    kind: eidola_app_core::BackendKind::Eidola,
+                    display_name: "Eidola".into(),
+                    enabled: true,
+                    base_url: None,
+                    has_api_key: false,
+                    models_dir: None,
+                    model_overrides: None,
+                    created_at: 0,
+                },
+                models: Loadable::loaded(vec![ModelInfo {
+                    id: "gemma4-31b".into(),
+                    context_length: 131_072,
+                    prompt_credits_per_token: 0.53,
+                    completion_credits_per_token: 1.5,
+                    request_credits: None,
+                }]),
+            },
+            BackendCatalog {
+                backend: eidola_app_core::BackendInfo {
+                    id: "my-vllm".into(),
+                    kind: eidola_app_core::BackendKind::OpenAi,
+                    display_name: "My vLLM".into(),
+                    enabled: true,
+                    base_url: Some("http://10.0.0.2:8000".into()),
+                    has_api_key: true,
+                    models_dir: None,
+                    model_overrides: None,
+                    created_at: 1,
+                },
+                models: Loadable::Failed {
+                    error: eidola_app_core::error::AppError::Internal {
+                        message: "connection refused".into(),
+                    },
+                    prior: None,
+                },
+            },
+        ]);
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    for expected in [
+        // Engine groups: the managed store and the llamacpp backend.
+        "space/request-panel/local/0",
+        "space/request-panel/engine/my-box/0",
+        // The healthy eidola catalog: rows + refresh, no retry.
+        "space/request-panel/row/0",
+        "space/request-panel/eidola/refresh",
+        // The dead openai backend: its own retry — nobody else's health.
+        "space/request-panel/my-vllm/retry",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "multi-backend panel probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"space/request-panel/eidola/retry".to_string()),
+        "one backend's failure must not mark another's group: {names:?}"
     );
 
     probe::set_probes_enabled(false);

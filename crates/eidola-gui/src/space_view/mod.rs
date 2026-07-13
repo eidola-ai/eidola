@@ -386,6 +386,8 @@ impl SpaceView {
             // it's open must re-render. Offline, the models store is quiet, so
             // this is the *only* signal that would refresh the panel.
             cx.observe(&stores.local_models, |_, _, cx| cx.notify()),
+            // Backend enable/disable flips which groups the panel shows.
+            cx.observe(&stores.backends, |_, _, cx| cx.notify()),
         ];
 
         let mut this = Self {

@@ -40,8 +40,9 @@ One gpui entity per domain, created at startup, held by `AppGlobal`, observed by
 | Store | Owns | Notes |
 |---|---|---|
 | `ConfigStore` | `ConfigState` snapshot; set/clear overrides, default model | Synchronous reads, write-through; emits `Config` |
-| `ModelsStore` | model list + pricing | Refreshed at launch + on demand; first-window list comes from here (fixes wave-2 bug 1 structurally) |
-| `LocalModelsStore` | local-inference snapshot (models on disk / downloading, running engines, engine binary) | Refreshed at launch + on `LocalModels`; ops are thin initiating calls — the downloads/engine supervisors are core-owned tasks that survive any window |
+| `BackendsStore` | the backend registry (configured inference destinations) | Refreshed at launch + on `Backends`; add/enable/remove ops with optimistic list edits |
+| `ModelsStore` | per-backend model catalogs (one `Loadable` + fetch slot per fetch-based backend) | Refreshed at launch + on demand; `refresh_backend(id)` re-fetches one — a dead server never blanks another's list (first-window list comes from here; fixes wave-2 bug 1 structurally) |
+| `LocalModelsStore` | engine-domain snapshot (managed models on disk / downloading, running engines, engine binary, each llamacpp backend's scanned directory) | Refreshed at launch + on `LocalModels`; ops are thin initiating calls — the downloads/engine supervisors are core-owned tasks that survive any window |
 | `AccountStore` | balances, prices, account lifecycle, checkout | The checkout *poll* is view-owned (see scoping); its result lands here via invalidation |
 | `WalletStore` | credential lifecycle list, recovery | |
 | `SpacesStore` | the Library index **and** the space-entity registry (below) | |
@@ -126,6 +127,7 @@ pub enum Change {
     Record,             // attestations / requests / spend trail appended
     UpdateState,
     LocalModels,        // local model downloads / engine lifecycle
+    Backends,           // the backend registry (add/update/enable/remove)
 }
 ```
 
@@ -146,7 +148,8 @@ Any list that can exceed roughly one screen renders through gpui's virtualized p
 | State | Scope | Owner |
 |---|---|---|
 | Config / overrides / default model | global | `ConfigStore` |
-| Models + pricing | global | `ModelsStore` |
+| Backend registry | global | `BackendsStore` |
+| Per-backend model catalogs | global | `ModelsStore` |
 | Local models + engines | global | `LocalModelsStore` (snapshots; the work itself is core-owned) |
 | Balances, prices, account lifecycle | global | `AccountStore` |
 | Credential lifecycle | global | `WalletStore` |

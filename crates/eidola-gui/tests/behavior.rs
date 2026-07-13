@@ -2808,6 +2808,46 @@ fn onboarding_starts_on_first_slide(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn onboarding_skip_account_disables_eidola_and_closes(cx: &mut TestAppContext) {
+    // The GetStarted slide's quiet third choice: no account at all. It
+    // disables the eidola backend (optimistically visible in the store; the
+    // stub has no core, so the op stops at the guard) and closes the window.
+    let stores = stub_stores(cx, |s| {
+        s.backends = vec![eidola_app_core::BackendInfo {
+            id: "eidola".into(),
+            kind: eidola_app_core::BackendKind::Eidola,
+            display_name: "Eidola".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            created_at: 0,
+        }];
+    });
+    let (window, view) = open_onboarding(cx, &stores);
+
+    stores
+        .backends
+        .read_with(cx, |b, _| assert!(b.is_enabled("eidola")));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.skip_account(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    stores.backends.read_with(cx, |b, _| {
+        assert!(
+            !b.is_enabled("eidola"),
+            "skip must disable the eidola backend"
+        );
+    });
+    // The onboarding window is gone.
+    let open_windows = cx.update(|cx| cx.windows().len());
+    assert_eq!(open_windows, 0, "skip must close the onboarding window");
+}
+
+#[gpui::test]
 fn onboarding_reveal_advances_and_is_idempotent(cx: &mut TestAppContext) {
     let stores = stub_stores(cx, |_| {});
     let (_w, view) = open_onboarding(cx, &stores);

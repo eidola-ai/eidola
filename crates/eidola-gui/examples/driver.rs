@@ -331,13 +331,57 @@ mod driver {
     }
 
     /// A funded, ready account with a populated model list (so the ⌥ model
-    /// reveal and picker are live).
+    /// reveal and picker are live), the backend registry (so the Backends
+    /// settings pane and the picker's per-backend groups render), and the
+    /// engine fixtures.
     fn ready_stores(cx: &mut App) -> Stores {
         stub_stores(cx, |s| {
             s.config_state = Some(config_state(true));
             s.models = models();
+            s.backends = backends();
             s.local_models = Some(local_models_state());
         })
+    }
+
+    /// Backend-registry fixture: the two singletons plus one external
+    /// OpenAI-compatible server, mirroring a configured multi-backend setup.
+    fn backends() -> Vec<eidola_app_core::BackendInfo> {
+        use eidola_app_core::{BackendInfo, BackendKind};
+        vec![
+            BackendInfo {
+                id: "eidola".into(),
+                kind: BackendKind::Eidola,
+                display_name: "Eidola".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                created_at: 0,
+            },
+            BackendInfo {
+                id: "local".into(),
+                kind: BackendKind::Local,
+                display_name: "On this device".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                created_at: 0,
+            },
+            BackendInfo {
+                id: "my-vllm".into(),
+                kind: BackendKind::OpenAi,
+                display_name: "My vLLM box".into(),
+                enabled: true,
+                base_url: Some("http://192.168.1.20:8000".into()),
+                has_api_key: true,
+                models_dir: None,
+                model_overrides: Some(vec!["qwen3-8b".into()]),
+                created_at: 1,
+            },
+        ]
     }
 
     /// Local-inference fixture: one model loaded and serving, one merely
@@ -531,6 +575,7 @@ mod driver {
                 ],
             });
             s.prices = prices();
+            s.backends = backends();
             s.local_models = Some(local_models_state());
         })
     }

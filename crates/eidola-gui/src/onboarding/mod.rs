@@ -314,6 +314,18 @@ impl OnboardingView {
 
     // -- Account operations ------------------------------------------------
 
+    /// The account-free path: disable the `eidola` backend (recorded in the
+    /// DB, so launch stops auto-opening onboarding) and close this window.
+    /// Asks then route only to on-device / self-configured backends; the
+    /// choice reverses any time in Settings → Backends (or by walking this
+    /// flow again from the Eidola menu).
+    pub fn skip_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stores
+            .backends
+            .update(cx, |s, cx| s.set_enabled("eidola".into(), false, cx));
+        window.remove_window();
+    }
+
     /// Create an anonymous account (new-account branch). On success, store the
     /// id/secret, refresh config + balances, and reveal the "Your new account"
     /// slide; on failure, surface the error inline.
@@ -599,6 +611,9 @@ impl OnboardingView {
                 on_existing_account: Box::new(cx.listener(|this, _, _, cx| {
                     this.reveal(Slide::GetStarted, Slide::ExistingAccount, cx)
                 })),
+                on_skip_account: Box::new(
+                    cx.listener(|this, _, window, cx| this.skip_account(window, cx)),
+                ),
             }
             .into_any_element(),
             Slide::CreateAccount => slides::CreateAccount {
