@@ -486,11 +486,49 @@ impl Space {
     /// so no spinner outlives its task ("every spinner maps to a live task");
     /// a re-fetch over data stays `Loaded { stale: true }` until the
     /// mutation's reload resolves it.
+    ///
+    /// **Cancelling here creates a debt**: the cancelled load may have carried
+    /// another writer's change (a bus-driven refresh), so the mutation must
+    /// re-establish the durable truth at *every* exit — the success arms
+    /// reload inline, and every failure arm goes through
+    /// [`Self::fail_mutation`], which restarts the load.
     fn supersede_load_for_mutation(&mut self) {
         self.load_task = None;
         if self.transcript.is_loading() {
             self.transcript = Loadable::NotLoaded;
         }
+    }
+
+    /// Shared failure completion for every mutation runner (submit /
+    /// post-only / edit / regenerate): clear the streaming state and the
+    /// runner slot, adopt the id a `ChatFailed` wrapper carries (blank-space
+    /// adoption on failure), **restart the transcript load**, and emit
+    /// `Failed` with the unwrapped source so the view's error routing sees
+    /// the real variant.
+    ///
+    /// The reload is load-bearing, not defensive: accepting the mutation
+    /// cancelled any in-flight transcript load
+    /// ([`Self::supersede_load_for_mutation`]) on the promise that the
+    /// mutation's own post-commit reload would re-establish the durable
+    /// truth. The success arms keep that promise inline; this keeps it on
+    /// failure — otherwise a cancelled bus-driven refresh (another writer's
+    /// change) is silently lost, and durable rows committed by the failed
+    /// mutation itself (whose `Change::Space` the [`Self::on_space_changed`]
+    /// guard dropped while the runner slot was occupied) never render until
+    /// the next unrelated invalidation (the codex finding on PR #206). A
+    /// pre-persist failure on a blank space has no id, so `load_transcript`
+    /// no-ops — nothing durable exists to reload.
+    fn fail_mutation(&mut self, e: AppError, cx: &mut Context<Self>) {
+        self.streaming = None;
+        self.submit_runner = None;
+        if self.id.is_none()
+            && let Some(id) = e.chat_space_id()
+        {
+            self.id = Some(id.to_string());
+        }
+        self.load_transcript(cx);
+        cx.emit(SpaceEvent::Failed(e.root().clone()));
+        cx.notify();
     }
 
     /// Submit a prompt with an explicitly-resolved model. The model is
@@ -632,16 +670,7 @@ impl Space {
                     });
                 }
                 Err(e) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.submit_runner = None;
-                        if this.id.is_none()
-                            && let Some(id) = e.chat_space_id()
-                        {
-                            this.id = Some(id.to_string());
-                        }
-                        cx.emit(SpaceEvent::Failed(e.root().clone()));
-                        cx.notify();
-                    });
+                    let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
                 }
             }
         }));
@@ -705,7 +734,8 @@ impl Space {
 
     /// Shared completion for edit/regenerate: on success reload the tree from
     /// the resulting space id (adopting it if the space was blank) and emit
-    /// `StreamEnded`; on failure surface `Failed`. Clears the runner slot.
+    /// `StreamEnded`; on failure [`Self::fail_mutation`] surfaces `Failed`
+    /// and restarts the transcript load. Clears the runner slot either way.
     async fn finish_reload(
         this: gpui::WeakEntity<Self>,
         cx: &mut gpui::AsyncApp,
@@ -741,11 +771,7 @@ impl Space {
                 });
             }
             Err(e) => {
-                let _ = this.update(cx, |this, cx| {
-                    this.submit_runner = None;
-                    cx.emit(SpaceEvent::Failed(e.root().clone()));
-                    cx.notify();
-                });
+                let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
             }
         }
     }
@@ -823,27 +849,10 @@ impl Space {
                     });
                 }
                 Err(e) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.streaming = None;
-                        this.submit_runner = None;
-                        // Blank-space id adoption on the FAILURE path: app-core
-                        // wraps any post-persist error as `ChatFailed` carrying
-                        // the now-persisted space id. If this is the first
-                        // exchange of a blank space (id still `None`), learn the
-                        // id from the wrapper so the registry can adopt this
-                        // entity (mirroring the `StreamEnded` success path) — a
-                        // later open of that id then shares this same `Space`.
-                        if this.id.is_none()
-                            && let Some(id) = e.chat_space_id()
-                        {
-                            this.id = Some(id.to_string());
-                        }
-                        // Surface the *unwrapped* source so the view's error
-                        // routing (and band copy) sees the real error variant,
-                        // not the id-carrying wrapper.
-                        cx.emit(SpaceEvent::Failed(e.root().clone()));
-                        cx.notify();
-                    });
+                    // Blank-space id adoption, the transcript-load restart,
+                    // and the unwrapped `Failed` emission all live in the
+                    // shared failure completion.
+                    let _ = this.update(cx, |this, cx| this.fail_mutation(e, cx));
                 }
             }
         }));
@@ -940,20 +949,14 @@ impl Space {
         self.apply_loaded_transcript(Ok(views), cx)
     }
 
-    /// Test-only: drive the chat-failure outcome exactly as `spawn_stream`'s
-    /// error arm does — adopt the id from a `ChatFailed` wrapper if the space
-    /// is still blank, clear streaming, and emit `Failed` with the unwrapped
-    /// source. Drives the blank-space id-adoption-on-failure regression test.
+    /// Test-only: drive the shared mutation-failure completion exactly as
+    /// every runner's error arm does (it delegates to the same
+    /// [`Self::fail_mutation`]): adopt the id from a `ChatFailed` wrapper if
+    /// the space is still blank, clear streaming, restart the transcript
+    /// load, and emit `Failed` with the unwrapped source. Drives the
+    /// blank-space id-adoption and failure-restarts-load regression tests.
     #[doc(hidden)]
     pub fn apply_chat_failure_for_test(&mut self, error: AppError, cx: &mut Context<Self>) {
-        self.streaming = None;
-        self.submit_runner = None;
-        if self.id.is_none()
-            && let Some(id) = error.chat_space_id()
-        {
-            self.id = Some(id.to_string());
-        }
-        cx.emit(SpaceEvent::Failed(error.root().clone()));
-        cx.notify();
+        self.fail_mutation(error, cx);
     }
 }
