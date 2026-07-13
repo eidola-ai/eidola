@@ -64,6 +64,11 @@ enum Command {
         #[command(subcommand)]
         command: ModelCommand,
     },
+    /// Manage inference backends (where an ask can be routed)
+    Backend {
+        #[command(subcommand)]
+        command: BackendCommand,
+    },
     /// Check for and verify newer releases
     Update {
         #[command(subcommand)]
@@ -181,6 +186,74 @@ enum ModelCommand {
     Unload {
         /// Model id (`local/<slug>`) or bare slug
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackendCommand {
+    /// List configured backends
+    List,
+    /// Add an external backend
+    Add {
+        #[command(subcommand)]
+        kind: BackendAddCommand,
+    },
+    /// Enable a backend
+    Enable {
+        /// Backend id
+        id: String,
+    },
+    /// Disable a backend (for `eidola`: run with no account, on-device only)
+    Disable {
+        /// Backend id
+        id: String,
+    },
+    /// Remove an external backend (its forensic trail is preserved;
+    /// re-adding the same id revives it)
+    Remove {
+        /// Backend id
+        id: String,
+    },
+    /// List the models a backend offers (`model list` covers `local`)
+    Models {
+        /// Backend id
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackendAddCommand {
+    /// Any OpenAI-compatible HTTP server (self-hosted vLLM/Ollama/llama.cpp,
+    /// or a conventional provider you choose to trust)
+    Openai {
+        /// Backend id (lowercase letters, digits, hyphens) — models are then
+        /// addressed as `<model>@<id>`
+        id: String,
+        /// Base URL (e.g. http://192.168.1.20:8000)
+        #[arg(long)]
+        url: String,
+        /// API key, sent as a Bearer token
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Display name (defaults to the id)
+        #[arg(long)]
+        name: Option<String>,
+        /// Pin the model list (comma-separated) instead of trusting
+        /// GET /v1/models — not every "OpenAI-compatible" server offers it
+        #[arg(long, value_delimiter = ',')]
+        models: Option<Vec<String>>,
+    },
+    /// A llama.cpp install whose models you manage yourself: Eidola scans
+    /// the directory and starts/stops llama-server engines on demand
+    Llamacpp {
+        /// Backend id (lowercase letters, digits, hyphens)
+        id: String,
+        /// Directory of .gguf files (never written to by Eidola)
+        #[arg(long)]
+        models_dir: String,
+        /// Display name (defaults to the id)
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -505,15 +578,30 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             // default).
             let model = model.unwrap_or_else(|| core.config_state().default_model);
 
-            // Local models are served by an engine owned by *this* process
-            // (a `model load` in another CLI invocation died with it), so a
-            // local chat auto-loads its engine for the duration of the run.
-            if model.starts_with(eidola_app_core::LOCAL_MODEL_PREFIX) {
-                let slug = model
-                    .strip_prefix(eidola_app_core::LOCAL_MODEL_PREFIX)
-                    .unwrap_or(&model);
-                let loaded = core.local_models_state().await?.models.iter().any(|m| {
-                    m.slug == slug
+            // Engine-served models (the managed `local` store and llamacpp
+            // backends) run on an engine owned by *this* process (a `model
+            // load` in another CLI invocation died with it), so such a chat
+            // auto-loads its engine for the duration of the run.
+            let mref = eidola_app_core::parse_model_ref(&model);
+            let engine_backed = mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID
+                || core.list_backends().await?.iter().any(|b| {
+                    b.id == mref.backend_id && b.kind == eidola_app_core::BackendKind::LlamaCpp
+                });
+            if engine_backed {
+                let state = core.local_models_state().await?;
+                let in_backend: Vec<&eidola_app_core::LocalModelInfo> =
+                    if mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID {
+                        state.models.iter().collect()
+                    } else {
+                        state
+                            .external
+                            .iter()
+                            .find(|b| b.backend_id == mref.backend_id)
+                            .map(|b| b.models.iter().collect())
+                            .unwrap_or_default()
+                    };
+                let loaded = in_backend.iter().any(|m| {
+                    m.id == model
                         && matches!(m.status, eidola_app_core::LocalModelStatus::Loaded { .. })
                 });
                 if !loaded {
@@ -752,6 +840,108 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             ModelCommand::Unload { id } => {
                 core.unload_local_model(id.clone()).await?;
                 println!("unloaded {id}");
+                Ok(())
+            }
+        },
+        Some(Command::Backend { command }) => match command {
+            BackendCommand::List => {
+                let backends = core.list_backends().await?;
+                for b in &backends {
+                    let state = if b.enabled { "enabled" } else { "disabled" };
+                    println!(
+                        "{:<16} {:<9} {:<9} {}",
+                        b.id,
+                        b.kind.as_str(),
+                        state,
+                        b.display_name
+                    );
+                    if let Some(url) = &b.base_url {
+                        println!(
+                            "    url: {url}{}",
+                            if b.has_api_key { "  (api key set)" } else { "" }
+                        );
+                    }
+                    if let Some(dir) = &b.models_dir {
+                        println!("    models dir: {dir}");
+                    }
+                    if let Some(pinned) = &b.model_overrides {
+                        println!("    pinned models: {}", pinned.join(", "));
+                    }
+                }
+                Ok(())
+            }
+            BackendCommand::Add { kind } => {
+                let new = match kind {
+                    BackendAddCommand::Openai {
+                        id,
+                        url,
+                        api_key,
+                        name,
+                        models,
+                    } => eidola_app_core::NewBackend {
+                        id,
+                        kind: eidola_app_core::BackendKind::OpenAi,
+                        display_name: name.unwrap_or_default(),
+                        base_url: Some(url),
+                        api_key,
+                        models_dir: None,
+                        model_overrides: models,
+                    },
+                    BackendAddCommand::Llamacpp {
+                        id,
+                        models_dir,
+                        name,
+                    } => eidola_app_core::NewBackend {
+                        id,
+                        kind: eidola_app_core::BackendKind::LlamaCpp,
+                        display_name: name.unwrap_or_default(),
+                        base_url: None,
+                        api_key: None,
+                        models_dir: Some(models_dir),
+                        model_overrides: None,
+                    },
+                };
+                let added = core.add_backend(new).await?;
+                println!("added backend `{}` ({})", added.id, added.kind.as_str());
+                println!(
+                    "address its models as `<model>@{}` (see `eidola backend models {}`)",
+                    added.id, added.id
+                );
+                Ok(())
+            }
+            BackendCommand::Enable { id } => {
+                core.set_backend_enabled(id.clone(), true).await?;
+                println!("enabled backend `{id}`");
+                Ok(())
+            }
+            BackendCommand::Disable { id } => {
+                core.set_backend_enabled(id.clone(), false).await?;
+                println!("disabled backend `{id}`");
+                if id == "eidola" {
+                    println!(
+                        "asks now route only to local / configured backends (no account needed)"
+                    );
+                }
+                Ok(())
+            }
+            BackendCommand::Remove { id } => {
+                core.remove_backend(id.clone()).await?;
+                println!("removed backend `{id}`");
+                Ok(())
+            }
+            BackendCommand::Models { id } => {
+                let models = core.backend_models(id.clone()).await?;
+                if models.is_empty() {
+                    println!("no models offered (for engine-backed backends, load one first)");
+                    return Ok(());
+                }
+                for m in &models {
+                    if m.context_length > 0 {
+                        println!("{:<48} {}-token context", m.id, m.context_length);
+                    } else {
+                        println!("{}", m.id);
+                    }
+                }
                 Ok(())
             }
         },
