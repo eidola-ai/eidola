@@ -2771,6 +2771,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidola-www"
+version = "0.1.0"
+dependencies = [
+ "pulldown-cmark 0.13.4",
+ "serde",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

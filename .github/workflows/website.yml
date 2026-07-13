@@ -1,0 +1,83 @@
+name: Website
+
+# Builds www.eidola.ai with the in-workspace generator (crates/eidola-www)
+# and deploys it to GitHub Pages.
+#
+# PRs into `next`/`main` that touch a site input get a validating build —
+# this is the content gate (a broken doc link-target or malformed blog
+# front matter fails here), intentionally separate from `rust-checks`,
+# whose scope step ignores `www/**` for the cargo gates. Deployment
+# happens only on push to `main` (i.e. on promotion), matching the branch
+# flow: `main` is the verified branch, so the live site always reflects a
+# promoted, fully-gated tree. This check is not required for merge, so the
+# path filter can't wedge a PR.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+      - next
+    paths:
+      - "www/**"
+      - "docs/**"
+      - "crates/eidola-www/**"
+      - ".github/workflows/website.yml"
+
+# One deploy at a time; don't cancel an in-flight production deploy.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
+        # Save only from pushes to main (the deploy path); PRs restore.
+        # The built site is static output verified below, not a trusted
+        # artifact chain — Pages deploys are not release artifacts.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build site
+        run: cargo run -q -p eidola-www -- build --out _site
+
+      - name: Upload Pages artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

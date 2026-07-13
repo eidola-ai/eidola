@@ -113,6 +113,7 @@ jobs:
               # Paths that cannot change a cargo fmt/clippy/test/openapi outcome:
               .github/*)              : ;;  # other CI/workflow/config files
               docs/*)                 : ;;  # docs assets (markdown caught above)
+              www/*)                  : ;;  # website content/assets (markdown caught above; the site build is gated by website.yml)
               scripts/*|*.sh)         : ;;  # shell tooling
               justfile)               : ;;  # task runner recipes
               compose*.yaml|compose*.yml) : ;;  # local dev compose

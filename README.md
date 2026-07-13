@@ -111,6 +111,17 @@ just test           # cargo test
 
 On macOS, `just build gui` produces `crates/eidola-gui/build/Eidola.app`; on Linux, `just run gui` runs the binary directly (the Linux GUI is Wayland-only). See `crates/eidola-gui/AGENTS.md` for the architecture details.
 
+### Website
+
+The public site ([www.eidola.ai](https://www.eidola.ai)) lives in this repo: content in `www/`, generator in `crates/eidola-www` (see its README), and the docs section rendered directly from `docs/`. It adopts the app's circadian theme.
+
+```bash
+just build www      # build the static site to target/www
+just run www        # local dev server at http://127.0.0.1:8000 (drafts included)
+```
+
+Deploys to GitHub Pages on promotion to `main` via `.github/workflows/website.yml`; PRs that touch site inputs get a validating build.
+
 See more available commands:
 
 ```bash
