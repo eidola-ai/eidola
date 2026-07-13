@@ -878,12 +878,12 @@ fn settings_nav_switches_panes(cx: &mut TestAppContext) {
     view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
     view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Account));
 
-    view.update(cx, |v, cx| v.select(SettingsPane::Models, cx));
-    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Models));
+    view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Backends));
 }
 
 #[gpui::test]
-fn settings_models_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext) {
+fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext) {
     // With stub stores, every local-model operation clears the standing
     // error and stops at the backend guard — an honest no-op, no phantom
     // Loading states, no panics.
@@ -910,8 +910,8 @@ fn settings_models_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext) 
         cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
     });
 
-    let models_view = view.read_with(cx, |v, _| v.models());
-    models_view.update(cx, |m, cx| {
+    let backends_view = view.read_with(cx, |v, _| v.backends_pane());
+    backends_view.update(cx, |m, cx| {
         m.download_catalog("https://example.com/some.gguf", cx)
     });
     cx.run_until_parked();
@@ -922,6 +922,62 @@ fn settings_models_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext) 
         assert_eq!(s.models().len(), 1);
         assert_eq!(s.loaded_models().len(), 1);
         assert_eq!(s.loaded_models()[0].id, "local/tiny");
+    });
+}
+
+#[gpui::test]
+fn settings_backends_pane_add_form_and_toggle(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::AddKind;
+
+    let stores = stub_stores(cx, |s| {
+        s.backends = vec![eidola_app_core::BackendInfo {
+            id: "eidola".into(),
+            kind: eidola_app_core::BackendKind::Eidola,
+            display_name: "Eidola".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            created_at: 0,
+        }];
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+
+    // The add form opens per kind, is idempotent, and cancel closes it.
+    pane.read_with(cx, |p, _| assert_eq!(p.adding(), None));
+    cx.update(|cx| {
+        _window
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |p, cx| p.begin_add(AddKind::OpenAi, window, cx));
+            })
+            .unwrap();
+    });
+    pane.read_with(cx, |p, _| assert_eq!(p.adding(), Some(AddKind::OpenAi)));
+    cx.update(|cx| {
+        _window
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |p, cx| p.begin_add(AddKind::LlamaCpp, window, cx));
+            })
+            .unwrap();
+    });
+    pane.read_with(cx, |p, _| assert_eq!(p.adding(), Some(AddKind::LlamaCpp)));
+    pane.update(cx, |p, cx| p.cancel_add(cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.adding(), None));
+
+    // Submitting with no form open is a quiet no-op.
+    pane.update(cx, |p, cx| p.submit_add(cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.adding(), None));
+
+    // Disabling the eidola backend flips the cached row immediately (the
+    // optimistic write; the stub has no backend, so the op stops there).
+    pane.update(cx, |p, cx| p.toggle_backend("eidola".into(), false, cx));
+    stores.backends.read_with(cx, |b, _| {
+        assert!(!b.is_enabled("eidola"), "optimistic flip must be visible");
+        assert!(b.op_error().is_none(), "stub ops must not surface errors");
     });
 }
 

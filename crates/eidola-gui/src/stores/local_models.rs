@@ -70,13 +70,40 @@ impl LocalModelsStore {
             .unwrap_or(&[])
     }
 
-    /// Models currently loaded (ready to serve) — the set the model picker
-    /// surfaces at the top of the dropdown.
+    /// Models currently loaded (ready to serve) in the managed local store
+    /// — the "On this device" group of the model picker.
     pub fn loaded_models(&self) -> Vec<LocalModelInfo> {
         self.models()
             .iter()
             .filter(|m| matches!(m.status, LocalModelStatus::Loaded { .. }))
             .cloned()
+            .collect()
+    }
+
+    /// The configured llamacpp backends' scanned directories (empty unless
+    /// loaded).
+    pub fn external(&self) -> &[eidola_app_core::ExternalEngineBackend] {
+        self.state
+            .value()
+            .map(|s| s.external.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// One llamacpp backend's scanned models (empty when absent).
+    pub fn external_models(&self, backend_id: &str) -> Vec<LocalModelInfo> {
+        self.external()
+            .iter()
+            .find(|b| b.backend_id == backend_id)
+            .map(|b| b.models.clone())
+            .unwrap_or_default()
+    }
+
+    /// One llamacpp backend's currently loaded models — its group in the
+    /// model picker.
+    pub fn external_loaded_models(&self, backend_id: &str) -> Vec<LocalModelInfo> {
+        self.external_models(backend_id)
+            .into_iter()
+            .filter(|m| matches!(m.status, LocalModelStatus::Loaded { .. }))
             .collect()
     }
 

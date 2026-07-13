@@ -849,10 +849,27 @@ fn chrome_menu_opens_on_wordmark_click(cx: &mut TestAppContext) {
 // ---------------------------------------------------------------------------
 
 fn local_models_fixture() -> eidola_app_core::LocalModelsState {
-    use eidola_app_core::{LocalModelInfo, LocalModelStatus, LocalModelsState};
+    use eidola_app_core::{
+        ExternalEngineBackend, LocalModelInfo, LocalModelStatus, LocalModelsState,
+    };
     LocalModelsState {
         engine_path: Some("/opt/homebrew/bin/llama-server".into()),
-        external: Vec::new(),
+        external: vec![ExternalEngineBackend {
+            backend_id: "my-box".into(),
+            display_name: "My box".into(),
+            enabled: true,
+            models_dir: "/Users/me/models".into(),
+            models: vec![LocalModelInfo {
+                id: "qwen3-8b@my-box".into(),
+                slug: "qwen3-8b".into(),
+                display_name: "Qwen3 8B".into(),
+                file_name: "qwen3-8b.gguf".into(),
+                size_bytes: Some(5_200_000_000),
+                source_url: None,
+                status: LocalModelStatus::Available,
+                last_error: None,
+            }],
+        }],
         models: vec![
             LocalModelInfo {
                 id: "local/tiny-a".into(),
@@ -881,37 +898,145 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
     }
 }
 
+/// A registry fixture: the two singletons plus one llamacpp external.
+fn backends_fixture() -> Vec<eidola_app_core::BackendInfo> {
+    use eidola_app_core::{BackendInfo, BackendKind};
+    vec![
+        BackendInfo {
+            id: "eidola".into(),
+            kind: BackendKind::Eidola,
+            display_name: "Eidola".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            created_at: 0,
+        },
+        BackendInfo {
+            id: "local".into(),
+            kind: BackendKind::Local,
+            display_name: "On this device".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            created_at: 0,
+        },
+        BackendInfo {
+            id: "my-box".into(),
+            kind: BackendKind::LlamaCpp,
+            display_name: "My box".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: Some("/Users/me/models".into()),
+            model_overrides: None,
+            created_at: 1,
+        },
+    ]
+}
+
 #[gpui::test]
-fn models_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext) {
-    use eidola_gui::models_settings::ModelsSettingsView;
+fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::BackendsSettingsView;
 
     let _guard = probes_on();
 
     let stores = stub_stores(cx, |s| {
+        s.backends = backends_fixture();
         s.local_models = Some(local_models_fixture());
     });
     let (window, _view) = open_view(cx, |window, cx| {
-        cx.new(|cx| ModelsSettingsView::new(stores, window, cx))
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
     });
 
     let names = fresh_names(cx, window);
     for expected in [
+        // Every backend section carries its enable/disable toggle; the
+        // external one also affords removal.
+        "settings/backends/eidola/toggle",
+        "settings/backends/local/toggle",
+        "settings/backends/my-box/toggle",
+        "settings/backends/my-box/remove",
+        // The llamacpp backend's scanned model affords load (never delete —
+        // the file is the user's).
+        "settings/backends/my-box/model/0/load",
         // The Available model affords load + delete; the Loaded one, unload.
-        "settings/models/installed/0/load",
-        "settings/models/installed/0/delete",
-        "settings/models/installed/1/unload",
+        "settings/backends/local/installed/0/load",
+        "settings/backends/local/installed/0/delete",
+        "settings/backends/local/installed/1/unload",
         // No fixture file matches a catalog entry, so every catalog row
         // affords download.
-        "settings/models/catalog/0/download",
+        "settings/backends/local/catalog/0/download",
         // The paste-a-URL affordances.
-        "settings/models/url",
-        "settings/models/url/download",
+        "settings/backends/local/url",
+        "settings/backends/local/url/download",
+        // The add-a-backend affordances.
+        "settings/backends/add/openai",
+        "settings/backends/add/llamacpp",
     ] {
         assert!(
             names.contains(&expected.to_string()),
-            "models pane probe {expected:?} missing; recorded: {names:?}"
+            "backends pane probe {expected:?} missing; recorded: {names:?}"
         );
     }
+    // The user-owned file must never afford deletion through Eidola.
+    assert!(
+        !names.contains(&"settings/backends/my-box/model/0/delete".to_string()),
+        "a llamacpp backend's files are the user's: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn backends_pane_add_form_probes_appear_per_kind(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::{AddKind, BackendsSettingsView};
+
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.backends = backends_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    });
+
+    // Open the OpenAI form: id + url + key inputs plus submit/cancel.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_add(AddKind::OpenAi, window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/add/id",
+        "settings/backends/add/url",
+        "settings/backends/add/key",
+        "settings/backends/add/submit",
+        "settings/backends/add/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "openai add-form probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    // Switching to the llama.cpp form swaps url/key for the directory.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_add(AddKind::LlamaCpp, window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/backends/add/dir".to_string()),
+        "llamacpp add-form dir input missing: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/backends/add/url".to_string()),
+        "url input must not linger on the llamacpp form: {names:?}"
+    );
 
     probe::set_probes_enabled(false);
 }

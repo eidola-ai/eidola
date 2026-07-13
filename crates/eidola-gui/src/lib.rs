@@ -4,12 +4,12 @@
 pub mod about;
 pub mod account;
 pub mod actions;
+pub mod backends_settings;
 pub mod bridge;
 pub mod chrome;
 pub mod general;
 pub mod library;
 pub mod loadable;
-pub mod models_settings;
 pub mod onboarding;
 mod plans;
 pub mod probe;
