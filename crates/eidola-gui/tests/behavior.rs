@@ -2431,6 +2431,41 @@ fn space_stale_initial_load_does_not_replace_submitted_prompt(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+fn space_edit_and_regenerate_supersede_in_flight_load(cx: &mut TestAppContext) {
+    // Same stale-fetch class as the Record listing race (the codex finding on
+    // PR #179), on the transcript: a reload in flight (e.g. bus-driven, from a
+    // CLI write to the same space) when the user commits an edit or regenerate
+    // must be *cancelled* at that moment — the mutation's own post-commit
+    // reload is the authoritative truth, and a superseded load must never land
+    // late around it. The structural fix is the shared mutation prologue
+    // (`Space::supersede_load_for_mutation`, replace-cancels on the load
+    // slot), which `submit`/`post_only` already ran and `edit`/
+    // `regenerate_post` previously skipped.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    space.update(cx, |s, cx| {
+        s.arm_load_for_test(cx);
+        assert!(s.edit("a1".into(), "edited".into(), cx));
+        assert!(
+            !s.has_pending_load_for_test(),
+            "committing an edit must supersede the in-flight transcript load"
+        );
+    });
+
+    space.update(cx, |s, cx| {
+        s.arm_load_for_test(cx);
+        assert!(s.regenerate_post("a2".into(), "gemma4-31b".into(), cx));
+        assert!(
+            !s.has_pending_load_for_test(),
+            "regenerate must supersede the in-flight transcript load"
+        );
+    });
+}
+
+#[gpui::test]
 fn space_post_reasoning_projection_toggles(cx: &mut TestAppContext) {
     // Reasoning re-attached to a finalized post survives into the render
     // snapshot, and `Space::toggle_message_reasoning` flips the disclosure —

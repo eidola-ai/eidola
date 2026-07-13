@@ -199,6 +199,69 @@ fn spaces_registry_joins_existing_and_blanks_are_distinct(cx: &mut TestAppContex
     );
 }
 
+/// A mutation cancels any in-flight transcript load when it is accepted
+/// (`supersede_load_for_mutation`) on the promise that its own post-commit
+/// reload re-establishes the durable truth. The *failure* completion must
+/// keep that promise too — the cancelled load may have carried another
+/// writer's change, and a failed mutation can itself commit durable rows
+/// whose `Change::Space` the runner-occupied bus guard dropped. The codex
+/// finding on PR #206: the error arms only cleared the runner and emitted
+/// `Failed`, stranding the space on a stale transcript until an unrelated
+/// invalidation.
+///
+/// Backend-backed (a real `AppCore`, so `load_transcript` actually spawns),
+/// asserting only the synchronous slot transitions per this module's rules;
+/// the failure completion is replayed via the seam that delegates to the
+/// production `fail_mutation`.
+#[gpui::test]
+fn space_mutation_failure_restarts_superseded_load(cx: &mut TestAppContext) {
+    use eidola_app_core::error::AppError;
+
+    let (stores, _dir) = backed_stores(cx);
+
+    // Opening an existing space kicks the initial transcript load — a live
+    // task in the load slot (this also stands in for a bus-driven refresh,
+    // which occupies the same slot).
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open("space-x".into(), cx));
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.has_pending_load_for_test(),
+            "open() must start the initial transcript load"
+        );
+    });
+
+    // Accepting a regenerate supersedes that load (the mutation prologue)...
+    space.update(cx, |s, cx| {
+        assert!(s.regenerate_post("a1".into(), "gemma4-31b".into(), cx));
+        assert!(
+            !s.has_pending_load_for_test(),
+            "accepting a mutation cancels the in-flight load"
+        );
+    });
+
+    // ...so the mutation *failing* must restart it.
+    space.update(cx, |s, cx| {
+        s.apply_chat_failure_for_test(
+            AppError::Internal {
+                message: "boom".into(),
+            },
+            cx,
+        );
+        assert!(
+            s.has_pending_load_for_test(),
+            "the failure completion must restart the transcript load it \
+             cancelled at accept"
+        );
+        assert!(
+            s.transcript().is_loading(),
+            "the restarted load re-enters the in-flight state (every spinner \
+             maps to a live task)"
+        );
+    });
+}
+
 /// Supersede semantics: two back-to-back refreshes on the same slot. Replacing
 /// the task field drops (cancels) the predecessor, so only one live task ever
 /// owns the cell — keep-newest, no interleaving. Both calls leave the cell
