@@ -842,3 +842,208 @@ fn chrome_menu_opens_on_wordmark_click(cx: &mut TestAppContext) {
         "clicking the wordmark must open the primary menu: {names:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Local models — the Settings Models pane and the request panel's
+// on-this-device group.
+// ---------------------------------------------------------------------------
+
+fn local_models_fixture() -> eidola_app_core::LocalModelsState {
+    use eidola_app_core::{LocalModelInfo, LocalModelStatus, LocalModelsState};
+    LocalModelsState {
+        engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+        models: vec![
+            LocalModelInfo {
+                id: "local/tiny-a".into(),
+                slug: "tiny-a".into(),
+                display_name: "Tiny A".into(),
+                file_name: "tiny-a.gguf".into(),
+                size_bytes: Some(3_000_000_000),
+                source_url: None,
+                status: LocalModelStatus::Available,
+                last_error: None,
+            },
+            LocalModelInfo {
+                id: "local/tiny-b".into(),
+                slug: "tiny-b".into(),
+                display_name: "Tiny B".into(),
+                file_name: "tiny-b.gguf".into(),
+                size_bytes: Some(5_000_000_000),
+                source_url: None,
+                status: LocalModelStatus::Loaded {
+                    port: 4242,
+                    context_tokens: 8192,
+                },
+                last_error: None,
+            },
+        ],
+    }
+}
+
+#[gpui::test]
+fn models_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext) {
+    use eidola_gui::models_settings::ModelsSettingsView;
+
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.local_models = Some(local_models_fixture());
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ModelsSettingsView::new(stores, window, cx))
+    });
+
+    let names = fresh_names(cx, window);
+    for expected in [
+        // The Available model affords load + delete; the Loaded one, unload.
+        "settings/models/installed/0/load",
+        "settings/models/installed/0/delete",
+        "settings/models/installed/1/unload",
+        // No fixture file matches a catalog entry, so every catalog row
+        // affords download.
+        "settings/models/catalog/0/download",
+        // The paste-a-URL affordances.
+        "settings/models/url",
+        "settings/models/url/download",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "models pane probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn request_panel_lists_loaded_local_models_first(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = None;
+        s.models = vec![ModelInfo {
+            id: "gemma4-31b".into(),
+            context_length: 131_072,
+            prompt_credits_per_token: 0.53,
+            completion_credits_per_token: 1.5,
+            request_credits: None,
+        }];
+        s.local_models = Some(local_models_fixture());
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    // Only the *loaded* local model appears (Tiny B), ahead of the remote
+    // rows; the merely-downloaded Tiny A does not.
+    assert!(
+        names.contains(&"space/request-panel/local/0".to_string()),
+        "loaded local model row missing: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/request-panel/local/1".to_string()),
+        "an unloaded local model must not appear in the picker: {names:?}"
+    );
+    assert!(
+        names.contains(&"space/request-panel/row/0".to_string()),
+        "remote model rows must still render below the local group: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn request_panel_offline_shows_local_models_and_retry(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    // Offline: no remote models, and the remote store forced into a failed
+    // state (the app-launch fetch couldn't reach the upstream).
+    let stores = stub_stores(cx, |s| {
+        s.config_state = None;
+        s.local_models = Some(local_models_fixture());
+    });
+    cx.update(|cx| {
+        stores
+            .models
+            .update(cx, |s, cx| s.set_failed_for_test("offline", cx));
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    // The loaded local model stays selectable even though the remote fetch
+    // failed — the panel is never a dead end.
+    assert!(
+        names.contains(&"space/request-panel/local/0".to_string()),
+        "loaded local model must show while offline: {names:?}"
+    );
+    // ...and the remote list offers a retry, not silent nothing.
+    assert!(
+        names.contains(&"space/request-panel/retry".to_string()),
+        "retry affordance missing on a failed remote fetch: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/request-panel/refresh".to_string()),
+        "a failed fetch shows retry, not refresh: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn request_panel_shows_refresh_when_remote_loaded(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = None;
+        s.models = vec![ModelInfo {
+            id: "gemma4-31b".into(),
+            context_length: 131_072,
+            prompt_credits_per_token: 0.53,
+            completion_credits_per_token: 1.5,
+            request_credits: None,
+        }];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&ToggleModelPicker, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let names = fresh_names(cx, window);
+    // A refresh is offered even over a *successful* remote list.
+    assert!(
+        names.contains(&"space/request-panel/refresh".to_string()),
+        "refresh affordance must be available over a good remote list: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space/request-panel/retry".to_string()),
+        "a good fetch shows refresh, not retry: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}

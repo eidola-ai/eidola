@@ -336,7 +336,56 @@ mod driver {
         stub_stores(cx, |s| {
             s.config_state = Some(config_state(true));
             s.models = models();
+            s.local_models = Some(local_models_state());
         })
+    }
+
+    /// Local-inference fixture: one model loaded and serving, one merely
+    /// downloaded, one mid-download — every state the Models pane renders,
+    /// with the loaded one surfacing in the space view's model picker.
+    fn local_models_state() -> eidola_app_core::LocalModelsState {
+        use eidola_app_core::{LocalModelInfo, LocalModelStatus, LocalModelsState};
+        LocalModelsState {
+            engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+            models: vec![
+                LocalModelInfo {
+                    id: "local/gemma-4-12b-it-qat-q4_0".into(),
+                    slug: "gemma-4-12b-it-qat-q4_0".into(),
+                    display_name: "Gemma 4 12B".into(),
+                    file_name: "gemma-4-12b-it-qat-q4_0.gguf".into(),
+                    size_bytes: Some(6_975_877_728),
+                    source_url: None,
+                    status: LocalModelStatus::Downloading {
+                        received: 3_100_000_000,
+                        total: Some(6_975_877_728),
+                    },
+                    last_error: None,
+                },
+                LocalModelInfo {
+                    id: "local/gemma-4-E2B_q4_0-it".into(),
+                    slug: "gemma-4-E2B_q4_0-it".into(),
+                    display_name: "Gemma 4 E2B".into(),
+                    file_name: "gemma-4-E2B_q4_0-it.gguf".into(),
+                    size_bytes: Some(3_349_514_112),
+                    source_url: None,
+                    status: LocalModelStatus::Loaded {
+                        port: 51_432,
+                        context_tokens: 8192,
+                    },
+                    last_error: None,
+                },
+                LocalModelInfo {
+                    id: "local/gemma-4-E4B_q4_0-it".into(),
+                    slug: "gemma-4-E4B_q4_0-it".into(),
+                    display_name: "Gemma 4 E4B".into(),
+                    file_name: "gemma-4-E4B_q4_0-it.gguf".into(),
+                    size_bytes: Some(5_154_939_136),
+                    source_url: None,
+                    status: LocalModelStatus::Available,
+                    last_error: None,
+                },
+            ],
+        }
     }
 
     fn config_state(has_account: bool) -> ConfigState {
@@ -481,6 +530,7 @@ mod driver {
                 ],
             });
             s.prices = prices();
+            s.local_models = Some(local_models_state());
         })
     }
 

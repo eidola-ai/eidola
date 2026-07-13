@@ -382,6 +382,10 @@ impl SpaceView {
             // The request panel renders the model list + config default.
             cx.observe(&stores.models, |_, _, cx| cx.notify()),
             cx.observe(&stores.config, |_, _, cx| cx.notify()),
+            // Loaded local models lead the request panel; a load/unload while
+            // it's open must re-render. Offline, the models store is quiet, so
+            // this is the *only* signal that would refresh the panel.
+            cx.observe(&stores.local_models, |_, _, cx| cx.notify()),
         ];
 
         let mut this = Self {

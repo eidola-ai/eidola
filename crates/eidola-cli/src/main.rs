@@ -59,6 +59,11 @@ enum Command {
         #[command(subcommand)]
         command: SpacesCommand,
     },
+    /// Manage local inference models (llama.cpp)
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
     /// Check for and verify newer releases
     Update {
         #[command(subcommand)]
@@ -149,6 +154,34 @@ enum CredentialsCommand {
     List,
     /// Recover stuck (in-flight) credentials
     Recover,
+}
+
+#[derive(Subcommand)]
+enum ModelCommand {
+    /// List local models (downloaded / loading / loaded) and the curated
+    /// Gemma 4 catalog
+    List,
+    /// Download a model: a catalog id (see `model list`) or a `.gguf` URL
+    /// (direct or a Hugging Face file page). Waits with a progress line.
+    Download {
+        /// Catalog id (e.g. `gemma-4-e2b`) or URL
+        source: String,
+    },
+    /// Delete a downloaded model
+    Delete {
+        /// Model id (`local/<slug>`) or bare slug
+        id: String,
+    },
+    /// Load a model: start its llama-server engine and wait until ready
+    Load {
+        /// Model id (`local/<slug>`) or bare slug
+        id: String,
+    },
+    /// Unload a model, terminating its engine
+    Unload {
+        /// Model id (`local/<slug>`) or bare slug
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -472,6 +505,23 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             // default).
             let model = model.unwrap_or_else(|| core.config_state().default_model);
 
+            // Local models are served by an engine owned by *this* process
+            // (a `model load` in another CLI invocation died with it), so a
+            // local chat auto-loads its engine for the duration of the run.
+            if model.starts_with(eidola_app_core::LOCAL_MODEL_PREFIX) {
+                let slug = model
+                    .strip_prefix(eidola_app_core::LOCAL_MODEL_PREFIX)
+                    .unwrap_or(&model);
+                let loaded = core.local_models_state().await?.models.iter().any(|m| {
+                    m.slug == slug
+                        && matches!(m.status, eidola_app_core::LocalModelStatus::Loaded { .. })
+                });
+                if !loaded {
+                    eprintln!("loading {model}…");
+                    core.load_local_model(model.clone()).await?;
+                }
+            }
+
             // Stream chunks straight to stdout. Reasoning goes to stderr
             // (dim, prefixed with "thinking: ") so a piped stdout still
             // captures only the final answer text.
@@ -567,6 +617,144 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
         },
+        Some(Command::Model { command }) => match command {
+            ModelCommand::List => {
+                let state = core.local_models_state().await?;
+                match &state.engine_path {
+                    Some(p) => println!("engine: {p}"),
+                    None => println!(
+                        "engine: llama-server not found — install llama.cpp \
+                         (e.g. `brew install llama.cpp`)"
+                    ),
+                }
+                println!();
+                if state.models.is_empty() {
+                    println!("no local models yet");
+                } else {
+                    for m in &state.models {
+                        let status = match &m.status {
+                            eidola_app_core::LocalModelStatus::Downloading { received, total } => {
+                                match total {
+                                    Some(t) if *t > 0 => {
+                                        format!("downloading {}%", received * 100 / t)
+                                    }
+                                    _ => "downloading".to_string(),
+                                }
+                            }
+                            eidola_app_core::LocalModelStatus::Available => "available".into(),
+                            eidola_app_core::LocalModelStatus::Loading => "loading".into(),
+                            eidola_app_core::LocalModelStatus::Loaded { port, .. } => {
+                                format!("loaded (127.0.0.1:{port})")
+                            }
+                        };
+                        println!(
+                            "{:<40} {:>9}  {}",
+                            m.id,
+                            m.size_bytes.map(fmt_size).unwrap_or_default(),
+                            status
+                        );
+                        if let Some(err) = &m.last_error {
+                            println!("    last error: {}", err.lines().next().unwrap_or(err));
+                        }
+                    }
+                }
+                println!("\ncatalog (download with `eidola model download <id>`):");
+                for entry in core.local_model_catalog() {
+                    let installed = state.models.iter().any(|m| m.file_name == entry.file_name);
+                    println!(
+                        "{:<18} {:>9}  {}{}",
+                        entry.id,
+                        fmt_size(entry.size_bytes),
+                        entry.description,
+                        if installed { "  [installed]" } else { "" }
+                    );
+                }
+                Ok(())
+            }
+            ModelCommand::Download { source } => {
+                // A catalog id resolves to its URL; anything else is a URL.
+                let url = core
+                    .local_model_catalog()
+                    .iter()
+                    .find(|c| c.id == source)
+                    .map(|c| c.url.to_string())
+                    .unwrap_or(source);
+                let id = core.download_local_model(url).await?;
+                println!("downloading {id}…");
+                // The transfer task dies with this process, so wait for it,
+                // rendering a progress line.
+                let slug = id.strip_prefix("local/").unwrap_or(&id).to_string();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let state = core.local_models_state().await?;
+                    let Some(m) = state.models.iter().find(|m| m.slug == slug) else {
+                        return Err(AppError::LocalModel {
+                            message: "model disappeared during download".into(),
+                        });
+                    };
+                    match &m.status {
+                        eidola_app_core::LocalModelStatus::Downloading { received, total } => {
+                            match total {
+                                Some(t) if *t > 0 => print!(
+                                    "\r{} / {} ({}%)   ",
+                                    fmt_size(*received),
+                                    fmt_size(*t),
+                                    received * 100 / t
+                                ),
+                                _ => print!("\r{}   ", fmt_size(*received)),
+                            }
+                            let _ = std::io::stdout().flush();
+                        }
+                        _ => {
+                            println!();
+                            match &m.last_error {
+                                Some(err) => {
+                                    return Err(AppError::LocalModel {
+                                        message: format!("download failed: {err}"),
+                                    });
+                                }
+                                None => println!("downloaded {id}"),
+                            }
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ModelCommand::Delete { id } => {
+                core.delete_local_model(id.clone()).await?;
+                println!("deleted {id}");
+                Ok(())
+            }
+            ModelCommand::Load { id } => {
+                println!("loading {id} (this can take a while for large models)…");
+                core.load_local_model(id.clone()).await?;
+                let state = core.local_models_state().await?;
+                let slug = id.strip_prefix("local/").unwrap_or(&id);
+                if let Some(eidola_app_core::LocalModelStatus::Loaded { port, .. }) = state
+                    .models
+                    .iter()
+                    .find(|m| m.slug == slug)
+                    .map(|m| m.status.clone())
+                {
+                    println!("loaded — serving on 127.0.0.1:{port}");
+                    println!("chat with it: `eidola chat \"hi\" --model local/{slug}`");
+                }
+                // The engine is a child of *this* process, so exiting would
+                // kill it. Keep serving until Ctrl-C (the GUI, by contrast,
+                // holds engines for its whole app lifetime).
+                println!("serving — press Ctrl-C to stop");
+                let _ = tokio::signal::ctrl_c().await;
+                core.unload_local_model(id.clone()).await.ok();
+                println!("\nunloaded {id}");
+                Ok(())
+            }
+            ModelCommand::Unload { id } => {
+                core.unload_local_model(id.clone()).await?;
+                println!("unloaded {id}");
+                Ok(())
+            }
+        },
         Some(Command::Update {
             command: UpdateCommand::Check,
         }) => {
@@ -630,6 +818,15 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             Ok(())
         }
+    }
+}
+
+/// Human-readable byte size (GB/MB) for model listings.
+fn fmt_size(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.2} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{:.0} MB", bytes as f64 / 1e6)
     }
 }
 

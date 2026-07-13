@@ -34,7 +34,15 @@ signature = "2"
 spki = { version = "0.7", features = ["pem"] }
 thiserror = "2"
 tinfoil-verifier = { path = "../tinfoil-verifier" }
-tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
+tokio = { version = "1", features = [
+    "sync",
+    "rt-multi-thread",
+    "process",
+    "fs",
+    "io-util",
+    "time",
+    "macros",
+] }
 toml = "1"
 turso = { version = "0.7.0-pre.18", default-features = false, features = ["pure-rust-crypto"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }

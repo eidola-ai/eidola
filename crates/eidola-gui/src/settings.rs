@@ -1,5 +1,5 @@
 //! Settings window — a calm two-pane surface. A narrow nav list (General ·
-//! Account · Wallet) sits on a `theme.sidebar` band down the left edge; the
+//! Models · Account · Wallet) sits on a `theme.sidebar` band down the left edge; the
 //! selected pane renders in the content column. No primary-button tab strip,
 //! no boxes-in-boxes: the nav is quiet text, the content is hairline rows.
 //!
@@ -17,6 +17,7 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use crate::account::AccountView;
 use crate::actions::CloseWindow;
 use crate::general::GeneralView;
+use crate::models_settings::ModelsSettingsView;
 use crate::probe::Probe as _;
 use crate::stores::Stores;
 use crate::wallet::WalletView;
@@ -33,6 +34,7 @@ const NAV_WIDTH: gpui::Pixels = gpui::px(132.);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SettingsPane {
     General,
+    Models,
     Account,
     Wallet,
 }
@@ -41,6 +43,7 @@ impl SettingsPane {
     fn label(self) -> &'static str {
         match self {
             SettingsPane::General => "General",
+            SettingsPane::Models => "Models",
             SettingsPane::Account => "Account",
             SettingsPane::Wallet => "Wallet",
         }
@@ -50,6 +53,7 @@ impl SettingsPane {
 pub struct SettingsView {
     selected: SettingsPane,
     general: Entity<GeneralView>,
+    models: Entity<ModelsSettingsView>,
     account: Entity<AccountView>,
     wallet: Entity<WalletView>,
     /// The per-window modifier state. The root's `on_modifiers_changed`
@@ -76,6 +80,7 @@ impl SettingsView {
     ) -> Self {
         let general =
             cx.new(|cx| GeneralView::new(stores.config.clone(), window_input.clone(), window, cx));
+        let models = cx.new(|cx| ModelsSettingsView::new(stores.clone(), window, cx));
         let account = cx.new(|cx| AccountView::new(stores.clone(), window, cx));
         let wallet = cx.new(|cx| WalletView::new(stores, window, cx));
 
@@ -85,6 +90,7 @@ impl SettingsView {
         Self {
             selected: SettingsPane::General,
             general,
+            models,
             account,
             wallet,
             window_input,
@@ -121,6 +127,12 @@ impl SettingsView {
     /// reset-confirm flow.
     pub fn account(&self) -> Entity<AccountView> {
         self.account.clone()
+    }
+
+    /// The Models pane entity — exposed for behavior tests asserting the
+    /// local-model affordances.
+    pub fn models(&self) -> Entity<ModelsSettingsView> {
+        self.models.clone()
     }
 
     fn nav_item(&self, pane: SettingsPane, cx: &mut Context<Self>) -> impl IntoElement {
@@ -160,6 +172,7 @@ impl Render for SettingsView {
 
         let body: gpui::AnyElement = match self.selected {
             SettingsPane::General => self.general.clone().into_any_element(),
+            SettingsPane::Models => self.models.clone().into_any_element(),
             SettingsPane::Account => self.account.clone().into_any_element(),
             SettingsPane::Wallet => self.wallet.clone().into_any_element(),
         };
@@ -203,6 +216,7 @@ impl Render for SettingsView {
                 .px_2()
                 .gap_0p5()
                 .child(self.nav_item(SettingsPane::General, cx))
+                .child(self.nav_item(SettingsPane::Models, cx))
                 .child(self.nav_item(SettingsPane::Account, cx))
                 .child(self.nav_item(SettingsPane::Wallet, cx)),
             )

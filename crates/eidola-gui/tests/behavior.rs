@@ -877,6 +877,51 @@ fn settings_nav_switches_panes(cx: &mut TestAppContext) {
 
     view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
     view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Account));
+
+    view.update(cx, |v, cx| v.select(SettingsPane::Models, cx));
+    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Models));
+}
+
+#[gpui::test]
+fn settings_models_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext) {
+    // With stub stores, every local-model operation clears the standing
+    // error and stops at the backend guard — an honest no-op, no phantom
+    // Loading states, no panics.
+    let stores = stub_stores(cx, |s| {
+        s.local_models = Some(eidola_app_core::LocalModelsState {
+            engine_path: None,
+            models: vec![eidola_app_core::LocalModelInfo {
+                id: "local/tiny".into(),
+                slug: "tiny".into(),
+                display_name: "Tiny".into(),
+                file_name: "tiny.gguf".into(),
+                size_bytes: Some(1_000_000_000),
+                source_url: None,
+                status: eidola_app_core::LocalModelStatus::Loaded {
+                    port: 4242,
+                    context_tokens: 8192,
+                },
+                last_error: None,
+            }],
+        });
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+    });
+
+    let models_view = view.read_with(cx, |v, _| v.models());
+    models_view.update(cx, |m, cx| {
+        m.download_catalog("https://example.com/some.gguf", cx)
+    });
+    cx.run_until_parked();
+
+    stores.local_models.read_with(cx, |s, _| {
+        assert!(s.op_error().is_none(), "stub ops must not surface errors");
+        // The fixture snapshot survives untouched (no refresh happened).
+        assert_eq!(s.models().len(), 1);
+        assert_eq!(s.loaded_models().len(), 1);
+        assert_eq!(s.loaded_models()[0].id, "local/tiny");
+    });
 }
 
 #[gpui::test]

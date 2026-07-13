@@ -97,6 +97,15 @@ impl SpaceView {
         cx.notify();
     }
 
+    /// Re-fetch the remote model list — the panel's retry (after a failed
+    /// fetch) and refresh (over a good one) affordance. The store owns the
+    /// task slot; the panel stays open so the refreshing → result transition
+    /// is visible in place.
+    fn refresh_models(&mut self, cx: &mut Context<Self>) {
+        self.stores.models.update(cx, |s, cx| s.refresh(cx));
+        cx.notify();
+    }
+
     // -- The action gutter ---------------------------------------------------
 
     /// The active composer's action gutter: Ask (⌘↩), the ⌥-revealed Post
@@ -251,7 +260,18 @@ impl SpaceView {
             .state()
             .map(|s| s.default_model.clone())
             .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string());
-        let models = self.stores.models.read(cx).list().to_vec();
+        let models_store = self.stores.models.read(cx);
+        let models = models_store.list().to_vec();
+        // The remote list's health drives the retry/refresh footer below: a
+        // failed/offline fetch degrades to "retry", a good one to "refresh".
+        // Loaded local models stay selectable above regardless, so the panel
+        // is never a dead end.
+        let remote_error = models_store.models().error().map(|e| e.to_string());
+        let remote_refreshing =
+            models_store.models().is_loading() || models_store.models().is_stale();
+        // Loaded local models lead the list — a running engine on this
+        // machine outranks the remote catalog for immediacy.
+        let local_models = self.stores.local_models.read(cx).loaded_models();
 
         let mut panel = v_flex()
             .id("space-request-panel")
@@ -271,21 +291,105 @@ impl SpaceView {
             panel.bottom(px(win - anchor_top + 8.0))
         };
 
-        if models.is_empty() {
-            // Honest empty state: the model list hasn't loaded (or the fetch
-            // failed) — say what a send will actually use.
-            return panel
-                .child(
-                    div()
+        if models.is_empty() && local_models.is_empty() {
+            // Honest note when nothing is selectable yet — say what a send will
+            // actually use. Unlike before we do *not* early-return: the
+            // retry/refresh footer still renders below, so an offline/failed
+            // fetch stays actionable rather than a dead end.
+            panel = panel.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(format!(
+                        "Model list unavailable — asks use {current}."
+                    ))),
+            );
+        }
+
+        if !local_models.is_empty() {
+            panel = panel.child(group_header("On this device", false, cx));
+            for (idx, model) in local_models.iter().enumerate() {
+                let is_current = model.id == current;
+                let is_default = model.id == default_model;
+
+                let mut markers: Vec<&str> = Vec::new();
+                if is_current {
+                    markers.push("current");
+                }
+                if is_default {
+                    markers.push("default");
+                }
+
+                let mut name = div()
+                    .text_sm()
+                    .child(SharedString::from(model.display_name.clone()));
+                if is_current {
+                    name = name.font_weight(FontWeight::SEMIBOLD);
+                }
+                let mut name_row = h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_baseline()
+                    .child(name);
+                if !markers.is_empty() {
+                    name_row = name_row.child(
+                        div()
+                            .text_xs()
+                            .italic()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(markers.join(" · "))),
+                    );
+                }
+
+                let ctx_tokens = match model.status {
+                    eidola_app_core::LocalModelStatus::Loaded { context_tokens, .. } => {
+                        context_tokens
+                    }
+                    _ => 0,
+                };
+                let info = if ctx_tokens > 0 {
+                    format!(
+                        "on this device · {}-token context · no charge",
+                        format_credits(ctx_tokens as i64)
+                    )
+                } else {
+                    "on this device · no charge".to_string()
+                };
+
+                let id = model.id.clone();
+                panel = panel.child(
+                    v_flex()
+                        .id(("space-model-row-local", idx))
+                        .probe(
+                            format!("space/request-panel/local/{idx}"),
+                            gpui::Role::ListBoxOption,
+                            model.id.clone(),
+                        )
+                        .aria_selected(is_current)
+                        .w_full()
                         .px_3()
                         .py_2()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(SharedString::from(format!(
-                            "Model list unavailable — asks use {current}."
-                        ))),
-                )
-                .into_any_element();
+                        .gap_0p5()
+                        .when(idx > 0, |d| d.border_t_1().border_color(theme.border))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(cx.theme().muted.opacity(0.5)))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.select_model(id.clone(), cx)),
+                        )
+                        .child(name_row)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(SharedString::from(info)),
+                        ),
+                );
+            }
+            if !models.is_empty() {
+                panel = panel.child(group_header("Via Eidola", true, cx));
+            }
         }
 
         for (idx, model) in models.iter().enumerate() {
@@ -347,6 +451,76 @@ impl SpaceView {
             );
         }
 
+        // Remote-list status + the retry/refresh affordance. Local models above
+        // stay selectable regardless, so this footer governs only the remote
+        // catalog: refreshing → a quiet in-flight note, a failed/offline fetch
+        // → "Retry", a good one → "Refresh" (always available, even on success).
+        if remote_refreshing {
+            panel = panel.child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .italic()
+                    .text_color(theme.muted_foreground)
+                    .child("Refreshing models…"),
+            );
+        } else if let Some(err) = remote_error {
+            panel = panel.child(
+                v_flex()
+                    .id("space-request-panel-retry")
+                    .probe(
+                        "space/request-panel/retry",
+                        gpui::Role::Button,
+                        "Retry loading models",
+                    )
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_0p5()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().muted.opacity(0.5)))
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_models(cx)))
+                    .child(div().text_xs().text_color(theme.muted_foreground).child(
+                        SharedString::from(format!("Couldn't load the model list — {err}")),
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child("Retry"),
+                    ),
+            );
+        } else {
+            panel = panel.child(
+                div()
+                    .id("space-request-panel-refresh")
+                    .probe(
+                        "space/request-panel/refresh",
+                        gpui::Role::Button,
+                        "Refresh models",
+                    )
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .italic()
+                    .text_color(theme.muted_foreground)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(cx.theme().foreground))
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_models(cx)))
+                    .child("Refresh models"),
+            );
+        }
+
         if current != default_model {
             // Quiet, secondary: persist this space's model as the config
             // default. Only offered when it would change anything.
@@ -381,6 +555,24 @@ impl SpaceView {
 /// A small muted keyboard hint beside a verb (shown while ⌥ is held).
 fn kbd_hint(text: &'static str, color: gpui::Hsla) -> gpui::Div {
     div().text_xs().text_color(color).child(text)
+}
+
+/// A quiet group header inside the request panel — separates the loaded
+/// on-device models from the remote catalog.
+fn group_header(label: &'static str, bordered: bool, cx: &gpui::App) -> gpui::Div {
+    let theme = cx.theme();
+    let mut header = div()
+        .px_3()
+        .pt_2()
+        .pb_0p5()
+        .text_xs()
+        .italic()
+        .text_color(theme.muted_foreground)
+        .child(label);
+    if bordered {
+        header = header.border_t_1().border_color(theme.border);
+    }
+    header
 }
 
 /// One honest line of per-model info for the panel, from the `/models`

@@ -49,6 +49,20 @@ impl ModelsStore {
         &self.models
     }
 
+    /// Test seam: force the snapshot into a failed state, modelling an
+    /// offline/unreachable upstream. Lets the request-panel tests exercise the
+    /// retry footer without a live (failing) backend.
+    #[doc(hidden)]
+    pub fn set_failed_for_test(&mut self, message: &str, cx: &mut Context<Self>) {
+        self.models = Loadable::Failed {
+            error: eidola_app_core::error::AppError::Internal {
+                message: message.to_string(),
+            },
+            prior: self.models.value().cloned(),
+        };
+        cx.notify();
+    }
+
     /// The model list as a slice (empty unless `Loaded`/`Failed{prior}`).
     pub fn list(&self) -> &[ModelInfo] {
         self.models.value().map(|v| v.as_slice()).unwrap_or(&[])

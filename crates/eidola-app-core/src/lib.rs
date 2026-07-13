@@ -2,6 +2,7 @@ pub mod changes;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod local_models;
 pub mod trust_root;
 pub mod updater;
 pub mod updates;
@@ -24,6 +25,10 @@ use uuid::Uuid;
 use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
 use error::AppError;
+pub use local_models::{
+    LOCAL_MODEL_CATALOG, LOCAL_MODEL_PREFIX, LocalCatalogEntry, LocalModelInfo, LocalModelStatus,
+    LocalModelsState,
+};
 
 // ============================================================================
 // Data transfer types — returned from `AppCore` methods to the apps
@@ -468,6 +473,10 @@ struct Inner {
     update_polling: std::sync::atomic::AtomicBool,
     /// Invalidation bus — emits a [`Change`] after every durable commit.
     bus: BroadcastSource,
+    /// Runtime local-inference state (downloads in flight, running
+    /// llama.cpp engines). `Arc` so core-owned transfer/supervisor tasks
+    /// can hold it beyond the initiating call.
+    local: Arc<local_models::LocalRuntime>,
     /// Test-only HTTP client override. When `Some`, [`Inner::build_client`]
     /// returns a clone of this client *instead of* constructing the
     /// attesting client, letting integration tests drive `chat`/`chat_stream`
@@ -1603,37 +1612,84 @@ impl Inner {
         budget: Option<i64>,
     ) -> Result<TurnPrep, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
         let now = now_ms();
 
         let db_conn = self.db_conn().await?;
-        let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
 
         let attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let log_clone = attestation_log.clone();
-        let observer: Option<tinfoil_verifier::AttestationObserver> = Some(Arc::new(
-            move |att: tinfoil_verifier::VerifiedAttestation| {
-                log_clone.lock().unwrap().push(att);
-            },
-        ));
 
-        let client = self.build_client(&cfg, observer).await?;
+        // Route by model id: `local/<slug>` turns run against the loaded
+        // llama.cpp engine on loopback — plain client, no attestation, no
+        // credential spend. Everything else runs against the remote
+        // attested server exactly as before. `remote_pricing` is
+        // `Some((prompt_rate, completion_rate, scale_factor))` only for
+        // remote turns; its absence is what disables the whole spend path
+        // below.
+        let (provider_id, client, base_url, connection_id, context_length, remote_pricing) =
+            if local_models::is_local_model(model) {
+                let slug = model
+                    .strip_prefix(local_models::LOCAL_MODEL_PREFIX)
+                    .unwrap_or(model);
+                let (engine_url, context_tokens) =
+                    self.local
+                        .ready_engine(slug)
+                        .ok_or_else(|| AppError::LocalModel {
+                            message: format!(
+                                "`{model}` is not loaded — load it in Settings → Models"
+                            ),
+                        })?;
+                let provider_id = db::ensure_provider(&db_conn, "local", "inference", now).await?;
+                let client = match &self.http_override {
+                    Some(c) => c.clone(),
+                    None => local_models::plain_http_client()?,
+                };
+                (
+                    provider_id,
+                    client,
+                    engine_url,
+                    None,
+                    context_tokens as u64,
+                    None,
+                )
+            } else {
+                let base_url = cfg.base_url().to_string();
+                let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
+                let log_clone = attestation_log.clone();
+                let observer: Option<tinfoil_verifier::AttestationObserver> = Some(Arc::new(
+                    move |att: tinfoil_verifier::VerifiedAttestation| {
+                        log_clone.lock().unwrap().push(att);
+                    },
+                ));
 
-        let models = fetch_models(&client, base_url).await?;
-        let connection_id =
-            flush_attestations(&attestation_log, &db_conn, &provider_id, base_url, now).await?;
+                let client = self.build_client(&cfg, observer).await?;
 
-        let model_entry =
-            models
-                .data
-                .iter()
-                .find(|m| m.id == model)
-                .ok_or_else(|| AppError::NotConfigured {
-                    message: format!("model not found: {model}"),
+                let models = fetch_models(&client, &base_url).await?;
+                let connection_id =
+                    flush_attestations(&attestation_log, &db_conn, &provider_id, &base_url, now)
+                        .await?;
+
+                let model_entry = models.data.iter().find(|m| m.id == model).ok_or_else(|| {
+                    AppError::NotConfigured {
+                        message: format!("model not found: {model}"),
+                    }
                 })?;
+                let pricing = (
+                    model_entry.pricing.per_prompt_token.value as u128,
+                    model_entry.pricing.per_completion_token.value as u128,
+                    model_entry.pricing.per_prompt_token.scale_factor as u128,
+                );
+                (
+                    provider_id,
+                    client,
+                    base_url,
+                    connection_id,
+                    model_entry.context_length,
+                    Some(pricing),
+                )
+            };
 
-        let max_completion_tokens = (model_entry.context_length).min(4096) as u32;
+        let max_completion_tokens = context_length.min(4096) as u32;
 
         let model_participant_id =
             db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
@@ -1694,101 +1750,125 @@ impl Inner {
         };
         let prior_messages = actions_to_messages(&context_rows);
 
-        // Estimate the charge from the assembled context. The prompt side is
-        // the shared client/server pricing contract
-        // (`eidola_common::chargeable_prompt_tokens`): a content-byte term at
-        // the safe cost factor plus per-message and per-request constants.
-        // The server computes the identical function of the identical
-        // `messages` array as its pre-flight minimum and clamps its charged
-        // prompt tokens to it, so this hold covers the server's charge by
-        // construction.
-        let total_content_bytes: u64 = prior_messages.iter().map(|m| m.content.len() as u64).sum();
-        let chargeable_prompt = eidola_common::chargeable_prompt_tokens(
-            total_content_bytes,
-            prior_messages.len() as u64,
-        );
+        // The spend side runs only for remote turns. A local turn is free by
+        // construction: no charge estimate, no credential, no ACT header —
+        // which also means local inference needs no account or onboarding.
+        let (charge_credits, spend, auth_value) = match remote_pricing {
+            None => (0u128, None, None),
+            Some((prompt_rate, completion_rate, sf)) => {
+                // Estimate the charge from the assembled context. The prompt
+                // side is the shared client/server pricing contract
+                // (`eidola_common::chargeable_prompt_tokens`): a content-byte
+                // term at the safe cost factor plus per-message and
+                // per-request constants. The server computes the identical
+                // function of the identical `messages` array as its
+                // pre-flight minimum and clamps its charged prompt tokens to
+                // it, so this hold covers the server's charge by
+                // construction.
+                let total_content_bytes: u64 =
+                    prior_messages.iter().map(|m| m.content.len() as u64).sum();
+                let chargeable_prompt = eidola_common::chargeable_prompt_tokens(
+                    total_content_bytes,
+                    prior_messages.len() as u64,
+                );
 
-        let sf = model_entry.pricing.per_prompt_token.scale_factor as u128;
-        let prompt_rate = model_entry.pricing.per_prompt_token.value as u128;
-        let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
-        let completion_rate = model_entry.pricing.per_completion_token.value as u128;
-        let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
-        let charge_credits = prompt_credits + completion_credits;
+                let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
+                let completion_credits =
+                    (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
+                let charge_credits = prompt_credits + completion_credits;
 
-        if charge_credits == 0 {
-            return Err(wrap(AppError::Credential {
-                message: "computed charge is zero — model pricing may be missing".into(),
-            }));
-        }
+                if charge_credits == 0 {
+                    return Err(wrap(AppError::Credential {
+                        message: "computed charge is zero — model pricing may be missing".into(),
+                    }));
+                }
 
-        // Spend budget ceiling for this turn.
-        if let Some(b) = budget
-            && charge_credits as i64 > b
-        {
-            return Err(wrap(AppError::Credential {
-                message: format!("estimated charge {charge_credits} exceeds the turn budget {b}"),
-            }));
-        }
+                // Spend budget ceiling for this turn.
+                if let Some(b) = budget
+                    && charge_credits as i64 > b
+                {
+                    return Err(wrap(AppError::Credential {
+                        message: format!(
+                            "estimated charge {charge_credits} exceeds the turn budget {b}"
+                        ),
+                    }));
+                }
 
-        let cred = self
-            .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
-            .await
-            .map_err(wrap)?;
+                let cred = self
+                    .ensure_spendable_credential(&cfg, &db_conn, charge_credits as i64)
+                    .await
+                    .map_err(wrap)?;
 
-        let credit_token =
-            CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
-                message: format!("failed to decode credential: {e}"),
-            })?;
-        let public_key =
-            PublicKey::from_cbor(&cred.public_key_data).map_err(|e| AppError::Credential {
-                message: format!("failed to decode public key: {e}"),
-            })?;
+                let credit_token =
+                    CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
+                        message: format!("failed to decode credential: {e}"),
+                    })?;
+                let public_key = PublicKey::from_cbor(&cred.public_key_data).map_err(|e| {
+                    AppError::Credential {
+                        message: format!("failed to decode public key: {e}"),
+                    }
+                })?;
 
-        let params = params_from_domain_separator(cfg.domain_separator())?;
+                let params = params_from_domain_separator(cfg.domain_separator())?;
 
-        let charge_scalar =
-            credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
-                message: format!("invalid charge amount: {e:?}"),
-            })?;
-        let (spend_proof, pre_refund) = credit_token
-            .prove_spend::<128>(&params, charge_scalar, OsRng)
-            .map_err(|e| AppError::Credential {
-                message: format!("failed to create spend proof: {e:?}"),
-            })?;
+                let charge_scalar =
+                    credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
+                        message: format!("invalid charge amount: {e:?}"),
+                    })?;
+                let (spend_proof, pre_refund) = credit_token
+                    .prove_spend::<128>(&params, charge_scalar, OsRng)
+                    .map_err(|e| AppError::Credential {
+                        message: format!("failed to create spend proof: {e:?}"),
+                    })?;
 
-        let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode pre_refund: {e}"),
-        })?;
-        let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode spend proof: {e}"),
-        })?;
-        let pre_cred_id = Uuid::now_v7().to_string();
-        db::insert_pre_credential_refund(
-            &db_conn,
-            &pre_cred_id,
-            &cred.nonce,
-            &cred.issuer_key_id,
-            &pre_refund_cbor,
-            charge_credits as i64,
-            &spend_proof_cbor,
-            now,
-        )
-        .await?;
-        // Credential flipped to "spending" — wallet state changed regardless of
-        // whether the rest of the operation succeeds.
-        self.bus.emit(Change::Wallet);
+                let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
+                    message: format!("failed to encode pre_refund: {e}"),
+                })?;
+                let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
+                    message: format!("failed to encode spend proof: {e}"),
+                })?;
+                let pre_cred_id = Uuid::now_v7().to_string();
+                db::insert_pre_credential_refund(
+                    &db_conn,
+                    &pre_cred_id,
+                    &cred.nonce,
+                    &cred.issuer_key_id,
+                    &pre_refund_cbor,
+                    charge_credits as i64,
+                    &spend_proof_cbor,
+                    now,
+                )
+                .await?;
+                // Credential flipped to "spending" — wallet state changed
+                // regardless of whether the rest of the operation succeeds.
+                self.bus.emit(Change::Wallet);
 
-        let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
-        let challenge_digest = compute_challenge_digest();
+                let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
+                let challenge_digest = compute_challenge_digest();
 
-        let mut token_bytes = Vec::new();
-        token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
-        token_bytes.extend_from_slice(&challenge_digest);
-        token_bytes.extend_from_slice(&issuer_key_hash);
-        token_bytes.extend_from_slice(&spend_proof_cbor);
+                let mut token_bytes = Vec::new();
+                token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+                token_bytes.extend_from_slice(&challenge_digest);
+                token_bytes.extend_from_slice(&issuer_key_hash);
+                token_bytes.extend_from_slice(&spend_proof_cbor);
 
-        let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
-        let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+                let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
+                let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+
+                (
+                    charge_credits,
+                    Some(SpendPrep {
+                        cred,
+                        public_key,
+                        params,
+                        spend_proof,
+                        pre_refund,
+                        pre_cred_id,
+                    }),
+                    Some(auth_value),
+                )
+            }
+        };
 
         // Build the messages array from the assembled context. The posted user
         // turn is already part of it (post persisted it); the agent's response
@@ -1804,7 +1884,7 @@ impl Inner {
             attestation_log,
             client,
             connection_id,
-            base_url: base_url.to_string(),
+            base_url,
             now,
             space_id,
             model: model.to_string(),
@@ -1816,12 +1896,7 @@ impl Inner {
             context_rows,
             messages,
             charge_credits,
-            cred,
-            public_key,
-            params,
-            spend_proof,
-            pre_refund,
-            pre_cred_id,
+            spend,
             auth_value,
         })
     }
@@ -1852,14 +1927,16 @@ impl Inner {
         let request_at = now_ms();
 
         // Send the chat request. On failure, attempt refund recovery before
-        // propagating the error so the credential isn't abandoned.
-        let chat_result = prep
+        // propagating the error so the credential isn't abandoned. Local
+        // turns carry no Authorization header — there is nothing to spend.
+        let mut request = prep
             .client
             .post(format!("{}/v1/chat/completions", prep.base_url))
-            .header("Authorization", &prep.auth_value)
-            .json(&request_body_json)
-            .send()
-            .await;
+            .json(&request_body_json);
+        if let Some(auth_value) = &prep.auth_value {
+            request = request.header("Authorization", auth_value);
+        }
+        let chat_result = request.send().await;
         let response_at = now_ms();
 
         // `post` already emitted the user turn's `Space(id)` + `SpaceIndex`
@@ -1915,16 +1992,19 @@ impl Inner {
 
         // Process the refund token from the response. If none is present,
         // attempt recovery from the server (best-effort — the final Wallet
-        // emission below covers a written successor).
-        match body.get("refund") {
-            Some(refund_obj) => {
-                prep.process_refund_obj(refund_obj)
-                    .await
-                    .inspect_err(|_| emit_user_turn())
-                    .map_err(|e| prep.wrap(e))?;
-            }
-            None => {
-                let _ = prep.try_refund_recovery().await;
+        // emission below covers a written successor). Local turns have no
+        // spend, hence nothing to refund.
+        if prep.spend.is_some() {
+            match body.get("refund") {
+                Some(refund_obj) => {
+                    prep.process_refund_obj(refund_obj)
+                        .await
+                        .inspect_err(|_| emit_user_turn())
+                        .map_err(|e| prep.wrap(e))?;
+                }
+                None => {
+                    let _ = prep.try_refund_recovery().await;
+                }
             }
         }
 
@@ -1976,9 +2056,12 @@ impl Inner {
 
         // All durable writes succeeded — emit per affected domain. post owns the
         // SpaceIndex (new space / auto-title); a response doesn't change the
-        // listing's identity.
+        // listing's identity. Local turns touched no credential, so no
+        // Wallet emission.
         self.bus.emit(Change::Space(prep.space_id.clone()));
-        self.bus.emit(Change::Wallet);
+        if prep.spend.is_some() {
+            self.bus.emit(Change::Wallet);
+        }
         self.bus.emit(Change::Record);
 
         Ok(ChatResult {
@@ -2072,14 +2155,15 @@ impl Inner {
         let request_body_json = prep.request_body(true);
         let request_at = now_ms();
 
-        let chat_result = prep
+        let mut request = prep
             .client
             .post(format!("{}/v1/chat/completions", prep.base_url))
-            .header("Authorization", &prep.auth_value)
             .header("Accept", "text/event-stream")
-            .json(&request_body_json)
-            .send()
-            .await;
+            .json(&request_body_json);
+        if let Some(auth_value) = &prep.auth_value {
+            request = request.header("Authorization", auth_value);
+        }
+        let chat_result = request.send().await;
 
         // post already emitted the user turn's Space(id) + SpaceIndex; on a
         // run_turn_stream error exit we re-signal the space (idempotent
@@ -2138,7 +2222,7 @@ impl Inner {
                     response_at: Some(now_ms()),
                     duration_ms: Some(now_ms() - request_at),
                     error: None,
-                    credential_nonce: Some(prep.cred.nonce.clone()),
+                    credential_nonce: prep.credential_nonce(),
                     created_at: now_ms(),
                 },
             )
@@ -2272,9 +2356,12 @@ impl Inner {
         .await?;
 
         // All durable writes succeeded — emit per affected domain. post owns the
-        // SpaceIndex (new space / auto-title).
+        // SpaceIndex (new space / auto-title). Local turns touched no
+        // credential, so no Wallet emission.
         self.bus.emit(Change::Space(prep.space_id.clone()));
-        self.bus.emit(Change::Wallet);
+        if prep.spend.is_some() {
+            self.bus.emit(Change::Wallet);
+        }
         self.bus.emit(Change::Record);
 
         Ok(ChatResult {
@@ -2453,6 +2540,7 @@ impl AppCore {
                 update_state: Mutex::new(None),
                 update_polling: std::sync::atomic::AtomicBool::new(false),
                 bus,
+                local: Arc::new(local_models::LocalRuntime::default()),
                 http_override,
             }),
         }
@@ -2558,6 +2646,17 @@ impl AppCore {
     pub fn set_light_character(&self, character: config::LightCharacter) -> Result<(), AppError> {
         let mut cfg = self.inner.load_config();
         cfg.light_character_override = Some(character);
+        cfg.save_to(&self.inner.config_path)?;
+        self.bus.emit(Change::Config);
+        Ok(())
+    }
+
+    /// Set (or clear, with `None`/blank) the explicit `llama-server` path
+    /// used for local inference. When unset, the binary is discovered on
+    /// `PATH` and in the usual install locations.
+    pub fn set_llama_server_path(&self, path: Option<String>) -> Result<(), AppError> {
+        let mut cfg = self.inner.load_config();
+        cfg.llama_server_path_override = path.filter(|p| !p.trim().is_empty());
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
         Ok(())
@@ -2884,6 +2983,86 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    // -----------------------------------------------------------------------
+    // Local models — download, delete, and llama.cpp engine lifecycle
+    // -----------------------------------------------------------------------
+
+    /// The curated downloadable-model catalog (static data; installed
+    /// state comes from [`AppCore::local_models_state`]).
+    pub fn local_model_catalog(&self) -> &'static [LocalCatalogEntry] {
+        LOCAL_MODEL_CATALOG
+    }
+
+    /// Snapshot of the local-inference domain: resolved engine binary and
+    /// every model with its lifecycle state. Refresh on
+    /// [`Change::LocalModels`].
+    pub async fn local_models_state(&self) -> Result<LocalModelsState, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.local_models_state().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Start a background model download from a direct `.gguf` URL (or a
+    /// Hugging Face file-page URL). Returns the future `local/<slug>` id
+    /// immediately; progress arrives via [`Change::LocalModels`].
+    pub async fn download_local_model(&self, url: String) -> Result<String, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.download_local_model(&url).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Cancel an in-flight model download; the partial file is removed.
+    pub async fn cancel_local_model_download(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.cancel_local_model_download(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Delete a downloaded model from disk. Fails while the model is
+    /// loaded (unload first) or downloading (cancel instead).
+    pub async fn delete_local_model(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.delete_local_model(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Load a local model: spawn `llama-server` for it and wait until it
+    /// is ready to serve. Resolves when the model is chat-selectable (or
+    /// the load failed); intermediate states arrive via
+    /// [`Change::LocalModels`].
+    pub async fn load_local_model(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.load_local_model(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Unload a local model, terminating its engine subprocess.
+    pub async fn unload_local_model(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.unload_local_model(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Test-only seam: mark `slug` as a loaded local model served at
+    /// `127.0.0.1:<port>`, so integration tests can drive local chat turns
+    /// against a mock upstream without spawning a real `llama-server`.
+    #[doc(hidden)]
+    pub fn test_register_loaded_local_model(&self, slug: &str, port: u16) {
+        self.inner.local.register_for_test(slug, port);
+    }
+
     /// List spaces, most recently active first. Archived spaces are
     /// excluded unless `include_archived` is set.
     pub async fn list_spaces(&self, include_archived: bool) -> Result<Vec<SpaceInfo>, AppError> {
@@ -3184,14 +3363,25 @@ struct TurnPrep {
     context_rows: Vec<db::SpaceActionRow>,
     /// The OpenAI messages array built from `context_rows`.
     messages: Vec<serde_json::Value>,
+    /// Estimated hold for this turn. Always `0` when `spend` is `None`.
     charge_credits: u128,
+    /// The in-flight credential spend — `None` for local turns, which have
+    /// no billing. Its absence disables the ACT header, the refund
+    /// machinery, and the `Wallet` emissions throughout the transports.
+    spend: Option<SpendPrep>,
+    /// The `Authorization` header value; present iff `spend` is.
+    auth_value: Option<String>,
+}
+
+/// The credential-spend half of a prepared (remote) turn: the spendable
+/// credential, the proof materials, and the pending-refund row id.
+struct SpendPrep {
     cred: db::SpendableCredential,
     public_key: PublicKey,
     params: Params,
     spend_proof: SpendProof<128>,
     pre_refund: PreRefund,
     pre_cred_id: String,
-    auth_value: String,
 }
 
 impl TurnPrep {
@@ -3213,6 +3403,13 @@ impl TurnPrep {
         });
         if stream {
             body["stream"] = serde_json::Value::Bool(true);
+            // The Eidola server forces `include_usage` upstream regardless
+            // (accurate refunds depend on it), so the remote request stays
+            // minimal — but a local llama-server only reports usage when the
+            // client asks.
+            if self.spend.is_none() {
+                body["stream_options"] = serde_json::json!({ "include_usage": true });
+            }
         }
         body
     }
@@ -3236,17 +3433,21 @@ impl TurnPrep {
     }
 
     /// Apply a refund object (inline from a response body, or recovered) to
-    /// the pending spend — writes the successor credential.
+    /// the pending spend — writes the successor credential. A no-op for
+    /// local turns (nothing was spent).
     async fn process_refund_obj(&self, refund_obj: &serde_json::Value) -> Result<(), AppError> {
+        let Some(spend) = &self.spend else {
+            return Ok(());
+        };
         process_refund(
             refund_obj,
-            &self.params,
-            &self.spend_proof,
-            &self.pre_refund,
-            &self.public_key,
+            &spend.params,
+            &spend.spend_proof,
+            &spend.pre_refund,
+            &spend.public_key,
             &self.db_conn,
-            &self.pre_cred_id,
-            self.cred.generation + 1,
+            &spend.pre_cred_id,
+            spend.cred.generation + 1,
             self.now,
         )
         .await
@@ -3254,12 +3455,23 @@ impl TurnPrep {
 
     /// Best-effort refund recovery via `/v1/credentials/refund`. Returns
     /// whether a successor credential was written (the caller decides whether
-    /// that warrants an immediate `Wallet` emission).
+    /// that warrants an immediate `Wallet` emission). Always `false` for
+    /// local turns — there is no spend to recover.
     async fn try_refund_recovery(&self) -> bool {
-        match recover_refund(&self.client, &self.base_url, &self.auth_value).await {
+        let (Some(_), Some(auth_value)) = (&self.spend, &self.auth_value) else {
+            return false;
+        };
+        match recover_refund(&self.client, &self.base_url, auth_value).await {
             Ok(refund_obj) => self.process_refund_obj(&refund_obj).await.is_ok(),
             Err(_) => false,
         }
+    }
+
+    /// The nonce of the spending credential, if this turn carries a spend.
+    /// Recorded on request rows; `None` keeps local turns honest in the
+    /// Record.
+    fn credential_nonce(&self) -> Option<String> {
+        self.spend.as_ref().map(|s| s.cred.nonce.clone())
     }
 
     /// Persist the turn's durable rows — the inference action (per the attach
@@ -3295,7 +3507,8 @@ impl TurnPrep {
                 model: Some(self.model.clone()),
                 input_tokens,
                 output_tokens,
-                credits_consumed: Some(self.charge_credits as i64),
+                // Local turns record no charge (`None`), not a fake zero.
+                credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
                 created_at: now_ms(),
             },
         )
@@ -3363,7 +3576,7 @@ impl TurnPrep {
                 response_at: Some(response_at),
                 duration_ms: Some(response_at - request_at),
                 error: None,
-                credential_nonce: Some(self.cred.nonce.clone()),
+                credential_nonce: self.credential_nonce(),
                 created_at: now_ms(),
             },
         )

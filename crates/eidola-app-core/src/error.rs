@@ -50,6 +50,12 @@ pub enum AppError {
     #[error("internal error: {message}")]
     Internal { message: String },
 
+    /// A local-model operation failed: a download, the llama.cpp engine
+    /// lifecycle (spawn/load/unload), or routing a chat turn to a local
+    /// model that isn't loaded.
+    #[error("local model error: {message}")]
+    LocalModel { message: String },
+
     /// A self-update verification step failed.
     ///
     /// Used by [`crate::updater`] to surface fetch/parse/schema/continuity

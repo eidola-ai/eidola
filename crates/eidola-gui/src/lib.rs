@@ -9,6 +9,7 @@ pub mod chrome;
 pub mod general;
 pub mod library;
 pub mod loadable;
+pub mod models_settings;
 pub mod onboarding;
 mod plans;
 pub mod probe;
@@ -115,6 +116,7 @@ pub fn run() {
         // bug is fixed structurally: the model list refresh cannot be
         // dropped by an in-flight wallet recovery).
         stores.models.update(cx, |s, cx| s.refresh(cx));
+        stores.local_models.update(cx, |s, cx| s.refresh(cx));
         stores.spaces.update(cx, |s, cx| s.refresh(cx));
 
         // Best-effort recovery of any in-flight credentials left over from a

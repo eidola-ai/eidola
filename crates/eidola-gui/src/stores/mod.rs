@@ -21,6 +21,7 @@
 
 pub mod account;
 pub mod config;
+pub mod local_models;
 pub mod models;
 pub mod record;
 pub mod spaces;
@@ -35,6 +36,7 @@ use gpui::{App, AppContext, AsyncApp, Entity};
 
 pub use account::AccountStore;
 pub use config::ConfigStore;
+pub use local_models::LocalModelsStore;
 pub use models::ModelsStore;
 pub use record::RecordStore;
 pub use spaces::SpacesStore;
@@ -55,6 +57,7 @@ pub struct Stores {
     app_core: Option<Arc<AppCore>>,
     pub config: Entity<ConfigStore>,
     pub models: Entity<ModelsStore>,
+    pub local_models: Entity<LocalModelsStore>,
     pub account: Entity<AccountStore>,
     pub wallet: Entity<WalletStore>,
     pub spaces: Entity<SpacesStore>,
@@ -94,6 +97,7 @@ impl Stores {
     pub fn stub_with(fixture: StoresStub, cx: &mut App) -> Self {
         let config = cx.new(|_| ConfigStore::stub(fixture.config_state));
         let models = cx.new(|_| ModelsStore::stub(fixture.models));
+        let local_models = cx.new(|_| LocalModelsStore::stub(fixture.local_models));
         let account = cx.new(|_| AccountStore::stub(fixture.balances, fixture.prices));
         let wallet =
             cx.new(|_| WalletStore::stub(fixture.credential_lifecycle, fixture.credentials));
@@ -104,6 +108,7 @@ impl Stores {
             app_core: None,
             config,
             models,
+            local_models,
             account,
             wallet,
             spaces,
@@ -123,6 +128,7 @@ impl Stores {
     fn with_core(app_core: Option<Arc<AppCore>>, cx: &mut App) -> Self {
         let config = cx.new(|_| ConfigStore::new(app_core.clone()));
         let models = cx.new(|_| ModelsStore::new(app_core.clone()));
+        let local_models = cx.new(|_| LocalModelsStore::new(app_core.clone()));
         let account = cx.new(|_| AccountStore::new(app_core.clone()));
         let wallet = cx.new(|_| WalletStore::new(app_core.clone()));
         let spaces = cx.new(|_| SpacesStore::new(app_core.clone()));
@@ -132,6 +138,7 @@ impl Stores {
             app_core,
             config,
             models,
+            local_models,
             account,
             wallet,
             spaces,
@@ -155,6 +162,7 @@ impl Stores {
 pub struct StoresStub {
     pub config_state: Option<eidola_app_core::ConfigState>,
     pub models: Vec<eidola_app_core::ModelInfo>,
+    pub local_models: Option<eidola_app_core::LocalModelsState>,
     pub balances: Option<eidola_app_core::BalancesResult>,
     pub prices: Vec<eidola_app_core::PriceInfo>,
     pub credentials: Vec<eidola_app_core::CredentialInfo>,
@@ -274,6 +282,11 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
         Change::UpdateState => {
             stores.update.update(cx, |s, cx| s.refresh(cx));
         }
+        // Downloads progressing, engines loading/unloading, deletions — the
+        // whole local-inference domain re-snapshots from one signal.
+        Change::LocalModels => {
+            stores.local_models.update(cx, |s, cx| s.refresh(cx));
+        }
     }
 }
 
@@ -282,6 +295,7 @@ fn dispatch_change(stores: &Stores, change: Change, cx: &mut App) {
 fn refresh_everything(stores: &Stores, cx: &mut App) {
     stores.config.update(cx, |s, cx| s.refresh(cx));
     stores.models.update(cx, |s, cx| s.refresh(cx));
+    stores.local_models.update(cx, |s, cx| s.refresh(cx));
     stores.account.update(cx, |s, cx| {
         s.refresh_balances(cx);
         s.refresh_prices(cx);

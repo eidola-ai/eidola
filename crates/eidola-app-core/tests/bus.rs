@@ -46,6 +46,21 @@
 //! action/content/antecedent inserts stays *unemitted* — internal-consistency
 //! (kill-`-9`-class) failures, not durable partial state to reconcile.
 //!
+//! **Local turns (`local/<slug>` models).** `prepare_turn` routes these to the
+//! loopback llama.cpp engine with `TurnPrep.spend = None`: no credential is
+//! provisioned, no `Authorization` header is sent, and every `Wallet` emission
+//! above is skipped (spend-start, refund-recovery, and the success emission are
+//! all gated on `spend`). The rows otherwise apply unchanged — same
+//! `Space`/`SpaceIndex`/`Record` placement, same `ChatFailed` wrapping after
+//! the post persists. A local model that is not loaded fails in the routing
+//! step (typed `AppError::LocalModel`, pre-`wrap`, post surviving) — executed
+//! in `tests/local_models.rs` (`local_blocking_chat_has_no_spend_no_auth_no_wallet`,
+//! `local_streaming_chat_streams_and_persists_without_wallet`,
+//! `local_chat_with_unloaded_model_is_typed_error`). The local-domain
+//! lifecycle emissions (`Change::LocalModels` on download start / throttled
+//! progress / completion / failure / delete / engine load / ready / unload /
+//! crash) are asserted there too and never touch the chat-domain rows.
+//!
 //! **Failure-path id adoption (item C).** `post` persists the space before
 //! `run_turn` runs, so every `run_turn` error is wrapped as
 //! `AppError::ChatFailed { space_id }` (its `Display` defers to the source). A

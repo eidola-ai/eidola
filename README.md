@@ -99,6 +99,18 @@ To run the CLI against a local development stack:
 
 Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) for convenience.
 
+### Local inference (llama.cpp)
+
+The client can run models entirely on-device through [llama.cpp](https://github.com/ggml-org/llama.cpp) in server mode — no account, credentials, or network required for the inference itself. Install the engine first (`brew install llama.cpp` on macOS, or set `llama_server_path` in `config.toml`), then:
+
+```bash
+cargo run -p eidola-cli -- model list                   # curated Gemma 4 catalog + installed models
+cargo run -p eidola-cli -- model download gemma-4-e2b   # or any .gguf / Hugging Face file URL
+cargo run -p eidola-cli -- chat "hello" --model local/gemma-4-E2B_q4_0-it
+```
+
+Local models are identified as `local/<file-stem>` and stored under the app data directory (`~/Library/Application Support/eidola/models/` on macOS). In the GUI, **Settings → Models** manages downloads and engine load/unload, and loaded models appear at the top of the model picker under "On this device".
+
 ### GUI
 
 Build, run, and test the gpui-based desktop app (macOS, or Linux under Wayland) from the command line:

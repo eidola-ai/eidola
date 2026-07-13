@@ -29,10 +29,10 @@ pub const DEFAULT_MODEL: &str = "gemma4-31b";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppearanceSetting {
-    #[default]
     System,
     Day,
     Night,
+    #[default]
     Auto,
 }
 
@@ -126,6 +126,17 @@ pub struct Config {
         skip_serializing_if = "Option::is_none"
     )]
     pub update_feed_override: Option<String>,
+    /// Explicit path to the `llama-server` binary used for local
+    /// inference. `None` = discover it (`PATH`, then the usual install
+    /// locations). Unlike the `*_override` pins there is no embedded
+    /// fallback value — resolution lives in
+    /// `local_models::resolve_engine_path`.
+    #[serde(
+        rename = "llama_server_path",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub llama_server_path_override: Option<String>,
     /// Circadian theme, day/night axis. `None` = the default (`system`).
     #[serde(
         rename = "appearance",
