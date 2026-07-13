@@ -60,6 +60,56 @@ CREATE TABLE credential (
 -- #  LAYER 1 — TRANSPORT & ATTESTATION                       #
 -- ############################################################
 
+-- ============================================================
+-- Backend: a *configured* inference destination — where an ask
+-- can be routed. Distinct from `provider` (below), which is the
+-- append-only forensic identity of whoever serviced a
+-- connection: a backend is user configuration (mutable,
+-- enable/disable-able, removable); a provider row is a record.
+--
+-- kind:
+--   eidola    the confidential Eidola service (singleton; its
+--             base_url stays NULL — the trust-root pin + config
+--             override remain the authority)
+--   local     Eidola-managed on-device models (singleton; the
+--             models live in <data_dir>/models)
+--   openai    any OpenAI-compatible HTTP server the user
+--             configures (base_url + optional api_key)
+--   llamacpp  a user-owned llama.cpp install: Eidola scans
+--             models_dir and starts/stops llama-server engines,
+--             but does NOT manage (download/delete) the models
+--
+-- model_overrides: JSON array of model ids. "OpenAI-compatible"
+-- does not guarantee GET /v1/models (Azure's deployment model,
+-- scoped gateway keys, partial proxy listings), so a backend's
+-- model list can be pinned manually; NULL = trust the listing.
+--
+-- removed_at: soft delete. Forensic rows (request.backend_id)
+-- keep a valid FK target forever; re-adding the same id revives
+-- the row.
+-- ============================================================
+CREATE TABLE backend (
+    id              TEXT PRIMARY KEY,          -- user-visible slug
+    kind            TEXT NOT NULL CHECK (kind IN (
+                        'eidola', 'local', 'openai', 'llamacpp'
+                    )),
+    display_name    TEXT NOT NULL,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    base_url        TEXT,
+    api_key         TEXT,
+    models_dir      TEXT,
+    model_overrides TEXT,                      -- JSON array
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    removed_at      INTEGER
+);
+
+-- The eidola and local backends are singletons; externally
+-- configured kinds may have any number of rows.
+CREATE UNIQUE INDEX idx_backend_singleton
+    ON backend (kind)
+    WHERE kind IN ('eidola', 'local');
+
 CREATE TABLE provider (
     id          TEXT PRIMARY KEY,              -- UUIDv7
     name        TEXT NOT NULL,
@@ -448,7 +498,12 @@ CREATE TABLE request (
 
     credential_nonce  TEXT REFERENCES credential(nonce),
 
-    created_at        INTEGER NOT NULL
+    created_at        INTEGER NOT NULL,
+
+    -- The configured backend this request was routed through, when the
+    -- request belongs to one (chat turns; NULL for e.g. attestation-only
+    -- traffic recorded before backends existed).
+    backend_id        TEXT REFERENCES backend(id)
 );
 
 CREATE INDEX idx_request_action

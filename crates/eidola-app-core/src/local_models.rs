@@ -14,24 +14,33 @@
 //!
 //! Process isolation is deliberate: an inference crash (OOM, driver bugs)
 //! kills the child, never the app, and the subprocess boundary is the same
-//! OpenAI-HTTP seam a future *external* llama.cpp instance or a self-hosted
-//! second-device server would plug into.
+//! OpenAI-HTTP seam a self-hosted second-device server would plug into.
+//!
+//! Two backend kinds share this module's machinery (see `crate::backends`):
+//! the managed **`local`** singleton (Eidola's own model store under
+//! `<data_dir>/models/` — downloads, catalog, delete) and any number of
+//! **`llamacpp`** backends (a *user-owned* llama.cpp install: Eidola scans
+//! the backend's `models_dir` and starts/stops engines, but never
+//! downloads or deletes the files). Engines are keyed by
+//! `(backend_id, slug)`.
 //!
 //! ## State
 //!
-//! Durable truth is the filesystem: `<data_dir>/models/` holds one
-//! `<file>.gguf` per model plus a `<file>.gguf.meta.json` sidecar
-//! (display name, source URL, download time). A `.gguf` dropped in
-//! manually is picked up on the next scan — the sidecar is optional.
-//! In-flight downloads write `<file>.gguf.part` and rename on completion,
-//! so a crash never leaves a truncated file masquerading as a model.
+//! Durable truth is the filesystem: one `<file>.gguf` per model plus (in
+//! the managed store) a `<file>.gguf.meta.json` sidecar (display name,
+//! source URL, download time). A `.gguf` dropped in manually is picked up
+//! on the next scan — the sidecar is optional. In-flight downloads write
+//! `<file>.gguf.part` and rename on completion, so a crash never leaves a
+//! truncated file masquerading as a model.
 //!
 //! Runtime state (downloads in progress, running engines) lives in
 //! [`LocalRuntime`] on `Inner`. Every state transition emits
 //! [`Change::LocalModels`] so subscribers re-snapshot via
 //! `AppCore::local_models_state`; download progress emits throttled.
-//! Model identifiers are namespaced as `local/<file-stem>` so the chat
-//! path can route on the prefix.
+//! The managed store's model ids keep the legacy `local/<file-stem>` form;
+//! llamacpp backends' are qualified `<file-stem>@<backend-id>` — either
+//! way the id doubles as the spawned engine's `--alias`, so a chat body's
+//! `model` field matches the selection string verbatim.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -145,13 +154,14 @@ pub enum LocalModelStatus {
     Loaded { port: u16, context_tokens: u32 },
 }
 
-/// One local model as shown in Settings → Models and (when loaded) the
-/// model picker.
+/// One engine-served model as shown in Settings → Backends and (when
+/// loaded) the model picker.
 #[derive(Clone, Debug)]
 pub struct LocalModelInfo {
-    /// The chat-routable id: `local/<slug>`.
+    /// The chat-routable selection id: `local/<slug>` for the managed
+    /// store, `<slug>@<backend-id>` for llamacpp backends.
     pub id: String,
-    /// The file stem — the part after `local/`.
+    /// The file stem.
     pub slug: String,
     pub display_name: String,
     pub file_name: String,
@@ -164,12 +174,28 @@ pub struct LocalModelInfo {
     pub last_error: Option<String>,
 }
 
-/// Snapshot of the whole local-inference domain.
+/// Snapshot of the whole local-inference domain: the managed `local`
+/// singleton plus every configured `llamacpp` backend's scanned directory.
 #[derive(Clone, Debug)]
 pub struct LocalModelsState {
     /// Resolved `llama-server` binary (config override, `PATH`, or a known
     /// install location), if one was found.
     pub engine_path: Option<String>,
+    /// The `local` singleton's models (Eidola-managed store).
+    pub models: Vec<LocalModelInfo>,
+    /// Each configured `llamacpp` backend: its user-owned directory scanned
+    /// for `.gguf`s, with live engine status. Eidola never downloads or
+    /// deletes here — the verbs are load/unload only.
+    pub external: Vec<ExternalEngineBackend>,
+}
+
+/// One `llamacpp` backend's scanned models.
+#[derive(Clone, Debug)]
+pub struct ExternalEngineBackend {
+    pub backend_id: String,
+    pub display_name: String,
+    pub enabled: bool,
+    pub models_dir: String,
     pub models: Vec<LocalModelInfo>,
 }
 
@@ -207,36 +233,44 @@ struct EngineEntry {
     shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
+/// Engine/failure map key: `(backend_id, slug)`. The `local` singleton and
+/// every `llamacpp` backend share one runtime, so the backend id is part of
+/// the identity (two backends may hold same-named files).
+pub(crate) type EngineKey = (String, String);
+
 /// All runtime (non-durable) local-inference state, held by `Inner` behind
 /// an `Arc` so transfer/supervisor tasks can outlive individual calls.
 /// Plain `std::sync::Mutex` — never held across an `.await`.
 #[derive(Default)]
 pub(crate) struct LocalRuntime {
+    /// Downloads exist only for the managed `local` backend, keyed by slug.
     downloads: StdMutex<HashMap<String, Arc<DownloadEntry>>>,
-    engines: StdMutex<HashMap<String, EngineEntry>>,
-    /// Last failure per slug (download or load), shown until retried.
-    failures: StdMutex<HashMap<String, String>>,
+    engines: StdMutex<HashMap<EngineKey, EngineEntry>>,
+    /// Last failure per (backend, slug) — download or load — until retried.
+    failures: StdMutex<HashMap<EngineKey, String>>,
 }
 
 impl LocalRuntime {
-    /// The loopback base URL + context window of a ready engine, if the
-    /// slug is loaded. `None` while still warming up.
-    pub(crate) fn ready_engine(&self, slug: &str) -> Option<(String, u32)> {
+    /// The loopback base URL + context window of a ready engine, if that
+    /// backend's slug is loaded. `None` while still warming up.
+    pub(crate) fn ready_engine(&self, backend_id: &str, slug: &str) -> Option<(String, u32)> {
         let engines = self.engines.lock().expect("engines lock");
-        engines.get(slug).and_then(|e| {
-            e.ready
-                .then(|| (format!("http://127.0.0.1:{}", e.port), e.context_tokens))
-        })
+        engines
+            .get(&(backend_id.to_string(), slug.to_string()))
+            .and_then(|e| {
+                e.ready
+                    .then(|| (format!("http://127.0.0.1:{}", e.port), e.context_tokens))
+            })
     }
 
     /// Test seam: register a fake "ready" engine at an arbitrary port so
     /// integration tests can route local turns at a mock upstream without
     /// spawning a real llama-server.
     #[doc(hidden)]
-    pub(crate) fn register_for_test(&self, slug: &str, port: u16) {
+    pub(crate) fn register_for_test(&self, backend_id: &str, slug: &str, port: u16) {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         self.engines.lock().expect("engines lock").insert(
-            slug.to_string(),
+            (backend_id.to_string(), slug.to_string()),
             EngineEntry {
                 port,
                 context_tokens: LOCAL_CONTEXT_TOKENS,
@@ -258,15 +292,40 @@ pub(crate) fn models_dir(data_dir: &Path) -> PathBuf {
 
 /// Strip the `local/` prefix if present, so public APIs accept either the
 /// full model id or the bare slug.
-fn slug_of(id_or_slug: &str) -> &str {
+pub(crate) fn slug_of(id_or_slug: &str) -> &str {
     id_or_slug
         .strip_prefix(LOCAL_MODEL_PREFIX)
         .unwrap_or(id_or_slug)
 }
 
-/// Whether a model id routes to the local engine.
-pub(crate) fn is_local_model(model: &str) -> bool {
-    model.starts_with(LOCAL_MODEL_PREFIX)
+/// The selectable model id for an engine-backed backend's slug. The local
+/// singleton keeps its legacy `local/<slug>` form; llamacpp backends use
+/// the qualified `<slug>@<backend>` form. Either way the id doubles as the
+/// engine's `--alias`, so the wire model in a chat body equals the
+/// selection string.
+pub(crate) fn engine_model_id(backend_id: &str, slug: &str) -> String {
+    if backend_id == crate::backends::LOCAL_BACKEND_ID {
+        format!("{LOCAL_MODEL_PREFIX}{slug}")
+    } else {
+        crate::backends::qualified_model_id(slug, backend_id)
+    }
+}
+
+/// Resolve any accepted model spelling (`local/<slug>`, bare slug,
+/// `<slug>@<backend>`) to its engine key `(backend_id, slug)`. A bare slug
+/// belongs to the local singleton — the historic CLI shorthand.
+pub(crate) fn engine_key_for_id(id: &str) -> EngineKey {
+    let mref = crate::backends::parse_model_ref(id);
+    if mref.backend_id == crate::backends::EIDOLA_BACKEND_ID {
+        // A bare slug (no `local/`, no `@`) parses as eidola; in this
+        // module's vocabulary it is the local shorthand.
+        (
+            crate::backends::LOCAL_BACKEND_ID.to_string(),
+            mref.model.clone(),
+        )
+    } else {
+        (mref.backend_id, slug_of(&mref.model).to_string())
+    }
 }
 
 /// Normalize a pasted model URL into `(download_url, file_name)`.
@@ -410,70 +469,20 @@ fn sidecar_path(gguf_path: &Path) -> PathBuf {
 // ============================================================================
 
 impl Inner {
-    /// Snapshot the whole local-inference domain: resolved engine binary +
-    /// every model (on disk, downloading, loading, loaded).
+    /// Snapshot the whole local-inference domain: resolved engine binary,
+    /// the managed `local` store (on disk, downloading, loading, loaded),
+    /// and every configured `llamacpp` backend's scanned directory.
     pub(crate) async fn local_models_state(&self) -> Result<LocalModelsState, AppError> {
         let cfg = self.load_config();
         let engine_path = resolve_engine_path(&cfg).map(|p| p.display().to_string());
         let dir = models_dir(&self.data_dir);
 
-        let mut models: Vec<LocalModelInfo> = Vec::new();
+        let mut models: Vec<LocalModelInfo> = self
+            .scan_engine_dir(crate::backends::LOCAL_BACKEND_ID, &dir)
+            .await;
 
-        // On-disk models.
-        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if !name.to_ascii_lowercase().ends_with(".gguf") {
-                    continue;
-                }
-                let slug = slug_for_file(name);
-                let size_bytes = entry.metadata().await.ok().map(|m| m.len());
-                let sidecar: Option<ModelSidecar> = tokio::fs::read(sidecar_path(&path))
-                    .await
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-
-                let status = {
-                    let engines = self.local.engines.lock().expect("engines lock");
-                    match engines.get(&slug) {
-                        Some(e) if e.ready => LocalModelStatus::Loaded {
-                            port: e.port,
-                            context_tokens: e.context_tokens,
-                        },
-                        Some(_) => LocalModelStatus::Loading,
-                        None => LocalModelStatus::Available,
-                    }
-                };
-                let last_error = self
-                    .local
-                    .failures
-                    .lock()
-                    .expect("failures lock")
-                    .get(&slug)
-                    .cloned();
-
-                let display_name = sidecar
-                    .as_ref()
-                    .map(|s| s.display_name.clone())
-                    .unwrap_or_else(|| prettify_stem(&slug));
-
-                models.push(LocalModelInfo {
-                    id: format!("{LOCAL_MODEL_PREFIX}{slug}"),
-                    slug,
-                    display_name,
-                    file_name: name.to_string(),
-                    size_bytes,
-                    source_url: sidecar.map(|s| s.source_url),
-                    status,
-                    last_error,
-                });
-            }
-        }
-
-        // In-flight downloads (not yet on disk as `.gguf`).
+        // In-flight downloads (not yet on disk as `.gguf`) — the managed
+        // local store only.
         {
             let downloads = self.local.downloads.lock().expect("downloads lock");
             for (slug, dl) in downloads.iter() {
@@ -497,12 +506,15 @@ impl Inner {
             }
         }
 
-        // Failures for slugs with no file and no active download (a failed
-        // download leaves nothing on disk — the error must stay visible).
+        // Failures for local slugs with no file and no active download (a
+        // failed download leaves nothing on disk — the error must stay
+        // visible).
         {
             let failures = self.local.failures.lock().expect("failures lock");
-            for (slug, message) in failures.iter() {
-                if models.iter().any(|m| &m.slug == slug) {
+            for ((backend_id, slug), message) in failures.iter() {
+                if backend_id != crate::backends::LOCAL_BACKEND_ID
+                    || models.iter().any(|m| &m.slug == slug)
+                {
                     continue;
                 }
                 models.push(LocalModelInfo {
@@ -523,10 +535,100 @@ impl Inner {
                 .to_lowercase()
                 .cmp(&b.display_name.to_lowercase())
         });
+
+        // Configured llamacpp backends: scan each user-owned directory.
+        // Disabled backends are still listed (Settings shows them greyed);
+        // removed ones are not.
+        let mut external = Vec::new();
+        let db_conn = self.db_conn().await?;
+        for row in crate::db::list_backends(&db_conn).await? {
+            if row.kind != crate::backends::BackendKind::LlamaCpp.as_str() {
+                continue;
+            }
+            let Some(models_dir) = row.models_dir.clone() else {
+                continue;
+            };
+            let mut scanned = self.scan_engine_dir(&row.id, Path::new(&models_dir)).await;
+            scanned.sort_by(|a, b| {
+                a.display_name
+                    .to_lowercase()
+                    .cmp(&b.display_name.to_lowercase())
+            });
+            external.push(ExternalEngineBackend {
+                backend_id: row.id,
+                display_name: row.display_name,
+                enabled: row.enabled,
+                models_dir,
+                models: scanned,
+            });
+        }
+
         Ok(LocalModelsState {
             engine_path,
             models,
+            external,
         })
+    }
+
+    /// Scan one directory of `.gguf`s for a backend, merging live engine
+    /// status and standing failures. Shared by the managed local store and
+    /// the user-owned llamacpp directories.
+    async fn scan_engine_dir(&self, backend_id: &str, dir: &Path) -> Vec<LocalModelInfo> {
+        let mut models: Vec<LocalModelInfo> = Vec::new();
+        if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !name.to_ascii_lowercase().ends_with(".gguf") {
+                    continue;
+                }
+                let slug = slug_for_file(name);
+                let size_bytes = entry.metadata().await.ok().map(|m| m.len());
+                let sidecar: Option<ModelSidecar> = tokio::fs::read(sidecar_path(&path))
+                    .await
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+
+                let key = (backend_id.to_string(), slug.clone());
+                let status = {
+                    let engines = self.local.engines.lock().expect("engines lock");
+                    match engines.get(&key) {
+                        Some(e) if e.ready => LocalModelStatus::Loaded {
+                            port: e.port,
+                            context_tokens: e.context_tokens,
+                        },
+                        Some(_) => LocalModelStatus::Loading,
+                        None => LocalModelStatus::Available,
+                    }
+                };
+                let last_error = self
+                    .local
+                    .failures
+                    .lock()
+                    .expect("failures lock")
+                    .get(&key)
+                    .cloned();
+
+                let display_name = sidecar
+                    .as_ref()
+                    .map(|s| s.display_name.clone())
+                    .unwrap_or_else(|| prettify_stem(&slug));
+
+                models.push(LocalModelInfo {
+                    id: engine_model_id(backend_id, &slug),
+                    slug,
+                    display_name,
+                    file_name: name.to_string(),
+                    size_bytes,
+                    source_url: sidecar.map(|s| s.source_url),
+                    status,
+                    last_error,
+                });
+            }
+        }
+        models
     }
 
     /// Start downloading a model from `url` in the background. Returns the
@@ -567,11 +669,12 @@ impl Inner {
             }
             downloads.insert(slug.clone(), entry.clone());
         }
+        let key = (crate::backends::LOCAL_BACKEND_ID.to_string(), slug.clone());
         self.local
             .failures
             .lock()
             .expect("failures lock")
-            .remove(&slug);
+            .remove(&key);
         self.bus.emit(Change::LocalModels);
 
         let client = match &self.http_override {
@@ -591,11 +694,10 @@ impl Inner {
                 .expect("downloads lock")
                 .remove(&slug_task);
             if let Err(e) = result {
-                local
-                    .failures
-                    .lock()
-                    .expect("failures lock")
-                    .insert(slug_task, e.to_string());
+                local.failures.lock().expect("failures lock").insert(
+                    (crate::backends::LOCAL_BACKEND_ID.to_string(), slug_task),
+                    e.to_string(),
+                );
             }
             bus.emit(Change::LocalModels);
         });
@@ -620,12 +722,24 @@ impl Inner {
     }
 
     /// Delete a downloaded model (its `.gguf` + sidecar). Refuses while the
-    /// model is loaded or loading — unload first, explicitly.
+    /// model is loaded or loading — unload first, explicitly. Only the
+    /// managed `local` store deletes; llamacpp backends' files are the
+    /// user's own.
     pub(crate) async fn delete_local_model(&self, id: &str) -> Result<(), AppError> {
-        let slug = slug_of(id).to_string();
+        let key = engine_key_for_id(id);
+        if key.0 != crate::backends::LOCAL_BACKEND_ID {
+            return Err(AppError::LocalModel {
+                message: format!(
+                    "models in the `{}` backend's directory are managed by you, not Eidola — \
+                     delete the file yourself if you mean to",
+                    key.0
+                ),
+            });
+        }
+        let slug = key.1.clone();
         {
             let engines = self.local.engines.lock().expect("engines lock");
-            if engines.contains_key(&slug) {
+            if engines.contains_key(&key) {
                 return Err(AppError::LocalModel {
                     message: format!("`{slug}` is loaded — unload it before deleting"),
                 });
@@ -653,24 +767,43 @@ impl Inner {
             .failures
             .lock()
             .expect("failures lock")
-            .remove(&slug);
+            .remove(&key);
         self.bus.emit(Change::LocalModels);
         Ok(())
     }
 
     /// Load a model: spawn `llama-server` on a free loopback port and wait
     /// until its `/health` endpoint reports ready (or the load fails).
-    /// Emits [`Change::LocalModels`] at spawn, on ready, and on failure; a
-    /// supervisor task owns the child and also emits if the engine later
-    /// exits unexpectedly.
+    /// Accepts `local/<slug>`, a bare slug (local shorthand), or a
+    /// llamacpp backend's `<slug>@<backend>`. Emits [`Change::LocalModels`]
+    /// at spawn, on ready, and on failure; a supervisor task owns the child
+    /// and also emits if the engine later exits unexpectedly.
     pub(crate) async fn load_local_model(&self, id: &str) -> Result<(), AppError> {
-        let slug = slug_of(id).to_string();
+        let key = engine_key_for_id(id);
+        let (backend_id, slug) = (key.0.clone(), key.1.clone());
         let cfg = self.load_config();
 
-        let model_path = models_dir(&self.data_dir).join(format!("{slug}.gguf"));
+        // Resolve the model file's directory by backend: the managed local
+        // store, or a llamacpp backend's user-owned directory.
+        let dir = if backend_id == crate::backends::LOCAL_BACKEND_ID {
+            models_dir(&self.data_dir)
+        } else {
+            let db_conn = self.db_conn().await?;
+            let row = self.require_backend(&db_conn, &backend_id).await?;
+            if row.kind != crate::backends::BackendKind::LlamaCpp.as_str() {
+                return Err(AppError::LocalModel {
+                    message: format!("backend `{backend_id}` does not serve local engines"),
+                });
+            }
+            PathBuf::from(row.models_dir.ok_or_else(|| AppError::LocalModel {
+                message: format!("backend `{backend_id}` has no models directory"),
+            })?)
+        };
+
+        let model_path = dir.join(format!("{slug}.gguf"));
         if !model_path.is_file() {
             return Err(AppError::LocalModel {
-                message: format!("model `{slug}` is not downloaded"),
+                message: format!("no model file at `{}`", model_path.display()),
             });
         }
         let engine = resolve_engine_path(&cfg).ok_or_else(|| AppError::LocalModel {
@@ -680,7 +813,9 @@ impl Inner {
         })?;
 
         let port = pick_free_port()?;
-        let model_id = format!("{LOCAL_MODEL_PREFIX}{slug}");
+        // The alias equals the selectable model id, so a chat body's
+        // `model` field matches what the engine expects verbatim.
+        let model_id = engine_model_id(&backend_id, &slug);
 
         let mut command = tokio::process::Command::new(&engine);
         command
@@ -701,13 +836,13 @@ impl Inner {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         {
             let mut engines = self.local.engines.lock().expect("engines lock");
-            if engines.contains_key(&slug) {
+            if engines.contains_key(&key) {
                 return Err(AppError::LocalModel {
-                    message: format!("`{slug}` is already loaded"),
+                    message: format!("`{model_id}` is already loaded"),
                 });
             }
             engines.insert(
-                slug.clone(),
+                key.clone(),
                 EngineEntry {
                     port,
                     context_tokens: LOCAL_CONTEXT_TOKENS,
@@ -720,7 +855,7 @@ impl Inner {
             .failures
             .lock()
             .expect("failures lock")
-            .remove(&slug);
+            .remove(&key);
         self.bus.emit(Change::LocalModels);
 
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -730,22 +865,11 @@ impl Inner {
             Some(c) => c.clone(),
             None => plain_http_client()?,
         };
-        let slug_task = slug.clone();
         // Supervisor task: owns the child for its whole life. Cancellation
         // authority is the shutdown channel (map removal → send) — and if
         // the whole runtime is torn down, `kill_on_drop` reaps the child.
         tokio::spawn(async move {
-            supervise_engine(
-                command,
-                port,
-                http,
-                shutdown_rx,
-                ready_tx,
-                bus,
-                local,
-                slug_task,
-            )
-            .await;
+            supervise_engine(command, port, http, shutdown_rx, ready_tx, bus, local, key).await;
         });
 
         match ready_rx.await {
@@ -759,10 +883,10 @@ impl Inner {
 
     /// Unload a model: signal its supervisor, which kills the subprocess.
     pub(crate) async fn unload_local_model(&self, id: &str) -> Result<(), AppError> {
-        let slug = slug_of(id).to_string();
+        let key = engine_key_for_id(id);
         let entry = {
             let mut engines = self.local.engines.lock().expect("engines lock");
-            engines.remove(&slug)
+            engines.remove(&key)
         };
         match entry {
             Some(e) => {
@@ -773,7 +897,7 @@ impl Inner {
                 Ok(())
             }
             None => Err(AppError::LocalModel {
-                message: format!("`{slug}` is not loaded"),
+                message: format!("`{}` is not loaded", engine_model_id(&key.0, &key.1)),
             }),
         }
     }
@@ -907,15 +1031,15 @@ async fn supervise_engine(
     ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     bus: BroadcastSource,
     local: Arc<LocalRuntime>,
-    slug: String,
+    key: EngineKey,
 ) {
     let fail = |message: &str| {
-        local.engines.lock().expect("engines lock").remove(&slug);
+        local.engines.lock().expect("engines lock").remove(&key);
         local
             .failures
             .lock()
             .expect("failures lock")
-            .insert(slug.clone(), message.to_string());
+            .insert(key.clone(), message.to_string());
     };
 
     let mut child = match command.spawn() {
@@ -1026,7 +1150,7 @@ async fn supervise_engine(
     // decision happens under the lock; the kill happens after it drops.
     let still_wanted = {
         let mut engines = local.engines.lock().expect("engines lock");
-        match engines.get_mut(&slug) {
+        match engines.get_mut(&key) {
             Some(e) => {
                 e.ready = true;
                 true
@@ -1119,7 +1243,26 @@ mod tests {
         let id = format!("{LOCAL_MODEL_PREFIX}{slug}");
         assert_eq!(slug_of(&id), slug);
         assert_eq!(slug_of(&slug), slug);
-        assert!(is_local_model(&id));
-        assert!(!is_local_model("gemma4-31b"));
+    }
+
+    #[test]
+    fn engine_ids_and_keys_round_trip_per_backend() {
+        // The local singleton keeps the legacy `local/<slug>` form.
+        assert_eq!(engine_model_id("local", "tiny"), "local/tiny");
+        assert_eq!(
+            engine_key_for_id("local/tiny"),
+            ("local".to_string(), "tiny".to_string())
+        );
+        // A bare slug is the local shorthand (the historic CLI form).
+        assert_eq!(
+            engine_key_for_id("tiny"),
+            ("local".to_string(), "tiny".to_string())
+        );
+        // llamacpp backends use the qualified form; alias == selection id.
+        assert_eq!(engine_model_id("my-box", "tiny"), "tiny@my-box");
+        assert_eq!(
+            engine_key_for_id("tiny@my-box"),
+            ("my-box".to_string(), "tiny".to_string())
+        );
     }
 }

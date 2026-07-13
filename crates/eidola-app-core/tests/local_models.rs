@@ -237,7 +237,7 @@ fn delete_removes_files_and_emits() {
 
         // Deleting a loaded model is refused.
         std::fs::write(models_dir.join("held.gguf"), b"gguf").unwrap();
-        core.test_register_loaded_local_model("held", 1);
+        core.test_register_loaded_local_model("local", "held", 1);
         let err = core
             .runtime()
             .block_on(core.delete_local_model("held".into()))
@@ -256,7 +256,7 @@ fn local_blocking_chat_has_no_spend_no_auth_no_wallet() {
         let (mock, core, _dir) = chat_harness::core_for(MockConfig::default());
         // NOTE: no `with_account` — local inference must work with zero
         // onboarding (no account, no balance, no credentials).
-        core.test_register_loaded_local_model("test-model", mock.port());
+        core.test_register_loaded_local_model("local", "test-model", mock.port());
         let mut rx = core.subscribe_changes();
 
         let result = core
@@ -324,7 +324,7 @@ fn local_streaming_chat_streams_and_persists_without_wallet() {
             chat: ChatBehavior::OkStreaming,
             ..MockConfig::default()
         });
-        core.test_register_loaded_local_model("test-model", mock.port());
+        core.test_register_loaded_local_model("local", "test-model", mock.port());
         let mut rx = core.subscribe_changes();
 
         let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();

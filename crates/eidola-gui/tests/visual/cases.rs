@@ -827,6 +827,8 @@ fn register_record(s: &mut Snapshots) {
                 ),
                 space_id: None,
                 space_title: None,
+                backend_id: Some("eidola".into()),
+                backend_display_name: Some("Eidola".into()),
             }))));
             view
         })

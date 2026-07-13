@@ -1,3 +1,4 @@
+pub mod backends;
 pub mod changes;
 pub mod config;
 pub mod db;
@@ -22,12 +23,16 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+pub use backends::{
+    BackendInfo, BackendKind, BackendUpdate, EIDOLA_BACKEND_ID, LOCAL_BACKEND_ID, ModelRef,
+    NewBackend, parse_model_ref, qualified_model_id,
+};
 use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
 use error::AppError;
 pub use local_models::{
-    LOCAL_MODEL_CATALOG, LOCAL_MODEL_PREFIX, LocalCatalogEntry, LocalModelInfo, LocalModelStatus,
-    LocalModelsState,
+    ExternalEngineBackend, LOCAL_MODEL_CATALOG, LOCAL_MODEL_PREFIX, LocalCatalogEntry,
+    LocalModelInfo, LocalModelStatus, LocalModelsState,
 };
 
 // ============================================================================
@@ -382,6 +387,10 @@ pub struct RequestDetail {
     pub space_id: Option<String>,
     /// The space's title, if set (may be `None` for untitled spaces).
     pub space_title: Option<String>,
+    /// The configured backend this request was routed through, if recorded.
+    pub backend_id: Option<String>,
+    /// That backend's display name (soft-removed backends keep theirs).
+    pub backend_display_name: Option<String>,
 }
 
 /// One row of the `spend_trail` view: credential → request → action → space.
@@ -1135,6 +1144,8 @@ impl Inner {
             attestation_hash: r.attestation_hash,
             space_id: r.space_id,
             space_title: r.space_title,
+            backend_id: r.backend_id,
+            backend_display_name: r.backend_display_name,
         }))
     }
 
@@ -1619,27 +1630,61 @@ impl Inner {
         let attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>> =
             Arc::new(Mutex::new(Vec::new()));
 
-        // Route by model id: `local/<slug>` turns run against the loaded
-        // llama.cpp engine on loopback — plain client, no attestation, no
-        // credential spend. Everything else runs against the remote
-        // attested server exactly as before. `remote_pricing` is
-        // `Some((prompt_rate, completion_rate, scale_factor))` only for
-        // remote turns; its absence is what disables the whole spend path
-        // below.
-        let (provider_id, client, base_url, connection_id, context_length, remote_pricing) =
-            if local_models::is_local_model(model) {
-                let slug = model
-                    .strip_prefix(local_models::LOCAL_MODEL_PREFIX)
-                    .unwrap_or(model);
-                let (engine_url, context_tokens) =
-                    self.local
-                        .ready_engine(slug)
-                        .ok_or_else(|| AppError::LocalModel {
-                            message: format!(
-                                "`{model}` is not loaded — load it in Settings → Models"
-                            ),
-                        })?;
-                let provider_id = db::ensure_provider(&db_conn, "local", "inference", now).await?;
+        // Resolve the selection to its backend, then route on the backend's
+        // *kind*: `eidola` keeps the attested + credential-spend path;
+        // engine-backed kinds (`local`, `llamacpp`) run against their
+        // loopback llama.cpp engine; `openai` runs plain HTTPS with an
+        // optional bearer key. Only the eidola kind carries pricing —
+        // `remote_pricing` is `Some((prompt_rate, completion_rate,
+        // scale_factor))` there, and its absence is what disables the whole
+        // spend path below (no charge estimate, no credential, no refunds —
+        // which also means non-eidola inference needs no account or
+        // onboarding). `external_auth` is the non-spend Authorization header
+        // (an openai backend's key).
+        let mref = backends::parse_model_ref(model);
+        let backend = self.require_backend(&db_conn, &mref.backend_id).await?;
+        let backend_kind =
+            backends::BackendKind::parse(&backend.kind).ok_or_else(|| AppError::Database {
+                message: format!("unknown backend kind `{}`", backend.kind),
+            })?;
+
+        // The canonical selection string (recorded on actions, shown in
+        // UIs) and the wire model (what the backend's HTTP API expects).
+        // Engine-backed aliases are spawned equal to the canonical id, so
+        // the two coincide there; openai backends get the bare model.
+        let canonical_model = match backend_kind {
+            BackendKind::Local | BackendKind::LlamaCpp => {
+                local_models::engine_model_id(&backend.id, local_models::slug_of(&mref.model))
+            }
+            _ => backends::qualified_model_id(&mref.model, &backend.id),
+        };
+        let wire_model = match backend_kind {
+            BackendKind::OpenAi => mref.model.clone(),
+            _ => canonical_model.clone(),
+        };
+        let model = canonical_model.as_str();
+
+        let (
+            provider_id,
+            client,
+            base_url,
+            connection_id,
+            context_length,
+            remote_pricing,
+            external_auth,
+        ) = match backend_kind {
+            BackendKind::Local | BackendKind::LlamaCpp => {
+                let slug = local_models::slug_of(&mref.model);
+                let (engine_url, context_tokens) = self
+                    .local
+                    .ready_engine(&backend.id, slug)
+                    .ok_or_else(|| AppError::LocalModel {
+                        message: format!(
+                            "`{model}` is not loaded — load it in Settings → Backends"
+                        ),
+                    })?;
+                let provider_id =
+                    db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
                 let client = match &self.http_override {
                     Some(c) => c.clone(),
                     None => local_models::plain_http_client()?,
@@ -1651,10 +1696,31 @@ impl Inner {
                     None,
                     context_tokens as u64,
                     None,
+                    None,
                 )
-            } else {
+            }
+            BackendKind::OpenAi => {
+                let base_url = backend
+                    .base_url
+                    .clone()
+                    .ok_or_else(|| AppError::NotConfigured {
+                        message: format!("backend `{}` has no base URL", backend.id),
+                    })?;
+                let provider_id =
+                    db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
+                let client = match &self.http_override {
+                    Some(c) => c.clone(),
+                    None => local_models::plain_http_client()?,
+                };
+                let auth = backend.api_key.as_ref().map(|k| format!("Bearer {k}"));
+                // Context length is unknown for a generic server — 0
+                // resolves to the 4096 completion default below.
+                (provider_id, client, base_url, None, 0u64, None, auth)
+            }
+            BackendKind::Eidola => {
                 let base_url = cfg.base_url().to_string();
-                let provider_id = db::ensure_provider(&db_conn, "eidola", "inference", now).await?;
+                let provider_id =
+                    db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
                 let log_clone = attestation_log.clone();
                 let observer: Option<tinfoil_verifier::AttestationObserver> = Some(Arc::new(
                     move |att: tinfoil_verifier::VerifiedAttestation| {
@@ -1669,11 +1735,14 @@ impl Inner {
                     flush_attestations(&attestation_log, &db_conn, &provider_id, &base_url, now)
                         .await?;
 
-                let model_entry = models.data.iter().find(|m| m.id == model).ok_or_else(|| {
-                    AppError::NotConfigured {
-                        message: format!("model not found: {model}"),
-                    }
-                })?;
+                let model_entry =
+                    models
+                        .data
+                        .iter()
+                        .find(|m| m.id == wire_model)
+                        .ok_or_else(|| AppError::NotConfigured {
+                            message: format!("model not found: {model}"),
+                        })?;
                 let pricing = (
                     model_entry.pricing.per_prompt_token.value as u128,
                     model_entry.pricing.per_completion_token.value as u128,
@@ -1686,10 +1755,16 @@ impl Inner {
                     connection_id,
                     model_entry.context_length,
                     Some(pricing),
+                    None,
                 )
-            };
+            }
+        };
 
-        let max_completion_tokens = context_length.min(4096) as u32;
+        let max_completion_tokens = if context_length == 0 {
+            4096
+        } else {
+            context_length.min(4096) as u32
+        };
 
         let model_participant_id =
             db::ensure_participant(&db_conn, "agent", model, Some(&provider_id), now).await?;
@@ -1750,11 +1825,13 @@ impl Inner {
         };
         let prior_messages = actions_to_messages(&context_rows);
 
-        // The spend side runs only for remote turns. A local turn is free by
-        // construction: no charge estimate, no credential, no ACT header —
-        // which also means local inference needs no account or onboarding.
+        // The spend side runs only for eidola turns. Local and external
+        // turns carry no charge estimate, no credential, and no ACT header
+        // (an openai backend's bearer key rides in `external_auth` instead)
+        // — which also means non-eidola inference needs no account or
+        // onboarding.
         let (charge_credits, spend, auth_value) = match remote_pricing {
-            None => (0u128, None, None),
+            None => (0u128, None, external_auth),
             Some((prompt_rate, completion_rate, sf)) => {
                 // Estimate the charge from the assembled context. The prompt
                 // side is the shared client/server pricing contract
@@ -1881,6 +1958,7 @@ impl Inner {
         Ok(TurnPrep {
             db_conn,
             provider_id,
+            backend_id: backend.id,
             attestation_log,
             client,
             connection_id,
@@ -1888,6 +1966,7 @@ impl Inner {
             now,
             space_id,
             model: model.to_string(),
+            wire_model,
             model_participant_id,
             max_completion_tokens,
             inf_item_id,
@@ -2224,6 +2303,7 @@ impl Inner {
                     error: None,
                     credential_nonce: prep.credential_nonce(),
                     created_at: now_ms(),
+                    backend_id: Some(prep.backend_id.clone()),
                 },
             )
             .await?;
@@ -2984,6 +3064,74 @@ impl AppCore {
     }
 
     // -----------------------------------------------------------------------
+    // Backends — the configured inference destinations
+    // -----------------------------------------------------------------------
+
+    /// List the configured backends (soft-removed ones excluded): the
+    /// eidola and local singletons first, then external backends in
+    /// creation order. Refresh on [`Change::Backends`].
+    pub async fn list_backends(&self) -> Result<Vec<BackendInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.list_backends().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Add an external backend (kind `openai` or `llamacpp`), or revive a
+    /// previously removed one with the same id.
+    pub async fn add_backend(&self, new: NewBackend) -> Result<BackendInfo, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.add_backend(new).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Enable or disable a backend. Works for the singletons too —
+    /// disabling `eidola` is the "no account, on-device only" mode.
+    pub async fn set_backend_enabled(&self, id: String, enabled: bool) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.set_backend_enabled(&id, enabled).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Update an external backend's configuration (display name, base URL,
+    /// api key, models directory, pinned model list).
+    pub async fn update_backend(&self, id: String, update: BackendUpdate) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.update_backend(&id, update).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Soft-remove an external backend. Its forensic trail (request rows)
+    /// stays resolvable; re-adding the same id revives the row.
+    pub async fn remove_backend(&self, id: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.remove_backend(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The models one backend offers, as selectable entries (ids are the
+    /// qualified selection strings). See `backends::backend_models` for the
+    /// per-kind sources — and note that a generic OpenAI-compatible server
+    /// is not guaranteed to implement `GET /v1/models`; a failed listing
+    /// suggests pinning the backend's models manually.
+    pub async fn backend_models(&self, id: String) -> Result<Vec<ModelInfo>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.backend_models(&id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    // -----------------------------------------------------------------------
     // Local models — download, delete, and llama.cpp engine lifecycle
     // -----------------------------------------------------------------------
 
@@ -3055,12 +3203,13 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// Test-only seam: mark `slug` as a loaded local model served at
-    /// `127.0.0.1:<port>`, so integration tests can drive local chat turns
-    /// against a mock upstream without spawning a real `llama-server`.
+    /// Test-only seam: mark `slug` as a loaded engine model for
+    /// `backend_id` served at `127.0.0.1:<port>`, so integration tests can
+    /// drive engine-backed chat turns against a mock upstream without
+    /// spawning a real `llama-server`.
     #[doc(hidden)]
-    pub fn test_register_loaded_local_model(&self, slug: &str, port: u16) {
-        self.inner.local.register_for_test(slug, port);
+    pub fn test_register_loaded_local_model(&self, backend_id: &str, slug: &str, port: u16) {
+        self.inner.local.register_for_test(backend_id, slug, port);
     }
 
     /// List spaces, most recently active first. Archived spaces are
@@ -3342,6 +3491,9 @@ struct ModelListEntry {
 struct TurnPrep {
     db_conn: turso::Connection,
     provider_id: String,
+    /// The configured backend this turn routes through — recorded on the
+    /// request row (the forensic reference).
+    backend_id: String,
     attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>>,
     client: reqwest::Client,
     /// Connection row adopted from the most recent attestation flush; the
@@ -3351,7 +3503,12 @@ struct TurnPrep {
     /// The preparation timestamp — spend/refund rows key off it.
     now: i64,
     space_id: String,
+    /// The canonical selection string (`qualified_model_id`) — recorded on
+    /// actions, shown in UIs, returned in `ChatResult`.
     model: String,
+    /// The model id the backend's HTTP API expects in the request body.
+    /// Equals `model` except for openai backends (bare wire model).
+    wire_model: String,
     model_participant_id: String,
     max_completion_tokens: u32,
     /// The inference's attach plan (Reply → fresh item; Revise → a new
@@ -3397,7 +3554,7 @@ impl TurnPrep {
     /// The chat request body for this turn.
     fn request_body(&self, stream: bool) -> serde_json::Value {
         let mut body = serde_json::json!({
-            "model": self.model,
+            "model": self.wire_model,
             "messages": self.messages,
             "max_completion_tokens": self.max_completion_tokens,
         });
@@ -3578,6 +3735,7 @@ impl TurnPrep {
                 error: None,
                 credential_nonce: self.credential_nonce(),
                 created_at: now_ms(),
+                backend_id: Some(self.backend_id.clone()),
             },
         )
         .await?;
@@ -4292,25 +4450,26 @@ mod tests {
 
         let core = AppCore::new(config_dir.clone(), data_dir.clone());
         let state = core.config_state();
-        assert_eq!(state.appearance, config::AppearanceSetting::System);
+        // `auto` (follow the sun) is the shipped default since the
+        // local-inference wave flipped it from `system`.
+        assert_eq!(state.appearance, config::AppearanceSetting::Auto);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::On);
         assert_eq!(state.light_character, config::LightCharacter::Neutral);
 
-        core.set_appearance(config::AppearanceSetting::Auto)
-            .unwrap();
+        core.set_appearance(config::AppearanceSetting::Day).unwrap();
         core.set_time_of_day_tint(config::TimeOfDayTint::Off)
             .unwrap();
         core.set_light_character(config::LightCharacter::Cool)
             .unwrap();
         let state = core.config_state();
-        assert_eq!(state.appearance, config::AppearanceSetting::Auto);
+        assert_eq!(state.appearance, config::AppearanceSetting::Day);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);
         assert_eq!(state.light_character, config::LightCharacter::Cool);
 
         // A fresh core over the same config dir sees the persisted values.
         let core2 = AppCore::new(config_dir, data_dir);
         let state = core2.config_state();
-        assert_eq!(state.appearance, config::AppearanceSetting::Auto);
+        assert_eq!(state.appearance, config::AppearanceSetting::Day);
         assert_eq!(state.time_of_day_tint, config::TimeOfDayTint::Off);
     }
 

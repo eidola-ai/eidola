@@ -852,6 +852,7 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
     use eidola_app_core::{LocalModelInfo, LocalModelStatus, LocalModelsState};
     LocalModelsState {
         engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+        external: Vec::new(),
         models: vec![
             LocalModelInfo {
                 id: "local/tiny-a".into(),

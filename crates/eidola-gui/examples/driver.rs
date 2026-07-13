@@ -347,6 +347,7 @@ mod driver {
         use eidola_app_core::{LocalModelInfo, LocalModelStatus, LocalModelsState};
         LocalModelsState {
             engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+            external: Vec::new(),
             models: vec![
                 LocalModelInfo {
                     id: "local/gemma-4-12b-it-qat-q4_0".into(),

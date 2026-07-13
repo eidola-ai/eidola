@@ -890,6 +890,7 @@ fn settings_models_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext) 
     let stores = stub_stores(cx, |s| {
         s.local_models = Some(eidola_app_core::LocalModelsState {
             engine_path: None,
+            external: Vec::new(),
             models: vec![eidola_app_core::LocalModelInfo {
                 id: "local/tiny".into(),
                 slug: "tiny".into(),
@@ -1217,6 +1218,8 @@ fn record_request_detail_exposes_space_link(cx: &mut TestAppContext) {
         attestation_hash: None,
         space_id: Some("space-abc".into()),
         space_title: Some("The quantum eraser experiment".into()),
+        backend_id: Some("eidola".into()),
+        backend_display_name: Some("Eidola".into()),
     };
 
     view.update(cx, |v, _| {

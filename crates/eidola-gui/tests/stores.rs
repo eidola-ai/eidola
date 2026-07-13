@@ -160,6 +160,37 @@ fn bus_bridge_routes_record_change_to_record_store(cx: &mut TestAppContext) {
     );
 }
 
+/// `Change::Backends` routes to the registry snapshot *and* the model
+/// catalogs (the set of destinations changed, so the catalog set is stale).
+/// As everywhere in this file, only the synchronous `Loading` transition is
+/// asserted — the tasks' results need no network.
+#[gpui::test]
+fn bus_bridge_routes_backends_change(cx: &mut TestAppContext) {
+    let (stores, _dir) = backed_stores(cx);
+
+    stores.backends.read_with(cx, |b, _| {
+        assert!(
+            matches!(b.state(), eidola_gui::loadable::Loadable::NotLoaded),
+            "backends start NotLoaded"
+        );
+    });
+
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Backends), cx));
+
+    stores.backends.read_with(cx, |b, _| {
+        assert!(
+            b.state().is_loading(),
+            "a Change::Backends must start the registry refresh"
+        );
+    });
+    stores.models.read_with(cx, |m, _| {
+        assert!(
+            m.models().is_loading(),
+            "a Change::Backends must re-fetch the model catalogs"
+        );
+    });
+}
+
 /// The space-entity registry's join-existing semantics: two `open` calls for
 /// the same id return the *same* `Space` entity (so two windows on one space
 /// share one transcript + streaming buffer — wave-2 bug 4), while a different
@@ -307,20 +338,22 @@ fn config_store_circadian_settings_write_through(cx: &mut TestAppContext) {
 
     stores.config.read_with(cx, |c, _| {
         let s = c.state().expect("backed store seeds a snapshot");
-        assert_eq!(s.appearance, AppearanceSetting::System, "default");
+        // `auto` (follow the sun) is the shipped default since the
+        // local-inference wave flipped it from `system`.
+        assert_eq!(s.appearance, AppearanceSetting::Auto, "default");
         assert_eq!(s.time_of_day_tint, TimeOfDayTint::On, "default");
         assert_eq!(s.light_character, LightCharacter::Neutral, "default");
     });
 
     stores.config.update(cx, |c, cx| {
-        c.set_appearance(AppearanceSetting::Auto, cx);
+        c.set_appearance(AppearanceSetting::Day, cx);
         c.set_time_of_day_tint(TimeOfDayTint::Off, cx);
         c.set_light_character(LightCharacter::Warm, cx);
     });
 
     stores.config.read_with(cx, |c, _| {
         let s = c.state().expect("snapshot re-read after write");
-        assert_eq!(s.appearance, AppearanceSetting::Auto);
+        assert_eq!(s.appearance, AppearanceSetting::Day);
         assert_eq!(s.time_of_day_tint, TimeOfDayTint::Off);
         assert_eq!(s.light_character, LightCharacter::Warm);
     });

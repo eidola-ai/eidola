@@ -115,6 +115,7 @@ pub fn run() {
         // busy flag, so none can starve another (the wave-2 launch-order
         // bug is fixed structurally: the model list refresh cannot be
         // dropped by an in-flight wallet recovery).
+        stores.backends.update(cx, |s, cx| s.refresh(cx));
         stores.models.update(cx, |s, cx| s.refresh(cx));
         stores.local_models.update(cx, |s, cx| s.refresh(cx));
         stores.spaces.update(cx, |s, cx| s.refresh(cx));

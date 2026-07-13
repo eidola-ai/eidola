@@ -137,7 +137,7 @@ pub struct Config {
         skip_serializing_if = "Option::is_none"
     )]
     pub llama_server_path_override: Option<String>,
-    /// Circadian theme, day/night axis. `None` = the default (`system`).
+    /// Circadian theme, day/night axis. `None` = the default (`auto`).
     #[serde(
         rename = "appearance",
         default,
@@ -187,7 +187,7 @@ impl Config {
     }
 
     /// The circadian day/night axis: the user's `appearance` override if
-    /// set, otherwise `system` (track the OS appearance).
+    /// set, otherwise `auto` (follow the sun).
     pub fn appearance(&self) -> AppearanceSetting {
         self.appearance_override.unwrap_or_default()
     }
@@ -469,21 +469,22 @@ tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
 
     #[test]
     fn circadian_settings_default_and_round_trip_via_toml() {
-        // Absent keys → the resolvers fall back to the defaults.
+        // Absent keys → the resolvers fall back to the defaults (`auto` —
+        // follow the sun — since the local-inference wave flipped it).
         let cfg: Config = toml::from_str("").expect("deserialize empty");
-        assert_eq!(cfg.appearance(), AppearanceSetting::System);
+        assert_eq!(cfg.appearance(), AppearanceSetting::Auto);
         assert_eq!(cfg.time_of_day_tint(), TimeOfDayTint::On);
         assert_eq!(cfg.light_character(), LightCharacter::Neutral);
 
         let original = Config {
-            appearance_override: Some(AppearanceSetting::Auto),
+            appearance_override: Some(AppearanceSetting::Day),
             time_of_day_tint_override: Some(TimeOfDayTint::Off),
             light_character_override: Some(LightCharacter::Warm),
             ..Config::default()
         };
         let toml_text = toml::to_string_pretty(&original).expect("serialize");
         assert!(
-            toml_text.contains("appearance = \"auto\""),
+            toml_text.contains("appearance = \"day\""),
             "override must serialize under the public `appearance` key: {toml_text}"
         );
         assert!(
@@ -495,7 +496,7 @@ tdx_measurement = { rtmr1 = "bb", rtmr2 = "cc" }
             "override must serialize under the public `light_character` key: {toml_text}"
         );
         let parsed: Config = toml::from_str(&toml_text).expect("deserialize");
-        assert_eq!(parsed.appearance(), AppearanceSetting::Auto);
+        assert_eq!(parsed.appearance(), AppearanceSetting::Day);
         assert_eq!(parsed.time_of_day_tint(), TimeOfDayTint::Off);
         assert_eq!(parsed.light_character(), LightCharacter::Warm);
 
