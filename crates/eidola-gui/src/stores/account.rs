@@ -1,5 +1,5 @@
 //! `AccountStore` — balances, prices, and account lifecycle (create / reset /
-//! checkout). Per `docs/architecture/state.md` the checkout *poll* is
+//! checkout). Per `crates/eidola-gui/STATE.md` the checkout *poll* is
 //! view-owned (it dies with its window); its result lands here via the bus.
 //!
 //! Two method shapes, distinguished by who owns the task:

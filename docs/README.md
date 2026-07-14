@@ -1,4 +1,4 @@
-# Eidola Documentation
+# Documentation
 
 These docs describe how Eidola works, what it commits to, and what it doesn't yet defend against. They are written for a technical reader who wants to understand the design without necessarily reading every line of source — and who, in turn, can vouch for it to friends and family who aren't going to read it themselves.
 
@@ -17,7 +17,7 @@ These docs describe how Eidola works, what it commits to, and what it doesn't ye
 ## Release flow
 
 7. **[Releases](releases.md)** — How a new client+server bundle becomes trustable. CI signature plus human attestation, both on the same transparency log.
-8. **[Trust root: technical specification](trust-root.md)** — What's pinned at compile time, how schema versions work, how the verifier walks the chain.
+8. **[Trust root](trust-root.md)** — The technical specification: what's pinned at compile time, how schema versions work, how the verifier walks the chain.
 
 ## What's missing
 

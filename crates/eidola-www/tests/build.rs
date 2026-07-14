@@ -57,8 +57,11 @@ fn builds_the_real_site() {
     let docs_index = read(&out, "docs/index.html");
     assert!(docs_index.contains("href=\"/docs/paradigm/\""));
     assert!(docs_index.contains("https://github.com/eidola-ai/eidola/blob/main/README.md"));
-    assert!(out.join("docs/architecture/state/index.html").exists());
     assert!(out.join("docs/contributing/index.html").exists());
+    assert!(
+        out.join("docs/contributing/release-attestant-yubikey/index.html")
+            .exists()
+    );
 
     // Docs sidebar: on every docs page (both renderings), current page
     // marked, driven by www/docs-nav.toml — and never on non-doc pages.
@@ -85,8 +88,11 @@ fn builds_the_real_site() {
     // else does.
     assert!(client.contains("https://github.com/eidola-ai/eidola/edit/main/docs/client.md"));
     assert!(
-        read(&out, "docs/architecture/state/index.html")
-            .contains("edit/main/docs/architecture/state.md")
+        read(
+            &out,
+            "docs/contributing/release-attestant-yubikey/index.html"
+        )
+        .contains("edit/main/docs/contributing/release-attestant-yubikey.md")
     );
     assert!(!home.contains("page-edit"));
     assert!(!read(&out, "privacy/index.html").contains("page-edit"));

@@ -5,7 +5,7 @@
 //! real backend each write also emits `Change::Config`, so other windows'
 //! `ConfigStore`s refresh via the bus.
 //!
-//! Per `docs/architecture/state.md`: `ConfigState` is not a `Loadable` — it is
+//! Per `crates/eidola-gui/STATE.md`: `ConfigState` is not a `Loadable` — it is
 //! always present (read synchronously at construction) on a backed store, and
 //! `None` only on a stub. The store keeps a `last_error` for write failures so
 //! the settings panes can surface them.

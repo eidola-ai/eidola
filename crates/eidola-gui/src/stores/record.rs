@@ -2,7 +2,7 @@
 //!
 //! Unlike the other stores this one owns **no data**: Record listings,
 //! cursors, and details are *window-scoped reader* state (the doctrine's
-//! "Record pattern" — `docs/architecture/state.md`), held by each open
+//! "Record pattern" — `crates/eidola-gui/STATE.md`), held by each open
 //! `RecordView` together with its own fetch tasks, dying with the window.
 //! What a window-scoped reader cannot do on its own is hear the
 //! invalidation bus — the app-lifetime bus bridge dispatches `Change`s to

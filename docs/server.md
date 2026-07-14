@@ -1,4 +1,4 @@
-# The Server
+# The server
 
 The Eidola server is an OpenAI-compatible proxy that sits between the client and an upstream inference provider. It also runs the account and billing surface. Its design is dominated by one structural decision: the **linked** account surface and the **unlinked** inference surface are kept disjoint, in code and at runtime.
 

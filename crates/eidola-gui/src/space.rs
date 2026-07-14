@@ -1,6 +1,6 @@
 //! `Space` — the per-conversation domain entity.
 //!
-//! Per `docs/architecture/state.md` ("Space entities — shared, registried"),
+//! Per `crates/eidola-gui/STATE.md` ("Space entities — shared, registried"),
 //! a `Space` is a long-lived gpui entity owning *everything* about one
 //! conversation: the transcript (`Loadable<Vec<ChatMessageView>>`), the live
 //! streaming buffers + reasoning disclosure, the per-space model selection,
@@ -480,7 +480,7 @@ impl Space {
     /// The mutation's own post-commit reload is now the authoritative truth,
     /// and a superseded load must never land late around it — the same
     /// stale-fetch class as the Record listing race from PR #179; the fix is
-    /// the same replace-cancels idiom (`docs/architecture/state.md` →
+    /// the same replace-cancels idiom (`crates/eidola-gui/STATE.md` →
     /// "Concurrency patterns"). If the cancelled load was an *initial* one
     /// (`Loading`, nothing kept visible), the cell steps back to `NotLoaded`
     /// so no spinner outlives its task ("every spinner maps to a live task");

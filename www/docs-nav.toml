@@ -37,10 +37,6 @@ title = "What's missing"
 pages = [["gaps.md", "Known gaps"]]
 
 [[sections]]
-title = "Architecture"
-pages = [["architecture/state.md", "State & async"]]
-
-[[sections]]
 title = "Contributing"
 pages = [
     ["contributing/README.md", "Runbooks"],

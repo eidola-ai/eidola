@@ -16,7 +16,7 @@ A given client binary trusts **exactly one server build**. The trust root — th
 
 The client is also designed to **fail safe**: if anything in the verification chain cannot be confirmed, the connection is refused rather than downgraded. There is no quiet fallback to an unverified path.
 
-Your app's data — chat history, drafts, accounts — lives on your device. When data is sent for remote processing, it is bound to the exact code that produced your app, which cannot be changed even by us or our infrastructure operators. It remains inpossible for anyone but you to view or save this content.
+Your app's data — chat history, drafts, accounts — lives on your device. When data is sent for remote processing, it is bound to the exact code that produced your app, which cannot be changed even by us or our infrastructure operators. It remains impossible for anyone but you to view or save this content.
 
 ## 2. Code is the trust boundary, not policy
 

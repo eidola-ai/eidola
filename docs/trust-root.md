@@ -1,4 +1,4 @@
-# Trust Root: Technical Specification
+# Trust root
 
 This is the spec for spot-checking rigor. For the narrative version of how releases become trustable, see [releases.md](releases.md); for the day-to-day operational procedures (rotating keys, updating Sigstore roots, etc.) see [`releases/README.md`](../releases/README.md).
 

@@ -1,4 +1,4 @@
-# Privacy Guarantees
+# Privacy guarantees
 
 This document enumerates the privacy and integrity properties Eidola commits to. It is the referent for the `privacy_guarantees_not_weakened`, `code_delivers_guarantees`, and `no_known_backdoor` claims in the release attestation schema (see [releases.md](releases.md)): a release attestation signed under this document's content hash asserts that the release does not weaken any item below and that no known code path violates them.
 
@@ -120,7 +120,7 @@ These invariants describe what you get when you install and run a **generally-av
 
 **8.4.** Eidola does not promise anonymity against Stripe with respect to payment metadata. The boundary Eidola enforces is between payment metadata and service usage (§1.5). Stripe's own retention and Eidola's retention of Stripe-collected data are out of scope.
 
-**8.5.** Eidola does not promise defense against traffic analysis. Network metadata (the fact that a connection occurred, its size, timing, originating IP) is visible to network observers. Users who need that property should layer Eidola behind Tor or a similar anonymity network. (See [gaps.md](gaps.md#traffic-analysis).)
+**8.5.** Eidola does not promise defense against traffic analysis. Network metadata (the fact that a connection occurred, its size, timing, originating IP) is visible to network observers. Users who need that property should layer Eidola behind Tor or a similar anonymity network. (See [gaps.md](gaps.md#network--metadata).)
 
 **8.6.** Eidola does not promise the absence of bugs. An undisclosed vulnerability is not a backdoor in this document's sense (§6.3), but it could be exploited as if it were. The promise is the absence of *intent* to subvert, not the absence of error.
 

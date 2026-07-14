@@ -1,4 +1,4 @@
-# Known Gaps
+# Known gaps
 
 Every piece of the Eidola trust chain that is intentionally deferred is catalogued here. Each gap closes a specific class of attack that is already constrained by other parts of the chain — but they are real and worth understanding. Reading this page is the fastest way to see what Eidola does not yet defend against.
 
@@ -64,19 +64,15 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **Current behavior.** Eidola trusts AMD, Intel, and NVIDIA to issue genuine attestation chains. A vendor issuing fraudulent attestations for an enclave that does not in fact provide confidential compute would defeat that layer of the chain.
 
-**Mitigations today.** Limited. The use of WebPKI for our TLS certificate provides a defense in depth, ensuring that an outside party issuing a fraudulent attestation must also product or obtain a fraudulent WebPKI certificate. However, this provides little resistance in the case of a malicious insider. Generally, we accept hardware vendor trust as residual.
+**Mitigations today.** Limited. The use of WebPKI for our TLS certificate provides a defense in depth, ensuring that an outside party issuing a fraudulent attestation must also produce or obtain a fraudulent WebPKI certificate. However, this provides little resistance in the case of a malicious insider. Generally, we accept hardware vendor trust as residual.
 
 **Future.** Open hardware roots like OpenTitan reduce the scope of vendors the trust chain depends on. This is an industry-wide direction, not an Eidola-specific roadmap item, but it is the long-term mitigation for this residual trust.
 
 ## Network / metadata
 
-### Traffic analysis
+Eidola does not defend against an adversary observing network metadata (connection patterns, packet sizes, timing). Content is protected by TLS terminated inside the attested enclave; metadata is visible to network observers. There are really two distinct gaps here that share infrastructure but answer different questions for the user:
 
-**Current behavior.** Eidola does not defend against an adversary observing network metadata (connection patterns, packet sizes, timing). Content is protected by TLS terminated inside the attested enclave; metadata is visible to network observers.
-
-There are really two distinct gaps here that share infrastructure but answer different questions for the user:
-
-#### Passive traffic analysis
+### Passive traffic analysis
 
 **What it would catch.** Connection patterns, packet sizes, timing — even with TLS confidentiality, these can reveal a great deal (which model you used, the rough shape of conversations, when you are active).
 
@@ -84,7 +80,7 @@ There are really two distinct gaps here that share infrastructure but answer dif
 
 **Future.** We consider this in-scope as an Eidola problem to address, but do not yet have a committed plan. Explored directions include offering a Tor hidden service endpoint and partnering with independent organizations to provide oblivious HTTP (oHTTP) or MASQUE/CONNECT-style transports that decouple network identity from request content.
 
-#### Network identity as a linking factor
+### Network identity as a linking factor
 
 **What it would catch.** Even a single connection to Eidola from a unique IP is itself an identity signal: an observer (or Eidola's own network logs, were they to exist) can correlate "a connection from IP X" with the account billed at approximately the same time, undermining the unlinkability invariants in [privacy-guarantees.md §2](privacy-guarantees.md#2-unlinkability) at the transport layer rather than at the application layer.
 

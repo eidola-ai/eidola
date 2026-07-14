@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, oneshot};
 /// returned future resolves on the caller's (gpui) executor when the oneshot
 /// fires. Cancelling the gpui `Task` that holds this future drops the
 /// receiver — the core-side work runs to completion regardless (see the
-/// atomicity rules in `docs/architecture/state.md`).
+/// atomicity rules in `crates/eidola-gui/STATE.md`).
 pub async fn bridge<MakeFut, Fut, T>(core: Arc<AppCore>, make_fut: MakeFut) -> Result<T, AppError>
 where
     MakeFut: FnOnce(Arc<AppCore>) -> Fut + Send + 'static,
