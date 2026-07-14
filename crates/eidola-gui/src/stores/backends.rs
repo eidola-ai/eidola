@@ -133,6 +133,25 @@ impl BackendsStore {
         });
     }
 
+    /// Flip a `llamacpp` backend's request-triggered auto-start. Optimistic
+    /// like `set_enabled`, so the toggle answers immediately; the bus-driven
+    /// refresh reconciles.
+    pub fn set_auto_start(&mut self, id: String, auto_start: bool, cx: &mut Context<Self>) {
+        if let Some(list) = self.backends.value_mut()
+            && let Some(b) = list.iter_mut().find(|b| b.id == id)
+        {
+            b.auto_start = auto_start;
+        }
+        let key = format!("autostart:{id}");
+        let update = BackendUpdate {
+            auto_start: Some(auto_start),
+            ..Default::default()
+        };
+        self.run_op(key, cx, move |c| async move {
+            c.update_backend(id, update).await
+        });
+    }
+
     /// Soft-remove an external backend.
     pub fn remove(&mut self, id: String, cx: &mut Context<Self>) {
         // Optimistic removal from the cached list; the bus refresh confirms.

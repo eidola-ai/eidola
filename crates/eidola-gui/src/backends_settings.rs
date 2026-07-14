@@ -1,22 +1,26 @@
 //! Backends settings pane — *where an ask can be routed*.
 //!
-//! One quiet section per configured backend, in the settings voice
-//! (hairline rows, no cards):
+//! An internal tab strip (Eidola · Local · External) splits the registry
+//! into the three mental buckets; the selected tab renders in the settings
+//! voice (hairline rows, no cards):
 //!
-//! - **Eidola** — the confidential service. Enable/disable only (disabling
-//!   is the "no account, on-device only" configuration).
-//! - **Local** — the managed local store: the **engine** line
-//!   (resolved `llama-server` path, or an install hint), the installed
-//!   models (status + per-state verbs: load / unload / cancel / delete,
-//!   with download progress and honest inline errors), the curated
+//! - **Eidola** — the confidential service. Enable/disable the singleton;
+//!   when enabled, the embedded [`AccountView`] hosts the full account
+//!   surface (create/reset, balance + pools, plans/checkout). When disabled,
+//!   a short "no account, on-device only" explanation. (Disabling `eidola`
+//!   *is* the on-device-only configuration.)
+//! - **Local** — the managed local store: enable/disable, the **engine**
+//!   line (resolved bundled `llama-server`, or an honest dev-build hint), the
+//!   installed models (status + per-state verbs: load / unload / cancel /
+//!   delete, with download progress and honest inline errors), the curated
 //!   **Gemma 4 catalog**, and a paste-a-URL row.
-//! - **Each external backend** — an `openai` server shows its URL /
-//!   key-state / pinned models; a `llamacpp` backend shows its user-owned
-//!   directory and the scanned models with load/unload verbs (never
-//!   download/delete — the files are the user's).
-//! - **Add a backend** — two quiet affordances that expand an inline form
-//!   (OpenAI-compatible server: id + URL + optional key; llama.cpp
-//!   directory: id + path).
+//! - **External** — everything the user owns. An `openai` server shows its
+//!   URL / key-state / pinned models; a `llamacpp` backend shows its
+//!   user-owned directory, its resolved engine line, an **auto-start**
+//!   toggle (whether a request may spawn an engine), and the scanned models
+//!   with load/unload verbs (never download/delete — the files are the
+//!   user's). Plus the **add a backend** inline form (OpenAI-compatible
+//!   server, or System llama.cpp with an optional engine path + auto-start).
 //!
 //! State lives in `BackendsStore` (refreshed by `Change::Backends`) and
 //! `LocalModelsStore` (refreshed by `Change::LocalModels`); this view is a
@@ -39,8 +43,36 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::account::AccountView;
 use crate::probe::Probe as _;
 use crate::stores::{BackendsStore, LocalModelsStore, Stores};
+
+/// Which internal tab of the Backends pane is showing. View-local state — the
+/// selection isn't persisted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackendsTab {
+    Eidola,
+    Local,
+    External,
+}
+
+impl BackendsTab {
+    fn label(self) -> &'static str {
+        match self {
+            BackendsTab::Eidola => "Eidola",
+            BackendsTab::Local => "Local",
+            BackendsTab::External => "External",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            BackendsTab::Eidola => "eidola",
+            BackendsTab::Local => "local",
+            BackendsTab::External => "external",
+        }
+    }
+}
 
 /// Which kind the inline add-backend form is collecting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,11 +91,22 @@ struct AddForm {
     key_state: Entity<InputState>,
     /// Models directory (llamacpp) — unused for openai.
     dir_state: Entity<InputState>,
+    /// Explicit `llama-server` path (llamacpp, optional) — unused for openai.
+    engine_state: Entity<InputState>,
+    /// Whether a request may auto-start an engine (llamacpp). Default `true`.
+    auto_start: bool,
 }
 
 pub struct BackendsSettingsView {
     backends: Entity<BackendsStore>,
     local_models: Entity<LocalModelsStore>,
+    /// The embedded Account surface, shown in the Eidola tab when the
+    /// singleton is enabled. Hosting `AccountView` here (rather than as a
+    /// top-level Settings pane) keeps its `settings/account/*` probe names
+    /// stable while folding the account *into* the eidola backend.
+    account: Entity<AccountView>,
+    /// Which internal tab is showing (view-local; not persisted).
+    tab: BackendsTab,
     /// The paste-a-URL input (the local section's download row).
     url_state: Entity<InputState>,
     /// The inline add-backend form, while one is open.
@@ -75,6 +118,7 @@ impl BackendsSettingsView {
     pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let backends = stores.backends.clone();
         let local_models = stores.local_models.clone();
+        let account = cx.new(|cx| AccountView::new(stores.clone(), window, cx));
         let url_state = cx.new(|cx| {
             InputState::new(window, cx).placeholder("https://huggingface.co/…/model.gguf")
         });
@@ -97,10 +141,63 @@ impl BackendsSettingsView {
         Self {
             backends,
             local_models,
+            account,
+            tab: BackendsTab::Eidola,
             url_state,
             add_form: None,
             _subscriptions,
         }
+    }
+
+    /// The embedded Account view — exposed so behavior/visual tests reach the
+    /// reset-confirm and checkout flows now that the Account pane is hosted
+    /// here.
+    pub fn account(&self) -> Entity<AccountView> {
+        self.account.clone()
+    }
+
+    /// The selected internal tab (test accessor).
+    pub fn tab(&self) -> BackendsTab {
+        self.tab
+    }
+
+    /// Switch internal tabs. Public so the tab strip and behavior tests share
+    /// one path.
+    pub fn select_tab(&mut self, tab: BackendsTab, cx: &mut Context<Self>) {
+        if self.tab != tab {
+            self.tab = tab;
+            cx.notify();
+        }
+    }
+
+    /// One tab in the internal strip (quiet text, active = underline).
+    fn tab_item(&self, tab: BackendsTab, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let active = self.tab == tab;
+        let mut item = div()
+            .id(tab.slug())
+            .probe(
+                format!("settings/backends/tab/{}", tab.slug()),
+                gpui::Role::Tab,
+                tab.label(),
+            )
+            .aria_selected(active)
+            .cursor_pointer()
+            .pb_1()
+            .border_b_2()
+            .on_click(cx.listener(move |this, _, _, cx| this.select_tab(tab, cx)))
+            .child(tab.label());
+        if active {
+            item = item
+                .border_color(theme.primary)
+                .text_color(theme.foreground);
+        } else {
+            item = item
+                .border_color(gpui::transparent_black())
+                .text_color(theme.muted_foreground)
+                .hover(|s| s.text_color(theme.foreground));
+        }
+        item
     }
 
     // -- Operations (public so behavior tests share the click paths) --------
@@ -128,6 +225,12 @@ impl BackendsSettingsView {
             .update(cx, |s, cx| s.set_enabled(id, enabled, cx));
     }
 
+    /// Flip a `llamacpp` backend's request-triggered auto-start.
+    pub fn set_auto_start(&mut self, id: String, auto_start: bool, cx: &mut Context<Self>) {
+        self.backends
+            .update(cx, |s, cx| s.set_auto_start(id, auto_start, cx));
+    }
+
     /// Remove an external backend.
     pub fn remove_backend(&mut self, id: String, cx: &mut Context<Self>) {
         self.backends.update(cx, |s, cx| s.remove(id, cx));
@@ -144,12 +247,17 @@ impl BackendsSettingsView {
             cx.new(|cx| InputState::new(window, cx).placeholder("http://192.168.1.20:8000"));
         let key_state = cx.new(|cx| InputState::new(window, cx).placeholder("optional API key"));
         let dir_state = cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/models"));
+        let engine_state = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("optional — discovered if left blank")
+        });
         self.add_form = Some(AddForm {
             kind,
             id_state,
             url_state,
             key_state,
             dir_state,
+            engine_state,
+            auto_start: true,
         });
         cx.notify();
     }
@@ -158,6 +266,14 @@ impl BackendsSettingsView {
     pub fn cancel_add(&mut self, cx: &mut Context<Self>) {
         self.add_form = None;
         cx.notify();
+    }
+
+    /// Flip the pending llama.cpp add-form's auto-start checkbox.
+    pub fn toggle_add_auto_start(&mut self, cx: &mut Context<Self>) {
+        if let Some(form) = self.add_form.as_mut() {
+            form.auto_start = !form.auto_start;
+            cx.notify();
+        }
     }
 
     /// Submit the add form. Validation lives in app-core; a refusal
@@ -187,6 +303,7 @@ impl BackendsSettingsView {
             }
             AddKind::LlamaCpp => {
                 let dir = form.dir_state.read(cx).value().trim().to_string();
+                let engine = form.engine_state.read(cx).value().trim().to_string();
                 NewBackend {
                     id,
                     kind: BackendKind::LlamaCpp,
@@ -195,8 +312,8 @@ impl BackendsSettingsView {
                     api_key: None,
                     models_dir: Some(dir),
                     model_overrides: None,
-                    engine_path: None,
-                    auto_start: true,
+                    engine_path: (!engine.is_empty()).then_some(engine),
+                    auto_start: form.auto_start,
                 }
             }
         };
@@ -535,17 +652,23 @@ impl BackendsSettingsView {
         );
         out.push(
             match &engine_path {
-                Some(p) => div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(SharedString::from(format!("Engine: llama-server at {p}"))),
+                Some(p) => {
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(format!(
+                            "Engine: bundled llama-server at {p}"
+                        )))
+                }
                 None => {
                     div()
                         .text_sm()
                         .text_color(theme.muted_foreground)
                         .child(SharedString::from(
-                            "llama-server not found. Install llama.cpp (e.g. `brew install \
-                         llama.cpp`) to load models on this device; downloads work either way.",
+                            "No bundled engine in this build — loading models on this device \
+                             is unavailable. (Dev builds: run `just engine`, or point the \
+                             `llama_server_path` config at a llama-server.) Downloads work \
+                             either way.",
                         ))
                 }
             }
@@ -712,6 +835,35 @@ impl BackendsSettingsView {
                 }
             }
             BackendKind::LlamaCpp => {
+                // The resolved engine for this backend (its pinned
+                // `engine_path`, else discovery), stated plainly.
+                let resolved_engine = self
+                    .local_models
+                    .read(cx)
+                    .external()
+                    .iter()
+                    .find(|b| b.backend_id == backend.id)
+                    .and_then(|b| b.engine_path.clone())
+                    .or_else(|| backend.engine_path.clone());
+                out.push(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(match &resolved_engine {
+                            Some(p) => format!("Engine: llama-server at {p}"),
+                            None => "Engine: llama-server not found — set a path or install it \
+                                     on this machine."
+                                .to_string(),
+                        }))
+                        .into_any_element(),
+                );
+
+                // Auto-start toggle: whether a request may spawn an engine.
+                out.push(
+                    self.auto_start_toggle(&backend.id, backend.auto_start, cx)
+                        .into_any_element(),
+                );
+
                 // The scanned directory, with load/unload verbs.
                 let external = self.local_models.read(cx).external_models(&backend.id);
                 if external.is_empty() {
@@ -736,6 +888,51 @@ impl BackendsSettingsView {
         out
     }
 
+    /// A llamacpp backend's auto-start toggle: a checkbox-style row wired to
+    /// `update_backend`. Auto-start gates *request-triggered* engine loads;
+    /// an explicit Load ignores it.
+    fn auto_start_toggle(
+        &self,
+        backend_id: &str,
+        auto_start: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let id = backend_id.to_string();
+        let id_click = id.clone();
+        h_flex()
+            .id(SharedString::from(format!("autostart-{id}")))
+            .probe(
+                format!("settings/backends/{id}/autostart"),
+                gpui::Role::CheckBox,
+                "Start an engine automatically on request",
+            )
+            .aria_selected(auto_start)
+            .cursor_pointer()
+            .gap_2()
+            .items_center()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_auto_start(id_click.clone(), !auto_start, cx);
+            }))
+            .child(
+                div()
+                    .size(px(14.))
+                    .flex_none()
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .when(auto_start, |d| {
+                        d.bg(theme.primary).border_color(theme.primary)
+                    }),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Start an engine automatically when a request needs one"),
+            )
+    }
+
     /// The add-a-backend affordances and (when open) the inline form.
     fn add_section(&self, cx: &Context<Self>) -> Vec<gpui::AnyElement> {
         let theme = cx.theme();
@@ -757,14 +954,14 @@ impl BackendsSettingsView {
                         ),
                 )
                 .child(
-                    quiet_verb("add-llamacpp", "llama.cpp directory…", cx)
+                    quiet_verb("add-llamacpp", "System llama.cpp…", cx)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.begin_add(AddKind::LlamaCpp, window, cx)
                         }))
                         .probe(
                             "settings/backends/add/llamacpp",
                             gpui::Role::Button,
-                            "Add a llama.cpp models directory",
+                            "Add a system llama.cpp install",
                         ),
                 )
                 .into_any_element(),
@@ -801,13 +998,56 @@ impl BackendsSettingsView {
                     ));
             }
             AddKind::LlamaCpp => {
-                col = col.child(labeled_input(
-                    "Models directory",
-                    "settings/backends/add/dir",
-                    "a folder of .gguf files you manage",
-                    &form.dir_state,
-                    cx,
-                ));
+                col = col
+                    .child(labeled_input(
+                        "Models directory",
+                        "settings/backends/add/dir",
+                        "a folder of .gguf files you manage",
+                        &form.dir_state,
+                        cx,
+                    ))
+                    .child(labeled_input(
+                        "Engine path",
+                        "settings/backends/add/engine-path",
+                        "optional path to llama-server; discovered on PATH if left blank",
+                        &form.engine_state,
+                        cx,
+                    ))
+                    .child(
+                        h_flex().pl(px(132.)).child(
+                            h_flex()
+                                .id("add-autostart")
+                                .probe(
+                                    "settings/backends/add/autostart",
+                                    gpui::Role::CheckBox,
+                                    "Start an engine automatically on request",
+                                )
+                                .aria_selected(form.auto_start)
+                                .cursor_pointer()
+                                .gap_2()
+                                .items_center()
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.toggle_add_auto_start(cx)),
+                                )
+                                .child(
+                                    div()
+                                        .size(px(14.))
+                                        .flex_none()
+                                        .rounded(px(3.))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .when(form.auto_start, |d| {
+                                            d.bg(theme.primary).border_color(theme.primary)
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child("Start an engine automatically on request"),
+                                ),
+                        ),
+                    );
             }
         }
         col = col.child(
@@ -846,7 +1086,11 @@ impl BackendsSettingsView {
 
 impl Render for BackendsSettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+        // Copy the colors we need up front — `tab_item` takes `&mut Context`
+        // (for its click listener), so we can't hold a `cx.theme()` borrow
+        // across the tab-strip build.
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
         let backends: Vec<BackendInfo> = self.backends.read(cx).list().to_vec();
         let backends_op_error = self.backends.read(cx).op_error().map(|s| s.to_string());
         let local_op_error = self.local_models.read(cx).op_error().map(|s| s.to_string());
@@ -868,56 +1112,127 @@ impl Render for BackendsSettingsView {
             }
         }
 
+        // The internal tab strip: Eidola · Local · External.
+        col = col.child(
+            h_flex()
+                .w_full()
+                .gap_5()
+                .pb_2()
+                .border_b_1()
+                .border_color(border)
+                .child(self.tab_item(BackendsTab::Eidola, cx))
+                .child(self.tab_item(BackendsTab::Local, cx))
+                .child(self.tab_item(BackendsTab::External, cx)),
+        );
+
         if backends.is_empty() {
             // The registry hasn't loaded yet (or a fixture-less stub scene):
             // say so rather than rendering a blank pane.
-            col = col.child(
+            col = col.child(div().text_sm().text_color(muted).child("Loading backends…"));
+            return col;
+        }
+
+        // Per-tab content. Each tab pulls the backend(s) it owns out of the
+        // registry snapshot.
+        let children: Vec<gpui::AnyElement> = match self.tab {
+            BackendsTab::Eidola => self.eidola_tab(&backends, cx),
+            BackendsTab::Local => backends
+                .iter()
+                .find(|b| b.kind == BackendKind::Local)
+                .map(|b| self.local_section(b, cx))
+                .unwrap_or_default(),
+            BackendsTab::External => self.external_tab(&backends, cx),
+        };
+        let mut section = v_flex().w_full().gap_3();
+        for child in children {
+            section = section.child(child);
+        }
+        col = col.child(section);
+
+        col
+    }
+}
+
+impl BackendsSettingsView {
+    /// The Eidola tab: the singleton's enable/disable header, and — when
+    /// enabled — the embedded Account surface (create/reset, balance, plans).
+    fn eidola_tab(&self, backends: &[BackendInfo], cx: &Context<Self>) -> Vec<gpui::AnyElement> {
+        let theme = cx.theme();
+        let mut out: Vec<gpui::AnyElement> = Vec::new();
+        let Some(backend) = backends.iter().find(|b| b.kind == BackendKind::Eidola) else {
+            return out;
+        };
+        out.push(
+            self.backend_header(
+                backend,
+                "Confidential inference via the Eidola service — attested hardware, \
+                 anonymous credits. Disable to run with no account, on-device only."
+                    .into(),
+                false,
+                cx,
+            )
+            .into_any_element(),
+        );
+        if backend.enabled {
+            // The account *is* the eidola backend's configuration.
+            out.push(self.account.clone().into_any_element());
+        } else {
+            out.push(
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child("Loading backends…"),
+                    .child(
+                        "No account, on-device only. Enable Eidola to create or link an \
+                         account and buy credits for confidential inference.",
+                    )
+                    .into_any_element(),
             );
         }
+        out
+    }
 
+    /// The External tab: the openai/llamacpp backends, plus the add-a-backend
+    /// form.
+    fn external_tab(&self, backends: &[BackendInfo], cx: &Context<Self>) -> Vec<gpui::AnyElement> {
+        let theme = cx.theme();
+        let mut out: Vec<gpui::AnyElement> = Vec::new();
         let mut first = true;
-        for backend in &backends {
+        for backend in backends
+            .iter()
+            .filter(|b| matches!(b.kind, BackendKind::OpenAi | BackendKind::LlamaCpp))
+        {
             if !first {
-                col = col.child(div().w_full().border_t_1().border_color(theme.border));
+                out.push(
+                    div()
+                        .w_full()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .into_any_element(),
+                );
             }
             first = false;
-            let children: Vec<gpui::AnyElement> = match backend.kind {
-                BackendKind::Eidola => {
-                    vec![
-                        self.backend_header(
-                            backend,
-                            "Confidential inference via the Eidola service — attested \
-                             hardware, anonymous credits. Disable to run with no account, \
-                             on-device only."
-                                .into(),
-                            false,
-                            cx,
-                        )
-                        .into_any_element(),
-                    ]
-                }
-                BackendKind::Local => self.local_section(backend, cx),
-                BackendKind::OpenAi | BackendKind::LlamaCpp => self.external_section(backend, cx),
-            };
             let mut section = v_flex().w_full().gap_3();
-            for child in children {
+            for child in self.external_section(backend, cx) {
                 section = section.child(child);
             }
-            col = col.child(section);
+            out.push(section.into_any_element());
         }
 
-        if !backends.is_empty() {
-            col = col.child(div().w_full().border_t_1().border_color(theme.border));
+        if !first {
+            out.push(
+                div()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .into_any_element(),
+            );
         }
+        let mut add = v_flex().w_full().gap_3();
         for child in self.add_section(cx) {
-            col = col.child(child);
+            add = add.child(child);
         }
-
-        col
+        out.push(add.into_any_element());
+        out
     }
 }
 

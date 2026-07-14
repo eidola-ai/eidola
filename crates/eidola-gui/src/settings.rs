@@ -1,7 +1,11 @@
 //! Settings window — a calm two-pane surface. A narrow nav list (General ·
-//! Backends · Account · Wallet) sits on a `theme.sidebar` band down the left edge; the
+//! Backends · Wallet) sits on a `theme.sidebar` band down the left edge; the
 //! selected pane renders in the content column. No primary-button tab strip,
 //! no boxes-in-boxes: the nav is quiet text, the content is hairline rows.
+//!
+//! Account (create/reset, balance, plans) is no longer a top-level pane — it
+//! lives inside **Backends → Eidola** (the account *is* the eidola backend's
+//! configuration). `BackendsSettingsView` hosts the `AccountView` entity.
 //!
 //! Settings deliberately keeps **no raw-data dumps** — measurement hex,
 //! attestation documents, and the request log live in the Record window
@@ -14,7 +18,6 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
-use crate::account::AccountView;
 use crate::actions::CloseWindow;
 use crate::backends_settings::BackendsSettingsView;
 use crate::general::GeneralView;
@@ -35,7 +38,6 @@ const NAV_WIDTH: gpui::Pixels = gpui::px(132.);
 pub enum SettingsPane {
     General,
     Backends,
-    Account,
     Wallet,
 }
 
@@ -44,7 +46,6 @@ impl SettingsPane {
         match self {
             SettingsPane::General => "General",
             SettingsPane::Backends => "Backends",
-            SettingsPane::Account => "Account",
             SettingsPane::Wallet => "Wallet",
         }
     }
@@ -54,7 +55,6 @@ pub struct SettingsView {
     selected: SettingsPane,
     general: Entity<GeneralView>,
     backends: Entity<BackendsSettingsView>,
-    account: Entity<AccountView>,
     wallet: Entity<WalletView>,
     /// The per-window modifier state. The root's `on_modifiers_changed`
     /// listener (registered in `Render`) mirrors events here; `GeneralView`
@@ -81,7 +81,6 @@ impl SettingsView {
         let general =
             cx.new(|cx| GeneralView::new(stores.config.clone(), window_input.clone(), window, cx));
         let backends = cx.new(|cx| BackendsSettingsView::new(stores.clone(), window, cx));
-        let account = cx.new(|cx| AccountView::new(stores.clone(), window, cx));
         let wallet = cx.new(|cx| WalletView::new(stores, window, cx));
 
         let focus_handle = cx.focus_handle();
@@ -91,7 +90,6 @@ impl SettingsView {
             selected: SettingsPane::General,
             general,
             backends,
-            account,
             wallet,
             window_input,
             focus_handle,
@@ -123,14 +121,10 @@ impl SettingsView {
         self.general.clone()
     }
 
-    /// The Account pane entity — exposed for behavior tests asserting the
-    /// reset-confirm flow.
-    pub fn account(&self) -> Entity<AccountView> {
-        self.account.clone()
-    }
-
     /// The Backends pane entity — exposed for behavior tests asserting the
-    /// backend + local-model affordances.
+    /// backend + local-model affordances (and, via
+    /// `BackendsSettingsView::account()`, the Account controls now hosted in
+    /// its Eidola tab).
     pub fn backends_pane(&self) -> Entity<BackendsSettingsView> {
         self.backends.clone()
     }
@@ -173,7 +167,6 @@ impl Render for SettingsView {
         let body: gpui::AnyElement = match self.selected {
             SettingsPane::General => self.general.clone().into_any_element(),
             SettingsPane::Backends => self.backends.clone().into_any_element(),
-            SettingsPane::Account => self.account.clone().into_any_element(),
             SettingsPane::Wallet => self.wallet.clone().into_any_element(),
         };
 
@@ -217,7 +210,6 @@ impl Render for SettingsView {
                 .gap_0p5()
                 .child(self.nav_item(SettingsPane::General, cx))
                 .child(self.nav_item(SettingsPane::Backends, cx))
-                .child(self.nav_item(SettingsPane::Account, cx))
                 .child(self.nav_item(SettingsPane::Wallet, cx)),
             )
             // The scroll container needs the same width discipline as the
