@@ -8,11 +8,15 @@
 
 use std::sync::Arc;
 
-use gpui::{App, Hsla, Pixels, Rems, SharedString, px, rems};
+use gpui::{App, FontWeight, Hsla, Pixels, Rems, SharedString, px, rems};
 use gpui_component::Theme;
 
 /// Function: heading level (1..=6) + base font size → final heading size.
 pub type HeadingFontSize = Arc<dyn Fn(u8, Pixels) -> Pixels + Send + Sync + 'static>;
+
+/// Function: heading level (1..=6) → font weight. Overrides the default
+/// bold-h1/h2, semibold-h3+ ramp when set.
+pub type HeadingWeight = Arc<dyn Fn(u8) -> FontWeight + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct MarkdownStyle {
@@ -36,6 +40,12 @@ pub struct MarkdownStyle {
     /// scales this per level. Default is `font_size`.
     pub heading_base_font_size: Pixels,
     pub heading_font_size: Option<HeadingFontSize>,
+
+    /// Per-level heading weight. When `None`, the default ramp applies
+    /// (h1/h2 bold, h3+ semibold — weight carries hierarchy). Set it to
+    /// impose a uniform or custom weight (e.g. the prose surface pins every
+    /// heading to Medium and lets the size ramp carry hierarchy instead).
+    pub heading_weight: Option<HeadingWeight>,
 
     /// Mono font size used for code blocks. Defaults to the theme's
     /// `mono_font_size`.
@@ -148,6 +158,7 @@ impl MarkdownStyle {
 
             heading_base_font_size: theme.font_size,
             heading_font_size: None,
+            heading_weight: None,
 
             mono_font_size: theme.mono_font_size,
             code_block_background: theme.muted,
@@ -209,6 +220,14 @@ impl MarkdownStyle {
         F: Fn(u8, Pixels) -> Pixels + Send + Sync + 'static,
     {
         self.heading_font_size = Some(Arc::new(f));
+        self
+    }
+
+    pub fn heading_weight<F>(mut self, f: F) -> Self
+    where
+        F: Fn(u8) -> FontWeight + Send + Sync + 'static,
+    {
+        self.heading_weight = Some(Arc::new(f));
         self
     }
 
@@ -298,7 +317,21 @@ impl MarkdownStyle {
         px(f32::from(base) * mult)
     }
 
-    /// h1 / h2 are bold; h3+ are semibold.
+    /// Final font weight for `level` (1..=6). Uses the `heading_weight`
+    /// callback if set, otherwise the default ramp (h1/h2 bold, h3+ semibold).
+    pub fn weight_for_heading(&self, level: u8) -> FontWeight {
+        if let Some(f) = &self.heading_weight {
+            return f(level);
+        }
+        if self.heading_is_bold(level) {
+            FontWeight::BOLD
+        } else {
+            FontWeight::SEMIBOLD
+        }
+    }
+
+    /// h1 / h2 are bold; h3+ are semibold. Only consulted for the default
+    /// weight ramp — a `heading_weight` override supersedes it.
     pub fn heading_is_bold(&self, level: u8) -> bool {
         level <= 2
     }

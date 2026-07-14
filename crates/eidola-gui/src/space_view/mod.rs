@@ -35,10 +35,10 @@ use std::rc::Rc;
 
 use eidola_app_core::error::AppError;
 use gpui::{
-    AnyElement, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, IsZero, Overflow, ParentElement, Pixels, Render, ScrollHandle, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TouchPhase, Window, div,
-    px, rems,
+    AnyElement, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight,
+    InteractiveElement, IntoElement, IsZero, Overflow, ParentElement, Pixels, Render, ScrollHandle,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
+    TouchPhase, Window, div, px, rems,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use gpui_markdown_editor::{MarkdownEditorState, MarkdownStyle};
@@ -107,10 +107,12 @@ pub(crate) const MINIMAP_FADE: std::time::Duration = std::time::Duration::from_m
 pub(crate) const VIRT_MARGIN: f32 = 600.0;
 
 /// `MarkdownStyle` for prose bodies and the composer: Newsreader at a book
-/// size/leading with a gentle heading ramp and Courier-New inline code (its
-/// x-height matches Newsreader's, where Menlo reads too large). `from_theme`
-/// seeds the system font + theme colors, so we override the family back to
-/// Newsreader for narrative content.
+/// size/leading with a size-led heading ramp (h1 2.5× … h4 1.125×) at a
+/// uniform Medium (500) weight — size carries the hierarchy — and Courier-New
+/// inline code (its x-height matches Newsreader's, where Menlo reads too
+/// large). Mirrors the website's prose ramp (`www/static/site.css`).
+/// `from_theme` seeds the system font + theme colors, so we override the
+/// family back to Newsreader for narrative content.
 pub(crate) fn prose_style(cx: &gpui::App) -> MarkdownStyle {
     let mut style = MarkdownStyle::from_theme(cx)
         .font_size(PROSE_FONT_SIZE)
@@ -118,11 +120,12 @@ pub(crate) fn prose_style(cx: &gpui::App) -> MarkdownStyle {
         .paragraph_gap(rems(PROSE_PARAGRAPH_GAP))
         .heading_base_font_size(PROSE_FONT_SIZE)
         .heading_font_size(|level, base| match level {
-            1 => base * 1.5,
-            2 => base * 1.25,
-            3 => base * 1.125,
-            _ => base,
+            1 => base * 2.5,
+            2 => base * 1.75,
+            3 => base * 1.25,
+            _ => base * 1.125,
         })
+        .heading_weight(|_| FontWeight::MEDIUM)
         .inline_code_font_family("Courier New");
     style.font_family = theme::FONT_FAMILY.into();
     style
