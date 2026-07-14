@@ -399,6 +399,86 @@ main.prose {
   }
 }
 
+/* --- In-page table of contents ------------------------------------------ */
+/* The right-hand rail — a cousin of the app's minimap: a hairline with
+ * the current section marked, entries in quiet 12px chrome text. toc.js
+ * sets aria-current on the section being read and .passed on the ones
+ * above it, so the filled edge doubles as reading progress. */
+
+.toc {
+  display: none;
+  grid-column: 3;
+  justify-self: start;
+  width: 220px;
+  margin-left: 24px;
+  padding: 32px 0;
+  position: sticky;
+  top: 60px;
+  align-self: start;
+  max-height: calc(100vh - 60px);
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+@media (min-width: 1200px) {
+  .toc {
+    display: block;
+  }
+}
+
+.toc ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-left: 1px solid var(--border);
+}
+
+.toc li {
+  margin: 0;
+  padding: 0;
+}
+
+.toc a {
+  display: block;
+  padding: 3px 0 3px 14px;
+  margin-left: -1px;
+  border-left: 1px solid transparent;
+  color: var(--muted-foreground);
+  text-decoration: none;
+}
+
+.toc .toc-h3 a {
+  padding-left: 28px;
+}
+
+.toc a:hover {
+  color: var(--foreground);
+}
+
+.toc a.passed {
+  border-left-color: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
+}
+
+.toc a[aria-current="true"] {
+  color: var(--foreground);
+  border-left-color: var(--foreground);
+}
+
+/* Anchored headings land clear of the sticky chrome; in-page jumps
+ * glide unless the reader prefers otherwise. */
+.prose h2,
+.prose h3,
+.prose h4 {
+  scroll-margin-top: 64px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
 /* --- Page furniture ----------------------------------------------------- */
 
 .byline {

@@ -71,6 +71,15 @@ fn builds_the_real_site() {
     assert!(!home.contains("docs-sidebar"));
     assert!(!read(&out, "blog/index.html").contains("docs-sidebar"));
 
+    // In-page ToC: on structured docs (entries link the generated
+    // heading ids), never on plain pages like privacy.
+    let trust_root = read(&out, "docs/trust-root/index.html");
+    assert!(trust_root.contains("class=\"toc\""));
+    assert!(trust_root.contains("<a href=\"#whats-pinned\">"));
+    assert!(trust_root.contains("/assets/toc.js"));
+    assert!(!read(&out, "privacy/index.html").contains("class=\"toc\""));
+    assert!(read(&out, "assets/toc.js").contains("aria-current"));
+
     // Blog: index and feed exist even with no published posts; the draft
     // example post must not publish.
     let blog = read(&out, "blog/index.html");

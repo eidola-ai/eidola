@@ -157,6 +157,27 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
         }
         _ => (String::new(), String::new()),
     };
+    // The in-page ToC rail: docs and posts with enough structure to be
+    // worth navigating. toc.js drives the scroll-spy state.
+    let toc = if matches!(page.kind, PageKind::Doc | PageKind::Post) && page.headings.len() >= 3 {
+        let mut items = String::new();
+        for heading in &page.headings {
+            items.push_str(&format!(
+                "<li class=\"toc-h{}\"><a href=\"#{}\">{}</a></li>\n",
+                heading.level,
+                escape_html(&heading.id),
+                escape_html(&heading.text)
+            ));
+        }
+        format!("<nav class=\"toc\" aria-label=\"On this page\">\n<ul>\n{items}</ul>\n</nav>\n")
+    } else {
+        String::new()
+    };
+    let toc_script = if toc.is_empty() {
+        ""
+    } else {
+        "<script defer src=\"/assets/toc.js\"></script>\n"
+    };
 
     format!(
         r#"<!doctype html>
@@ -173,7 +194,7 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
 <meta property="og:url" content="{canonical}">
 <script defer src="/assets/zones.js"></script>
 <script defer src="/assets/circadian.js"></script>
-</head>
+{toc_script}</head>
 <body>
 <header class="site-header">
 <a class="wordmark" href="/">Eidola</a>
@@ -186,7 +207,7 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
 <div class="layout">
 {sidebar}<main class="{main_class}">
 {inline_nav}{draft_notice}{byline}{body}</main>
-</div>
+{toc}</div>
 <footer class="site-footer">
 <span>© 2026 <a href="/about/">Eidola, Inc.</a></span>
 <nav>
@@ -209,6 +230,8 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
         main_class = main_class,
         sidebar = sidebar,
         inline_nav = inline_nav,
+        toc = toc,
+        toc_script = toc_script,
         draft_notice = draft_notice,
         byline = byline,
         body = page.html,
@@ -277,5 +300,43 @@ mod tests {
         home.route = "/".into();
         let html = layout(&home, Some(&nav));
         assert!(!html.contains("docs-sidebar"));
+    }
+
+    #[test]
+    fn toc_renders_for_structured_docs_and_posts_only() {
+        use crate::content::Heading;
+        let heading = |level: u8, id: &str, text: &str| Heading {
+            level,
+            id: id.into(),
+            text: text.into(),
+        };
+
+        let mut page = doc_page();
+        page.headings = vec![
+            heading(2, "one", "One"),
+            heading(3, "one-a", "One A"),
+            heading(2, "two", "Two"),
+        ];
+        let html = layout(&page, None);
+        assert!(html.contains("class=\"toc\""));
+        assert!(html.contains("<li class=\"toc-h3\"><a href=\"#one-a\">One A</a></li>"));
+        assert!(html.contains("/assets/toc.js"));
+
+        // Too little structure -> no rail, no script.
+        let mut short = doc_page();
+        short.headings = vec![heading(2, "only", "Only")];
+        let html = layout(&short, None);
+        assert!(!html.contains("class=\"toc\""));
+        assert!(!html.contains("/assets/toc.js"));
+
+        // Plain pages never get one, however long.
+        let mut plain = doc_page();
+        plain.kind = PageKind::Page;
+        plain.headings = vec![
+            heading(2, "a", "A"),
+            heading(2, "b", "B"),
+            heading(2, "c", "C"),
+        ];
+        assert!(!layout(&plain, None).contains("class=\"toc\""));
     }
 }
