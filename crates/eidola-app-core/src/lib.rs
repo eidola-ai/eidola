@@ -1660,6 +1660,7 @@ impl Inner {
         };
         let model = canonical_model.as_str();
 
+        let mut engine_lease: Option<local_models::EngineLease> = None;
         let (
             provider_id,
             client,
@@ -1670,14 +1671,28 @@ impl Inner {
             external_auth,
         ) = match backend_kind {
             BackendKind::Local | BackendKind::LlamaCpp => {
-                let (engine_url, context_tokens) = self
-                    .local
-                    .ready_engine(&backend.id, &mref.model)
-                    .ok_or_else(|| AppError::LocalModel {
-                        message: format!(
-                            "`{model}` is not loaded — load it in Settings → Backends"
-                        ),
-                    })?;
+                // A request *is* the load trigger: an unloaded engine is
+                // loaded on demand (the eviction planner makes room by
+                // unloading LRU idle, unpinned engines first) and a warming
+                // one is awaited. The turn then holds a lease on the engine
+                // — bumping the LRU clock and shielding it from auto-unload
+                // until the turn ends (`TurnPrep` carries the lease; its
+                // drop releases).
+                let (engine_url, context_tokens, lease) =
+                    match self.local.lease_engine(&backend.id, &mref.model) {
+                        Some(leased) => leased,
+                        None => {
+                            self.load_local_model(model).await?;
+                            self.local
+                                .lease_engine(&backend.id, &mref.model)
+                                .ok_or_else(|| AppError::LocalModel {
+                                    message: format!(
+                                        "`{model}` was unloaded while the request was starting"
+                                    ),
+                                })?
+                        }
+                    };
+                engine_lease = Some(lease);
                 let provider_id =
                     db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
                 let client = match &self.http_override {
@@ -1954,6 +1969,7 @@ impl Inner {
             db_conn,
             provider_id,
             backend_id: backend.id,
+            engine_lease,
             attestation_log,
             client,
             connection_id,
@@ -3198,6 +3214,17 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Pin or unpin a loaded model's engine. Pinned engines are protected
+    /// from automatic (LRU) unloading when another model needs the memory;
+    /// manual unload still applies.
+    pub async fn set_local_model_pinned(&self, id: String, pinned: bool) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.set_local_model_pinned(&id, pinned).await })
+            .await
+            .map_err(join_err)?
+    }
+
     /// Test-only seam: mark `slug` as a loaded engine model for
     /// `backend_id` served at `127.0.0.1:<port>`, so integration tests can
     /// drive engine-backed chat turns against a mock upstream without
@@ -3205,6 +3232,36 @@ impl AppCore {
     #[doc(hidden)]
     pub fn test_register_loaded_local_model(&self, backend_id: &str, slug: &str, port: u16) {
         self.inner.local.register_for_test(backend_id, slug, port);
+    }
+
+    /// Test-only seam: register a fake ready engine with explicit
+    /// footprint / pin / LRU timestamp — the eviction tests' fixture.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn test_register_engine(
+        &self,
+        backend_id: &str,
+        slug: &str,
+        port: u16,
+        footprint: u64,
+        pinned: bool,
+        last_used_ms: i64,
+    ) {
+        self.inner.local.register_engine_for_test(
+            backend_id,
+            slug,
+            port,
+            footprint,
+            pinned,
+            last_used_ms,
+        );
+    }
+
+    /// Test-only seam: pin the engine-pool memory budget so eviction tests
+    /// are deterministic on any machine.
+    #[doc(hidden)]
+    pub fn test_set_memory_budget(&self, budget: u64) {
+        self.inner.local.set_memory_budget_for_test(budget);
     }
 
     /// List spaces, most recently active first. Archived spaces are
@@ -3489,6 +3546,11 @@ struct TurnPrep {
     /// The configured backend this turn routes through — recorded on the
     /// request row (the forensic reference).
     backend_id: String,
+    /// For engine-backed turns: the in-flight hold on the serving engine.
+    /// Held for the turn's whole life (this struct's) so the engine is
+    /// never auto-unloaded mid-request; dropping releases it.
+    #[allow(dead_code)]
+    engine_lease: Option<local_models::EngineLease>,
     attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>>,
     client: reqwest::Client,
     /// Connection row adopted from the most recent attestation flush; the

@@ -70,12 +70,23 @@ impl LocalModelsStore {
             .unwrap_or(&[])
     }
 
-    /// Models currently loaded (ready to serve) in the managed local store
-    /// — the "On this device" group of the model picker.
+    /// Models currently loaded (ready to serve) in the managed local store.
     pub fn loaded_models(&self) -> Vec<LocalModelInfo> {
         self.models()
             .iter()
             .filter(|m| matches!(m.status, LocalModelStatus::Loaded { .. }))
+            .cloned()
+            .collect()
+    }
+
+    /// The managed store's *selectable* models — everything on disk
+    /// (loaded, warming, or not-yet-loaded; a request loads on demand).
+    /// Mid-download models are excluded (no file to serve yet). The "On
+    /// this device" group of the model picker.
+    pub fn selectable_models(&self) -> Vec<LocalModelInfo> {
+        self.models()
+            .iter()
+            .filter(|m| !matches!(m.status, LocalModelStatus::Downloading { .. }))
             .cloned()
             .collect()
     }
@@ -104,6 +115,16 @@ impl LocalModelsStore {
         self.external_models(backend_id)
             .into_iter()
             .filter(|m| matches!(m.status, LocalModelStatus::Loaded { .. }))
+            .collect()
+    }
+
+    /// One llamacpp backend's *selectable* models — everything scanned
+    /// except mid-download (a request loads on demand); its group in the
+    /// model picker.
+    pub fn external_selectable_models(&self, backend_id: &str) -> Vec<LocalModelInfo> {
+        self.external_models(backend_id)
+            .into_iter()
+            .filter(|m| !matches!(m.status, LocalModelStatus::Downloading { .. }))
             .collect()
     }
 
@@ -180,6 +201,15 @@ impl LocalModelsStore {
             cx,
             move |c| async move { c.unload_local_model(id).await },
         );
+    }
+
+    /// Pin/unpin a loaded model's engine (protection from automatic LRU
+    /// unloading; manual unload still applies).
+    pub fn set_pinned(&mut self, id: String, pinned: bool, cx: &mut Context<Self>) {
+        let key = format!("pin:{id}");
+        self.run_op(key, cx, move |c| async move {
+            c.set_local_model_pinned(id, pinned).await
+        });
     }
 
     /// Shared operation shape: clear the standing error, run the initiating

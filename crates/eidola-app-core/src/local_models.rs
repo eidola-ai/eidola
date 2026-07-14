@@ -146,8 +146,13 @@ pub enum LocalModelStatus {
     Available,
     /// An engine subprocess is spawned and warming up (polling `/health`).
     Loading,
-    /// Serving on `127.0.0.1:<port>`; selectable for chat.
-    Loaded { port: u16, context_tokens: u32 },
+    /// Serving on `127.0.0.1:<port>`. `pinned` engines are protected from
+    /// automatic (LRU) unloading; manual unload still applies.
+    Loaded {
+        port: u16,
+        context_tokens: u32,
+        pinned: bool,
+    },
 }
 
 /// One engine-served model as shown in Settings → Backends and (when
@@ -227,6 +232,32 @@ struct EngineEntry {
     /// Consumed by `unload` (map removal hands us ownership); the
     /// supervisor kills the child on receipt or on drop.
     shutdown: tokio::sync::oneshot::Sender<()>,
+    /// Estimated resident footprint (file size + [`ENGINE_OVERHEAD_BYTES`])
+    /// — the eviction planner's currency.
+    footprint: u64,
+    /// Pinned engines are protected from *automatic* (LRU) unloading;
+    /// manual unload still applies. Runtime state — set from Settings →
+    /// Backends on a loaded engine, gone with it.
+    pinned: bool,
+    /// When a turn last leased this engine (ms since epoch; load time
+    /// initially) — the LRU clock.
+    last_used_ms: i64,
+    /// Turns currently running against this engine. `Arc` so an
+    /// [`EngineLease`]'s decrement survives the entry being removed.
+    in_flight: Arc<AtomicU64>,
+}
+
+/// An in-flight-turn hold on an engine: taken when a turn routes to it,
+/// released (`Drop`) when the turn ends — success or failure. While any
+/// lease is live the engine is never auto-unloaded.
+pub(crate) struct EngineLease {
+    in_flight: Arc<AtomicU64>,
+}
+
+impl Drop for EngineLease {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Engine/failure map key: `(backend_id, slug)`. The `local` singleton and
@@ -244,6 +275,8 @@ pub(crate) struct LocalRuntime {
     engines: StdMutex<HashMap<EngineKey, EngineEntry>>,
     /// Last failure per (backend, slug) — download or load — until retried.
     failures: StdMutex<HashMap<EngineKey, String>>,
+    /// Test override for the machine memory budget ([`memory_budget`]).
+    budget_override: StdMutex<Option<u64>>,
 }
 
 impl LocalRuntime {
@@ -259,11 +292,92 @@ impl LocalRuntime {
             })
     }
 
+    /// Lease a ready engine for one turn: bumps the LRU clock and the
+    /// in-flight count (released when the returned [`EngineLease`] drops).
+    /// `None` while absent or still warming up.
+    pub(crate) fn lease_engine(
+        &self,
+        backend_id: &str,
+        slug: &str,
+    ) -> Option<(String, u32, EngineLease)> {
+        let mut engines = self.engines.lock().expect("engines lock");
+        let entry = engines.get_mut(&(backend_id.to_string(), slug.to_string()))?;
+        if !entry.ready {
+            return None;
+        }
+        entry.last_used_ms = crate::now_ms();
+        entry.in_flight.fetch_add(1, Ordering::SeqCst);
+        Some((
+            format!("http://127.0.0.1:{}", entry.port),
+            entry.context_tokens,
+            EngineLease {
+                in_flight: entry.in_flight.clone(),
+            },
+        ))
+    }
+
+    /// Whether an entry (ready or warming) exists for this key.
+    fn engine_present(&self, key: &EngineKey) -> bool {
+        self.engines.lock().expect("engines lock").contains_key(key)
+    }
+
+    /// Snapshot the loaded engines for the eviction planner.
+    fn plan_snapshot(&self) -> Vec<EngineUsage> {
+        let engines = self.engines.lock().expect("engines lock");
+        engines
+            .iter()
+            .map(|(key, e)| EngineUsage {
+                key: key.clone(),
+                footprint: e.footprint,
+                last_used_ms: e.last_used_ms,
+                pinned: e.pinned,
+                in_flight: e.in_flight.load(Ordering::SeqCst),
+            })
+            .collect()
+    }
+
+    /// The total memory the engine pool may occupy: a fixed fraction of
+    /// physical RAM (leaving headroom for the app and the OS), or the test
+    /// override. The estimate errs permissive — a genuinely-too-big load
+    /// still fails at the engine and surfaces honestly.
+    fn memory_budget(&self) -> u64 {
+        if let Some(b) = *self.budget_override.lock().expect("budget lock") {
+            return b;
+        }
+        total_memory_bytes()
+            .map(|total| total / MEMORY_BUDGET_DEN * MEMORY_BUDGET_NUM)
+            // Unknown RAM (exotic platform): a permissive fallback — the
+            // planner never evicts needlessly and real failures surface.
+            .unwrap_or(u64::MAX / 2)
+    }
+
+    /// Test seam: pin the memory budget so eviction tests are
+    /// deterministic on any machine.
+    #[doc(hidden)]
+    pub(crate) fn set_memory_budget_for_test(&self, budget: u64) {
+        *self.budget_override.lock().expect("budget lock") = Some(budget);
+    }
+
     /// Test seam: register a fake "ready" engine at an arbitrary port so
     /// integration tests can route local turns at a mock upstream without
     /// spawning a real llama-server.
     #[doc(hidden)]
     pub(crate) fn register_for_test(&self, backend_id: &str, slug: &str, port: u16) {
+        self.register_engine_for_test(backend_id, slug, port, ENGINE_OVERHEAD_BYTES, false, 0);
+    }
+
+    /// Test seam: like [`register_for_test`] but with explicit footprint,
+    /// pin state, and LRU timestamp — the eviction tests' fixture.
+    #[doc(hidden)]
+    pub(crate) fn register_engine_for_test(
+        &self,
+        backend_id: &str,
+        slug: &str,
+        port: u16,
+        footprint: u64,
+        pinned: bool,
+        last_used_ms: i64,
+    ) {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         self.engines.lock().expect("engines lock").insert(
             (backend_id.to_string(), slug.to_string()),
@@ -272,8 +386,139 @@ impl LocalRuntime {
                 context_tokens: LOCAL_CONTEXT_TOKENS,
                 ready: true,
                 shutdown: tx,
+                footprint,
+                pinned,
+                last_used_ms,
+                in_flight: Arc::new(AtomicU64::new(0)),
             },
         );
+    }
+}
+
+// ============================================================================
+// Memory budget + the eviction planner
+// ============================================================================
+
+/// Fraction of physical RAM the engine pool may occupy (numerator /
+/// denominator): 4/5. The remainder is headroom for the app, the OS, and
+/// the KV-cache estimate error.
+const MEMORY_BUDGET_NUM: u64 = 4;
+const MEMORY_BUDGET_DEN: u64 = 5;
+
+/// Estimated per-engine overhead beyond the mmapped weights: KV cache at
+/// [`LOCAL_CONTEXT_TOKENS`], compute buffers, and the process itself. A
+/// deliberate rough heuristic — the planner only decides *evictions*; a
+/// load that genuinely doesn't fit still fails at the engine and surfaces
+/// as an honest error.
+const ENGINE_OVERHEAD_BYTES: u64 = 1 << 30; // 1 GiB
+
+/// Estimated resident footprint of an engine serving a model file.
+fn engine_footprint(file_size: u64) -> u64 {
+    file_size.saturating_add(ENGINE_OVERHEAD_BYTES)
+}
+
+/// Physical RAM, if the platform tells us.
+fn total_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut size: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        let name = c"hw.memsize";
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut size as *mut u64 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(size)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = meminfo
+            .lines()
+            .find(|l| l.starts_with("MemTotal:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        Some(kb * 1024)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// One loaded engine as the eviction planner sees it.
+#[derive(Clone, Debug)]
+struct EngineUsage {
+    key: EngineKey,
+    footprint: u64,
+    last_used_ms: i64,
+    pinned: bool,
+    in_flight: u64,
+}
+
+/// Decide which engines to unload so a new engine of `required` footprint
+/// fits inside `budget`. Pure, so the policy is unit-testable:
+///
+/// - Nothing to do when it already fits.
+/// - Otherwise evict least-recently-used first, but **only** engines that
+///   are neither pinned nor serving an in-flight turn.
+/// - If even evicting every candidate can't make room, `Err` explains
+///   what's holding the memory — the caller surfaces it without unloading
+///   anything (a pointless eviction would punish the user twice).
+fn plan_evictions(
+    required: u64,
+    budget: u64,
+    engines: &[EngineUsage],
+) -> Result<Vec<EngineKey>, String> {
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    if required > budget {
+        return Err(format!(
+            "the model needs ~{:.1} GiB but the memory budget is {:.1} GiB",
+            gib(required),
+            gib(budget)
+        ));
+    }
+    let in_use: u64 = engines.iter().map(|e| e.footprint).sum();
+    let mut free = budget.saturating_sub(in_use);
+    if free >= required {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates: Vec<&EngineUsage> = engines
+        .iter()
+        .filter(|e| !e.pinned && e.in_flight == 0)
+        .collect();
+    candidates.sort_by_key(|e| e.last_used_ms);
+
+    let mut evict = Vec::new();
+    for e in candidates {
+        if free >= required {
+            break;
+        }
+        free = free.saturating_add(e.footprint);
+        evict.push(e.key.clone());
+    }
+    if free >= required {
+        Ok(evict)
+    } else {
+        let held: u64 = engines
+            .iter()
+            .filter(|e| e.pinned || e.in_flight > 0)
+            .map(|e| e.footprint)
+            .sum();
+        Err(format!(
+            "the model needs ~{:.1} GiB, but ~{:.1} GiB is held by pinned or in-use models — \
+             unpin or unload one in Settings → Backends",
+            gib(required),
+            gib(held)
+        ))
     }
 }
 
@@ -578,6 +823,7 @@ impl Inner {
                         Some(e) if e.ready => LocalModelStatus::Loaded {
                             port: e.port,
                             context_tokens: e.context_tokens,
+                            pinned: e.pinned,
                         },
                         Some(_) => LocalModelStatus::Loading,
                         None => LocalModelStatus::Available,
@@ -755,13 +1001,32 @@ impl Inner {
     /// Load a model: spawn `llama-server` on a free loopback port and wait
     /// until its `/health` endpoint reports ready (or the load fails).
     /// Accepts `<slug>@<backend>` or a bare slug (shorthand for the
-    /// managed local store). Emits [`Change::LocalModels`]
-    /// at spawn, on ready, and on failure; a supervisor task owns the child
-    /// and also emits if the engine later exits unexpectedly.
+    /// managed local store).
+    ///
+    /// **Idempotent**: a ready engine returns immediately; one still
+    /// warming up is awaited rather than double-spawned (so a request that
+    /// races another request's auto-load simply joins it). Before spawning,
+    /// the eviction planner ([`plan_evictions`]) makes room inside the
+    /// memory budget by unloading least-recently-used engines that are
+    /// neither pinned nor serving an in-flight turn; if even that can't
+    /// free enough, the load is refused with an error naming what holds
+    /// the memory (and nothing is unloaded).
+    ///
+    /// Emits [`Change::LocalModels`] at spawn, on ready, and on failure; a
+    /// supervisor task owns the child and also emits if the engine later
+    /// exits unexpectedly.
     pub(crate) async fn load_local_model(&self, id: &str) -> Result<(), AppError> {
         let key = engine_key_for_id(id);
         let (backend_id, slug) = (key.0.clone(), key.1.clone());
         let cfg = self.load_config();
+
+        // Already present: ready → done; warming → join the in-flight load.
+        if self.local.engine_present(&key) {
+            if self.local.ready_engine(&backend_id, &slug).is_some() {
+                return Ok(());
+            }
+            return self.await_engine_ready(&key).await;
+        }
 
         // Resolve the model file's directory by backend: the managed local
         // store, or a llamacpp backend's user-owned directory.
@@ -797,6 +1062,29 @@ impl Inner {
         // `model` field matches what the engine expects verbatim.
         let model_id = engine_model_id(&backend_id, &slug);
 
+        // Make room: evict LRU idle, unpinned engines until this model's
+        // estimated footprint fits the budget. A refusal unloads nothing.
+        let footprint = engine_footprint(
+            tokio::fs::metadata(&model_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0),
+        );
+        let victims = plan_evictions(
+            footprint,
+            self.local.memory_budget(),
+            &self.local.plan_snapshot(),
+        )
+        .map_err(|message| AppError::LocalModel {
+            message: format!("cannot load `{model_id}`: {message}"),
+        })?;
+        for victim in victims {
+            // Best-effort: a victim may have been unloaded concurrently.
+            let _ = self
+                .unload_local_model(&engine_model_id(&victim.0, &victim.1))
+                .await;
+        }
+
         let mut command = tokio::process::Command::new(&engine);
         command
             .arg("-m")
@@ -814,22 +1102,31 @@ impl Inner {
             .kill_on_drop(true);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        {
+        let raced_existing = {
             let mut engines = self.local.engines.lock().expect("engines lock");
             if engines.contains_key(&key) {
-                return Err(AppError::LocalModel {
-                    message: format!("`{model_id}` is already loaded"),
-                });
+                true
+            } else {
+                engines.insert(
+                    key.clone(),
+                    EngineEntry {
+                        port,
+                        context_tokens: LOCAL_CONTEXT_TOKENS,
+                        ready: false,
+                        shutdown: shutdown_tx,
+                        footprint,
+                        pinned: false,
+                        last_used_ms: crate::now_ms(),
+                        in_flight: Arc::new(AtomicU64::new(0)),
+                    },
+                );
+                false
             }
-            engines.insert(
-                key.clone(),
-                EngineEntry {
-                    port,
-                    context_tokens: LOCAL_CONTEXT_TOKENS,
-                    ready: false,
-                    shutdown: shutdown_tx,
-                },
-            );
+        };
+        if raced_existing {
+            // Raced another load between the presence check and here — join
+            // that load instead of double-spawning.
+            return self.await_engine_ready(&key).await;
         }
         self.local
             .failures
@@ -859,6 +1156,61 @@ impl Inner {
                 message: "engine supervisor exited before the model became ready".into(),
             }),
         }
+    }
+
+    /// Wait for another caller's in-flight load of `key` to settle: ready →
+    /// `Ok`, entry gone (load failed / unloaded) → the recorded failure, or
+    /// a timeout mirroring the loader's own budget.
+    async fn await_engine_ready(&self, key: &EngineKey) -> Result<(), AppError> {
+        let deadline = std::time::Instant::now() + ENGINE_READY_TIMEOUT;
+        loop {
+            if self.local.ready_engine(&key.0, &key.1).is_some() {
+                return Ok(());
+            }
+            if !self.local.engine_present(key) {
+                let message = self
+                    .local
+                    .failures
+                    .lock()
+                    .expect("failures lock")
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| "the engine load was cancelled".into());
+                return Err(AppError::LocalModel { message });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(AppError::LocalModel {
+                    message: format!(
+                        "engine did not become ready within {}s",
+                        ENGINE_READY_TIMEOUT.as_secs()
+                    ),
+                });
+            }
+            tokio::time::sleep(ENGINE_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Pin or unpin a loaded engine. Pinned engines are protected from
+    /// automatic (LRU) unloading; manual unload still applies. Runtime
+    /// state — it lives and dies with the loaded engine.
+    pub(crate) async fn set_local_model_pinned(
+        &self,
+        id: &str,
+        pinned: bool,
+    ) -> Result<(), AppError> {
+        let key = engine_key_for_id(id);
+        {
+            let mut engines = self.local.engines.lock().expect("engines lock");
+            let entry = engines.get_mut(&key).ok_or_else(|| AppError::LocalModel {
+                message: format!(
+                    "`{}` is not loaded — only loaded models can be pinned",
+                    engine_model_id(&key.0, &key.1)
+                ),
+            })?;
+            entry.pinned = pinned;
+        }
+        self.bus.emit(Change::LocalModels);
+        Ok(())
     }
 
     /// Unload a model: signal its supervisor, which kills the subprocess.
@@ -1221,6 +1573,81 @@ mod tests {
         let slug = slug_for_file("gemma-4-E2B_q4_0-it.gguf");
         assert_eq!(slug, "gemma-4-E2B_q4_0-it");
         assert_eq!(engine_model_id("local", &slug), "gemma-4-E2B_q4_0-it@local");
+    }
+
+    // -- The eviction planner -------------------------------------------
+
+    const GIB: u64 = 1 << 30;
+
+    fn usage(
+        name: &str,
+        footprint: u64,
+        last_used: i64,
+        pinned: bool,
+        in_flight: u64,
+    ) -> EngineUsage {
+        EngineUsage {
+            key: ("local".to_string(), name.to_string()),
+            footprint,
+            last_used_ms: last_used,
+            pinned,
+            in_flight,
+        }
+    }
+
+    #[test]
+    fn plan_no_eviction_when_it_fits() {
+        let loaded = vec![usage("a", 4 * GIB, 1, false, 0)];
+        assert_eq!(
+            plan_evictions(3 * GIB, 16 * GIB, &loaded).unwrap(),
+            Vec::<EngineKey>::new()
+        );
+    }
+
+    #[test]
+    fn plan_evicts_lru_first_and_only_as_needed() {
+        // Budget 16, loaded 4+5+4=13, need 6 → free 3; evicting the LRU
+        // (b, oldest) frees 5 more → 8 ≥ 6. One eviction, the oldest.
+        let loaded = vec![
+            usage("a", 4 * GIB, 300, false, 0),
+            usage("b", 5 * GIB, 100, false, 0),
+            usage("c", 4 * GIB, 200, false, 0),
+        ];
+        let plan = plan_evictions(6 * GIB, 16 * GIB, &loaded).unwrap();
+        assert_eq!(plan, vec![("local".to_string(), "b".to_string())]);
+
+        // Needing more takes the next-oldest too (b then c), never a.
+        let plan = plan_evictions(10 * GIB, 16 * GIB, &loaded).unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                ("local".to_string(), "b".to_string()),
+                ("local".to_string(), "c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_never_touches_pinned_or_in_flight_engines() {
+        let loaded = vec![
+            usage("pinned-old", 6 * GIB, 1, true, 0),
+            usage("busy-old", 6 * GIB, 2, false, 3),
+            usage("idle", 3 * GIB, 900, false, 0),
+        ];
+        // Fits after evicting only the idle one — the older pinned/busy
+        // engines are skipped despite being better LRU candidates.
+        let plan = plan_evictions(4 * GIB, 16 * GIB, &loaded).unwrap();
+        assert_eq!(plan, vec![("local".to_string(), "idle".to_string())]);
+
+        // Can't fit even after the idle eviction: refuse, naming the hold.
+        let err = plan_evictions(8 * GIB, 16 * GIB, &loaded).unwrap_err();
+        assert!(err.contains("pinned or in-use"), "got {err}");
+    }
+
+    #[test]
+    fn plan_refuses_models_larger_than_the_budget() {
+        let err = plan_evictions(20 * GIB, 16 * GIB, &[]).unwrap_err();
+        assert!(err.contains("memory budget"), "got {err}");
     }
 
     #[test]

@@ -891,6 +891,7 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
                 status: LocalModelStatus::Loaded {
                     port: 4242,
                     context_tokens: 8192,
+                    pinned: false,
                 },
                 last_error: None,
             },
@@ -963,9 +964,11 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
         // The llamacpp backend's scanned model affords load (never delete —
         // the file is the user's).
         "settings/backends/my-box/model/0/load",
-        // The Available model affords load + delete; the Loaded one, unload.
+        // The Available model affords load + delete; the Loaded one,
+        // pin + unload.
         "settings/backends/local/installed/0/load",
         "settings/backends/local/installed/0/delete",
+        "settings/backends/local/installed/1/pin",
         "settings/backends/local/installed/1/unload",
         // No fixture file matches a catalog entry, so every catalog row
         // affords download.
@@ -1042,7 +1045,7 @@ fn backends_pane_add_form_probes_appear_per_kind(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn request_panel_lists_loaded_local_models_first(cx: &mut TestAppContext) {
+fn request_panel_lists_all_on_disk_local_models_first(cx: &mut TestAppContext) {
     let _guard = probes_on();
 
     let stores = stub_stores(cx, |s| {
@@ -1069,15 +1072,15 @@ fn request_panel_lists_loaded_local_models_first(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let names = fresh_names(cx, window);
-    // Only the *loaded* local model appears (Tiny B), ahead of the remote
-    // rows; the merely-downloaded Tiny A does not.
+    // *Every* on-disk local model appears ahead of the remote rows — the
+    // merely-downloaded Tiny A included (a request loads it on demand).
     assert!(
         names.contains(&"space/request-panel/engine/local/0".to_string()),
-        "loaded local model row missing: {names:?}"
+        "downloaded (unloaded) local model row missing: {names:?}"
     );
     assert!(
-        !names.contains(&"space/request-panel/engine/local/1".to_string()),
-        "an unloaded local model must not appear in the picker: {names:?}"
+        names.contains(&"space/request-panel/engine/local/1".to_string()),
+        "loaded local model row missing: {names:?}"
     );
     assert!(
         names.contains(&"space/request-panel/remote/eidola/0".to_string()),
@@ -1193,6 +1196,7 @@ fn request_panel_groups_per_backend_with_independent_health(cx: &mut TestAppCont
         m.status = eidola_app_core::LocalModelStatus::Loaded {
             port: 4243,
             context_tokens: 8192,
+            pinned: false,
         };
     }
     let stores = stub_stores(cx, |s| {

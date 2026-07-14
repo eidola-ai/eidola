@@ -247,6 +247,156 @@ fn delete_removes_files_and_emits() {
 }
 
 // ===========================================================================
+// Pinning + the on-demand load's eviction pass
+// ===========================================================================
+
+const GIB: u64 = 1 << 30;
+
+#[test]
+fn pin_state_round_trips_and_requires_a_loaded_engine() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let models_dir = _dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("tiny.gguf"), b"gguf").unwrap();
+        core.test_register_loaded_local_model("local", "tiny", 1);
+        let mut rx = core.subscribe_changes();
+
+        core.runtime()
+            .block_on(core.set_local_model_pinned("tiny@local".into(), true))
+            .expect("pin");
+        assert_eq!(drain(&mut rx), vec![Change::LocalModels]);
+        let state = core
+            .runtime()
+            .block_on(core.local_models_state())
+            .expect("state");
+        assert!(matches!(
+            state.models[0].status,
+            eidola_app_core::LocalModelStatus::Loaded { pinned: true, .. }
+        ));
+
+        core.runtime()
+            .block_on(core.set_local_model_pinned("tiny@local".into(), false))
+            .expect("unpin");
+        let state = core
+            .runtime()
+            .block_on(core.local_models_state())
+            .expect("state");
+        assert!(matches!(
+            state.models[0].status,
+            eidola_app_core::LocalModelStatus::Loaded { pinned: false, .. }
+        ));
+
+        // Pinning an engine that isn't loaded is refused honestly.
+        let err = core
+            .runtime()
+            .block_on(core.set_local_model_pinned("absent@local".into(), true))
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("not loaded"), "got {err}");
+    });
+}
+
+/// The on-demand load evicts LRU idle engines to make room — and never
+/// touches pinned ones. The load itself is pointed at `/usr/bin/false`
+/// (spawns, exits immediately) so the test exercises the eviction pass on
+/// any machine without a real llama-server; the load's failure is expected
+/// and honest.
+#[test]
+fn on_demand_load_evicts_lru_idle_but_not_pinned() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let models_dir = _dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        // A "5 GiB" model by declared footprint; the file itself is tiny,
+        // so pin the budget + register fixtures with explicit footprints.
+        std::fs::write(models_dir.join("wanted.gguf"), vec![0u8; 64]).unwrap();
+        // Fixture files so the scan lists the fake engines' models.
+        std::fs::write(models_dir.join("pinned-old.gguf"), b"gguf").unwrap();
+        std::fs::write(models_dir.join("idle-new.gguf"), b"gguf").unwrap();
+        core.set_llama_server_path(Some("/usr/bin/false".into()))
+            .unwrap();
+        core.test_set_memory_budget(8 * GIB);
+        // Loaded pool: an old pinned engine (4 GiB) + a newer idle one
+        // (3 GiB). The new model (~1 GiB overhead + tiny file) needs the
+        // idle engine's memory; the pinned one must survive despite being
+        // the better LRU candidate.
+        core.test_register_engine("local", "pinned-old", 1, 4 * GIB, true, 100);
+        core.test_register_engine("local", "idle-new", 2, 3 * GIB, false, 900);
+
+        let err = core
+            .runtime()
+            .block_on(core.load_local_model("wanted@local".into()))
+            .expect_err("/usr/bin/false exits — the load fails after eviction");
+        assert!(err.to_string().contains("exited during load"), "got {err}");
+
+        let state = core
+            .runtime()
+            .block_on(core.local_models_state())
+            .expect("state");
+        let status_of = |slug: &str| {
+            state
+                .models
+                .iter()
+                .find(|m| m.slug == slug)
+                .map(|m| m.status.clone())
+        };
+        // The idle engine was LRU-evicted (back to Available); the pinned
+        // one survived despite being older.
+        assert!(
+            matches!(
+                status_of("idle-new"),
+                Some(eidola_app_core::LocalModelStatus::Available)
+            ),
+            "the idle engine must have been LRU-evicted: {state:?}"
+        );
+        assert!(
+            matches!(
+                status_of("pinned-old"),
+                Some(eidola_app_core::LocalModelStatus::Loaded { pinned: true, .. })
+            ),
+            "the pinned engine must survive eviction: {state:?}"
+        );
+    });
+}
+
+/// When even evicting every idle engine can't make room, the load is
+/// refused *without unloading anything* — a pointless eviction would
+/// punish the user twice.
+#[test]
+fn on_demand_load_refuses_without_evicting_when_pins_hold_the_memory() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let models_dir = _dir.path().join("data").join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("wanted.gguf"), vec![0u8; 64]).unwrap();
+        std::fs::write(models_dir.join("idle-small.gguf"), b"gguf").unwrap();
+        core.set_llama_server_path(Some("/usr/bin/false".into()))
+            .unwrap();
+        core.test_set_memory_budget(8 * GIB);
+        // 7.5 GiB pinned + idle 0.2 GiB: evicting the idle engine still
+        // can't fit the ~1 GiB requirement.
+        core.test_register_engine("local", "pinned-big", 1, 7 * GIB + GIB / 2, true, 100);
+        core.test_register_engine("local", "idle-small", 2, GIB / 5, false, 900);
+
+        let err = core
+            .runtime()
+            .block_on(core.load_local_model("wanted@local".into()))
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("pinned or in-use"), "got {err}");
+        // Nothing was unloaded: the idle engine still serves.
+        let state = core
+            .runtime()
+            .block_on(core.local_models_state())
+            .expect("state");
+        assert!(
+            state.models.iter().any(|m| m.slug == "idle-small"
+                && matches!(m.status, eidola_app_core::LocalModelStatus::Loaded { .. })),
+            "a refused load must not evict anyone: {state:?}"
+        );
+    });
+}
+
+// ===========================================================================
 // Local chat turns — the credential-free path through run_turn
 // ===========================================================================
 
@@ -357,11 +507,13 @@ fn local_streaming_chat_streams_and_persists_without_wallet() {
 }
 
 #[test]
-fn local_chat_with_unloaded_model_is_typed_error() {
+fn local_chat_with_missing_model_is_typed_error() {
     run(|| {
         let (_mock, core, _dir) = chat_harness::core_for(MockConfig::default());
         with_account(&core);
 
+        // A request against an unloaded model *auto-loads* it; here the
+        // model file doesn't exist, so the load itself fails honestly.
         let err = core
             .runtime()
             .block_on(core.chat("Hi".into(), "never-loaded@local".into(), None))
@@ -370,7 +522,7 @@ fn local_chat_with_unloaded_model_is_typed_error() {
             matches!(err.root(), AppError::LocalModel { .. }),
             "got {err:?}"
         );
-        assert!(err.to_string().contains("not loaded"), "got {err}");
+        assert!(err.to_string().contains("no model file"), "got {err}");
 
         // The post persisted before routing failed — the saved thought
         // survives (post-first contract), with no inference row.

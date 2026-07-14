@@ -479,6 +479,12 @@ impl Inner {
                         .map(|b| b.models)
                         .unwrap_or_default()
                 };
+                // Every on-disk model is selectable — a request against an
+                // unloaded one loads its engine on demand. Only models
+                // still downloading are excluded (no file to serve yet).
+                // Context length is reported for running engines; 0 for
+                // not-yet-loaded models (honest: it's not known until the
+                // engine starts).
                 Ok(models
                     .into_iter()
                     .filter_map(|m| match m.status {
@@ -491,7 +497,15 @@ impl Inner {
                             completion_credits_per_token: 0.0,
                             request_credits: None,
                         }),
-                        _ => None,
+                        crate::local_models::LocalModelStatus::Available
+                        | crate::local_models::LocalModelStatus::Loading => Some(ModelInfo {
+                            id: m.id,
+                            context_length: 0,
+                            prompt_credits_per_token: 0.0,
+                            completion_credits_per_token: 0.0,
+                            request_credits: None,
+                        }),
+                        crate::local_models::LocalModelStatus::Downloading { .. } => None,
                     })
                     .collect())
             }

@@ -416,6 +416,7 @@ mod driver {
                     status: LocalModelStatus::Loaded {
                         port: 51_432,
                         context_tokens: 8192,
+                        pinned: false,
                     },
                     last_error: None,
                 },

@@ -264,9 +264,11 @@ impl SpaceView {
             .map(|s| s.default_model.clone())
             .unwrap_or_else(|| eidola_app_core::config::DEFAULT_MODEL.to_string());
 
-        // One group per backend. Engine-backed groups lead — a running
-        // engine on this machine outranks any catalog for immediacy: the
-        // managed local store, then each enabled llamacpp backend. The
+        // One group per backend. Engine-backed groups lead — models on this
+        // machine outrank any catalog for immediacy: the managed local
+        // store, then each enabled llamacpp backend, listing **every**
+        // on-disk model (a request against an unloaded one loads its engine
+        // on demand; the per-row info line says which are loaded). The
         // fetch-based catalogs (eidola, then openai backends) follow, each
         // carrying its own health so a dead server degrades to *its own*
         // retry footer while every other group stays selectable — the panel
@@ -276,18 +278,18 @@ impl SpaceView {
         let mut engine_groups: Vec<(String, String, Vec<eidola_app_core::LocalModelInfo>)> =
             Vec::new();
         if backends_store.is_enabled(eidola_app_core::LOCAL_BACKEND_ID) {
-            let loaded = local_store.loaded_models();
-            if !loaded.is_empty() {
-                engine_groups.push(("local".into(), "On this device".into(), loaded));
+            let selectable = local_store.selectable_models();
+            if !selectable.is_empty() {
+                engine_groups.push(("local".into(), "On this device".into(), selectable));
             }
         }
         for ext in local_store.external() {
             if !ext.enabled {
                 continue;
             }
-            let loaded = local_store.external_loaded_models(&ext.backend_id);
-            if !loaded.is_empty() {
-                engine_groups.push((ext.backend_id.clone(), ext.display_name.clone(), loaded));
+            let selectable = local_store.external_selectable_models(&ext.backend_id);
+            if !selectable.is_empty() {
+                engine_groups.push((ext.backend_id.clone(), ext.display_name.clone(), selectable));
             }
         }
         let catalogs: Vec<crate::stores::BackendCatalog> =
@@ -329,25 +331,27 @@ impl SpaceView {
 
         let mut first_group = true;
 
-        // Engine-backed groups: loaded engines only, selectable always.
+        // Engine-backed groups: every on-disk model, its load state told
+        // honestly in the info line.
         for (backend_id, header, models) in &engine_groups {
             panel = panel.child(group_header(header.clone(), !first_group, cx));
             first_group = false;
             for (idx, model) in models.iter().enumerate() {
                 let probe_name = format!("space/request-panel/engine/{backend_id}/{idx}");
-                let ctx_tokens = match model.status {
-                    eidola_app_core::LocalModelStatus::Loaded { context_tokens, .. } => {
-                        context_tokens
+                let info = match model.status {
+                    eidola_app_core::LocalModelStatus::Loaded {
+                        context_tokens,
+                        pinned,
+                        ..
+                    } => format!(
+                        "loaded{} · {}-token context · no charge",
+                        if pinned { " · pinned" } else { "" },
+                        format_credits(context_tokens as i64)
+                    ),
+                    eidola_app_core::LocalModelStatus::Loading => {
+                        "starting engine… · no charge".to_string()
                     }
-                    _ => 0,
-                };
-                let info = if ctx_tokens > 0 {
-                    format!(
-                        "on this device · {}-token context · no charge",
-                        format_credits(ctx_tokens as i64)
-                    )
-                } else {
-                    "on this device · no charge".to_string()
+                    _ => "loads on request · no charge".to_string(),
                 };
                 panel = panel.child(self.panel_model_row(
                     probe_name,

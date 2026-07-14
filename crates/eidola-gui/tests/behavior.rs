@@ -901,6 +901,7 @@ fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext
                 status: eidola_app_core::LocalModelStatus::Loaded {
                     port: 4242,
                     context_tokens: 8192,
+                    pinned: false,
                 },
                 last_error: None,
             }],
@@ -922,6 +923,43 @@ fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext
         assert_eq!(s.models().len(), 1);
         assert_eq!(s.loaded_models().len(), 1);
         assert_eq!(s.loaded_models()[0].id, "tiny@local");
+    });
+}
+
+#[gpui::test]
+fn local_models_store_pin_op_is_stub_safe(cx: &mut TestAppContext) {
+    // The pin/unpin op follows the standard thin-initiating-call shape:
+    // with stub stores it clears the standing error and stops at the
+    // backend guard — no phantom state, no panic.
+    let stores = stub_stores(cx, |s| {
+        s.local_models = Some(eidola_app_core::LocalModelsState {
+            engine_path: None,
+            external: Vec::new(),
+            models: vec![eidola_app_core::LocalModelInfo {
+                id: "tiny@local".into(),
+                slug: "tiny".into(),
+                display_name: "Tiny".into(),
+                file_name: "tiny.gguf".into(),
+                size_bytes: Some(1_000_000_000),
+                source_url: None,
+                status: eidola_app_core::LocalModelStatus::Loaded {
+                    port: 4242,
+                    context_tokens: 8192,
+                    pinned: false,
+                },
+                last_error: None,
+            }],
+        });
+    });
+    stores.local_models.update(cx, |s, cx| {
+        s.set_pinned("tiny@local".into(), true, cx);
+    });
+    cx.run_until_parked();
+    stores.local_models.read_with(cx, |s, _| {
+        assert!(s.op_error().is_none(), "stub ops must not surface errors");
+        // The fixture snapshot is untouched (no backend, no refresh) —
+        // the real pin lands via Change::LocalModels in production.
+        assert_eq!(s.selectable_models().len(), 1);
     });
 }
 

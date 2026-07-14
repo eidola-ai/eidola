@@ -187,6 +187,17 @@ enum ModelCommand {
         /// Model id (`<slug>@<backend>`) or bare slug (the local store)
         id: String,
     },
+    /// Pin a loaded model: protect it from automatic (LRU) unloading when
+    /// another model needs the memory
+    Pin {
+        /// Model id (`<slug>@<backend>`) or bare slug (the local store)
+        id: String,
+    },
+    /// Unpin a loaded model
+    Unpin {
+        /// Model id (`<slug>@<backend>`) or bare slug (the local store)
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -578,36 +589,17 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             // default).
             let model = model.unwrap_or_else(|| core.config_state().default_model);
 
-            // Engine-served models (the managed `local` store and llamacpp
-            // backends) run on an engine owned by *this* process (a `model
-            // load` in another CLI invocation died with it), so such a chat
-            // auto-loads its engine for the duration of the run.
+            // Engine-served models load on demand inside the request path
+            // (app-core evicts LRU idle engines to make room); this block
+            // only narrates the potentially-long first-load wait. Engines
+            // are owned by *this* process, so they die with the run.
             let mref = eidola_app_core::parse_model_ref(&model);
             let engine_backed = mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID
                 || core.list_backends().await?.iter().any(|b| {
                     b.id == mref.backend_id && b.kind == eidola_app_core::BackendKind::LlamaCpp
                 });
             if engine_backed {
-                let state = core.local_models_state().await?;
-                let in_backend: Vec<&eidola_app_core::LocalModelInfo> =
-                    if mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID {
-                        state.models.iter().collect()
-                    } else {
-                        state
-                            .external
-                            .iter()
-                            .find(|b| b.backend_id == mref.backend_id)
-                            .map(|b| b.models.iter().collect())
-                            .unwrap_or_default()
-                    };
-                let loaded = in_backend.iter().any(|m| {
-                    m.id == model
-                        && matches!(m.status, eidola_app_core::LocalModelStatus::Loaded { .. })
-                });
-                if !loaded {
-                    eprintln!("loading {model}…");
-                    core.load_local_model(model.clone()).await?;
-                }
+                eprintln!("loading {model}… (a request loads the engine on demand)");
             }
 
             // Stream chunks straight to stdout. Reasoning goes to stderr
@@ -731,8 +723,11 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                             }
                             eidola_app_core::LocalModelStatus::Available => "available".into(),
                             eidola_app_core::LocalModelStatus::Loading => "loading".into(),
-                            eidola_app_core::LocalModelStatus::Loaded { port, .. } => {
-                                format!("loaded (127.0.0.1:{port})")
+                            eidola_app_core::LocalModelStatus::Loaded { port, pinned, .. } => {
+                                format!(
+                                    "loaded (127.0.0.1:{port}{})",
+                                    if *pinned { ", pinned" } else { "" }
+                                )
                             }
                         };
                         println!(
@@ -853,6 +848,16 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             ModelCommand::Unload { id } => {
                 core.unload_local_model(id.clone()).await?;
                 println!("unloaded {id}");
+                Ok(())
+            }
+            ModelCommand::Pin { id } => {
+                core.set_local_model_pinned(id.clone(), true).await?;
+                println!("pinned {id} — protected from automatic unloading");
+                Ok(())
+            }
+            ModelCommand::Unpin { id } => {
+                core.set_local_model_pinned(id.clone(), false).await?;
+                println!("unpinned {id}");
                 Ok(())
             }
         },

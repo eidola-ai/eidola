@@ -109,7 +109,7 @@ cargo run -p eidola-cli -- model download gemma-4-e2b   # or any .gguf / Hugging
 cargo run -p eidola-cli -- chat "hello" --model gemma-4-E2B_q4_0-it@local
 ```
 
-Local models are identified as `<file-stem>@local` — the same `<model>@<backend>` form every configured backend uses — and stored under the app data directory (`~/Library/Application Support/eidola/models/` on macOS). In the GUI, **Settings → Backends** manages downloads and engine load/unload, and loaded models appear at the top of the model picker under "On this device".
+Local models are identified as `<file-stem>@local` — the same `<model>@<backend>` form every configured backend uses — and stored under the app data directory (`~/Library/Application Support/eidola/models/` on macOS). Every downloaded model is selectable; **a request loads its engine on demand**, evicting least-recently-used idle engines when memory runs short (pin a loaded model in **Settings → Backends** — or `eidola model pin` — to protect it from automatic unloading). The model picker's "On this device" group shows each model's load state.
 
 ### Backends
 

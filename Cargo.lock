@@ -2640,6 +2640,7 @@ dependencies = [
  "eidola-common",
  "futures-util",
  "hex",
+ "libc",
  "p256",
  "p384",
  "rand_core 0.6.4",

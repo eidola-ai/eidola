@@ -322,9 +322,13 @@ impl BackendsSettingsView {
             },
             LocalModelStatus::Available => ("downloaded".into(), None),
             LocalModelStatus::Loading => ("starting engine…".into(), None),
-            LocalModelStatus::Loaded { port, .. } => {
-                (format!("loaded — serving on 127.0.0.1:{port}"), None)
-            }
+            LocalModelStatus::Loaded { port, pinned, .. } => (
+                format!(
+                    "loaded — serving on 127.0.0.1:{port}{}",
+                    if *pinned { " · pinned" } else { "" }
+                ),
+                None,
+            ),
         };
 
         let mut verbs = h_flex().gap_3().flex_none();
@@ -385,7 +389,32 @@ impl BackendsSettingsView {
                 }
             }
             LocalModelStatus::Loading => {}
-            LocalModelStatus::Loaded { .. } => {
+            LocalModelStatus::Loaded { pinned, .. } => {
+                // Pin protects the engine from *automatic* (LRU) unloading
+                // when another model needs the memory; the manual Unload
+                // verb stays available either way.
+                let pinned = *pinned;
+                let id_p = id.clone();
+                verbs = verbs.child(
+                    quiet_verb(
+                        SharedString::from(format!("model-pin-{id}")),
+                        if pinned { "Unpin" } else { "Pin" },
+                        cx,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.local_models
+                            .update(cx, |s, cx| s.set_pinned(id_p.clone(), !pinned, cx));
+                    }))
+                    .probe(
+                        format!("{probe_prefix}/{idx}/pin"),
+                        gpui::Role::Button,
+                        format!(
+                            "{} {}",
+                            if pinned { "Unpin" } else { "Pin" },
+                            model.display_name
+                        ),
+                    ),
+                );
                 let id_u = id.clone();
                 verbs = verbs.child(
                     quiet_verb(
