@@ -927,6 +927,76 @@ fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn space_model_display_splits_name_and_backend(cx: &mut TestAppContext) {
+    // The gutter/chip display pair: human model name over backend name.
+    let stores = stub_stores(cx, |s| {
+        s.backends = vec![
+            eidola_app_core::BackendInfo {
+                id: "local".into(),
+                kind: eidola_app_core::BackendKind::Local,
+                display_name: "Local".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                created_at: 0,
+            },
+            eidola_app_core::BackendInfo {
+                id: "my-vllm".into(),
+                kind: eidola_app_core::BackendKind::OpenAi,
+                display_name: "My vLLM box".into(),
+                enabled: true,
+                base_url: Some("http://x".into()),
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                created_at: 1,
+            },
+        ];
+        s.local_models = Some(eidola_app_core::LocalModelsState {
+            engine_path: None,
+            external: Vec::new(),
+            models: vec![eidola_app_core::LocalModelInfo {
+                id: "gemma-4-E2B_q4_0-it@local".into(),
+                slug: "gemma-4-E2B_q4_0-it".into(),
+                display_name: "Gemma 4 E2B".into(),
+                file_name: "gemma-4-E2B_q4_0-it.gguf".into(),
+                size_bytes: Some(3_349_514_112),
+                source_url: None,
+                status: eidola_app_core::LocalModelStatus::Available,
+                last_error: None,
+            }],
+        });
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, None, WindowInput::new(cx), window, cx))
+    });
+
+    view.read_with(cx, |v, cx| {
+        // An engine model resolves to its sidecar display name + "Local".
+        assert_eq!(
+            v.model_display("gemma-4-E2B_q4_0-it@local", cx),
+            ("Gemma 4 E2B".into(), "Local".into())
+        );
+        // A catalog model keeps its wire id as the name; backend resolves.
+        assert_eq!(
+            v.model_display("gemma4-31b", cx),
+            ("gemma4-31b".into(), "Eidola".into())
+        );
+        assert_eq!(
+            v.model_display("qwen3-8b@my-vllm", cx),
+            ("qwen3-8b".into(), "My vLLM box".into())
+        );
+        // An unknown/deleted engine model falls back to its raw parts.
+        assert_eq!(
+            v.model_display("gone@local", cx),
+            ("gone".into(), "Local".into())
+        );
+    });
+}
+
+#[gpui::test]
 fn local_models_store_pin_op_is_stub_safe(cx: &mut TestAppContext) {
     // The pin/unpin op follows the standard thin-initiating-call shape:
     // with stub stores it clears the standing error and stops at the

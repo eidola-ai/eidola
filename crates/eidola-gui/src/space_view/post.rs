@@ -61,24 +61,35 @@ impl SpaceView {
         let bw = px(body_width(page_width));
         let editing_this = self.editing.as_ref().map(|e| &e.node_id) == Some(&node.id);
 
-        let (byline, time, body): (SharedString, SharedString, AnyElement) = match node.src {
+        let (byline, byline_backend, time, body): (
+            SharedString,
+            Option<SharedString>,
+            SharedString,
+            AnyElement,
+        ) = match node.src {
             NodeSrc::Msg(i) => {
                 let post = &self.posts[i];
                 (
                     post.byline.clone(),
+                    post.byline_backend.clone(),
                     post.time.clone(),
                     self.render_post_body(i, node, bw, editing_this, cx),
                 )
             }
             NodeSrc::Streaming => {
-                let byline = self
-                    .space
-                    .read(cx)
-                    .last_submitted_model()
-                    .map(SharedString::from)
-                    .unwrap_or_else(|| SharedString::from("Eidola"));
+                // The in-flight turn's byline resolves live (the snapshot
+                // only carries persisted rows): the human model name over
+                // its backend, same as a finished post.
+                let (byline, byline_backend) = match self.space.read(cx).last_submitted_model() {
+                    Some(model) => {
+                        let (name, backend) = self.model_display(model, cx);
+                        (name, Some(backend))
+                    }
+                    None => (SharedString::from("Eidola"), None),
+                };
                 (
                     byline,
+                    byline_backend,
                     SharedString::from("now"),
                     self.render_streaming_body(bw, cx),
                 )
@@ -86,12 +97,25 @@ impl SpaceView {
             // Draft never reaches here (it renders an in-flow slot placeholder).
             NodeSrc::Draft => (
                 SharedString::default(),
+                None,
                 SharedString::default(),
                 div().into_any_element(),
             ),
         };
 
-        let byline_el = byline_gutter(byline, theme.foreground, None).child(
+        // The gutter stack: author (bold), the serving backend (quiet,
+        // assistant rows only — suppressed when it would just repeat the
+        // author line), then the time.
+        let mut byline_el = byline_gutter(byline.clone(), theme.foreground, None);
+        if let Some(backend) = byline_backend.filter(|b| *b != byline) {
+            byline_el = byline_el.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(backend),
+            );
+        }
+        let byline_el = byline_el.child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)

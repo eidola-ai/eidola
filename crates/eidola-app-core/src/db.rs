@@ -68,7 +68,7 @@ async fn ensure_default_backends(conn: &Connection) -> Result<(), AppError> {
     .map_err(AppError::db)?;
     conn.execute(
         "INSERT OR IGNORE INTO backend (id, kind, display_name, enabled, created_at, updated_at) \
-         VALUES ('local', 'local', 'On this device', 1, ?1, ?1)",
+         VALUES ('local', 'local', 'Local', 1, ?1, ?1)",
         (Value::Integer(now),),
     )
     .await

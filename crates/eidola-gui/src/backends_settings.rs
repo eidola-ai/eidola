@@ -5,7 +5,7 @@
 //!
 //! - **Eidola** — the confidential service. Enable/disable only (disabling
 //!   is the "no account, on-device only" configuration).
-//! - **On this device** — the managed local store: the **engine** line
+//! - **Local** — the managed local store: the **engine** line
 //!   (resolved `llama-server` path, or an install hint), the installed
 //!   models (status + per-state verbs: load / unload / cancel / delete,
 //!   with download progress and honest inline errors), the curated

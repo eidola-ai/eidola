@@ -186,28 +186,39 @@ impl SpaceView {
             );
         }
 
-        // The addressee — who the ask goes to. Mirrors the time line under the
-        // byline (text_xs, muted); opens the request panel.
+        // The addressee — who the ask goes to. Mirrors the byline's display
+        // pair: the model's human name over its backend's name (text_xs,
+        // muted); opens the request panel.
         let model = self.current_model(cx);
+        let (model_name, backend_name) = self.model_display(&model, cx);
         col = col.child(
             h_flex()
                 .id("space-model-chip")
                 .probe(
                     "space/composer/model",
                     gpui::Role::Button,
-                    SharedString::from(format!("Model: {model}")),
+                    SharedString::from(format!("Model: {model_name}, via {backend_name}")),
                 )
                 .px_1()
                 .ml_neg_1()
                 .mt_0p5()
                 .rounded_md()
                 .cursor_pointer()
-                .items_baseline()
+                .items_start()
                 .gap_1()
                 .text_xs()
                 .text_color(fg)
                 .hover(move |s| s.text_color(fg_hover).bg(bg_hover))
-                .child(SharedString::from(model))
+                .child(
+                    v_flex()
+                        .items_start()
+                        .child(model_name.clone())
+                        // Suppressed when it would just repeat the name
+                        // (mirrors the gutter's rule).
+                        .when(backend_name != model_name, |d| {
+                            d.child(div().text_color(hint_fg).child(backend_name))
+                        }),
+                )
                 .child(div().text_color(hint_fg).child(if self.request_panel_open {
                     "⌃"
                 } else {
@@ -280,7 +291,11 @@ impl SpaceView {
         if backends_store.is_enabled(eidola_app_core::LOCAL_BACKEND_ID) {
             let selectable = local_store.selectable_models();
             if !selectable.is_empty() {
-                engine_groups.push(("local".into(), "On this device".into(), selectable));
+                let header = backends_store
+                    .get(eidola_app_core::LOCAL_BACKEND_ID)
+                    .map(|b| b.display_name.clone())
+                    .unwrap_or_else(|| "Local".into());
+                engine_groups.push(("local".into(), header, selectable));
             }
         }
         for ext in local_store.external() {
@@ -317,6 +332,7 @@ impl SpaceView {
             // Honest note when nothing is selectable yet — say what a send
             // will actually use. Rendered inline (no early return) so any
             // catalog footers below stay actionable.
+            let (name, backend) = self.model_display(&current, cx);
             panel = panel.child(
                 div()
                     .px_3()
@@ -324,7 +340,7 @@ impl SpaceView {
                     .text_sm()
                     .text_color(theme.muted_foreground)
                     .child(SharedString::from(format!(
-                        "Model list unavailable — asks use {current}."
+                        "Model list unavailable — asks use {name} (via {backend})."
                     ))),
             );
         }
@@ -480,8 +496,10 @@ impl SpaceView {
 
         if current != default_model {
             // Quiet, secondary: persist this space's model as the config
-            // default. Only offered when it would change anything.
-            let label = format!("Set {current} as default");
+            // default. Only offered when it would change anything. Displays
+            // the human name; the persisted value stays the selection id.
+            let (name, _) = self.model_display(&current, cx);
+            let label = format!("Set {name} as default");
             panel = panel.child(
                 div()
                     .id("space-set-default-model")

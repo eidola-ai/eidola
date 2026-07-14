@@ -362,7 +362,7 @@ mod driver {
             BackendInfo {
                 id: "local".into(),
                 kind: BackendKind::Local,
-                display_name: "On this device".into(),
+                display_name: "Local".into(),
                 enabled: true,
                 base_url: None,
                 has_api_key: false,
