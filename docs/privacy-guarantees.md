@@ -28,7 +28,7 @@ These invariants describe what you get when you install and run an attested, **g
 
 **2.2.** **[S]** *Redemption ↔ redemption.* ACTs presented across different requests are cryptographically unlinkable to each other. The server cannot answer "which inference requests came from the same account."
 
-**2.3.** **[S]** The anonymity set for a given token is the set of accounts that received at least one token under the same `(issuer_key, domain_separator)` during the issuer key's issuance window. Issuance and key-rotation policies are tuned to keep this set as sufficiently large. (See [server.md](server.md#anonymity-set).)
+**2.3.** **[S]** The anonymity set for a given token is the set of accounts that received at least one token under the same `(issuer_key, domain_separator)` during the issuer key's issuance window. Issuance and key-rotation policies are tuned to keep this set sufficiently large. (See [server.md](server.md#anonymity-set).)
 
 **2.4.** **[S]** Issuance and redemption are temporally decoupled: tokens remain redeemable across an acceptance window that extends beyond their issuance window, so the issuance timestamp on the linked surface and the redemption timestamp on the unlinked surface are not forced to be near-equal.
 
@@ -54,7 +54,7 @@ These invariants describe what you get when you install and run an attested, **g
 
 **4.2.** **[S]** The client re-verifies the server's hardware attestation on every new TCP+TLS handshake. There is no "verified once" cache; policy changes (TCB floor, allowed measurements) take effect on the next handshake. (See [client.md](client.md#per-handshake-attestation-no-caching).)
 
-**4.3.** **[S]** The attestation report's is checked to match the expected peer cert. The inline attestation rides the *same* TCP+TLS connection as the subsequent application request, so attestation and request share one HTTP lifecycle and the LB-routed backend that served the attestation is the one that serves the request.
+**4.3.** **[S]** The attestation report is bound to the expected peer cert (its `REPORT_DATA` commits to `sha256(SPKI(peer_cert))`). The inline attestation rides the *same* TCP+TLS connection as the subsequent application request, so attestation and request share one HTTP lifecycle and the load-balancer-routed backend that served the attestation is the one that serves the request.
 
 **4.4.** **[S]** A TCB policy floor is enforced on every attestation. Measurements outside `ALLOWED_MEASUREMENTS` are rejected.
 
@@ -70,7 +70,7 @@ These invariants describe what you get when you install and run an attested, **g
 
 **5.2.** **[S]** The full server runtime configuration — image digest, argument list, environment variable schema, and hashes of all measured secrets — lives in `tinfoil-config.yml` and is therefore bound into the measurement via §5.1. Configuration changes are release events.
 
-**5.3.** **[S]** Secrets that allow access to persisted state inside the enclave (`CREDENTIAL_MASTER_KEY`, `DATABASE_PASSWORD`) are injected as Tinfoil secrets bound to the enclave measurement. A different measurement cannot retrieve them; the server image itsle has no intrinsic ability to access its own persisted state outside the attested boot path.
+**5.3.** **[S]** Secrets that allow access to persisted state inside the enclave (`CREDENTIAL_MASTER_KEY`, `DATABASE_PASSWORD`) are injected as Tinfoil secrets bound to the enclave measurement. A different measurement cannot retrieve them; the server image itself has no intrinsic ability to access its own persisted state outside the attested boot path.
 
 **5.4.** **[S]** The Eidola server resolves the upstream inference enclave-measurement set at runtime from the provider's latest release, verifying its Sigstore provenance (Fulcio chain + Rekor, against the expected repository identity and exact release tag) before trusting it. It refuses to connect to — or start against — any enclave whose measurement it has not resolved and verified this way. (See [upstream.md](upstream.md#what-pins-the-upstream-measurement).)
 

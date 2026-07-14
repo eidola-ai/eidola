@@ -16,7 +16,9 @@ A given client binary trusts **exactly one server build**. The trust root — th
 
 The client is also designed to **fail safe**: if anything in the verification chain cannot be confirmed, the connection is refused rather than downgraded. There is no quiet fallback to an unverified path.
 
-Your app's data — chat history, drafts, accounts — lives on your device. When data is sent for remote processing, it is bound to the exact code that produced your app, which cannot be changed even by us or our infrastructure operators. It remains impossible for anyone but you to view or save this content.
+Your app's data — chat history, drafts, accounts — lives on your device. When a request does need remote computation, it is sent only to confidential-compute enclaves, with TLS terminated inside the enclave so that no host, operator, or network observer — us included — can read it in transit, and no system writes it to storage or logs.
+
+The most meaningful limitation today is provenance. The models themselves run in enclaves fully managed by our upstream provider (Tinfoil). These make the same confidentiality promises as the rest of Eidola, but are held to a category-weaker discipline than our own: they are not yet reproducible and human-attested to the same standard, and their exact version is not pinned transitively from your client the way Eidola's server is. Eidola verifies the upstream's hardware attestation on every connection, but does not yet re-derive or pin the code running inside it. Hosting inference ourselves — on the same reproducible, human-attested, client-pinned footing as the rest of Eidola — is the intended resolution; it waits on enough real usage to justify the GPU cost. The full picture is in the [threat model](threat-model.md), [inference upstream](upstream.md), and [known gaps](gaps.md).
 
 ## 2. Code is the trust boundary, not policy
 

@@ -37,8 +37,8 @@ use crate::space_view::{TITLE_BAR_RESERVE, prose_style};
 
 /// External links referenced by the slides.
 const REPO_URL: &str = "https://github.com/eidola-ai/eidola";
-const TERMS_URL: &str = "https://www.eidola.ai/legal/terms-of-use";
-const PRIVACY_URL: &str = "https://www.eidola.ai/legal/privacy-policy";
+const TERMS_URL: &str = "https://www.eidola.ai/terms/";
+const PRIVACY_URL: &str = "https://www.eidola.ai/privacy/";
 
 /// The reading column width for slide content (left-aligned prose, like a post).
 const COLUMN_WIDTH: Pixels = px(560.);
@@ -107,17 +107,21 @@ impl RenderOnce for Tool {
 
 // -- Control ---------------------------------------------------------------
 
-/// "Your control" — nobody but you can see or update it. Links to the repo.
+/// "Your control" — no operator can read, retain, or change it. Links to the repo.
 #[derive(IntoElement)]
 pub(super) struct Control {
     pub on_advance: OnClick,
 }
 
 impl Control {
-    const MARKDOWN: &'static str = "## *Your* control\n\nNobody but you can:\n\n- See, evaluate, or track the content of \
-         your interactions.\n- Update the version of Eidola running on your device or in a \
-         datacenter.\n\nDon't trust our claims; verify them. If you don't know how to \
-         evaluate our code and architecture, **request the opinion of the most technical \
+    const MARKDOWN: &'static str = "## *Your* control\n\nNo one but you — not us, not the operators who run the \
+         hardware — can:\n\n- Read, retain, or profile your interactions. Your data is \
+         decrypted only inside sealed, hardware-attested enclaves that keep nothing, and \
+         the side of Eidola that handles payment is cryptographically separated from the \
+         side that serves your requests.\n- Change the version of Eidola you run — on your \
+         device or on the server it answers from. A new build isn't trusted until your \
+         client verifies it.\n\nDon't trust our claims; verify them. If you don't know how \
+         to evaluate our code and architecture, **request the opinion of the most technical \
          person you already trust**.";
 }
 
@@ -180,8 +184,9 @@ pub(super) struct GetStarted {
 }
 
 impl GetStarted {
-    const MARKDOWN: &'static str = "## Get started\n\nYou'll need some credits to process queries.\n\nManaging your balance \
-         is the only time we see your identity, and [we are structurally unable to associate your queries with your account](https://github.com/eidola-ai/eidola/blob/main/docs/privacy-guarantees.md#1-identity-and-authorization).";
+    const MARKDOWN: &'static str = "## Get started\n\nYou'll need some credits to run models.\n\nYour account is just a \
+         random id — buying credit is the only step that touches a payment method, and even \
+         then [we are structurally unable to link your requests back to it](https://www.eidola.ai/docs/privacy-guarantees/#2-unlinkability).";
 }
 
 impl RenderOnce for GetStarted {
@@ -227,15 +232,15 @@ pub(super) struct CreateAccount {
 }
 
 impl CreateAccount {
-    const MARKDOWN: &'static str = "## Create an account\n\nPlease read and understand our terms of use and privacy \
-         policy.";
+    const MARKDOWN: &'static str = "## Create an account\n\nPlease read and understand our Terms of Service and Privacy \
+         Policy.";
 }
 
 impl RenderOnce for CreateAccount {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let extras = v_flex()
             .gap_3()
-            .child(link_row("Terms of Use", TERMS_URL, cx))
+            .child(link_row("Terms of Service", TERMS_URL, cx))
             .child(link_row("Privacy Policy", PRIVACY_URL, cx))
             .child(
                 // Required consent — the "Create a new account." button
@@ -246,11 +251,11 @@ impl RenderOnce for CreateAccount {
                     .probe(
                         "onboarding/agree",
                         Role::CheckBox,
-                        "I agree to the Terms of Use and Privacy policy.",
+                        "I agree to the Terms of Service and Privacy Policy.",
                     )
                     .child(
                         Checkbox::new("onboarding-agree-box")
-                            .label("I agree to the Terms of Use and Privacy policy.")
+                            .label("I agree to the Terms of Service and Privacy Policy.")
                             .checked(self.agreed)
                             .on_click(self.on_toggle_agree)
                             .p_1(),

@@ -68,7 +68,7 @@ pub enum Slide {
     Pause,
     /// "Eidola is your tool" — the CD-era sovereignty analogy.
     Tool,
-    /// "Your control" — nobody but you can see or update it.
+    /// "Your control" — no operator can read, retain, or change it.
     Control,
     /// "Your responsibility" — models are fallible; effects are yours.
     Responsibility,
