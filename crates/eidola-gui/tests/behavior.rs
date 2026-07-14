@@ -875,11 +875,39 @@ fn settings_nav_switches_panes(cx: &mut TestAppContext) {
     view.update(cx, |v, cx| v.select(SettingsPane::Wallet, cx));
     view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Wallet));
 
-    view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
-    view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Account));
-
     view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
     view.read_with(cx, |v, _| assert_eq!(v.selected(), SettingsPane::Backends));
+}
+
+#[gpui::test]
+fn settings_backends_tabs_switch(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::BackendsTab;
+
+    // The Backends pane's internal tab strip is view-local state. Account
+    // moved from a top-level pane into the Eidola tab, so the three tabs
+    // (Eidola · Local · External) are how you reach each surface.
+    let stores = stub_stores_with_config(cx);
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+
+    // Eidola is the resting tab (it hosts the account).
+    pane.read_with(cx, |p, _| assert_eq!(p.tab(), BackendsTab::Eidola));
+
+    pane.update(cx, |p, cx| p.select_tab(BackendsTab::Local, cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.tab(), BackendsTab::Local));
+
+    pane.update(cx, |p, cx| p.select_tab(BackendsTab::External, cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.tab(), BackendsTab::External));
+
+    pane.update(cx, |p, cx| p.select_tab(BackendsTab::Eidola, cx));
+    pane.read_with(cx, |p, _| assert_eq!(p.tab(), BackendsTab::Eidola));
+
+    // The embedded Account view is reachable through the pane (its reset
+    // flow is now hosted in the Eidola tab).
+    let account = pane.read_with(cx, |p, _| p.account());
+    account.read_with(cx, |a, _| assert!(!a.reset_armed()));
 }
 
 #[gpui::test]
@@ -1091,6 +1119,40 @@ fn settings_backends_pane_add_form_and_toggle(cx: &mut TestAppContext) {
     pane.update(cx, |p, cx| p.toggle_backend("eidola".into(), false, cx));
     stores.backends.read_with(cx, |b, _| {
         assert!(!b.is_enabled("eidola"), "optimistic flip must be visible");
+        assert!(b.op_error().is_none(), "stub ops must not surface errors");
+    });
+}
+
+#[gpui::test]
+fn settings_backends_pane_auto_start_toggle(cx: &mut TestAppContext) {
+    // A llamacpp backend's auto-start toggle flips the cached row optimistically
+    // and stops at the stub backend guard (no phantom op-error).
+    let stores = stub_stores(cx, |s| {
+        s.backends = vec![eidola_app_core::BackendInfo {
+            id: "my-box".into(),
+            kind: eidola_app_core::BackendKind::LlamaCpp,
+            display_name: "My box".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: Some("/Users/me/models".into()),
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        }];
+    });
+    let (_window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+
+    pane.update(cx, |p, cx| p.set_auto_start("my-box".into(), false, cx));
+    stores.backends.read_with(cx, |b, _| {
+        assert!(
+            !b.get("my-box").unwrap().auto_start,
+            "optimistic auto-start flip must be visible"
+        );
         assert!(b.op_error().is_none(), "stub ops must not surface errors");
     });
 }

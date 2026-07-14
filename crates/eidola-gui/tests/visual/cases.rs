@@ -13,6 +13,7 @@ use eidola_app_core::{
     SpaceInfo, SpendTrailEntry,
 };
 use eidola_gui::about::AboutView;
+use eidola_gui::backends_settings::BackendsTab;
 use eidola_gui::library::LibraryView;
 use eidola_gui::onboarding::OnboardingView;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
@@ -521,6 +522,134 @@ fn settings_stores(cx: &mut App) -> Stores {
     })
 }
 
+/// `settings_stores` plus a populated backend registry and local-model
+/// state, so the Backends pane's three tabs render with content.
+fn settings_backends_stores(cx: &mut App) -> Stores {
+    use eidola_app_core::{
+        BackendInfo, BackendKind, ExternalEngineBackend, LocalModelInfo, LocalModelStatus,
+        LocalModelsState,
+    };
+    stub_stores(cx, |s| {
+        s.config_state = Some(stub_config_state(true));
+        s.balances = Some(BalancesResult {
+            available: 4_200_000,
+            pools: vec![BalancePoolInfo {
+                amount: 4_200_000,
+                source: "subscription".into(),
+                expires_at: Some(eidola_app_core::now_ms() + 23 * 24 * 60 * 60 * 1000),
+            }],
+        });
+        s.prices = vec![
+            PriceInfo {
+                id: "price_starter".into(),
+                product_name: "Starter".into(),
+                product_description: Some("A month of casual questions".into()),
+                amount_display: "5.00 USD".into(),
+                recurrence: "/month".into(),
+                credits: 5_000_000,
+            },
+            PriceInfo {
+                id: "price_standard".into(),
+                product_name: "Standard".into(),
+                product_description: Some("Daily thinking, long documents".into()),
+                amount_display: "20.00 USD".into(),
+                recurrence: "/month".into(),
+                credits: 20_000_000,
+            },
+        ];
+        s.backends = vec![
+            BackendInfo {
+                id: "eidola".into(),
+                kind: BackendKind::Eidola,
+                display_name: "Eidola".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+                created_at: 0,
+            },
+            BackendInfo {
+                id: "local".into(),
+                kind: BackendKind::Local,
+                display_name: "Local".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+                created_at: 0,
+            },
+            BackendInfo {
+                id: "my-box".into(),
+                kind: BackendKind::LlamaCpp,
+                display_name: "My box".into(),
+                enabled: true,
+                base_url: None,
+                has_api_key: false,
+                models_dir: Some("/Users/me/models".into()),
+                model_overrides: None,
+                engine_path: None,
+                auto_start: false,
+                created_at: 1,
+            },
+        ];
+        s.local_models = Some(LocalModelsState {
+            engine_path: Some(
+                "/Applications/Eidola.app/Contents/Resources/bin/llama-server".into(),
+            ),
+            external: vec![ExternalEngineBackend {
+                backend_id: "my-box".into(),
+                display_name: "My box".into(),
+                enabled: true,
+                models_dir: "/Users/me/models".into(),
+                engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+                auto_start: false,
+                models: vec![LocalModelInfo {
+                    id: "qwen3-8b@my-box".into(),
+                    slug: "qwen3-8b".into(),
+                    display_name: "Qwen3 8B".into(),
+                    file_name: "qwen3-8b.gguf".into(),
+                    size_bytes: Some(5_200_000_000),
+                    source_url: None,
+                    status: LocalModelStatus::Available,
+                    last_error: None,
+                }],
+            }],
+            models: vec![
+                LocalModelInfo {
+                    id: "gemma-4-E2B_q4_0-it@local".into(),
+                    slug: "gemma-4-E2B_q4_0-it".into(),
+                    display_name: "Gemma 4 E2B".into(),
+                    file_name: "gemma-4-E2B_q4_0-it.gguf".into(),
+                    size_bytes: Some(3_349_514_112),
+                    source_url: None,
+                    status: LocalModelStatus::Available,
+                    last_error: None,
+                },
+                LocalModelInfo {
+                    id: "gemma-4-E4B_q4_0-it@local".into(),
+                    slug: "gemma-4-E4B_q4_0-it".into(),
+                    display_name: "Gemma 4 E4B".into(),
+                    file_name: "gemma-4-E4B_q4_0-it.gguf".into(),
+                    size_bytes: Some(5_000_000_000),
+                    source_url: None,
+                    status: LocalModelStatus::Loaded {
+                        port: 4242,
+                        context_tokens: 8192,
+                        pinned: true,
+                    },
+                    last_error: None,
+                },
+            ],
+        });
+    })
+}
+
 fn register_settings(s: &mut Snapshots) {
     let settings_size = size(px(620.), px(520.));
 
@@ -555,27 +684,38 @@ fn register_settings(s: &mut Snapshots) {
         view
     });
 
-    // Account pane: balance, pools with humanized expiry, plans.
-    s.add("settings_account", settings_size, |window, cx| {
-        let core = settings_stores(cx);
+    // Backends → Eidola: the singleton toggle plus the embedded account
+    // surface (balance, pools with humanized expiry, plans).
+    s.add("settings_backends_eidola", settings_size, |window, cx| {
+        let core = settings_backends_stores(cx);
         let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
-        view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+        let pane = view.read(cx).backends_pane();
+        pane.update(cx, |p, cx| p.select_tab(BackendsTab::Eidola, cx));
         view
     });
 
-    // Account pane with the reset confirm armed (step two of two).
-    s.add(
-        "settings_account_reset_confirm",
-        settings_size,
-        |window, cx| {
-            let core = settings_stores(cx);
-            let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
-            view.update(cx, |v, cx| v.select(SettingsPane::Account, cx));
-            let account = view.read(cx).account();
-            account.update(cx, |a, cx| a.request_reset(cx));
-            view
-        },
-    );
+    // Backends → Local: the managed store — engine line, installed models,
+    // catalog, paste-a-URL.
+    s.add("settings_backends_local", settings_size, |window, cx| {
+        let core = settings_backends_stores(cx);
+        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+        let pane = view.read(cx).backends_pane();
+        pane.update(cx, |p, cx| p.select_tab(BackendsTab::Local, cx));
+        view
+    });
+
+    // Backends → External: a llamacpp backend (engine line + auto-start +
+    // scanned models) and the add-a-backend affordances.
+    s.add("settings_backends_external", settings_size, |window, cx| {
+        let core = settings_backends_stores(cx);
+        let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+        let pane = view.read(cx).backends_pane();
+        pane.update(cx, |p, cx| p.select_tab(BackendsTab::External, cx));
+        view
+    });
 
     // Wallet pane: the four lifecycle states in one honest listing.
     s.add("settings_wallet", settings_size, |window, cx| {

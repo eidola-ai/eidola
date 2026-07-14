@@ -14,7 +14,6 @@ use eidola_app_core::{
     AttestationInfo, BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
     PriceInfo, RequestInfo, SpendTrailEntry,
 };
-use eidola_gui::account::AccountView;
 use eidola_gui::actions::ToggleModelPicker;
 use eidola_gui::general::GeneralView;
 use eidola_gui::library::LibraryView;
@@ -533,15 +532,23 @@ fn record_probes_cover_rows_tabs_and_chrome(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::BackendsSettingsView;
+
     let _guard = probes_on();
 
-    let stores = ready_stores(cx);
+    // Account is no longer a top-level pane — it's embedded in Backends →
+    // Eidola (the account *is* the eidola backend's configuration). Its
+    // `settings/account/*` probes must stay stable through the new host.
+    let stores = account_backends_stores(cx);
     let (window, _view) = open_view(cx, |window, cx| {
-        cx.new(|cx| AccountView::new(stores, window, cx))
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
     });
 
+    // The default (Eidola) tab hosts the account surface when eidola is
+    // enabled.
     let names = fresh_names(cx, window);
     for expected in [
+        "settings/backends/eidola/toggle",
         "settings/account/reset",
         "settings/account/refresh-balances",
         // The shared plans component, scoped to the Account host.
@@ -555,6 +562,54 @@ fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
     }
 
     probe::set_probes_enabled(false);
+}
+
+/// Stores with a linked account (balance + plans) *and* an eidola-enabled
+/// registry, so `BackendsSettingsView`'s Eidola tab renders the embedded
+/// account surface.
+fn account_backends_stores(cx: &mut TestAppContext) -> Stores {
+    stub_stores(cx, |s| {
+        s.config_state = Some(ConfigState {
+            base_url: "https://eidola.example/v1".into(),
+            default_model: "gemma4-31b".into(),
+            base_url_pin: "https://eidola.example/v1".into(),
+            base_url_is_override: false,
+            has_account: true,
+            has_account_secret: true,
+            domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
+            trusted_measurements: Vec::new(),
+            trusted_measurements_are_override: false,
+            has_hardware_root_ca: false,
+            has_hardware_intermediate_ca: false,
+            attestation_url: None,
+            appearance: eidola_app_core::config::AppearanceSetting::System,
+            time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
+            light_character: eidola_app_core::config::LightCharacter::Neutral,
+        });
+        s.balances = Some(BalancesResult {
+            available: 4_200_000,
+            pools: Vec::new(),
+        });
+        s.prices = vec![
+            PriceInfo {
+                id: "price_month".into(),
+                product_name: "Monthly".into(),
+                product_description: Some("Recurring top-up".into()),
+                amount_display: "$10".into(),
+                recurrence: "/mo".into(),
+                credits: 10_000_000,
+            },
+            PriceInfo {
+                id: "price_once".into(),
+                product_name: "One-time".into(),
+                product_description: None,
+                amount_display: "$5".into(),
+                recurrence: "".into(),
+                credits: 5_000_000,
+            },
+        ];
+        s.backends = backends_fixture();
+    })
 }
 
 #[gpui::test]
@@ -949,7 +1004,7 @@ fn backends_fixture() -> Vec<eidola_app_core::BackendInfo> {
 
 #[gpui::test]
 fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext) {
-    use eidola_gui::backends_settings::BackendsSettingsView;
+    use eidola_gui::backends_settings::{BackendsSettingsView, BackendsTab};
 
     let _guard = probes_on();
 
@@ -957,21 +1012,31 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
         s.backends = backends_fixture();
         s.local_models = Some(local_models_fixture());
     });
-    let (window, _view) = open_view(cx, |window, cx| {
+    let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
     });
 
+    // The tab strip is present regardless of the selected tab. The Eidola tab
+    // (default) carries the eidola singleton's enable/disable toggle.
     let names = fresh_names(cx, window);
     for expected in [
-        // Every backend section carries its enable/disable toggle; the
-        // external one also affords removal.
+        "settings/backends/tab/eidola",
+        "settings/backends/tab/local",
+        "settings/backends/tab/external",
         "settings/backends/eidola/toggle",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "eidola-tab probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    // The Local tab: the singleton toggle, installed-model verbs, catalog,
+    // and the paste-a-URL row.
+    view.update(cx, |v, cx| v.select_tab(BackendsTab::Local, cx));
+    let names = fresh_names(cx, window);
+    for expected in [
         "settings/backends/local/toggle",
-        "settings/backends/my-box/toggle",
-        "settings/backends/my-box/remove",
-        // The llamacpp backend's scanned model affords load (never delete —
-        // the file is the user's).
-        "settings/backends/my-box/model/0/load",
         // The Available model affords load + delete; the Loaded one,
         // pin + unload.
         "settings/backends/local/installed/0/load",
@@ -984,13 +1049,31 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
         // The paste-a-URL affordances.
         "settings/backends/local/url",
         "settings/backends/local/url/download",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "local-tab probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+
+    // The External tab: the llamacpp backend's toggle/remove/autostart, its
+    // scanned model's load verb, and the add-a-backend affordances.
+    view.update(cx, |v, cx| v.select_tab(BackendsTab::External, cx));
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/my-box/toggle",
+        "settings/backends/my-box/remove",
+        "settings/backends/my-box/autostart",
+        // The llamacpp backend's scanned model affords load (never delete —
+        // the file is the user's).
+        "settings/backends/my-box/model/0/load",
         // The add-a-backend affordances.
         "settings/backends/add/openai",
         "settings/backends/add/llamacpp",
     ] {
         assert!(
             names.contains(&expected.to_string()),
-            "backends pane probe {expected:?} missing; recorded: {names:?}"
+            "external-tab probe {expected:?} missing; recorded: {names:?}"
         );
     }
     // The user-owned file must never afford deletion through Eidola.
@@ -1004,7 +1087,7 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn backends_pane_add_form_probes_appear_per_kind(cx: &mut TestAppContext) {
-    use eidola_gui::backends_settings::{AddKind, BackendsSettingsView};
+    use eidola_gui::backends_settings::{AddKind, BackendsSettingsView, BackendsTab};
 
     let _guard = probes_on();
 
@@ -1014,6 +1097,9 @@ fn backends_pane_add_form_probes_appear_per_kind(cx: &mut TestAppContext) {
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
     });
+
+    // The add form lives in the External tab.
+    view.update(cx, |v, cx| v.select_tab(BackendsTab::External, cx));
 
     // Open the OpenAI form: id + url + key inputs plus submit/cancel.
     cx.update_window(window, |_, window, cx| {
@@ -1034,16 +1120,23 @@ fn backends_pane_add_form_probes_appear_per_kind(cx: &mut TestAppContext) {
         );
     }
 
-    // Switching to the llama.cpp form swaps url/key for the directory.
+    // Switching to the System llama.cpp form swaps url/key for the directory,
+    // and adds the optional engine-path input + auto-start checkbox.
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.begin_add(AddKind::LlamaCpp, window, cx));
     })
     .unwrap();
     let names = fresh_names(cx, window);
-    assert!(
-        names.contains(&"settings/backends/add/dir".to_string()),
-        "llamacpp add-form dir input missing: {names:?}"
-    );
+    for expected in [
+        "settings/backends/add/dir",
+        "settings/backends/add/engine-path",
+        "settings/backends/add/autostart",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "llamacpp add-form probe {expected:?} missing: {names:?}"
+        );
+    }
     assert!(
         !names.contains(&"settings/backends/add/url".to_string()),
         "url input must not linger on the llamacpp form: {names:?}"
