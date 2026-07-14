@@ -178,6 +178,14 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
     } else {
         "<script defer src=\"/assets/toc.js\"></script>\n"
     };
+    // Docs render straight from the repo, so offer the door back into it.
+    let edit = match (page.kind, &page.source_path) {
+        (PageKind::Doc, Some(source)) => format!(
+            "<p class=\"page-edit\"><a href=\"https://github.com/eidola-ai/eidola/edit/main/{}\">Edit this page on GitHub</a></p>\n",
+            escape_html(source)
+        ),
+        _ => String::new(),
+    };
 
     format!(
         r#"<!doctype html>
@@ -206,7 +214,7 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
 </header>
 <div class="layout">
 {sidebar}<main class="{main_class}">
-{inline_nav}{draft_notice}{byline}{body}</main>
+{inline_nav}{draft_notice}{byline}{body}{edit}</main>
 {toc}</div>
 <footer class="site-footer">
 <span>© 2026 <a href="/about/">Eidola, Inc.</a></span>
@@ -232,6 +240,7 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
         inline_nav = inline_nav,
         toc = toc,
         toc_script = toc_script,
+        edit = edit,
         draft_notice = draft_notice,
         byline = byline,
         body = page.html,
@@ -300,6 +309,20 @@ mod tests {
         home.route = "/".into();
         let html = layout(&home, Some(&nav));
         assert!(!html.contains("docs-sidebar"));
+    }
+
+    #[test]
+    fn docs_pages_get_edit_links() {
+        let html = layout(&doc_page(), None);
+        assert!(html.contains(
+            "<a href=\"https://github.com/eidola-ai/eidola/edit/main/docs/client.md\">Edit this page on GitHub</a>"
+        ));
+
+        // Posts and pages don't (their sources aren't repo docs).
+        let mut post = doc_page();
+        post.kind = PageKind::Post;
+        post.source_path = None;
+        assert!(!layout(&post, None).contains("page-edit"));
     }
 
     #[test]

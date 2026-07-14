@@ -80,6 +80,16 @@ fn builds_the_real_site() {
     assert!(!read(&out, "privacy/index.html").contains("class=\"toc\""));
     assert!(read(&out, "assets/toc.js").contains("aria-current"));
 
+    // Every docs page carries an edit link to its own source; nothing
+    // else does.
+    assert!(client.contains("https://github.com/eidola-ai/eidola/edit/main/docs/client.md"));
+    assert!(
+        read(&out, "docs/architecture/state/index.html")
+            .contains("edit/main/docs/architecture/state.md")
+    );
+    assert!(!home.contains("page-edit"));
+    assert!(!read(&out, "privacy/index.html").contains("page-edit"));
+
     // Blog: index and feed exist even with no published posts; the draft
     // example post must not publish.
     let blog = read(&out, "blog/index.html");

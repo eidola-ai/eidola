@@ -487,6 +487,22 @@ main.prose {
   font-size: 14px;
 }
 
+/* The quiet door back into the repo, at the foot of every docs page. */
+.page-edit {
+  margin-top: 3rem;
+  font-family: system-ui, sans-serif;
+  font-size: 13px;
+}
+
+.prose .page-edit a {
+  color: var(--muted-foreground);
+  text-decoration: none;
+}
+
+.prose .page-edit a:hover {
+  color: var(--foreground);
+}
+
 .draft-notice {
   color: var(--accent-foreground);
   border: 1px dashed var(--border);
