@@ -136,6 +136,8 @@ just test           # cargo test
 
 On macOS, `just build gui` produces `crates/eidola-gui/build/Eidola.app`; on Linux, `just run gui` runs the binary directly (the Linux GUI is Wayland-only). See `crates/eidola-gui/AGENTS.md` for the architecture details.
 
+The `local` on-device backend runs a bundled, statically-linked llama.cpp `llama-server` — release desktop artifacts ship it, so no system llama.cpp install is needed. For dev, `just engine` (Nix) materializes the sidecar and `just build gui` copies it into the dev `Eidola.app`; without it the GUI's Local tab shows an honest missing-engine state (or point `llama_server_path` at your own build).
+
 ### Website
 
 The public site ([www.eidola.ai](https://www.eidola.ai)) lives in this repo: content in `www/`, generator in `crates/eidola-www` (see its README), and the docs section rendered directly from `docs/`. It adopts the app's circadian theme.

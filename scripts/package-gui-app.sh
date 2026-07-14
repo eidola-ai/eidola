@@ -58,8 +58,32 @@ if [[ -f "$ICON" ]]; then
   cp "$ICON" "$APP_DIR/Contents/Resources/"
 fi
 
+# Bundle the on-device inference engine sidecar, if one is available. This
+# is best-effort for dev: the `local` backend needs a `llama-server` at
+# Contents/Resources/bin/llama-server (app-core resolves it exe-relative).
+# Look for an explicit override first, then the `just engine` nix result
+# symlink. A dev without either just sees the honest missing-engine state in
+# the Local tab (or points `llama_server_path` at their own build).
+SIDECAR=""
+if [[ -n "${EIDOLA_LLAMA_SERVER:-}" && -x "${EIDOLA_LLAMA_SERVER}" ]]; then
+  SIDECAR="$EIDOLA_LLAMA_SERVER"
+elif [[ -x "$REPO_ROOT/crates/eidola-gui/build/llama-server/bin/llama-server" ]]; then
+  SIDECAR="$REPO_ROOT/crates/eidola-gui/build/llama-server/bin/llama-server"
+fi
+
+if [[ -n "$SIDECAR" ]]; then
+  mkdir -p "$APP_DIR/Contents/Resources/bin"
+  cp "$SIDECAR" "$APP_DIR/Contents/Resources/bin/llama-server"
+  chmod u+w "$APP_DIR/Contents/Resources/bin/llama-server"
+  echo "Bundled inference engine: $SIDECAR"
+else
+  echo "No inference engine bundled (run 'just engine' to add one)."
+fi
+
 # Ad-hoc codesign for local dev. Required on Apple Silicon for the binary
-# to launch at all; on Intel it's not strictly required but harmless.
+# to launch at all; on Intel it's not strictly required but harmless. Done
+# after the sidecar copy so the bundle seal covers it; the nix-built sidecar
+# already carries its own ad-hoc signature for subprocess exec regardless.
 codesign --force --sign - "$APP_DIR"
 
 echo "Done: $APP_DIR"

@@ -57,6 +57,15 @@ build system:
         ;;
     esac
 
+# Build the bundled on-device inference engine sidecar (static llama.cpp
+# `llama-server`) via Nix and materialize it at
+# crates/eidola-gui/build/llama-server. `just build gui` / `just run gui`
+# then copy it into the dev Eidola.app so the `local` backend has an engine.
+# Optional for dev — a checkout without it just shows the missing-engine
+# state (or set `llama_server_path`). Requires Nix.
+engine:
+    nix build .#llama-server -o crates/eidola-gui/build/llama-server
+
 # Build and run a system: server, cli, gui, or www
 run system *args:
     #!/usr/bin/env bash
