@@ -1,26 +1,26 @@
 # Privacy guarantees
 
-This document enumerates the privacy and integrity properties Eidola commits to. It is the referent for the `privacy_guarantees_not_weakened`, `code_delivers_guarantees`, and `no_known_backdoor` claims in the release attestation schema (see [releases.md](releases.md)): a release attestation signed under this document's content hash asserts that the release does not weaken any item below and that no known code path violates them.
+This document enumerates the privacy and integrity properties Eidola commits to. It is the referent for several claims in the release attestation schema (see [releases.md](releases.md)): a release attestation signed under this document's content hash asserts that the release does not weaken any item below and that no known code path violates them.
 
-Each item is stated as an invariant. Contributors maintain these invariants when changing code. Release attestants walk a diff against them before signing.
+Each item is stated as an invariant. Contributors maintain these invariants when changing code and release attestants walk a diff against them before signing.
 
 Items are labelled **[S]** (structurally enforced — broken only by code that defeats the architecture, e.g. typed routing, blind-signature math, or build-time pinning) or **[P]** (policy — broken by code that violates stated discipline).
 
-These invariants describe what you get when you install and run a **generally-available release of Eidola** — the app downloaded from the public release channel, running on hardware whose confidential-compute attestation verifies under the trust root that release was built with. They do not extend to development builds, contributor-installed test versions, or any scenario where configuration overrides have been set (see [client.md](client.md#configuration-overrides) and [trust-root.md](trust-root.md#whats-pinned)).
+These invariants describe what you get when you install and run an attested, **generally-available release of Eidola** running under the trust root that release was built with. They do not extend to development builds, contributor-installed test versions, or any scenario where configuration overrides have been set (see [Client](client.md#configuration-overrides) and [Trust root](trust-root.md#whats-pinned)).
 
 ---
 
 ## 1. Identity and authorization
 
-**1.1.** **[S]** Every server endpoint is classified `linked`, `unlinked`, or `public`. The classification is bound to the handler in code and checked in middleware before the handler executes. (See [server.md](server.md#linked-vs-unlinked).)
+**1.1.** **[S]** Every server endpoint is classified `linked`, `unlinked`, or `public`. The classification is bound to the handler in code and checked in middleware before the handler executes. (See [Server](server.md#linked-vs-unlinked).)
 
 **1.2.** **[S]** `unlinked` endpoints accept only anonymous credential tokens (Privacy Pass ACT, `draft-schlesinger-privacypass-act-01`). They never receive, derive, persist, or log any identifier that ties a request to its issuance transaction, to the account it was issued to, or to other requests from the same client.
 
 **1.3.** **[S]** `linked` endpoints accept only the HTTP Basic `(account_uuid, account_secret)` bearer pair. They never accept ACTs, and they never receive or emit inference request or response content.
 
-**1.4.** **[S]** The two authentication surfaces are disjoint at the Rust type level: the `BasicAuth` and `TokenAuth` extractors are distinct types, and an endpoint may take only one. Cross-acceptance requires a code change visible in a diff.
+**1.4.** **[S]** The two authentication surfaces are disjoint at the type level: the `BasicAuth` and `TokenAuth` extractors are distinct types, and an endpoint may take only one. Cross-acceptance requires a code change visible in a diff.
 
-**1.5.** **[P]** No personally identifiable information is requested or accepted at account creation. Email, phone, name, address, and government identifiers are never collected or stored by Eidola. Stripe's own retention is governed by Stripe and is out of scope (see §8.4).
+**1.5.** **[P]** No personally identifiable information is requested or accepted at account creation. Email, phone, name, address, and government identifiers are never collected by Eidola's API or stored on Eidola's servers. Eidola uses Stripe for payment with the minimum configurable data collection. The retention practices of data collected by Stripe is governed by Stripe and dictated by relevant commerce laws and regulations and is out of scope of this document (see §8.4).
 
 ## 2. Unlinkability
 
@@ -134,7 +134,7 @@ These invariants describe what you get when you install and run a **generally-av
 
 ## How this document evolves
 
-Changes are **append-only in spirit.** Subsequent releases may add items, narrow scope where doing so does not remove a promise, or correct ambiguous wording. They may not remove or weaken any item that was in effect at the prior release.
+Changes are **append-only in spirit.** Subsequent releases may add items, narrow scope where doing so does not remove a promise, or correct ambiguous wording. They may not remove or weaken any item that was in effect at the prior release without breaking the update flow and flagging the discrepancy to the user.
 
 Strengthening goes through the normal release flow. Weakening requires the attestant to be unable to sign `privacy_guarantees_not_weakened` truthfully; the release notes must call out the weakening explicitly, and users would have to opt into such a release out of band. The verifier enforces the structural side: a release whose attestation lacks `privacy_guarantees_not_weakened` will fail.
 

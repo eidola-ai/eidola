@@ -1,11 +1,11 @@
 # Documentation
 
-These docs describe how Eidola works, what it commits to, and what it doesn't yet defend against. They are written for a technical reader who wants to understand the design without necessarily reading every line of source — and who, in turn, can vouch for it to friends and family who aren't going to read it themselves.
+These docs describe how Eidola works, what it commits to, and what it doesn't yet defend against. They are written for a technical reader who wants to understand the design without necessarily reading every line of source — and who, in turn, can vouch for it to less technical friends and family.
 
 ## Start here
 
 1. **[Paradigm](paradigm.md)** — How to think about Eidola. The user-sovereignty lens that everything else assumes.
-2. **[Privacy guarantees](privacy-guarantees.md)** — The contract. Enumerated, durable commitments that a release engineer signs against every release.
+2. **[Privacy guarantees](privacy-guarantees.md)** — Enumerated, durable commitments that a release engineer signs against every release.
 3. **[Threat model](threat-model.md)** — Who Eidola defends against, who it doesn't, and what is left as residual trust.
 
 ## Design pieces

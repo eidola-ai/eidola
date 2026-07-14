@@ -22,7 +22,7 @@ Your app's data — chat history, drafts, accounts — lives on your device. Whe
 
 Privacy guarantees in Eidola are properties of the *running code*, not of an operator's stated policy. The user can verify which code is running because:
 
-- **The source is public and reproducible.** Anyone can rebuild the released binaries from the committed source and bit-for-bit reproduce what we shipped.
+- **The source is public and reproducible.** Anyone can rebuild the released binaries from the committed source and bit-for-bit reproduce what we shipped. The expected values are stored under version control alongside the source and tested in CI, making this property structurally enforced and easily auditable.
 - **Releases are signed by humans, attesting under their own legal identity.** Every release ships with a signed [attestation](releases.md) recording that a named engineer reproduced the manifest from source, reviewed the diff against the prior release, and is not under compulsion to weaken the published guarantees. Their fingerprint is pinned in the prior client.
 - **Servers run in confidential compute** (currently AMD SEV-SNP, Intel TDX, and NVIDIA confidential compute), and the client verifies the enclave's hardware attestation on every TLS handshake. The measurement it checks against is the one compiled into that client build. See [server.md](server.md) and [upstream.md](upstream.md).
 
@@ -36,11 +36,9 @@ Eidola's residual trust assumptions and deferred defenses are catalogued in the 
 
 Eidola has two audiences who need to read this differently.
 
-For the **technically curious user** — someone who has used a few AI products, is uneasy about where their data goes, and wants enough mental scaffolding to evaluate Eidola against the alternatives — these docs offer the design without requiring you to follow every link. [privacy-guarantees.md](privacy-guarantees.md) is the contract. The component pages explain how the design upholds it.
+For the **technically curious user** — someone who has used a few AI products, is uneasy about where their data goes, and wants enough mental scaffolding to evaluate Eidola against the alternatives — these docs offer the design without requiring you to follow every link. Read [Privacy guarantees](privacy-guarantees.md) for an enumerated list of Eidola's privacy properties. The component pages explain how the design upholds it.
 
-For the **technical reader doing due diligence** — security engineers, privacy researchers, and the natural tech leaders whose recommendations are trusted by friends and family — every claim is realized in this same repo. Where we cite an enclave measurement, you can read the code that computes it. Where we describe an attestation flow, you can read the verifier that walks it. Where we acknowledge a gap, you can read the issue and the workaround.
-
-This is intentional. We can only be trusted to the extent that we are checkable, and the deepest layer of that check is the source.
+For the **technical reader doing due diligence** — security engineers, privacy researchers, etc — every claim is realized in this same repo. We can only be trusted to the extent that we are accountable, and the deepest layer of that check is the source.
 
 A note on these docs themselves: they are a map, not the territory. They will be incomplete, and they may drift from the code over time. The source is the source of truth. If you catch a divergence, please open an issue or PR.
 
