@@ -1,0 +1,48 @@
+# Structured navigation for the docs section of the website — the sidebar
+# on /docs/ pages. Each entry is [path, label]: the path is relative to
+# docs/, the label is the short sidebar name (doc h1s are often too long
+# for a 200px rail). The build fails if an entry points at a missing file
+# or if a docs page is missing from this nav — when adding a doc, add it
+# here too.
+
+[[sections]]
+title = ""
+pages = [["README.md", "Overview"]]
+
+[[sections]]
+title = "Start here"
+pages = [
+    ["paradigm.md", "Paradigm"],
+    ["privacy-guarantees.md", "Privacy guarantees"],
+    ["threat-model.md", "Threat model"],
+]
+
+[[sections]]
+title = "Design pieces"
+pages = [
+    ["client.md", "The client"],
+    ["server.md", "The server"],
+    ["upstream.md", "Inference upstream"],
+]
+
+[[sections]]
+title = "Release flow"
+pages = [
+    ["releases.md", "Releases"],
+    ["trust-root.md", "Trust root"],
+]
+
+[[sections]]
+title = "What's missing"
+pages = [["gaps.md", "Known gaps"]]
+
+[[sections]]
+title = "Architecture"
+pages = [["architecture/state.md", "State & async"]]
+
+[[sections]]
+title = "Contributing"
+pages = [
+    ["contributing/README.md", "Runbooks"],
+    ["contributing/release-attestant-yubikey.md", "Attestant YubiKey"],
+]

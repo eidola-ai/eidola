@@ -140,13 +140,26 @@ body {
   color: var(--foreground);
 }
 
+/* --- The page grid ------------------------------------------------------ */
+/* Mirrors the app's symmetric page geometry: [gutter | reading column |
+ * gutter]. The reading column stays centered on every page; docs pages
+ * put the sidebar in the left gutter (and the in-page ToC in the right),
+ * so the measure never shifts between sections. */
+
+.layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr min(648px, 100%) 1fr;
+}
+
+.layout > main {
+  grid-column: 2;
+}
+
 /* --- The reading column ------------------------------------------------ */
 
 main.prose {
-  flex: 1;
   width: 100%;
-  max-width: 648px; /* 600px measure + padding */
-  margin: 0 auto;
   padding: 24px 24px 96px;
   font-family: "Newsreader", Georgia, serif;
   font-optical-sizing: auto;
@@ -281,6 +294,109 @@ main.prose {
 
 .prose img {
   max-width: 100%;
+}
+
+/* --- Docs sidebar -------------------------------------------------------- */
+/* Quiet text in the left gutter — no ground, no box, hairline-free (the
+ * Library idiom). One markup source renders twice: the sticky rail here
+ * and a native <details> disclosure above the content on narrow screens. */
+
+.docs-sidebar {
+  grid-column: 1;
+  justify-self: end;
+  width: 200px;
+  margin-right: 24px;
+  padding: 32px 0;
+  position: sticky;
+  top: 60px;
+  align-self: start;
+  max-height: calc(100vh - 60px);
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Scoped to both renderings so .prose's block margins can't leak into
+ * the disclosure copy. */
+.docs-sidebar .docs-nav-title,
+.docs-nav-inline .docs-nav-title {
+  margin: 0 0 0.25rem;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent-foreground);
+}
+
+.docs-sidebar ul,
+.docs-nav-inline ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.docs-sidebar li,
+.docs-nav-inline li {
+  margin: 0;
+  padding: 3px 0;
+}
+
+.docs-sidebar .docs-nav-group,
+.docs-nav-inline .docs-nav-group {
+  margin: 0 0 1.25rem;
+}
+
+.docs-sidebar a,
+.docs-nav-inline a {
+  color: var(--muted-foreground);
+  text-decoration: none;
+}
+
+.docs-sidebar a:hover,
+.docs-nav-inline a:hover {
+  color: var(--foreground);
+}
+
+.docs-sidebar a[aria-current="page"],
+.docs-nav-inline a[aria-current="page"] {
+  color: var(--foreground);
+  font-weight: 600;
+}
+
+/* The narrow-screen disclosure: system-ui like all chrome, folded shut
+ * by default so the document leads. */
+.docs-nav-inline {
+  display: none;
+  margin: 0 0 1.5rem;
+  font-family: system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.docs-nav-inline summary {
+  cursor: pointer;
+  color: var(--muted-foreground);
+  font-size: 14px;
+  padding: 6px 0;
+}
+
+.docs-nav-inline summary:hover {
+  color: var(--foreground);
+}
+
+.docs-nav-inline nav {
+  padding: 8px 0 4px 12px;
+  border-left: 1px solid var(--border);
+}
+
+@media (max-width: 1103px) {
+  .docs-sidebar {
+    display: none;
+  }
+
+  .docs-nav-inline {
+    display: block;
+  }
 }
 
 /* --- Page furniture ----------------------------------------------------- */

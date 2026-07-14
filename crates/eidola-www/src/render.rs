@@ -6,6 +6,51 @@ use crate::content::{Page, PageKind};
 
 pub const BASE_URL: &str = "https://www.eidola.ai";
 
+/// One sidebar entry: a resolved docs route and its short label.
+pub struct NavPage {
+    pub route: String,
+    pub label: String,
+}
+
+/// A titled group of sidebar entries (title may be empty for the
+/// unlabeled top group).
+pub struct NavSection {
+    pub title: String,
+    pub pages: Vec<NavPage>,
+}
+
+/// The docs-nav list markup, shared by the wide-screen sidebar and the
+/// narrow-screen disclosure. The current page is marked with
+/// `aria-current` (which the CSS styles) rather than a class.
+fn docs_nav_list(sections: &[NavSection], current_route: &str) -> String {
+    let mut html = String::new();
+    for section in sections {
+        html.push_str("<div class=\"docs-nav-group\">\n");
+        if !section.title.is_empty() {
+            html.push_str(&format!(
+                "<p class=\"docs-nav-title\">{}</p>\n",
+                escape_html(&section.title)
+            ));
+        }
+        html.push_str("<ul>\n");
+        for page in &section.pages {
+            let current = if page.route == current_route {
+                " aria-current=\"page\""
+            } else {
+                ""
+            };
+            html.push_str(&format!(
+                "<li><a href=\"{}\"{}>{}</a></li>\n",
+                escape_html(&page.route),
+                current,
+                escape_html(&page.label)
+            ));
+        }
+        html.push_str("</ul>\n</div>\n");
+    }
+    html
+}
+
 pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -52,8 +97,9 @@ pub fn human_date(iso: &str) -> String {
     )
 }
 
-/// Render a full page.
-pub fn layout(page: &Page) -> String {
+/// Render a full page. `docs_nav` supplies the docs sidebar, rendered on
+/// `Doc` pages only.
+pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
     let title = match page.kind {
         PageKind::Home => "Eidola".to_string(),
         _ => format!("{} · Eidola", escape_html(&page.title)),
@@ -94,6 +140,23 @@ pub fn layout(page: &Page) -> String {
         PageKind::Home => "prose home",
         _ => "prose",
     };
+    // The docs sidebar renders twice from one source: a sticky rail in
+    // the left gutter (wide screens) and a native <details> disclosure
+    // above the content (narrow screens) — CSS shows exactly one.
+    let (sidebar, inline_nav) = match (page.kind, docs_nav) {
+        (PageKind::Doc, Some(sections)) => {
+            let list = docs_nav_list(sections, &page.route);
+            (
+                format!(
+                    "<nav class=\"docs-sidebar\" aria-label=\"Documentation\">\n{list}</nav>\n"
+                ),
+                format!(
+                    "<details class=\"docs-nav-inline\">\n<summary>Documentation</summary>\n<nav aria-label=\"Documentation\">\n{list}</nav>\n</details>\n"
+                ),
+            )
+        }
+        _ => (String::new(), String::new()),
+    };
 
     format!(
         r#"<!doctype html>
@@ -120,8 +183,10 @@ pub fn layout(page: &Page) -> String {
 <a href="https://github.com/eidola-ai/eidola">GitHub</a>
 </nav>
 </header>
-<main class="{main_class}">
-{draft_notice}{byline}{body}</main>
+<div class="layout">
+{sidebar}<main class="{main_class}">
+{inline_nav}{draft_notice}{byline}{body}</main>
+</div>
 <footer class="site-footer">
 <span>© 2026 <a href="/about/">Eidola, Inc.</a></span>
 <nav>
@@ -142,6 +207,8 @@ pub fn layout(page: &Page) -> String {
         nav_blog = nav_class("/blog/"),
         nav_docs = nav_class("/docs/"),
         main_class = main_class,
+        sidebar = sidebar,
+        inline_nav = inline_nav,
         draft_notice = draft_notice,
         byline = byline,
         body = page.html,
@@ -159,9 +226,8 @@ mod tests {
         assert_eq!(human_date("garbage"), "garbage");
     }
 
-    #[test]
-    fn layout_marks_active_nav_and_titles() {
-        let page = Page {
+    fn doc_page() -> Page {
+        Page {
             kind: PageKind::Doc,
             route: "/docs/client/".into(),
             title: "The client".into(),
@@ -169,11 +235,47 @@ mod tests {
             date: None,
             draft: false,
             html: "<h1>The client</h1>".into(),
-        };
-        let html = layout(&page);
+            headings: Vec::new(),
+            source_path: Some("docs/client.md".into()),
+        }
+    }
+
+    #[test]
+    fn layout_marks_active_nav_and_titles() {
+        let html = layout(&doc_page(), None);
         assert!(html.contains("<title>The client · Eidola</title>"));
         assert!(html.contains("<a href=\"/docs/\" class=\"active\">"));
         assert!(html.contains("atom.xml"));
         assert!(html.contains("rel=\"canonical\" href=\"https://www.eidola.ai/docs/client/\""));
+    }
+
+    #[test]
+    fn docs_pages_get_sidebar_with_current_marker() {
+        let nav = vec![NavSection {
+            title: "Start here".into(),
+            pages: vec![
+                NavPage {
+                    route: "/docs/client/".into(),
+                    label: "The client".into(),
+                },
+                NavPage {
+                    route: "/docs/server/".into(),
+                    label: "The server".into(),
+                },
+            ],
+        }];
+        let html = layout(&doc_page(), Some(&nav));
+        assert!(html.contains("class=\"docs-sidebar\""));
+        assert!(html.contains("class=\"docs-nav-inline\""));
+        assert!(html.contains("<a href=\"/docs/client/\" aria-current=\"page\">The client</a>"));
+        assert!(html.contains("<a href=\"/docs/server/\">The server</a>"));
+        assert!(html.contains("<p class=\"docs-nav-title\">Start here</p>"));
+
+        // Non-doc pages never get the sidebar, even when nav is supplied.
+        let mut home = doc_page();
+        home.kind = PageKind::Home;
+        home.route = "/".into();
+        let html = layout(&home, Some(&nav));
+        assert!(!html.contains("docs-sidebar"));
     }
 }

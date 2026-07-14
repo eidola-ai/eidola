@@ -28,7 +28,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use content::{Page, PageKind, post_stem_parts, split_front_matter};
-use render::{BASE_URL, escape_html, layout};
+use render::{BASE_URL, NavPage, NavSection, escape_html, layout};
+use serde::Deserialize;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -80,10 +81,12 @@ fn load_page(path: &Path, kind: PageKind, route: String, source_dir: &str) -> Re
         date: matter.date,
         draft: matter.draft,
         html: rendered.html,
+        headings: rendered.headings,
+        source_path: None,
     })
 }
 
-fn write_page(out: &Path, page: &Page) -> Result<(), Error> {
+fn write_page(out: &Path, page: &Page, docs_nav: Option<&[NavSection]>) -> Result<(), Error> {
     let rel = page.route.trim_matches('/');
     let dir = if rel.is_empty() {
         out.to_path_buf()
@@ -91,8 +94,72 @@ fn write_page(out: &Path, page: &Page) -> Result<(), Error> {
         out.join(rel)
     };
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join("index.html"), layout(page))?;
+    fs::write(dir.join("index.html"), layout(page, docs_nav))?;
     Ok(())
+}
+
+/// `www/docs-nav.toml` — the docs sidebar structure. Each page entry is
+/// `[path-relative-to-docs, sidebar-label]`.
+#[derive(Deserialize)]
+struct DocsNavFile {
+    sections: Vec<DocsNavSection>,
+}
+
+#[derive(Deserialize)]
+struct DocsNavSection {
+    title: String,
+    pages: Vec<(String, String)>,
+}
+
+/// Load and validate the docs nav: every entry must point at a real docs
+/// page, and every docs page must appear exactly once — so the sidebar
+/// can never silently drift from the docs tree.
+fn load_docs_nav(www: &Path, doc_paths: &[String]) -> Result<Vec<NavSection>, Error> {
+    let path = www.join("docs-nav.toml");
+    let raw = fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let parsed: DocsNavFile =
+        toml::from_str(&raw).map_err(|e| format!("{}: {e}", path.display()))?;
+
+    let mut seen: Vec<&str> = Vec::new();
+    for section in &parsed.sections {
+        for (page, _) in &section.pages {
+            if !doc_paths.iter().any(|p| p == page) {
+                return Err(format!("docs-nav.toml lists {page}, which is not in docs/").into());
+            }
+            if seen.contains(&page.as_str()) {
+                return Err(format!("docs-nav.toml lists {page} twice").into());
+            }
+            seen.push(page);
+        }
+    }
+    let missing: Vec<&str> = doc_paths
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !seen.contains(p))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "docs pages missing from www/docs-nav.toml: {} (every doc must appear in the sidebar)",
+            missing.join(", ")
+        )
+        .into());
+    }
+
+    Ok(parsed
+        .sections
+        .into_iter()
+        .map(|section| NavSection {
+            title: section.title,
+            pages: section
+                .pages
+                .into_iter()
+                .map(|(path, label)| NavPage {
+                    route: content::docs_route(&path),
+                    label,
+                })
+                .collect(),
+        })
+        .collect())
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<(), Error> {
@@ -162,6 +229,8 @@ fn blog_index(posts: &[Page]) -> Page {
         date: None,
         draft: false,
         html,
+        headings: Vec::new(),
+        source_path: None,
     }
 }
 
@@ -279,6 +348,7 @@ pub fn build(opts: &BuildOptions) -> Result<BuildStats, Error> {
     // Docs.
     let mut doc_paths = Vec::new();
     collect_docs(&docs, "", &mut doc_paths)?;
+    let docs_nav = load_docs_nav(&www, &doc_paths)?;
     let mut doc_pages: Vec<Page> = Vec::new();
     for rel in &doc_paths {
         let route = content::docs_route(rel);
@@ -286,12 +356,9 @@ pub fn build(opts: &BuildOptions) -> Result<BuildStats, Error> {
             Some((dir, _)) => format!("docs/{dir}"),
             None => "docs".to_string(),
         };
-        doc_pages.push(load_page(
-            &docs.join(rel),
-            PageKind::Doc,
-            route,
-            &source_dir,
-        )?);
+        let mut page = load_page(&docs.join(rel), PageKind::Doc, route, &source_dir)?;
+        page.source_path = Some(format!("docs/{rel}"));
+        doc_pages.push(page);
     }
 
     pages.retain(|p| opts.include_drafts || !p.draft);
@@ -305,20 +372,20 @@ pub fn build(opts: &BuildOptions) -> Result<BuildStats, Error> {
         docs: doc_pages.len(),
     };
     for page in &pages {
-        write_page(&opts.out, page)?;
+        write_page(&opts.out, page, None)?;
         routes.push(page.route.clone());
     }
     let index = blog_index(&posts);
-    write_page(&opts.out, &index)?;
+    write_page(&opts.out, &index, None)?;
     routes.push(index.route.clone());
     for post in &posts {
-        write_page(&opts.out, post)?;
+        write_page(&opts.out, post, None)?;
         if !post.draft {
             routes.push(post.route.clone());
         }
     }
     for page in &doc_pages {
-        write_page(&opts.out, page)?;
+        write_page(&opts.out, page, Some(&docs_nav))?;
         routes.push(page.route.clone());
     }
 

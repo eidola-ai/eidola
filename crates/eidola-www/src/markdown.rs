@@ -10,7 +10,7 @@
 
 use pulldown_cmark::{CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
 
-use crate::content::docs_route;
+use crate::content::{Heading, docs_route};
 
 const GITHUB_BLOB_BASE: &str = "https://github.com/eidola-ai/eidola/blob/main";
 
@@ -21,6 +21,8 @@ pub struct Rendered {
     pub first_heading: Option<String>,
     /// Plain text of the first paragraph, for blog-index snippets.
     pub first_paragraph: Option<String>,
+    /// h2/h3 headings in document order, for the in-page table of contents.
+    pub headings: Vec<Heading>,
 }
 
 /// Rewrite one link destination. `source_dir` is the repo-relative
@@ -112,6 +114,7 @@ pub fn render(body: &str, source_dir: &str) -> Rendered {
     // Assign ids to headings that lack one, and capture metadata.
     let mut first_heading = None;
     let mut first_paragraph = None;
+    let mut headings: Vec<Heading> = Vec::new();
     let mut used_ids: Vec<String> = Vec::new();
     let mut i = 0;
     while i < events.len() {
@@ -139,6 +142,13 @@ pub fn render(body: &str, source_dir: &str) -> Rendered {
                     slug = format!("{base}-{n}");
                 }
                 used_ids.push(slug.clone());
+                if matches!(level, HeadingLevel::H2 | HeadingLevel::H3) {
+                    headings.push(Heading {
+                        level: if level == HeadingLevel::H2 { 2 } else { 3 },
+                        id: slug.clone(),
+                        text: text.clone(),
+                    });
+                }
                 if let Event::Start(Tag::Heading { id, .. }) = &mut events[i] {
                     *id = Some(CowStr::from(slug));
                 }
@@ -163,6 +173,7 @@ pub fn render(body: &str, source_dir: &str) -> Rendered {
         html: out,
         first_heading,
         first_paragraph,
+        headings,
     }
 }
 

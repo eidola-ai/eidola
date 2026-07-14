@@ -44,7 +44,7 @@ fn builds_the_real_site() {
     // Home page.
     let home = read(&out, "index.html");
     assert!(home.contains("<title>Eidola</title>"));
-    assert!(home.contains("yours."));
+    assert!(home.contains("Intelligence should be intimate"));
     assert!(home.contains("/assets/circadian.css"));
     assert!(home.contains("class=\"prose home\""));
 
@@ -59,6 +59,17 @@ fn builds_the_real_site() {
     assert!(docs_index.contains("https://github.com/eidola-ai/eidola/blob/main/README.md"));
     assert!(out.join("docs/architecture/state/index.html").exists());
     assert!(out.join("docs/contributing/index.html").exists());
+
+    // Docs sidebar: on every docs page (both renderings), current page
+    // marked, driven by www/docs-nav.toml — and never on non-doc pages.
+    let client = read(&out, "docs/client/index.html");
+    assert!(client.contains("class=\"docs-sidebar\""));
+    assert!(client.contains("class=\"docs-nav-inline\""));
+    assert!(client.contains("<a href=\"/docs/client/\" aria-current=\"page\">The client</a>"));
+    assert!(client.contains("<p class=\"docs-nav-title\">Start here</p>"));
+    assert!(docs_index.contains("<a href=\"/docs/\" aria-current=\"page\">Overview</a>"));
+    assert!(!home.contains("docs-sidebar"));
+    assert!(!read(&out, "blog/index.html").contains("docs-sidebar"));
 
     // Blog: index and feed exist even with no published posts; the draft
     // example post must not publish.

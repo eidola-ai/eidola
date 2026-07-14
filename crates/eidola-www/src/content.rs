@@ -42,6 +42,14 @@ pub enum PageKind {
     Doc,
 }
 
+/// A heading collected during rendering, for the in-page table of
+/// contents (h2/h3 only — the h1 is the page itself).
+pub struct Heading {
+    pub level: u8,
+    pub id: String,
+    pub text: String,
+}
+
 /// A fully-loaded page, ready to render.
 pub struct Page {
     pub kind: PageKind,
@@ -54,6 +62,11 @@ pub struct Page {
     pub draft: bool,
     /// Rendered markdown body.
     pub html: String,
+    /// h2/h3 headings, in document order.
+    pub headings: Vec<Heading>,
+    /// Repo-relative source path (docs pages only) — drives the
+    /// edit-on-GitHub link.
+    pub source_path: Option<String>,
 }
 
 /// Derive the site route for a docs source path relative to `docs/`
