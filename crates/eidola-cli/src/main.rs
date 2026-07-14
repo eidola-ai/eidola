@@ -262,6 +262,14 @@ enum BackendAddCommand {
         /// Directory of .gguf files (never written to by Eidola)
         #[arg(long)]
         models_dir: String,
+        /// Explicit llama-server binary path (default: discover on $PATH and
+        /// the usual install prefixes)
+        #[arg(long)]
+        engine_path: Option<String>,
+        /// Require models to be pre-loaded (`eidola model load …`) instead of
+        /// auto-starting an engine on the first request
+        #[arg(long)]
+        no_auto_start: bool,
         /// Display name (defaults to the id)
         #[arg(long)]
         name: Option<String>,
@@ -703,8 +711,8 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 match &state.engine_path {
                     Some(p) => println!("engine: {p}"),
                     None => println!(
-                        "engine: llama-server not found — install llama.cpp \
-                         (e.g. `brew install llama.cpp`)"
+                        "engine: not present in this build — set `llama_server_path` in config \
+                         to point at a `llama-server` binary"
                     ),
                 }
                 println!();
@@ -882,6 +890,16 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     if let Some(dir) = &b.models_dir {
                         println!("    models dir: {dir}");
                     }
+                    if b.kind == eidola_app_core::BackendKind::LlamaCpp {
+                        println!(
+                            "    auto-start: {}",
+                            if b.auto_start { "on" } else { "off" }
+                        );
+                        match &b.engine_path {
+                            Some(p) => println!("    engine: {p}"),
+                            None => println!("    engine: discovered ($PATH / install prefixes)"),
+                        }
+                    }
                     if let Some(pinned) = &b.model_overrides {
                         println!("    pinned models: {}", pinned.join(", "));
                     }
@@ -904,10 +922,14 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                         api_key,
                         models_dir: None,
                         model_overrides: models,
+                        engine_path: None,
+                        auto_start: true,
                     },
                     BackendAddCommand::Llamacpp {
                         id,
                         models_dir,
+                        engine_path,
+                        no_auto_start,
                         name,
                     } => eidola_app_core::NewBackend {
                         id,
@@ -917,6 +939,8 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                         api_key: None,
                         models_dir: Some(models_dir),
                         model_overrides: None,
+                        engine_path,
+                        auto_start: !no_auto_start,
                     },
                 };
                 let added = core.add_backend(new).await?;

@@ -940,6 +940,8 @@ fn space_model_display_splits_name_and_backend(cx: &mut TestAppContext) {
                 has_api_key: false,
                 models_dir: None,
                 model_overrides: None,
+                engine_path: None,
+                auto_start: true,
                 created_at: 0,
             },
             eidola_app_core::BackendInfo {
@@ -951,6 +953,8 @@ fn space_model_display_splits_name_and_backend(cx: &mut TestAppContext) {
                 has_api_key: false,
                 models_dir: None,
                 model_overrides: None,
+                engine_path: None,
+                auto_start: true,
                 created_at: 1,
             },
         ];
@@ -1047,6 +1051,8 @@ fn settings_backends_pane_add_form_and_toggle(cx: &mut TestAppContext) {
             has_api_key: false,
             models_dir: None,
             model_overrides: None,
+            engine_path: None,
+            auto_start: true,
             created_at: 0,
         }];
     });
@@ -2930,6 +2936,8 @@ fn onboarding_skip_account_disables_eidola_and_closes(cx: &mut TestAppContext) {
             has_api_key: false,
             models_dir: None,
             model_overrides: None,
+            engine_path: None,
+            auto_start: true,
             created_at: 0,
         }];
     });

@@ -181,6 +181,8 @@ impl BackendsSettingsView {
                     api_key: (!key.is_empty()).then_some(key),
                     models_dir: None,
                     model_overrides: None,
+                    engine_path: None,
+                    auto_start: true,
                 }
             }
             AddKind::LlamaCpp => {
@@ -193,6 +195,8 @@ impl BackendsSettingsView {
                     api_key: None,
                     models_dir: Some(dir),
                     model_overrides: None,
+                    engine_path: None,
+                    auto_start: true,
                 }
             }
         };

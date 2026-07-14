@@ -47,6 +47,8 @@ pub fn eidola_backend_stub() -> BackendInfo {
         has_api_key: false,
         models_dir: None,
         model_overrides: None,
+        engine_path: None,
+        auto_start: true,
         created_at: 0,
     }
 }

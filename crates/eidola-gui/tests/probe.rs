@@ -859,6 +859,8 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
             display_name: "My box".into(),
             enabled: true,
             models_dir: "/Users/me/models".into(),
+            engine_path: Some("/opt/homebrew/bin/llama-server".into()),
+            auto_start: true,
             models: vec![LocalModelInfo {
                 id: "qwen3-8b@my-box".into(),
                 slug: "qwen3-8b".into(),
@@ -912,6 +914,8 @@ fn backends_fixture() -> Vec<eidola_app_core::BackendInfo> {
             has_api_key: false,
             models_dir: None,
             model_overrides: None,
+            engine_path: None,
+            auto_start: true,
             created_at: 0,
         },
         BackendInfo {
@@ -923,6 +927,8 @@ fn backends_fixture() -> Vec<eidola_app_core::BackendInfo> {
             has_api_key: false,
             models_dir: None,
             model_overrides: None,
+            engine_path: None,
+            auto_start: true,
             created_at: 0,
         },
         BackendInfo {
@@ -934,6 +940,8 @@ fn backends_fixture() -> Vec<eidola_app_core::BackendInfo> {
             has_api_key: false,
             models_dir: Some("/Users/me/models".into()),
             model_overrides: None,
+            engine_path: None,
+            auto_start: true,
             created_at: 1,
         },
     ]
@@ -1214,6 +1222,8 @@ fn request_panel_groups_per_backend_with_independent_health(cx: &mut TestAppCont
                     has_api_key: false,
                     models_dir: None,
                     model_overrides: None,
+                    engine_path: None,
+                    auto_start: true,
                     created_at: 0,
                 },
                 models: Loadable::loaded(vec![ModelInfo {
@@ -1234,6 +1244,8 @@ fn request_panel_groups_per_backend_with_independent_health(cx: &mut TestAppCont
                     has_api_key: true,
                     models_dir: None,
                     model_overrides: None,
+                    engine_path: None,
+                    auto_start: true,
                     created_at: 1,
                 },
                 models: Loadable::Failed {

@@ -357,6 +357,8 @@ mod driver {
                 has_api_key: false,
                 models_dir: None,
                 model_overrides: None,
+                engine_path: None,
+                auto_start: true,
                 created_at: 0,
             },
             BackendInfo {
@@ -368,6 +370,8 @@ mod driver {
                 has_api_key: false,
                 models_dir: None,
                 model_overrides: None,
+                engine_path: None,
+                auto_start: true,
                 created_at: 0,
             },
             BackendInfo {
@@ -379,6 +383,8 @@ mod driver {
                 has_api_key: true,
                 models_dir: None,
                 model_overrides: Some(vec!["qwen3-8b".into()]),
+                engine_path: None,
+                auto_start: true,
                 created_at: 1,
             },
         ]
