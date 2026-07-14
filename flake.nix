@@ -491,11 +491,38 @@
         # (unwrapped, so it inherits none of the GUI wrapper's
         # VK_ADD_DRIVER_FILES). Wiring that is the follow-up; CPU-only ships a
         # working engine on every Linux host today.
+        # The pinned nixpkgs ships llama.cpp build 6981, which predates the
+        # `gemma4` GGUF architecture the curated catalog uses ("unknown model
+        # architecture: 'gemma4'"), so the source is bumped to release b9960
+        # (verified against the catalog models) while keeping the nixpkgs
+        # build recipe. The base recipe derives its src tag from `version` and
+        # only uses `leaveDotGit` to extract the short commit into a COMMIT
+        # file for `LLAMA_BUILD_COMMIT`; a plain pinned fetch plus injecting
+        # the known commit directly is equivalent and more reproducible.
+        llamaServerVersion = "9960";
+        llamaServerCommit = "a935fbff"; # short rev of tag b9960
         llamaServer = pkgs.llama-cpp.overrideAttrs (o: {
+          version = llamaServerVersion;
+          src = pkgs.fetchFromGitHub {
+            owner = "ggml-org";
+            repo = "llama.cpp";
+            tag = "b${llamaServerVersion}";
+            hash = "sha256-FheVvdqpF3pqxmovFXBh65iNAH+lSM+jqGrM8CpLHF8=";
+          };
+          preConfigure = ''
+            prependToVar cmakeFlags "-DLLAMA_BUILD_COMMIT:STRING=${llamaServerCommit}"
+          '';
           cmakeFlags = o.cmakeFlags ++ [
             "-DLLAMA_CURL=OFF"
             "-DBUILD_SHARED_LIBS=OFF"
+            # The server auto-detects OpenSSL for httplib TLS; we speak plain
+            # HTTP over loopback only, and a libssl dep would pin the binary
+            # to nix-store paths (not relocatable on user machines).
+            "-DLLAMA_SERVER_SSL=OFF"
           ];
+          # curl is unused with LLAMA_CURL=OFF, and its presence propagates
+          # OpenSSL into the server's auto-detection — drop it entirely.
+          buildInputs = pkgs.lib.filter (d: (d.pname or "") != "curl") o.buildInputs;
           # Trim the closure to just the one tool we ship. The static build
           # embeds llama.cpp's libs into the binary, so the sibling llama-*
           # tools, the `llama` symlink, and the installed headers/archives are
