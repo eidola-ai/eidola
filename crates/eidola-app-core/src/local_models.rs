@@ -179,8 +179,10 @@ pub struct LocalModelInfo {
 /// singleton plus every configured `llamacpp` backend's scanned directory.
 #[derive(Clone, Debug)]
 pub struct LocalModelsState {
-    /// Resolved `llama-server` binary (config override, `PATH`, or a known
-    /// install location), if one was found.
+    /// The resolved **bundled** `local` engine (config override,
+    /// `EIDOLA_LLAMA_SERVER`, or the exe-relative sidecar). `None` ⇒ this
+    /// build ships no engine — the UI shows an honest "engine not present"
+    /// state and the `llama_server_path` override is the escape hatch.
     pub engine_path: Option<String>,
     /// The `local` singleton's models (Eidola-managed store).
     pub models: Vec<LocalModelInfo>,
@@ -197,6 +199,11 @@ pub struct ExternalEngineBackend {
     pub display_name: String,
     pub enabled: bool,
     pub models_dir: String,
+    /// The resolved `llama-server` for this backend (its explicit
+    /// `engine_path`, else discovery), if one was found.
+    pub engine_path: Option<String>,
+    /// Whether a request may auto-start an engine for this backend.
+    pub auto_start: bool,
     pub models: Vec<LocalModelInfo>,
 }
 
@@ -626,29 +633,112 @@ fn prettify_stem(stem: &str) -> String {
     stem.replace(['-', '_'], " ")
 }
 
-/// Locate the `llama-server` binary: config override first, then `PATH`,
-/// then the usual install locations (a GUI launched from Finder does not
-/// inherit a shell `PATH`, so Homebrew's prefix is checked explicitly).
-pub(crate) fn resolve_engine_path(cfg: &Config) -> Option<PathBuf> {
-    if let Some(overridden) = cfg.llama_server_path_override.as_deref() {
-        let p = PathBuf::from(overridden);
-        return p.is_file().then_some(p);
+/// Candidate locations for the **bundled** `local` engine, exe-relative, in
+/// probe order. Pure over the executable path so it's unit-testable.
+///
+/// - macOS `.app`: the main binary sits at `…/Contents/MacOS/<x>`; the
+///   sidecar is shipped at `…/Contents/Resources/bin/llama-server`.
+/// - Otherwise (CLI Nix output, `target/debug` dev builds): a `llama-server`
+///   sibling next to the executable.
+fn bundled_engine_candidates(exe: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = exe.parent() {
+        if dir.file_name() == Some(std::ffi::OsStr::new("MacOS"))
+            && let Some(contents) = dir.parent()
+        {
+            candidates.push(contents.join("Resources").join("bin").join("llama-server"));
+        }
+        candidates.push(dir.join("llama-server"));
     }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("llama-server");
-            if candidate.is_file() {
+    candidates
+}
+
+/// Resolve the **`local`** (bundled) engine, in order: the config override
+/// (`llama_server_path`, the dev escape hatch + test seam), the
+/// `EIDOLA_LLAMA_SERVER` env var (set by the Linux GUI wrapper), then the
+/// exe-relative bundled sidecar. There is **no `$PATH` scan** — the managed
+/// engine is shipped with the app, never borrowed from the system. Pure over
+/// its injected inputs so the ordering is unit-testable.
+fn resolve_local_engine_path(
+    override_path: Option<&str>,
+    env_path: Option<&str>,
+    current_exe: Option<&Path>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    // The override is a pin: set-but-missing resolves to `None` rather than
+    // silently falling through (honest for an explicit escape hatch).
+    if let Some(p) = override_path {
+        let p = PathBuf::from(p);
+        return exists(&p).then_some(p);
+    }
+    if let Some(p) = env_path {
+        let p = PathBuf::from(p);
+        if exists(&p) {
+            return Some(p);
+        }
+    }
+    if let Some(exe) = current_exe {
+        for candidate in bundled_engine_candidates(exe) {
+            if exists(&candidate) {
                 return Some(candidate);
             }
         }
     }
-    for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
-        let candidate = Path::new(dir).join("llama-server");
-        if candidate.is_file() {
+    None
+}
+
+/// The `local` (bundled) engine binary, resolved against the live process.
+pub(crate) fn resolve_local_engine(cfg: &Config) -> Option<PathBuf> {
+    let env = std::env::var("EIDOLA_LLAMA_SERVER").ok();
+    let exe = std::env::current_exe().ok();
+    resolve_local_engine_path(
+        cfg.llama_server_path_override.as_deref(),
+        env.as_deref(),
+        exe.as_deref(),
+        &|p| p.is_file(),
+    )
+}
+
+/// Resolve a **`llamacpp`** backend's engine: the row's explicit
+/// `engine_path` if set (a pin — set-but-missing resolves to `None`), else
+/// discovery across `discovery_dirs` (typically `$PATH` then the usual
+/// install prefixes). Pure over its injected inputs so it's unit-testable.
+fn resolve_external_engine_path(
+    engine_path: Option<&str>,
+    discovery_dirs: impl Iterator<Item = PathBuf>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if let Some(p) = engine_path {
+        let p = PathBuf::from(p);
+        return exists(&p).then_some(p);
+    }
+    for dir in discovery_dirs {
+        let candidate = dir.join("llama-server");
+        if exists(&candidate) {
             return Some(candidate);
         }
     }
     None
+}
+
+/// The discovery search path for a user-owned `llama-server`: `$PATH` first,
+/// then the usual install prefixes (a GUI launched from Finder inherits no
+/// shell `$PATH`, so Homebrew's prefix is checked explicitly).
+fn external_discovery_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+        dirs.push(PathBuf::from(dir));
+    }
+    dirs
+}
+
+/// A `llamacpp` backend's engine binary, resolved against the live system.
+pub(crate) fn resolve_external_engine(engine_path: Option<&str>) -> Option<PathBuf> {
+    resolve_external_engine_path(engine_path, external_discovery_dirs().into_iter(), &|p| {
+        p.is_file()
+    })
 }
 
 /// A plain (non-attesting) HTTPS-capable client: native trust roots, used
@@ -699,7 +789,7 @@ impl Inner {
     /// and every configured `llamacpp` backend's scanned directory.
     pub(crate) async fn local_models_state(&self) -> Result<LocalModelsState, AppError> {
         let cfg = self.load_config();
-        let engine_path = resolve_engine_path(&cfg).map(|p| p.display().to_string());
+        let engine_path = resolve_local_engine(&cfg).map(|p| p.display().to_string());
         let dir = models_dir(&self.data_dir);
 
         let mut models: Vec<LocalModelInfo> = self
@@ -784,6 +874,9 @@ impl Inner {
                 display_name: row.display_name,
                 enabled: row.enabled,
                 models_dir,
+                engine_path: resolve_external_engine(row.engine_path.as_deref())
+                    .map(|p| p.display().to_string()),
+                auto_start: row.auto_start,
                 models: scanned,
             });
         }
@@ -1028,10 +1121,20 @@ impl Inner {
             return self.await_engine_ready(&key).await;
         }
 
-        // Resolve the model file's directory by backend: the managed local
-        // store, or a llamacpp backend's user-owned directory.
-        let dir = if backend_id == crate::backends::LOCAL_BACKEND_ID {
-            models_dir(&self.data_dir)
+        // Resolve the model file's directory by backend, and note how the
+        // engine binary resolves for it: the managed `local` store served by
+        // the bundled engine, or a `llamacpp` backend's user-owned directory
+        // served by the user's own (or discovered) `llama-server`. The engine
+        // itself is resolved *after* the model-file check so a missing file
+        // reports the clearer error.
+        enum EngineSource {
+            /// The bundled `local` engine.
+            Bundled,
+            /// A `llamacpp` backend's explicit path (`Some`) or discovery.
+            External(Option<String>),
+        }
+        let (dir, engine_source) = if backend_id == crate::backends::LOCAL_BACKEND_ID {
+            (models_dir(&self.data_dir), EngineSource::Bundled)
         } else {
             let db_conn = self.db_conn().await?;
             let row = self.require_backend(&db_conn, &backend_id).await?;
@@ -1040,9 +1143,10 @@ impl Inner {
                     message: format!("backend `{backend_id}` does not serve local engines"),
                 });
             }
-            PathBuf::from(row.models_dir.ok_or_else(|| AppError::LocalModel {
+            let dir = PathBuf::from(row.models_dir.ok_or_else(|| AppError::LocalModel {
                 message: format!("backend `{backend_id}` has no models directory"),
-            })?)
+            })?);
+            (dir, EngineSource::External(row.engine_path))
         };
 
         let model_path = dir.join(format!("{slug}.gguf"));
@@ -1051,11 +1155,23 @@ impl Inner {
                 message: format!("no model file at `{}`", model_path.display()),
             });
         }
-        let engine = resolve_engine_path(&cfg).ok_or_else(|| AppError::LocalModel {
-            message: "llama-server not found — install llama.cpp (e.g. `brew install llama.cpp`) \
-                      or set `llama_server_path` in config"
-                .into(),
-        })?;
+
+        let engine = match engine_source {
+            EngineSource::Bundled => {
+                resolve_local_engine(&cfg).ok_or_else(|| AppError::LocalModel {
+                    message: "this build doesn't include the bundled inference engine — set \
+                              `llama_server_path` in config to point at a `llama-server` binary"
+                        .into(),
+                })?
+            }
+            EngineSource::External(engine_path) => resolve_external_engine(engine_path.as_deref())
+                .ok_or_else(|| AppError::LocalModel {
+                    message: format!(
+                        "llama-server not found for backend `{backend_id}` — install \
+                             llama.cpp (e.g. `brew install llama.cpp`) or set its engine path"
+                    ),
+                })?,
+        };
 
         let port = pick_free_port()?;
         // The alias equals the selectable model id, so a chat body's
@@ -1648,6 +1764,95 @@ mod tests {
     fn plan_refuses_models_larger_than_the_budget() {
         let err = plan_evictions(20 * GIB, 16 * GIB, &[]).unwrap_err();
         assert!(err.contains("memory budget"), "got {err}");
+    }
+
+    // -- Engine resolution --------------------------------------------
+
+    #[test]
+    fn local_engine_override_is_a_pin() {
+        // Override present + exists → used; present + missing → None (no
+        // fall-through to env/exe; the escape hatch is honest).
+        let exe = PathBuf::from("/app/Contents/MacOS/Eidola");
+        assert_eq!(
+            resolve_local_engine_path(
+                Some("/opt/llama-server"),
+                Some("/env/llama-server"),
+                Some(&exe),
+                &|p| p == Path::new("/opt/llama-server")
+            ),
+            Some(PathBuf::from("/opt/llama-server"))
+        );
+        assert_eq!(
+            resolve_local_engine_path(
+                Some("/nope"),
+                Some("/env/llama-server"),
+                Some(&exe),
+                &|_| { false }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn local_engine_env_then_exe_relative() {
+        let exe = PathBuf::from("/app/Contents/MacOS/Eidola");
+        // Env used when it exists.
+        assert_eq!(
+            resolve_local_engine_path(None, Some("/env/llama-server"), Some(&exe), &|p| p
+                == Path::new("/env/llama-server")),
+            Some(PathBuf::from("/env/llama-server"))
+        );
+        // Env missing → macOS .app sidecar under Contents/Resources/bin.
+        let sidecar = PathBuf::from("/app/Contents/Resources/bin/llama-server");
+        assert_eq!(
+            resolve_local_engine_path(None, Some("/env/missing"), Some(&exe), &|p| p == sidecar),
+            Some(sidecar)
+        );
+        // CLI/dev layout: a sibling next to the exe.
+        let cli_exe = PathBuf::from("/nix/store/x/bin/eidola");
+        let sibling = PathBuf::from("/nix/store/x/bin/llama-server");
+        assert_eq!(
+            resolve_local_engine_path(None, None, Some(&cli_exe), &|p| p == sibling),
+            Some(sibling)
+        );
+    }
+
+    #[test]
+    fn local_engine_never_scans_path() {
+        // A llama-server on $PATH must NOT satisfy the bundled `local`
+        // engine — only override/env/exe-relative do. With nothing set and
+        // no exe-relative match, resolution is None even though the probe
+        // would happily report a $PATH binary present.
+        let exe = PathBuf::from("/app/Contents/MacOS/Eidola");
+        assert_eq!(
+            resolve_local_engine_path(None, None, Some(&exe), &|p| p
+                == Path::new("/usr/local/bin/llama-server")),
+            None
+        );
+    }
+
+    #[test]
+    fn external_engine_path_is_preferred_over_discovery() {
+        let dirs = || vec![PathBuf::from("/usr/bin")].into_iter();
+        // engine_path set + exists → used even though discovery would match.
+        assert_eq!(
+            resolve_external_engine_path(Some("/custom/llama-server"), dirs(), &|_| true),
+            Some(PathBuf::from("/custom/llama-server"))
+        );
+        // engine_path set + missing → None (a pin, no fall-through).
+        assert_eq!(
+            resolve_external_engine_path(Some("/custom/llama-server"), dirs(), &|p| p
+                == Path::new("/usr/bin/llama-server")),
+            None
+        );
+        // No engine_path → discovery finds it under a search dir.
+        assert_eq!(
+            resolve_external_engine_path(None, dirs(), &|p| p
+                == Path::new("/usr/bin/llama-server")),
+            Some(PathBuf::from("/usr/bin/llama-server"))
+        );
+        // No engine_path, nothing on the search path → None.
+        assert_eq!(resolve_external_engine_path(None, dirs(), &|_| false), None);
     }
 
     #[test]

@@ -107,6 +107,11 @@ pub struct BackendInfo {
     pub models_dir: Option<String>,
     /// Manually pinned model list; `None` = trust the backend's listing.
     pub model_overrides: Option<Vec<String>>,
+    /// `llamacpp` only: explicit `llama-server` path; `None` = discover it.
+    pub engine_path: Option<String>,
+    /// `llamacpp` only: may a request auto-start an engine on demand? The
+    /// `local` backend always auto-starts (it's Eidola's own engine).
+    pub auto_start: bool,
     pub created_at: i64,
 }
 
@@ -124,6 +129,8 @@ impl BackendInfo {
             has_api_key: row.api_key.is_some(),
             models_dir: row.models_dir.clone(),
             model_overrides: parse_overrides(row.model_overrides.as_deref())?,
+            engine_path: row.engine_path.clone(),
+            auto_start: row.auto_start,
             created_at: row.created_at,
         })
     }
@@ -221,6 +228,11 @@ pub struct NewBackend {
     pub api_key: Option<String>,
     pub models_dir: Option<String>,
     pub model_overrides: Option<Vec<String>>,
+    /// `llamacpp` only: explicit `llama-server` path (`None` = discover it).
+    pub engine_path: Option<String>,
+    /// `llamacpp` only: whether a request may auto-start an engine. Ignored
+    /// (and required `true`) for other kinds.
+    pub auto_start: bool,
 }
 
 /// Partial update of an external backend's configuration. `None` leaves the
@@ -232,6 +244,10 @@ pub struct BackendUpdate {
     pub api_key: Option<Option<String>>,
     pub models_dir: Option<Option<String>>,
     pub model_overrides: Option<Option<Vec<String>>>,
+    /// `llamacpp` only: set/clear the explicit engine path.
+    pub engine_path: Option<Option<String>>,
+    /// `llamacpp` only: flip request-triggered auto-start.
+    pub auto_start: Option<bool>,
 }
 
 // ============================================================================
@@ -289,6 +305,18 @@ impl Inner {
                             .into(),
                     });
                 }
+                // `engine_path` / `auto_start` are engine-backed concerns.
+                if new
+                    .engine_path
+                    .as_deref()
+                    .is_some_and(|p| !p.trim().is_empty())
+                    || !new.auto_start
+                {
+                    return Err(AppError::Config {
+                        message: "engine path and auto-start apply only to llama.cpp backends"
+                            .into(),
+                    });
+                }
             }
             BackendKind::LlamaCpp => {
                 let dir = new.models_dir.as_deref().unwrap_or("").trim();
@@ -306,6 +334,17 @@ impl Inner {
         } else {
             new.display_name.trim().to_string()
         };
+        // Only `llamacpp` carries an engine path / auto-start flag; every
+        // other kind stores `None` + the always-on default.
+        let (engine_path, auto_start) = match new.kind {
+            BackendKind::LlamaCpp => (
+                new.engine_path
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty()),
+                new.auto_start,
+            ),
+            _ => (None, true),
+        };
         let row = db::BackendRow {
             id: new.id.clone(),
             kind: new.kind.as_str().to_string(),
@@ -317,6 +356,8 @@ impl Inner {
             api_key: new.api_key.filter(|k| !k.trim().is_empty()),
             models_dir: new.models_dir.map(|d| d.trim().to_string()),
             model_overrides: overrides_to_json(new.model_overrides.as_deref()),
+            engine_path,
+            auto_start,
             created_at: now,
             updated_at: now,
             removed_at: None,
@@ -356,10 +397,26 @@ impl Inner {
                 message: format!("backend `{id}` is built in — only enable/disable applies"),
             });
         }
+        let conn = self.db_conn().await?;
+        // `engine_path` / `auto_start` are engine-backed concerns; refuse
+        // them on any non-`llamacpp` backend rather than silently storing
+        // an inert value.
+        if update.engine_path.is_some() || update.auto_start.is_some() {
+            let row = db::get_backend(&conn, id)
+                .await?
+                .filter(|r| r.removed_at.is_none())
+                .ok_or_else(|| AppError::NotConfigured {
+                    message: format!("no backend named `{id}` is configured"),
+                })?;
+            if row.kind != BackendKind::LlamaCpp.as_str() {
+                return Err(AppError::Config {
+                    message: "engine path and auto-start apply only to llama.cpp backends".into(),
+                });
+            }
+        }
         let overrides_json = update
             .model_overrides
             .map(|o| overrides_to_json(o.as_deref()));
-        let conn = self.db_conn().await?;
         let updated = db::update_backend_config(
             &conn,
             id,
@@ -371,6 +428,11 @@ impl Inner {
             update.api_key.as_ref().map(|o| o.as_deref()),
             update.models_dir.as_ref().map(|o| o.as_deref()),
             overrides_json.as_ref().map(|o| o.as_deref()),
+            update
+                .engine_path
+                .as_ref()
+                .map(|o| o.as_deref().map(|p| p.trim()).filter(|p| !p.is_empty())),
+            update.auto_start,
             now_ms(),
         )
         .await?;

@@ -49,6 +49,29 @@ fn openai_backend(id: &str, base_url: &str, api_key: Option<&str>) -> NewBackend
         api_key: api_key.map(String::from),
         models_dir: None,
         model_overrides: None,
+        engine_path: None,
+        auto_start: true,
+    }
+}
+
+/// A `llamacpp` backend over `models_dir`, with an optional explicit engine
+/// path and the auto-start flag.
+fn llamacpp_backend(
+    id: &str,
+    models_dir: &str,
+    engine_path: Option<&str>,
+    auto_start: bool,
+) -> NewBackend {
+    NewBackend {
+        id: id.into(),
+        kind: BackendKind::LlamaCpp,
+        display_name: String::new(),
+        base_url: None,
+        api_key: None,
+        models_dir: Some(models_dir.into()),
+        model_overrides: None,
+        engine_path: engine_path.map(String::from),
+        auto_start,
     }
 }
 
@@ -183,6 +206,8 @@ fn add_backend_validates_ids_and_kind_requirements() {
             api_key: None,
             models_dir: None,
             model_overrides: None,
+            engine_path: None,
+            auto_start: true,
         })
         .expect_err("missing url");
         assert!(err.to_string().contains("base URL"), "got {err}");
@@ -195,9 +220,24 @@ fn add_backend_validates_ids_and_kind_requirements() {
             api_key: None,
             models_dir: None,
             model_overrides: None,
+            engine_path: None,
+            auto_start: true,
         })
         .expect_err("missing dir");
         assert!(err.to_string().contains("models directory"), "got {err}");
+        // engine path / auto-start are llamacpp-only.
+        let err = add(NewBackend {
+            engine_path: Some("/usr/bin/llama-server".into()),
+            ..openai_backend("openai-engine", "http://x", None)
+        })
+        .expect_err("engine path on openai");
+        assert!(err.to_string().contains("llama.cpp backends"), "got {err}");
+        let err = add(NewBackend {
+            auto_start: false,
+            ..openai_backend("openai-noauto", "http://x", None)
+        })
+        .expect_err("auto-start off on openai");
+        assert!(err.to_string().contains("llama.cpp backends"), "got {err}");
         // Built-in kinds cannot be added.
         let err = add(NewBackend {
             id: "fake-eidola".into(),
@@ -207,6 +247,8 @@ fn add_backend_validates_ids_and_kind_requirements() {
             api_key: None,
             models_dir: None,
             model_overrides: None,
+            engine_path: None,
+            auto_start: true,
         })
         .expect_err("built-in kind");
         assert!(err.to_string().contains("built in"), "got {err}");
@@ -222,6 +264,75 @@ fn add_backend_validates_ids_and_kind_requirements() {
             .expect("disable eidola");
         let listed = core.runtime().block_on(core.list_backends()).unwrap();
         assert!(!listed.iter().find(|b| b.id == "eidola").unwrap().enabled);
+    });
+}
+
+#[test]
+fn llamacpp_engine_path_and_auto_start_persist_and_revive() {
+    run(|| {
+        let (core, _dir) = bare_core();
+
+        // Add with an explicit engine path and auto-start disabled.
+        let added = core
+            .runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                "/Users/me/models",
+                Some("/opt/llama-server"),
+                false,
+            )))
+            .expect("add");
+        assert_eq!(added.engine_path.as_deref(), Some("/opt/llama-server"));
+        assert!(!added.auto_start);
+
+        // The columns round-trip through the listing.
+        let listed = core.runtime().block_on(core.list_backends()).unwrap();
+        let mine = listed.iter().find(|b| b.id == "my-box").unwrap();
+        assert_eq!(mine.engine_path.as_deref(), Some("/opt/llama-server"));
+        assert!(!mine.auto_start);
+
+        // Update flips auto-start and clears the engine path.
+        core.runtime()
+            .block_on(core.update_backend(
+                "my-box".into(),
+                BackendUpdate {
+                    auto_start: Some(true),
+                    engine_path: Some(None),
+                    ..BackendUpdate::default()
+                },
+            ))
+            .expect("update");
+        let listed = core.runtime().block_on(core.list_backends()).unwrap();
+        let mine = listed.iter().find(|b| b.id == "my-box").unwrap();
+        assert!(mine.auto_start);
+        assert_eq!(mine.engine_path, None);
+
+        // engine_path / auto_start are refused on a non-llamacpp backend.
+        core.runtime()
+            .block_on(core.add_backend(openai_backend("ext", "http://x", None)))
+            .expect("add openai");
+        let err = core
+            .runtime()
+            .block_on(core.update_backend(
+                "ext".into(),
+                BackendUpdate {
+                    auto_start: Some(false),
+                    ..BackendUpdate::default()
+                },
+            ))
+            .expect_err("auto-start on openai");
+        assert!(err.to_string().contains("llama.cpp backends"), "got {err}");
+
+        // Soft-remove, then revive with fresh engine settings.
+        core.runtime()
+            .block_on(core.remove_backend("my-box".into()))
+            .expect("remove");
+        let revived = core
+            .runtime()
+            .block_on(core.add_backend(llamacpp_backend("my-box", "/Users/me/models", None, false)))
+            .expect("revive");
+        assert_eq!(revived.engine_path, None);
+        assert!(!revived.auto_start);
     });
 }
 
@@ -312,13 +423,13 @@ fn llamacpp_backend_routes_to_its_own_engine() {
 
         core.runtime()
             .block_on(core.add_backend(NewBackend {
-                id: "my-box".into(),
-                kind: BackendKind::LlamaCpp,
                 display_name: "My box".into(),
-                base_url: None,
-                api_key: None,
-                models_dir: Some(models_dir.path().display().to_string()),
-                model_overrides: None,
+                ..llamacpp_backend(
+                    "my-box",
+                    &models_dir.path().display().to_string(),
+                    None,
+                    true,
+                )
             }))
             .expect("add backend");
 
@@ -357,6 +468,56 @@ fn llamacpp_backend_routes_to_its_own_engine() {
             .block_on(core.delete_local_model("tiny@my-box".into()))
             .expect_err("refuse external delete");
         assert!(err.to_string().contains("managed by you"), "got {err}");
+    });
+}
+
+#[test]
+fn llamacpp_auto_start_disabled_refuses_request_without_spawning() {
+    run(|| {
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig::default());
+        let models_dir = tempfile::tempdir().expect("models dir");
+        std::fs::write(models_dir.path().join("tiny.gguf"), b"gguf").unwrap();
+
+        // auto-start OFF, and no engine registered/loaded.
+        core.runtime()
+            .block_on(core.add_backend(llamacpp_backend(
+                "my-box",
+                &models_dir.path().display().to_string(),
+                None,
+                false,
+            )))
+            .expect("add backend");
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("Hi".into(), "tiny@my-box".into(), None))
+            .expect_err("must refuse a request-triggered load");
+        // Typed refusal following the disabled-backend pattern; nothing was
+        // spawned (the model stays Available, never Loading/Loaded).
+        assert!(
+            matches!(err.root(), AppError::NotConfigured { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("auto-start"), "got {err}");
+
+        let state = core
+            .runtime()
+            .block_on(core.local_models_state())
+            .expect("state");
+        let external = state
+            .external
+            .iter()
+            .find(|b| b.backend_id == "my-box")
+            .expect("external backend section");
+        assert!(!external.auto_start);
+        assert!(
+            matches!(
+                external.models[0].status,
+                eidola_app_core::LocalModelStatus::Available
+            ),
+            "no engine should have spawned: {:?}",
+            external.models[0].status
+        );
     });
 }
 

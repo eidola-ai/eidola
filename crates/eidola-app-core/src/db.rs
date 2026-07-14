@@ -416,6 +416,11 @@ pub struct BackendRow {
     pub api_key: Option<String>,
     pub models_dir: Option<String>,
     pub model_overrides: Option<String>,
+    /// `llamacpp` only: explicit `llama-server` path; `None` = discover it.
+    pub engine_path: Option<String>,
+    /// `llamacpp` only: may a request auto-start an engine? The `local`
+    /// backend always auto-starts regardless.
+    pub auto_start: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub removed_at: Option<i64>,
@@ -431,14 +436,16 @@ fn backend_row_from(row: &turso::Row) -> Result<BackendRow, AppError> {
         api_key: row.get::<Option<String>>(5).map_err(AppError::db)?,
         models_dir: row.get::<Option<String>>(6).map_err(AppError::db)?,
         model_overrides: row.get::<Option<String>>(7).map_err(AppError::db)?,
-        created_at: row.get::<i64>(8).map_err(AppError::db)?,
-        updated_at: row.get::<i64>(9).map_err(AppError::db)?,
-        removed_at: row.get::<Option<i64>>(10).map_err(AppError::db)?,
+        engine_path: row.get::<Option<String>>(8).map_err(AppError::db)?,
+        auto_start: row.get::<i64>(9).map_err(AppError::db)? != 0,
+        created_at: row.get::<i64>(10).map_err(AppError::db)?,
+        updated_at: row.get::<i64>(11).map_err(AppError::db)?,
+        removed_at: row.get::<Option<i64>>(12).map_err(AppError::db)?,
     })
 }
 
 const BACKEND_COLUMNS: &str = "id, kind, display_name, enabled, base_url, api_key, \
-     models_dir, model_overrides, created_at, updated_at, removed_at";
+     models_dir, model_overrides, engine_path, auto_start, created_at, updated_at, removed_at";
 
 /// List backends, soft-removed rows excluded. Singletons first (eidola,
 /// then local), then externals in creation order — the stable presentation
@@ -493,8 +500,8 @@ pub async fn insert_backend(conn: &Connection, row: &BackendRow) -> Result<(), A
         }
         conn.execute(
             "UPDATE backend SET kind = ?2, display_name = ?3, enabled = ?4, base_url = ?5, \
-             api_key = ?6, models_dir = ?7, model_overrides = ?8, updated_at = ?9, \
-             removed_at = NULL WHERE id = ?1",
+             api_key = ?6, models_dir = ?7, model_overrides = ?8, engine_path = ?9, \
+             auto_start = ?10, updated_at = ?11, removed_at = NULL WHERE id = ?1",
             (
                 Value::Text(row.id.clone()),
                 Value::Text(row.kind.clone()),
@@ -504,6 +511,8 @@ pub async fn insert_backend(conn: &Connection, row: &BackendRow) -> Result<(), A
                 opt_text(&row.api_key),
                 opt_text(&row.models_dir),
                 opt_text(&row.model_overrides),
+                opt_text(&row.engine_path),
+                Value::Integer(row.auto_start as i64),
                 Value::Integer(row.updated_at),
             ),
         )
@@ -513,8 +522,8 @@ pub async fn insert_backend(conn: &Connection, row: &BackendRow) -> Result<(), A
     }
     conn.execute(
         "INSERT INTO backend (id, kind, display_name, enabled, base_url, api_key, \
-         models_dir, model_overrides, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         models_dir, model_overrides, engine_path, auto_start, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         (
             Value::Text(row.id.clone()),
             Value::Text(row.kind.clone()),
@@ -524,6 +533,8 @@ pub async fn insert_backend(conn: &Connection, row: &BackendRow) -> Result<(), A
             opt_text(&row.api_key),
             opt_text(&row.models_dir),
             opt_text(&row.model_overrides),
+            opt_text(&row.engine_path),
+            Value::Integer(row.auto_start as i64),
             Value::Integer(row.created_at),
             Value::Integer(row.updated_at),
         ),
@@ -567,6 +578,8 @@ pub async fn update_backend_config(
     api_key: Option<Option<&str>>,
     models_dir: Option<Option<&str>>,
     model_overrides: Option<Option<&str>>,
+    engine_path: Option<Option<&str>>,
+    auto_start: Option<bool>,
     now: i64,
 ) -> Result<bool, AppError> {
     // Build the SET list dynamically; every branch binds positionally.
@@ -624,6 +637,25 @@ pub async fn update_backend_config(
                 Some(o) => Value::Text(o.to_string()),
                 None => Value::Null,
             },
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(path) = engine_path {
+        bind(
+            "engine_path",
+            match path {
+                Some(p) => Value::Text(p.to_string()),
+                None => Value::Null,
+            },
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(auto) = auto_start {
+        bind(
+            "auto_start",
+            Value::Integer(auto as i64),
             &mut params,
             &mut sets,
         );

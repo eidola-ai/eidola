@@ -1682,6 +1682,21 @@ impl Inner {
                     match self.local.lease_engine(&backend.id, &mref.model) {
                         Some(leased) => leased,
                         None => {
+                            // Auto-start gate: a `llamacpp` backend with
+                            // auto-start disabled refuses request-triggered
+                            // loads before any spawn — the engine must be
+                            // pre-loaded explicitly. `local` always
+                            // auto-starts (it's ours).
+                            if backend_kind == BackendKind::LlamaCpp && !backend.auto_start {
+                                return Err(AppError::NotConfigured {
+                                    message: format!(
+                                        "`{model}` is not loaded and backend `{}` has auto-start \
+                                         disabled — load it explicitly (`eidola model load \
+                                         {model}`) or enable auto-start",
+                                        backend.id
+                                    ),
+                                });
+                            }
                             self.load_local_model(model).await?;
                             self.local
                                 .lease_engine(&backend.id, &mref.model)

@@ -84,6 +84,15 @@ CREATE TABLE credential (
 -- scoped gateway keys, partial proxy listings), so a backend's
 -- model list can be pinned manually; NULL = trust the listing.
 --
+-- engine_path: for 'llamacpp' backends only, an explicit path to
+-- the user's llama-server binary; NULL = discover it ($PATH, then
+-- the usual install prefixes). The managed 'local' engine is the
+-- bundled sidecar and never reads this column.
+--
+-- auto_start: for 'llamacpp' backends only, whether a request may
+-- start an engine on demand (1) or must be pre-loaded explicitly
+-- (0). The 'local' backend always auto-starts (it's ours).
+--
 -- removed_at: soft delete. Forensic rows (request.backend_id)
 -- keep a valid FK target forever; re-adding the same id revives
 -- the row.
@@ -99,6 +108,8 @@ CREATE TABLE backend (
     api_key         TEXT,
     models_dir      TEXT,
     model_overrides TEXT,                      -- JSON array
+    engine_path     TEXT,                      -- llamacpp: explicit binary path
+    auto_start      INTEGER NOT NULL DEFAULT 1, -- llamacpp: start engines on request
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL,
     removed_at      INTEGER
