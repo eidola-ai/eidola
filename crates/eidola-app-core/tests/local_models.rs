@@ -1,6 +1,6 @@
 //! Integration tests for the local-inference domain: model downloads (over a
 //! wiremock HTTP fixture), deletion, and — via the chat harness — routing
-//! `local/<slug>` turns to a loopback engine with **no credential spend, no
+//! `<slug>@local` turns to a loopback engine with **no credential spend, no
 //! ACT header, and no Wallet emissions**. The engine itself is faked through
 //! the `test_register_loaded_local_model` seam; the real `llama-server`
 //! subprocess lifecycle is exercised manually / end-to-end (it needs the
@@ -96,7 +96,7 @@ fn download_persists_model_and_emits() {
                 core.download_local_model(format!("{}/repo/tiny-test-model.gguf", mock.uri())),
             )
             .expect("download starts");
-        assert_eq!(id, "local/tiny-test-model");
+        assert_eq!(id, "tiny-test-model@local");
 
         let state = wait_for_state(&core, |s| {
             s.models
@@ -108,7 +108,7 @@ fn download_persists_model_and_emits() {
             .iter()
             .find(|m| m.slug == "tiny-test-model")
             .unwrap();
-        assert_eq!(model.id, "local/tiny-test-model");
+        assert_eq!(model.id, "tiny-test-model@local");
         assert_eq!(model.size_bytes, Some(64 * 1024));
         assert_eq!(model.last_error, None);
         assert!(
@@ -227,7 +227,7 @@ fn delete_removes_files_and_emits() {
 
         let mut rx = core.subscribe_changes();
         core.runtime()
-            .block_on(core.delete_local_model("local/doomed".into()))
+            .block_on(core.delete_local_model("doomed@local".into()))
             .expect("delete");
 
         assert!(!models_dir.join("doomed.gguf").exists());
@@ -261,11 +261,11 @@ fn local_blocking_chat_has_no_spend_no_auth_no_wallet() {
 
         let result = core
             .runtime()
-            .block_on(core.chat("Hello local".into(), "local/test-model".into(), None))
+            .block_on(core.chat("Hello local".into(), "test-model@local".into(), None))
             .expect("local chat succeeds");
 
         assert_eq!(result.content, "Hello from the mock.");
-        assert_eq!(result.model, "local/test-model");
+        assert_eq!(result.model, "test-model@local");
         assert_eq!(result.credits_charged, 0);
 
         // The upstream request carried no Authorization header and the
@@ -276,7 +276,7 @@ fn local_blocking_chat_has_no_spend_no_auth_no_wallet() {
         // The request body carried the local model id.
         assert_eq!(
             mock.chat_bodies()[0]["model"],
-            serde_json::json!("local/test-model")
+            serde_json::json!("test-model@local")
         );
 
         // Emissions: post's SpaceIndex + Space, then run_turn's Space +
@@ -303,7 +303,7 @@ fn local_blocking_chat_has_no_spend_no_auth_no_wallet() {
             .iter()
             .find(|n| n.action_type == "inference")
             .expect("inference node");
-        assert_eq!(inference.model.as_deref(), Some("local/test-model"));
+        assert_eq!(inference.model.as_deref(), Some("test-model@local"));
         assert_eq!(inference.credits_consumed, None);
 
         // The request row exists with no credential nonce (Record stays
@@ -330,7 +330,7 @@ fn local_streaming_chat_streams_and_persists_without_wallet() {
         let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
         let result = core
             .runtime()
-            .block_on(core.chat_stream("Stream local".into(), "local/test-model".into(), None, tx))
+            .block_on(core.chat_stream("Stream local".into(), "test-model@local".into(), None, tx))
             .expect("local chat_stream succeeds");
 
         assert_eq!(result.content, "Hello from the stream.");
@@ -364,7 +364,7 @@ fn local_chat_with_unloaded_model_is_typed_error() {
 
         let err = core
             .runtime()
-            .block_on(core.chat("Hi".into(), "local/never-loaded".into(), None))
+            .block_on(core.chat("Hi".into(), "never-loaded@local".into(), None))
             .expect_err("must fail");
         assert!(
             matches!(err.root(), AppError::LocalModel { .. }),

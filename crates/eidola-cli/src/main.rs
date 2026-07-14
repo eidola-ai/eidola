@@ -174,17 +174,17 @@ enum ModelCommand {
     },
     /// Delete a downloaded model
     Delete {
-        /// Model id (`local/<slug>`) or bare slug
+        /// Model id (`<slug>@local`) or bare slug
         id: String,
     },
     /// Load a model: start its llama-server engine and wait until ready
     Load {
-        /// Model id (`local/<slug>`) or bare slug
+        /// Model id (`<slug>@<backend>`) or bare slug (the local store)
         id: String,
     },
     /// Unload a model, terminating its engine
     Unload {
-        /// Model id (`local/<slug>`) or bare slug
+        /// Model id (`<slug>@<backend>`) or bare slug (the local store)
         id: String,
     },
 }
@@ -771,7 +771,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 println!("downloading {id}…");
                 // The transfer task dies with this process, so wait for it,
                 // rendering a progress line.
-                let slug = id.strip_prefix("local/").unwrap_or(&id).to_string();
+                let slug = eidola_app_core::parse_model_ref(&id).model;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                     let state = core.local_models_state().await?;
@@ -818,15 +818,28 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 println!("loading {id} (this can take a while for large models)…");
                 core.load_local_model(id.clone()).await?;
                 let state = core.local_models_state().await?;
-                let slug = id.strip_prefix("local/").unwrap_or(&id);
-                if let Some(eidola_app_core::LocalModelStatus::Loaded { port, .. }) = state
-                    .models
-                    .iter()
-                    .find(|m| m.slug == slug)
-                    .map(|m| m.status.clone())
+                let mref = eidola_app_core::parse_model_ref(&id);
+                let in_backend: Vec<&eidola_app_core::LocalModelInfo> = if mref.backend_id
+                    == eidola_app_core::EIDOLA_BACKEND_ID
+                    || mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID
                 {
-                    println!("loaded — serving on 127.0.0.1:{port}");
-                    println!("chat with it: `eidola chat \"hi\" --model local/{slug}`");
+                    state.models.iter().collect()
+                } else {
+                    state
+                        .external
+                        .iter()
+                        .find(|b| b.backend_id == mref.backend_id)
+                        .map(|b| b.models.iter().collect())
+                        .unwrap_or_default()
+                };
+                if let Some(m) = in_backend.iter().find(|m| {
+                    matches!(m.status, eidola_app_core::LocalModelStatus::Loaded { .. })
+                        && m.slug == mref.model
+                }) {
+                    if let eidola_app_core::LocalModelStatus::Loaded { port, .. } = m.status {
+                        println!("loaded — serving on 127.0.0.1:{port}");
+                    }
+                    println!("chat with it: `eidola chat \"hi\" --model {}`", m.id);
                 }
                 // The engine is a child of *this* process, so exiting would
                 // kill it. Keep serving until Ctrl-C (the GUI, by contrast,

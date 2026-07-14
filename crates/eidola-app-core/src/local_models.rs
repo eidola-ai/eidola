@@ -37,10 +37,10 @@
 //! [`LocalRuntime`] on `Inner`. Every state transition emits
 //! [`Change::LocalModels`] so subscribers re-snapshot via
 //! `AppCore::local_models_state`; download progress emits throttled.
-//! The managed store's model ids keep the legacy `local/<file-stem>` form;
-//! llamacpp backends' are qualified `<file-stem>@<backend-id>` — either
-//! way the id doubles as the spawned engine's `--alias`, so a chat body's
-//! `model` field matches the selection string verbatim.
+//! Model ids are the uniform qualified form — `<file-stem>@<backend-id>`,
+//! e.g. `<file-stem>@local` for the managed store — and the id doubles as
+//! the spawned engine's `--alias`, so a chat body's `model` field matches
+//! the selection string verbatim.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -54,10 +54,6 @@ use crate::Inner;
 use crate::changes::{BroadcastSource, Change};
 use crate::config::Config;
 use crate::error::AppError;
-
-/// Namespace prefix that routes a model id to the local engine instead of
-/// the remote attested server.
-pub const LOCAL_MODEL_PREFIX: &str = "local/";
 
 /// Context window requested from `llama-server` (`-c`). Deliberately
 /// bounded — KV-cache memory scales with it — and far below what Gemma 4
@@ -158,8 +154,8 @@ pub enum LocalModelStatus {
 /// loaded) the model picker.
 #[derive(Clone, Debug)]
 pub struct LocalModelInfo {
-    /// The chat-routable selection id: `local/<slug>` for the managed
-    /// store, `<slug>@<backend-id>` for llamacpp backends.
+    /// The chat-routable selection id: `<slug>@<backend-id>` (the managed
+    /// store's backend id is `local`).
     pub id: String,
     /// The file stem.
     pub slug: String,
@@ -290,41 +286,25 @@ pub(crate) fn models_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("models")
 }
 
-/// Strip the `local/` prefix if present, so public APIs accept either the
-/// full model id or the bare slug.
-pub(crate) fn slug_of(id_or_slug: &str) -> &str {
-    id_or_slug
-        .strip_prefix(LOCAL_MODEL_PREFIX)
-        .unwrap_or(id_or_slug)
-}
-
-/// The selectable model id for an engine-backed backend's slug. The local
-/// singleton keeps its legacy `local/<slug>` form; llamacpp backends use
-/// the qualified `<slug>@<backend>` form. Either way the id doubles as the
-/// engine's `--alias`, so the wire model in a chat body equals the
-/// selection string.
+/// The selectable model id for an engine-backed backend's slug — the
+/// uniform qualified form ([`crate::backends::qualified_model_id`]). The id
+/// doubles as the engine's `--alias`, so the wire model in a chat body
+/// equals the selection string.
 pub(crate) fn engine_model_id(backend_id: &str, slug: &str) -> String {
-    if backend_id == crate::backends::LOCAL_BACKEND_ID {
-        format!("{LOCAL_MODEL_PREFIX}{slug}")
-    } else {
-        crate::backends::qualified_model_id(slug, backend_id)
-    }
+    crate::backends::qualified_model_id(slug, backend_id)
 }
 
-/// Resolve any accepted model spelling (`local/<slug>`, bare slug,
-/// `<slug>@<backend>`) to its engine key `(backend_id, slug)`. A bare slug
-/// belongs to the local singleton — the historic CLI shorthand.
+/// Resolve a model-management argument (`<slug>@<backend>`, or a bare slug
+/// as shorthand for the managed local store — the natural spelling for
+/// `eidola model download/load/…`) to its engine key `(backend_id, slug)`.
 pub(crate) fn engine_key_for_id(id: &str) -> EngineKey {
     let mref = crate::backends::parse_model_ref(id);
     if mref.backend_id == crate::backends::EIDOLA_BACKEND_ID {
-        // A bare slug (no `local/`, no `@`) parses as eidola; in this
-        // module's vocabulary it is the local shorthand.
-        (
-            crate::backends::LOCAL_BACKEND_ID.to_string(),
-            mref.model.clone(),
-        )
+        // Bare parses as eidola (the chat sugar); in this module's
+        // management vocabulary a bare slug means the local store.
+        (crate::backends::LOCAL_BACKEND_ID.to_string(), mref.model)
     } else {
-        (mref.backend_id, slug_of(&mref.model).to_string())
+        (mref.backend_id, mref.model)
     }
 }
 
@@ -386,7 +366,7 @@ pub fn normalize_model_url(input: &str) -> Result<(String, String), AppError> {
     Ok((url, file_name))
 }
 
-/// The slug (and thus the `local/<slug>` id) for a model file name.
+/// The slug (and thus the `<slug>@local` id) for a model file name.
 fn slug_for_file(file_name: &str) -> String {
     file_name
         .strip_suffix(".gguf")
@@ -491,7 +471,7 @@ impl Inner {
                 }
                 let total = dl.total.load(Ordering::Relaxed);
                 models.push(LocalModelInfo {
-                    id: format!("{LOCAL_MODEL_PREFIX}{slug}"),
+                    id: engine_model_id(crate::backends::LOCAL_BACKEND_ID, slug),
                     slug: slug.clone(),
                     display_name: dl.display_name.clone(),
                     file_name: format!("{slug}.gguf"),
@@ -518,7 +498,7 @@ impl Inner {
                     continue;
                 }
                 models.push(LocalModelInfo {
-                    id: format!("{LOCAL_MODEL_PREFIX}{slug}"),
+                    id: engine_model_id(crate::backends::LOCAL_BACKEND_ID, slug),
                     slug: slug.clone(),
                     display_name: prettify_stem(slug),
                     file_name: format!("{slug}.gguf"),
@@ -632,13 +612,13 @@ impl Inner {
     }
 
     /// Start downloading a model from `url` in the background. Returns the
-    /// `local/<slug>` id immediately; progress and completion arrive as
+    /// `<slug>@local` id immediately; progress and completion arrive as
     /// [`Change::LocalModels`] emissions. If the URL matches a curated
     /// catalog entry its display name is adopted.
     pub(crate) async fn download_local_model(&self, url: &str) -> Result<String, AppError> {
         let (download_url, file_name) = normalize_model_url(url)?;
         let slug = slug_for_file(&file_name);
-        let id = format!("{LOCAL_MODEL_PREFIX}{slug}");
+        let id = engine_model_id(crate::backends::LOCAL_BACKEND_ID, &slug);
         let dir = models_dir(&self.data_dir);
 
         if dir.join(&file_name).exists() {
@@ -708,9 +688,9 @@ impl Inner {
     /// Cancel an in-flight download. The transfer task removes the partial
     /// file and emits when it notices (within one chunk).
     pub(crate) async fn cancel_local_model_download(&self, id: &str) -> Result<(), AppError> {
-        let slug = slug_of(id);
+        let (_, slug) = engine_key_for_id(id);
         let downloads = self.local.downloads.lock().expect("downloads lock");
-        match downloads.get(slug) {
+        match downloads.get(&slug) {
             Some(entry) => {
                 entry.cancel.store(true, Ordering::Relaxed);
                 Ok(())
@@ -774,8 +754,8 @@ impl Inner {
 
     /// Load a model: spawn `llama-server` on a free loopback port and wait
     /// until its `/health` endpoint reports ready (or the load fails).
-    /// Accepts `local/<slug>`, a bare slug (local shorthand), or a
-    /// llamacpp backend's `<slug>@<backend>`. Emits [`Change::LocalModels`]
+    /// Accepts `<slug>@<backend>` or a bare slug (shorthand for the
+    /// managed local store). Emits [`Change::LocalModels`]
     /// at spawn, on ready, and on failure; a supervisor task owns the child
     /// and also emits if the engine later exits unexpectedly.
     pub(crate) async fn load_local_model(&self, id: &str) -> Result<(), AppError> {
@@ -1240,29 +1220,28 @@ mod tests {
     fn slug_round_trips_through_id() {
         let slug = slug_for_file("gemma-4-E2B_q4_0-it.gguf");
         assert_eq!(slug, "gemma-4-E2B_q4_0-it");
-        let id = format!("{LOCAL_MODEL_PREFIX}{slug}");
-        assert_eq!(slug_of(&id), slug);
-        assert_eq!(slug_of(&slug), slug);
+        assert_eq!(engine_model_id("local", &slug), "gemma-4-E2B_q4_0-it@local");
     }
 
     #[test]
     fn engine_ids_and_keys_round_trip_per_backend() {
-        // The local singleton keeps the legacy `local/<slug>` form.
-        assert_eq!(engine_model_id("local", "tiny"), "local/tiny");
+        // Every engine backend uses the uniform qualified form; the alias
+        // equals the selection id.
+        assert_eq!(engine_model_id("local", "tiny"), "tiny@local");
         assert_eq!(
-            engine_key_for_id("local/tiny"),
+            engine_key_for_id("tiny@local"),
             ("local".to_string(), "tiny".to_string())
         );
-        // A bare slug is the local shorthand (the historic CLI form).
-        assert_eq!(
-            engine_key_for_id("tiny"),
-            ("local".to_string(), "tiny".to_string())
-        );
-        // llamacpp backends use the qualified form; alias == selection id.
         assert_eq!(engine_model_id("my-box", "tiny"), "tiny@my-box");
         assert_eq!(
             engine_key_for_id("tiny@my-box"),
             ("my-box".to_string(), "tiny".to_string())
+        );
+        // A bare slug is the managed-store shorthand for the management
+        // verbs (`eidola model load tiny`).
+        assert_eq!(
+            engine_key_for_id("tiny"),
+            ("local".to_string(), "tiny".to_string())
         );
     }
 }

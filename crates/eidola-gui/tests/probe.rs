@@ -275,7 +275,7 @@ fn space_probes_record_composer_and_band(cx: &mut TestAppContext) {
     assert!(
         names
             .iter()
-            .any(|n| n.starts_with("space/request-panel/row/")),
+            .any(|n| n.starts_with("space/request-panel/remote/eidola/")),
         "request panel model rows missing; recorded: {names:?}"
     );
     // The minimap is a navigable table of contents: a labelled Group of
@@ -643,8 +643,8 @@ fn request_panel_probes_appear_on_open_and_clear_on_dismiss(cx: &mut TestAppCont
         "panel probe missing after open: {names:?}"
     );
     assert!(
-        names.contains(&"space/request-panel/row/0".to_string())
-            && names.contains(&"space/request-panel/row/2".to_string()),
+        names.contains(&"space/request-panel/remote/eidola/0".to_string())
+            && names.contains(&"space/request-panel/remote/eidola/2".to_string()),
         "per-model row probes missing: {names:?}"
     );
 
@@ -872,7 +872,7 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
         }],
         models: vec![
             LocalModelInfo {
-                id: "local/tiny-a".into(),
+                id: "tiny-a@local".into(),
                 slug: "tiny-a".into(),
                 display_name: "Tiny A".into(),
                 file_name: "tiny-a.gguf".into(),
@@ -882,7 +882,7 @@ fn local_models_fixture() -> eidola_app_core::LocalModelsState {
                 last_error: None,
             },
             LocalModelInfo {
-                id: "local/tiny-b".into(),
+                id: "tiny-b@local".into(),
                 slug: "tiny-b".into(),
                 display_name: "Tiny B".into(),
                 file_name: "tiny-b.gguf".into(),
@@ -1072,15 +1072,15 @@ fn request_panel_lists_loaded_local_models_first(cx: &mut TestAppContext) {
     // Only the *loaded* local model appears (Tiny B), ahead of the remote
     // rows; the merely-downloaded Tiny A does not.
     assert!(
-        names.contains(&"space/request-panel/local/0".to_string()),
+        names.contains(&"space/request-panel/engine/local/0".to_string()),
         "loaded local model row missing: {names:?}"
     );
     assert!(
-        !names.contains(&"space/request-panel/local/1".to_string()),
+        !names.contains(&"space/request-panel/engine/local/1".to_string()),
         "an unloaded local model must not appear in the picker: {names:?}"
     );
     assert!(
-        names.contains(&"space/request-panel/row/0".to_string()),
+        names.contains(&"space/request-panel/remote/eidola/0".to_string()),
         "remote model rows must still render below the local group: {names:?}"
     );
 
@@ -1118,7 +1118,7 @@ fn request_panel_offline_shows_local_models_and_retry(cx: &mut TestAppContext) {
     // The loaded local model stays selectable even though the remote fetch
     // failed — the panel is never a dead end.
     assert!(
-        names.contains(&"space/request-panel/local/0".to_string()),
+        names.contains(&"space/request-panel/engine/local/0".to_string()),
         "loaded local model must show while offline: {names:?}"
     );
     // ...and the remote list offers a retry, not silent nothing.
@@ -1256,10 +1256,10 @@ fn request_panel_groups_per_backend_with_independent_health(cx: &mut TestAppCont
     let names = fresh_names(cx, window);
     for expected in [
         // Engine groups: the managed store and the llamacpp backend.
-        "space/request-panel/local/0",
+        "space/request-panel/engine/local/0",
         "space/request-panel/engine/my-box/0",
         // The healthy eidola catalog: rows + refresh, no retry.
-        "space/request-panel/row/0",
+        "space/request-panel/remote/eidola/0",
         "space/request-panel/eidola/refresh",
         // The dead openai backend: its own retry — nobody else's health.
         "space/request-panel/my-vllm/retry",

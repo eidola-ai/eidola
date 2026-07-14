@@ -334,13 +334,7 @@ impl SpaceView {
             panel = panel.child(group_header(header.clone(), !first_group, cx));
             first_group = false;
             for (idx, model) in models.iter().enumerate() {
-                // The managed store keeps its historic probe names; other
-                // engine backends scope under their id.
-                let probe_name = if backend_id == eidola_app_core::LOCAL_BACKEND_ID {
-                    format!("space/request-panel/local/{idx}")
-                } else {
-                    format!("space/request-panel/engine/{backend_id}/{idx}")
-                };
+                let probe_name = format!("space/request-panel/engine/{backend_id}/{idx}");
                 let ctx_tokens = match model.status {
                     eidola_app_core::LocalModelStatus::Loaded { context_tokens, .. } => {
                         context_tokens
@@ -381,11 +375,7 @@ impl SpaceView {
 
             let models = catalog.models.value().map(|v| v.as_slice()).unwrap_or(&[]);
             for (idx, model) in models.iter().enumerate() {
-                let probe_name = if catalog.backend.kind == eidola_app_core::BackendKind::Eidola {
-                    format!("space/request-panel/row/{idx}")
-                } else {
-                    format!("space/request-panel/remote/{backend_id}/{idx}")
-                };
+                let probe_name = format!("space/request-panel/remote/{backend_id}/{idx}");
                 panel = panel.child(self.panel_model_row(
                     probe_name,
                     model.id.clone(),

@@ -5,7 +5,7 @@ use turso::{Builder, Connection, Database, Value};
 use crate::error::AppError;
 
 const SCHEMA: &str = include_str!("../schema/schema.sql");
-const LATEST_VERSION: i64 = 4;
+const LATEST_VERSION: i64 = 1;
 
 /// Opens (or creates) the local database at `data_dir/eidola.db` and runs any
 /// pending migrations.
@@ -84,33 +84,6 @@ async fn migrate(conn: &Connection, current_version: i64) -> Result<(), AppError
                 message: format!("migration 1 failed: {e}"),
             })?;
         set_user_version(conn, 1).await?;
-    }
-
-    if current_version < 2 {
-        conn.execute_batch(MIGRATION_2)
-            .await
-            .map_err(|e| AppError::Database {
-                message: format!("migration 2 failed: {e}"),
-            })?;
-        set_user_version(conn, 2).await?;
-    }
-
-    if current_version < 3 {
-        conn.execute_batch(MIGRATION_3)
-            .await
-            .map_err(|e| AppError::Database {
-                message: format!("migration 3 failed: {e}"),
-            })?;
-        set_user_version(conn, 3).await?;
-    }
-
-    if current_version < 4 {
-        conn.execute_batch(MIGRATION_4)
-            .await
-            .map_err(|e| AppError::Database {
-                message: format!("migration 4 failed: {e}"),
-            })?;
-        set_user_version(conn, 4).await?;
     }
 
     Ok(())
@@ -2118,198 +2091,13 @@ pub async fn list_credential_lifecycle(
 // Migrations
 // ---------------------------------------------------------------------------
 
+/// Migration 1 is the full current schema — the pre-release baseline (all
+/// earlier incremental migrations were collapsed while the app had no real
+/// users). Future migrations append as `MIGRATION_N` constants + version
+/// blocks in `migrate()`; see AGENTS.md ("Adding a migration") and the
+/// `migrations_match_schema` test, which structurally compares a
+/// fresh-from-schema database against a fully-migrated one.
 const MIGRATION_1: &str = include_str!("../schema/schema.sql");
-
-/// Rebuild `action` to add the denormalized `supersedes_item_id` and the
-/// compound `(supersedes_action_id, supersedes_item_id)` FK. SQLite cannot add
-/// table constraints via `ALTER TABLE`, so: create the new shape, copy
-/// (backfilling the item from the row's own `item_id` — a generation chain
-/// never hops items, which is exactly the invariant the new FK enforces), swap,
-/// and recreate the indexes. The DDL must stay textually identical to
-/// `schema.sql`'s `action` table (the `migrations_match_schema` test compares
-/// them structurally).
-///
-/// Idempotent-safe: the copy's SELECT only names columns present in both the
-/// old and new shapes, so re-running against an already-new table is a no-op
-/// rebuild.
-const MIGRATION_2: &str = "\
-CREATE TABLE action_new (
-    id              TEXT PRIMARY KEY,          -- UUIDv7
-    space_id        TEXT NOT NULL REFERENCES space(id),
-    participant_id  TEXT NOT NULL REFERENCES participant(id),
-
-    -- generation identity (generation number is derived, not stored)
-    item_id              TEXT NOT NULL,
-    supersedes_action_id TEXT,
-    supersedes_item_id   TEXT,
-
-    action_type     TEXT NOT NULL CHECK (action_type IN (
-                        'user_input',
-                        'inference',
-                        'tool_call',
-                        'tool_result',
-                        'retrieval',
-                        'request',
-                        'checkpoint',
-                        'decision',
-                        'publish',
-                        'system',
-                        'error'
-                    )),
-
-    status          TEXT NOT NULL CHECK (status IN (
-                        'draft',
-                        'streaming',
-                        'complete',
-                        'cancelled',
-                        'error'
-                    )) DEFAULT 'complete',
-
-    intent          TEXT,
-    model           TEXT,
-
-    -- usage / cost
-    input_tokens    INTEGER,
-    output_tokens   INTEGER,
-    credits_consumed INTEGER,
-
-    created_at      INTEGER NOT NULL,
-
-    -- supersedes is item-scoped: both halves present together, the item
-    -- is this row's own, and the referenced (action, item) pair must
-    -- really exist — so a generation chain cannot hop items.
-    CHECK ((supersedes_action_id IS NULL) = (supersedes_item_id IS NULL)),
-    CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
-    FOREIGN KEY (supersedes_action_id, supersedes_item_id)
-        REFERENCES action (id, item_id)
-);
-
-INSERT INTO action_new (id, space_id, participant_id, item_id,
-    supersedes_action_id, supersedes_item_id, action_type, status, intent,
-    model, input_tokens, output_tokens, credits_consumed, created_at)
-SELECT id, space_id, participant_id, item_id, supersedes_action_id,
-       CASE WHEN supersedes_action_id IS NULL THEN NULL ELSE item_id END,
-       action_type, status, intent, model, input_tokens, output_tokens,
-       credits_consumed, created_at
-FROM action;
-
-DROP TABLE action;
-ALTER TABLE action_new RENAME TO action;
-
-CREATE INDEX idx_action_space ON action (space_id, created_at);
-CREATE INDEX idx_action_participant ON action (participant_id);
-CREATE INDEX idx_action_type ON action (action_type);
-CREATE INDEX idx_action_item ON action (space_id, item_id);
-CREATE INDEX idx_action_status ON action (status)
-    WHERE status != 'complete';
-
-CREATE UNIQUE INDEX idx_one_successor_per_action
-    ON action (supersedes_action_id)
-    WHERE supersedes_action_id IS NOT NULL;
-
-CREATE UNIQUE INDEX idx_action_id_item ON action (id, item_id);
-";
-
-/// One gen-0 per item: together with `idx_one_successor_per_action`, an
-/// item's tip becomes provably unique (previously a convention only — a
-/// second gen-0 row would have given `item_current` two rows for one item).
-const MIGRATION_3: &str = "\
-CREATE UNIQUE INDEX idx_one_root_per_item
-    ON action (space_id, item_id)
-    WHERE supersedes_action_id IS NULL;
-";
-
-/// The backend registry: configured inference destinations (the eidola and
-/// local singletons plus user-added OpenAI-compatible / llama.cpp servers),
-/// and the forensic `request.backend_id` reference. The singleton rows are
-/// seeded by `ensure_default_backends` on every open, not here — so
-/// databases from before this migration and fresh installs get identical
-/// treatment. DDL mirrors `schema.sql` (the `migrations_match_schema` test
-/// compares them structurally).
-///
-/// Idempotent-safe, like MIGRATION_2: the backend table/index guard with
-/// IF NOT EXISTS, and `backend_id` is added to `request` via a rebuild
-/// whose copy SELECT names only columns present in both the old and new
-/// shapes — so replaying over an already-current schema is a no-op rebuild
-/// (an ALTER TABLE ADD COLUMN would instead fail with a duplicate column).
-const MIGRATION_4: &str = "\
-CREATE TABLE IF NOT EXISTS backend (
-    id              TEXT PRIMARY KEY,          -- user-visible slug
-    kind            TEXT NOT NULL CHECK (kind IN (
-                        'eidola', 'local', 'openai', 'llamacpp'
-                    )),
-    display_name    TEXT NOT NULL,
-    enabled         INTEGER NOT NULL DEFAULT 1,
-    base_url        TEXT,
-    api_key         TEXT,
-    models_dir      TEXT,
-    model_overrides TEXT,                      -- JSON array
-    created_at      INTEGER NOT NULL,
-    updated_at      INTEGER NOT NULL,
-    removed_at      INTEGER
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_backend_singleton
-    ON backend (kind)
-    WHERE kind IN ('eidola', 'local');
-
-CREATE TABLE request_new (
-    id                TEXT PRIMARY KEY,        -- UUIDv7
-    connection_id     TEXT REFERENCES connection(id),
-    action_id         TEXT REFERENCES action(id),
-
-    method            TEXT NOT NULL,
-    path              TEXT NOT NULL,
-    request_headers   TEXT,
-    request_body      BLOB,
-
-    response_status   INTEGER,
-    response_headers  TEXT,
-    response_body     BLOB,
-
-    request_at        INTEGER NOT NULL,
-    response_at       INTEGER,
-    duration_ms       INTEGER,
-
-    error             TEXT,
-
-    retry_of_id       TEXT REFERENCES request(id),
-    attempt_number    INTEGER NOT NULL DEFAULT 1,
-
-    credential_nonce  TEXT REFERENCES credential(nonce),
-
-    created_at        INTEGER NOT NULL,
-
-    -- The configured backend this request was routed through, when the
-    -- request belongs to one (chat turns; NULL for e.g. attestation-only
-    -- traffic recorded before backends existed).
-    backend_id        TEXT REFERENCES backend(id)
-);
-
-INSERT INTO request_new (id, connection_id, action_id, method, path,
-    request_headers, request_body, response_status, response_headers,
-    response_body, request_at, response_at, duration_ms, error, retry_of_id,
-    attempt_number, credential_nonce, created_at)
-SELECT id, connection_id, action_id, method, path, request_headers,
-    request_body, response_status, response_headers, response_body,
-    request_at, response_at, duration_ms, error, retry_of_id,
-    attempt_number, credential_nonce, created_at
-FROM request;
-
-DROP TABLE request;
-ALTER TABLE request_new RENAME TO request;
-
-CREATE INDEX idx_request_action
-    ON request (action_id)
-    WHERE action_id IS NOT NULL;
-
-CREATE INDEX idx_request_connection
-    ON request (connection_id);
-
-CREATE INDEX idx_request_credential
-    ON request (credential_nonce)
-    WHERE credential_nonce IS NOT NULL;
-";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2756,64 +2544,6 @@ mod tests {
         assert!(
             dup.is_err(),
             "a second gen-0 for one item must violate idx_one_root_per_item"
-        );
-    }
-
-    /// A genuine v1-shaped database (the pre-`supersedes_item_id` action DDL)
-    /// migrated by MIGRATION_2: the rebuild must backfill the denormalized
-    /// item from each row's own item_id and preserve every row.
-    #[tokio::test]
-    async fn migration_2_backfills_supersedes_item_id() {
-        let db = Builder::new_local(":memory:").build().await.unwrap();
-        let conn = db.connect().unwrap();
-
-        // The v1 `action` shape (no supersedes_item_id, inline FK).
-        conn.execute_batch(
-            "CREATE TABLE action (
-                id              TEXT PRIMARY KEY,
-                space_id        TEXT NOT NULL,
-                participant_id  TEXT NOT NULL,
-                item_id              TEXT NOT NULL,
-                supersedes_action_id TEXT REFERENCES action(id),
-                action_type     TEXT NOT NULL,
-                status          TEXT NOT NULL DEFAULT 'complete',
-                intent          TEXT,
-                model           TEXT,
-                input_tokens    INTEGER,
-                output_tokens   INTEGER,
-                credits_consumed INTEGER,
-                created_at      INTEGER NOT NULL
-            );
-            INSERT INTO action (id, space_id, participant_id, item_id,
-                supersedes_action_id, action_type, status, created_at)
-            VALUES
-                ('u1',  's', 'p', 'iu1', NULL, 'user_input', 'complete', 1),
-                ('u1b', 's', 'p', 'iu1', 'u1', 'user_input', 'complete', 2);",
-        )
-        .await
-        .unwrap();
-
-        conn.execute_batch(MIGRATION_2).await.unwrap();
-
-        let mut stmt = conn
-            .prepare("SELECT id, supersedes_item_id FROM action ORDER BY id")
-            .await
-            .unwrap();
-        let mut rows = stmt.query(()).await.unwrap();
-        let mut got = Vec::new();
-        while let Some(row) = rows.next().await.unwrap() {
-            got.push((
-                row.get::<String>(0).unwrap(),
-                row.get::<Option<String>>(1).unwrap(),
-            ));
-        }
-        assert_eq!(
-            got,
-            vec![
-                ("u1".to_string(), None),
-                ("u1b".to_string(), Some("iu1".to_string())),
-            ],
-            "gen-0 stays NULL; a superseding generation backfills its own item"
         );
     }
 

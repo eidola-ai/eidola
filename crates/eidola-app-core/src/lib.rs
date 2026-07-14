@@ -31,8 +31,8 @@ use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
 use error::AppError;
 pub use local_models::{
-    ExternalEngineBackend, LOCAL_MODEL_CATALOG, LOCAL_MODEL_PREFIX, LocalCatalogEntry,
-    LocalModelInfo, LocalModelStatus, LocalModelsState,
+    ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
+    LocalModelStatus, LocalModelsState,
 };
 
 // ============================================================================
@@ -1651,13 +1651,9 @@ impl Inner {
         // The canonical selection string (recorded on actions, shown in
         // UIs) and the wire model (what the backend's HTTP API expects).
         // Engine-backed aliases are spawned equal to the canonical id, so
-        // the two coincide there; openai backends get the bare model.
-        let canonical_model = match backend_kind {
-            BackendKind::Local | BackendKind::LlamaCpp => {
-                local_models::engine_model_id(&backend.id, local_models::slug_of(&mref.model))
-            }
-            _ => backends::qualified_model_id(&mref.model, &backend.id),
-        };
+        // the two coincide there (as they do for eidola, where canonical is
+        // the bare model); openai backends get the bare model.
+        let canonical_model = backends::qualified_model_id(&mref.model, &backend.id);
         let wire_model = match backend_kind {
             BackendKind::OpenAi => mref.model.clone(),
             _ => canonical_model.clone(),
@@ -1674,10 +1670,9 @@ impl Inner {
             external_auth,
         ) = match backend_kind {
             BackendKind::Local | BackendKind::LlamaCpp => {
-                let slug = local_models::slug_of(&mref.model);
                 let (engine_url, context_tokens) = self
                     .local
-                    .ready_engine(&backend.id, slug)
+                    .ready_engine(&backend.id, &mref.model)
                     .ok_or_else(|| AppError::LocalModel {
                         message: format!(
                             "`{model}` is not loaded — load it in Settings → Backends"
@@ -3153,7 +3148,7 @@ impl AppCore {
     }
 
     /// Start a background model download from a direct `.gguf` URL (or a
-    /// Hugging Face file-page URL). Returns the future `local/<slug>` id
+    /// Hugging Face file-page URL). Returns the future `<slug>@local` id
     /// immediately; progress arrives via [`Change::LocalModels`].
     pub async fn download_local_model(&self, url: String) -> Result<String, AppError> {
         let inner = self.inner.clone();

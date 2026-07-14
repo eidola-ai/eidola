@@ -106,10 +106,10 @@ The client can run models entirely on-device through [llama.cpp](https://github.
 ```bash
 cargo run -p eidola-cli -- model list                   # curated Gemma 4 catalog + installed models
 cargo run -p eidola-cli -- model download gemma-4-e2b   # or any .gguf / Hugging Face file URL
-cargo run -p eidola-cli -- chat "hello" --model local/gemma-4-E2B_q4_0-it
+cargo run -p eidola-cli -- chat "hello" --model gemma-4-E2B_q4_0-it@local
 ```
 
-Local models are identified as `local/<file-stem>` and stored under the app data directory (`~/Library/Application Support/eidola/models/` on macOS). In the GUI, **Settings → Backends** manages downloads and engine load/unload, and loaded models appear at the top of the model picker under "On this device".
+Local models are identified as `<file-stem>@local` — the same `<model>@<backend>` form every configured backend uses — and stored under the app data directory (`~/Library/Application Support/eidola/models/` on macOS). In the GUI, **Settings → Backends** manages downloads and engine load/unload, and loaded models appear at the top of the model picker under "On this device".
 
 ### Backends
 

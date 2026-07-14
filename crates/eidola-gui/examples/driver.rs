@@ -394,7 +394,7 @@ mod driver {
             external: Vec::new(),
             models: vec![
                 LocalModelInfo {
-                    id: "local/gemma-4-12b-it-qat-q4_0".into(),
+                    id: "gemma-4-12b-it-qat-q4_0@local".into(),
                     slug: "gemma-4-12b-it-qat-q4_0".into(),
                     display_name: "Gemma 4 12B".into(),
                     file_name: "gemma-4-12b-it-qat-q4_0.gguf".into(),
@@ -407,7 +407,7 @@ mod driver {
                     last_error: None,
                 },
                 LocalModelInfo {
-                    id: "local/gemma-4-E2B_q4_0-it".into(),
+                    id: "gemma-4-E2B_q4_0-it@local".into(),
                     slug: "gemma-4-E2B_q4_0-it".into(),
                     display_name: "Gemma 4 E2B".into(),
                     file_name: "gemma-4-E2B_q4_0-it.gguf".into(),
@@ -420,7 +420,7 @@ mod driver {
                     last_error: None,
                 },
                 LocalModelInfo {
-                    id: "local/gemma-4-E4B_q4_0-it".into(),
+                    id: "gemma-4-E4B_q4_0-it@local".into(),
                     slug: "gemma-4-E4B_q4_0-it".into(),
                     display_name: "Gemma 4 E4B".into(),
                     file_name: "gemma-4-E4B_q4_0-it.gguf".into(),

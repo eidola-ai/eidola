@@ -892,7 +892,7 @@ fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext
             engine_path: None,
             external: Vec::new(),
             models: vec![eidola_app_core::LocalModelInfo {
-                id: "local/tiny".into(),
+                id: "tiny@local".into(),
                 slug: "tiny".into(),
                 display_name: "Tiny".into(),
                 file_name: "tiny.gguf".into(),
@@ -921,7 +921,7 @@ fn settings_backends_pane_stub_ops_stop_at_backend_guard(cx: &mut TestAppContext
         // The fixture snapshot survives untouched (no refresh happened).
         assert_eq!(s.models().len(), 1);
         assert_eq!(s.loaded_models().len(), 1);
-        assert_eq!(s.loaded_models()[0].id, "local/tiny");
+        assert_eq!(s.loaded_models()[0].id, "tiny@local");
     });
 }
 

@@ -501,8 +501,8 @@ CREATE TABLE request (
     created_at        INTEGER NOT NULL,
 
     -- The configured backend this request was routed through, when the
-    -- request belongs to one (chat turns; NULL for e.g. attestation-only
-    -- traffic recorded before backends existed).
+    -- request belongs to one (chat turns; NULL for traffic that isn't
+    -- addressed to a configured backend).
     backend_id        TEXT REFERENCES backend(id)
 );
 

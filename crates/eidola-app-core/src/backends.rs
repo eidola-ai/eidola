@@ -26,12 +26,15 @@
 //!
 //! ## Model references
 //!
-//! A model selection is qualified as `<model>@<backend-id>`, parsed at the
-//! **last** `@` (backend ids are validated to `[a-z0-9-]`, so the split is
-//! unambiguous even for Ollama-style `name:tag` or HF-style `org/model`
-//! ids). Two legacy forms stay first-class: a bare model id routes to
-//! `eidola`, and `local/<slug>` routes to `local` — so existing configs,
-//! space histories, and CLI invocations keep working unchanged.
+//! One rule, uniformly applied: a model selection is
+//! `<model>@<backend-id>`, parsed at the **last** `@` (backend ids are
+//! validated to `[a-z0-9-]`, so the split is unambiguous even for
+//! Ollama-style `name:tag` or HF-style `org/model` ids). The single sugar:
+//! `eidola`, being the default backend, may be written bare — `gemma4-31b`
+//! means `gemma4-31b@eidola`, and [`qualified_model_id`] keeps the bare
+//! form canonical so the common case reads clean everywhere (config,
+//! action rows, the CLI). Every other backend — the local singleton
+//! included — always spells its models qualified (`<slug>@local`).
 //!
 //! ## Forensics
 //!
@@ -134,10 +137,10 @@ pub struct ModelRef {
     pub model: String,
 }
 
-/// Parse a model selection string. `<model>@<backend>` splits at the last
-/// `@`; a bare `local/<slug>` routes to the local singleton (legacy form);
-/// anything else routes to `eidola`. Pure and infallible — whether the
-/// backend *exists* is the router's question, not the parser's.
+/// Parse a model selection string: `<model>@<backend>` splits at the last
+/// `@`; a bare selection routes to `eidola` (the default backend's sugar).
+/// Pure and infallible — whether the backend *exists* is the router's
+/// question, not the parser's.
 pub fn parse_model_ref(selection: &str) -> ModelRef {
     if let Some(at) = selection.rfind('@') {
         let (model, backend) = selection.split_at(at);
@@ -149,12 +152,6 @@ pub fn parse_model_ref(selection: &str) -> ModelRef {
             };
         }
     }
-    if selection.starts_with(crate::local_models::LOCAL_MODEL_PREFIX) {
-        return ModelRef {
-            backend_id: LOCAL_BACKEND_ID.to_string(),
-            model: selection.to_string(),
-        };
-    }
     ModelRef {
         backend_id: EIDOLA_BACKEND_ID.to_string(),
         model: selection.to_string(),
@@ -162,16 +159,13 @@ pub fn parse_model_ref(selection: &str) -> ModelRef {
 }
 
 /// The canonical selection string for a (model, backend) pair — the inverse
-/// of [`parse_model_ref`]. Eidola models stay bare and `local/<slug>` stays
-/// the local singleton's canonical form, so histories and configs written
-/// before backends existed remain the canonical spelling.
+/// of [`parse_model_ref`]. Eidola models stay bare (the default backend's
+/// sugar); every other backend's models are spelled qualified.
 pub fn qualified_model_id(model: &str, backend_id: &str) -> String {
-    match backend_id {
-        EIDOLA_BACKEND_ID => model.to_string(),
-        LOCAL_BACKEND_ID if model.starts_with(crate::local_models::LOCAL_MODEL_PREFIX) => {
-            model.to_string()
-        }
-        _ => format!("{model}@{backend_id}"),
+    if backend_id == EIDOLA_BACKEND_ID {
+        model.to_string()
+    } else {
+        format!("{model}@{backend_id}")
     }
 }
 
@@ -546,12 +540,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_legacy_local_prefix_routes_to_local() {
+    fn parse_local_models_are_qualified_like_any_backend() {
         assert_eq!(
-            parse_model_ref("local/gemma-4-E2B_q4_0-it"),
+            parse_model_ref("gemma-4-E2B_q4_0-it@local"),
             ModelRef {
                 backend_id: "local".into(),
-                model: "local/gemma-4-E2B_q4_0-it".into()
+                model: "gemma-4-E2B_q4_0-it".into()
             }
         );
     }
@@ -586,7 +580,7 @@ mod tests {
     fn qualified_id_round_trips() {
         for (model, backend) in [
             ("gemma4-31b", "eidola"),
-            ("local/tiny", "local"),
+            ("tiny", "local"),
             ("qwen3-8b", "my-llama"),
             ("llama3:8b", "ollama-box"),
         ] {
@@ -595,9 +589,10 @@ mod tests {
             assert_eq!(parsed.backend_id, backend, "{q}");
             assert_eq!(parsed.model, model, "{q}");
         }
-        // The legacy forms stay canonical (no redundant qualifier).
+        // The default backend's sugar stays canonical (no redundant
+        // qualifier); everything else is spelled out.
         assert_eq!(qualified_model_id("gemma4-31b", "eidola"), "gemma4-31b");
-        assert_eq!(qualified_model_id("local/tiny", "local"), "local/tiny");
+        assert_eq!(qualified_model_id("tiny", "local"), "tiny@local");
     }
 
     #[test]
