@@ -158,8 +158,11 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
         _ => (String::new(), String::new()),
     };
     // The in-page ToC rail: docs and posts with enough structure to be
-    // worth navigating. toc.js drives the scroll-spy state.
-    let toc = if matches!(page.kind, PageKind::Doc | PageKind::Post) && page.headings.len() >= 3 {
+    // worth navigating (the h1 doesn't count toward the threshold — it's
+    // the scroll-to-top entry, not structure). toc.js drives the
+    // scroll-spy state.
+    let structure = page.headings.iter().filter(|h| h.level >= 2).count();
+    let toc = if matches!(page.kind, PageKind::Doc | PageKind::Post) && structure >= 3 {
         let mut items = String::new();
         for heading in &page.headings {
             items.push_str(&format!(
@@ -336,18 +339,25 @@ mod tests {
 
         let mut page = doc_page();
         page.headings = vec![
+            heading(1, "the-client", "The client"),
             heading(2, "one", "One"),
             heading(3, "one-a", "One A"),
             heading(2, "two", "Two"),
         ];
         let html = layout(&page, None);
         assert!(html.contains("class=\"toc\""));
+        assert!(html.contains("<li class=\"toc-h1\"><a href=\"#the-client\">The client</a></li>"));
         assert!(html.contains("<li class=\"toc-h3\"><a href=\"#one-a\">One A</a></li>"));
         assert!(html.contains("/assets/toc.js"));
 
-        // Too little structure -> no rail, no script.
+        // Too little structure -> no rail, no script. The h1 is the
+        // scroll-to-top entry, so it doesn't count toward the threshold.
         let mut short = doc_page();
-        short.headings = vec![heading(2, "only", "Only")];
+        short.headings = vec![
+            heading(1, "title", "Title"),
+            heading(2, "only", "Only"),
+            heading(2, "other", "Other"),
+        ];
         let html = layout(&short, None);
         assert!(!html.contains("class=\"toc\""));
         assert!(!html.contains("/assets/toc.js"));

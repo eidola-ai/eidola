@@ -76,6 +76,7 @@ fn builds_the_real_site() {
     let trust_root = read(&out, "docs/trust-root/index.html");
     assert!(trust_root.contains("class=\"toc\""));
     assert!(trust_root.contains("<a href=\"#whats-pinned\">"));
+    assert!(trust_root.contains("class=\"toc-h1\""));
     assert!(trust_root.contains("/assets/toc.js"));
     assert!(!read(&out, "privacy/index.html").contains("class=\"toc\""));
     assert!(read(&out, "assets/toc.js").contains("aria-current"));

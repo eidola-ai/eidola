@@ -21,7 +21,8 @@ pub struct Rendered {
     pub first_heading: Option<String>,
     /// Plain text of the first paragraph, for blog-index snippets.
     pub first_paragraph: Option<String>,
-    /// h2/h3 headings in document order, for the in-page table of contents.
+    /// h1/h2/h3 headings in document order, for the in-page table of
+    /// contents (the h1 gives the rail a scroll-to-top entry).
     pub headings: Vec<Heading>,
 }
 
@@ -142,9 +143,16 @@ pub fn render(body: &str, source_dir: &str) -> Rendered {
                     slug = format!("{base}-{n}");
                 }
                 used_ids.push(slug.clone());
-                if matches!(level, HeadingLevel::H2 | HeadingLevel::H3) {
+                if matches!(
+                    level,
+                    HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3
+                ) {
                     headings.push(Heading {
-                        level: if level == HeadingLevel::H2 { 2 } else { 3 },
+                        level: match level {
+                            HeadingLevel::H1 => 1,
+                            HeadingLevel::H2 => 2,
+                            _ => 3,
+                        },
                         id: slug.clone(),
                         text: text.clone(),
                     });

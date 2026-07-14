@@ -43,7 +43,7 @@ pub enum PageKind {
 }
 
 /// A heading collected during rendering, for the in-page table of
-/// contents (h2/h3 only — the h1 is the page itself).
+/// contents (h1–h3; the h1 renders as the rail's scroll-to-top entry).
 pub struct Heading {
     pub level: u8,
     pub id: String,
@@ -62,7 +62,7 @@ pub struct Page {
     pub draft: bool,
     /// Rendered markdown body.
     pub html: String,
-    /// h2/h3 headings, in document order.
+    /// h1/h2/h3 headings, in document order.
     pub headings: Vec<Heading>,
     /// Repo-relative source path (docs pages only) — drives the
     /// edit-on-GitHub link.

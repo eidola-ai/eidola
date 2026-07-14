@@ -448,6 +448,12 @@ main.prose {
   text-decoration: none;
 }
 
+/* The page's h1 leads the rail as a scroll-to-top entry: same indent as
+ * the sections, distinguished by weight alone (the heading-ramp rule). */
+.toc .toc-h1 a {
+  font-weight: 600;
+}
+
 .toc .toc-h3 a {
   padding-left: 28px;
 }
