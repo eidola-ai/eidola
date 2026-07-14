@@ -343,7 +343,7 @@ main.prose {
 
 .docs-sidebar .docs-nav-group,
 .docs-nav-inline .docs-nav-group {
-  margin: 0 0 1.25rem;
+  margin: 0 0 1.25rem 1rem;
 }
 
 .docs-sidebar a,
@@ -406,10 +406,10 @@ main.prose {
  * above it, so the filled edge doubles as reading progress. */
 
 .toc {
-  display: none;
+  display: block;
   grid-column: 3;
   justify-self: start;
-  width: 220px;
+  width: 200px;
   margin-left: 24px;
   padding: 32px 0;
   position: sticky;
@@ -421,9 +421,9 @@ main.prose {
   line-height: 1.5;
 }
 
-@media (min-width: 1200px) {
+@media (max-width: 1103px) {
   .toc {
-    display: block;
+    display: none;
   }
 }
 
@@ -441,7 +441,7 @@ main.prose {
 
 .toc a {
   display: block;
-  padding: 3px 0 3px 14px;
+  padding: 3px 1rem 3px;
   margin-left: -1px;
   border-left: 1px solid transparent;
   color: var(--muted-foreground);
@@ -570,14 +570,13 @@ main.prose {
 
 .site-footer {
   width: 100%;
-  max-width: 648px;
+  max-width: 1102px;
   margin: 0 auto;
   padding: 20px 24px 48px;
-  border-top: 1px solid var(--border);
   display: flex;
   flex-wrap: wrap;
   gap: 8px 20px;
-  align-items: baseline;
+  align-items: center;
   color: var(--muted-foreground);
   font-size: 13px;
 }
@@ -599,10 +598,49 @@ main.prose {
 .appearance {
   margin-left: auto;
   display: flex;
+  /* The icon stays anchored at the right; options expand inline to its
+     left when the disclosure is open. */
+  flex-direction: row-reverse;
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 2px;
+}
+
+.appearance:active, .appearance:hover, .appearance[open] {
+    border-color: var(--border);
+}
+
+.appearance[open] {
+    gap: 8px;
+}
+
+/* The collapsed trigger: the icon of the mode actually in use (set by JS). */
+.appearance > summary {
+  list-style: none;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  font-size: 14px;
+  line-height: 1;
+  user-select: none;
+  padding: 3px 8px;
+}
+
+.appearance > summary::-webkit-details-marker {
+  display: none;
+}
+
+.appearance > summary:hover,
+.appearance[open] > summary {
+  color: var(--foreground);
+}
+
+.appearance-options {
+  display: flex;
   gap: 2px;
 }
 
-.appearance button {
+.appearance-options button {
   background: none;
   border: none;
   padding: 2px 6px;
@@ -612,11 +650,11 @@ main.prose {
   border-radius: var(--radius);
 }
 
-.appearance button:hover {
+.appearance-options button:hover {
   color: var(--foreground);
 }
 
-.appearance button[aria-pressed="true"] {
+.appearance-options button[aria-pressed="true"] {
   color: var(--foreground);
   background: var(--secondary);
 }

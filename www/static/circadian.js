@@ -5,8 +5,10 @@
 //
 // Defaults mirror the app: appearance = auto (light between canonical
 // 06:00 and 18:00, dark otherwise), time-of-day tint = on. The footer
-// control can pin appearance to day/night (persisted in localStorage);
-// there is no tint control on the site.
+// control (a ☀/☾ disclosure — the glyph reflects the mode in use — that
+// expands inline to the options) can pin appearance to day/night, or follow
+// the OS color scheme ("system"), all persisted in localStorage; there is
+// no tint control on the site.
 //
 // Geography, like the app, is inferred from the IANA timezone — never
 // from geolocation. The browser has no tzdb, so zones.js ships a snapshot
@@ -104,7 +106,21 @@
     } catch (e) {
       /* private mode etc. */
     }
-    return stored === "day" || stored === "night" ? stored : "auto";
+    return stored === "day" || stored === "night" || stored === "system"
+      ? stored
+      : "auto";
+  }
+
+  // Whether the OS reports a dark color scheme. Used only in "system" mode.
+  function prefersDark() {
+    try {
+      return !!(
+        window.matchMedia &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches
+      );
+    } catch (e) {
+      return false;
+    }
   }
 
   function resolve() {
@@ -117,6 +133,7 @@
     var isDay;
     if (pref === "day") isDay = true;
     else if (pref === "night") isDay = false;
+    else if (pref === "system") isDay = !prefersDark();
     else if (ph.kind === "polar-day") isDay = true;
     else if (ph.kind === "polar-night") isDay = false;
     else isDay = canonical >= 6 && canonical < 18;
@@ -126,6 +143,13 @@
 
     var root = document.documentElement;
     if (root.dataset.palette !== palette) root.dataset.palette = palette;
+
+    // The collapsed trigger shows the icon of the mode actually in use.
+    var summary = document.querySelector(".appearance > summary");
+    if (summary) {
+      var glyph = isDay ? "☀" : "☾";
+      if (summary.textContent !== glyph) summary.textContent = glyph;
+    }
 
     var buttons = document.querySelectorAll(".appearance button");
     for (var i = 0; i < buttons.length; i++) {
@@ -146,6 +170,7 @@
   }
 
   function wireToggle() {
+    var details = document.querySelector("details.appearance");
     var buttons = document.querySelectorAll(".appearance button");
     for (var i = 0; i < buttons.length; i++) {
       buttons[i].addEventListener("click", function (ev) {
@@ -156,9 +181,33 @@
         } catch (e) {
           /* ignore */
         }
+        if (details) details.removeAttribute("open"); // collapse after choosing
         resolve();
       });
     }
+
+    if (!details) return;
+    // Collapse the disclosure on an outside click or Escape.
+    document.addEventListener("click", function (ev) {
+      if (details.hasAttribute("open") && !details.contains(ev.target)) {
+        details.removeAttribute("open");
+      }
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") details.removeAttribute("open");
+    });
+  }
+
+  // Re-resolve when the OS color scheme flips, but only while in "system" mode.
+  try {
+    var mq = window.matchMedia("(prefers-color-scheme: dark)");
+    var onSchemeChange = function () {
+      if (appearance() === "system") resolve();
+    };
+    if (mq.addEventListener) mq.addEventListener("change", onSchemeChange);
+    else if (mq.addListener) mq.addListener(onSchemeChange);
+  } catch (e) {
+    /* ignore */
   }
 
   wireToggle();

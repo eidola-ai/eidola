@@ -225,9 +225,12 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
 <a href="/privacy/">Privacy</a>
 <a href="/terms/">Terms</a>
 </nav>
-<div class="appearance" role="group" aria-label="Appearance">
-<button data-appearance="auto">auto</button><button data-appearance="day">day</button><button data-appearance="night">night</button>
+<details class="appearance">
+<summary aria-label="Appearance" title="Appearance">☀</summary>
+<div class="appearance-options" role="group" aria-label="Appearance">
+<button data-appearance="auto">auto</button><button data-appearance="system">system</button><button data-appearance="day">day</button><button data-appearance="night">night</button>
 </div>
+</details>
 </footer>
 </body>
 </html>
