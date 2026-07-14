@@ -1,8 +1,8 @@
-# Contributing docs
+# Contributor runbooks
 
 Operational runbooks and how-to guides for people *working on* Eidola — release engineers, maintainers, and contributors carrying out a specific procedure.
 
-If you are looking for conceptual or architectural docs, move one level up in [`docs/`](../README.md), where you will find articlees on *how the system works and why*.
+If you are looking for conceptual or architectural docs, move one level up in [`docs/`](../README.md), where you will find articles on *how the system works and why*.
 
 ## Index
 

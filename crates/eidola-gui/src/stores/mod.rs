@@ -2,7 +2,7 @@
 //! entity per domain, created at startup and held in `AppGlobal`.
 //!
 //! This module replaces the old `Core` god-object. See
-//! `docs/architecture/state.md` ("Domain stores", "Loadable", "Concurrency
+//! `crates/eidola-gui/STATE.md` ("Domain stores", "Loadable", "Concurrency
 //! patterns") for the governing contract. In short:
 //!
 //! - Each store owns its `Loadable` snapshots, its in-flight `Task` fields
@@ -205,7 +205,7 @@ pub fn install_bus_bridge(stores: &Stores, cx: &mut App) {
     let stores = stores.clone();
     // App-lifetime task: it lives for the whole process and there is nothing
     // to cancel it against, so `.detach()` is the *sanctioned* exception to
-    // the no-detach rule (see `docs/architecture/state.md` principle 3 and the
+    // the no-detach rule (see `crates/eidola-gui/STATE.md` principle 3 and the
     // stores module docs). Every other task in the app is owned by an entity
     // field with replace-cancels semantics.
     let task: gpui::Task<()> = cx.spawn(async move |cx: &mut AsyncApp| {

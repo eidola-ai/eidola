@@ -8,7 +8,7 @@
 //! entity makes the modifier state available to every descendant via
 //! `cx.observe(&window_input, …)`, regardless of which leaf holds focus.
 //!
-//! ## Rules (see `docs/architecture/state.md` — "Input-state sharing")
+//! ## Rules (see `crates/eidola-gui/STATE.md` — "Input-state sharing")
 //!
 //! - **One listener per window**, registered on the root view. Descendants
 //!   observe the entity; they never register `on_modifiers_changed` themselves.

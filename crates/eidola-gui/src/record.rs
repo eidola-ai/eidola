@@ -201,7 +201,7 @@ struct Listing<T> {
     /// (refresh) drops the slot and cancels the in-flight task, so a
     /// superseded fetch can never land late and append stale or duplicate
     /// rows — replace-cancels, no generation counters
-    /// (`docs/architecture/state.md` → "Concurrency patterns").
+    /// (`crates/eidola-gui/STATE.md` → "Concurrency patterns").
     task: Option<Task<()>>,
 }
 

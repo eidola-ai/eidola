@@ -35,7 +35,7 @@ use tokio::sync::broadcast;
 /// write.  Consumers subscribe via [`ChangeSource::subscribe`] and refresh
 /// the affected domain(s) on receipt.
 ///
-/// Each variant maps 1:1 to a domain store (see `docs/architecture/state.md`).
+/// Each variant maps 1:1 to a domain store (see `crates/eidola-gui/STATE.md`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
     /// The on-disk config was updated (any field: base URL, account

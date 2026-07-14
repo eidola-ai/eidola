@@ -65,13 +65,15 @@
 //!
 //! The body font is **Newsreader** (SIL OFL 1.1), shipped as the upstream
 //! `productiontype/Newsreader` 16pt static instances and embedded into the
-//! binary. We ship five faces — Regular / Italic / SemiBold / Bold /
+//! binary. We ship six faces — Regular / Italic / Medium / SemiBold / Bold /
 //! BoldItalic — because gpui's macOS text system does **not** apply
 //! variable-font weight axes: each registered TTF is one face with the
 //! properties of its default instance, and `font_kit::matching::find_best_match`
 //! picks the closest face per weight request. With only a variable upright +
 //! italic registered, every weight request resolved to Regular; with the
-//! statics it resolves correctly (heading SEMIBOLD, **bold** BOLD, etc.).
+//! statics it resolves correctly (prose headings MEDIUM, **bold** BOLD, etc.).
+//! Medium (500) is the prose heading weight (see `space_view::prose_style`);
+//! without the static face a 500 request would fall back to Regular.
 //!
 //! Family names: the 16pt statics report `Newsreader 16pt` as their
 //! typographic family (nid 16 — the SemiBold needs nid 16 to override its
@@ -102,14 +104,16 @@ use crate::stores::ConfigStore;
 /// the theme leaves components on the system UI font.
 pub const FONT_FAMILY: &str = "Newsreader 16pt";
 
-/// 16pt static instances from `productiontype/Newsreader`. Five faces are the
+/// 16pt static instances from `productiontype/Newsreader`. Six faces are the
 /// minimum to make markdown bold/italic/heading weights render correctly:
-/// `find_best_match` picks SemiBold for h2-h5, Bold for h1 and **strong**,
-/// BoldItalic for ***bold-italic***, Italic for `*emphasis*`, Regular for
-/// body. Without a SemiBold the headings would still bold-fall-back; we ship
-/// it for the visual cue between heading and body.
+/// `find_best_match` picks Medium for prose headings, SemiBold for the
+/// editor's default heading ramp, Bold for **strong**, BoldItalic for
+/// ***bold-italic***, Italic for `*emphasis*`, Regular for body. Medium (500)
+/// backs the prose heading weight (`space_view::prose_style`); without the
+/// static face a 500 request falls back to Regular.
 const NEWSREADER_REGULAR_TTF: &[u8] = include_bytes!("../assets/fonts/Newsreader16pt-Regular.ttf");
 const NEWSREADER_ITALIC_TTF: &[u8] = include_bytes!("../assets/fonts/Newsreader16pt-Italic.ttf");
+const NEWSREADER_MEDIUM_TTF: &[u8] = include_bytes!("../assets/fonts/Newsreader16pt-Medium.ttf");
 const NEWSREADER_SEMIBOLD_TTF: &[u8] =
     include_bytes!("../assets/fonts/Newsreader16pt-SemiBold.ttf");
 const NEWSREADER_BOLD_TTF: &[u8] = include_bytes!("../assets/fonts/Newsreader16pt-Bold.ttf");
@@ -460,6 +464,7 @@ fn load_fonts(cx: &App) {
     let result = cx.text_system().add_fonts(vec![
         Cow::Borrowed(NEWSREADER_REGULAR_TTF),
         Cow::Borrowed(NEWSREADER_ITALIC_TTF),
+        Cow::Borrowed(NEWSREADER_MEDIUM_TTF),
         Cow::Borrowed(NEWSREADER_SEMIBOLD_TTF),
         Cow::Borrowed(NEWSREADER_BOLD_TTF),
         Cow::Borrowed(NEWSREADER_BOLD_ITALIC_TTF),

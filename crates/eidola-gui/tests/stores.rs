@@ -1,5 +1,5 @@
 //! Store-level behavior tests — the regression gate for the state-2 stores
-//! refactor (`docs/architecture/state.md`).
+//! refactor (`crates/eidola-gui/STATE.md`).
 //!
 //! These build *backend-backed* stores (a real `AppCore` over tempdirs,
 //! pointed at an unreachable base URL) so the store task machinery actually

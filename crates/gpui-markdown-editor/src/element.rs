@@ -3073,8 +3073,7 @@ fn base_weight_for_block(kind: &BlockKind, style: &MarkdownStyle) -> FontWeight 
         _ => None,
     };
     match level {
-        Some(l) if style.heading_is_bold(l) => FontWeight::BOLD,
-        Some(_) => FontWeight::SEMIBOLD,
+        Some(l) => style.weight_for_heading(l),
         None => FontWeight::NORMAL,
     }
 }

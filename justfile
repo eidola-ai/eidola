@@ -26,7 +26,7 @@ db-reset:
 
 # --- Build (local toolchain, fast iteration) ---
 
-# Build a system: server, cli, or gui
+# Build a system: server, cli, gui, or www
 build system:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -47,13 +47,17 @@ build system:
           ./scripts/package-gui-app.sh debug
         fi
         ;;
+      www)
+        # Build the website to target/www (drafts excluded, as deployed).
+        cargo run -q -p eidola-www -- build
+        ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui)" >&2
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www)" >&2
         exit 1
         ;;
     esac
 
-# Build and run a system: server, cli, or gui
+# Build and run a system: server, cli, gui, or www
 run system *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -78,8 +82,13 @@ run system *args:
           cargo run -p eidola-gui -- {{ args }}
         fi
         ;;
+      www)
+        # Dev server at http://127.0.0.1:8000 — drafts included, rebuilds
+        # on change. Pass --addr <host:port> to override.
+        cargo run -q -p eidola-www -- serve {{ args }}
+        ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui)" >&2
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www)" >&2
         exit 1
         ;;
     esac

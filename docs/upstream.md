@@ -1,4 +1,4 @@
-# Inference Upstream
+# Inference upstream
 
 The model itself does not run inside the Eidola server. It runs in a separate confidential-compute deployment operated by an inference provider (currently [Tinfoil](https://tinfoil.sh)), with its own attestation chain that the Eidola server verifies on every outbound connection.
 

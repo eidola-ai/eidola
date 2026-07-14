@@ -1,26 +1,26 @@
-# Privacy Guarantees
+# Privacy guarantees
 
-This document enumerates the privacy and integrity properties Eidola commits to. It is the referent for the `privacy_guarantees_not_weakened`, `code_delivers_guarantees`, and `no_known_backdoor` claims in the release attestation schema (see [releases.md](releases.md)): a release attestation signed under this document's content hash asserts that the release does not weaken any item below and that no known code path violates them.
+This document enumerates the privacy and integrity properties Eidola commits to. It is the referent for several claims in the release attestation schema (see [releases.md](releases.md)): a release attestation signed under this document's content hash asserts that the release does not weaken any item below and that no known code path violates them.
 
-Each item is stated as an invariant. Contributors maintain these invariants when changing code. Release attestants walk a diff against them before signing.
+Each item is stated as an invariant. Contributors maintain these invariants when changing code and release attestants walk a diff against them before signing.
 
 Items are labelled **[S]** (structurally enforced — broken only by code that defeats the architecture, e.g. typed routing, blind-signature math, or build-time pinning) or **[P]** (policy — broken by code that violates stated discipline).
 
-These invariants describe what you get when you install and run a **generally-available release of Eidola** — the app downloaded from the public release channel, running on hardware whose confidential-compute attestation verifies under the trust root that release was built with. They do not extend to development builds, contributor-installed test versions, or any scenario where configuration overrides have been set (see [client.md](client.md#configuration-overrides) and [trust-root.md](trust-root.md#whats-pinned)).
+These invariants describe what you get when you install and run an attested, **generally-available release of Eidola** running under the trust root that release was built with. They do not extend to development builds, contributor-installed test versions, or any scenario where configuration overrides have been set (see [Client](client.md#configuration-overrides) and [Trust root](trust-root.md#whats-pinned)).
 
 ---
 
 ## 1. Identity and authorization
 
-**1.1.** **[S]** Every server endpoint is classified `linked`, `unlinked`, or `public`. The classification is bound to the handler in code and checked in middleware before the handler executes. (See [server.md](server.md#linked-vs-unlinked).)
+**1.1.** **[S]** Every server endpoint is classified `linked`, `unlinked`, or `public`. The classification is bound to the handler in code and checked in middleware before the handler executes. (See [Server](server.md#linked-vs-unlinked).)
 
 **1.2.** **[S]** `unlinked` endpoints accept only anonymous credential tokens (Privacy Pass ACT, `draft-schlesinger-privacypass-act-01`). They never receive, derive, persist, or log any identifier that ties a request to its issuance transaction, to the account it was issued to, or to other requests from the same client.
 
 **1.3.** **[S]** `linked` endpoints accept only the HTTP Basic `(account_uuid, account_secret)` bearer pair. They never accept ACTs, and they never receive or emit inference request or response content.
 
-**1.4.** **[S]** The two authentication surfaces are disjoint at the Rust type level: the `BasicAuth` and `TokenAuth` extractors are distinct types, and an endpoint may take only one. Cross-acceptance requires a code change visible in a diff.
+**1.4.** **[S]** The two authentication surfaces are disjoint at the type level: the `BasicAuth` and `TokenAuth` extractors are distinct types, and an endpoint may take only one. Cross-acceptance requires a code change visible in a diff.
 
-**1.5.** **[P]** No personally identifiable information is requested or accepted at account creation. Email, phone, name, address, and government identifiers are never collected or stored by Eidola. Stripe's own retention is governed by Stripe and is out of scope (see §8.4).
+**1.5.** **[P]** No personally identifiable information is requested or accepted at account creation. Email, phone, name, address, and government identifiers are never collected by Eidola's API or stored on Eidola's servers. Eidola uses Stripe for payment with the minimum configurable data collection. The retention practices of data collected by Stripe is governed by Stripe and dictated by relevant commerce laws and regulations and is out of scope of this document (see §8.4).
 
 ## 2. Unlinkability
 
@@ -28,7 +28,7 @@ These invariants describe what you get when you install and run a **generally-av
 
 **2.2.** **[S]** *Redemption ↔ redemption.* ACTs presented across different requests are cryptographically unlinkable to each other. The server cannot answer "which inference requests came from the same account."
 
-**2.3.** **[S]** The anonymity set for a given token is the set of accounts that received at least one token under the same `(issuer_key, domain_separator)` during the issuer key's issuance window. Issuance and key-rotation policies are tuned to keep this set as sufficiently large. (See [server.md](server.md#anonymity-set).)
+**2.3.** **[S]** The anonymity set for a given token is the set of accounts that received at least one token under the same `(issuer_key, domain_separator)` during the issuer key's issuance window. Issuance and key-rotation policies are tuned to keep this set sufficiently large. (See [server.md](server.md#anonymity-set).)
 
 **2.4.** **[S]** Issuance and redemption are temporally decoupled: tokens remain redeemable across an acceptance window that extends beyond their issuance window, so the issuance timestamp on the linked surface and the redemption timestamp on the unlinked surface are not forced to be near-equal.
 
@@ -54,7 +54,7 @@ These invariants describe what you get when you install and run a **generally-av
 
 **4.2.** **[S]** The client re-verifies the server's hardware attestation on every new TCP+TLS handshake. There is no "verified once" cache; policy changes (TCB floor, allowed measurements) take effect on the next handshake. (See [client.md](client.md#per-handshake-attestation-no-caching).)
 
-**4.3.** **[S]** The attestation report's is checked to match the expected peer cert. The inline attestation rides the *same* TCP+TLS connection as the subsequent application request, so attestation and request share one HTTP lifecycle and the LB-routed backend that served the attestation is the one that serves the request.
+**4.3.** **[S]** The attestation report is bound to the expected peer cert (its `REPORT_DATA` commits to `sha256(SPKI(peer_cert))`). The inline attestation rides the *same* TCP+TLS connection as the subsequent application request, so attestation and request share one HTTP lifecycle and the load-balancer-routed backend that served the attestation is the one that serves the request.
 
 **4.4.** **[S]** A TCB policy floor is enforced on every attestation. Measurements outside `ALLOWED_MEASUREMENTS` are rejected.
 
@@ -70,7 +70,7 @@ These invariants describe what you get when you install and run a **generally-av
 
 **5.2.** **[S]** The full server runtime configuration — image digest, argument list, environment variable schema, and hashes of all measured secrets — lives in `tinfoil-config.yml` and is therefore bound into the measurement via §5.1. Configuration changes are release events.
 
-**5.3.** **[S]** Secrets that allow access to persisted state inside the enclave (`CREDENTIAL_MASTER_KEY`, `DATABASE_PASSWORD`) are injected as Tinfoil secrets bound to the enclave measurement. A different measurement cannot retrieve them; the server image itsle has no intrinsic ability to access its own persisted state outside the attested boot path.
+**5.3.** **[S]** Secrets that allow access to persisted state inside the enclave (`CREDENTIAL_MASTER_KEY`, `DATABASE_PASSWORD`) are injected as Tinfoil secrets bound to the enclave measurement. A different measurement cannot retrieve them; the server image itself has no intrinsic ability to access its own persisted state outside the attested boot path.
 
 **5.4.** **[S]** The Eidola server resolves the upstream inference enclave-measurement set at runtime from the provider's latest release, verifying its Sigstore provenance (Fulcio chain + Rekor, against the expected repository identity and exact release tag) before trusting it. It refuses to connect to — or start against — any enclave whose measurement it has not resolved and verified this way. (See [upstream.md](upstream.md#what-pins-the-upstream-measurement).)
 
@@ -120,7 +120,7 @@ These invariants describe what you get when you install and run a **generally-av
 
 **8.4.** Eidola does not promise anonymity against Stripe with respect to payment metadata. The boundary Eidola enforces is between payment metadata and service usage (§1.5). Stripe's own retention and Eidola's retention of Stripe-collected data are out of scope.
 
-**8.5.** Eidola does not promise defense against traffic analysis. Network metadata (the fact that a connection occurred, its size, timing, originating IP) is visible to network observers. Users who need that property should layer Eidola behind Tor or a similar anonymity network. (See [gaps.md](gaps.md#traffic-analysis).)
+**8.5.** Eidola does not promise defense against traffic analysis. Network metadata (the fact that a connection occurred, its size, timing, originating IP) is visible to network observers. Users who need that property should layer Eidola behind Tor or a similar anonymity network. (See [gaps.md](gaps.md#network--metadata).)
 
 **8.6.** Eidola does not promise the absence of bugs. An undisclosed vulnerability is not a backdoor in this document's sense (§6.3), but it could be exploited as if it were. The promise is the absence of *intent* to subvert, not the absence of error.
 
@@ -134,7 +134,7 @@ These invariants describe what you get when you install and run a **generally-av
 
 ## How this document evolves
 
-Changes are **append-only in spirit.** Subsequent releases may add items, narrow scope where doing so does not remove a promise, or correct ambiguous wording. They may not remove or weaken any item that was in effect at the prior release.
+Changes are **append-only in spirit.** Subsequent releases may add items, narrow scope where doing so does not remove a promise, or correct ambiguous wording. They may not remove or weaken any item that was in effect at the prior release without breaking the update flow and flagging the discrepancy to the user.
 
 Strengthening goes through the normal release flow. Weakening requires the attestant to be unable to sign `privacy_guarantees_not_weakened` truthfully; the release notes must call out the weakening explicitly, and users would have to opt into such a release out of band. The verifier enforces the structural side: a release whose attestation lacks `privacy_guarantees_not_weakened` will fail.
 

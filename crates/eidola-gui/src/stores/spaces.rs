@@ -1,7 +1,7 @@
 //! `SpacesStore` — the Library index (the list of non-archived spaces) **and**
 //! the per-space entity registry.
 //!
-//! Per `docs/architecture/state.md` ("Space entities — shared, registried"),
+//! Per `crates/eidola-gui/STATE.md` ("Space entities — shared, registried"),
 //! this store holds `HashMap<SpaceId, WeakEntity<Space>>`. Opening a space goes
 //! through [`SpacesStore::open`], which gets-or-creates: two windows on the
 //! same space share **one** `Space` entity (and one transcript load), which is

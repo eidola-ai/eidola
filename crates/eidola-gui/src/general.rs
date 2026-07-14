@@ -199,6 +199,12 @@ impl Render for GeneralView {
             let mut day_night = h_flex().gap_2();
             for (value, id, probe_name, label) in [
                 (
+                    AppearanceSetting::Auto,
+                    "appearance-auto",
+                    "settings/general/appearance/auto",
+                    "Auto",
+                ),
+                (
                     AppearanceSetting::System,
                     "appearance-system",
                     "settings/general/appearance/system",
@@ -215,12 +221,6 @@ impl Render for GeneralView {
                     "appearance-night",
                     "settings/general/appearance/night",
                     "Night",
-                ),
-                (
-                    AppearanceSetting::Auto,
-                    "appearance-auto",
-                    "settings/general/appearance/auto",
-                    "Auto",
                 ),
             ] {
                 let active = s.appearance == value;

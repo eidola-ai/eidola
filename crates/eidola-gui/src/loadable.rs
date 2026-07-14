@@ -1,5 +1,5 @@
 //! `Loadable<T>` — the universal async cell described in
-//! `docs/architecture/state.md` ("Loadable — the universal async cell").
+//! `crates/eidola-gui/STATE.md` ("Loadable — the universal async cell").
 //!
 //! A store exposes `Loadable<T>` snapshots; views match on them exhaustively.
 //! The in-flight `Task` that drives a load lives in a *sibling* field on the
@@ -20,7 +20,7 @@
 use eidola_app_core::error::AppError;
 
 /// The universal async cell. See the module docs and
-/// `docs/architecture/state.md`.
+/// `crates/eidola-gui/STATE.md`.
 #[derive(Clone, Debug, Default)]
 pub enum Loadable<T> {
     /// Never requested. Render nothing or a quiet placeholder.

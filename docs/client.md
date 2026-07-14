@@ -1,4 +1,4 @@
-# The Client
+# The client
 
 The client is the user's entry point and the **arbiter of trust** for every interaction with Eidola. Where most products treat the client as a thin shell around server-side decisions, Eidola treats it as the locus of authority: the client decides what servers to talk to, what code to run, and what to refuse.
 

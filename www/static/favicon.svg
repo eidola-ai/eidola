@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- "The word is the mark" — the favicon is a lowercase serif e, ink on
+       paper by day, warm grey on the night ground by night. -->
+  <style>
+    text { font-family: "Newsreader", "Iowan Old Style", Georgia, serif; font-weight: 600; fill: #15191e; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #d4d0c8; }
+    }
+  </style>
+  <text x="32" y="51" font-size="58" text-anchor="middle">e</text>
+</svg>

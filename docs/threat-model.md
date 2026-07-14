@@ -1,4 +1,4 @@
-# Threat Model
+# Threat model
 
 This document names who Eidola defends against, who it does not, and what is left as residual trust. It is deliberately complete on the *scope* side — knowing what we **do not** protect against is part of knowing what protection means.
 
