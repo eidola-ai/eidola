@@ -604,7 +604,9 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             let mref = eidola_app_core::parse_model_ref(&model);
             let engine_backed = mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID
                 || core.list_backends().await?.iter().any(|b| {
-                    b.id == mref.backend_id && b.kind == eidola_app_core::BackendKind::LlamaCpp
+                    b.id == mref.backend_id
+                        && b.kind == eidola_app_core::BackendKind::LlamaCpp
+                        && b.auto_start
                 });
             if engine_backed {
                 eprintln!("loading {model}… (a request loads the engine on demand)");

@@ -652,14 +652,10 @@ impl BackendsSettingsView {
         );
         out.push(
             match &engine_path {
-                Some(p) => {
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(SharedString::from(format!(
-                            "Engine: bundled llama-server at {p}"
-                        )))
-                }
+                Some(p) => div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(format!("Engine: llama-server at {p}"))),
                 None => {
                     div()
                         .text_sm()

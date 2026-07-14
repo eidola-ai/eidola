@@ -99,9 +99,9 @@ To run the CLI against a local development stack:
 
 Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) for convenience.
 
-### Local inference (llama.cpp)
+### Local inference
 
-The client can run models entirely on-device through [llama.cpp](https://github.com/ggml-org/llama.cpp) in server mode — no account, credentials, or network required for the inference itself. Install the engine first (`brew install llama.cpp` on macOS, or set `llama_server_path` in `config.toml`), then:
+The client can run models entirely on-device through its bundled inference engine (a statically-linked [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`, shipped inside every release desktop artifact) — no account, credentials, or network required for the inference itself, and no system llama.cpp install. For dev builds the sidecar isn't produced by cargo: run `just engine` once and point `EIDOLA_LLAMA_SERVER` at `crates/eidola-gui/build/llama-server/bin/llama-server` (or set `llama_server_path` in `config.toml`). Then:
 
 ```bash
 cargo run -p eidola-cli -- model list                   # curated Gemma 4 catalog + installed models
