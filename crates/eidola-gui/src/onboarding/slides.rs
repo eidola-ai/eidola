@@ -84,7 +84,7 @@ pub(super) struct Tool {
 
 impl Tool {
     const MARKDOWN: &'static str = "## Eidola is *your* tool\n\nIn years past, an application was delivered to your \
-         computer via a CD:\n\n- Its behavior *couldn't* spontaneously change without your \
+         computer on a CD:\n\n- Its behavior *couldn't* spontaneously change without your \
          involvement.\n- Your files, plans, usage patterns, and insights were *yours alone*, \
          undiscoverable by any third party.\n- The **structure** of the technology — *not* some \
          company's promises — enforced these properties.\n\nEidola approximates this \

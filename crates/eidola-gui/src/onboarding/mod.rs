@@ -327,16 +327,40 @@ impl OnboardingView {
 
     // -- Account operations ------------------------------------------------
 
+    /// Leave onboarding through one of its deliberate exits (skip / done /
+    /// later), landing the user in the app.
+    ///
+    /// At launch onboarding opens *instead of* a blank space (see `run`), so
+    /// the exit has to open the space it stood in for — otherwise a finished
+    /// flow leaves no window at all: macOS would linger dock-only, and Linux
+    /// quits outright the moment the last window closes (gpui's own
+    /// `QuitMode::Default`, plus `run`'s `on_window_closed`). Only when this
+    /// *is* the last window, though — opened from the Eidola menu there's
+    /// already a window behind it, and a surprise second blank space is not
+    /// what "Later" means.
+    ///
+    /// Order is load-bearing: open first, close second. `remove_window` only
+    /// flags the window; gpui tears it down and runs the quit-on-empty check
+    /// as this update unwinds, so the replacement must already be in
+    /// `cx.windows()` by then. Deferring the open would land it after the
+    /// app had quit.
+    fn leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if cx.windows().len() <= 1 {
+            crate::open_blank_space_window(cx, self.stores.clone());
+        }
+        window.remove_window();
+    }
+
     /// The account-free path: disable the `eidola` backend (recorded in the
-    /// DB, so launch stops auto-opening onboarding) and close this window.
-    /// Asks then route only to on-device / self-configured backends; the
-    /// choice reverses any time in Settings → Backends (or by walking this
-    /// flow again from the Eidola menu).
+    /// DB, so launch stops auto-opening onboarding) and leave. Asks then
+    /// route only to on-device / self-configured backends; the choice
+    /// reverses any time in Settings → Backends (or by walking this flow
+    /// again from the Eidola menu).
     pub fn skip_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stores
             .backends
             .update(cx, |s, cx| s.set_enabled("eidola".into(), false, cx));
-        window.remove_window();
+        self.leave(window, cx);
     }
 
     /// Create an anonymous account (new-account branch). On success, store the
@@ -679,7 +703,7 @@ impl OnboardingView {
                 on_purchase: Box::new(cx.listener(|this, _, _, cx| {
                     this.reveal(Slide::ExistingAccount, Slide::Purchase, cx)
                 })),
-                on_done: Box::new(cx.listener(|_, _, window, _| window.remove_window())),
+                on_done: Box::new(cx.listener(|this, _, window, cx| this.leave(window, cx))),
             }
             .into_any_element(),
             Slide::Purchase => {
@@ -694,7 +718,7 @@ impl OnboardingView {
                     checkout_pending: self.checkout_pending.clone(),
                     checkout_error: self.checkout_error.clone(),
                     on_select,
-                    on_later: Box::new(cx.listener(|_, _, window, _| window.remove_window())),
+                    on_later: Box::new(cx.listener(|this, _, window, cx| this.leave(window, cx))),
                 }
                 .into_any_element()
             }

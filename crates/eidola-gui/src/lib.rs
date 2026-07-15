@@ -176,39 +176,51 @@ pub fn run() {
         })
         .detach();
 
-        open_main_window(cx);
-
         // First-run onboarding: with no account configured, open the "Get
-        // Started" window on top of the main window. A configured account —
-        // or a deliberately *disabled* eidola backend (the "no account,
-        // on-device only" choice, recorded in the DB) — skips straight to
-        // the main window (onboarding is then only reachable via the Eidola
-        // menu). The account bit reads synchronously from the ConfigStore
-        // snapshot; the backend bit needs a DB read, so the decision is one
-        // spawned read behind launch.
+        // Started" window *instead of* a blank space — onboarding is the
+        // door, and a blank space behind it is both premature (there's
+        // nothing to ask yet) and noise to close. A configured account — or
+        // a deliberately *disabled* eidola backend (the "no account,
+        // on-device only" choice, recorded in the DB) — opens straight into
+        // a space (onboarding is then only reachable via the Eidola menu).
+        // Leaving onboarding opens the space it stood in for; see
+        // `OnboardingView::leave`.
+        //
+        // The account bit reads synchronously from the ConfigStore snapshot;
+        // the backend bit needs a DB read, so in that case the decision —
+        // and with it the first window — is one spawned read behind launch.
         let needs_account = stores
             .config
             .read(cx)
             .state()
             .map(|s| !s.has_account || !s.has_account_secret)
             .unwrap_or(false);
-        if needs_account && let Some(core) = stores.app_core() {
-            let task: gpui::Task<()> = cx.spawn(async move |cx: &mut gpui::AsyncApp| {
-                let backends =
-                    crate::bridge::bridge(core, |c| async move { c.list_backends().await }).await;
-                let eidola_enabled = backends
-                    .ok()
-                    .and_then(|list| list.iter().find(|b| b.id == "eidola").map(|b| b.enabled))
-                    // On a read failure, err toward showing onboarding —
-                    // the window is dismissible; a silent skip is not.
-                    .unwrap_or(true);
-                if eidola_enabled {
-                    cx.update(open_onboarding_window);
-                }
-            });
-            // Startup-scoped one-shot with nothing to own it; the sanctioned
-            // app-lifetime detach pattern (see stores::install_bus_bridge).
-            task.detach();
+        match stores.app_core().filter(|_| needs_account) {
+            Some(core) => {
+                let task: gpui::Task<()> = cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                    let backends =
+                        crate::bridge::bridge(core, |c| async move { c.list_backends().await })
+                            .await;
+                    let eidola_enabled = backends
+                        .ok()
+                        .and_then(|list| list.iter().find(|b| b.id == "eidola").map(|b| b.enabled))
+                        // On a read failure, err toward showing onboarding —
+                        // the window is dismissible; a silent skip is not.
+                        .unwrap_or(true);
+                    cx.update(|cx| {
+                        if eidola_enabled {
+                            open_onboarding_window(cx);
+                        } else {
+                            open_main_window(cx);
+                        }
+                    });
+                });
+                // Startup-scoped one-shot with nothing to own it; the
+                // sanctioned app-lifetime detach pattern (see
+                // stores::install_bus_bridge).
+                task.detach();
+            }
+            None => open_main_window(cx),
         }
     });
 }
@@ -618,7 +630,7 @@ fn open_about_window(cx: &mut App) {
 
 fn open_main_window(cx: &mut App) {
     let stores = cx.global::<AppGlobal>().stores.clone();
-    open_chat_window(cx, stores, None);
+    open_blank_space_window(cx, stores);
 }
 
 /// Open a chat window onto an existing space. Public-to-the-crate entry
@@ -627,6 +639,14 @@ fn open_main_window(cx: &mut App) {
 /// installed.
 pub fn open_space_window(cx: &mut App, stores: Stores, space_id: String) {
     open_chat_window(cx, stores, Some(space_id));
+}
+
+/// Open a chat window onto a fresh blank space (⌘N). Takes the stores
+/// explicitly for the same reason [`open_space_window`] does: onboarding
+/// opens one on its way out, and its stub-store tests run without
+/// `AppGlobal` installed.
+pub fn open_blank_space_window(cx: &mut App, stores: Stores) {
+    open_chat_window(cx, stores, None);
 }
 
 /// The side length of the square "writing surface" windows — the space (chat)

@@ -3283,10 +3283,13 @@ fn onboarding_starts_on_first_slide(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn onboarding_skip_account_disables_eidola_and_closes(cx: &mut TestAppContext) {
+fn onboarding_skip_account_disables_eidola_and_hands_off_to_a_space(cx: &mut TestAppContext) {
     // The GetStarted slide's quiet third choice: no account at all. It
     // disables the eidola backend (optimistically visible in the store; the
-    // stub has no core, so the op stops at the guard) and closes the window.
+    // stub has no core, so the op stops at the guard) and leaves onboarding —
+    // which, being the only window (as at launch, where onboarding opens
+    // *instead of* a blank space), must hand off to a space rather than
+    // leaving the user with no window at all.
     let stores = stub_stores(cx, |s| {
         s.backends = vec![eidola_app_core::BackendInfo {
             id: "eidola".into(),
@@ -3319,9 +3322,39 @@ fn onboarding_skip_account_disables_eidola_and_closes(cx: &mut TestAppContext) {
             "skip must disable the eidola backend"
         );
     });
-    // The onboarding window is gone.
-    let open_windows = cx.update(|cx| cx.windows().len());
-    assert_eq!(open_windows, 0, "skip must close the onboarding window");
+    // The onboarding window is gone, replaced by exactly one space window —
+    // not zero (macOS would linger dock-only; Linux would quit outright on
+    // the very choice to keep using the app on-device).
+    let windows = cx.update(|cx| cx.windows());
+    assert_eq!(windows.len(), 1, "skip must hand off to a space window");
+    assert!(
+        !windows.contains(&window),
+        "skip must close the onboarding window"
+    );
+}
+
+#[gpui::test]
+fn onboarding_leaving_with_a_window_behind_opens_no_extra_space(cx: &mut TestAppContext) {
+    // The hand-off is for the launch case, where onboarding is the only
+    // window. Reached from the Eidola menu there is already a window behind
+    // it, and leaving must not conjure a second blank space on top of it.
+    let stores = stub_stores(cx, |_| {});
+    let (behind, _) = open_space(cx, &stores, None);
+    let (window, view) = open_onboarding(cx, &stores);
+    assert_eq!(cx.update(|cx| cx.windows().len()), 2);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.skip_account(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let windows = cx.update(|cx| cx.windows());
+    assert_eq!(
+        windows,
+        vec![behind],
+        "leaving must close onboarding and leave the window behind it untouched"
+    );
 }
 
 #[gpui::test]
