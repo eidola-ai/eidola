@@ -204,6 +204,19 @@ impl OnboardingView {
         self.revealed.clone()
     }
 
+    /// Glide the page to a revealed slide by index — the back arrow's action.
+    /// Public so behavior tests can drive the same path the arrow's click takes.
+    #[doc(hidden)]
+    pub fn scroll_to_slide(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.glide_to_index(index, window, cx);
+    }
+
+    /// The resting offset the current glide lands on (test seam for the snap).
+    #[doc(hidden)]
+    pub fn pinned_y_for_test(&self) -> Option<f32> {
+        self.pinned_y
+    }
+
     /// The freshly-created account id + secret, if account creation succeeded.
     #[doc(hidden)]
     pub fn created_for_test(&self) -> Option<(String, String)> {
@@ -471,11 +484,30 @@ impl Render for OnboardingView {
         }
 
         let revealed = self.revealed.clone();
-        let body = v_flex().w_full().children(
-            revealed
-                .into_iter()
-                .map(|slide| self.render_slide(slide, cx)),
-        );
+        let body = v_flex()
+            .w_full()
+            .children(revealed.into_iter().enumerate().map(|(idx, slide)| {
+                let inner = self.render_slide(slide, cx);
+                // Every slide past the first carries a visible up-chevron "back"
+                // affordance (a discoverable alternative to the scroll-back
+                // gesture) that glides to the previous slide. Flow sequencing —
+                // forward *and* back — lives with the parent, so the back wiring
+                // is here rather than on the stateless slide components.
+                if idx == 0 {
+                    inner
+                } else {
+                    let on_back: slides::OnClick =
+                        Box::new(cx.listener(move |this, _, window, cx| {
+                            this.glide_to_index(idx - 1, window, cx);
+                        }));
+                    div()
+                        .relative()
+                        .w_full()
+                        .child(inner)
+                        .child(slides::back_button(idx, on_back, cx))
+                        .into_any_element()
+                }
+            }));
 
         // Round all four corners to the CSD frame on Linux (no-op on
         // macOS/SSD) — the same treatment every other window root gets.

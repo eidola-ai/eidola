@@ -20,7 +20,7 @@ use gpui::{
     Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable,
+    ActiveTheme, Disableable, Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     h_flex,
@@ -114,13 +114,13 @@ pub(super) struct Control {
 }
 
 impl Control {
-    const MARKDOWN: &'static str = "## *Your* control\n\nNo one but you — not us, not the operators who run the \
-         hardware — can:\n\n- Read, retain, or profile your interactions. Your data is \
+    const MARKDOWN: &'static str = "## *Your* control\n\nYou and only you are in control — not us, not the operators who run the \
+         hardware.:\n\n- **Only you can read, retain, or profile your interactions.** Your data is \
          decrypted only inside sealed, hardware-attested enclaves that keep nothing, and \
          the side of Eidola that handles payment is cryptographically separated from the \
-         side that serves your requests.\n- Change the version of Eidola you run — on your \
-         device or on the server it answers from. A new build isn't trusted until your \
-         client verifies it.\n\nDon't trust our claims; verify them. If you don't know how \
+         side that serves your requests.\n- **Only you can update Eidola — on your \
+         device the server.** Nothing changes until your \
+         client verifies a new version and you decide to trust it.\n\nDon't blindly trust our claims; verify them. If you don't know how \
          to evaluate our code and architecture, **request the opinion of the most technical \
          person you already trust**.";
 }
@@ -608,6 +608,53 @@ fn cta_button(
                 .ghost()
                 .label(label)
                 .on_click(on_click),
+        )
+}
+
+/// The vertical inset of the back affordance from a slide's top — clear of the
+/// titlebar drag band (which owns the top [`TITLE_BAR_RESERVE`] and paints last)
+/// so the window-move gesture keeps the very top edge.
+const BACK_BUTTON_TOP: Pixels = px(46.);
+
+/// An up-chevron "back" affordance pinned near the top of a slide, shown on
+/// every slide after the first. It's a *visible* alternative to the scroll-back
+/// gesture — clicking it glides to the previous slide — since the gesture is a
+/// less obvious way to go back for many people. `key` scopes the a11y/driver
+/// name so the per-slide buttons (all painted at once) don't collide.
+pub(super) fn back_button(
+    key: impl std::fmt::Display,
+    on_back: OnClick,
+    cx: &App,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    let fg = theme.muted_foreground;
+    let fg_hover = theme.foreground;
+    let hover_bg = theme.muted.opacity(0.5);
+    div()
+        .absolute()
+        .top(BACK_BUTTON_TOP)
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .id(SharedString::from(format!("onboarding-back-{key}")))
+                .probe(
+                    SharedString::from(format!("onboarding/back/{key}")),
+                    Role::Button,
+                    "Go to the previous slide",
+                )
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(28.))
+                .rounded_full()
+                .cursor_pointer()
+                .text_color(fg)
+                .hover(move |s| s.text_color(fg_hover).bg(hover_bg))
+                .child(Icon::new(IconName::ChevronUp).small())
+                .on_click(on_back),
         )
 }
 

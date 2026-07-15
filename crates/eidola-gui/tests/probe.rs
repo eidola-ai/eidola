@@ -382,6 +382,17 @@ fn onboarding_probes_record_ctas_and_inputs(cx: &mut TestAppContext) {
             "existing-account probe {expected:?} missing; recorded: {names:?}"
         );
     }
+    // Every revealed slide past the first carries a "back" affordance (the
+    // visible up-arrow alternative to the scroll-back gesture); the first slide
+    // (index 0) does not.
+    assert!(
+        names.iter().any(|n| n.starts_with("onboarding/back/")),
+        "back-arrow probe missing on a non-first slide; recorded: {names:?}"
+    );
+    assert!(
+        !names.contains(&"onboarding/back/0"),
+        "the first slide must not carry a back arrow; recorded: {names:?}"
+    );
 
     // Re-choose the new-account branch: the create slide carries the required
     // agreement checkbox and the (checkbox-gated) create CTA.

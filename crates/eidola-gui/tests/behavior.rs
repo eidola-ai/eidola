@@ -3342,6 +3342,41 @@ fn onboarding_reveal_advances_and_is_idempotent(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn onboarding_back_arrow_glides_to_previous_slide(cx: &mut TestAppContext) {
+    // Each slide past the first shows an up-arrow that glides to the previous
+    // slide — the same `scroll_to_slide` path the arrow's click drives. The
+    // resting offset (`pinned_y`) is set synchronously, so no frame-pumping.
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Pause, Slide::Tool);
+    reveal(&view, cx, Slide::Tool, Slide::Control);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            // Back from the Control slide (index 2) to the Tool slide (index 1):
+            // the page pins above the top (a negative offset).
+            v.scroll_to_slide(1, window, cx);
+            let one_up = v
+                .pinned_y_for_test()
+                .expect("glide must pin a resting offset");
+            assert!(
+                one_up < 0.0,
+                "gliding to slide 1 must pin the page below the top, got {one_up}"
+            );
+
+            // Back all the way to the first slide pins exactly at the top.
+            v.scroll_to_slide(0, window, cx);
+            assert_eq!(
+                v.pinned_y_for_test(),
+                Some(0.0),
+                "gliding to the first slide must pin at the top"
+            );
+        });
+    })
+    .unwrap();
+}
+
+#[gpui::test]
 fn onboarding_rechoosing_branch_truncates_downstream(cx: &mut TestAppContext) {
     let stores = stub_stores(cx, |_| {});
     let (_w, view) = open_onboarding(cx, &stores);
