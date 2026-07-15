@@ -187,6 +187,132 @@ fn external_backend_lifecycle_add_update_disable_remove_revive() {
 }
 
 #[test]
+fn eidola_row_owns_connection_and_trust_bundle() {
+    run(|| {
+        let (core, _dir) = bare_core();
+        let mut rx = core.subscribe_changes();
+
+        // Defaults: the embedded pin, no overrides.
+        let trust = core.runtime().block_on(core.eidola_trust()).unwrap();
+        assert!(!trust.base_url_is_override);
+        assert_eq!(trust.base_url, trust.base_url_pin);
+        assert!(!trust.trusted_measurements_are_override);
+        assert_eq!(trust.trusted_measurements.len(), 1);
+        assert!(!trust.has_hardware_root_ca);
+
+        // Base URL override → Backends emission, honest override flag.
+        core.runtime()
+            .block_on(core.set_base_url("https://staging.example/v1".into()))
+            .unwrap();
+        assert_eq!(drain(&mut rx), vec![Change::Backends]);
+        let trust = core.runtime().block_on(core.eidola_trust()).unwrap();
+        assert!(trust.base_url_is_override);
+        assert_eq!(trust.base_url, "https://staging.example/v1");
+
+        // Revert to pin.
+        core.runtime()
+            .block_on(core.clear_base_url_override())
+            .unwrap();
+        assert_eq!(drain(&mut rx), vec![Change::Backends]);
+        let trust = core.runtime().block_on(core.eidola_trust()).unwrap();
+        assert!(!trust.base_url_is_override);
+
+        // Trust a measurement (idempotent), then untrust back to pin.
+        let snp = "a".repeat(96);
+        let r1 = "b".repeat(96);
+        let r2 = "c".repeat(96);
+        let added = core
+            .runtime()
+            .block_on(core.trust_measurement(snp.clone(), r1.clone(), r2.clone()))
+            .unwrap();
+        assert!(added);
+        assert_eq!(drain(&mut rx), vec![Change::Backends]);
+        let again = core
+            .runtime()
+            .block_on(core.trust_measurement(snp.clone(), r1, r2))
+            .unwrap();
+        assert!(!again, "idempotent: no second write");
+        assert_eq!(drain(&mut rx), vec![]);
+        let trust = core.runtime().block_on(core.eidola_trust()).unwrap();
+        assert!(trust.trusted_measurements_are_override);
+        assert_eq!(trust.trusted_measurements.len(), 1);
+        assert_eq!(trust.trusted_measurements[0].snp, snp);
+
+        let removed = core
+            .runtime()
+            .block_on(core.untrust_measurement(snp.clone()))
+            .unwrap();
+        assert!(removed);
+        assert_eq!(drain(&mut rx), vec![Change::Backends]);
+        let trust = core.runtime().block_on(core.eidola_trust()).unwrap();
+        assert!(
+            !trust.trusted_measurements_are_override,
+            "emptying the override list reverts to the pin"
+        );
+
+        // A malformed base URL never lands (validated before write).
+        let err = core
+            .runtime()
+            .block_on(core.set_base_url("not-a-url".into()))
+            .expect_err("bad url");
+        assert!(matches!(err, AppError::Config { .. }), "{err}");
+        assert_eq!(drain(&mut rx), vec![]);
+    });
+}
+
+#[test]
+fn update_backend_per_kind_field_validation() {
+    run(|| {
+        let (core, _dir) = bare_core();
+
+        // `local` is built in — it refuses every update.
+        let err = core
+            .runtime()
+            .block_on(core.update_backend(
+                "local".into(),
+                BackendUpdate {
+                    base_url: Some(Some("http://x".into())),
+                    ..BackendUpdate::default()
+                },
+            ))
+            .expect_err("local update");
+        assert!(err.to_string().contains("built in"), "got {err}");
+
+        // `eidola` refuses non-trust (external) fields.
+        let err = core
+            .runtime()
+            .block_on(core.update_backend(
+                "eidola".into(),
+                BackendUpdate {
+                    api_key: Some(Some("k".into())),
+                    ..BackendUpdate::default()
+                },
+            ))
+            .expect_err("eidola external field");
+        assert!(
+            err.to_string().contains("connection and trust"),
+            "got {err}"
+        );
+
+        // An `openai` backend refuses the trust bundle.
+        core.runtime()
+            .block_on(core.add_backend(openai_backend("box", "http://x", None)))
+            .unwrap();
+        let err = core
+            .runtime()
+            .block_on(core.update_backend(
+                "box".into(),
+                BackendUpdate {
+                    hardware_root_ca: Some(Some("pem".into())),
+                    ..BackendUpdate::default()
+                },
+            ))
+            .expect_err("openai trust field");
+        assert!(err.to_string().contains("only to the eidola"), "got {err}");
+    });
+}
+
+#[test]
 fn add_backend_validates_ids_and_kind_requirements() {
     run(|| {
         let (core, _dir) = bare_core();

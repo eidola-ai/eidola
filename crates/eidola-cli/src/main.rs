@@ -346,8 +346,17 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
     match cli.command {
         None => {
             let state = core.config_state();
+            let trust = core.eidola_trust().await?;
             println!("config path: {:?}", config::default_config_path());
-            println!("base_url: {}", state.base_url);
+            println!(
+                "base_url: {}{}",
+                trust.base_url,
+                if trust.base_url_is_override {
+                    format!(" (override; pin is {})", trust.base_url_pin)
+                } else {
+                    " (built-in pin)".to_string()
+                }
+            );
             println!("default_model: {}", state.default_model);
             println!(
                 "account_id: {}",
@@ -365,15 +374,22 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     "<not set>"
                 }
             );
-            println!("trusted_measurements:");
-            for m in &state.trusted_measurements {
+            println!(
+                "trusted_measurements:{}",
+                if trust.trusted_measurements_are_override {
+                    " (override)"
+                } else {
+                    " (built-in pin)"
+                }
+            );
+            for m in &trust.trusted_measurements {
                 println!("  - snp = {}", m.snp);
                 println!("    tdx.rtmr1 = {}", m.tdx_rtmr1);
                 println!("    tdx.rtmr2 = {}", m.tdx_rtmr2);
             }
             println!(
                 "hardware_root_ca: {}",
-                if state.has_hardware_root_ca {
+                if trust.has_hardware_root_ca {
                     "<set>"
                 } else {
                     "<not set>"
@@ -381,7 +397,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             );
             println!(
                 "hardware_intermediate_ca: {}",
-                if state.has_hardware_intermediate_ca {
+                if trust.has_hardware_intermediate_ca {
                     "<set>"
                 } else {
                     "<not set>"
@@ -413,7 +429,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 });
             }
             if let Some(url) = base_url {
-                core.set_base_url(url.clone())?;
+                core.set_base_url(url.clone()).await?;
                 println!("base_url set to {url}");
             }
             if let Some(url) = attestation_url {
@@ -424,23 +440,25 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 let pem = std::fs::read_to_string(&path).map_err(|e| AppError::Config {
                     message: format!("failed to read {path}: {e}"),
                 })?;
-                core.set_hardware_root_ca(pem)?;
+                core.set_hardware_root_ca(pem).await?;
                 println!("hardware_root_ca set from {path}");
             }
             if let Some(path) = hardware_intermediate_ca {
                 let pem = std::fs::read_to_string(&path).map_err(|e| AppError::Config {
                     message: format!("failed to read {path}: {e}"),
                 })?;
-                core.set_hardware_intermediate_ca(pem)?;
+                core.set_hardware_intermediate_ca(pem).await?;
                 println!("hardware_intermediate_ca set from {path}");
             }
             if let Some(spec) = trust_measurement {
                 let m = config::parse_trust_measurement(&spec)?;
-                let added = core.trust_measurement(
-                    m.snp_measurement.clone(),
-                    m.tdx_measurement.rtmr1.clone(),
-                    m.tdx_measurement.rtmr2.clone(),
-                )?;
+                let added = core
+                    .trust_measurement(
+                        m.snp_measurement.clone(),
+                        m.tdx_measurement.rtmr1.clone(),
+                        m.tdx_measurement.rtmr2.clone(),
+                    )
+                    .await?;
                 if added {
                     println!(
                         "added trusted measurement: snp={}, tdx.rtmr1={}, tdx.rtmr2={}",
@@ -452,7 +470,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             if let Some(spec) = untrust_measurement {
                 let key = config::parse_untrust_key(&spec)?;
-                let removed = core.untrust_measurement(key.clone())?;
+                let removed = core.untrust_measurement(key.clone()).await?;
                 if removed {
                     println!("removed trusted measurement (snp={key})");
                 } else {

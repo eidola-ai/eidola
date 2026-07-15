@@ -337,6 +337,7 @@ mod driver {
     fn ready_stores(cx: &mut App) -> Stores {
         stub_stores(cx, |s| {
             s.config_state = Some(config_state(true));
+            s.eidola_trust = Some(eidola_trust());
             s.models = models();
             s.backends = backends();
             s.local_models = Some(local_models_state());
@@ -442,21 +443,26 @@ mod driver {
 
     fn config_state(has_account: bool) -> ConfigState {
         ConfigState {
-            base_url: "https://eidola.example/v1".into(),
             default_model: "gemma4-31b".into(),
-            base_url_pin: "https://eidola.example/v1".into(),
-            base_url_is_override: false,
             has_account,
             has_account_secret: has_account,
             domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
-            trusted_measurements: Vec::new(),
-            trusted_measurements_are_override: false,
-            has_hardware_root_ca: false,
-            has_hardware_intermediate_ca: false,
             attestation_url: None,
             appearance: eidola_app_core::config::AppearanceSetting::System,
             time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
             light_character: eidola_app_core::config::LightCharacter::Neutral,
+        }
+    }
+
+    fn eidola_trust() -> eidola_app_core::EidolaTrust {
+        eidola_app_core::EidolaTrust {
+            base_url: "https://eidola.example/v1".into(),
+            base_url_pin: "https://eidola.example/v1".into(),
+            base_url_is_override: false,
+            trusted_measurements: Vec::new(),
+            trusted_measurements_are_override: false,
+            has_hardware_root_ca: false,
+            has_hardware_intermediate_ca: false,
         }
     }
 
@@ -566,6 +572,7 @@ mod driver {
     fn settings_stores(cx: &mut App) -> Stores {
         stub_stores(cx, |s| {
             s.config_state = Some(config_state(true));
+            s.eidola_trust = Some(eidola_trust());
             s.balances = Some(BalancesResult {
                 available: 4_200_000,
                 pools: vec![

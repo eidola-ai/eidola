@@ -6,8 +6,13 @@
 //! today, in decreasing expected frequency of use:
 //!
 //! - `eidola` — the confidential Eidola service (singleton). Attested
-//!   transport, anonymous-credential billing. Its base URL is *not* stored
-//!   on the row: the trust-root pin + config override remain the authority.
+//!   transport, anonymous-credential billing. A backend row describes how
+//!   to reach and trust that backend, so the eidola row owns the whole
+//!   connection + trust bundle: its `base_url`, `trusted_measurements`
+//!   (JSON overrides), and `hardware_root_ca` / `hardware_intermediate_ca`
+//!   (PEM ARK/ASK overrides). Each is NULL by default, which means "use the
+//!   embedded trust-root pin baked into this build"; `update_backend`
+//!   accepts exactly this bundle for the eidola row (and nothing else).
 //! - `local` — Eidola-managed on-device models (singleton): the curated
 //!   catalog and downloads under `<data_dir>/models`, served by managed
 //!   llama.cpp engines. Gated by device capability, no account required.
@@ -248,6 +253,13 @@ pub struct BackendUpdate {
     pub engine_path: Option<Option<String>>,
     /// `llamacpp` only: flip request-triggered auto-start.
     pub auto_start: Option<bool>,
+    /// `eidola` only: set/clear the enclave-measurement override list (a JSON
+    /// array of the `EnclaveMeasurement` shape). `Some(None)` reverts to pin.
+    pub trusted_measurements: Option<Option<String>>,
+    /// `eidola` only: set/clear the PEM ARK certificate override.
+    pub hardware_root_ca: Option<Option<String>>,
+    /// `eidola` only: set/clear the PEM ASK certificate override.
+    pub hardware_intermediate_ca: Option<Option<String>>,
 }
 
 // ============================================================================
@@ -358,6 +370,11 @@ impl Inner {
             model_overrides: overrides_to_json(new.model_overrides.as_deref()),
             engine_path,
             auto_start,
+            // The connection + trust bundle is the eidola row's alone; external
+            // backends never carry it.
+            trusted_measurements: None,
+            hardware_root_ca: None,
+            hardware_intermediate_ca: None,
             created_at: now,
             updated_at: now,
             removed_at: None,
@@ -385,35 +402,86 @@ impl Inner {
         Ok(())
     }
 
-    /// Update an external backend's configuration. Singletons carry no
-    /// editable connection config, so they are refused here.
+    /// Update a backend's configuration. Per-kind field validation: the
+    /// `eidola` row accepts exactly its connection + trust bundle
+    /// (base_url / trusted_measurements / hardware CAs — each clearable back
+    /// to NULL = the embedded pin); `local` is built in and accepts nothing;
+    /// `openai` / `llamacpp` accept their own fields but never the trust
+    /// bundle. Emits [`Change::Backends`] on success.
     pub(crate) async fn update_backend(
         &self,
         id: &str,
         update: BackendUpdate,
     ) -> Result<(), AppError> {
-        if id == EIDOLA_BACKEND_ID || id == LOCAL_BACKEND_ID {
-            return Err(AppError::Config {
-                message: format!("backend `{id}` is built in — only enable/disable applies"),
-            });
-        }
         let conn = self.db_conn().await?;
-        // `engine_path` / `auto_start` are engine-backed concerns; refuse
-        // them on any non-`llamacpp` backend rather than silently storing
-        // an inert value.
-        if update.engine_path.is_some() || update.auto_start.is_some() {
-            let row = db::get_backend(&conn, id)
-                .await?
-                .filter(|r| r.removed_at.is_none())
-                .ok_or_else(|| AppError::NotConfigured {
-                    message: format!("no backend named `{id}` is configured"),
-                })?;
-            if row.kind != BackendKind::LlamaCpp.as_str() {
+        let row = db::get_backend(&conn, id)
+            .await?
+            .filter(|r| r.removed_at.is_none())
+            .ok_or_else(|| AppError::NotConfigured {
+                message: format!("no backend named `{id}` is configured"),
+            })?;
+        let kind = BackendKind::parse(&row.kind).ok_or_else(|| AppError::Database {
+            message: format!("unknown backend kind `{}`", row.kind),
+        })?;
+
+        let touches_trust = update.trusted_measurements.is_some()
+            || update.hardware_root_ca.is_some()
+            || update.hardware_intermediate_ca.is_some();
+        let touches_external = update.display_name.is_some()
+            || update.api_key.is_some()
+            || update.models_dir.is_some()
+            || update.model_overrides.is_some()
+            || update.engine_path.is_some()
+            || update.auto_start.is_some();
+
+        match kind {
+            BackendKind::Local => {
                 return Err(AppError::Config {
-                    message: "engine path and auto-start apply only to llama.cpp backends".into(),
+                    message: format!("backend `{id}` is built in — only enable/disable applies"),
                 });
             }
+            BackendKind::Eidola => {
+                // The eidola row is the confidential service's connection +
+                // trust bundle — nothing else lives on it.
+                if touches_external {
+                    return Err(AppError::Config {
+                        message: "the eidola backend accepts only connection and trust settings \
+                                  (base URL, trusted measurements, hardware CAs)"
+                            .into(),
+                    });
+                }
+                if let Some(Some(url)) = update.base_url.as_ref() {
+                    let url = url.trim();
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        return Err(AppError::Config {
+                            message: "base URL must start with http:// or https://".into(),
+                        });
+                    }
+                }
+            }
+            BackendKind::OpenAi | BackendKind::LlamaCpp => {
+                // The trust bundle is the eidola row's alone.
+                if touches_trust {
+                    return Err(AppError::Config {
+                        message: "trusted measurements and hardware CAs apply only to the eidola \
+                                  backend"
+                            .into(),
+                    });
+                }
+                // `engine_path` / `auto_start` are engine-backed concerns;
+                // refuse them on an `openai` backend rather than silently
+                // storing an inert value.
+                if (update.engine_path.is_some() || update.auto_start.is_some())
+                    && kind != BackendKind::LlamaCpp
+                {
+                    return Err(AppError::Config {
+                        message: "engine path and auto-start apply only to llama.cpp backends"
+                            .into(),
+                    });
+                }
+            }
         }
+
         let overrides_json = update
             .model_overrides
             .map(|o| overrides_to_json(o.as_deref()));
@@ -433,6 +501,15 @@ impl Inner {
                 .as_ref()
                 .map(|o| o.as_deref().map(|p| p.trim()).filter(|p| !p.is_empty())),
             update.auto_start,
+            update
+                .trusted_measurements
+                .as_ref()
+                .map(|o| o.as_deref().filter(|m| !m.is_empty())),
+            update.hardware_root_ca.as_ref().map(|o| o.as_deref()),
+            update
+                .hardware_intermediate_ca
+                .as_ref()
+                .map(|o| o.as_deref()),
             now_ms(),
         )
         .await?;

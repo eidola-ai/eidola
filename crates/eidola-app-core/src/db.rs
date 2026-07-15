@@ -421,6 +421,13 @@ pub struct BackendRow {
     /// `llamacpp` only: may a request auto-start an engine? The `local`
     /// backend always auto-starts regardless.
     pub auto_start: bool,
+    /// `eidola` only: JSON array of enclave-measurement overrides; `None`
+    /// = the single build measurement pinned in the trust root.
+    pub trusted_measurements: Option<String>,
+    /// `eidola` only: PEM ARK certificate override; `None` = vendor chain.
+    pub hardware_root_ca: Option<String>,
+    /// `eidola` only: PEM ASK certificate override; `None` = vendor chain.
+    pub hardware_intermediate_ca: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub removed_at: Option<i64>,
@@ -438,14 +445,18 @@ fn backend_row_from(row: &turso::Row) -> Result<BackendRow, AppError> {
         model_overrides: row.get::<Option<String>>(7).map_err(AppError::db)?,
         engine_path: row.get::<Option<String>>(8).map_err(AppError::db)?,
         auto_start: row.get::<i64>(9).map_err(AppError::db)? != 0,
-        created_at: row.get::<i64>(10).map_err(AppError::db)?,
-        updated_at: row.get::<i64>(11).map_err(AppError::db)?,
-        removed_at: row.get::<Option<i64>>(12).map_err(AppError::db)?,
+        trusted_measurements: row.get::<Option<String>>(10).map_err(AppError::db)?,
+        hardware_root_ca: row.get::<Option<String>>(11).map_err(AppError::db)?,
+        hardware_intermediate_ca: row.get::<Option<String>>(12).map_err(AppError::db)?,
+        created_at: row.get::<i64>(13).map_err(AppError::db)?,
+        updated_at: row.get::<i64>(14).map_err(AppError::db)?,
+        removed_at: row.get::<Option<i64>>(15).map_err(AppError::db)?,
     })
 }
 
 const BACKEND_COLUMNS: &str = "id, kind, display_name, enabled, base_url, api_key, \
-     models_dir, model_overrides, engine_path, auto_start, created_at, updated_at, removed_at";
+     models_dir, model_overrides, engine_path, auto_start, trusted_measurements, \
+     hardware_root_ca, hardware_intermediate_ca, created_at, updated_at, removed_at";
 
 /// List backends, soft-removed rows excluded. Singletons first (eidola,
 /// then local), then externals in creation order — the stable presentation
@@ -501,7 +512,8 @@ pub async fn insert_backend(conn: &Connection, row: &BackendRow) -> Result<(), A
         conn.execute(
             "UPDATE backend SET kind = ?2, display_name = ?3, enabled = ?4, base_url = ?5, \
              api_key = ?6, models_dir = ?7, model_overrides = ?8, engine_path = ?9, \
-             auto_start = ?10, updated_at = ?11, removed_at = NULL WHERE id = ?1",
+             auto_start = ?10, trusted_measurements = ?11, hardware_root_ca = ?12, \
+             hardware_intermediate_ca = ?13, updated_at = ?14, removed_at = NULL WHERE id = ?1",
             (
                 Value::Text(row.id.clone()),
                 Value::Text(row.kind.clone()),
@@ -513,6 +525,9 @@ pub async fn insert_backend(conn: &Connection, row: &BackendRow) -> Result<(), A
                 opt_text(&row.model_overrides),
                 opt_text(&row.engine_path),
                 Value::Integer(row.auto_start as i64),
+                opt_text(&row.trusted_measurements),
+                opt_text(&row.hardware_root_ca),
+                opt_text(&row.hardware_intermediate_ca),
                 Value::Integer(row.updated_at),
             ),
         )
@@ -522,8 +537,9 @@ pub async fn insert_backend(conn: &Connection, row: &BackendRow) -> Result<(), A
     }
     conn.execute(
         "INSERT INTO backend (id, kind, display_name, enabled, base_url, api_key, \
-         models_dir, model_overrides, engine_path, auto_start, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         models_dir, model_overrides, engine_path, auto_start, trusted_measurements, \
+         hardware_root_ca, hardware_intermediate_ca, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         (
             Value::Text(row.id.clone()),
             Value::Text(row.kind.clone()),
@@ -535,6 +551,9 @@ pub async fn insert_backend(conn: &Connection, row: &BackendRow) -> Result<(), A
             opt_text(&row.model_overrides),
             opt_text(&row.engine_path),
             Value::Integer(row.auto_start as i64),
+            opt_text(&row.trusted_measurements),
+            opt_text(&row.hardware_root_ca),
+            opt_text(&row.hardware_intermediate_ca),
             Value::Integer(row.created_at),
             Value::Integer(row.updated_at),
         ),
@@ -580,6 +599,9 @@ pub async fn update_backend_config(
     model_overrides: Option<Option<&str>>,
     engine_path: Option<Option<&str>>,
     auto_start: Option<bool>,
+    trusted_measurements: Option<Option<&str>>,
+    hardware_root_ca: Option<Option<&str>>,
+    hardware_intermediate_ca: Option<Option<&str>>,
     now: i64,
 ) -> Result<bool, AppError> {
     // Build the SET list dynamically; every branch binds positionally.
@@ -656,6 +678,39 @@ pub async fn update_backend_config(
         bind(
             "auto_start",
             Value::Integer(auto as i64),
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(measurements) = trusted_measurements {
+        bind(
+            "trusted_measurements",
+            match measurements {
+                Some(m) => Value::Text(m.to_string()),
+                None => Value::Null,
+            },
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(ca) = hardware_root_ca {
+        bind(
+            "hardware_root_ca",
+            match ca {
+                Some(c) => Value::Text(c.to_string()),
+                None => Value::Null,
+            },
+            &mut params,
+            &mut sets,
+        );
+    }
+    if let Some(ca) = hardware_intermediate_ca {
+        bind(
+            "hardware_intermediate_ca",
+            match ca {
+                Some(c) => Value::Text(c.to_string()),
+                None => Value::Null,
+            },
             &mut params,
             &mut sets,
         );

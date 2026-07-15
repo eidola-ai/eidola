@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, ConfigState};
+use eidola_app_core::{AppCore, ConfigState, EidolaTrust};
 use gpui::Context;
 
 pub struct ConfigStore {
@@ -22,6 +22,11 @@ pub struct ConfigStore {
     /// construction, refreshed on `Change::Config`); `None` on a stub until a
     /// test installs one.
     state: Option<ConfigState>,
+    /// The eidola connection + trust bundle (base URL, measurements, hardware
+    /// CAs) — read from the `eidola` backend row via `AppCore::eidola_trust`.
+    /// Since it moved off `ConfigState` it is fetched separately (blocking on
+    /// the core runtime, off the gpui main thread) and re-read on each write.
+    trust: Option<EidolaTrust>,
     /// The last config-write error, surfaced by the settings panes.
     error: Option<AppError>,
 }
@@ -29,9 +34,13 @@ pub struct ConfigStore {
 impl ConfigStore {
     pub fn new(app_core: Option<Arc<AppCore>>) -> Self {
         let state = app_core.as_ref().map(|c| c.config_state());
+        let trust = app_core
+            .as_ref()
+            .and_then(|c| c.runtime().block_on(c.eidola_trust()).ok());
         Self {
             app_core,
             state,
+            trust,
             error: None,
         }
     }
@@ -41,6 +50,7 @@ impl ConfigStore {
         Self {
             app_core: None,
             state,
+            trust: None,
             error: None,
         }
     }
@@ -50,10 +60,21 @@ impl ConfigStore {
         self.state.as_ref()
     }
 
+    /// The resolved eidola connection + trust bundle, if known.
+    pub fn eidola_trust(&self) -> Option<&EidolaTrust> {
+        self.trust.as_ref()
+    }
+
     /// Test-only: install a fixture config snapshot.
     #[doc(hidden)]
     pub fn set_state_for_test(&mut self, state: Option<ConfigState>) {
         self.state = state;
+    }
+
+    /// Test-only: install a fixture eidola-trust snapshot.
+    #[doc(hidden)]
+    pub fn set_eidola_trust_for_test(&mut self, trust: Option<EidolaTrust>) {
+        self.trust = trust;
     }
 
     /// The last config-write error, if any.
@@ -72,6 +93,7 @@ impl ConfigStore {
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if let Some(core) = self.app_core.as_ref() {
             self.state = Some(core.config_state());
+            self.trust = core.runtime().block_on(core.eidola_trust()).ok();
             cx.notify();
         }
     }
@@ -83,6 +105,7 @@ impl ConfigStore {
         match f(core) {
             Ok(()) => {
                 self.state = Some(core.config_state());
+                self.trust = core.runtime().block_on(core.eidola_trust()).ok();
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
@@ -91,11 +114,13 @@ impl ConfigStore {
     }
 
     pub fn set_base_url(&mut self, url: String, cx: &mut Context<Self>) {
-        self.write(cx, |c| c.set_base_url(url));
+        // The setter moved to the eidola backend row (async); block on the
+        // core runtime off the gpui main thread.
+        self.write(cx, |c| c.runtime().block_on(c.set_base_url(url)));
     }
 
     pub fn clear_base_url_override(&mut self, cx: &mut Context<Self>) {
-        self.write(cx, |c| c.clear_base_url_override());
+        self.write(cx, |c| c.runtime().block_on(c.clear_base_url_override()));
     }
 
     pub fn set_default_model(&mut self, model: String, cx: &mut Context<Self>) {

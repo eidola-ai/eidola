@@ -117,25 +117,35 @@ fn stub_stores(cx: &mut TestAppContext, setup: impl FnOnce(&mut StoresStub)) -> 
     })
 }
 
+fn probe_config_state() -> ConfigState {
+    ConfigState {
+        default_model: "gemma4-31b".into(),
+        has_account: true,
+        has_account_secret: true,
+        domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
+        attestation_url: None,
+        appearance: eidola_app_core::config::AppearanceSetting::System,
+        time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
+        light_character: eidola_app_core::config::LightCharacter::Neutral,
+    }
+}
+
+fn probe_eidola_trust() -> eidola_app_core::EidolaTrust {
+    eidola_app_core::EidolaTrust {
+        base_url: "https://eidola.example/v1".into(),
+        base_url_pin: "https://eidola.example/v1".into(),
+        base_url_is_override: false,
+        trusted_measurements: Vec::new(),
+        trusted_measurements_are_override: false,
+        has_hardware_root_ca: false,
+        has_hardware_intermediate_ca: false,
+    }
+}
+
 fn ready_stores(cx: &mut TestAppContext) -> Stores {
     stub_stores(cx, |s| {
-        s.config_state = Some(ConfigState {
-            base_url: "https://eidola.example/v1".into(),
-            default_model: "gemma4-31b".into(),
-            base_url_pin: "https://eidola.example/v1".into(),
-            base_url_is_override: false,
-            has_account: true,
-            has_account_secret: true,
-            domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
-            trusted_measurements: Vec::new(),
-            trusted_measurements_are_override: false,
-            has_hardware_root_ca: false,
-            has_hardware_intermediate_ca: false,
-            attestation_url: None,
-            appearance: eidola_app_core::config::AppearanceSetting::System,
-            time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
-            light_character: eidola_app_core::config::LightCharacter::Neutral,
-        });
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
         s.balances = Some(BalancesResult {
             available: 4_200_000,
             pools: Vec::new(),
@@ -569,23 +579,8 @@ fn account_pane_probes_cover_controls_and_plans(cx: &mut TestAppContext) {
 /// account surface.
 fn account_backends_stores(cx: &mut TestAppContext) -> Stores {
     stub_stores(cx, |s| {
-        s.config_state = Some(ConfigState {
-            base_url: "https://eidola.example/v1".into(),
-            default_model: "gemma4-31b".into(),
-            base_url_pin: "https://eidola.example/v1".into(),
-            base_url_is_override: false,
-            has_account: true,
-            has_account_secret: true,
-            domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
-            trusted_measurements: Vec::new(),
-            trusted_measurements_are_override: false,
-            has_hardware_root_ca: false,
-            has_hardware_intermediate_ca: false,
-            attestation_url: None,
-            appearance: eidola_app_core::config::AppearanceSetting::System,
-            time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
-            light_character: eidola_app_core::config::LightCharacter::Neutral,
-        });
+        s.config_state = Some(probe_config_state());
+        s.eidola_trust = Some(probe_eidola_trust());
         s.balances = Some(BalancesResult {
             available: 4_200_000,
             pools: Vec::new(),

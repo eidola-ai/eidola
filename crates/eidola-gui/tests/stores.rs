@@ -39,7 +39,9 @@ fn test_core() -> (Arc<AppCore>, tempfile::TempDir) {
     let config_dir = dir.path().to_path_buf();
     let data_dir = dir.path().join("data");
     let core = AppCore::new(config_dir, data_dir);
-    core.set_base_url("https://127.0.0.1:1/v1".into()).unwrap();
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
+        .unwrap();
     (Arc::new(core), dir)
 }
 

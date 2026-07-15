@@ -95,7 +95,7 @@ To run the CLI against a local development stack:
 
    `--trust-measurement` takes a `<snp>:<rtmr1>:<rtmr2>` triple — three 96-char hex strings separated by colons — since each Tinfoil release ships paired AMD SEV-SNP and Intel TDX measurements. The mock shim advertises all-zeros for every field, so the dev triple is just three zero blocks. Both `--hardware-root-ca` and `--hardware-intermediate-ca` are required when pointing the CLI at the local mock shim — without ASK, the verifier falls back to AMD's production Genoa ASK, which obviously isn't signed by your local mock ARK and the chain fails to verify. (If you ever rotate `.dev-certs/`, re-run this `configure` command to refresh the embedded certs.)
 
-   On macOS, the CLI's configuration is stored in `~/Library/Application Support/eidola/config.toml`.
+   The connection + trust bundle these flags set — base URL, hardware CAs, and trusted measurements — is stored on the `eidola` backend row in the local database (`~/Library/Application Support/eidola/eidola.db` on macOS); each is a per-column override of the embedded trust-root pin. Other CLI settings (default model, attestation URL, account credentials) live in `~/Library/Application Support/eidola/config.toml`.
 
 Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) for convenience.
 

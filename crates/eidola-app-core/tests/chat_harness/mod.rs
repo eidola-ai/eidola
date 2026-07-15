@@ -685,7 +685,8 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
         .expect("plain http client");
     let core = AppCore::with_test_http_client(config_dir, data_dir, client);
     let mock = core.runtime().block_on(async { start(config).await });
-    core.set_base_url(mock.base_url.clone())
+    core.runtime()
+        .block_on(core.set_base_url(mock.base_url.clone()))
         .expect("set base url");
     (mock, core, dir)
 }

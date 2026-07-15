@@ -60,8 +60,8 @@ impl GeneralView {
     ) -> Self {
         let initial = config
             .read(cx)
-            .state()
-            .map(|s| s.base_url.clone())
+            .eidola_trust()
+            .map(|t| t.base_url.clone())
             .unwrap_or_default();
 
         let base_url_state = cx.new(|cx| {
@@ -114,8 +114,8 @@ impl GeneralView {
         let current = self
             .config
             .read(cx)
-            .state()
-            .map(|s| s.base_url.clone())
+            .eidola_trust()
+            .map(|t| t.base_url.clone())
             .unwrap_or_default();
         self.base_url_state.update(cx, |s, cx| {
             s.set_value(&current, window, cx);
@@ -136,7 +136,11 @@ impl GeneralView {
         if value.is_empty() {
             return;
         }
-        let pin = self.config.read(cx).state().map(|s| s.base_url_pin.clone());
+        let pin = self
+            .config
+            .read(cx)
+            .eidola_trust()
+            .map(|t| t.base_url_pin.clone());
         self.config.update(cx, |c, cx| {
             if pin.as_deref() == Some(value.as_str()) {
                 c.clear_base_url_override(cx);
@@ -185,6 +189,7 @@ impl Render for GeneralView {
         let theme = cx.theme();
         let store = self.config.read(cx);
         let state = store.state().cloned();
+        let trust = store.eidola_trust().cloned();
         let error = store.error().map(|e| e.to_string());
 
         // Note: ⌥ state is driven by the `WindowInput` observer installed in
@@ -387,7 +392,7 @@ impl Render for GeneralView {
                                 ),
                         ),
                 );
-        } else if let Some(s) = state.as_ref() {
+        } else if let Some(s) = trust.as_ref() {
             base_value = base_value.child(
                 div()
                     .text_sm()
@@ -474,11 +479,18 @@ impl Render for GeneralView {
                         ),
                 );
 
+                // The hardware CAs + trusted-measurements summary come from
+                // the eidola backend row (the connection + trust bundle),
+                // not `ConfigState`.
+                let (has_root_ca, has_intermediate_ca) = trust
+                    .as_ref()
+                    .map(|t| (t.has_hardware_root_ca, t.has_hardware_intermediate_ca))
+                    .unwrap_or((false, false));
                 col = col.child(field_row(
                     "Hardware root CA",
                     cx,
                     muted_text(
-                        if s.has_hardware_root_ca {
+                        if has_root_ca {
                             "Custom certificate set"
                         } else {
                             "Not set — AMD/Intel vendor chain"
@@ -490,7 +502,7 @@ impl Render for GeneralView {
                     "Intermediate CA",
                     cx,
                     muted_text(
-                        if s.has_hardware_intermediate_ca {
+                        if has_intermediate_ca {
                             "Custom certificate set"
                         } else {
                             "Not set — AMD/Intel vendor chain"
@@ -500,15 +512,19 @@ impl Render for GeneralView {
                 ));
 
                 // Measurements: a summary + a door, never a hex dump.
-                let summary = if s.trusted_measurements_are_override {
+                let measurements_are_override = trust
+                    .as_ref()
+                    .map(|t| t.trusted_measurements_are_override)
+                    .unwrap_or(false);
+                let measurements_len = trust
+                    .as_ref()
+                    .map(|t| t.trusted_measurements.len())
+                    .unwrap_or(0);
+                let summary = if measurements_are_override {
                     format!(
                         "{} user-trusted measurement{}",
-                        s.trusted_measurements.len(),
-                        if s.trusted_measurements.len() == 1 {
-                            ""
-                        } else {
-                            "s"
-                        }
+                        measurements_len,
+                        if measurements_len == 1 { "" } else { "s" }
                     )
                 } else {
                     "1 measurement — pinned at build".to_string()

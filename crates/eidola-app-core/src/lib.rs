@@ -42,32 +42,19 @@ pub use local_models::{
 
 /// Snapshot of the current config for display.
 ///
-/// `base_url` and `trusted_measurements` are the *resolved* values: the
-/// user's override if set, the trust-root pin otherwise. UI displays these
-/// directly without needing to know which source they came from.
+/// Purely config-backed (resolvable without the database). The eidola
+/// connection + trust bundle (base URL, trusted measurements, hardware CAs)
+/// moved to the `eidola` backend row — see [`EidolaTrust`] and
+/// [`AppCore::eidola_trust`].
 #[derive(Clone, Debug)]
 pub struct ConfigState {
-    pub base_url: String,
     /// The resolved default inference model: the user's `default_model`
     /// config override if set, otherwise the embedded fallback
     /// ([`config::DEFAULT_MODEL`]).
     pub default_model: String,
-    /// The trust-root pin baked into this binary. Equal to `base_url` unless
-    /// the user has set an override — the UI uses the pair to be honest
-    /// about override-vs-pin instead of presenting one undifferentiated URL.
-    pub base_url_pin: String,
-    /// Whether `base_url` comes from a user override (`true`) or the
-    /// embedded trust-root pin (`false`).
-    pub base_url_is_override: bool,
     pub has_account: bool,
     pub has_account_secret: bool,
     pub domain_separator: String,
-    pub trusted_measurements: Vec<MeasurementInfo>,
-    /// Whether `trusted_measurements` is a user override list (`true`) or
-    /// the single pinned build measurement (`false`).
-    pub trusted_measurements_are_override: bool,
-    pub has_hardware_root_ca: bool,
-    pub has_hardware_intermediate_ca: bool,
     pub attestation_url: Option<String>,
     /// The resolved circadian day/night axis (`appearance` override if set,
     /// otherwise `system`).
@@ -78,6 +65,30 @@ pub struct ConfigState {
     /// The resolved fixed light character used while `time_of_day_tint` is
     /// `off` (`light_character` override if set, otherwise `neutral`).
     pub light_character: config::LightCharacter,
+}
+
+/// The eidola backend's resolved connection + trust bundle, honest about
+/// override-vs-pin. Read from the `eidola` backend row (see
+/// [`AppCore::eidola_trust`]); each field falls back to the embedded
+/// trust-root pin when the row's column is NULL. Overriding the trust root
+/// is security-relevant state, so UIs render override state + revert-to-pin
+/// explicitly.
+#[derive(Clone, Debug)]
+pub struct EidolaTrust {
+    /// The resolved server URL (row override, else the pin).
+    pub base_url: String,
+    /// The trust-root pin baked into this binary — equal to `base_url`
+    /// unless overridden, so the UI can be honest about the source.
+    pub base_url_pin: String,
+    /// Whether `base_url` is a row override (`true`) or the pin (`false`).
+    pub base_url_is_override: bool,
+    /// The resolved measurements the client will accept on handshake.
+    pub trusted_measurements: Vec<MeasurementInfo>,
+    /// Whether `trusted_measurements` is a row override list (`true`) or the
+    /// single pinned build measurement (`false`).
+    pub trusted_measurements_are_override: bool,
+    pub has_hardware_root_ca: bool,
+    pub has_hardware_intermediate_ca: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -603,9 +614,146 @@ impl Inner {
         database.connect().map_err(AppError::db)
     }
 
+    /// Load the `eidola` backend row and resolve its connection + trust
+    /// bundle against the embedded trust-root pin. This is the single place
+    /// URL / measurements / hardware CAs are sourced now that they live on
+    /// the row instead of `Config`.
+    async fn eidola_resolved(&self) -> Result<EidolaResolved, AppError> {
+        let conn = self.db_conn().await?;
+        let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID).await?;
+        EidolaResolved::from_row(row.as_ref())
+    }
+
+    /// The public [`EidolaTrust`] DTO: the resolved bundle plus the
+    /// override-vs-pin honesty flags the UIs render.
+    async fn eidola_trust(&self) -> Result<EidolaTrust, AppError> {
+        let resolved = self.eidola_resolved().await?;
+        let to_info = |m: &tinfoil_verifier::EnclaveMeasurement| MeasurementInfo {
+            snp: m.snp_measurement.clone(),
+            tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
+            tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
+        };
+        Ok(EidolaTrust {
+            base_url: resolved.base_url.clone(),
+            base_url_pin: trust_root::SERVER_URL.to_string(),
+            base_url_is_override: resolved.base_url_is_override,
+            trusted_measurements: resolved.measurements.iter().map(to_info).collect(),
+            trusted_measurements_are_override: resolved.measurements_are_override,
+            has_hardware_root_ca: resolved.hardware_root_ca.is_some(),
+            has_hardware_intermediate_ca: resolved.hardware_intermediate_ca.is_some(),
+        })
+    }
+
+    /// Read the eidola row's raw enclave-measurement override list (the
+    /// *stored* overrides, not the pin-resolved set). Empty when the column
+    /// is NULL — the read-modify-write base for trust/untrust.
+    async fn eidola_measurement_overrides(
+        &self,
+    ) -> Result<Vec<tinfoil_verifier::EnclaveMeasurement>, AppError> {
+        let conn = self.db_conn().await?;
+        let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID).await?;
+        match row.and_then(|r| r.trusted_measurements) {
+            Some(json) if !json.trim().is_empty() => {
+                serde_json::from_str(&json).map_err(|e| AppError::Database {
+                    message: format!("invalid trusted_measurements JSON on eidola row: {e}"),
+                })
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Add a measurement to the eidola row's override list (idempotent by
+    /// SNP measurement). Returns whether it was newly added.
+    async fn trust_measurement(
+        &self,
+        entry: tinfoil_verifier::EnclaveMeasurement,
+    ) -> Result<bool, AppError> {
+        let mut list = self.eidola_measurement_overrides().await?;
+        if list.iter().any(|m| {
+            m.snp_measurement
+                .eq_ignore_ascii_case(&entry.snp_measurement)
+        }) {
+            return Ok(false);
+        }
+        list.push(entry);
+        let json = serde_json::to_string(&list).map_err(|e| AppError::Database {
+            message: format!("failed to serialize trusted_measurements: {e}"),
+        })?;
+        self.update_backend(
+            backends::EIDOLA_BACKEND_ID,
+            backends::BackendUpdate {
+                trusted_measurements: Some(Some(json)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Remove a measurement (by SNP key) from the eidola row's override list.
+    /// Clears the column back to NULL (= pin) when the list empties. Returns
+    /// whether a measurement was removed.
+    async fn untrust_measurement(&self, key: String) -> Result<bool, AppError> {
+        let mut list = self.eidola_measurement_overrides().await?;
+        let Some(pos) = list
+            .iter()
+            .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
+        else {
+            return Ok(false);
+        };
+        list.remove(pos);
+        let json = if list.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&list).map_err(|e| AppError::Database {
+                    message: format!("failed to serialize trusted_measurements: {e}"),
+                })?,
+            )
+        };
+        self.update_backend(
+            backends::EIDOLA_BACKEND_ID,
+            backends::BackendUpdate {
+                trusted_measurements: Some(json),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Set/clear a hardware CA (ARK or ASK) override on the eidola row.
+    /// `pem = None` clears back to the vendor chain.
+    async fn set_hardware_ca(
+        &self,
+        which: HardwareCa,
+        pem: Option<String>,
+    ) -> Result<(), AppError> {
+        let pem = match pem {
+            Some(p) if !p.trim().is_empty() => {
+                config::parse_cert_config(Some(&p), which.field_name())?;
+                Some(p.trim().to_string())
+            }
+            _ => None,
+        };
+        let update = match which {
+            HardwareCa::Root => backends::BackendUpdate {
+                hardware_root_ca: Some(pem),
+                ..Default::default()
+            },
+            HardwareCa::Intermediate => backends::BackendUpdate {
+                hardware_intermediate_ca: Some(pem),
+                ..Default::default()
+            },
+        };
+        self.update_backend(backends::EIDOLA_BACKEND_ID, update)
+            .await
+    }
+
     async fn build_client(
         &self,
         config: &Config,
+        eidola: &EidolaResolved,
         attestation_observer: Option<tinfoil_verifier::AttestationObserver>,
     ) -> Result<reqwest::Client, AppError> {
         // Test seam: a plain-HTTP client injected via
@@ -617,19 +765,17 @@ impl Inner {
         if let Some(client) = &self.http_override {
             return Ok(client.clone());
         }
-        let origin = config.base_url();
-        let allowed_measurements = config.trusted_measurements();
 
         let hardware_root_der =
-            config::parse_cert_config(config.hardware_root_ca.as_deref(), "hardware_root_ca")?;
+            config::parse_cert_config(eidola.hardware_root_ca.as_deref(), "hardware_root_ca")?;
         let hardware_intermediate_der = config::parse_cert_config(
-            config.hardware_intermediate_ca.as_deref(),
+            eidola.hardware_intermediate_ca.as_deref(),
             "hardware_intermediate_ca",
         )?;
 
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &allowed_measurements,
-            inference_base_url: origin,
+            allowed_measurements: &eidola.measurements,
+            inference_base_url: &eidola.base_url,
             atc_url: config.attestation_url.as_deref(),
             enclave_repo: Some(config.attestation_repo()),
             trusted_ark_der: hardware_root_der.as_deref(),
@@ -648,15 +794,78 @@ impl Inner {
     }
 }
 
+/// The `eidola` backend's resolved connection + trust bundle. Overrides come
+/// from the eidola row; NULL columns fall back to the embedded trust-root
+/// pin. Built once per operation and shared by [`Inner::build_client`] and
+/// the request-URL construction so both agree on where they're talking.
+struct EidolaResolved {
+    base_url: String,
+    base_url_is_override: bool,
+    measurements: Vec<tinfoil_verifier::EnclaveMeasurement>,
+    measurements_are_override: bool,
+    hardware_root_ca: Option<String>,
+    hardware_intermediate_ca: Option<String>,
+}
+
+impl EidolaResolved {
+    fn from_row(row: Option<&db::BackendRow>) -> Result<Self, AppError> {
+        let base_url_override = row.and_then(|r| r.base_url.clone());
+        let base_url_is_override = base_url_override.is_some();
+        let base_url = base_url_override.unwrap_or_else(|| trust_root::SERVER_URL.to_string());
+
+        let measurements_override: Vec<tinfoil_verifier::EnclaveMeasurement> =
+            match row.and_then(|r| r.trusted_measurements.as_deref()) {
+                Some(json) if !json.trim().is_empty() => {
+                    serde_json::from_str(json).map_err(|e| AppError::Database {
+                        message: format!("invalid trusted_measurements JSON on eidola row: {e}"),
+                    })?
+                }
+                _ => Vec::new(),
+            };
+        let measurements_are_override = !measurements_override.is_empty();
+        let measurements = if measurements_are_override {
+            measurements_override
+        } else {
+            vec![trust_root::server_measurement()]
+        };
+
+        Ok(EidolaResolved {
+            base_url,
+            base_url_is_override,
+            measurements,
+            measurements_are_override,
+            hardware_root_ca: row.and_then(|r| r.hardware_root_ca.clone()),
+            hardware_intermediate_ca: row.and_then(|r| r.hardware_intermediate_ca.clone()),
+        })
+    }
+}
+
+/// Which hardware attestation-chain certificate an override targets.
+#[derive(Clone, Copy)]
+enum HardwareCa {
+    Root,
+    Intermediate,
+}
+
+impl HardwareCa {
+    fn field_name(self) -> &'static str {
+        match self {
+            HardwareCa::Root => "hardware_root_ca",
+            HardwareCa::Intermediate => "hardware_intermediate_ca",
+        }
+    }
+}
+
 // --- High-level async operations (run on the owned tokio runtime) ------------
 
 impl Inner {
     async fn account_show(&self) -> Result<AccountShowResult, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
 
-        let client = self.build_client(&cfg, None).await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let resp = client
             .get(format!("{base_url}/v1/account"))
             .basic_auth(id, Some(secret))
@@ -681,7 +890,6 @@ impl Inner {
 
     async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
 
         if cfg.account_id.is_some() || cfg.account_secret.is_some() {
             return Err(AppError::Config {
@@ -689,7 +897,9 @@ impl Inner {
             });
         }
 
-        let client = self.build_client(&cfg, None).await?;
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let resp = client
             .post(format!("{base_url}/v1/account"))
             .send()
@@ -719,9 +929,10 @@ impl Inner {
 
     async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
 
-        let client = self.build_client(&cfg, None).await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let resp = client
             .get(format!("{base_url}/v1/prices"))
             .send()
@@ -771,10 +982,11 @@ impl Inner {
 
     async fn account_checkout(&self, price_id: &str) -> Result<String, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
 
-        let client = self.build_client(&cfg, None).await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let resp = client
             .post(format!("{base_url}/v1/account/checkout"))
             .basic_auth(id, Some(secret))
@@ -796,10 +1008,11 @@ impl Inner {
 
     async fn account_balances(&self) -> Result<BalancesResult, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
 
-        let client = self.build_client(&cfg, None).await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let resp = client
             .get(format!("{base_url}/v1/account/balances"))
             .basic_auth(id, Some(secret))
@@ -840,9 +1053,10 @@ impl Inner {
         }
 
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
         let (account_id, secret) = self.require_credentials(&cfg)?;
-        let client = self.build_client(&cfg, None).await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
 
         // 1. Fetch issuer keys
         let resp = client
@@ -1178,8 +1392,9 @@ impl Inner {
 
     async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
-        let client = self.build_client(&cfg, None).await?;
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let client = self.build_client(&cfg, &eidola, None).await?;
         let db_conn = self.db_conn().await?;
         let params = params_from_domain_separator(cfg.domain_separator())?;
         let now = now_ms();
@@ -1246,10 +1461,10 @@ impl Inner {
 
     async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
         let cfg = self.load_config();
-        let base_url = cfg.base_url();
-        let client = self.build_client(&cfg, None).await?;
+        let eidola = self.eidola_resolved().await?;
+        let client = self.build_client(&cfg, &eidola, None).await?;
 
-        let models = fetch_models(&client, base_url).await?;
+        let models = fetch_models(&client, &eidola.base_url).await?;
         Ok(models
             .data
             .into_iter()
@@ -1743,7 +1958,12 @@ impl Inner {
                 (provider_id, client, base_url, None, 0u64, None, auth)
             }
             BackendKind::Eidola => {
-                let base_url = cfg.base_url().to_string();
+                // The eidola row was already fetched by `require_backend`
+                // above — resolve its connection + trust bundle straight from
+                // it (base URL / measurements / hardware CAs, falling back to
+                // the embedded pin per column).
+                let eidola = EidolaResolved::from_row(Some(&backend))?;
+                let base_url = eidola.base_url.clone();
                 let provider_id =
                     db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
                 let log_clone = attestation_log.clone();
@@ -1753,7 +1973,7 @@ impl Inner {
                     },
                 ));
 
-                let client = self.build_client(&cfg, observer).await?;
+                let client = self.build_client(&cfg, &eidola, observer).await?;
 
                 let models = fetch_models(&client, &base_url).await?;
                 let connection_id =
@@ -2675,23 +2895,11 @@ impl AppCore {
 
     pub fn config_state(&self) -> ConfigState {
         let cfg = self.inner.load_config();
-        let to_info = |m: &tinfoil_verifier::EnclaveMeasurement| MeasurementInfo {
-            snp: m.snp_measurement.clone(),
-            tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
-            tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
-        };
         ConfigState {
-            base_url: cfg.base_url().to_string(),
             default_model: cfg.default_model().to_string(),
-            base_url_pin: trust_root::SERVER_URL.to_string(),
-            base_url_is_override: cfg.base_url_override.is_some(),
             has_account: cfg.account_id.is_some(),
             has_account_secret: cfg.account_secret.is_some(),
             domain_separator: cfg.domain_separator().to_string(),
-            trusted_measurements: cfg.trusted_measurements().iter().map(&to_info).collect(),
-            trusted_measurements_are_override: !cfg.trusted_measurements_override.is_empty(),
-            has_hardware_root_ca: cfg.hardware_root_ca.is_some(),
-            has_hardware_intermediate_ca: cfg.hardware_intermediate_ca.is_some(),
             attestation_url: cfg.attestation_url.clone(),
             appearance: cfg.appearance(),
             time_of_day_tint: cfg.time_of_day_tint(),
@@ -2699,12 +2907,36 @@ impl AppCore {
         }
     }
 
-    pub fn set_base_url(&self, url: String) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.base_url_override = Some(url);
-        cfg.save_to(&self.inner.config_path)?;
-        self.bus.emit(Change::Config);
-        Ok(())
+    /// The eidola backend's resolved connection + trust bundle (base URL,
+    /// measurements, hardware CAs) with the override-vs-pin honesty flags —
+    /// read from the `eidola` backend row. Async because it reads the DB;
+    /// UIs cache the snapshot and refresh it on [`Change::Backends`].
+    pub async fn eidola_trust(&self) -> Result<EidolaTrust, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.eidola_trust().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Set the eidola server URL override (persisted on the `eidola` backend
+    /// row). Validated before write; emits [`Change::Backends`].
+    pub async fn set_base_url(&self, url: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .update_backend(
+                        backends::EIDOLA_BACKEND_ID,
+                        backends::BackendUpdate {
+                            base_url: Some(Some(url)),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+            .await
+            .map_err(join_err)?
     }
 
     /// Persist the user's default inference model (the `default_model`
@@ -2768,14 +3000,25 @@ impl AppCore {
         Ok(())
     }
 
-    /// Remove the user's base-URL override, reverting to the trust-root pin
-    /// baked into this binary.
-    pub fn clear_base_url_override(&self) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.base_url_override = None;
-        cfg.save_to(&self.inner.config_path)?;
-        self.bus.emit(Change::Config);
-        Ok(())
+    /// Remove the eidola base-URL override (clears the row column back to
+    /// NULL), reverting to the trust-root pin baked into this binary. Emits
+    /// [`Change::Backends`].
+    pub async fn clear_base_url_override(&self) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .update_backend(
+                        backends::EIDOLA_BACKEND_ID,
+                        backends::BackendUpdate {
+                            base_url: Some(None),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+            .await
+            .map_err(join_err)?
     }
 
     pub fn set_attestation_url(&self, url: String) -> Result<(), AppError> {
@@ -2786,25 +3029,34 @@ impl AppCore {
         Ok(())
     }
 
-    pub fn set_hardware_root_ca(&self, pem: String) -> Result<(), AppError> {
-        config::parse_cert_config(Some(&pem), "hardware_root_ca")?;
-        let mut cfg = self.inner.load_config();
-        cfg.hardware_root_ca = Some(pem.trim().to_string());
-        cfg.save_to(&self.inner.config_path)?;
-        self.bus.emit(Change::Config);
-        Ok(())
+    /// Set the eidola hardware root CA (ARK) PEM override on the backend row.
+    /// Validated before write; emits [`Change::Backends`].
+    pub async fn set_hardware_root_ca(&self, pem: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.set_hardware_ca(HardwareCa::Root, Some(pem)).await })
+            .await
+            .map_err(join_err)?
     }
 
-    pub fn set_hardware_intermediate_ca(&self, pem: String) -> Result<(), AppError> {
-        config::parse_cert_config(Some(&pem), "hardware_intermediate_ca")?;
-        let mut cfg = self.inner.load_config();
-        cfg.hardware_intermediate_ca = Some(pem.trim().to_string());
-        cfg.save_to(&self.inner.config_path)?;
-        self.bus.emit(Change::Config);
-        Ok(())
+    /// Set the eidola hardware intermediate CA (ASK) PEM override on the
+    /// backend row. Validated before write; emits [`Change::Backends`].
+    pub async fn set_hardware_intermediate_ca(&self, pem: String) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .set_hardware_ca(HardwareCa::Intermediate, Some(pem))
+                    .await
+            })
+            .await
+            .map_err(join_err)?
     }
 
-    pub fn trust_measurement(
+    /// Add a trusted enclave measurement to the eidola backend row's override
+    /// list. Returns whether it was newly added (idempotent by SNP
+    /// measurement). Emits [`Change::Backends`] when it writes.
+    pub async fn trust_measurement(
         &self,
         snp: String,
         tdx_rtmr1: String,
@@ -2812,34 +3064,23 @@ impl AppCore {
     ) -> Result<bool, AppError> {
         let spec = format!("{snp}:{tdx_rtmr1}:{tdx_rtmr2}");
         let entry = config::parse_trust_measurement(&spec)?;
-        let mut cfg = self.inner.load_config();
-        if cfg.trusted_measurements_override.iter().any(|m| {
-            m.snp_measurement
-                .eq_ignore_ascii_case(&entry.snp_measurement)
-        }) {
-            return Ok(false);
-        }
-        cfg.trusted_measurements_override.push(entry);
-        cfg.save_to(&self.inner.config_path)?;
-        self.bus.emit(Change::Config);
-        Ok(true)
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.trust_measurement(entry).await })
+            .await
+            .map_err(join_err)?
     }
 
-    pub fn untrust_measurement(&self, snp: String) -> Result<bool, AppError> {
+    /// Remove a trusted measurement (by SNP key) from the eidola backend
+    /// row's override list. Returns whether one was removed; clearing the
+    /// last reverts to the pin. Emits [`Change::Backends`] when it writes.
+    pub async fn untrust_measurement(&self, snp: String) -> Result<bool, AppError> {
         let key = config::parse_untrust_key(&snp)?;
-        let mut cfg = self.inner.load_config();
-        if let Some(pos) = cfg
-            .trusted_measurements_override
-            .iter()
-            .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
-        {
-            cfg.trusted_measurements_override.remove(pos);
-            cfg.save_to(&self.inner.config_path)?;
-            self.bus.emit(Change::Config);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.untrust_measurement(key).await })
+            .await
+            .map_err(join_err)?
     }
 
     pub fn set_account_credentials(&self, id: String, secret: String) -> Result<(), AppError> {

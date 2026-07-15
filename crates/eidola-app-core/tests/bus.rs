@@ -113,16 +113,22 @@ fn drain(rx: &mut tokio::sync::broadcast::Receiver<Change>) -> Vec<Change> {
 // ===========================================================================
 
 #[test]
-fn config_write_emits_config() {
-    let (core, _dir) = make_core();
-    let mut rx = core.subscribe_changes();
+fn set_base_url_emits_backends() {
+    // The eidola connection + trust bundle lives on the `eidola` backend row
+    // now, so a base-URL write is a Backends mutation (not Config).
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        let mut rx = core.subscribe_changes();
 
-    core.set_base_url("https://example.com".into()).unwrap();
-    let changes = drain(&mut rx);
-    assert!(
-        changes.contains(&Change::Config),
-        "set_base_url should emit Config; got {changes:?}"
-    );
+        core.runtime()
+            .block_on(core.set_base_url("https://example.com".into()))
+            .unwrap();
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Backends),
+            "set_base_url should emit Backends; got {changes:?}"
+        );
+    });
 }
 
 #[test]
@@ -139,17 +145,23 @@ fn set_default_model_emits_config() {
 }
 
 #[test]
-fn clear_base_url_override_emits_config() {
-    let (core, _dir) = make_core();
-    core.set_base_url("https://example.com".into()).unwrap();
+fn clear_base_url_override_emits_backends() {
+    run_in_thread(|| {
+        let (core, _dir) = make_core();
+        core.runtime()
+            .block_on(core.set_base_url("https://example.com".into()))
+            .unwrap();
 
-    let mut rx = core.subscribe_changes();
-    core.clear_base_url_override().unwrap();
-    let changes = drain(&mut rx);
-    assert!(
-        changes.contains(&Change::Config),
-        "clear_base_url_override should emit Config; got {changes:?}"
-    );
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.clear_base_url_override())
+            .unwrap();
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Backends),
+            "clear_base_url_override should emit Backends; got {changes:?}"
+        );
+    });
 }
 
 #[test]
@@ -586,7 +598,7 @@ fn two_subscribers_both_receive() {
     let mut rx1 = core.subscribe_changes();
     let mut rx2 = core.subscribe_changes();
 
-    core.set_base_url("https://example.com".into()).unwrap();
+    core.set_default_model("kimi-k2-6".into()).unwrap();
 
     let c1 = drain(&mut rx1);
     let c2 = drain(&mut rx2);
@@ -655,7 +667,7 @@ fn set_account_credentials_followed_by_reset_emits_config_each_time() {
 fn late_subscriber_does_not_see_past_events() {
     let (core, _dir) = make_core();
 
-    core.set_base_url("https://example.com".into()).unwrap();
+    core.set_default_model("kimi-k2-6".into()).unwrap();
 
     // Subscribe AFTER the write.
     let mut rx = core.subscribe_changes();

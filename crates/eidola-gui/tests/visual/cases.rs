@@ -452,6 +452,7 @@ fn register_library(s: &mut Snapshots) {
 fn settings_stores(cx: &mut App) -> Stores {
     stub_stores(cx, |s| {
         s.config_state = Some(stub_config_state(true));
+        s.eidola_trust = Some(stub_eidola_trust());
         s.balances = Some(BalancesResult {
             available: 4_200_000,
             pools: vec![
@@ -664,19 +665,21 @@ fn register_settings(s: &mut Snapshots) {
     s.add("settings_general_advanced", settings_size, |window, cx| {
         let core = stub_stores(cx, |s| {
             let mut state = stub_config_state(true);
-            state.base_url = "https://staging.eidola.example/v1".into();
-            state.base_url_is_override = true;
             state.attestation_url = Some("https://atc.tinfoil.sh/v1/attest".into());
-            state.has_hardware_root_ca = true;
-            state.trusted_measurements = vec![MeasurementInfo {
+            s.config_state = Some(state);
+            let mut trust = stub_eidola_trust();
+            trust.base_url = "https://staging.eidola.example/v1".into();
+            trust.base_url_is_override = true;
+            trust.has_hardware_root_ca = true;
+            trust.trusted_measurements = vec![MeasurementInfo {
                 snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
                 tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .into(),
                 tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
                     .into(),
             }];
-            state.trusted_measurements_are_override = true;
-            s.config_state = Some(state);
+            trust.trusted_measurements_are_override = true;
+            s.eidola_trust = Some(trust);
         });
         let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
         let general = view.read(cx).general();
@@ -1050,20 +1053,25 @@ fn model_stores(cx: &mut App) -> Stores {
 
 fn stub_config_state(has_account: bool) -> ConfigState {
     ConfigState {
-        base_url: "https://eidola.example/v1".into(),
         default_model: "gemma4-31b".into(),
-        base_url_pin: "https://eidola.example/v1".into(),
-        base_url_is_override: false,
         has_account,
         has_account_secret: has_account,
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
-        trusted_measurements: Vec::new(),
-        trusted_measurements_are_override: false,
-        has_hardware_root_ca: false,
-        has_hardware_intermediate_ca: false,
         attestation_url: None,
         appearance: eidola_app_core::config::AppearanceSetting::System,
         time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
         light_character: eidola_app_core::config::LightCharacter::Neutral,
+    }
+}
+
+fn stub_eidola_trust() -> eidola_app_core::EidolaTrust {
+    eidola_app_core::EidolaTrust {
+        base_url: "https://eidola.example/v1".into(),
+        base_url_pin: "https://eidola.example/v1".into(),
+        base_url_is_override: false,
+        trusted_measurements: Vec::new(),
+        trusted_measurements_are_override: false,
+        has_hardware_root_ca: false,
+        has_hardware_intermediate_ca: false,
     }
 }

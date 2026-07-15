@@ -244,6 +244,7 @@ fn account_op_error_surfaces_and_clears(cx: &mut TestAppContext) {
     let stores = stub_stores(cx, |s| {
         // No account yet — the Account pane shows the "Create account" button.
         s.config_state = Some(config_state(false));
+        s.eidola_trust = Some(eidola_trust());
     });
     let (_window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| AccountView::new(stores.clone(), window, cx))
@@ -1591,7 +1592,9 @@ fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let _dir = tempfile::tempdir().unwrap();
     let core = AppCore::new(_dir.path().to_path_buf(), _dir.path().join("data"));
-    core.set_base_url("https://127.0.0.1:1/v1".into()).unwrap();
+    core.runtime()
+        .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
+        .unwrap();
     let stores = cx.update(|cx| Stores::for_test(std::sync::Arc::new(core), cx));
     let (_window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| RecordView::new(stores.clone(), window, cx))
@@ -1626,21 +1629,28 @@ fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
 
 fn config_state(has_account: bool) -> ConfigState {
     ConfigState {
-        base_url: "https://eidola.example/v1".into(),
         default_model: "gemma4-31b".into(),
-        base_url_pin: "https://eidola.example/v1".into(),
-        base_url_is_override: false,
         has_account,
         has_account_secret: has_account,
         domain_separator: "ACT-v1:eidola:inference:production:2026-03-05".into(),
-        trusted_measurements: Vec::new(),
-        trusted_measurements_are_override: false,
-        has_hardware_root_ca: false,
-        has_hardware_intermediate_ca: false,
         attestation_url: None,
         appearance: eidola_app_core::config::AppearanceSetting::System,
         time_of_day_tint: eidola_app_core::config::TimeOfDayTint::On,
         light_character: eidola_app_core::config::LightCharacter::Neutral,
+    }
+}
+
+/// The eidola connection + trust bundle fixture (moved off `ConfigState`);
+/// the General pane's base-URL + trust rows read it.
+fn eidola_trust() -> eidola_app_core::EidolaTrust {
+    eidola_app_core::EidolaTrust {
+        base_url: "https://eidola.example/v1".into(),
+        base_url_pin: "https://eidola.example/v1".into(),
+        base_url_is_override: false,
+        trusted_measurements: Vec::new(),
+        trusted_measurements_are_override: false,
+        has_hardware_root_ca: false,
+        has_hardware_intermediate_ca: false,
     }
 }
 
@@ -1659,6 +1669,7 @@ fn stub_stores(cx: &mut TestAppContext, setup: impl FnOnce(&mut StoresStub)) -> 
 fn stub_stores_with_config(cx: &mut TestAppContext) -> Stores {
     stub_stores(cx, |s| {
         s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
         s.balances = Some(BalancesResult {
             available: 5_000_000,
             pools: Vec::new(),

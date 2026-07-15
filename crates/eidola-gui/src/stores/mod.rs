@@ -98,7 +98,11 @@ impl Stores {
     /// the scene declaratively and each store is constructed via its own
     /// stub constructor with no backend.
     pub fn stub_with(fixture: StoresStub, cx: &mut App) -> Self {
-        let config = cx.new(|_| ConfigStore::stub(fixture.config_state));
+        let config = cx.new(|_| {
+            let mut store = ConfigStore::stub(fixture.config_state);
+            store.set_eidola_trust_for_test(fixture.eidola_trust);
+            store
+        });
         let backends = cx.new(|_| BackendsStore::stub(fixture.backends));
         // Explicit per-backend catalogs win; otherwise the flat model list
         // becomes the eidola catalog (the pre-backends fixture shape).
@@ -173,6 +177,10 @@ impl Stores {
 #[derive(Default)]
 pub struct StoresStub {
     pub config_state: Option<eidola_app_core::ConfigState>,
+    /// The eidola connection + trust bundle (base URL, measurements, hardware
+    /// CAs) — read from the `eidola` backend row in production; supplied here
+    /// for the General pane's base-URL + trust rows in stub scenes.
+    pub eidola_trust: Option<eidola_app_core::EidolaTrust>,
     /// Configured backends. An empty list leaves the store `NotLoaded`,
     /// which reads as "singletons enabled" (the optimistic default).
     pub backends: Vec<eidola_app_core::BackendInfo>,
