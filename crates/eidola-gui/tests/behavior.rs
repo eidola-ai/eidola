@@ -1025,6 +1025,120 @@ fn settings_eidola_url_editor_save_cancel_revert(cx: &mut TestAppContext) {
     pane.update(cx, |p, cx| p.revert_measurements(cx));
 }
 
+/// The measurement + hardware-CA *editors* on the Eidola tab appear only while
+/// ⌥ is held. This drives the real platform dispatch: the `SettingsView` root's
+/// single `on_modifiers_changed` listener mirrors into `WindowInput`, which the
+/// backends pane observes — the same seam the General pane uses.
+#[gpui::test]
+fn settings_eidola_trust_editors_gate_on_option(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(eidola_trust());
+        s.backends = backends_fixture(true);
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+
+    pane.read_with(cx, |p, _| {
+        assert!(!p.advanced(), "trust editors hidden at rest");
+    });
+
+    // Drive the real modifier-changed dispatch path through the root listener.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_modifiers_change(Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    });
+    pane.read_with(&vcx, |p, _| {
+        assert!(p.advanced(), "⌥ held reveals the trust editors");
+    });
+
+    vcx.simulate_modifiers_change(Modifiers::default());
+    pane.read_with(&vcx, |p, _| {
+        assert!(!p.advanced(), "releasing ⌥ hides the trust editors");
+    });
+}
+
+/// The Eidola trust editors route through the config store. On a stub (no
+/// backend) each write stops at the store's backend guard — an honest no-op —
+/// so a successful submit clears its input and nothing panics. Exercises the
+/// add-measurement, untrust, and CA set/clear paths.
+#[gpui::test]
+fn settings_eidola_trust_editors_call_through(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::CaKind;
+
+    let mut trust = eidola_trust();
+    trust.trusted_measurements = vec![eidola_app_core::MeasurementInfo {
+        snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+        tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+    }];
+    trust.trusted_measurements_are_override = true;
+    trust.has_hardware_root_ca = true;
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.eidola_trust = Some(trust);
+        s.backends = backends_fixture(true);
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SettingsView::new(stores.clone(), WindowInput::new(cx), window, cx))
+    });
+    let pane = view.read_with(cx, |v, _| v.backends_pane());
+    pane.update(cx, |p, cx| p.set_advanced(true, cx));
+
+    // Add a measurement: seed the input triple, submit, expect a cleared field
+    // (the stub write reports no error, so the success branch clears it).
+    let triple = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44\
+                  ee55ff66aa11bb22cc33dd44:\
+                  0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:\
+                  fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    let add_input = pane.read_with(cx, |p, _| p.add_measurement_input());
+    cx.update_window(window, |_, window, cx| {
+        add_input.update(cx, |s, cx| s.set_value(triple, window, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.submit_add_measurement(window, cx));
+    })
+    .unwrap();
+    add_input.read_with(cx, |s, _| {
+        assert!(s.value().is_empty(), "a successful add clears the input");
+    });
+
+    // Untrust routes through without panicking.
+    pane.update(cx, |p, cx| {
+        p.untrust_measurement(
+            "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+            cx,
+        )
+    });
+
+    // CA set: seed a PEM, submit, expect a cleared field; then Clear routes
+    // through.
+    let ca_input = pane.read_with(cx, |p, _| p.ca_input(CaKind::Root));
+    cx.update_window(window, |_, window, cx| {
+        ca_input.update(cx, |s, cx| {
+            s.set_value(
+                "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+                window,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        pane.update(cx, |p, cx| p.submit_ca(CaKind::Root, window, cx));
+    })
+    .unwrap();
+    ca_input.read_with(cx, |s, _| {
+        assert!(s.value().is_empty(), "a successful CA set clears the input");
+    });
+    pane.update(cx, |p, cx| p.clear_ca(CaKind::Root, cx));
+}
+
 #[gpui::test]
 fn settings_account_pane_reachable_at_top_level(cx: &mut TestAppContext) {
     // Account is a top-level pane again; its reset-confirm flow is reachable

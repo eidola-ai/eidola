@@ -148,6 +148,58 @@ impl ConfigStore {
         });
     }
 
+    /// Add a trusted enclave measurement to the eidola row's override list.
+    /// `spec` is the CLI's `<snp>:<rtmr1>:<rtmr2>` triple; a parse failure is
+    /// surfaced in the store's `error` (the settings op-error banner) rather
+    /// than silently dropped. Writes through the backend row; emits
+    /// `Change::Backends`.
+    pub fn trust_measurement(&mut self, spec: String, cx: &mut Context<Self>) {
+        self.write(cx, |c| {
+            let m = eidola_app_core::config::parse_trust_measurement(spec.trim())?;
+            c.runtime()
+                .block_on(c.trust_measurement(
+                    m.snp_measurement,
+                    m.tdx_measurement.rtmr1,
+                    m.tdx_measurement.rtmr2,
+                ))
+                .map(|_| ())
+        });
+    }
+
+    /// Remove a trusted measurement (by SNP key) from the eidola row's
+    /// override list. Clearing the last one reverts to the pin. Writes through
+    /// the backend row; emits `Change::Backends`.
+    pub fn untrust_measurement(&mut self, snp: String, cx: &mut Context<Self>) {
+        self.write(cx, |c| {
+            c.runtime().block_on(c.untrust_measurement(snp)).map(|_| ())
+        });
+    }
+
+    /// Set the eidola hardware root CA (ARK) PEM override. PEM validation
+    /// lives in app-core; a failure lands in the op-error banner.
+    pub fn set_hardware_root_ca(&mut self, pem: String, cx: &mut Context<Self>) {
+        self.write(cx, |c| c.runtime().block_on(c.set_hardware_root_ca(pem)));
+    }
+
+    /// Set the eidola hardware intermediate CA (ASK) PEM override.
+    pub fn set_hardware_intermediate_ca(&mut self, pem: String, cx: &mut Context<Self>) {
+        self.write(cx, |c| {
+            c.runtime().block_on(c.set_hardware_intermediate_ca(pem))
+        });
+    }
+
+    /// Remove the eidola hardware root CA override (row column back to NULL).
+    pub fn clear_hardware_root_ca(&mut self, cx: &mut Context<Self>) {
+        self.write(cx, |c| c.runtime().block_on(c.clear_hardware_root_ca()));
+    }
+
+    /// Remove the eidola hardware intermediate CA override.
+    pub fn clear_hardware_intermediate_ca(&mut self, cx: &mut Context<Self>) {
+        self.write(cx, |c| {
+            c.runtime().block_on(c.clear_hardware_intermediate_ca())
+        });
+    }
+
     pub fn set_default_model(&mut self, model: String, cx: &mut Context<Self>) {
         self.write(cx, |c| c.set_default_model(model));
     }

@@ -100,7 +100,8 @@ impl SettingsView {
     ) -> Self {
         let general =
             cx.new(|cx| GeneralView::new(stores.config.clone(), window_input.clone(), window, cx));
-        let backends = cx.new(|cx| BackendsSettingsView::new(stores.clone(), window, cx));
+        let backends = cx
+            .new(|cx| BackendsSettingsView::new(stores.clone(), window_input.clone(), window, cx));
         let account = cx.new(|cx| AccountView::new(stores.clone(), window, cx));
         let wallet = cx.new(|cx| WalletView::new(stores.clone(), window, cx));
         let backends_store = stores.backends.clone();

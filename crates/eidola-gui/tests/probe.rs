@@ -1010,7 +1010,7 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
         s.local_models = Some(local_models_fixture());
     });
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+        cx.new(|cx| BackendsSettingsView::new(stores, WindowInput::new(cx), window, cx))
     });
 
     // The tab strip is present regardless of the selected tab. The Eidola tab
@@ -1029,6 +1029,11 @@ fn backends_pane_probes_cover_installed_catalog_and_url(cx: &mut TestAppContext)
             "eidola-tab probe {expected:?} missing; recorded: {names:?}"
         );
     }
+    // No overrides in this fixture: the danger warning band must be absent.
+    assert!(
+        !names.contains(&"settings/backends/eidola/trust-warning".to_string()),
+        "no override → no warning band: {names:?}"
+    );
 
     // The Local tab: the singleton toggle, installed-model verbs, catalog,
     // and the paste-a-URL row.
@@ -1100,19 +1105,27 @@ fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContex
         tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
     }];
     trust.trusted_measurements_are_override = true;
+    // Root CA overridden so the Clear verb renders; intermediate left at the
+    // pin (only Set shows there).
+    trust.has_hardware_root_ca = true;
 
     let stores = stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
         s.eidola_trust = Some(trust);
         s.backends = backends_fixture();
     });
-    let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    let window_input = cx.update(WindowInput::new);
+    let wi = window_input.clone();
+    let (window, view) = open_view(cx, move |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, wi, window, cx))
     });
 
-    // At rest: change + both revert affordances.
+    // At rest (⌥ not held): the override warning band, the base-URL Change
+    // affordance, and both revert-to-pin verbs. The measurement/CA *editors*
+    // are gated behind ⌥, so they must be absent here.
     let names = fresh_names(cx, window);
     for expected in [
+        "settings/backends/eidola/trust-warning",
         "settings/backends/eidola/url/change",
         "settings/backends/eidola/url/revert-to-pin",
         "settings/backends/eidola/measurements/revert",
@@ -1122,8 +1135,56 @@ fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContex
             "eidola trust-surface probe {expected:?} missing: {names:?}"
         );
     }
+    for gated in [
+        "settings/backends/eidola/measurements/0/untrust",
+        "settings/backends/eidola/measurements/add",
+        "settings/backends/eidola/measurements/add/submit",
+        "settings/backends/eidola/ca/root/set",
+        "settings/backends/eidola/ca/intermediate/set",
+    ] {
+        assert!(
+            !names.contains(&gated.to_string()),
+            "trust editor probe {gated:?} must be hidden without ⌥: {names:?}"
+        );
+    }
 
-    // Entering the editor swaps in the input + save/cancel.
+    // The warning band (role Alert) names exactly which values are overridden.
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let band = entries
+        .iter()
+        .find(|(n, _)| n == "settings/backends/eidola/trust-warning")
+        .expect("trust warning band recorded");
+    assert_eq!(band.1.role, gpui::Role::Alert);
+    let label = band.1.label.to_string();
+    for named in ["base URL", "trusted measurements", "hardware root CA"] {
+        assert!(
+            label.contains(named),
+            "warning band must name {named:?}; label: {label:?}"
+        );
+    }
+
+    // Holding ⌥ reveals the measurement + CA editors.
+    cx.update(|cx| {
+        window_input.update(cx, |wi, cx| wi.set_alt_for_test(true, cx));
+    });
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/backends/eidola/measurements/0/untrust",
+        "settings/backends/eidola/measurements/add",
+        "settings/backends/eidola/measurements/add/submit",
+        "settings/backends/eidola/ca/root/input",
+        "settings/backends/eidola/ca/root/set",
+        "settings/backends/eidola/ca/root/clear",
+        "settings/backends/eidola/ca/intermediate/input",
+        "settings/backends/eidola/ca/intermediate/set",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "eidola ⌥-editor probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    // Entering the base-URL editor swaps in the input + save/cancel.
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.begin_edit_base_url(window, cx));
     })
@@ -1153,7 +1214,7 @@ fn backends_pane_add_form_probes_appear_per_kind(cx: &mut TestAppContext) {
         s.backends = backends_fixture();
     });
     let (window, view) = open_view(cx, |window, cx| {
-        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+        cx.new(|cx| BackendsSettingsView::new(stores, WindowInput::new(cx), window, cx))
     });
 
     // The add form lives in the External tab.

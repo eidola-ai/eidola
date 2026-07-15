@@ -700,6 +700,69 @@ fn register_settings(s: &mut Snapshots) {
         view
     });
 
+    // Backends → Eidola with the whole trust bundle overridden and ⌥ held:
+    // the danger warning band up top, danger-tinted override status lines, and
+    // the ⌥-revealed measurement + hardware-CA editors.
+    s.add(
+        "settings_backends_eidola_overridden",
+        settings_size,
+        |window, cx| {
+            use eidola_app_core::{BackendInfo, BackendKind};
+            let core = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(true));
+                let mut trust = stub_eidola_trust();
+                trust.base_url = "https://staging.eidola.example/v1".into();
+                trust.base_url_is_override = true;
+                trust.trusted_measurements = vec![MeasurementInfo {
+                    snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
+                    tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .into(),
+                    tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                        .into(),
+                }];
+                trust.trusted_measurements_are_override = true;
+                trust.has_hardware_root_ca = true;
+                s.eidola_trust = Some(trust);
+                s.backends = vec![
+                    BackendInfo {
+                        id: "eidola".into(),
+                        kind: BackendKind::Eidola,
+                        display_name: "Eidola".into(),
+                        enabled: true,
+                        base_url: None,
+                        has_api_key: false,
+                        models_dir: None,
+                        model_overrides: None,
+                        engine_path: None,
+                        auto_start: true,
+                        created_at: 0,
+                    },
+                    BackendInfo {
+                        id: "local".into(),
+                        kind: BackendKind::Local,
+                        display_name: "Local".into(),
+                        enabled: true,
+                        base_url: None,
+                        has_api_key: false,
+                        models_dir: None,
+                        model_overrides: None,
+                        engine_path: None,
+                        auto_start: true,
+                        created_at: 0,
+                    },
+                ];
+            });
+            let view = cx.new(|cx| SettingsView::new(core, WindowInput::new(cx), window, cx));
+            view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
+            let pane = view.read(cx).backends_pane();
+            pane.update(cx, |p, cx| {
+                p.select_tab(BackendsTab::Eidola, cx);
+                p.set_advanced(true, cx);
+            });
+            view
+        },
+    );
+
     // Backends → Local: the managed store — engine line, installed models,
     // catalog, paste-a-URL.
     s.add("settings_backends_local", settings_size, |window, cx| {
