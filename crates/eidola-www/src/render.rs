@@ -201,6 +201,7 @@ pub fn layout(page: &Page, docs_nav: Option<&[NavSection]>) -> String {
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/circadian.css">
 <link rel="stylesheet" href="/assets/site.css">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self';">
 {feed}<meta property="og:title" content="{title}">
 <meta property="og:url" content="{canonical}">
 <script defer src="/assets/zones.js"></script>
